@@ -240,6 +240,22 @@ pub mod codec {
         whatsapp::Message::decode_from_slice(bytes)
     }
 
+    /// Keep retained comment-key serialization in one codec instantiation.
+    #[inline(never)]
+    pub fn message_key_to_vec(key: &whatsapp::MessageKey) -> Vec<u8> {
+        key.encode_to_vec()
+    }
+
+    #[inline(never)]
+    pub fn message_key_encoded_len(key: &whatsapp::MessageKey) -> usize {
+        key.encoded_len() as usize
+    }
+
+    #[inline(never)]
+    pub fn message_key_decode(bytes: &[u8]) -> Result<whatsapp::MessageKey, buffa::DecodeError> {
+        whatsapp::MessageKey::decode_from_slice(bytes)
+    }
+
     #[inline(never)]
     pub fn web_message_info_decode(
         bytes: &[u8],

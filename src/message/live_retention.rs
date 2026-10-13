@@ -14,6 +14,8 @@ pub(super) struct LiveRetention {
     #[cfg(test)]
     pub(super) stage_ready: tokio::sync::Notify,
     #[cfg(test)]
+    pub(super) forbid_access: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
     stage_release: tokio::sync::Notify,
 }
 #[derive(Default)]
@@ -41,8 +43,79 @@ struct Reservation {
     origin: StanzaOrigin,
     charge: Arc<Charge>,
     receiving: bool,
-    entries: Vec<PendingDelivery>,
+    entries: Vec<RetainedDelivery>,
     raw: Vec<RawRetained>,
+}
+
+#[derive(Clone)]
+struct RetainedDelivery {
+    info: Arc<MessageInfo>,
+    projection: bytes::Bytes,
+    message: std::sync::Weak<waproto::whatsapp::Message>,
+    ephemeral_expiration: Option<u32>,
+    comment_target: Option<bytes::Bytes>,
+    carrier: Option<(Option<u32>, bytes::Bytes)>,
+    origin: Option<super::raw_pending::DeliveryOrigin>,
+    retention: Arc<Charge>,
+    receipt: Option<Arc<ReceiptScope>>,
+    storage_sender: Option<Arc<str>>,
+    consumer_claimed: bool,
+}
+
+impl RetainedDelivery {
+    fn new(item: &PendingDelivery, charge: &Arc<Charge>) -> Self {
+        Self {
+            info: Arc::clone(&item.info),
+            projection: waproto::codec::message_to_vec(&item.message).into(),
+            message: Arc::downgrade(&item.message),
+            ephemeral_expiration: item.ephemeral_expiration,
+            comment_target: item
+                .comment_target
+                .as_ref()
+                .map(|key| waproto::codec::message_key_to_vec(key).into()),
+            carrier: item.carrier.clone(),
+            origin: item.origin,
+            retention: Arc::clone(charge),
+            receipt: item.receipt.clone(),
+            storage_sender: item.storage_sender.clone(),
+            consumer_claimed: item.consumer_claimed,
+        }
+    }
+
+    #[inline(never)]
+    fn materialize(&self) -> anyhow::Result<PendingDelivery> {
+        let message = match self.message.upgrade() {
+            Some(message) => message,
+            None => Arc::new(waproto::codec::message_decode(&self.projection)?),
+        };
+        Ok(PendingDelivery {
+            item: wacore::types::events::InboundMessage::builder()
+                .info(Arc::clone(&self.info))
+                .message(message)
+                .maybe_ephemeral_expiration(self.ephemeral_expiration)
+                .maybe_comment_target(
+                    self.comment_target
+                        .as_ref()
+                        .map(|bytes| waproto::codec::message_key_decode(bytes))
+                        .transpose()?
+                        .map(Box::new),
+                )
+                .build(),
+            carrier: self.carrier.clone(),
+            origin: self.origin,
+            retention: Some(Arc::clone(&self.retention)),
+            receipt: self.receipt.clone(),
+            storage_sender: self.storage_sender.clone(),
+            consumer_claimed: self.consumer_claimed,
+        })
+    }
+
+    fn retained_wire_bytes(&self) -> usize {
+        self.projection
+            .len()
+            .saturating_add(self.carrier.as_ref().map_or(0, |(_, bytes)| bytes.len()))
+            .saturating_add(self.comment_target.as_ref().map_or(0, |bytes| bytes.len()))
+    }
 }
 #[derive(Clone)]
 pub(super) struct RawRetained {
@@ -126,6 +199,15 @@ impl Drop for ReceiptProducer {
     }
 }
 impl LiveRetention {
+    #[cfg(test)]
+    fn assert_access_allowed(&self) {
+        assert!(
+            !self
+                .forbid_access
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "durability-disabled processing must not access live retention"
+        );
+    }
     pub fn begin_receipts(&self, info: &Arc<MessageInfo>) -> anyhow::Result<ReceiptProducer> {
         let mut state = lock(&self.state);
         state.receipts.retain(|scope| scope.strong_count() != 0);
@@ -141,6 +223,8 @@ impl LiveRetention {
         Ok(ReceiptProducer(scope))
     }
     pub fn receipt_for(&self, info: &Arc<MessageInfo>) -> Option<Arc<ReceiptScope>> {
+        #[cfg(test)]
+        self.assert_access_allowed();
         lock(&self.state)
             .receipts
             .iter()
@@ -205,6 +289,14 @@ impl LiveRetention {
         }))
     }
     pub fn retain(&self, item: &mut PendingDelivery) -> anyhow::Result<()> {
+        let retained_bytes = item
+            .retained_wire_bytes()
+            .checked_add(
+                item.comment_target
+                    .as_ref()
+                    .map_or(0, |key| waproto::codec::message_key_encoded_len(key)),
+            )
+            .ok_or_else(|| anyhow::anyhow!("live retention overflow"))?;
         let mut state = lock(&self.state);
         // Legacy replay has no producer origin. Reuse its existing charge
         // instead of adding another reservation on each failed alias retry.
@@ -235,8 +327,7 @@ impl LiveRetention {
                 // Direct replay/test entry points have no classified admission.
                 // Replays already have a durable row; first-receipt production
                 // entries use the reservation made before Signal decryption.
-                let bytes = item
-                    .retained_wire_bytes()
+                let bytes = retained_bytes
                     .checked_add(size_of::<PendingDelivery>() + size_of::<Reservation>())
                     .ok_or_else(|| anyhow::anyhow!("live retention overflow"))?;
                 let charge = match item.retention.as_ref() {
@@ -275,17 +366,19 @@ impl LiveRetention {
         let used = reservation
             .entries
             .iter()
-            .map(PendingDelivery::retained_wire_bytes)
+            .map(RetainedDelivery::retained_wire_bytes)
             .sum::<usize>();
         anyhow::ensure!(
-            used.checked_add(item.retained_wire_bytes())
+            used.checked_add(retained_bytes)
                 .is_some_and(|bytes| bytes <= reservation.charge.bytes),
             "live projection exceeds admission"
         );
         reservation
             .raw
             .retain(|raw| Some(raw.origin) != item.origin);
-        reservation.entries.push(item.clone());
+        reservation
+            .entries
+            .push(RetainedDelivery::new(item, &reservation.charge));
         Ok(())
     }
     #[cfg(test)]
@@ -307,6 +400,8 @@ impl LiveRetention {
         slot: (usize, &'static str, u8),
         plaintext: &[u8],
     ) {
+        #[cfg(test)]
+        self.assert_access_allowed();
         let mut state = lock(&self.state);
         let Some(reservation) = state
             .reservations
@@ -334,6 +429,8 @@ impl LiveRetention {
         });
     }
     pub fn finish_raw(&self, origin: super::raw_pending::DeliveryOrigin) {
+        #[cfg(test)]
+        self.assert_access_allowed();
         let mut state = lock(&self.state);
         for index in (0..state.reservations.len()).rev() {
             let reservation = &mut state.reservations[index];
@@ -363,14 +460,18 @@ impl LiveRetention {
             .cloned()
             .collect()
     }
-    pub fn for_message(&self, info: &MessageInfo) -> Vec<PendingDelivery> {
-        lock(&self.state)
+    #[inline(never)]
+    pub fn for_message(&self, info: &MessageInfo) -> anyhow::Result<Vec<PendingDelivery>> {
+        #[cfg(test)]
+        self.assert_access_allowed();
+        let entries: Vec<_> = lock(&self.state)
             .reservations
             .iter()
             .flat_map(|reservation| &reservation.entries)
             .filter(|entry| same_message(&entry.info, info))
             .cloned()
-            .collect()
+            .collect();
+        entries.iter().map(RetainedDelivery::materialize).collect()
     }
     pub fn charge_for_origin(
         &self,
@@ -424,11 +525,16 @@ fn same_message(first: &MessageInfo, second: &MessageInfo) -> bool {
                 && first.source.sender.to_non_ad() == second.source.sender.to_non_ad()))
 }
 
-fn same_entry(first: &PendingDelivery, second: &PendingDelivery) -> bool {
+#[inline(never)]
+fn same_entry(first: &RetainedDelivery, second: &PendingDelivery) -> bool {
     first.origin == second.origin
         && first.storage_sender == second.storage_sender
         && Arc::ptr_eq(&first.info, &second.info)
-        && Arc::ptr_eq(&first.message, &second.message)
+        && (first.message.ptr_eq(&Arc::downgrade(&second.message))
+            || second.retention.as_ref().is_some_and(|charge| {
+                Arc::ptr_eq(&first.retention, charge)
+                    && first.projection.as_ref() == waproto::codec::message_to_vec(&second.message)
+            }))
         && match (&first.carrier, &second.carrier) {
             (None, None) => true,
             (Some((first_index, first_bytes)), Some((second_index, second_bytes))) => {
@@ -444,6 +550,67 @@ fn same_entry(first: &PendingDelivery, second: &PendingDelivery) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_pending_resident_projection_does_not_keep_decoded_graph_alive() {
+        let retention = LiveRetention::default();
+        let info = Arc::new(MessageInfo::default());
+        let mut context = waproto::whatsapp::ContextInfo::default();
+        context.mentioned_jid = vec![String::new(); 8192];
+        let mut text = waproto::whatsapp::message::ExtendedTextMessage::default();
+        text.context_info = buffa::MessageField::some(context);
+        let mut message = waproto::whatsapp::Message::default();
+        message.extended_text_message = buffa::MessageField::some(text);
+        let mut target = waproto::whatsapp::MessageKey::default();
+        target.id = Some("RETAINED_PARENT".into());
+        let mut item = PendingDelivery::from(
+            wacore::types::events::InboundMessage::builder()
+                .info(Arc::clone(&info))
+                .message(Arc::new(message))
+                .ephemeral_expiration(3600)
+                .comment_target(Box::new(target))
+                .build(),
+        );
+        let weak = Arc::downgrade(&item.message);
+        retention.retain(&mut item).unwrap();
+        assert_eq!(
+            Arc::strong_count(&item.message),
+            1,
+            "resident retention must not own the decoded graph"
+        );
+        drop(item);
+        assert!(weak.upgrade().is_none());
+        let recovered = retention.for_message(&info).unwrap();
+        assert_eq!(recovered[0].ephemeral_expiration, Some(3600));
+        assert_eq!(
+            recovered[0].comment_target.as_ref().unwrap().id.as_deref(),
+            Some("RETAINED_PARENT")
+        );
+        assert_eq!(
+            recovered[0]
+                .message
+                .extended_text_message
+                .as_option()
+                .unwrap()
+                .context_info
+                .as_option()
+                .unwrap()
+                .mentioned_jid
+                .len(),
+            8192
+        );
+        retention.published(&recovered);
+        drop(recovered);
+        let recovered = retention.for_message(&info).unwrap();
+        assert!(
+            recovered[0].consumer_claimed,
+            "rehydration must preserve completed publication"
+        );
+        retention.stored(&recovered);
+        drop(recovered);
+        assert!(lock(&retention.state).reservations.is_empty());
+        assert_eq!(lock(&retention.budget).bytes, 0);
+    }
 
     #[test]
     fn raw_pending_legacy_alias_retry_reuses_its_reservation() {
@@ -478,9 +645,9 @@ mod tests {
         retention.retain(&mut first).unwrap();
         retention.retain(&mut second).unwrap();
         retention.stored(std::slice::from_ref(&first));
-        assert_eq!(retention.for_message(&second.info).len(), 1);
+        assert_eq!(retention.for_message(&second.info).unwrap().len(), 1);
         assert_eq!(
-            retention.for_message(&second.info)[0].carrier,
+            retention.for_message(&second.info).unwrap()[0].carrier,
             second.carrier
         );
     }

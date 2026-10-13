@@ -770,7 +770,7 @@ impl Client {
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
     ) -> anyhow::Result<()> {
-        let retained = self.inbound_commit_batch.live_retention.for_message(info);
+        let retained = self.inbound_commit_batch.live_retention.for_message(info)?;
         if !retained.is_empty() {
             let retained = self
                 .live_pending_retry_batch(&retained, true)
@@ -944,10 +944,13 @@ impl Client {
         mut item: PendingDelivery,
         track_commit: bool,
     ) -> InboundCommitState {
-        item.receipt = self
-            .inbound_commit_batch
-            .live_retention
-            .receipt_for(&item.info);
+        let durable = self.inbound_durability_hook.get().is_some();
+        if durable {
+            item.receipt = self
+                .inbound_commit_batch
+                .live_retention
+                .receipt_for(&item.info);
+        }
         if !self.inbound_commit_batch.is_active() {
             if self.inbound_durability_hook().is_some()
                 && let Err(error) = self.inbound_commit_batch.live_retention.retain(&mut item)
@@ -955,10 +958,21 @@ impl Client {
                 log::warn!("Live retention admission refused: {error:?}");
                 return InboundCommitState::Failed;
             }
-            let owned = self
-                .inbound_commit_batch
-                .live_retention
-                .for_message(&item.info);
+            let owned = if durable {
+                match self
+                    .inbound_commit_batch
+                    .live_retention
+                    .for_message(&item.info)
+                {
+                    Ok(owned) => owned,
+                    Err(error) => {
+                        log::warn!("Retained projection decode failed: {error:?}");
+                        return InboundCommitState::Failed;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
             let items: Arc<[PendingDelivery]> =
                 match self.live_pending_retry_batch(&owned, false).await {
                     Ok(Some(retained)) => retained.into(),
@@ -971,7 +985,7 @@ impl Client {
             let outcome = self
                 .commit_pending_batch_result(Arc::clone(&items), BatchOrigin::Live, None, true)
                 .await;
-            if !outcome.delivered {
+            if durable && !outcome.delivered {
                 for item in items.iter() {
                     self.inbound_commit_batch
                         .live_retention
@@ -989,7 +1003,7 @@ impl Client {
         // Raw replay can reenter while the offline batcher is active. Keep its
         // existing admission alive in queued storage even after the raw slot
         // is retired; ordinary drain arrivals do not create live reservations.
-        if item.retention.is_none() {
+        if durable && item.retention.is_none() {
             item.retention = self
                 .inbound_commit_batch
                 .live_retention

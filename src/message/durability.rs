@@ -14,7 +14,7 @@ use wacore::types::events::InboundMessage;
 
 impl Client {
     /// The registered inbound durability hook, if any. `None` (default) keeps
-    /// the at-most-once ack path with zero overhead.
+    /// the at-most-once ack path without live-retention locking or backing.
     pub(crate) fn inbound_durability_hook(&self) -> Option<Arc<dyn InboundDurabilityHook>> {
         self.inbound_durability_hook.get().cloned()
     }
@@ -113,7 +113,13 @@ impl Client {
             if !raw.is_empty() {
                 return Box::pin(self.replay_retained_raw(info, raw)).await;
             }
-            let retained = self.inbound_commit_batch.live_retention.for_message(info);
+            let retained = match self.inbound_commit_batch.live_retention.for_message(info) {
+                Ok(retained) => retained,
+                Err(error) => {
+                    log::warn!("Retained projection decode failed: {error:?}");
+                    return false;
+                }
+            };
             if !retained.is_empty() {
                 let retained = match self.live_pending_retry_batch(&retained, true).await {
                     Ok(Some(hydrated)) => hydrated,

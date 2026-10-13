@@ -58,6 +58,9 @@ use waproto::whatsapp as wa;
 ///   repeating Signal decryption. This resident copy cannot survive process
 ///   termination. Crash recovery requires the pending row to have been stored
 ///   durably before the process exits.
+///   Resident retry projections use encoded backing; decoded graphs belong to
+///   active processing, callbacks or consumers and are outside this backing
+///   budget. Consumer-held messages are not a bounded Client cache.
 /// - On a redelivery replay the `info` is re-parsed from the stanza, so a few
 ///   fields derived during the first dispatch (the ephemeral timer, encrypted
 ///   comment threading) may be absent. The stored `message` is the consumer

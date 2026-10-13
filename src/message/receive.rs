@@ -120,6 +120,28 @@ pub(super) struct PlaintextSlot<'a> {
 }
 
 impl Client {
+    #[inline(never)]
+    pub(super) fn stage_retained_plaintext(
+        &self,
+        info: &Arc<MessageInfo>,
+        producer: raw_pending::StanzaOrigin,
+        slot: (usize, &'static str, u8),
+        plaintext: &[u8],
+    ) {
+        if self.inbound_durability_hook.get().is_some() {
+            self.inbound_commit_batch
+                .live_retention
+                .stage(info, producer, slot, plaintext);
+        }
+    }
+
+    #[inline(never)]
+    pub(super) fn finish_retained_raw(&self, origin: raw_pending::DeliveryOrigin) {
+        if self.inbound_durability_hook.get().is_some() {
+            self.inbound_commit_batch.live_retention.finish_raw(origin);
+        }
+    }
+
     /// Test and bench convenience: scope to the current generation. Production
     /// inbound traffic always goes through the chat-lane worker, which passes
     /// its own spawn generation.
@@ -663,7 +685,7 @@ impl Client {
             }
             SessionBatchOutcome::default()
         };
-        if session_outcome.had_failure {
+        if session_outcome.had_failure && self.inbound_durability_hook.get().is_some() {
             self.inbound_commit_batch.live_retention.fail_receipt(&info);
         }
         let session_decrypted_successfully = session_outcome.decrypted;
@@ -1019,7 +1041,7 @@ impl Client {
 
             match decrypt_res {
                 Ok(decrypted) => {
-                    self.inbound_commit_batch.live_retention.stage(
+                    self.stage_retained_plaintext(
                         info,
                         stanza_origin,
                         (enc_index, enc_type, padding_version),
@@ -1150,7 +1172,7 @@ impl Client {
 
                         match retry_decrypt_res {
                             Ok(decrypted) => {
-                                self.inbound_commit_batch.live_retention.stage(
+                                self.stage_retained_plaintext(
                                     info,
                                     stanza_origin,
                                     (enc_index, enc_type, padding_version),
@@ -1692,7 +1714,7 @@ impl Client {
 
             match decrypt_result {
                 Ok(padded_plaintext) => {
-                    self.inbound_commit_batch.live_retention.stage(
+                    self.stage_retained_plaintext(
                         info,
                         stanza_origin,
                         (enc_index, enc_type, padding_version),
@@ -1975,7 +1997,7 @@ impl Client {
             // Successful protocol-only processing has no consumer delivery.
             // Recoverable errors and cancellation keep raw ownership; the
             // terminal padding/decode checks release only their rejected slot.
-            self.inbound_commit_batch.live_retention.finish_raw(origin);
+            self.finish_retained_raw(origin);
         }
         result
     }
@@ -1998,7 +2020,7 @@ impl Client {
             position: enc_index,
         };
         let source = wacore::messages::unpad_plaintext(padded_plaintext, padding_version)
-            .inspect_err(|_| self.inbound_commit_batch.live_retention.finish_raw(origin))?;
+            .inspect_err(|_| self.finish_retained_raw(origin))?;
 
         // Emitted before decoding, so a payload this build cannot decode still
         // reaches a consumer that wants it. Nothing is cloned while no lease is
@@ -2025,7 +2047,7 @@ impl Client {
             .transpose()?;
         let (original_msg, history_sync_taken) =
             wacore::messages::decode_unpadded_detached_history_sync(source)
-                .inspect_err(|_| self.inbound_commit_batch.live_retention.finish_raw(origin))?;
+                .inspect_err(|_| self.finish_retained_raw(origin))?;
         log::debug!(
             "[msg:{}] Successfully decrypted message from {}: type={} [batch path]",
             info.id,
@@ -2111,7 +2133,7 @@ impl Client {
                 &info.id,
                 axolotl_bytes,
             )
-            .await;
+            .await?;
         }
 
         // A peer-provided key could forge app-state mutations, so match WA Web's
@@ -2414,7 +2436,7 @@ impl Client {
             // the identity for the first time (NewOrUnchanged), so no local
             // identity-change reaction is warranted here.
             Ok(decrypted) => {
-                self.inbound_commit_batch.live_retention.stage(
+                self.stage_retained_plaintext(
                     info,
                     stanza_origin,
                     (enc_index, enc_type, padding_version),

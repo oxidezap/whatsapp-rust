@@ -803,14 +803,7 @@ impl Client {
         // was opened with is single-use, so nothing can ask for it again.
         // `Bytes::from` takes the buffer over rather than copying it.
         let plaintext = bytes::Bytes::from(plaintext);
-        if self.inbound_durability_hook().is_some() {
-            self.inbound_commit_batch.live_retention.stage(
-                info,
-                producer,
-                (enc_index, "msmsg", 3),
-                &plaintext,
-            );
-        }
+        self.stage_retained_plaintext(info, producer, (enc_index, "msmsg", 3), &plaintext);
         if self.decrypted_payload_forwarding_enabled() {
             self.core.event_bus.dispatch(Event::DecryptedPayload(
                 wacore::types::events::DecryptedPayload::builder()
@@ -838,12 +831,10 @@ impl Client {
                     EncDecryptFailureReason::PlaintextUnusable,
                 );
                 self.spawn_nack(info, NackReason::ParsingError, None);
-                self.inbound_commit_batch
-                    .live_retention
-                    .finish_raw(raw_pending::DeliveryOrigin {
-                        stanza: producer,
-                        position: enc_index,
-                    });
+                self.finish_retained_raw(raw_pending::DeliveryOrigin {
+                    stanza: producer,
+                    position: enc_index,
+                });
                 return;
             }
         };
@@ -856,12 +847,10 @@ impl Client {
         let index = match u32::try_from(enc_index) {
             Ok(index) => index,
             Err(_) => {
-                self.inbound_commit_batch
-                    .live_retention
-                    .finish_raw(raw_pending::DeliveryOrigin {
-                        stanza: producer,
-                        position: enc_index,
-                    });
+                self.finish_retained_raw(raw_pending::DeliveryOrigin {
+                    stanza: producer,
+                    position: enc_index,
+                });
                 return;
             }
         };

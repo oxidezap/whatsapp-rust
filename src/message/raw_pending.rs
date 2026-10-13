@@ -3,7 +3,8 @@
 use bytes::Bytes;
 use wacore::types::events::InboundMessage;
 
-const MAGIC: &[u8; 6] = b"\0WRPD\x03";
+const MAGIC: &[u8; 6] = b"\0WRPD\x04";
+const GROUPED_MAGIC: &[u8; 6] = b"\0WRPD\x03";
 const LEGACY_MAGIC: &[u8; 6] = b"\0WRPD\x01";
 pub(super) const MAX_PENDING_BYTES: usize = 4 * 1024 * 1024;
 
@@ -131,7 +132,8 @@ impl PendingJournal {
                 backing: None,
             });
         }
-        let grouped = bytes.starts_with(MAGIC);
+        let compact = bytes.starts_with(MAGIC);
+        let grouped = compact || bytes.starts_with(GROUPED_MAGIC);
         anyhow::ensure!(
             grouped || bytes.starts_with(LEGACY_MAGIC),
             "unsupported pending journal version"
@@ -174,7 +176,7 @@ impl PendingJournal {
                 _ => anyhow::bail!("invalid pending index"),
             };
             let original = cursor.blob()?;
-            let projection = cursor.blob()?;
+            let projection = cursor.projection(&original, compact)?;
             occurrences.push(Occurrence {
                 producer,
 
@@ -190,6 +192,14 @@ impl PendingJournal {
             backing: grouped.then(|| cursor.bytes.clone()),
         };
         journal.validate()?;
+        if compact {
+            anyhow::ensure!(
+                journal
+                    .retained_size()
+                    .is_some_and(|size| size <= MAX_PENDING_BYTES),
+                "pending journal backing and metadata exceed admission"
+            );
+        }
         Ok(journal)
     }
 
@@ -273,16 +283,18 @@ impl PendingJournal {
         Ok(())
     }
 
-    pub fn fits_additional(&self, original: usize, projection: usize) -> bool {
-        let current = self
-            .occurrences
+    fn retained_size(&self) -> Option<usize> {
+        self.occurrences
             .iter()
             .try_fold(MAGIC.len() + 16 + 4, |size, entry| {
                 size.checked_add(30 + size_of::<Occurrence>())
                     .and_then(|size| size.checked_add(entry.original.len()))
                     .and_then(|size| size.checked_add(entry.projection.len()))
-            });
-        current
+            })
+    }
+
+    pub fn fits_additional(&self, original: usize, projection: usize) -> bool {
+        self.retained_size()
             .and_then(|size| size.checked_add(30 + size_of::<Occurrence>()))
             .and_then(|size| size.checked_add(original))
             .and_then(|size| size.checked_add(projection))
@@ -307,10 +319,14 @@ impl PendingJournal {
             {
                 return Ok(false);
             }
-            for current in [&entry.original, &entry.projection] {
-                let saved = cursor.blob()?;
+            let original = cursor.blob()?;
+            let projection = cursor.projection(&original, bytes.starts_with(MAGIC))?;
+            for (saved, current) in [
+                (&original, &entry.original),
+                (&projection, &entry.projection),
+            ] {
                 if saved.len() != current.len()
-                    || (saved.as_ptr() != current.as_ptr() && saved != *current)
+                    || (saved.as_ptr() != current.as_ptr() && saved != current)
                 {
                     return Ok(false);
                 }
@@ -341,14 +357,19 @@ impl PendingJournal {
                 .ok_or_else(|| anyhow::anyhow!("pending journal size overflow"))?;
         }
         anyhow::ensure!(
-            self.occurrences
-                .len()
-                .checked_mul(size_of::<Occurrence>())
-                .and_then(|metadata| metadata.checked_add(length))
+            self.retained_size()
                 .is_some_and(|retained| retained <= MAX_PENDING_BYTES),
             "pending journal backing and metadata exceed admission"
         );
-        let mut out = Vec::with_capacity(length);
+        // Equal carrier/projection bytes share one stored slice. Admission
+        // still uses the conservative unshared size, preserving its limit.
+        let saved: usize = self
+            .occurrences
+            .iter()
+            .filter(|entry| entry.original == entry.projection)
+            .map(|entry| entry.projection.len())
+            .sum();
+        let mut out = Vec::with_capacity(length - saved);
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&self.generation);
         out.extend_from_slice(&u32::try_from(self.occurrences.len())?.to_le_bytes());
@@ -357,9 +378,13 @@ impl PendingJournal {
             out.extend_from_slice(&occurrence.producer.map_or([0; 16], |id| id.0));
             out.push(u8::from(occurrence.index.is_some()));
             out.extend_from_slice(&occurrence.index.unwrap_or(0).to_le_bytes());
-            for bytes in [&occurrence.original, &occurrence.projection] {
-                out.extend_from_slice(&u32::try_from(bytes.len())?.to_le_bytes());
-                out.extend_from_slice(bytes);
+            out.extend_from_slice(&u32::try_from(occurrence.original.len())?.to_le_bytes());
+            out.extend_from_slice(&occurrence.original);
+            if occurrence.original == occurrence.projection {
+                out.extend_from_slice(&u32::MAX.to_le_bytes());
+            } else {
+                out.extend_from_slice(&u32::try_from(occurrence.projection.len())?.to_le_bytes());
+                out.extend_from_slice(&occurrence.projection);
             }
         }
         Ok(out.into())
@@ -392,6 +417,14 @@ impl Cursor {
         let length = self.number()?;
         self.take(length)
     }
+    fn projection(&mut self, original: &Bytes, compact: bool) -> anyhow::Result<Bytes> {
+        let length = self.number()?;
+        if compact && length == u32::MAX as usize {
+            Ok(original.clone())
+        } else {
+            self.take(length)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -406,6 +439,67 @@ mod tests {
             original: Bytes::from_static(value),
             projection: Bytes::from_static(value),
         }
+    }
+
+    #[test]
+    fn raw_pending_compaction_keeps_unshared_admission_bound() {
+        let mut journal = PendingJournal::default();
+        let mut entry = occurrence(0, b"");
+        entry.original = vec![7; MAX_PENDING_BYTES / 2].into();
+        entry.projection = entry.original.clone();
+        journal.occurrences.push(entry);
+        assert!(
+            journal.encode().is_err(),
+            "sharing must not raise the logical limit"
+        );
+        let mut wire = Vec::new();
+        wire.extend_from_slice(MAGIC);
+        wire.extend_from_slice(&[7; 16]);
+        wire.extend_from_slice(&1u32.to_le_bytes());
+        wire.extend_from_slice(&[0; 17]);
+        wire.push(1);
+        wire.extend_from_slice(&0u32.to_le_bytes());
+        wire.extend_from_slice(&u32::try_from(MAX_PENDING_BYTES / 2).unwrap().to_le_bytes());
+        wire.extend_from_slice(&journal.occurrences[0].original);
+        wire.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(wire.len() < MAX_PENDING_BYTES);
+        assert!(PendingJournal::decode(wire.into()).is_err());
+    }
+
+    #[test]
+    fn raw_pending_compaction_preserves_payloads_and_legacy_grouped_rows() {
+        let mut journal = PendingJournal::default();
+        journal.merge(occurrence(0, b"equal plaintext")).unwrap();
+        let compact = journal.encode().unwrap();
+        let restored = PendingJournal::decode(compact.clone()).unwrap();
+        assert_eq!(
+            restored.occurrences[0].original,
+            restored.occurrences[0].projection
+        );
+        assert_eq!(
+            restored.occurrences[0].original.as_ptr(),
+            restored.occurrences[0].projection.as_ptr()
+        );
+        assert_eq!(restored.encode().unwrap(), compact);
+        let mut old = compact[..compact.len() - 4].to_vec();
+        old[5] = 3;
+        old.extend_from_slice(&15u32.to_le_bytes());
+        old.extend_from_slice(b"equal plaintext");
+        let mut restored = PendingJournal::decode(old.clone().into()).unwrap();
+        assert_eq!(restored.encode().unwrap().as_ref(), old);
+        restored
+            .merge(Occurrence {
+                producer: None,
+                index: Some(1),
+                original: Bytes::from_static(b"carrier"),
+                projection: Bytes::new(),
+            })
+            .unwrap();
+        let upgraded = restored.encode().unwrap();
+        assert!(upgraded.starts_with(MAGIC));
+        let restored = PendingJournal::decode(upgraded).unwrap();
+        assert_eq!(restored.occurrences[1].original.as_ref(), b"carrier");
+        assert!(restored.occurrences[1].projection.is_empty());
     }
 
     #[test]
@@ -521,7 +615,7 @@ mod tests {
             assert!(PendingJournal::decode(bytes.slice(..end)).is_err());
         }
         let mut future = bytes.to_vec();
-        future[5] = 4;
+        future[5] = 5;
         assert!(PendingJournal::decode(future.into()).is_err());
         journal.occurrences[0].original = vec![0; MAX_PENDING_BYTES].into();
         assert!(journal.encode().is_err());

@@ -276,6 +276,8 @@ pub struct InMemoryBackend {
     /// flush).
     #[cfg(any(test, feature = "test-util"))]
     fail_sender_key_writes: AtomicBool,
+    #[cfg(any(test, feature = "test-util"))]
+    fail_sender_key_reads: AtomicBool,
     /// Parks the next `load_signed_prekey` on a barrier. Test hook: lets a
     /// harness promote a rotated key while a lookup is already in flight,
     /// which is the window a caller's re-read exists to close.
@@ -349,6 +351,8 @@ impl InMemoryBackend {
             #[cfg(any(test, feature = "test-util"))]
             fail_sender_key_writes: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-util"))]
+            fail_sender_key_reads: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-util"))]
             signed_prekey_read_gate: std::sync::Mutex::new(None),
         }
     }
@@ -385,6 +389,12 @@ impl InMemoryBackend {
     #[cfg(any(test, feature = "test-util"))]
     pub fn set_fail_sender_key_writes(&self, fail: bool) {
         self.fail_sender_key_writes.store(fail, Ordering::Relaxed);
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    /// Inject errors in backend sender-key reads; cached keys are unaffected.
+    pub fn set_fail_sender_key_reads(&self, fail: bool) {
+        self.fail_sender_key_reads.store(fail, Ordering::Relaxed);
     }
 
     /// Park the next `load_signed_prekey` on `gate`, which it waits on twice:
@@ -701,6 +711,12 @@ impl SignalStore for InMemoryBackend {
     }
 
     async fn get_sender_key(&self, address: &str) -> Result<Option<Vec<u8>>> {
+        #[cfg(any(test, feature = "test-util"))]
+        if self.fail_sender_key_reads.load(Ordering::Relaxed) {
+            return Err(crate::store::error::StoreError::Io(std::io::Error::other(
+                "injected sender-key read failure",
+            )));
+        }
         Ok(self.state.lock().await.sender_keys.get(address).cloned())
     }
 

@@ -369,7 +369,7 @@ impl Client {
         sender_jid: &Jid,
         message_id: &str,
         axolotl_bytes: &[u8],
-    ) {
+    ) -> Result<(), crate::features::SignalError> {
         if let Err(e) = self
             .signal()
             .process_sender_key_distribution_cached(group_jid, sender_jid, axolotl_bytes)
@@ -399,12 +399,14 @@ impl Client {
                     e
                 );
             }
+            Err(e)
         } else {
             log::debug!(
                 "Successfully processed sender key distribution for group {} from {}",
                 group_jid.observe(),
                 sender_jid.observe()
             );
+            Ok(())
         }
     }
 }

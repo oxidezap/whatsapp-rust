@@ -7988,6 +7988,11 @@ async fn skdm_only_group_session_acknowledged_once_without_message_event() {
     use wacore::types::events::ChannelEventHandler;
 
     let (client, transport) = capturing_client("skdm_only_group_ack").await;
+    client
+        .inbound_commit_batch
+        .live_retention
+        .forbid_access
+        .store(true, Ordering::Relaxed);
     let (handler, rx) = ChannelEventHandler::new();
     client.core.event_bus.subscribe_handler(handler).detach();
 
@@ -8051,6 +8056,11 @@ async fn session_plaintext_decode_error_is_not_acked_as_skdm_only() {
     use wacore::types::events::ChannelEventHandler;
 
     let (client, transport) = capturing_client("bad_plaintext_no_skdm_ack").await;
+    client
+        .inbound_commit_batch
+        .live_retention
+        .forbid_access
+        .store(true, Ordering::Relaxed);
     let (handler, rx) = ChannelEventHandler::new();
     client.core.event_bus.subscribe_handler(handler).detach();
     let recorder = Arc::new(EventRecorder::default());
@@ -8333,7 +8343,8 @@ async fn skdm_processing_waits_for_sender_key_lock() {
             started.wait().await;
             client
                 .handle_sender_key_distribution_message(&group, &sender, "3EB0TESTMSGID001", &bytes)
-                .await;
+                .await
+                .unwrap();
         }
     });
 
@@ -8377,7 +8388,8 @@ async fn public_group_decrypt_waits_for_sender_key_lock() {
         .expect("SKDM bytes");
     client
         .handle_sender_key_distribution_message(&group, &alice.jid, "3EB0TESTMSGID002", &skdm_bytes)
-        .await;
+        .await
+        .unwrap();
 
     let plaintext = b"serialized group decrypt".to_vec();
     let ciphertext = alice.encrypt_group_message(&group, &plaintext).await;
@@ -19000,7 +19012,8 @@ async fn joined_group_sender(client: &Arc<Client>, jid_str: &str, group: &Jid) -
         .expect("skdm bytes");
     client
         .handle_sender_key_distribution_message(group, &peer.jid, "SKDM_INSTALL", &axolotl)
-        .await;
+        .await
+        .unwrap();
     peer
 }
 
@@ -19290,7 +19303,8 @@ async fn resend_after_our_own_decrypt_failure_dispatches() {
                 .axolotl_sender_key_distribution_message
                 .expect("skdm bytes"),
         )
-        .await;
+        .await
+        .unwrap();
 
     let resent = encrypt_group_text(&mut alice, &group, "ping").await;
     client
@@ -20521,6 +20535,11 @@ async fn live_storage_failure_retry(reset_and_flush: bool) {
 async fn raw_pending_sibling_bypass_keeps_default_duplicate_suppression() {
     use wacore::messages::MessageUtils;
     let (client, _) = capturing_client("default_sibling_suppression").await;
+    client
+        .inbound_commit_batch
+        .live_retention
+        .forbid_access
+        .store(true, Ordering::Relaxed);
     let (handler, rx) = wacore::types::events::ChannelEventHandler::new();
     client.core.event_bus.subscribe_handler(handler).detach();
     let info = Arc::new(create_test_message_info(
@@ -20597,6 +20616,93 @@ async fn raw_pending_protocol_only_replay_allows_progress_without_publication() 
     assert_eq!(message_events_for_id(&rx, &info.id), (0, 0));
     assert_eq!(message_acks_for(&transport.sent(), &info.id), 0);
     assert_eq!(delivery_receipts_for(&transport.sent(), &info.id), 0);
+}
+
+#[tokio::test]
+async fn raw_pending_protocol_only_backend_failure_keeps_replay_owned() {
+    use wacore::messages::MessageUtils;
+    use wacore::store::in_memory::InMemoryBackend;
+    struct NoDelivery;
+    #[async_trait::async_trait]
+    impl crate::InboundDurabilityHook for NoDelivery {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            _: &[wacore::types::events::InboundMessage],
+        ) -> anyhow::Result<()> {
+            panic!("SKDM must not enter the consumer hook")
+        }
+    }
+    let backend = Arc::new(InMemoryBackend::new());
+    let client = crate::test_utils::create_test_client_with_backend(backend.clone()).await;
+    let factory = crate::transport::mock::CapturingMockTransportFactory::new();
+    let transport = factory.transport();
+    let socket = crate::socket::NoiseSocket::new(
+        Arc::new(crate::runtime_impl::TokioRuntime),
+        transport.clone(),
+        wacore::handshake::NoiseCipher::new(&[0; 32]).unwrap(),
+        wacore::handshake::NoiseCipher::new(&[0; 32]).unwrap(),
+    );
+    *client.noise_socket.lock().unwrap() = Some(Arc::new(socket));
+    seed_test_pn(&client).await;
+    client
+        .inbound_durability_hook
+        .set(Arc::new(NoDelivery))
+        .ok()
+        .unwrap();
+    let group: Jid = "120363000000000086@g.us".parse().unwrap();
+    let mut alice = AlicePeer::new("100000000000004@lid").await;
+    let (bundle, bob) = bobs_prekey_bundle(&client).await;
+    let address = bob.to_protocol_address();
+    alice.install_bob_session(&address, &bundle).await;
+    let mut message = wa::Message::default();
+    message.sender_key_distribution_message =
+        buffa::MessageField::some(alice.create_group_skdm(&group).await);
+    let info = group_message_info("RAW_SKDM_BACKEND_FAILURE", &group, &alice.jid, false);
+    let retention = &client.inbound_commit_batch.live_retention;
+    let ciphertext = alice
+        .encrypt(&address, &MessageUtils::encode_and_pad(&message))
+        .await;
+    backend.set_fail_sender_key_reads(true);
+    process_group_classified(
+        &client,
+        Arc::clone(&info),
+        &alice.jid,
+        enc_payload_from_ciphertext(&ciphertext),
+        vec![],
+    )
+    .await;
+    assert!(!client.ack_or_replay_to_hook(&info).await);
+    assert!(
+        retention.has_raw_for_message(&info),
+        "a backend error must preserve ratchet-advanced plaintext"
+    );
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    assert_eq!(message_acks_for(&transport.sent(), &info.id), 0);
+    assert_eq!(delivery_receipts_for(&transport.sent(), &info.id), 0);
+    client.inbound_commit_batch.reset();
+    client.enter_live_mode_for_tests();
+    backend.set_fail_sender_key_reads(false);
+    process_group_classified(
+        &client,
+        Arc::new((*info).clone()),
+        &alice.jid,
+        enc_payload_from_ciphertext(&ciphertext),
+        vec![],
+    )
+    .await;
+    assert!(!retention.has_raw_for_message(&info));
+    let name = make_sender_key_name(&group, &alice.jid.to_non_ad().to_protocol_address());
+    let snapshot = client.persistence_manager.get_device_snapshot();
+    assert!(
+        client
+            .signal_cache
+            .get_sender_key(&name, &*snapshot.backend)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_exactly_one_confirmation(&transport, &info.id).await;
 }
 
 #[tokio::test]
