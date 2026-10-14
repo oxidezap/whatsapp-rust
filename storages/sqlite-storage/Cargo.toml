@@ -56,7 +56,7 @@ gloo-timers = { version = "0.4", features = ["futures"] }
 # 0.6 defaults to caller-provided host hooks. Keep the validated JS-backed
 # 0.5 ABI when fresh downstream resolution widens Diesel's transitive range.
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
-sqlite-wasm-rs = { version = "0.5.5", default-features = false }
+sqlite-wasm-rs = { version = "0.6.1", default-features = false }
 
 [[bench]]
 name = "signal_flush"
