@@ -102,9 +102,9 @@ fn failed_flush_preserves_source_and_can_be_retried_by_the_consumer() {
         let store = ExternalSignalStore::default();
         let cache = SignalStoreCache::new();
         let address = ProtocolAddress::new("15550001111", 1.into());
-        cache
-            .put_session(&address, SessionRecord::new_fresh())
-            .await;
+        let record = SessionRecord::new_fresh();
+        let expected = record.serialize().unwrap();
+        cache.put_session(&address, record).await;
         assert!(store.get_session(address.as_str()).await.unwrap().is_none());
         store.fail_writes.store(true, Ordering::SeqCst);
         let error = cache.flush(&store).await.unwrap_err();
@@ -121,7 +121,7 @@ fn failed_flush_preserves_source_and_can_be_retried_by_the_consumer() {
         store.fail_writes.store(false, Ordering::SeqCst);
         cache.flush(&store).await.unwrap();
         let persisted = store.get_session(address.as_str()).await.unwrap().unwrap();
-        assert!(!persisted.is_empty());
+        assert_eq!(persisted.as_ref(), expected);
         let cold_cache = SignalStoreCache::new();
         assert!(
             cold_cache
@@ -183,28 +183,33 @@ fn unsupported_device_operations_are_inspectable_without_parsing_messages() {
 }
 
 #[test]
-fn corrupt_persisted_session_is_a_backend_failure_in_the_public_adapter() {
-    use wacore::libsignal::protocol::{SessionStore as _, SignalProtocolError};
+fn adapter_distinguishes_missing_prekeys_from_malformed_persisted_records() {
+    use wacore::libsignal::protocol::{PreKeyStore as _, SignalProtocolError};
     use whatsapp_rust::store::{
         persistence_manager::PersistenceManager, signal_adapter::SignalProtocolStoreAdapter,
     };
     futures::executor::block_on(async {
         let backend = Arc::new(InMemoryBackend::new());
-        let address = ProtocolAddress::new("15550003333", 1.into());
-        backend
-            .put_session(address.as_str(), &[0xff])
-            .await
-            .unwrap();
+        // An empty protobuf decodes but lacks the required key material.
+        backend.store_prekey(41, b"", false).await.unwrap();
         let manager = Arc::new(PersistenceManager::new(backend).await.unwrap());
         let adapter = SignalProtocolStoreAdapter::new(manager, Arc::new(SignalStoreCache::new()));
-        let error = adapter
-            .session_store
-            .load_session(&address)
+        let corrupt = adapter
+            .pre_key_store
+            .get_pre_key(41.into())
             .await
             .err()
-            .expect("corrupt persisted session must fail");
-        assert!(matches!(error, SignalProtocolError::BackendError(..)));
-        assert!(std::error::Error::source(&error).is_some());
+            .expect("invalid stored key");
+        assert!(matches!(corrupt, SignalProtocolError::BackendError(..)));
+        let source = std::error::Error::source(&corrupt).expect("stored record cause");
+        assert!(source.is::<SignalProtocolError>());
+        let missing = adapter
+            .pre_key_store
+            .get_pre_key(42.into())
+            .await
+            .err()
+            .expect("missing key");
+        assert!(matches!(missing, SignalProtocolError::InvalidPreKeyId));
     });
 }
 
