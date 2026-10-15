@@ -29,7 +29,7 @@ use crate::voip_control::control::{GroupControl, VideoControl};
 use crate::voip_control::control::VideoControlSender;
 use crate::voip_control::group::{GroupCallState, GroupStateApply, group_device_is_local};
 use crate::voip_control::resident_session::{NoMediaBackend, video_control_to_command};
-use crate::voip_control::{CallPhase, CallSession};
+use crate::voip_control::{CallPhase, CallSession, VideoTeardownHook};
 use crate::voip_control::{MediaCommand, MediaSessionKey, VoipMediaBackend, VoipMediaSession};
 use wacore_binary::Jid;
 
@@ -156,7 +156,7 @@ struct CallEntry {
     group_warp_mi_tag_len: Option<usize>,
     /// Fully release the local video endpoints. Stored here so refusal and terminal paths share the
     /// same teardown without keeping codec resources alive through lingering handles.
-    video_teardown: Option<Box<dyn Fn() + Send + Sync>>,
+    video_teardown: Option<VideoTeardownHook>,
     /// Prevents concurrent video transitions from overtaking each other while an ack is in flight.
     event_publication_reserved: Arc<AtomicBool>,
     /// Mirrors WA's stream mutex for user actions, peer signaling, and timeout callbacks.
@@ -2160,7 +2160,7 @@ impl CallRegistry {
         generation: u64,
         event_tx: async_channel::Sender<CallEvent>,
         video_ctl_tx: VideoControlSender,
-        video_teardown: Box<dyn Fn() + Send + Sync>,
+        video_teardown: VideoTeardownHook,
     ) {
         if let Some(entry) = self.active_calls().get_mut(call_id)
             && entry.generation == generation
@@ -2397,7 +2397,7 @@ impl CallRegistry {
         &self,
         call_id: &str,
         generation: u64,
-        video_teardown: Box<dyn Fn() + Send + Sync>,
+        video_teardown: VideoTeardownHook,
     ) -> bool {
         let mut map = self.active_calls();
         let Some(entry) = map
@@ -6063,7 +6063,7 @@ mod tests {
             let calls = calls.clone();
             Box::new(move || {
                 calls.fetch_add(1, Ordering::SeqCst);
-            }) as Box<dyn Fn() + Send + Sync>
+            }) as VideoTeardownHook
         };
         reg.set_video_channels("CID", generation, event_tx, ctl_tx, hook(&calls));
 

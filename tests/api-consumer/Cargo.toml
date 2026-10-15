@@ -25,7 +25,7 @@ voip-runtime = ["voip-control", "whatsapp-rust/voip-runtime"]
 voip-mlow = ["voip-control", "whatsapp-rust/voip-mlow"]
 requests = ["sdk"]
 js = ["wacore/js"]
-runtime-execution = ["sdk", "js", "dep:wasm-bindgen-test"]
+runtime-execution = ["voip-control", "js", "dep:wasm-bindgen-test"]
 sqlite = ["sdk", "whatsapp-rust/sqlite-storage", "dep:whatsapp-rust-sqlite-storage", "dep:tokio"]
 wasm-execution = ["sqlite", "js", "whatsapp-rust-sqlite-storage/test-util", "dep:getrandom", "dep:rand", "dep:portable-atomic", "dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-test"]
 

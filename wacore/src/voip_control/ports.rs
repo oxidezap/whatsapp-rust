@@ -156,6 +156,12 @@ pub struct MediaVideoChannels {
     pub video_out: async_channel::Sender<VideoFrame>,
 }
 
+/// Endpoint teardown callback: thread-safe on native, local on wasm32.
+#[cfg(not(target_arch = "wasm32"))]
+pub type VideoTeardownHook = Box<dyn Fn() + Send + Sync>;
+#[cfg(target_arch = "wasm32")]
+pub type VideoTeardownHook = Box<dyn Fn()>;
+
 /// Sealed like every other seam DTO: `#[non_exhaustive]` plus a builder, so a later field does
 /// not break a backend that builds it.
 #[derive(bon::Builder)]
@@ -170,7 +176,7 @@ pub struct MediaOpenContext {
     /// Releases the local video endpoints on a refused upgrade or terminal teardown. The control
     /// plane owns the hook (it holds the consumer's endpoints); the backend stores it so the same
     /// teardown runs wherever the session ends.
-    pub video_teardown: Option<Box<dyn Fn() + Send + Sync>>,
+    pub video_teardown: Option<VideoTeardownHook>,
     /// Rotations a peer announced before media attached, in announcement order. The backend applies
     /// them the moment the plane is up, or the peer's first frames are stamped upright.
     pub peer_video_orientations: Vec<(Option<wacore_binary::Jid>, u8)>,

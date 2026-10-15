@@ -9,6 +9,8 @@ fn native_thread_bounds() {
     send_sync::<dyn Runtime>();
     send_sync::<AbortHandle>();
     send_sync::<wacore::stats::InstrumentedRuntime>();
+    #[cfg(feature = "voip-control")]
+    send_sync::<wacore::voip_control::VideoTeardownHook>();
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -73,6 +75,14 @@ mod local {
         );
         drop(metered.spawn(Box::pin(async {})));
         assert_eq!(calls.get(), 3);
+        #[cfg(feature = "voip-control")]
+        {
+            let captured = calls.clone();
+            let hook: wacore::voip_control::VideoTeardownHook =
+                Box::new(move || captured.set(captured.get() + 1));
+            hook();
+            assert_eq!(calls.get(), 4);
+        }
     }
 }
 

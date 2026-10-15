@@ -20,8 +20,8 @@ use wacore::voip::engine::{CallEngine, CodecDecisionSource};
 use wacore::voip::media_session::ResidentMediaSession;
 use wacore::voip::transport::RelayEndpointParams;
 use wacore::voip_control::{
-    CallDirection, MediaCommand, MediaEvent, MediaSessionSpec, MediaSetupError, VoipMediaBackend,
-    VoipMediaSession,
+    CallDirection, MediaCommand, MediaEvent, MediaSessionSpec, MediaSetupError, VideoTeardownHook,
+    VoipMediaBackend, VoipMediaSession,
 };
 
 /// Three 60 ms frames absorb scheduling jitter without building a long capture delay.
@@ -308,7 +308,7 @@ fn adopt_video_state(
     registry: &wacore::voip_control::registry::CallRegistry,
     key: &wacore::voip_control::MediaSessionKey,
     session: &ResidentMediaSession,
-    teardown: Option<Box<dyn Fn() + Send + Sync>>,
+    teardown: Option<VideoTeardownHook>,
     orientations: Vec<(Option<wacore_binary::Jid>, u8)>,
 ) {
     for (participant, orientation) in orientations {

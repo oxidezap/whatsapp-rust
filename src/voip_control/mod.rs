@@ -24,8 +24,8 @@ pub use wacore::voip_control::{
     MediaKeyframeUrgency, MediaOpenContext, MediaRtcpFeedback, MediaRtcpReportBlock,
     MediaSessionKey, MediaSessionSpec, MediaSetupError, MediaSilenceReason, MediaStats,
     MediaVideoChannels, MediaVideoUpgradeToken, TimedVideoFrame, VideoControl,
-    VideoControlReceiver, VideoFrame, VideoInput, VideoSink, VideoSource, VoipMediaBackend,
-    VoipMediaSession,
+    VideoControlReceiver, VideoFrame, VideoInput, VideoSink, VideoSource, VideoTeardownHook,
+    VoipMediaBackend, VoipMediaSession,
 };
 
 #[cfg(feature = "voip-engine-wacore")]

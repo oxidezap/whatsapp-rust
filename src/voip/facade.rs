@@ -44,7 +44,7 @@ use wacore::voip_control::{
     CallDirection, CallEvent, CallPhase, MediaAudioCodec as AudioCodec,
     MediaAudioFormat as AudioFormat, MediaAudioRtpProfile as AudioRtpProfile,
     MediaKeyframeUrgency as KeyframeUrgency, MediaVideoUpgradeToken as VideoUpgradeToken,
-    VideoFrame, VideoInput, VoipMediaSession,
+    VideoFrame, VideoInput, VideoTeardownHook, VoipMediaSession,
 };
 use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
@@ -2372,7 +2372,7 @@ pub(crate) struct PendingOutgoing {
     /// still dormant. Its loop halves are handed to `open` when the relay arrives.
     video_shared: Arc<VideoShared>,
     /// Releases the local video endpoints on a terminal teardown or refused upgrade.
-    video_teardown: Box<dyn Fn() + Send + Sync>,
+    video_teardown: VideoTeardownHook,
     muted: Arc<AtomicBool>,
     ended: Arc<EndedFlag>,
     /// The reserved media session. Setup failures publish through it (it owns the public stream
@@ -3300,7 +3300,7 @@ impl VideoShared {
 }
 
 /// A registry teardown hook that releases codec endpoints on refusal or call termination.
-fn video_teardown_hook(video: &Arc<VideoShared>) -> Box<dyn Fn() + Send + Sync> {
+fn video_teardown_hook(video: &Arc<VideoShared>) -> VideoTeardownHook {
     let video = video.clone();
     Box::new(move || video.detach_endpoints())
 }
