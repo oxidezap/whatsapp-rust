@@ -22679,7 +22679,18 @@ fn live_admission_refusal_metrics_regression() {
                     before_recovery,
                     "successful recovery must not count a refusal"
                 );
-                assert_eq!(delivery_receipts_for(&transport.sent(), id), 1);
+                // The original completed drain arrival and the recovering
+                // redelivery each own a receipt. A cancelled raw producer did
+                // not finish an arrival and only the recovery sends one.
+                let expected_receipts = match case {
+                    Case::OwnedDrainRecovery => 2,
+                    _ => 1,
+                };
+                assert_eq!(
+                    delivery_receipts_for(&transport.sent(), id),
+                    expected_receipts,
+                    "recovery receipts for {case:?}"
+                );
             }
             // A full drain batch can release capacity and admit the same arrival.
             // The first failed reservation must not increment the refusal metric.
