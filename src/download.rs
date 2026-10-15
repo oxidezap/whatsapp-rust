@@ -485,20 +485,20 @@ impl DownloadRequestError {
     }
 
     fn streamed(error: anyhow::Error) -> Self {
-        if let Some(policy) = error.chain().find_map(|e| {
-            e.downcast_ref::<DownloadPolicyError>().or_else(|| {
-                e.downcast_ref::<std::io::Error>()?
-                    .get_ref()?
-                    .downcast_ref::<DownloadPolicyError>()
-            })
-        }) {
-            return Self::ResourcePolicy(*policy);
-        }
         let tagged = error
             .downcast_ref::<std::io::Error>()
             .and_then(std::io::Error::get_ref)
             .is_some_and(|cause| cause.is::<WriterIoCause>());
         if !tagged {
+            if let Some(policy) = error.chain().find_map(|e| {
+                e.downcast_ref::<DownloadPolicyError>().or_else(|| {
+                    e.downcast_ref::<std::io::Error>()?
+                        .get_ref()?
+                        .downcast_ref::<DownloadPolicyError>()
+                })
+            }) {
+                return Self::ResourcePolicy(*policy);
+            }
             return Self::Other(error);
         }
         // Strip the private origin tag: direct downcasts must expose the same
@@ -1331,6 +1331,9 @@ async fn streaming_download_and_decrypt<W: DownloadWriter + MaybeSend + 'static>
                 }
             }
             drop(limited_writer);
+            budget
+                .check_cancelled()
+                .map_err(DownloadRequestError::ResourcePolicy)?;
             finish_verified_write(&mut writer)
         })();
 
@@ -2745,6 +2748,97 @@ mod tests {
             })
         ));
         assert_eq!(http.urls().len(), 2);
+    }
+
+    #[test]
+    fn sink_policy_error_still_has_writer_origin() {
+        struct PolicySink;
+        impl Write for PolicySink {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other(DownloadPolicyError::Cancelled))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let error = WriterIoOrigin(&mut PolicySink)
+            .write_all(b"media")
+            .unwrap_err();
+        let DownloadRequestError::WriterIo(source) = DownloadRequestError::streamed(error.into())
+        else {
+            panic!("a sink's policy error must remain a writer failure");
+        };
+        assert_eq!(
+            source
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<DownloadPolicyError>(),
+            Some(&DownloadPolicyError::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_final_write_prevents_rewind() {
+        struct CancelOnWrite {
+            sink: SharedWriter,
+            budget: DownloadBudget,
+            seeks: usize,
+        }
+        impl Write for CancelOnWrite {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let result = self.sink.write(bytes);
+                self.budget.cancel();
+                result
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.sink.flush()
+            }
+        }
+        impl Seek for CancelOnWrite {
+            fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+                self.seeks += 1;
+                self.sink.seek(pos)
+            }
+        }
+        impl DownloadWriter for CancelOnWrite {
+            fn truncate(&mut self, len: u64) -> std::io::Result<()> {
+                self.sink.truncate(len)
+            }
+        }
+        let (params, encrypted) = encrypted_params(b"final chunk");
+        let request =
+            DownloadUtils::prepare_download_requests(&params, &MediaRoute::default_hosts())
+                .unwrap()
+                .remove(0);
+        let http: Arc<dyn HttpClient> = RoutedHttpClient::streaming(Vec::new(), (200, encrypted));
+        let runtime: Arc<dyn Runtime> = Arc::new(crate::TokioRuntime);
+        let budget = DownloadBudget::new(DownloadLimits::new(100, 100));
+        let writer = CancelOnWrite {
+            sink: SharedWriter::new(),
+            budget: budget.clone(),
+            seeks: 0,
+        };
+        let (writer, result) = streaming_download_and_decrypt(
+            &http,
+            &runtime,
+            &request,
+            ExpectedMediaHashes {
+                budget: Some(budget),
+                ..ExpectedMediaHashes::from_downloadable(&params)
+            },
+            writer,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result,
+            Err(DownloadRequestError::ResourcePolicy(
+                DownloadPolicyError::Cancelled
+            ))
+        ));
+        assert_eq!(writer.seeks, 1, "only the initial clear may seek");
     }
 
     #[tokio::test]
