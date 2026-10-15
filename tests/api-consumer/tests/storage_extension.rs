@@ -248,10 +248,87 @@ fn default_batch_failure_can_leave_a_committed_prefix() {
 fn exhausted_contention_remains_classifiable_by_portable_consumers() {
     let error = StoreError::RetriesExhausted {
         op: "external_write".into(),
+        attempts: 6,
+        source: Box::new(BackendFailure),
     };
     assert!(error.is_database_busy_or_locked());
     match error {
-        StoreError::RetriesExhausted { op } => assert_eq!(op, "external_write"),
+        StoreError::RetriesExhausted { op, attempts, .. } => {
+            assert_eq!(op, "external_write");
+            assert_eq!(attempts, 6);
+        }
         _ => panic!("exhaustion classification changed"),
     }
+}
+
+#[test]
+fn typed_permanent_errors_are_not_contention() {
+    for error in [
+        StoreError::Validation("busy worker count is invalid".into()),
+        StoreError::InvalidConfig("locked mode requires a key".into()),
+        StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "database is locked by policy",
+        )),
+    ] {
+        assert!(!error.is_database_busy_or_locked(), "{error:?}");
+    }
+}
+
+#[test]
+fn exhausted_contention_preserves_the_backend_cause() {
+    let error = StoreError::RetriesExhausted {
+        op: "external_write".into(),
+        attempts: 6,
+        source: Box::new(BackendFailure),
+    };
+    let cause = std::error::Error::source(&error).expect("exhaustion lost its backend cause");
+    assert!(cause.is::<BackendFailure>());
+    assert!(!error.to_string().contains("synthetic write failure"));
+}
+
+#[derive(Debug)]
+struct OpaqueContext(StoreError);
+impl std::fmt::Display for OpaqueContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("opaque busy context")
+    }
+}
+impl std::error::Error for OpaqueContext {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+#[test]
+fn typed_causes_override_opaque_context_messages() {
+    let permanent = StoreError::Connection(Box::new(OpaqueContext(StoreError::Validation(
+        "invalid worker count".into(),
+    ))));
+    assert!(!permanent.is_database_busy_or_locked());
+    let contention = StoreError::Database(Box::new(StoreError::RetriesExhausted {
+        op: "save".into(),
+        attempts: 3,
+        source: Box::new(BackendFailure),
+    }));
+    assert!(contention.is_database_busy_or_locked());
+}
+
+#[test]
+fn opaque_database_causes_keep_the_legacy_text_fallback() {
+    for message in ["database is LOCKED", "SQLITE_BUSY: write contention"] {
+        for error in [
+            StoreError::Database(Box::new(std::io::Error::other(message))),
+            StoreError::Connection(Box::new(std::io::Error::other(message))),
+        ] {
+            assert!(error.is_database_busy_or_locked());
+        }
+    }
+    let permanent = StoreError::Database(Box::new(BackendFailure));
+    assert!(!permanent.is_database_busy_or_locked());
+    // Opaque messages cannot distinguish contention from unrelated wording.
+    let ambiguous = StoreError::Database(Box::new(std::io::Error::other(
+        "busy worker count is invalid",
+    )));
+    assert!(ambiguous.is_database_busy_or_locked());
 }

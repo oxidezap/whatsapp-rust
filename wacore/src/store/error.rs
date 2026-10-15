@@ -28,8 +28,15 @@ pub enum StoreError {
 
     /// The backend exhausted its busy/locked contention retry budget.
     /// This remains classified as contention by [`Self::is_database_busy_or_locked`].
-    #[error("database operation '{op}' exhausted retries")]
-    RetriesExhausted { op: String },
+    #[error("database operation '{op}' exhausted retries after {attempts} attempts")]
+    RetriesExhausted {
+        op: String,
+        /// Total attempts, including the initial operation.
+        attempts: u32,
+        /// The last contention failure, preserved for typed inspection.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[error("migration error")]
     Migration(#[source] Box<dyn std::error::Error + Send + Sync>),
@@ -42,27 +49,32 @@ pub enum StoreError {
 }
 
 impl StoreError {
-    /// Recognizes exhausted contention retries, or walks the source chain
-    /// for a `Display` indicating SQLite busy/locked. Used by retry layers that
-    /// can't depend on a specific backend (Diesel, libsql, etc.) directly.
+    /// Recognizes exhausted contention retries and rejects known non-database
+    /// error variants without inspecting their messages.
     ///
-    /// Substring matching is necessary because SQLite reports BUSY/LOCKED
-    /// through `sqlite3_errmsg()` strings; the error code itself is mapped
-    /// to `Diesel::DatabaseError(Unknown, _)` (or similar) without further
-    /// discrimination.
+    /// `Database` and `Connection` carry opaque backend causes. Unless their
+    /// source chain contains another typed `StoreError`, this compatibility
+    /// fallback looks for "busy" or "locked" in source messages, ignoring case.
+    /// It can misclassify unrelated backend messages and cannot establish retry
+    /// safety. Backends should use the specific error variants when available.
+    /// SQLite's Diesel adapter loses BUSY/LOCKED codes, so opaque source-text
+    /// detection remains necessary there.
     pub fn is_database_busy_or_locked(&self) -> bool {
-        if matches!(self, Self::RetriesExhausted { .. }) {
-            return true;
-        }
-        let mut layer: &dyn std::error::Error = self;
+        let mut layer: &(dyn std::error::Error + 'static) = match self {
+            Self::RetriesExhausted { .. } => return true,
+            Self::Database(source) | Self::Connection(source) => source.as_ref(),
+            _ => return false,
+        };
+        let mut text_indicates_contention = false;
         loop {
-            let s = layer.to_string().to_lowercase();
-            if s.contains("locked") || s.contains("busy") {
-                return true;
+            if let Some(typed) = layer.downcast_ref::<Self>() {
+                return typed.is_database_busy_or_locked();
             }
+            let message = layer.to_string().to_lowercase();
+            text_indicates_contention |= message.contains("locked") || message.contains("busy");
             match layer.source() {
                 Some(inner) => layer = inner,
-                None => return false,
+                None => return text_indicates_contention,
             }
         }
     }
