@@ -24,12 +24,27 @@ use wacore::runtime::{ShutdownNotifier, ShutdownSignal, wait_for_shutdown};
 /// use std::sync::Arc;
 /// use whatsapp_rust::Client;
 ///
-/// async fn stop(client: Arc<Client>) {
+/// async fn stop(client: Arc<Client>) -> Result<(), whatsapp_rust::ShutdownReport> {
+///     use whatsapp_rust::DrainOutcome;
+///
+///     // Stop host producers before entering this function. Other host-owned
+///     // clients, managers and snapshots must also be dropped before the wait.
 ///     let released = client.store_release();
 ///     let report = client.shutdown().await;
-///     drop(client); // do not await release while retaining a client/manager
+///     let cleanup_ok = matches!(report.inbound, DrainOutcome::Completed)
+///         && matches!(report.outbound, DrainOutcome::Completed)
+///         && matches!(report.signal_settle, DrainOutcome::Completed)
+///         && report.device.is_ok()
+///         && report.message_secrets.failed_batches == 0;
+///     drop(client);
 ///     released.wait().await;
-///     let _ = report; // independently inspect cleanup/durability results
+///     // Ownership release does not erase cleanup failures. Return the report
+///     // so the host can reconcile typed errors with appropriate redaction.
+///     if !cleanup_ok {
+///         return Err(report);
+///     }
+///     // Coordinate remaining raw backend owners before backend-specific close.
+///     Ok(())
 /// }
 /// ```
 #[derive(Clone)]

@@ -13,7 +13,7 @@ An async Rust library for WhatsApp Web. Pair a device, send and receive end-to-e
 - QR and pairing-code authentication with persistent sessions.
 - End-to-end encrypted direct and group messaging, media, reactions, receipts, and history sync.
 - Groups, communities, newsletters, status, contacts, and privacy controls.
-- Audio and video calls, both 1:1 and group, plus call links and screen sharing. The optional `voip` feature provides native relay transport and MLOW/Opus audio. Video takes application-supplied H.264 frames ([media API and codec options](https://github.com/oxidezap/whatsapp-rust-docs)).
+- Experimental audio and video calls, both 1:1 and group, plus call links and screen sharing. The optional `voip` feature provides native relay transport and MLOW/Opus audio. Video takes application-supplied H.264 frames ([media API and codec options](https://github.com/oxidezap/whatsapp-rust-docs)).
 - Replaceable storage, transport, HTTP client, and runtime. The default features include SQLite, Tokio WebSocket, ureq, and Tokio. Applications still choose a storage backend. Native plugins are [opt-in](agent_docs/architecture.md).
 
 ## Quick start
@@ -55,6 +55,131 @@ whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "<com
 ```
 
 See the [documentation](https://whatsapp-rust.jlucaso.com) for configuration, alternative backends, and API examples.
+
+## Support contracts
+
+This branch documents the current pre-1.0 API. It does not establish a release
+candidate or a frozen compatibility baseline. Use documentation for the version
+you depend on. When following unreleased APIs, pin a full Git commit rather than
+assuming the published `0.7` package contains every API on `main`.
+
+### Crates and extension points
+
+| Package | Intended use and compatibility responsibility |
+| --- | --- |
+| `whatsapp-rust` | Consumer API, feature facades, lifecycle reports and host adapters. Public low-level modules and re-exports remain public API; a feature flag does not waive source compatibility. |
+| `wacore` | Advanced protocol, IQ, runtime, network, storage and client-context implementers. Platform-neutral means independent of Tokio, not independent of `std`. |
+| `wacore-binary`, `wacore-appstate`, `wacore-libsignal`, `wacore-noise` | Advanced node/JID, app-state and cryptographic protocol APIs. These are not a separate promise of complete WhatsApp interoperability. |
+| `waproto` | Generated public models, views and enum representations. Follow its non-exhaustive construction policy. Unknown protobuf fields are discarded on decode/re-encode; retain original input bytes for lossless forwarding. |
+| `wacore-derive` | Public derive macros, including their generated paths and construction contracts. |
+| `whatsapp-rust-sqlite-storage`, `whatsapp-rust-tokio-transport`, `whatsapp-rust-ureq-http-client` | Optional host implementations, with platform and dependency requirements of their own. |
+| Plugins, examples, tests and `tools/*` | Unpublished workspace components. Test/benchmark features are fixtures, not shipping profiles. Host tools are not runtime dependencies. |
+
+Runtime, transport/factory, HTTP, storage domain traits, durability hooks and the
+neutral VoIP backend/session traits are intended implementation points. Keep them
+open to downstream implementations. `Backend` is composed by a blanket
+implementation from `SignalStore`, `AppSyncStore`, `ProtocolStore`, `DeviceStore`
+and `MsgSecretStore`; implement the domain traits rather than a competing
+`Backend` implementation. Custom core client contexts also own the synchronization
+obligations documented on their methods, including pairwise session serialization.
+
+Public dependency representations are part of these contracts. The SDK
+re-exports `anyhow`, `async_channel`, `async_trait`, `bytes`, `futures`, `serde`,
+`serde_json`, `chrono` and `buffa` to allow matching versions. Node/JID and
+`CompactString` types also appear publicly. Re-exporting them does not hide their
+compatibility cost. Use the target-correct `BoxFuture` and async-trait conventions
+when implementing adapters; consult the owning trait rather than adding blanket
+`Send` bounds. Storage domain traits retain `Send + Sync` on WASM too.
+Published packages declare their MSRV in their manifests; host tools can have a
+different floor.
+
+### Features and targets
+
+| Profile | Configuration and host obligations | Evidence boundary |
+| --- | --- | --- |
+| Native defaults | SQLite with bundled SQLite, Tokio runtime/transport, ureq, `tokio-native` and OS `signal`. Choose a backend explicitly. | Native CI and isolated API consumers. This does not qualify every OS or deployment. |
+| Native `std`, without Tokio | `default-features = false`; provide runtime, transport, HTTP and storage implementations. `wacore` has no Tokio runtime dependency. | Separate core/SDK consumer profiles prevent workspace dev-feature unification from standing in for a minimal consumer. This is not `no_std`. |
+| Local WASM | `wasm32-unknown-unknown`, defaults disabled, JS randomness configured by the host. Futures can be non-`Send`; network adapters use `MaybeSendSync`. | WASM CI builds and executes selected JS-hosted probes. It does not establish browser-wide, WASI or threaded/atomics WASM support. `Runtime` still requires `Send + Sync`, and its abort closure still requires `Send`. |
+| ESP-IDF / ESP32 | Portable core with `std`, application-supplied executor, entropy, network and storage. Native defaults and native VoIP relay are not an ESP-IDF profile. | The separate ESP32 project demonstrates an integration. This repository has no ESP-IDF CI lane; do not infer that every chip, SDK feature or codec is qualified on hardware. |
+| VoIP control | `voip-control` exposes signaling and neutral media backend ports. Without an injected backend, media setup returns `NoBackend`. | Control-only consumers are separate from the engine graph. |
+| Portable VoIP engine | `voip-runtime` / `voip-engine-wacore`; `voip-encoded` accepts application-supplied encoded audio. `voip-mlow` adds PCM/MLOW, `voip-libopus` links the Opus adapter. | A portable build is not proof of a host relay, codec budget or live peer interoperability. |
+| Native VoIP | `voip-relay-native` adds UDP/DTLS/SCTP and Tokio; `voip` also includes both codec adapters. | Experimental interoperability. Direct/group voice/video, call links, screen sharing and upgrade/downgrade need qualification for the exact peers and negotiated modes used. |
+
+`signal` means OS signal handling, not the Signal encryption protocol.
+`tracing-pii`, debug snapshots and TLS verification bypasses are diagnostic
+choices, not production defaults. Feature combinations remain subject to their
+adapter's platform requirements.
+
+HTTP streaming currently uses synchronous `Read + Send` bodies and a known upload
+length. It requires a blocking context. Browser buffered HTTP is a separate
+capability; asynchronous Fetch chunk streaming and bounded whole-body buffering
+are not guaranteed by this interface. Check the adapter's streaming capability
+methods. A preallocation cap is not a download byte limit.
+
+Hosted-business coexistence and hosted/E2EE account-type transitions are outside
+the supported capability boundary. Device identity changes are handled, but
+account-type transition cleanup is deferred in notification and usync paths.
+Do not infer support from the presence of a parsed account-type value.
+
+| VoIP mode | Interoperability scope |
+| --- | --- |
+| Direct voice, incoming and outgoing | Experimental. Qualify bidirectional audio, termination and negotiated MLOW/Opus or encoded I/O with the actual peer. |
+| Direct video, incoming and outgoing | Experimental. Picture reception does not establish peer audio; qualify both media directions and application-supplied H.264. |
+| Group voice/video, incoming and outgoing | Experimental. Direct-call evidence does not qualify group membership, relay or key transitions. |
+| Call links, screen sharing, upgrade/downgrade | Experimental. Qualify each transition and negotiated mode separately. |
+
+Engine tests and preserved official-client code do not prove audible peer media
+on a particular phone/Web build. Record peer versions, feature profile, codec,
+direction, topology and tested commit when qualifying a deployment. This scope
+does not change the source compatibility obligations of public call APIs.
+
+### Delivery by origin
+
+Observers are not a durable inbox. Choose the gate for the actual origin and
+persist idempotently before returning success. No gate promises exactly-once
+application effects or indefinite server retention.
+
+| Origin | Gate and ACK/receipt boundary | Persistence, retry and restart |
+| --- | --- | --- |
+| Encrypted direct/group live and offline messages | `InboundDurabilityHook` commits before pending-row cleanup and positive ACK. Without it, observers do not gate ACK. | Host commits the whole batch idempotently by chat, sender and message ID. SDK pending rows support replay after durable storage; resident plaintext surviving reconnect cannot survive process exit. Admission/storage failures have narrower guarantees, detailed on the hook. |
+| Newsletter/channel messages | Separate event-only path; the inbound message hook does not gate ACK. | No durable capture or replay guarantee from registering the message hook. |
+| PDO placeholder recovery | Separate recovery path; excluded from the inbound message hook. | Do not treat recovered events as a durable inbox. |
+| Group `w:gp2` notifications | `GroupNotificationDurabilityHook` commits the full raw envelope before effects and generic ACK. | Host atomically stores raw backing bytes and an outbox. Scoped IDs can conflict; absent IDs leave duplicate ambiguity. Withheld ACK permits possible redelivery, not guaranteed redelivery or local effects replay. |
+| History sync | Separately register `HistorySyncCaptureHook`. For admitted chunks, capture completes before attempting the history receipt. Skipped/rejected chunks can be acknowledged without capture. | Host deduplicates by message ID. There is no SDK replay buffer or hook retry; withholding a receipt does not guarantee phone retry. Capture precedes decompression/validation and detached history tasks are not joined by shutdown. |
+| Callbacks and event subscriptions | Bounded observers; asynchronous callbacks can drop work on overflow or cancellation. Ordered mode orders accepted work only. | Default callback capacity is 256 with concurrency 16. Inspect delivery stats; callback completion means `()` returned, not a durable commit. Drive durable downstream work from an outbox. |
+
+Do not synchronously reply from a durability hook while the receive pipeline
+holds the sender Signal lock. Commit and return, then schedule replies
+independently. Cancellation can leave an indeterminate host commit; reconcile
+persisted state before retrying. See the individual hook contracts for admission,
+ordering and shutdown details.
+
+### Shutdown and backend ownership
+
+Stop application producers first. For a background bot, obtain `store_release`
+from its client before consuming `BotHandle::shutdown`. Inspect both the cleanup
+report and run outcome. Drop every client, persistence manager and device snapshot
+owned by the host before awaiting release. Callback-initiated shutdown must not
+wait for its own callback to join.
+
+`ShutdownReport` describes one cleanup invocation, not a global durability fence.
+A completed outbound drain includes cancelled work and does not confirm delivery.
+Inspect inbound, outbound and Signal-settle outcomes, the device flush result,
+and cumulative message-secret failures. Device and secret flushes have no total
+shutdown deadline. A host timeout drops the awaited future; it is not proof that
+cleanup or backend I/O stopped. Abort handles request cancellation without a join
+acknowledgement, and detached work may retain backend ownership indefinitely.
+
+`StoreRelease` observes release of crate-owned backend references. It does not
+close the database, certify durability, or cover host-retained raw handles and
+backend-internal I/O. Only after coordinating all owners should the host invoke
+its backend-specific close/reset/remove operation. SQLite reset/remove does not
+revoke stale writable handles; stop those writers before account administration.
+SQLite NORMAL mode is not a power-loss durability guarantee.
+
+The `StoreRelease` Rustdoc contains a compile-checked low-level stop sequence.
+Use the Rustdoc generated from your pinned dependency for unreleased signatures. Operational recipes and
+migrations remain in the [consumer documentation](https://github.com/oxidezap/whatsapp-rust-docs).
 
 ## Related projects
 

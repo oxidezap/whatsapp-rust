@@ -7,6 +7,11 @@
 //!
 //! This source compatibility policy does not freeze ABI or struct layout, and
 //! does not promise lossless editing of unknown future wire occurrences.
+//! The generator disables unknown-field preservation globally, including for
+//! network messages. Decoding and re-encoding can therefore remove fields this
+//! schema does not know. Unknown enum values and unknown fields are different
+//! contracts. Keep original protobuf bytes for byte-preserving forwarding;
+//! generated models and their serde forms are not a lossless forwarding format.
 //! Durable input bytes and replay semantics are defined by the receiving API.
 //!
 #![allow(clippy::large_enum_variant)]

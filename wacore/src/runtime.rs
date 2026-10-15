@@ -47,8 +47,13 @@ pub trait Runtime: Send + Sync + 'static {
     }
 }
 
-/// WASM variant — `Send` bounds removed since WASM is single-threaded.
-/// Concrete types use `unsafe impl Send + Sync` since there's only one thread.
+/// Local-executor WASM variant with non-`Send` futures.
+///
+/// The runtime object still requires `Send + Sync`, and [`AbortHandle::new`]
+/// still requires a `Send` cancellation closure. Non-`Send` futures do not
+/// relax those separate obligations. Single-threaded execution alone is not
+/// justification for an unsafe thread-safety implementation. Threaded/atomics
+/// WASM and WASI are not qualified by this local-executor contract.
 #[cfg(target_arch = "wasm32")]
 #[async_trait(?Send)]
 pub trait Runtime: Send + Sync + 'static {
