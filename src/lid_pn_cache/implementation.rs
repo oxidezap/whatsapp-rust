@@ -105,6 +105,14 @@ pub(crate) struct LidPnMutationGuard<'a> {
     _guard: async_lock::MutexGuard<'a, ()>,
 }
 
+enum MappingWrite {
+    Live,
+    WarmUp {
+        preserve_lid: bool,
+        preserve_pn: bool,
+    },
+}
+
 impl Default for LidPnCache {
     fn default() -> Self {
         Self::new()
@@ -316,7 +324,8 @@ impl LidPnCache {
     }
 
     pub(crate) async fn add_guarded(&self, entry: &LidPnEntry, guard: &LidPnMutationGuard<'_>) {
-        self.add_guarded_impl(entry, guard, true).await;
+        self.add_guarded_impl(entry, guard, MappingWrite::Live)
+            .await;
     }
 
     /// The write behind [`add_guarded`](Self::add_guarded). `record_topology`
@@ -328,17 +337,26 @@ impl LidPnCache {
         &self,
         entry: &LidPnEntry,
         _guard: &LidPnMutationGuard<'_>,
-        record_topology: bool,
+        write: MappingWrite,
     ) {
-        let previous_pn = self.pn_to_entry.get(&*entry.phone_number).await;
-        let should_update_pn = match &previous_pn {
-            Some(existing) => existing.created_at <= entry.created_at,
-            None => true,
+        let (write_lid, write_pn, record_topology) = match write {
+            MappingWrite::Live => (true, true, true),
+            MappingWrite::WarmUp {
+                preserve_lid,
+                preserve_pn,
+            } => (!preserve_lid, !preserve_pn, false),
         };
+        let previous_pn = self.pn_to_entry.get(&*entry.phone_number).await;
+        let should_update_pn = write_pn
+            && match &previous_pn {
+                Some(existing) => existing.created_at <= entry.created_at,
+                None => true,
+            };
         let previous_lid = self.lid_to_entry.get(&*entry.lid).await;
-        let mapping_changed = previous_lid
-            .as_ref()
-            .is_none_or(|existing| existing.phone_number != entry.phone_number)
+        let mapping_changed = (write_lid
+            && previous_lid
+                .as_ref()
+                .is_none_or(|existing| existing.phone_number != entry.phone_number))
             || (should_update_pn
                 && previous_pn
                     .as_ref()
@@ -360,28 +378,45 @@ impl LidPnCache {
 
         // One shared copy of the entry; the keys clone the entry's own
         // Arc<str> allocations, so each identifier lives once per mapping.
-        let shared = Arc::new(entry.clone());
-        self.lid_to_entry
-            .insert(shared.lid.clone(), Arc::clone(&shared))
-            .await;
+        if write_lid || should_update_pn {
+            let shared = Arc::new(entry.clone());
+            if write_lid {
+                self.lid_to_entry
+                    .insert(shared.lid.clone(), Arc::clone(&shared))
+                    .await;
+                self.contact_hash_to_lid
+                    .insert(contact_hash_key(&shared.lid), Arc::clone(&shared.lid))
+                    .await;
+            }
+            if should_update_pn {
+                self.contact_hash_to_lid
+                    .insert(
+                        contact_hash_key(&shared.phone_number),
+                        Arc::clone(&shared.lid),
+                    )
+                    .await;
+                self.pn_to_entry
+                    .insert(shared.phone_number.clone(), shared)
+                    .await;
+            }
+        }
 
-        self.contact_hash_to_lid
-            .insert(contact_hash_key(&shared.lid), Arc::clone(&shared.lid))
-            .await;
-
-        // Update PN -> Entry map (only if newer or equal timestamp)
-        if should_update_pn {
-            // A losing older entry must not point this number's hash at a
-            // superseded LID.
-            self.contact_hash_to_lid
-                .insert(
-                    contact_hash_key(&shared.phone_number),
-                    Arc::clone(&shared.lid),
-                )
-                .await;
-            self.pn_to_entry
-                .insert(shared.phone_number.clone(), shared)
-                .await;
+        // Custom stores may survive this process; their winning entries still
+        // need the always-local hash index rebuilt, without rewriting either map.
+        if !record_topology {
+            if !write_lid && let Some(existing) = &previous_lid {
+                self.contact_hash_to_lid
+                    .insert(contact_hash_key(&existing.lid), Arc::clone(&existing.lid))
+                    .await;
+            }
+            if !should_update_pn && let Some(existing) = &previous_pn {
+                self.contact_hash_to_lid
+                    .insert(
+                        contact_hash_key(&existing.phone_number),
+                        Arc::clone(&existing.lid),
+                    )
+                    .await;
+            }
         }
 
         if record_topology && let Some(topology) = self.topology.get() {
@@ -416,30 +451,44 @@ impl LidPnCache {
     /// Warm up the cache with entries from persistent storage.
     ///
     /// This should be called during client initialization to populate
-    /// the cache from the database. Rows touching an identifier already cached
-    /// are ignored so a delayed snapshot cannot replace a live mapping.
+    /// the cache from the database. Existing cached directions take precedence
+    /// over a delayed snapshot; missing directions and local hashes are rebuilt.
     pub async fn warm_up(&self, entries: impl IntoIterator<Item = LidPnEntry>) {
         let start = wacore::time::Instant::now();
         let mut count = 0;
         let guard = self.lock_mutation().await;
         let mut touched: Vec<Arc<str>> = Vec::new();
 
-        // Live mappings may have changed since the backend captured this
-        // snapshot, even if their persistence is still pending. Filter before
-        // publishing any row so timestamp ordering within the snapshot stays
-        // intact, while neither direction of an existing mapping is replaced.
+        // Capture protection before publishing any row: live mappings win,
+        // while timestamp ordering among snapshot rows stays unchanged. Missing
+        // directions still load historical LIDs and heal partial custom caches.
         let entries = entries.into_iter();
         let mut seeds = Vec::with_capacity(entries.size_hint().0);
         for entry in entries {
-            if self.lid_to_entry.get(&*entry.lid).await.is_none()
-                && self.pn_to_entry.get(&*entry.phone_number).await.is_none()
+            let lid = self.lid_to_entry.get(&*entry.lid).await;
+            let pn = self.pn_to_entry.get(&*entry.phone_number).await;
+            let write = MappingWrite::WarmUp {
+                preserve_lid: lid.is_some(),
+                preserve_pn: pn.is_some(),
+            };
+            // A missing counterpart of the same pair inherits cached metadata,
+            // rather than restoring older source/timestamp data from storage.
+            let entry = if let Some(existing) = &lid
+                && existing.phone_number == entry.phone_number
             {
-                seeds.push(entry);
-            }
+                (**existing).clone()
+            } else if let Some(existing) = &pn
+                && existing.lid == entry.lid
+            {
+                (**existing).clone()
+            } else {
+                entry
+            };
+            seeds.push((entry, write));
         }
 
-        for entry in seeds {
-            self.add_guarded_impl(&entry, &guard, false).await;
+        for (entry, write) in seeds {
+            self.add_guarded_impl(&entry, &guard, write).await;
             touched.push(Arc::clone(&entry.lid));
             touched.push(Arc::clone(&entry.phone_number));
             // `warm_up` only accepts durable rows. Mark the pair that won the
@@ -704,7 +753,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warm_up_preserves_live_identifiers_before_pending_persistence() {
+    async fn warm_up_preserves_cached_mappings_and_metadata() {
         for (stored_lid, stored_pn) in [("lid1", "old_pn"), ("old_lid", "pn1"), ("lid1", "pn1")] {
             let cache = LidPnCache::new();
             let live = LidPnEntry::with_timestamp("lid1", "pn1", 10, LearningSource::Usync);
@@ -728,7 +777,148 @@ mod tests {
                 assert_eq!(entry.created_at, live.created_at);
                 assert_eq!(entry.learning_source, live.learning_source);
             }
-            assert!(!cache.can_skip_relearn("pn1", "lid1").await);
+            assert_eq!(
+                cache.can_skip_relearn("pn1", "lid1").await,
+                stored_lid == "lid1" && stored_pn == "pn1"
+            );
+            if stored_lid != "lid1" {
+                assert_eq!(
+                    cache.get_phone_number(stored_lid).await.as_deref(),
+                    Some(stored_pn)
+                );
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct SharedCacheStore(std::sync::Mutex<std::collections::HashMap<(String, String), Vec<u8>>>);
+
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl wacore::store::CacheStore for SharedCacheStore {
+        async fn get(&self, namespace: &str, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .get(&(namespace.into(), key.into()))
+                .cloned())
+        }
+
+        async fn set(
+            &self,
+            namespace: &str,
+            key: &str,
+            value: &[u8],
+            _: Option<std::time::Duration>,
+        ) -> anyhow::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .insert((namespace.into(), key.into()), value.into());
+            Ok(())
+        }
+
+        async fn delete(&self, namespace: &str, key: &str) -> anyhow::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .remove(&(namespace.into(), key.into()));
+            Ok(())
+        }
+
+        async fn clear(&self, namespace: &str) -> anyhow::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .retain(|(stored, _), _| stored != namespace);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_up_restores_custom_store_hashes_and_historical_lids() {
+        let store = Arc::new(SharedCacheStore::default());
+        let config = CacheConfig::default().lid_pn_cache;
+        let live = LidPnEntry::with_timestamp("new_lid", "pn1", 10, LearningSource::Usync);
+        let first = LidPnCache::with_config(&config, Some(store.clone()));
+        first.add(&live).await;
+        drop(first);
+
+        let restarted = LidPnCache::with_config(&config, Some(store));
+        let hash = wacore::crypto::contact_notification_hash;
+        assert!(restarted.lid_for_contact_hash(hash("pn1")).await.is_none());
+        restarted
+            .warm_up([
+                LidPnEntry::with_timestamp("old_lid", "pn1", 1, LearningSource::Other),
+                LidPnEntry::with_timestamp("new_lid", "pn1", 2, LearningSource::Other),
+            ])
+            .await;
+        assert_eq!(
+            restarted.get_current_lid("pn1").await.as_deref(),
+            Some("new_lid")
+        );
+        assert_eq!(
+            restarted.get_phone_number("old_lid").await.as_deref(),
+            Some("pn1")
+        );
+        for (user, expected_lid) in [
+            ("pn1", "new_lid"),
+            ("new_lid", "new_lid"),
+            ("old_lid", "old_lid"),
+        ] {
+            assert_eq!(
+                restarted.lid_for_contact_hash(hash(user)).await.as_deref(),
+                Some(expected_lid)
+            );
+        }
+        let cached = restarted.get_entry_by_lid("new_lid").await.unwrap();
+        assert_eq!(cached.created_at, live.created_at);
+        assert_eq!(cached.learning_source, live.learning_source);
+        assert!(restarted.can_skip_relearn("pn1", "new_lid").await);
+    }
+
+    #[tokio::test]
+    async fn warm_up_heals_either_missing_custom_store_direction() {
+        use wacore::store::CacheStore;
+
+        for (namespace, key) in [(NS_LID, "lid1"), (NS_PN, "pn1")] {
+            let store = Arc::new(SharedCacheStore::default());
+            let config = CacheConfig::default().lid_pn_cache;
+            let live = LidPnEntry::with_timestamp("lid1", "pn1", 10, LearningSource::Usync);
+            let first = LidPnCache::with_config(&config, Some(store.clone()));
+            first.add(&live).await;
+            // Model a previous best-effort write reaching only one direction.
+            store.delete(namespace, key).await.unwrap();
+            drop(first);
+            let restarted = LidPnCache::with_config(&config, Some(store));
+            restarted
+                .warm_up([LidPnEntry::with_timestamp(
+                    "lid1",
+                    "pn1",
+                    1,
+                    LearningSource::Other,
+                )])
+                .await;
+            for entry in [
+                restarted.get_entry_by_lid("lid1").await.unwrap(),
+                restarted.get_entry_by_phone("pn1").await.unwrap(),
+            ] {
+                assert_eq!(entry.lid, live.lid);
+                assert_eq!(entry.phone_number, live.phone_number);
+                assert_eq!(entry.created_at, live.created_at);
+                assert_eq!(entry.learning_source, live.learning_source);
+            }
+            for user in ["lid1", "pn1"] {
+                assert_eq!(
+                    restarted
+                        .lid_for_contact_hash(wacore::crypto::contact_notification_hash(user))
+                        .await
+                        .as_deref(),
+                    Some("lid1")
+                );
+            }
+            assert!(restarted.can_skip_relearn("pn1", "lid1").await);
         }
     }
 
