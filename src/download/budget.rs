@@ -53,7 +53,8 @@ pub enum MediaByteDomain {
     Plaintext,
 }
 
-/// Local policy failures are terminal, even when more CDN hosts are available.
+/// A download policy decision. SDK-origin decisions stop host failover;
+/// adapter and writer errors retain their I/O origin even if they contain this type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum DownloadPolicyError {
@@ -63,6 +64,16 @@ pub enum DownloadPolicyError {
     StreamingRequired,
     #[error("media download cancelled")]
     Cancelled,
+}
+
+// The public policy type can also appear in third-party I/O errors. Only this
+// private marker proves that the active SDK budget produced the failure.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(super) struct BudgetPolicyCause(#[source] pub(super) DownloadPolicyError);
+
+fn policy_io(error: DownloadPolicyError) -> io::Error {
+    io::Error::other(BudgetPolicyCause(error))
 }
 
 #[derive(Default)]
@@ -141,7 +152,7 @@ impl DownloadBudget {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.cancelled {
-            return Err(io::Error::other(DownloadPolicyError::Cancelled));
+            return Err(policy_io(DownloadPolicyError::Cancelled));
         }
         Ok(match (self.limits.bounds, domain) {
             (Some((limit, _)), MediaByteDomain::Wire) => limit.saturating_sub(state.wire),
@@ -172,7 +183,7 @@ impl DownloadBudget {
                 MediaByteDomain::Wire => wire,
                 MediaByteDomain::Plaintext => plain,
             });
-        io::Error::other(DownloadPolicyError::LimitExceeded { domain, limit })
+        policy_io(DownloadPolicyError::LimitExceeded { domain, limit })
     }
 }
 
@@ -223,7 +234,7 @@ impl<W: Write> Write for BudgetWriter<W> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.budget.check_cancelled().map_err(io::Error::other)?;
+        self.budget.check_cancelled().map_err(policy_io)?;
         self.inner.flush()
     }
 }
@@ -234,11 +245,12 @@ mod tests {
     use std::io::Cursor;
 
     fn policy(error: &io::Error) -> DownloadPolicyError {
-        *error
+        error
             .get_ref()
             .unwrap()
-            .downcast_ref::<DownloadPolicyError>()
+            .downcast_ref::<BudgetPolicyCause>()
             .unwrap()
+            .0
     }
 
     #[test]

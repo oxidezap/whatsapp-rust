@@ -10,7 +10,7 @@ use wacore::runtime::Runtime;
 use wacore::sync_marker::MaybeSend;
 
 mod budget;
-use budget::DownloadBudget;
+use budget::{BudgetPolicyCause, DownloadBudget};
 pub use budget::{DownloadLimits, DownloadPolicyError, MediaByteDomain};
 
 pub use wacore::download::{
@@ -491,13 +491,13 @@ impl DownloadRequestError {
             .is_some_and(|cause| cause.is::<WriterIoCause>());
         if !tagged {
             if let Some(policy) = error.chain().find_map(|e| {
-                e.downcast_ref::<DownloadPolicyError>().or_else(|| {
+                e.downcast_ref::<BudgetPolicyCause>().or_else(|| {
                     e.downcast_ref::<std::io::Error>()?
                         .get_ref()?
-                        .downcast_ref::<DownloadPolicyError>()
+                        .downcast_ref::<BudgetPolicyCause>()
                 })
             }) {
-                return Self::ResourcePolicy(*policy);
+                return Self::ResourcePolicy(policy.0);
             }
             return Self::Other(error);
         }
@@ -2778,6 +2778,79 @@ mod tests {
             })
         ));
         assert_eq!(http.urls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn adapter_policy_errors_keep_transport_origin_and_host_failover() {
+        use std::io::Read;
+        struct AdapterReader;
+        impl Read for AdapterReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other(DownloadPolicyError::LimitExceeded {
+                    domain: MediaByteDomain::Wire,
+                    limit: 1,
+                }))
+            }
+        }
+        struct AdapterHttp {
+            body: Vec<u8>,
+            calls: std::sync::Mutex<usize>,
+            recover: bool,
+        }
+        #[async_trait::async_trait]
+        impl HttpClient for AdapterHttp {
+            async fn execute(
+                &self,
+                _: crate::http::HttpRequest,
+            ) -> Result<crate::http::HttpResponse> {
+                unreachable!("streaming fixture")
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn execute_streaming(
+                &self,
+                _: crate::http::HttpRequest,
+            ) -> Result<wacore::net::StreamingHttpResponse> {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+                let reader: Box<dyn Read + Send> = if *calls > 1 && self.recover {
+                    Box::new(Cursor::new(self.body.clone()))
+                } else {
+                    Box::new(AdapterReader)
+                };
+                Ok(wacore::net::StreamingHttpResponse::new(200, reader))
+            }
+        }
+        for limits in [DownloadLimits::default(), DownloadLimits::new(100, 100)] {
+            for recover in [false, true] {
+                let data = b"adapter retry";
+                let (params, encrypted) = encrypted_params(data);
+                let http = Arc::new(AdapterHttp {
+                    body: encrypted,
+                    calls: std::sync::Mutex::new(0),
+                    recover,
+                });
+                let dl = MediaDownloader::new(
+                    http.clone(),
+                    Arc::new(crate::TokioRuntime),
+                    MediaRoute::new(vec![
+                        MediaHost::new("first.example"),
+                        MediaHost::new("second.example"),
+                    ]),
+                );
+                let result = dl.download(&params, limits).await;
+                if recover {
+                    assert_eq!(result.unwrap(), data);
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(MediaDownloadError::HostsUnreachable(_))
+                    ));
+                }
+                assert_eq!(*http.calls.lock().unwrap(), 2);
+            }
+        }
     }
 
     #[tokio::test]
