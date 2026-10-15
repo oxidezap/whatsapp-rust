@@ -404,7 +404,7 @@ pub struct SessionLockGuard(
 );
 
 impl SessionLockGuard {
-    /// No locks held — the default resolver behavior (tests/benches don't race).
+    /// No locks held. Only use when the caller serializes pairwise session access.
     pub fn none() -> Self {
         Self(None)
     }
@@ -473,17 +473,38 @@ pub trait SendContextResolver: crate::sync_marker::MaybeSendSync {
     /// in the same deadlock-free order the DM send path uses, so a group send and a
     /// concurrent DM (or another group send) sharing a device can't advance that
     /// device's pairwise ratchet at once and drop a chain step. The `sender_key_lock`
-    /// only serializes the sender-key chain, not these pairwise sessions. Default:
-    /// no-op — tests and benches don't race concurrent sends.
-    async fn lock_device_sessions(&self, device_jids: &[Jid]) -> SessionLockGuard {
-        let _ = device_jids;
-        SessionLockGuard::none()
-    }
+    /// only serializes the sender-key chain, not these pairwise sessions.
+    ///
+    /// Use the same canonical addresses and lock set as direct sends, deduplicate
+    /// targets, and acquire them in a stable order. The returned guard must own
+    /// the locks until dropped, including when the send is cancelled. Returning
+    /// [`SessionLockGuard::none`] requires caller-enforced serialization of all
+    /// overlapping pairwise session operations.
+    async fn lock_device_sessions(&self, device_jids: &[Jid]) -> SessionLockGuard;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelling_a_send_releases_its_owned_session_locks() {
+        use futures::FutureExt;
+
+        let lock = Arc::new(async_lock::Mutex::new(()));
+        let owned_lock = lock.clone();
+        let mut send = Box::pin(async move {
+            let _guard = SessionLockGuard::hold(Box::new(owned_lock.lock_arc().await));
+            std::future::pending::<()>().await;
+        });
+        assert!(send.as_mut().now_or_never().is_none());
+        assert!(lock.try_lock().is_none(), "overlapping sends must wait");
+        drop(send);
+        assert!(
+            lock.try_lock().is_some(),
+            "cancellation must release the lock"
+        );
+    }
 
     fn pn(user: &str) -> Jid {
         Jid::pn(user)

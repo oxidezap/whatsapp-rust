@@ -15,6 +15,14 @@ use waproto::whatsapp::{PreKeyRecordStructure, SignedPreKeyRecordStructure};
 
 type StoreError = Box<dyn std::error::Error + Send + Sync>;
 
+// Fail closed when an adapter cannot fulfill a public store operation.
+fn unsupported_device_store_operation(operation: &'static str) -> StoreError {
+    Box::new(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!("Device adapter does not implement {operation}"),
+    ))
+}
+
 type DirectStoreIncarnation = [u8; 16];
 
 // Synchronous direct writes make process restart the only unsafe reload boundary.
@@ -368,22 +376,15 @@ impl SignedPreKeyStore for Device {
     }
 
     async fn load_signed_prekeys(&self) -> Result<Vec<SignedPreKeyRecordStructure>, StoreError> {
-        log::warn!(
-            "Device: load_signed_prekeys() - returning empty list. Only the device's own signed pre-key should be accessed via load_signed_prekey()."
-        );
-        Ok(Vec::new())
+        Err(unsupported_device_store_operation("load_signed_prekeys"))
     }
 
     async fn store_signed_prekey(
         &self,
-        signed_prekey_id: u32,
+        _signed_prekey_id: u32,
         _record: SignedPreKeyRecordStructure,
     ) -> Result<(), StoreError> {
-        log::warn!(
-            "Device: store_signed_prekey({}) - no-op. Signed pre-keys should only be set once during device creation/pairing and managed via PersistenceManager.",
-            signed_prekey_id
-        );
-        Ok(())
+        Err(unsupported_device_store_operation("store_signed_prekey"))
     }
 
     async fn contains_signed_prekey(&self, signed_prekey_id: u32) -> Result<bool, StoreError> {
@@ -402,11 +403,8 @@ impl SignedPreKeyStore for Device {
     }
 
     async fn remove_signed_prekey(&self, signed_prekey_id: u32) -> Result<(), StoreError> {
-        log::warn!(
-            "Device: remove_signed_prekey({}) - no-op. Signed pre-keys are managed via PersistenceManager and should not be removed individually.",
-            signed_prekey_id
-        );
-        Ok(())
+        let _ = signed_prekey_id;
+        Err(unsupported_device_store_operation("remove_signed_prekey"))
     }
 }
 
@@ -427,7 +425,9 @@ impl SessionStore for Device {
 
     async fn get_sub_device_sessions(&self, name: &str) -> Result<Vec<u32>, StoreError> {
         let _ = name;
-        Ok(Vec::new())
+        Err(unsupported_device_store_operation(
+            "get_sub_device_sessions",
+        ))
     }
 
     async fn store_session(
@@ -463,7 +463,7 @@ impl SessionStore for Device {
 
     async fn delete_all_sessions(&self, name: &str) -> Result<(), StoreError> {
         let _ = name;
-        Ok(())
+        Err(unsupported_device_store_operation("delete_all_sessions"))
     }
 }
 
@@ -544,6 +544,38 @@ impl SenderKeyStore for Device {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unsupported_device_operations_fail_instead_of_claiming_persistence() {
+        let device = Device::new(crate::test_utils::create_test_backend().await);
+        let errors = [
+            SignedPreKeyStore::load_signed_prekeys(&device)
+                .await
+                .unwrap_err(),
+            SignedPreKeyStore::store_signed_prekey(
+                &device,
+                42,
+                SignedPreKeyRecordStructure::default(),
+            )
+            .await
+            .unwrap_err(),
+            SignedPreKeyStore::remove_signed_prekey(&device, 42)
+                .await
+                .unwrap_err(),
+            SessionStore::get_sub_device_sessions(&device, "15550001001")
+                .await
+                .unwrap_err(),
+            SessionStore::delete_all_sessions(&device, "15550001001")
+                .await
+                .unwrap_err(),
+        ];
+        for error in errors {
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::Unsupported,
+            );
+        }
+    }
 
     fn leased_session() -> SessionRecord {
         use wacore::libsignal::protocol::{ChainKey, KeyPair, RootKey, SessionState};

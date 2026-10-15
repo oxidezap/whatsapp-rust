@@ -525,6 +525,11 @@ impl MockSendContextResolver {
 
 #[async_trait::async_trait]
 impl SendContextResolver for MockSendContextResolver {
+    async fn lock_device_sessions(&self, _: &[Jid]) -> crate::client::context::SessionLockGuard {
+        // This fixture runs pairwise session operations sequentially.
+        crate::client::context::SessionLockGuard::none()
+    }
+
     async fn resolve_devices(&self, _jids: &[Jid]) -> Result<Vec<Jid>> {
         Ok(self.devices.clone())
     }

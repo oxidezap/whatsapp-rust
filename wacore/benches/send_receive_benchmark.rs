@@ -441,6 +441,11 @@ struct MockResolver(Vec<Jid>);
 
 #[async_trait]
 impl SendContextResolver for MockResolver {
+    async fn lock_device_sessions(&self, _: &[Jid]) -> wacore::client::context::SessionLockGuard {
+        // This fixture runs pairwise session operations sequentially.
+        wacore::client::context::SessionLockGuard::none()
+    }
+
     async fn resolve_devices(&self, _: &[Jid]) -> Result<Vec<Jid>, anyhow::Error> {
         Ok(self.0.clone())
     }

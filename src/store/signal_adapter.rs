@@ -88,6 +88,12 @@ impl SenderKeyAdapter {
     }
 }
 
+/// Signal stores backed by the shared cache and device persistence manager.
+///
+/// Successful session, identity and sender-key writes admit state to the cache;
+/// callers must flush the cache and propagate flush failures before relying on
+/// durability. Signed pre-key writes are unsupported here; rotation is owned by
+/// the persistence manager.
 #[derive(Clone)]
 pub struct SignalProtocolStoreAdapter {
     pub session_store: SessionAdapter,
@@ -525,7 +531,13 @@ impl SignedPreKeyStore for SignedPreKeyAdapter {
         _id: SignedPreKeyId,
         _record: &SignedPreKeyRecord,
     ) -> Result<(), SignalProtocolError> {
-        Ok(())
+        Err(SignalProtocolError::BackendError(
+            "save_signed_pre_key",
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "signed pre-key rotation is owned by PersistenceManager",
+            )),
+        ))
     }
 }
 
@@ -808,6 +820,43 @@ mod tests {
         let backend: Arc<dyn crate::store::Backend> = Arc::new(InMemoryBackend::new());
         let device = test_persistence_manager(backend).await;
         SignalProtocolStoreAdapter::new(device.clone(), Arc::new(SignalStoreCache::new()))
+    }
+
+    #[tokio::test]
+    async fn signed_pre_key_save_reports_unsupported_and_preserves_current_key() {
+        let mut adapter = test_adapter().await;
+        let id = adapter.signed_pre_key_store.0.device().signed_pre_key_id;
+        let record = adapter
+            .signed_pre_key_store
+            .get_signed_pre_key(id.into())
+            .await
+            .unwrap();
+        let error = adapter
+            .signed_pre_key_store
+            .save_signed_pre_key((id + 1).into(), &record)
+            .await
+            .unwrap_err();
+        let SignalProtocolError::BackendError(_, source) = error else {
+            panic!("expected backend error");
+        };
+        assert_eq!(
+            source.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        assert!(
+            adapter
+                .signed_pre_key_store
+                .get_signed_pre_key((id + 1).into())
+                .await
+                .is_err()
+        );
+        assert!(
+            adapter
+                .signed_pre_key_store
+                .get_signed_pre_key(id.into())
+                .await
+                .is_ok()
+        );
     }
 
     struct BlockingIdentityStore {
