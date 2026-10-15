@@ -517,6 +517,10 @@ pub(crate) struct ReadPool {
 
 /// Fixed-device storage handle implementing the open domain traits in `Backend`.
 /// Obtain siblings from [`crate::SqliteDatabase::store`] without opening new pools.
+/// Repeated SQLite busy/locked failures return [`StoreError::RetriesExhausted`]
+/// after six attempts. Other database failures retain their backend source.
+/// Exhaustion describes contention, not whether replaying a larger application
+/// operation is safe.
 /// Domain operations do not accept a second account id:
 ///
 /// ```compile_fail
@@ -1628,10 +1632,11 @@ impl SqliteStore {
                     barrier?;
                     return Ok(val);
                 }
-                Ok((Err(DieselOrStore::Diesel(ref e)), permit))
-                    if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
-                {
+                Ok((Err(DieselOrStore::Diesel(ref e)), permit)) if is_retriable_sqlite_error(e) => {
                     drop(permit);
+                    if attempt == MAX_RETRIES {
+                        break;
+                    }
                     let delay_ms = 10u64 * (1u64 << attempt.min(4));
                     // Skip the first transient blip; warn from the second retry on so
                     // sustained busy/locked contention doesn't go unobserved.
@@ -5208,7 +5213,13 @@ mod tests {
                     })
                 })
                 .await;
-            assert!(result.is_err());
+            match (expected_attempts, result) {
+                (6, Err(StoreError::RetriesExhausted { op })) => {
+                    assert_eq!(op, "bounded_retry");
+                }
+                (1, Err(StoreError::Database(_))) => {}
+                (_, result) => panic!("unexpected retry classification: {result:?}"),
+            }
             assert_eq!(attempts.load(Ordering::SeqCst), expected_attempts);
             assert_eq!(store.db_semaphore.available_permits(), 1);
         }

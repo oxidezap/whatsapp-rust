@@ -576,6 +576,13 @@ impl crate::stats::HeapSize for DeviceListRecord {
 ///
 /// Handles identity keys, sessions, pre-keys, signed pre-keys, and sender keys
 /// for end-to-end encryption.
+///
+/// Default batch writes run individual operations in order and stop on the
+/// first error. Earlier writes may already have committed. Implementations
+/// used with [`crate::store::SignalStoreCache`] must allow the same snapshot
+/// to be written again after a failed flush. This does not make a batch atomic.
+/// Serialize session ratchet operations separately, as required by the sending
+/// context; a backend's per-method lock does not cover a read-modify-write cycle.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait SignalStore: Send + Sync {
