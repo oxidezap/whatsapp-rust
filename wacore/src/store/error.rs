@@ -26,6 +26,8 @@ pub enum StoreError {
     #[error("database operation error")]
     Database(#[source] Box<dyn std::error::Error + Send + Sync>),
 
+    /// The backend exhausted its busy/locked contention retry budget.
+    /// This remains classified as contention by [`Self::is_database_busy_or_locked`].
     #[error("database operation '{op}' exhausted retries")]
     RetriesExhausted { op: String },
 
@@ -40,8 +42,8 @@ pub enum StoreError {
 }
 
 impl StoreError {
-    /// Walks the error source chain and returns true if any layer's `Display`
-    /// indicates a SQLite busy/locked condition. Used by retry layers that
+    /// Recognizes exhausted contention retries, or walks the source chain
+    /// for a `Display` indicating SQLite busy/locked. Used by retry layers that
     /// can't depend on a specific backend (Diesel, libsql, etc.) directly.
     ///
     /// Substring matching is necessary because SQLite reports BUSY/LOCKED
@@ -49,6 +51,9 @@ impl StoreError {
     /// to `Diesel::DatabaseError(Unknown, _)` (or similar) without further
     /// discrimination.
     pub fn is_database_busy_or_locked(&self) -> bool {
+        if matches!(self, Self::RetriesExhausted { .. }) {
+            return true;
+        }
         let mut layer: &dyn std::error::Error = self;
         loop {
             let s = layer.to_string().to_lowercase();

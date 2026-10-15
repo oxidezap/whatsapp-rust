@@ -155,8 +155,14 @@ fn external_backend_defaults_preserve_missing_rows_and_conservative_scan() {
         assert_eq!(rows, vec![(first.clone(), Bytes::from_static(b"opaque"))]);
         assert!(!store.has_session(&missing).await.unwrap());
         assert!(store.has_signal_state_for_user("unseen").await.unwrap());
-        store.delete_sessions_batch(&[first.clone()]).await.unwrap();
-        store.delete_sessions_batch(&[first.clone()]).await.unwrap();
+        store
+            .delete_sessions_batch(std::slice::from_ref(&first))
+            .await
+            .unwrap();
+        store
+            .delete_sessions_batch(std::slice::from_ref(&first))
+            .await
+            .unwrap();
         assert!(!store.has_session(&first).await.unwrap());
     });
 }
@@ -236,4 +242,16 @@ fn default_batch_failure_can_leave_a_committed_prefix() {
             3
         );
     });
+}
+
+#[test]
+fn exhausted_contention_remains_classifiable_by_portable_consumers() {
+    let error = StoreError::RetriesExhausted {
+        op: "external_write".into(),
+    };
+    assert!(error.is_database_busy_or_locked());
+    match error {
+        StoreError::RetriesExhausted { op } => assert_eq!(op, "external_write"),
+        _ => panic!("exhaustion classification changed"),
+    }
 }
