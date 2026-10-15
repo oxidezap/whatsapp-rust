@@ -102,6 +102,9 @@ and device scope on every read/write, including batch and detached operations.
 including on cancellation. An error after a durability barrier can mean the
 complete commit is visible; it does not establish rollback or safe blind retry.
 `Ok` must reflect the backend's declared persistence boundary, not just enqueue.
+An NVS commit is not evidence of a multi-key atomic transaction. Do not retain a
+collection version while evicting MACs needed for its incremental baseline;
+capacity refusal must preserve the complete old state or use explicit recovery.
 
 Pending-inbound durability is optional and fails closed by default. Its bounded
 reads must reject oversized payloads before copying them, preserve exact/group

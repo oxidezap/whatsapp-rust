@@ -93,6 +93,15 @@ when implementing adapters; consult the owning trait rather than adding blanket
 Published packages declare their MSRV in their manifests; host tools can have a
 different floor.
 
+| Implementer | Required contract |
+| --- | --- |
+| `Runtime` | `Send + Sync` object on native and WASM; native task futures are `Send`, local WASM futures need not be. Abort closures remain `Send`; abort is not join completion. |
+| `Transport` / `TransportFactory` | Target-conditional `MaybeSendSync` and async-trait futures; `Bytes`, `anyhow::Error` and an `async_channel` receiver are exposed. Dropped dial futures must not leak transports. |
+| `HttpClient` | Target-conditional async execution with status-preserving responses. Streaming is an optional synchronous `Read + Send` capability, not an async chunk protocol. |
+| Five storage domain traits | `Send + Sync` even on WASM; required atomic patch commits and device scope. Optional pending-inbound support fails closed; batch overrides must preserve bounded/CAS ownership rules. |
+| Durability hooks | Target-conditional bounds; host-owned idempotent commits and cancellation reconciliation. Message, group and history capture are separate registrations. |
+| Neutral media backend/session and relay ports | Target-conditional bounds; the host supplies media and relay capability. Audio/video source and sink ports separately retain `Send + Sync`. |
+
 ### Features and targets
 
 | Profile | Configuration and host obligations | Evidence boundary |
@@ -100,10 +109,19 @@ different floor.
 | Native defaults | SQLite with bundled SQLite, Tokio runtime/transport, ureq, `tokio-native` and OS `signal`. Choose a backend explicitly. | Native CI and isolated API consumers. This does not qualify every OS or deployment. |
 | Native `std`, without Tokio | `default-features = false`; provide runtime, transport, HTTP and storage implementations. `wacore` has no Tokio runtime dependency. | Separate core/SDK consumer profiles prevent workspace dev-feature unification from standing in for a minimal consumer. This is not `no_std`. |
 | Local WASM | `wasm32-unknown-unknown`, defaults disabled, JS randomness configured by the host. Futures can be non-`Send`; network adapters use `MaybeSendSync`. | WASM CI builds and executes selected JS-hosted probes. It does not establish browser-wide, WASI or threaded/atomics WASM support. `Runtime` still requires `Send + Sync`, and its abort closure still requires `Send`. |
-| ESP-IDF / ESP32 | Portable core with `std`, application-supplied executor, entropy, network and storage. Native defaults and native VoIP relay are not an ESP-IDF profile. | The separate ESP32 project demonstrates an integration. This repository has no ESP-IDF CI lane; do not infer that every chip, SDK feature or codec is qualified on hardware. |
+| ESP-IDF / ESP32 | Portable core with `std`, application-supplied executor, entropy, network and storage. Native defaults and native VoIP relay are not an ESP-IDF profile. | The existing ESP32 consumer pins an older SDK and needs API migration for current main. Its declared S3/C3/C5 targets are not candidate-qualified. There is no ESP-IDF CI lane here. |
 | VoIP control | `voip-control` exposes signaling and neutral media backend ports. Without an injected backend, media setup returns `NoBackend`. | Control-only consumers are separate from the engine graph. |
 | Portable VoIP engine | `voip-runtime` / `voip-engine-wacore`; `voip-encoded` accepts application-supplied encoded audio. `voip-mlow` adds PCM/MLOW, `voip-libopus` links the Opus adapter. | A portable build is not proof of a host relay, codec budget or live peer interoperability. |
 | Native VoIP | `voip-relay-native` adds UDP/DTLS/SCTP and Tokio; `voip` also includes both codec adapters. | Experimental interoperability. Direct/group voice/video, call links, screen sharing and upgrade/downgrade need qualification for the exact peers and negotiated modes used. |
+
+The [ESP32 consumer at `540603be`](https://github.com/oxidezap/whatsapp-rust-esp32/tree/540603be53012b905c9288add6663a2734a87206)
+pins SDK `e14300d1`. A host API probe against SDK `20c48f54` identified missing
+atomic app-state and typed message-secret methods, secret conversion changes and
+non-exhaustive HTTP construction. An adapted signature-only control compiled;
+this is not a firmware build or a working storage migration. ESP-IDF compilation,
+board-specific resource limits, reboot recovery and physical flash/power-loss
+behavior still require validation. Do not promote an older integration into a
+support claim for current main.
 
 `signal` means OS signal handling, not the Signal encryption protocol.
 `tracing-pii`, debug snapshots and TLS verification bypasses are diagnostic
