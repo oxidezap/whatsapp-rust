@@ -16,6 +16,9 @@
 /// bytes of a value it does not model.
 ///
 /// Generated from `STANZA_MSG_TYPES` in `WAWebHandleMsgCommon`.
+///
+/// Keep a wildcard when matching: future wire values can gain named variants.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, crate::WireEnum)]
 pub enum StanzaMessageType {
     #[wire = "text"]
@@ -65,6 +68,9 @@ pub enum PollType {
 /// claim and nothing checks it against the decrypted message.
 ///
 /// Generated from `EncMediaType` in `WAWebBackendJobs.flow`.
+///
+/// Keep a wildcard when matching: future wire values can gain named variants.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, crate::WireEnum)]
 pub enum EncMediaType {
     #[wire = "image"]

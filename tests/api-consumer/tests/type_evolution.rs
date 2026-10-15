@@ -5,6 +5,26 @@ use buffa::{Message as _, MessageView as _};
 use whatsapp_rust::{buffa, waproto::whatsapp as wa};
 
 #[test]
+fn open_envelope_enums_support_named_values_unknown_payloads_and_future_variants() {
+    use whatsapp_rust::wacore::types::message::{EncMediaType, StanzaMessageType};
+
+    let unknown = StanzaMessageType::from("synthetic-future-kind");
+    let payload = match unknown {
+        StanzaMessageType::Unknown(payload) => Some(payload),
+        _ => None,
+    };
+    assert_eq!(payload.as_deref(), Some("synthetic-future-kind"));
+
+    let media = EncMediaType::from("image");
+    assert!(matches!(media, EncMediaType::Image));
+    let raw = EncMediaType::from("synthetic-future-media");
+    match raw {
+        EncMediaType::Unknown(payload) => assert_eq!(payload, "synthetic-future-media"),
+        _ => panic!("future media value must retain its payload"),
+    }
+}
+
+#[test]
 fn dependency_reexports_accept_the_same_public_types() {
     // A consumer can mix direct core imports with the SDK without adapters.
     let direct: wacore_binary::Jid = "12345@s.whatsapp.net".parse().unwrap();

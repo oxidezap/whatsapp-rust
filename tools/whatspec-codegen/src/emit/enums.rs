@@ -260,8 +260,13 @@ fn wire_enum(wanted: &Wanted, def: &EnumDef) -> Result<String> {
 
     let open = matches!(wanted.shape, Shape::Open(_));
     let copy = if open { "" } else { ", Copy" };
+    let extensible = if open {
+        "///\n/// Keep a wildcard when matching: future wire values can gain named variants.\n#[non_exhaustive]\n"
+    } else {
+        ""
+    };
     let mut out = format!(
-        "/// {}\n///\n/// Generated from `{}` in `{}`.\n#[derive(Debug, Clone{copy}, PartialEq, Eq, crate::WireEnum)]\npub enum {} {{\n",
+        "/// {}\n///\n/// Generated from `{}` in `{}`.\n{extensible}#[derive(Debug, Clone{copy}, PartialEq, Eq, crate::WireEnum)]\npub enum {} {{\n",
         wanted.doc, wanted.name, def.module, wanted.rust
     );
 
@@ -416,11 +421,13 @@ mod tests {
         .expect("emit");
         assert!(out.contains("#[wire = \"medianotify\"]\n    MediaNotify,"));
         assert!(out.contains("#[wire_fallback]"));
+        assert!(out.contains("#[non_exhaustive]"));
         assert!(!out.contains(", Copy,"));
 
         let closed =
             wire_enum(wanted("POLL_TYPES"), &def("POLL_TYPES", "m", &["vote"])).expect("emit");
         assert!(!closed.contains("#[wire_fallback]"));
+        assert!(!closed.contains("#[non_exhaustive]"));
         assert!(closed.contains(", Copy,"));
     }
 
