@@ -1321,11 +1321,21 @@ async fn streaming_download_and_decrypt<W: DownloadWriter + MaybeSend + 'static>
     Ok(wacore::runtime::blocking(&**runtime, move || {
         let mut writer = writer;
 
+        if let Some(budget) = &hashes.budget
+            && let Err(error) = budget.check_cancelled()
+        {
+            return (writer, Err(DownloadRequestError::ResourcePolicy(error)));
+        }
         if let Err(e) = clear_writer(&mut writer) {
             return (writer, Err(DownloadRequestError::writer_io(e)));
         }
 
         let result = (|| -> std::result::Result<(), DownloadRequestError> {
+            if let Some(budget) = &hashes.budget {
+                budget
+                    .check_cancelled()
+                    .map_err(DownloadRequestError::ResourcePolicy)?;
+            }
             let http_request = crate::http::HttpRequest::get(url);
             let resp = http_client
                 .execute_streaming(http_request)
@@ -2775,6 +2785,42 @@ mod tests {
             })
         ));
         assert_eq!(http.urls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_queued_download_preserves_sink_and_does_not_start_http() {
+        let (params, encrypted) = encrypted_params(b"cancelled before start");
+        let request =
+            DownloadUtils::prepare_download_requests(&params, &MediaRoute::default_hosts())
+                .unwrap()
+                .remove(0);
+        let http = RoutedHttpClient::streaming(Vec::new(), (200, encrypted));
+        let http_client: Arc<dyn HttpClient> = http.clone();
+        let runtime: Arc<dyn Runtime> = Arc::new(crate::TokioRuntime);
+        let budget = DownloadBudget::new(DownloadLimits::new(100, 100));
+        budget.cancel();
+        let mut writer = SharedWriter::new();
+        writer.write_all(b"original output").unwrap();
+        let (writer, result) = streaming_download_and_decrypt(
+            &http_client,
+            &runtime,
+            &request,
+            ExpectedMediaHashes {
+                budget: Some(budget),
+                ..ExpectedMediaHashes::from_downloadable(&params)
+            },
+            writer,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result,
+            Err(DownloadRequestError::ResourcePolicy(
+                DownloadPolicyError::Cancelled
+            ))
+        ));
+        assert_eq!(writer.contents(), b"original output");
+        assert!(http.urls().is_empty());
     }
 
     #[tokio::test]

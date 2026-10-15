@@ -96,6 +96,19 @@ impl DownloadBudget {
             .cancelled = true;
     }
 
+    /// Check before starting other blocking I/O owned by this operation.
+    pub fn check_cancelled(&self) -> Result<(), DownloadPolicyError> {
+        if let Some(state) = &self.state
+            && state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .cancelled
+        {
+            return Err(DownloadPolicyError::Cancelled);
+        }
+        Ok(())
+    }
+
     pub fn reader<R: Read>(&self, inner: R) -> impl Read + use<R> {
         BudgetReader {
             inner,
@@ -200,6 +213,7 @@ impl<W: Write> Write for BudgetWriter<W> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        self.budget.check_cancelled().map_err(io::Error::other)?;
         self.inner.flush()
     }
 }
@@ -263,6 +277,28 @@ mod tests {
             policy(&budget.writer(io::sink()).write(b"x").unwrap_err()),
             DownloadPolicyError::Cancelled
         );
+    }
+
+    #[test]
+    fn cancelled_flush_does_not_touch_the_sink() {
+        struct FlushSink(bool);
+        impl Write for FlushSink {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.0 = true;
+                Ok(())
+            }
+        }
+        let budget = DownloadBudget::new(DownloadLimits::new(4, 4));
+        let mut sink = FlushSink(false);
+        budget.cancel();
+        assert_eq!(
+            policy(&budget.writer(&mut sink).flush().unwrap_err()),
+            DownloadPolicyError::Cancelled
+        );
+        assert!(!sink.0);
     }
 
     #[test]
