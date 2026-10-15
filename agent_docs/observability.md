@@ -5,6 +5,16 @@ clock/runtime hooks; do not add Tokio, allocator or tracing dependencies there.
 Counters on hot paths must avoid allocations and unbounded labels. Reports run
 on demand. Snapshots contain numbers, never JIDs, message IDs or phone numbers.
 
+With the `metrics` feature, `wa_live_admission_refused_total` counts live
+processing attempts stopped before decrypt with an inbound durability hook.
+Its closed `reason` label is `capacity`, `receipts` or `retained_write`.
+The last includes failure to recover retained plaintext or a durable predecessor,
+including hook failure. Count only the final capacity refusal after any batch
+flush retry. A later redelivery may count again; this measures refused attempts,
+not unique messages or server redelivery latency. It is separate from
+`wa_recv_total`, whose outcomes describe decrypt processing. With metrics disabled,
+emission is an inline no-op. The counter has no per-session or message labels.
+
 Session wire I/O is recorded at the Noise socket send observers and read-loop
 transport boundary, after the handshake. Count successful transport writes there,
 not at every caller. VoIP relay traffic is a separate scope. Activity deadlines

@@ -22485,3 +22485,189 @@ async fn malformed_signal_plaintext_does_not_poison_a_valid_retry() {
         .await;
     assert_eq!(*hook.0.lock().unwrap(), vec!["valid Signal retry"]);
 }
+
+#[cfg(feature = "metrics")]
+#[test]
+fn live_admission_refusal_metrics_regression() {
+    const CHILD_ENV: &str = "WA_LIVE_ADMISSION_METRICS_CHILD";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let module = module_path!().split_once("::").unwrap().1;
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("{module}::live_admission_refusal_metrics_regression"),
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "isolated metrics fixture must pass");
+        return;
+    }
+    let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .unwrap();
+    let counts = || {
+        ["capacity", "receipts", "retained_write"].map(|reason| {
+            let prefix = format!("wa_live_admission_refused_total{{reason=\"{reason}\"}} ");
+            handle
+                .render()
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix(&prefix)
+                        .map(|value| value.parse::<u64>().unwrap())
+                })
+                .unwrap_or(0)
+        })
+    };
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            struct Hook;
+            #[async_trait::async_trait]
+            impl crate::InboundDurabilityHook for Hook {
+                async fn on_messages(
+                    &self,
+                    _: Arc<Client>,
+                    _: &[wacore::types::events::InboundMessage],
+                ) -> anyhow::Result<()> {
+                    Ok(())
+                }
+            }
+            // Real encrypted receive processing against the in-memory test store.
+            // This does not exercise a connected WhatsApp server.
+            for case in 0..4 {
+                let reason = if case == 3 { 1 } else { case };
+                let (client, transport) = capturing_client("admission_metrics").await;
+                client
+                    .inbound_durability_hook
+                    .set(Arc::new(Hook))
+                    .ok()
+                    .unwrap();
+                let group: Jid = "120363000000000085@g.us".parse().unwrap();
+                let mut alice =
+                    joined_group_sender(&client, "100000000000003:76@lid", &group).await;
+                let ciphertext = encrypt_group_text(&mut alice, &group, "admission metrics").await;
+                let id = "ADMISSION_METRICS";
+                let stanza = || group_skmsg_stanza(&group, &alice.jid, id, ciphertext.clone());
+                if case == 3 {
+                    // Leave staged plaintext behind to exercise the earlier
+                    // receipt-admission branch used by raw replay.
+                    let retention = &client.inbound_commit_batch.live_retention;
+                    retention.pause_stage.store(true, Ordering::Release);
+                    let receiver = client.clone();
+                    let first = stanza();
+                    let worker =
+                        tokio::spawn(async move { receiver.handle_incoming_message(first).await });
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        retention.stage_ready.notified(),
+                    )
+                    .await
+                    .unwrap();
+                    worker.abort();
+                    assert!(worker.await.unwrap_err().is_cancelled());
+                    retention.pause_stage.store(false, Ordering::Release);
+                }
+                let before = counts();
+                let occupied = (reason == 0).then(|| {
+                    client
+                        .inbound_commit_batch
+                        .live_retention
+                        .occupy_remaining_for_tests()
+                });
+                let receipt_info = dm_info("OCCUPIED_RECEIPTS", &alice.jid);
+                let receipts: Vec<_> = if reason == 1 {
+                    (0..400)
+                        .map(|_| {
+                            client
+                                .inbound_commit_batch
+                                .live_retention
+                                .begin_receipts(&receipt_info)
+                                .unwrap()
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                if reason == 2 {
+                    client
+                        .inbound_commit_batch
+                        .fail_commits
+                        .store(true, Ordering::Release);
+                    client.clone().handle_incoming_message(stanza()).await;
+                    assert_eq!(
+                        counts(),
+                        before,
+                        "a post-decrypt write failure is not an admission refusal"
+                    );
+                }
+                for attempt in 1..=2 {
+                    client.clone().handle_incoming_message(stanza()).await;
+                    let mut expected = before;
+                    expected[reason] += attempt;
+                    assert_eq!(counts(), expected, "one reason per refused arrival");
+                    assert_eq!(message_acks_for(&transport.sent(), id), 0);
+                    assert_eq!(delivery_receipts_for(&transport.sent(), id), 0);
+                }
+                drop(occupied);
+                drop(receipts);
+                client
+                    .inbound_commit_batch
+                    .fail_commits
+                    .store(false, Ordering::Release);
+                let before_recovery = counts();
+                client.clone().handle_incoming_message(stanza()).await;
+                crate::test_utils::wait_for_outbound_tasks(&client).await;
+                assert_eq!(
+                    counts(),
+                    before_recovery,
+                    "successful recovery must not count a refusal"
+                );
+                assert_eq!(delivery_receipts_for(&transport.sent(), id), 1);
+            }
+            // A full drain batch can release capacity and admit the same arrival.
+            // The first failed reservation must not increment the refusal metric.
+            let client = crate::test_utils::create_test_client_with_backend(Arc::new(
+                wacore::store::in_memory::InMemoryBackend::new(),
+            ))
+            .await;
+            client.enter_drain_mode_for_tests();
+            client
+                .inbound_durability_hook
+                .set(Arc::new(Hook))
+                .ok()
+                .unwrap();
+            let group: Jid = "120363000000000093@g.us".parse().unwrap();
+            let mut alice = joined_group_sender(&client, "100000000000011@lid", &group).await;
+            let before = counts();
+            for index in 0..4 {
+                let ciphertext = encrypt_group_text(&mut alice, &group, "flush retry").await;
+                let mut info = (*group_message_info(
+                    &format!("METRICS_FLUSH_{index}"),
+                    &group,
+                    &alice.jid,
+                    false,
+                ))
+                .clone();
+                info.push_name = "n".repeat(1024 * 1024).into();
+                process_group_classified_with_sessions(
+                    &client,
+                    Arc::new(info),
+                    &alice.jid,
+                    vec![],
+                    vec![skmsg_payload_from_bytes(ciphertext)],
+                )
+                .await;
+            }
+            assert_eq!(counts(), before, "successful flush retry is not a refusal");
+            assert!(
+                client
+                    .flush_inbound_commits_under_permit(true, None, None)
+                    .await
+            );
+        });
+}

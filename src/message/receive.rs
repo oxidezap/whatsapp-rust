@@ -2,6 +2,7 @@
 
 use super::*;
 use smallvec::SmallVec;
+use wacore::telemetry::LiveAdmissionRefusal;
 
 /// Parsed session envelope with explicit retry/ownership semantics.
 ///
@@ -616,6 +617,7 @@ impl Client {
             {
                 Ok(producer) => Some(producer),
                 Err(error) => {
+                    wacore::telemetry::live_admission_refused(LiveAdmissionRefusal::Receipts);
                     log::warn!("Receipt admission refused before decrypt: {error:?}");
                     return;
                 }
@@ -634,6 +636,7 @@ impl Client {
         // untouched for server redelivery; reset never evicts a retained live row.
         let _live_admission = if self.inbound_durability_hook().is_some() {
             if let Err(error) = self.persist_live_retained_before_decrypt(&info).await {
+                wacore::telemetry::live_admission_refused(LiveAdmissionRefusal::RetainedWrite);
                 log::warn!(
                     "Retained live write is still unavailable; leaving ciphertext untouched: {error:?}"
                 );
@@ -670,6 +673,7 @@ impl Client {
             match admission {
                 Ok(admission) => Some(admission),
                 Err(error) => {
+                    wacore::telemetry::live_admission_refused(LiveAdmissionRefusal::Capacity);
                     log::warn!("Live pending capacity exhausted before decrypt: {error:?}");
                     return;
                 }
@@ -686,6 +690,7 @@ impl Client {
             {
                 Ok(producer) => Some(producer),
                 Err(error) => {
+                    wacore::telemetry::live_admission_refused(LiveAdmissionRefusal::Receipts);
                     log::warn!("Receipt admission refused before decrypt: {error:?}");
                     return;
                 }

@@ -19,6 +19,19 @@ pub const DECRYPT_DURATION: &str = "wa_decrypt_duration_seconds";
 pub const SEND_DURATION: &str = "wa_send_duration_seconds";
 pub const APPSTATE_SYNC_DURATION: &str = "wa_appstate_sync_duration_seconds";
 
+/// Why a live ciphertext was left untouched before decrypt with durability enabled.
+/// Counts refused processing attempts, including repeated server deliveries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LiveAdmissionRefusal {
+    /// The live plaintext reservation budget is exhausted after any flush retry.
+    Capacity,
+    /// No receipt scope can be reserved for this arrival.
+    Receipts,
+    /// Recovery of retained plaintext or its durable predecessor did not complete.
+    RetainedWrite,
+}
+
 #[cfg(feature = "metrics")]
 mod imp {
     use metrics::{
@@ -28,6 +41,16 @@ mod imp {
     /// Inbound message by decrypt outcome (`decrypted`/`duplicate`/`undecryptable`/`skmsg`).
     pub fn recv(outcome: &'static str) {
         counter!("wa_recv_total", "outcome" => outcome).increment(1);
+    }
+    /// Live pre-decrypt refusals by a closed reason set. Successful flush retries
+    /// are not refusals; each arrival that stops here increments exactly once.
+    pub fn live_admission_refused(reason: super::LiveAdmissionRefusal) {
+        let reason = match reason {
+            super::LiveAdmissionRefusal::Capacity => "capacity",
+            super::LiveAdmissionRefusal::Receipts => "receipts",
+            super::LiveAdmissionRefusal::RetainedWrite => "retained_write",
+        };
+        counter!("wa_live_admission_refused_total", "reason" => reason).increment(1);
     }
     /// Outgoing send attempt by kind (`dm`/`group`/`status`).
     pub fn send(kind: &'static str) {
@@ -137,6 +160,11 @@ mod imp {
             "Inbound messages by decrypt outcome"
         );
         describe_counter!(
+            "wa_live_admission_refused_total",
+            Unit::Count,
+            "Live processing attempts refused before decrypt, by reason"
+        );
+        describe_counter!(
             "wa_send_total",
             Unit::Count,
             "Outgoing send attempts by kind"
@@ -241,6 +269,8 @@ mod imp {
 mod imp {
     #[inline]
     pub fn recv(_outcome: &'static str) {}
+    #[inline]
+    pub fn live_admission_refused(_reason: super::LiveAdmissionRefusal) {}
     #[inline]
     pub fn send(_kind: &'static str) {}
     #[inline]
