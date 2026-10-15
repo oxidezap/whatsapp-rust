@@ -360,20 +360,20 @@ async fn self_pn_and_lid_sends_never_attach_tokens() {
 }
 
 #[tokio::test]
-async fn namespace_fixture_same_second_seed_replay_counterfactual() {
+async fn namespace_fixture_startup_replay_preserves_live_remap() {
     use crate::lid_pn_cache::{LearningSource, LidPnCache, LidPnEntry};
 
     let pn = "100000000000777";
     let original_lid = "555000000000777";
     let replacement_lid = "111111111111";
     let seed_second = 1_700_000_000;
-    for (offset, expected_after_replay) in [(0, original_lid), (1, replacement_lid)] {
+    for offset in [0, 1] {
         let cache = LidPnCache::new();
         let original =
             LidPnEntry::with_timestamp(original_lid, pn, seed_second, LearningSource::Usync);
         cache.add(&original).await;
         // Model a startup read that finishes applying after the live remap.
-        // The strict-newer twin distinguishes timestamp ordering from tokens.
+        // Same-second and strictly newer live remaps both survive warm-up.
         let startup_snapshot = [original];
         let replacement = LidPnEntry::with_timestamp(
             replacement_lid,
@@ -389,7 +389,7 @@ async fn namespace_fixture_same_second_seed_replay_counterfactual() {
         cache.warm_up(startup_snapshot).await;
         assert_eq!(
             cache.get_current_lid(pn).await.as_deref(),
-            Some(expected_after_replay)
+            Some(replacement_lid)
         );
     }
 }

@@ -1363,6 +1363,98 @@ mod tests {
     use wacore::store::traits::SignalStore;
     use wacore_binary::Server;
 
+    #[cfg(feature = "bench-harness")]
+    async fn startup_snapshot_preserves_usync(delayed: bool) {
+        use crate::store::release::tests::ProbeBackend;
+        use wacore::store::traits::ProtocolStore;
+
+        let lid = "100000001";
+        let old_pn = "12025550112";
+        let new_pn = "12025550111";
+        let (mut backend, _dropped) = ProbeBackend::new();
+        backend
+            .backend
+            .put_lid_mapping(&LidPnMappingEntry {
+                lid: lid.into(),
+                phone_number: old_pn.into(),
+                created_at: 1,
+                updated_at: 1,
+                learning_source: LearningSource::Other.as_str().into(),
+            })
+            .await
+            .unwrap();
+        let (unpark, parked) = async_channel::bounded(1);
+        let (entered, entry) = async_channel::bounded(1);
+        backend.gate_method = "after:get_all_lid_mappings";
+        backend.gate = Some(parked);
+        backend.entered = Some(entered);
+        let backend = Arc::new(backend);
+        let client = create_test_client_with_backend(backend.clone()).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), entry.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let update = client.add_lid_pn_mapping(lid, new_pn, LearningSource::Usync);
+        tokio::pin!(update);
+        // The backend has captured the old row but has not returned it.
+        // Poll the live writer while that snapshot is parked, without sleeps.
+        let completed = delayed
+            && match futures::poll!(update.as_mut()) {
+                std::task::Poll::Ready(result) => {
+                    result.unwrap();
+                    true
+                }
+                std::task::Poll::Pending => false,
+            };
+        unpark.send(()).await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.bench_startup.wait(),
+        )
+        .await
+        .unwrap();
+        if !delayed {
+            assert_eq!(
+                client.lid_pn_cache.get_phone_number(lid).await.as_deref(),
+                Some(old_pn)
+            );
+        }
+        if !completed {
+            update.await.unwrap();
+        }
+
+        assert_eq!(
+            client.lid_pn_cache.get_phone_number(lid).await.as_deref(),
+            Some(new_pn)
+        );
+        assert_eq!(
+            client.lid_pn_cache.get_current_lid(new_pn).await.as_deref(),
+            Some(lid)
+        );
+        assert_eq!(
+            backend
+                .get_lid_mapping(lid)
+                .await
+                .unwrap()
+                .unwrap()
+                .phone_number,
+            new_pn
+        );
+    }
+
+    #[cfg(feature = "bench-harness")]
+    #[tokio::test]
+    async fn delayed_startup_snapshot_preserves_usync() {
+        startup_snapshot_preserves_usync(true).await;
+    }
+
+    #[cfg(feature = "bench-harness")]
+    #[tokio::test]
+    async fn startup_snapshot_before_usync_control() {
+        startup_snapshot_preserves_usync(false).await;
+    }
+
     #[tokio::test]
     async fn lid_pn_batch_preserves_observation_order_after_phone_deduplication() {
         let client = create_test_client().await;

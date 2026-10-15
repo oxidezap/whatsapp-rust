@@ -416,14 +416,29 @@ impl LidPnCache {
     /// Warm up the cache with entries from persistent storage.
     ///
     /// This should be called during client initialization to populate
-    /// the cache from the database.
+    /// the cache from the database. Rows touching an identifier already cached
+    /// are ignored so a delayed snapshot cannot replace a live mapping.
     pub async fn warm_up(&self, entries: impl IntoIterator<Item = LidPnEntry>) {
         let start = wacore::time::Instant::now();
         let mut count = 0;
         let guard = self.lock_mutation().await;
         let mut touched: Vec<Arc<str>> = Vec::new();
 
+        // Live mappings may have changed since the backend captured this
+        // snapshot, even if their persistence is still pending. Filter before
+        // publishing any row so timestamp ordering within the snapshot stays
+        // intact, while neither direction of an existing mapping is replaced.
+        let entries = entries.into_iter();
+        let mut seeds = Vec::with_capacity(entries.size_hint().0);
         for entry in entries {
+            if self.lid_to_entry.get(&*entry.lid).await.is_none()
+                && self.pn_to_entry.get(&*entry.phone_number).await.is_none()
+            {
+                seeds.push(entry);
+            }
+        }
+
+        for entry in seeds {
             self.add_guarded_impl(&entry, &guard, false).await;
             touched.push(Arc::clone(&entry.lid));
             touched.push(Arc::clone(&entry.phone_number));
@@ -686,6 +701,58 @@ mod tests {
         assert!(cache.can_skip_relearn("pn1", "lid1").await);
         assert!(cache.can_skip_relearn("pn2", "lid2").await);
         assert!(cache.can_skip_relearn("pn3", "lid3").await);
+    }
+
+    #[tokio::test]
+    async fn warm_up_preserves_live_identifiers_before_pending_persistence() {
+        for (stored_lid, stored_pn) in [("lid1", "old_pn"), ("old_lid", "pn1"), ("lid1", "pn1")] {
+            let cache = LidPnCache::new();
+            let live = LidPnEntry::with_timestamp("lid1", "pn1", 10, LearningSource::Usync);
+            cache.add(&live).await;
+            // Even a larger stored timestamp cannot supersede an identifier
+            // already learned in this process. The live pair is not durable yet.
+            cache
+                .warm_up([LidPnEntry::with_timestamp(
+                    stored_lid,
+                    stored_pn,
+                    20,
+                    LearningSource::Other,
+                )])
+                .await;
+            for entry in [
+                cache.get_entry_by_lid("lid1").await.unwrap(),
+                cache.get_entry_by_phone("pn1").await.unwrap(),
+            ] {
+                assert_eq!(entry.lid, live.lid);
+                assert_eq!(entry.phone_number, live.phone_number);
+                assert_eq!(entry.created_at, live.created_at);
+                assert_eq!(entry.learning_source, live.learning_source);
+            }
+            assert!(!cache.can_skip_relearn("pn1", "lid1").await);
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_up_keeps_snapshot_timestamp_ordering_in_both_input_orders() {
+        let old = LidPnEntry::with_timestamp("old_lid", "pn1", 1, LearningSource::Other);
+        let latest = LidPnEntry::with_timestamp("new_lid", "pn1", 2, LearningSource::Usync);
+        for entries in [[old.clone(), latest.clone()], [latest.clone(), old.clone()]] {
+            let cache = LidPnCache::new();
+            cache.warm_up(entries).await;
+            assert_eq!(
+                cache.get_current_lid("pn1").await.as_deref(),
+                Some("new_lid")
+            );
+            assert_eq!(
+                cache.get_phone_number("old_lid").await.as_deref(),
+                Some("pn1")
+            );
+            assert_eq!(
+                cache.get_phone_number("new_lid").await.as_deref(),
+                Some("pn1")
+            );
+            assert!(cache.can_skip_relearn("pn1", "new_lid").await);
+        }
     }
 
     /// The startup warm-up races the first live refreshes, so it must record
