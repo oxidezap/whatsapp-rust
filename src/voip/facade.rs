@@ -3671,6 +3671,17 @@ impl CallHandle {
         &self.call_id
     }
 
+    /// The signaling phase owned by this handle's registry generation.
+    ///
+    /// `None` means this generation was removed or superseded. A same-call-id
+    /// replacement never supplies this handle's phase. This is a signaling
+    /// snapshot, not proof that media is flowing; use [`Self::media_stats`] for
+    /// media diagnostics.
+    pub fn phase(&self) -> Option<CallPhase> {
+        self.client_registry
+            .phase_if_current(&self.call_id, self.generation)
+    }
+
     /// Media counters for this call: what arrived, what was discarded, and where.
     ///
     /// All-zero until the media plane attaches, and additive after that; sample twice and subtract
@@ -7613,6 +7624,54 @@ mod tests {
             ended: Arc::new(EndedFlag::default()),
             media: None,
         }
+    }
+
+    #[tokio::test]
+    async fn handle_phase_tracks_owned_signaling_without_requiring_media() {
+        let (client, sends) = make_sending_client().await;
+        let registry = client.call_registry();
+        let generation = registry.insert(mk_session());
+        let handle = registry_handle(&client, generation);
+        let clone = handle.clone();
+
+        assert_eq!(handle.phase(), Some(CallPhase::Ringing));
+        assert!(registry.transition_if_current(
+            handle.call_id(),
+            generation,
+            CallPhase::Connecting
+        ));
+        assert_eq!(handle.phase(), Some(CallPhase::Connecting));
+        assert_eq!(clone.phase(), Some(CallPhase::Connecting));
+        assert!(
+            handle.media.is_none(),
+            "signaling does not imply media readiness"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 0, "observation sends nothing");
+
+        registry.remove_if_current(handle.call_id(), generation);
+        assert_eq!(handle.phase(), None);
+        assert_eq!(clone.phase(), None);
+    }
+
+    #[tokio::test]
+    async fn handle_phase_never_observes_a_same_id_replacement() {
+        let (client, _sends) = make_sending_client().await;
+        let registry = client.call_registry();
+        let generation = registry.insert(mk_session());
+        let old = registry_handle(&client, generation);
+        let replacement_generation = registry.insert(mk_session());
+        let replacement = registry_handle(&client, replacement_generation);
+
+        assert_ne!(generation, replacement_generation);
+        assert_eq!(old.phase(), None);
+        assert_eq!(replacement.phase(), Some(CallPhase::Ringing));
+        assert!(registry.transition_if_current(
+            replacement.call_id(),
+            replacement_generation,
+            CallPhase::Connecting
+        ));
+        assert_eq!(old.phase(), None);
+        assert_eq!(replacement.phase(), Some(CallPhase::Connecting));
     }
 
     // The counters of a call that carried nothing are the ones worth reading, and the natural moment
