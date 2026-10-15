@@ -13,7 +13,7 @@ An async Rust library for WhatsApp Web. Pair a device, send and receive end-to-e
 - QR and pairing-code authentication with persistent sessions.
 - End-to-end encrypted direct and group messaging, media, reactions, receipts, and history sync.
 - Groups, communities, newsletters, status, contacts, and privacy controls.
-- Experimental audio and video calls, both 1:1 and group, plus call links and screen sharing. The optional `voip` feature provides native relay transport and MLOW/Opus audio. Video takes application-supplied H.264 frames ([media API and codec options](https://github.com/oxidezap/whatsapp-rust-docs)).
+- Audio and video calls, both 1:1 and group, plus call links and screen sharing. The optional `voip` feature provides native relay transport and MLOW/Opus audio. Video takes application-supplied H.264 frames ([media API and codec options](https://github.com/oxidezap/whatsapp-rust-docs)).
 - Replaceable storage, transport, HTTP client, and runtime. The default features include SQLite, Tokio WebSocket, ureq, and Tokio. Applications still choose a storage backend. Native plugins are [opt-in](agent_docs/architecture.md).
 
 ## Quick start
@@ -55,28 +55,6 @@ whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "<com
 ```
 
 See the [documentation](https://whatsapp-rust.jlucaso.com) for configuration, alternative backends, and API examples.
-
-## Support
-
-Use docs matching your dependency. Pin a full commit for unreleased APIs;
-the published package version does not identify the current `main` API.
-
-| Profile | Requirements and limits |
-| --- | --- |
-| Native without Tokio | Disable default features and supply runtime, transport, HTTP and storage adapters. The portable core requires `std`; it is not `no_std`. |
-| Local WASM | `wasm32-unknown-unknown`, defaults disabled and host-configured JS randomness. CI executes selected JS-hosted probes; browser-wide, threaded WASM and WASI support are not qualified. |
-| ESP-IDF | `std` with application adapters. The existing ESP32 consumer needs API migration; current S3/C3/C5 firmware, resource limits and recovery are not qualified. |
-
-For VoIP, `voip-control` accepts a host media backend;
-`voip-runtime` adds the portable engine. `voip-relay-native` requires native
-networking, while `voip` also includes MLOW/Opus adapters. A portable build does
-not establish peer interoperability. Hosted-business coexistence and hosted/E2EE
-account-type transitions are outside the supported capability boundary.
-
-For durable ingestion, use the origin-specific hooks documented in
-`types::durability_hook`; callbacks are observers. For shutdown, follow the
-`StoreRelease` Rustdoc sequence and inspect cleanup results before closing your
-backend. Generate Rustdoc from your pinned dependency for unreleased signatures.
 
 ## Related projects
 
