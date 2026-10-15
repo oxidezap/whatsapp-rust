@@ -69,7 +69,9 @@ pub struct LidPnCache {
     // This instance's startup writes break bootstrap ties. Retained external
     // cache rows carry no such provenance. Drop this state
     // after bootstrap; ordinary learning never grows a permanent shadow index.
-    startup_writes: std::sync::Mutex<Option<StartupWrites>>,
+    // Allocate the two map headers only on the first live startup write, so
+    // clients without one do not retain their fixed cost for their lifetime.
+    startup_writes: std::sync::Mutex<Option<Box<StartupWrites>>>,
     startup_finished: AtomicBool,
     pub(crate) identity_continuity: wacore::store::signal_cache::IdentityContinuity,
     /// Device-topology tracker (attached by Client construction): a mapping
@@ -176,7 +178,7 @@ impl LidPnCache {
                 lid_to_entry: TypedCache::from_store(s.clone(), NS_LID, config.timeout),
                 pn_to_entry: TypedCache::from_store(s, NS_PN, config.timeout),
                 mutation: async_lock::Mutex::new(()),
-                startup_writes: std::sync::Mutex::new(Some(StartupWrites::default())),
+                startup_writes: std::sync::Mutex::new(None),
                 startup_finished: AtomicBool::new(false),
                 identity_continuity,
                 // Always in-memory: tracks per-process persist state, never the
@@ -189,7 +191,7 @@ impl LidPnCache {
                 lid_to_entry: TypedCache::from_local(config.build_with_tti()),
                 pn_to_entry: TypedCache::from_local(config.build_with_tti()),
                 mutation: async_lock::Mutex::new(()),
-                startup_writes: std::sync::Mutex::new(Some(StartupWrites::default())),
+                startup_writes: std::sync::Mutex::new(None),
                 startup_finished: AtomicBool::new(false),
                 identity_continuity,
                 persisted: TypedCache::from_local(config.build_with_tti()),
@@ -210,16 +212,19 @@ impl LidPnCache {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .take()
+            .map(|writes| *writes)
     }
 
     fn track_startup_write(&self, record: impl FnOnce(&mut StartupWrites)) {
-        if let Some(writes) = self
+        let mut writes = self
             .startup_writes
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_mut()
-        {
-            record(writes);
+            .unwrap_or_else(|p| p.into_inner());
+        // A caller can pass the fast-path check before warm-up takes the maps.
+        // Check under the lock before lazily creating them, or that late writer
+        // would recreate provenance after bootstrap has already released it.
+        if !self.startup_finished.load(Ordering::Acquire) {
+            record(writes.get_or_insert_default());
         }
     }
 
@@ -1075,11 +1080,13 @@ mod tests {
         for complete in [false, true] {
             let store = Arc::new(SharedCacheStore::default());
             let cache = LidPnCache::with_config(&CacheConfig::default().lid_pn_cache, Some(store));
+            assert!(cache.startup_writes.lock().unwrap().is_none());
             let entry = LidPnEntry::with_timestamp("lid1", "pn1", 10, LearningSource::Usync);
             // The custom store keeps bytes, and the local hash index keeps LIDs.
             // Only transient startup provenance can retain this phone allocation.
             let phone = Arc::downgrade(&entry.phone_number);
             cache.add(&entry).await;
+            assert!(cache.startup_writes.lock().unwrap().is_some());
             drop(entry);
             assert!(phone.upgrade().is_some());
             if complete {
@@ -1096,6 +1103,11 @@ mod tests {
                 drop(scope);
             }
             assert!(phone.upgrade().is_none());
+
+            // Model a writer that passed the outer fast-path check before the
+            // warm-up completed, then acquired the provenance lock afterwards.
+            cache.track_startup_write(|_| panic!("finished startup must reject late writers"));
+            assert!(cache.startup_writes.lock().unwrap().is_none());
 
             let later = LidPnEntry::with_timestamp("lid2", "pn2", 20, LearningSource::Usync);
             let phone = Arc::downgrade(&later.phone_number);
