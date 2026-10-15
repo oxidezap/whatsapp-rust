@@ -10,8 +10,10 @@ use std::sync::{Arc, Mutex};
 /// Both totals include failed attempts. This optional application policy prevents
 /// failover from multiplying the requested budget; it is not a Web retry rule.
 /// Bounded downloads require a streaming HTTP adapter and fail before HTTP when
-/// unavailable. Dropping the future stops work at the next I/O boundary; it
-/// cannot interrupt a blocked adapter read or guarantee sink cleanup.
+/// unavailable. Dropping the future stops active streaming processing at
+/// cooperative I/O checkpoints. It cannot interrupt a blocked adapter/writer
+/// call; already-scheduled failure cleanup may continue. Sink cleanup and
+/// publication safety still require the writer contract on error/cancellation.
 /// Limits count bytes consumed by the media layer and emitted to the sink, not
 /// adapter/TLS buffers, allocator capacity, or RSS. A small budget therefore also
 /// needs a bounded streaming adapter and a destination suited to the platform.

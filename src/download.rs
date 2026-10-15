@@ -1191,7 +1191,10 @@ fn tag_writer_io(error: std::io::Error) -> std::io::Error {
 
 impl<W: std::io::Write> std::io::Write for WriterIoOrigin<'_, W> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.write(bytes).map_err(tag_writer_io)
+        match self.0.write(bytes) {
+            Ok(0) if !bytes.is_empty() => Err(tag_writer_io(std::io::ErrorKind::WriteZero.into())),
+            result => result.map_err(tag_writer_io),
+        }
     }
 
     fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
@@ -1278,16 +1281,23 @@ async fn streaming_download_and_decrypt<W: DownloadWriter + MaybeSend + 'static>
     Ok(wacore::runtime::blocking(&**runtime, move || {
         let mut writer = writer;
 
-        if let Some(budget) = &hashes.budget
-            && let Err(error) = budget.check_cancelled()
-        {
-            return (writer, Err(DownloadRequestError::ResourcePolicy(error)));
-        }
-        if let Err(e) = clear_writer(&mut writer) {
-            return (writer, Err(DownloadRequestError::writer_io(e)));
-        }
-
         let result = (|| -> std::result::Result<(), DownloadRequestError> {
+            if let Some(budget) = &hashes.budget {
+                budget
+                    .check_cancelled()
+                    .map_err(DownloadRequestError::ResourcePolicy)?;
+            }
+            // Clearing has two I/O boundaries; cancellation during truncate must
+            // stop before seek, even when the blocking operation itself succeeds.
+            writer
+                .truncate(0)
+                .map_err(DownloadRequestError::writer_io)?;
+            if let Some(budget) = &hashes.budget {
+                budget
+                    .check_cancelled()
+                    .map_err(DownloadRequestError::ResourcePolicy)?;
+            }
+            writer.rewind().map_err(DownloadRequestError::writer_io)?;
             if let Some(budget) = &hashes.budget {
                 budget
                     .check_cancelled()
@@ -2750,6 +2760,51 @@ mod tests {
         assert_eq!(http.urls().len(), 2);
     }
 
+    #[tokio::test]
+    async fn zero_progress_writer_is_terminal_and_keeps_write_zero_cause() {
+        #[derive(Debug)]
+        struct NoProgress(SharedWriter);
+        impl Write for NoProgress {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Seek for NoProgress {
+            fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+                self.0.seek(pos)
+            }
+        }
+        impl DownloadWriter for NoProgress {
+            fn truncate(&mut self, len: u64) -> std::io::Result<()> {
+                self.0.truncate(len)
+            }
+        }
+        for limits in [DownloadLimits::default(), DownloadLimits::new(100, 100)] {
+            let (params, encrypted) = encrypted_params(b"zero progress");
+            let http = RoutedHttpClient::streaming(Vec::new(), (200, encrypted));
+            let dl = downloader(http.clone(), &["first.example", "second.example"]);
+            let error = dl
+                .download_to_writer(&params, NoProgress(SharedWriter::new()), limits)
+                .await
+                .unwrap_err();
+            let MediaDownloadError::WriterIo(source) = error else {
+                panic!("zero progress must remain a local sink failure");
+            };
+            assert_eq!(
+                source.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::WriteZero
+            );
+            assert_eq!(
+                http.urls().len(),
+                1,
+                "a sink failure must not retry another host"
+            );
+        }
+    }
+
     #[test]
     fn sink_policy_error_still_has_writer_origin() {
         struct PolicySink;
@@ -2780,16 +2835,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_during_final_write_prevents_rewind() {
+    async fn cancellation_during_writer_io_stops_at_next_boundary() {
         struct CancelOnWrite {
             sink: SharedWriter,
             budget: DownloadBudget,
             seeks: usize,
+            cancel_on_truncate: bool,
         }
         impl Write for CancelOnWrite {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
                 let result = self.sink.write(bytes);
-                self.budget.cancel();
+                if !self.cancel_on_truncate {
+                    self.budget.cancel();
+                }
                 result
             }
             fn flush(&mut self) -> std::io::Result<()> {
@@ -2804,41 +2862,58 @@ mod tests {
         }
         impl DownloadWriter for CancelOnWrite {
             fn truncate(&mut self, len: u64) -> std::io::Result<()> {
-                self.sink.truncate(len)
+                let result = self.sink.truncate(len);
+                if self.cancel_on_truncate {
+                    self.budget.cancel();
+                }
+                result
             }
         }
-        let (params, encrypted) = encrypted_params(b"final chunk");
-        let request =
-            DownloadUtils::prepare_download_requests(&params, &MediaRoute::default_hosts())
-                .unwrap()
-                .remove(0);
-        let http: Arc<dyn HttpClient> = RoutedHttpClient::streaming(Vec::new(), (200, encrypted));
-        let runtime: Arc<dyn Runtime> = Arc::new(crate::TokioRuntime);
-        let budget = DownloadBudget::new(DownloadLimits::new(100, 100));
-        let writer = CancelOnWrite {
-            sink: SharedWriter::new(),
-            budget: budget.clone(),
-            seeks: 0,
-        };
-        let (writer, result) = streaming_download_and_decrypt(
-            &http,
-            &runtime,
-            &request,
-            ExpectedMediaHashes {
-                budget: Some(budget),
-                ..ExpectedMediaHashes::from_downloadable(&params)
-            },
-            writer,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            result,
-            Err(DownloadRequestError::ResourcePolicy(
-                DownloadPolicyError::Cancelled
-            ))
-        ));
-        assert_eq!(writer.seeks, 1, "only the initial clear may seek");
+        for cancel_on_truncate in [true, false] {
+            let (params, encrypted) = encrypted_params(b"final chunk");
+            let request =
+                DownloadUtils::prepare_download_requests(&params, &MediaRoute::default_hosts())
+                    .unwrap()
+                    .remove(0);
+            let http = RoutedHttpClient::streaming(Vec::new(), (200, encrypted));
+            let http_client: Arc<dyn HttpClient> = http.clone();
+            let runtime: Arc<dyn Runtime> = Arc::new(crate::TokioRuntime);
+            let budget = DownloadBudget::new(DownloadLimits::new(100, 100));
+            let writer = CancelOnWrite {
+                sink: SharedWriter::new(),
+                budget: budget.clone(),
+                seeks: 0,
+                cancel_on_truncate,
+            };
+            let (writer, result) = streaming_download_and_decrypt(
+                &http_client,
+                &runtime,
+                &request,
+                ExpectedMediaHashes {
+                    budget: Some(budget),
+                    ..ExpectedMediaHashes::from_downloadable(&params)
+                },
+                writer,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                result,
+                Err(DownloadRequestError::ResourcePolicy(
+                    DownloadPolicyError::Cancelled
+                ))
+            ));
+            let expected = usize::from(!cancel_on_truncate);
+            assert_eq!(
+                writer.seeks, expected,
+                "no seek may start after cancellation"
+            );
+            assert_eq!(
+                http.urls().len(),
+                expected,
+                "cancellation during clearing must prevent HTTP"
+            );
+        }
     }
 
     #[tokio::test]
