@@ -83,6 +83,8 @@ fn fixture(n: usize) -> &'static Fixture {
                     for i in 0..m {
                         cache.add(&entry(i)).await;
                     }
+                    // Complete bootstrap before measuring steady-state lookups.
+                    cache.warm_up([]).await;
                 });
                 Fixture {
                     cache,

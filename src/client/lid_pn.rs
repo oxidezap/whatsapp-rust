@@ -129,6 +129,7 @@ impl Client {
         )
     )]
     pub(crate) async fn warm_up_lid_pn_cache(&self) -> Result<(), anyhow::Error> {
+        let _startup = self.lid_pn_cache.warm_up_guard();
         let backend = self.persistence_manager.backend();
         let entries = backend.get_all_lid_mappings().await?;
 
