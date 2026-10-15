@@ -967,13 +967,6 @@ impl InstrumentedRuntime {
     }
 }
 
-// The Runtime trait requires Send + Sync even on wasm32 (where concrete
-// runtimes use the same escape hatch); single-threaded, so this is sound.
-#[cfg(target_arch = "wasm32")]
-unsafe impl Send for InstrumentedRuntime {}
-#[cfg(target_arch = "wasm32")]
-unsafe impl Sync for InstrumentedRuntime {}
-
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait::async_trait]
 impl Runtime for InstrumentedRuntime {

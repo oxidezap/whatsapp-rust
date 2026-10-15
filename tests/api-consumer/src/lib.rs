@@ -58,3 +58,5 @@ pub mod status;
 
 #[cfg(feature = "sdk")]
 pub mod protobuf_contract;
+
+pub mod runtime;

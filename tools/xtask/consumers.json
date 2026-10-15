@@ -6,6 +6,13 @@
       {
         "lanes": ["wasm"],
         "mode": "test",
+        "features": ["runtime-execution"],
+        "test": "local_runtime",
+        "wasm_test": true
+      },
+      {
+        "lanes": ["wasm"],
+        "mode": "test",
         "features": ["wasm-execution"],
         "test": "durability_probe",
         "wasm_test": true

@@ -4,13 +4,15 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::sync_marker::{MaybeSend, MaybeSendSync};
+
 /// A runtime-agnostic abstraction over async executor capabilities.
 ///
 /// On native targets, futures must be `Send`, even on single-threaded executors.
 /// On wasm32, `Send` is dropped (single-threaded).
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
-pub trait Runtime: Send + Sync + 'static {
+pub trait Runtime: MaybeSendSync + 'static {
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> AbortHandle;
 
     /// Spawn a task nobody will cancel.
@@ -49,14 +51,11 @@ pub trait Runtime: Send + Sync + 'static {
 
 /// Local-executor WASM variant with non-`Send` futures.
 ///
-/// The runtime object still requires `Send + Sync`, and [`AbortHandle::new`]
-/// still requires a `Send` cancellation closure. Non-`Send` futures do not
-/// relax those separate obligations. Single-threaded execution alone is not
-/// justification for an unsafe thread-safety implementation. Threaded/atomics
-/// WASM and WASI are not qualified by this local-executor contract.
+/// Runtime objects and cancellation closures may hold local JS handles or `Rc`.
+/// Threaded/atomics WASM and WASI are not qualified by this contract.
 #[cfg(target_arch = "wasm32")]
 #[async_trait(?Send)]
-pub trait Runtime: Send + Sync + 'static {
+pub trait Runtime: MaybeSendSync + 'static {
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + 'static>>) -> AbortHandle;
 
     /// See the native variant: skips building an [`AbortHandle`] nobody keeps.
@@ -102,19 +101,24 @@ pub trait Spawnable: 'static {}
 #[cfg(target_arch = "wasm32")]
 impl<T: 'static> Spawnable for T {}
 
+#[cfg(not(target_arch = "wasm32"))]
+type CancelFn = Box<dyn FnOnce() + Send + 'static>;
+#[cfg(target_arch = "wasm32")]
+type CancelFn = Box<dyn FnOnce() + 'static>;
+
 /// Handle returned by [`Runtime::spawn`]. Aborts the spawned task when dropped.
 ///
-/// Uses `std::sync::Mutex` internally so that the handle is `Send + Sync`,
-/// which is required because it may be stored inside structs shared across
-/// tasks (e.g. `NoiseSocket` behind an `Arc`).
+/// On native targets the cancellation closure is `Send` and the handle is
+/// `Send + Sync`. On wasm32 it may capture local executor state. Aborting
+/// requests cancellation; it does not wait for task destruction.
 #[must_use = "dropping an AbortHandle aborts the task; use .detach() for fire-and-forget"]
 pub struct AbortHandle {
-    abort_fn: std::sync::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
+    abort_fn: std::sync::Mutex<Option<CancelFn>>,
 }
 
 impl AbortHandle {
     /// Create a new abort handle with the given cancellation function.
-    pub fn new(abort_fn: impl FnOnce() + Send + 'static) -> Self {
+    pub fn new(abort_fn: impl FnOnce() + MaybeSend + 'static) -> Self {
         Self {
             abort_fn: std::sync::Mutex::new(Some(Box::new(abort_fn))),
         }
