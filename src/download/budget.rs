@@ -38,8 +38,10 @@ impl DownloadLimits {
     }
 
     pub(super) fn plaintext_capacity(self, declared: u64) -> u64 {
-        self.bounds
-            .map_or(declared, |(_, limit)| declared.min(limit))
+        // CBC decryption and plaintext copying cannot expand their input.
+        self.bounds.map_or(declared, |(wire, plaintext)| {
+            declared.min(wire).min(plaintext)
+        })
     }
 }
 

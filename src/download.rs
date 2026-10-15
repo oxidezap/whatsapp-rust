@@ -2643,6 +2643,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wire_budget_also_bounds_speculative_output_capacity() {
+        use sha2::{Digest, Sha256};
+        let data = b"small media";
+        let params =
+            DownloadParams::plaintext("/small", &Sha256::digest(data), u64::MAX, MediaType::Image)
+                .unwrap();
+        let http = RoutedHttpClient::streaming(Vec::new(), (200, data.to_vec()));
+        let dl = downloader(http, &["cdn.example"]);
+        let output = dl
+            .download(&params, DownloadLimits::new(data.len() as u64, u64::MAX))
+            .await
+            .unwrap();
+        assert_eq!(output, data);
+        assert!(
+            output.capacity() <= data.len(),
+            "a bogus declared size must not reserve more output than the wire budget can produce"
+        );
+    }
+
+    #[tokio::test]
     async fn bounded_buffered_adapter_is_rejected_before_http() {
         let (params, encrypted) = encrypted_params(b"bounded");
         let http = RoutedHttpClient::new(Vec::new(), (200, encrypted));
