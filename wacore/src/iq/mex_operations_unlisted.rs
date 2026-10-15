@@ -1,6 +1,7 @@
 //! Historical public MEX contracts from whatspec 1a441f0329c941fcdb238490a6c604550d8a9939.
 //! Their GraphQL definitions are absent from the next locked Web capture.
-//! Retention preserves API and payload shapes, not a claim of current server support.
+//! Retention preserves payload shapes, not a claim of current server support.
+//! Construction follows [`super::mex_operations`].
 
 use serde::{Deserialize, Serialize};
 
@@ -13,20 +14,15 @@ pub mod create_labyrinth_backup {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaLabyrinthCreateBackup {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -48,6 +44,7 @@ pub mod create_labyrinth_backup {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub wa_labyrinth_create_backup: Option<WaLabyrinthCreateBackup>,
@@ -64,6 +61,7 @@ pub mod debug_labyrinth_inbox_snapshot {
     pub const VARIABLE_KEYS: &[&str] = &["params"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Params {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub lower_timestamp: Option<i64>,
@@ -75,20 +73,15 @@ pub mod debug_labyrinth_inbox_snapshot {
         pub upper_timestamp: Option<i64>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub params: Option<Params>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Item {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -98,6 +91,7 @@ pub mod debug_labyrinth_inbox_snapshot {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Messages {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -111,6 +105,7 @@ pub mod debug_labyrinth_inbox_snapshot {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ItemsWithMessages {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub item: Option<Item>,
@@ -119,12 +114,14 @@ pub mod debug_labyrinth_inbox_snapshot {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct SnapshotThreadsWithMessages {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub items_with_messages: Option<Vec<ItemsWithMessages>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct GetWaMailbox {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -136,6 +133,7 @@ pub mod debug_labyrinth_inbox_snapshot {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub get_wa_mailbox: Option<GetWaMailbox>,
@@ -151,14 +149,8 @@ pub mod debug_labyrinth_range {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["device_id", "message_count", "partial_thread_id"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub device_id: Option<String>,
@@ -169,6 +161,7 @@ pub mod debug_labyrinth_range {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Node {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -182,6 +175,7 @@ pub mod debug_labyrinth_range {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Edges {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -193,6 +187,7 @@ pub mod debug_labyrinth_range {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct PageInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub has_next_page: Option<bool>,
@@ -201,6 +196,7 @@ pub mod debug_labyrinth_range {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Messages {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -212,6 +208,7 @@ pub mod debug_labyrinth_range {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct GetWAMessagingViewerThreadByORF {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -223,6 +220,7 @@ pub mod debug_labyrinth_range {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(rename = "get_WAMessagingViewerThreadByORF")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -239,20 +237,15 @@ pub mod eb_message_metadata_query {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["data"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub data: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct DeanonMessagesMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub admin_message: Option<String>,
@@ -267,12 +260,14 @@ pub mod eb_message_metadata_query {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Mailbox {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub deanon_messages_metadata: Option<Vec<DeanonMessagesMetadata>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct EncryptedBackup {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -281,12 +276,14 @@ pub mod eb_message_metadata_query {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Viewer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub encrypted_backup: Option<EncryptedBackup>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub viewer: Option<Viewer>,
@@ -302,20 +299,15 @@ pub mod rotate_labyrinth_epoch {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaLabyrinthRotateEpoch {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -329,6 +321,7 @@ pub mod rotate_labyrinth_epoch {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub wa_labyrinth_rotate_epoch: Option<WaLabyrinthRotateEpoch>,
@@ -344,14 +337,8 @@ pub mod team_link_create_invitation {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["employeeName", "lid"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(rename = "employeeName")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -361,6 +348,7 @@ pub mod team_link_create_invitation {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WhatsappTeamlinkCreateAgentInvitation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub employee_lid: Option<String>,
@@ -375,6 +363,7 @@ pub mod team_link_create_invitation {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub whatsapp_teamlink_create_agent_invitation:
@@ -391,17 +380,12 @@ pub mod team_link_list_invitations {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &[];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {}
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WhatsappTeamlinkListAgentInvitations {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub employee_lid: Option<String>,
@@ -416,6 +400,7 @@ pub mod team_link_list_invitations {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub whatsapp_teamlink_list_agent_invitations:
@@ -432,20 +417,15 @@ pub mod team_link_remove_invitation {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["lid"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub lid: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WhatsappTeamlinkRemoveAgentInvitation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub removed: Option<String>,
@@ -454,6 +434,7 @@ pub mod team_link_remove_invitation {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub whatsapp_teamlink_remove_agent_invitation:
@@ -470,20 +451,15 @@ pub mod upload_labyrinth_messages {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Results {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub error: Option<String>,
@@ -494,6 +470,7 @@ pub mod upload_labyrinth_messages {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaLabyrinthUploadMessages {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -507,6 +484,7 @@ pub mod upload_labyrinth_messages {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub wa_labyrinth_upload_messages: Option<WaLabyrinthUploadMessages>,

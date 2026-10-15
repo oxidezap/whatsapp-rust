@@ -2,6 +2,10 @@
 //!
 //! One module per persisted GraphQL operation: typed `Variables` + `Response`
 //! plus `DOC_ID`/`OPERATION_KIND`/`NAME`. Depends only on `serde`.
+//!
+//! Construct with `Default` and assign fields. New optional fields preserve this
+//! construction path. `None` omits a key; it supplies no protocol default.
+//! Shapes are inferred from a Web capture, not server-requiredness validation.
 
 #![allow(clippy::all)]
 
@@ -23,20 +27,15 @@ pub mod acs_server_provider_config {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["project_name"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub project_name: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaWaAcsConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub cipher_suite: Option<String>,
@@ -55,6 +54,7 @@ pub mod acs_server_provider_config {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_wa_acs_config: Option<XwaWaAcsConfig>,
@@ -71,6 +71,7 @@ pub mod acs_server_provider_issuance {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub config_id: Option<String>,
@@ -82,26 +83,22 @@ pub mod acs_server_provider_issuance {
         pub request_proof: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Evaluation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub data: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Proof {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub c: Option<String>,
@@ -110,6 +107,7 @@ pub mod acs_server_provider_issuance {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Creds {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub evaluation: Option<Vec<Evaluation>>,
@@ -118,6 +116,7 @@ pub mod acs_server_provider_issuance {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaWaAcsIssueCredentials {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub creds: Option<Creds>,
@@ -128,6 +127,7 @@ pub mod acs_server_provider_issuance {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_wa_acs_issue_credentials: Option<XwaWaAcsIssueCredentials>,
@@ -143,20 +143,15 @@ pub mod accept_newsletter_admin_invite {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["newsletter_id"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub newsletter_id: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewsletterAdminInviteAccept {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -166,6 +161,7 @@ pub mod accept_newsletter_admin_invite {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_admin_invite_accept: Option<Xwa2NewsletterAdminInviteAccept>,
@@ -181,17 +177,12 @@ pub mod account_linking_api_get_certs {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &[];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {}
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct PasswordEncryption {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub cert_chain_pem: Option<String>,
@@ -202,6 +193,7 @@ pub mod account_linking_api_get_certs {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct PayloadEncryption {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub cert_chain_pem: Option<String>,
@@ -212,6 +204,7 @@ pub mod account_linking_api_get_certs {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaffleGetCerts {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub password_encryption: Option<PasswordEncryption>,
@@ -220,6 +213,7 @@ pub mod account_linking_api_get_certs {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub waffle_get_certs: Option<WaffleGetCerts>,
@@ -235,14 +229,8 @@ pub mod ai_agent_auto_reply_control {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["consumer_lid", "phone_number", "thread_status"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub consumer_lid: Option<String>,
@@ -253,6 +241,7 @@ pub mod ai_agent_auto_reply_control {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XfbWhatsappSmbMaibaStatusUpdate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub success: Option<String>,
@@ -261,6 +250,7 @@ pub mod ai_agent_auto_reply_control {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xfb_whatsapp_smb_maiba_status_update: Option<XfbWhatsappSmbMaibaStatusUpdate>,
@@ -276,23 +266,19 @@ pub mod auth_agent_feature_policy {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &[];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {}
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WhatsappAuthorizedAgentFeaturePolicy {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub disabled_features: Option<bool>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub whatsapp_authorized_agent_feature_policy: Option<WhatsappAuthorizedAgentFeaturePolicy>,
@@ -308,14 +294,8 @@ pub mod bp_access_token_and_session_cookies {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["application_id", "code"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub application_id: Option<String>,
@@ -324,6 +304,7 @@ pub mod bp_access_token_and_session_cookies {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaBpAccessTokenAndSessionCookies {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub access_token: Option<String>,
@@ -340,6 +321,7 @@ pub mod bp_access_token_and_session_cookies {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_bp_access_token_and_session_cookies: Option<XwaBpAccessTokenAndSessionCookies>,
@@ -356,6 +338,7 @@ pub mod biz_create_order {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Order {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub jid: Option<String>,
@@ -364,25 +347,21 @@ pub mod biz_create_order {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub order: Option<Order>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Price {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub currency: Option<String>,
@@ -395,6 +374,7 @@ pub mod biz_create_order {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Order2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub order_id: Option<String>,
@@ -405,12 +385,14 @@ pub mod biz_create_order {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaCheckoutPlaceOrder {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub order: Option<Order2>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_checkout_place_order: Option<XwaCheckoutPlaceOrder>,
@@ -427,31 +409,28 @@ pub mod biz_custom_url_get_user_graphql {
     pub const VARIABLE_KEYS: &[&str] = &["data"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct CustomUrl {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub path: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Data {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub custom_url: Option<CustomUrl>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub data: Option<Data>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaCustomUrlGetUser {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub error_code: Option<String>,
@@ -464,6 +443,7 @@ pub mod biz_custom_url_get_user_graphql {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_custom_url_get_user: Option<XwaCustomUrlGetUser>,
@@ -480,6 +460,7 @@ pub mod biz_get_categories {
     pub const VARIABLE_KEYS: &[&str] = &["query_params"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct QueryParams {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub locale: Option<String>,
@@ -491,20 +472,15 @@ pub mod biz_get_categories {
         pub version: Option<i64>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub query_params: Option<QueryParams>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Categories {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub display_name: Option<String>,
@@ -513,6 +489,7 @@ pub mod biz_get_categories {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct NotABiz {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub display_name: Option<String>,
@@ -521,6 +498,7 @@ pub mod biz_get_categories {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WhatsappCatkitTypeaheadProxy {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub categories: Option<Vec<Categories>>,
@@ -529,6 +507,7 @@ pub mod biz_get_categories {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub whatsapp_catkit_typeahead_proxy: Option<WhatsappCatkitTypeaheadProxy>,
@@ -545,6 +524,7 @@ pub mod biz_get_categories_v2 {
     pub const VARIABLE_KEYS: &[&str] = &["query_params"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct QueryParams {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub locale: Option<String>,
@@ -556,20 +536,15 @@ pub mod biz_get_categories_v2 {
         pub version: Option<i64>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub query_params: Option<QueryParams>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Categories {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub display_name: Option<String>,
@@ -578,6 +553,7 @@ pub mod biz_get_categories_v2 {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Categories2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub categories: Option<Vec<Categories>>,
@@ -588,6 +564,7 @@ pub mod biz_get_categories_v2 {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Categories3 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub categories: Option<Vec<Categories2>>,
@@ -598,6 +575,7 @@ pub mod biz_get_categories_v2 {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct NotABiz {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub display_name: Option<String>,
@@ -606,6 +584,7 @@ pub mod biz_get_categories_v2 {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WhatsappCatkitTypeaheadProxy {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub categories: Option<Vec<Categories3>>,
@@ -614,6 +593,7 @@ pub mod biz_get_categories_v2 {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub whatsapp_catkit_typeahead_proxy: Option<WhatsappCatkitTypeaheadProxy>,
@@ -630,37 +610,35 @@ pub mod biz_get_custom_url_user_graphql {
     pub const VARIABLE_KEYS: &[&str] = &["data"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct CustomUrl {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub path: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Data {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub custom_url: Option<CustomUrl>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub data: Option<Data>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct User {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub jid: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaCustomUrlGetUser {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub error_code: Option<String>,
@@ -673,6 +651,7 @@ pub mod biz_get_custom_url_user_graphql {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_custom_url_get_user: Option<XwaCustomUrlGetUser>,
@@ -688,20 +667,15 @@ pub mod biz_get_merchant_compliance {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["request"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub request: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct CustomerCareDetails {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub email: Option<String>,
@@ -712,6 +686,7 @@ pub mod biz_get_merchant_compliance {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct GrievanceOfficerDetails {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub email: Option<String>,
@@ -724,6 +699,7 @@ pub mod biz_get_merchant_compliance {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct MerchantInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub customer_care_details: Option<CustomerCareDetails>,
@@ -740,12 +716,14 @@ pub mod biz_get_merchant_compliance {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XfbWhatsappBizMerchantComplianceInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub merchant_info: Option<MerchantInfo>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xfb_whatsapp_biz_merchant_compliance_info: Option<XfbWhatsappBizMerchantComplianceInfo>,
@@ -762,25 +740,21 @@ pub mod biz_get_price_tiers {
     pub const VARIABLE_KEYS: &[&str] = &["request"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub locale: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub request: Option<Request>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct PriceTiers {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub description: Option<String>,
@@ -791,12 +765,14 @@ pub mod biz_get_price_tiers {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaWhatsappGetPricingTiers {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub price_tiers: Option<Vec<PriceTiers>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_whatsapp_get_pricing_tiers: Option<XwaWhatsappGetPricingTiers>,
@@ -812,14 +788,8 @@ pub mod biz_get_profile_shimlinks {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["bizJid"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(rename = "bizJid")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -827,6 +797,7 @@ pub mod biz_get_profile_shimlinks {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaWhatsappSmbGetProfileLinkshims {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub shimmed_website_url: Option<String>,
@@ -835,6 +806,7 @@ pub mod biz_get_profile_shimlinks {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_whatsapp_smb_get_profile_linkshims: Option<Vec<XwaWhatsappSmbGetProfileLinkshims>>,
@@ -850,20 +822,15 @@ pub mod biz_graph_ql_refresh_cart {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["request"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub request: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct PriceDetails {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub currency: Option<String>,
@@ -876,6 +843,7 @@ pub mod biz_graph_ql_refresh_cart {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ImporterAddress {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub city: Option<String>,
@@ -892,6 +860,7 @@ pub mod biz_graph_ql_refresh_cart {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ComplianceInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub country_code_origin: Option<String>,
@@ -902,6 +871,7 @@ pub mod biz_graph_ql_refresh_cart {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct OriginalDimensions {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub height: Option<i64>,
@@ -910,6 +880,7 @@ pub mod biz_graph_ql_refresh_cart {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Images {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -920,6 +891,7 @@ pub mod biz_graph_ql_refresh_cart {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Videos {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -930,6 +902,7 @@ pub mod biz_graph_ql_refresh_cart {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Media {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub images: Option<Vec<Images>>,
@@ -938,6 +911,7 @@ pub mod biz_graph_ql_refresh_cart {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct SalePrice {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub end_date: Option<String>,
@@ -948,6 +922,7 @@ pub mod biz_graph_ql_refresh_cart {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct StatusInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub can_appeal: Option<bool>,
@@ -960,6 +935,7 @@ pub mod biz_graph_ql_refresh_cart {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Options {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
@@ -968,6 +944,7 @@ pub mod biz_graph_ql_refresh_cart {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Listing {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub is_available: Option<bool>,
@@ -978,12 +955,14 @@ pub mod biz_graph_ql_refresh_cart {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Availability {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub listing: Option<Vec<Listing>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ListingDetails {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub description: Option<String>,
@@ -994,6 +973,7 @@ pub mod biz_graph_ql_refresh_cart {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ThumbnailMedia {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -1006,6 +986,7 @@ pub mod biz_graph_ql_refresh_cart {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Options2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub thumbnail_media: Option<ThumbnailMedia>,
@@ -1014,6 +995,7 @@ pub mod biz_graph_ql_refresh_cart {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Types {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
@@ -1022,6 +1004,7 @@ pub mod biz_graph_ql_refresh_cart {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct VariantProperties {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
@@ -1030,6 +1013,7 @@ pub mod biz_graph_ql_refresh_cart {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct VariantInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub availability: Option<Availability>,
@@ -1042,6 +1026,7 @@ pub mod biz_graph_ql_refresh_cart {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Products {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub availability: Option<String>,
@@ -1086,6 +1071,7 @@ pub mod biz_graph_ql_refresh_cart {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Cart {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub price_details: Option<PriceDetails>,
@@ -1094,12 +1080,14 @@ pub mod biz_graph_ql_refresh_cart {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaCheckoutRefreshCart {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub cart: Option<Cart>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_checkout_refresh_cart: Option<XwaCheckoutRefreshCart>,
@@ -1116,6 +1104,7 @@ pub mod biz_profile_address_autocomplete {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub center: Option<String>,
@@ -1125,20 +1114,15 @@ pub mod biz_profile_address_autocomplete {
         pub use_case_id: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Address {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub city: Option<String>,
@@ -1153,6 +1137,7 @@ pub mod biz_profile_address_autocomplete {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Location {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub latitude: Option<String>,
@@ -1161,6 +1146,7 @@ pub mod biz_profile_address_autocomplete {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Items {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub address: Option<Address>,
@@ -1173,12 +1159,14 @@ pub mod biz_profile_address_autocomplete {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WhatsappMapsTypeahead {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub items: Option<Vec<Items>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub whatsapp_maps_typeahead: Option<WhatsappMapsTypeahead>,
@@ -1195,6 +1183,7 @@ pub mod biz_query_order {
     pub const VARIABLE_KEYS: &[&str] = &["request"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ImageDimensions {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub height: Option<i64>,
@@ -1203,12 +1192,14 @@ pub mod biz_query_order {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Token {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub sensitive_string_value: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Order {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub direct_connection_encrypted_info: Option<String>,
@@ -1223,25 +1214,21 @@ pub mod biz_query_order {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub order: Option<Order>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub request: Option<Request>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct PriceDetails {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub currency: Option<String>,
@@ -1252,6 +1239,7 @@ pub mod biz_query_order {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Images {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -1260,12 +1248,14 @@ pub mod biz_query_order {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Media {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub images: Option<Vec<Images>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct VariantProperties {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
@@ -1274,12 +1264,14 @@ pub mod biz_query_order {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct VariantInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub variant_properties: Option<Vec<VariantProperties>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Products {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub currency: Option<String>,
@@ -1298,6 +1290,7 @@ pub mod biz_query_order {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Order2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub creation_time_stamp: Option<String>,
@@ -1308,12 +1301,14 @@ pub mod biz_query_order {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaCheckoutGetOrderInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub order: Option<Order2>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_checkout_get_order_info: Option<XwaCheckoutGetOrderInfo>,
@@ -1329,20 +1324,15 @@ pub mod biz_set_merchant_compliance {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct CustomerCareDetails {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub email: Option<String>,
@@ -1353,6 +1343,7 @@ pub mod biz_set_merchant_compliance {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct GrievanceOfficerDetails {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub email: Option<String>,
@@ -1365,6 +1356,7 @@ pub mod biz_set_merchant_compliance {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct MerchantInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub customer_care_details: Option<CustomerCareDetails>,
@@ -1381,6 +1373,7 @@ pub mod biz_set_merchant_compliance {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XfbWhatsappBizMerchantSetComplianceInfo {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1390,6 +1383,7 @@ pub mod biz_set_merchant_compliance {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xfb_whatsapp_biz_merchant_set_compliance_info:
@@ -1407,6 +1401,7 @@ pub mod cached_token {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub client_pub_key: Option<String>,
@@ -1414,20 +1409,15 @@ pub mod cached_token {
         pub request_id: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct EncryptedAccessTokens {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub algorithm: Option<String>,
@@ -1442,12 +1432,14 @@ pub mod cached_token {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2EntTradeCanonicalNonceForAccessTokens {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub encrypted_access_tokens: Option<EncryptedAccessTokens>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_ent_trade_canonical_nonce_for_access_tokens:
@@ -1464,23 +1456,19 @@ pub mod canonical_user_valid {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &[];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {}
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaCanonicalUserValid {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub success: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_canonical_user_valid: Option<XwaCanonicalUserValid>,
@@ -1496,14 +1484,8 @@ pub mod change_newsletter_owner {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["newsletter_id", "user_id"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub newsletter_id: Option<String>,
@@ -1512,6 +1494,7 @@ pub mod change_newsletter_owner {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewsletterChangeOwner {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1521,6 +1504,7 @@ pub mod change_newsletter_owner {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_change_owner: Option<Xwa2NewsletterChangeOwner>,
@@ -1537,6 +1521,7 @@ pub mod consumer_fetch_quick_promotions {
     pub const VARIABLE_KEYS: &[&str] = &["nux_ids", "trigger_context"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaSmbTriggerContext {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub app_version: Option<i64>,
@@ -1549,19 +1534,14 @@ pub mod consumer_fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct TriggerContext {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub wa_smb_trigger_context: Option<WaSmbTriggerContext>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub nux_ids: Option<Vec<String>>,
@@ -1570,6 +1550,7 @@ pub mod consumer_fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaBannerBackgroundColor {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub dark_mode_background_color: Option<String>,
@@ -1582,6 +1563,7 @@ pub mod consumer_fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ContentAttributes {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub wa_banner_background_color: Option<WaBannerBackgroundColor>,
@@ -1592,9 +1574,11 @@ pub mod consumer_fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Filters {}
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Clauses {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub clause_type: Option<String>,
@@ -1603,6 +1587,7 @@ pub mod consumer_fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Clauses2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub clause_type: Option<String>,
@@ -1613,6 +1598,7 @@ pub mod consumer_fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Clauses3 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub clause_type: Option<String>,
@@ -1623,6 +1609,7 @@ pub mod consumer_fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Clauses4 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub clause_type: Option<String>,
@@ -1633,6 +1620,7 @@ pub mod consumer_fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Clauses5 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub clause_type: Option<String>,
@@ -1643,6 +1631,7 @@ pub mod consumer_fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Clauses6 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub clause_type: Option<String>,
@@ -1653,6 +1642,7 @@ pub mod consumer_fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Clauses7 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub clause_type: Option<String>,
@@ -1663,6 +1653,7 @@ pub mod consumer_fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ContextualFiltersForWaDoNotUse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub clause_type: Option<String>,
@@ -1673,12 +1664,14 @@ pub mod consumer_fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Content {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub text: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct DismissAction {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1688,12 +1681,14 @@ pub mod consumer_fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Title {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub text: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct PrimaryAction {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1707,18 +1702,21 @@ pub mod consumer_fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaDarkModeMediaDetails {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub jpeg_thumbnail: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaLightModeMediaDetails {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub jpeg_thumbnail: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Creatives {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1744,6 +1742,7 @@ pub mod consumer_fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaQpContentAttributesDoNotUse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
@@ -1752,6 +1751,7 @@ pub mod consumer_fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Node {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1783,6 +1783,7 @@ pub mod consumer_fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct TimeRange {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub end: Option<String>,
@@ -1791,6 +1792,7 @@ pub mod consumer_fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Edges {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub client_ttl_seconds: Option<i64>,
@@ -1807,12 +1809,14 @@ pub mod consumer_fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct EligiblePromotions {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub edges: Option<Vec<Edges>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct QuickPromotionMultiverseBatchFetchRoot {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub eligible_promotions: Option<EligiblePromotions>,
@@ -1821,6 +1825,7 @@ pub mod consumer_fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub quick_promotion_multiverse_batch_fetch_root:
@@ -1837,26 +1842,22 @@ pub mod consumer_quick_promotion_action_graph_ql {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaConsumerQuickPromotionLogEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub client_mutation_id: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub wa_consumer_quick_promotion_log_event: Option<WaConsumerQuickPromotionLogEvent>,
@@ -1872,26 +1873,22 @@ pub mod contact_manager_customer_profile {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["lid"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub lid: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct LastUpdates {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub ts: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XfbWaCustomerProfile {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub acquisition_date: Option<String>,
@@ -1914,6 +1911,7 @@ pub mod contact_manager_customer_profile {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xfb_wa_customer_profile: Option<XfbWaCustomerProfile>,
@@ -1929,32 +1927,29 @@ pub mod contact_manager_customer_profile_upsert {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Vec<String>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Profiles {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub lid: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XfbWaUpsertCustomerProfiles {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub profiles: Option<Vec<Profiles>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xfb_wa_upsert_customer_profiles: Option<XfbWaUpsertCustomerProfiles>,
@@ -1971,6 +1966,7 @@ pub mod contact_manager_customer_profiles {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Filters {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub field_name: Option<String>,
@@ -1979,6 +1975,7 @@ pub mod contact_manager_customer_profiles {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub candidate_lids: Option<Vec<String>>,
@@ -1994,26 +1991,22 @@ pub mod contact_manager_customer_profiles {
         pub sort_descending: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct LastUpdates {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub ts: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Profiles {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub acquisition_source: Option<String>,
@@ -2032,6 +2025,7 @@ pub mod contact_manager_customer_profiles {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XfbWaCustomerProfiles {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub cursor: Option<String>,
@@ -2040,6 +2034,7 @@ pub mod contact_manager_customer_profiles {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xfb_wa_customer_profiles: Option<XfbWaCustomerProfiles>,
@@ -2056,6 +2051,7 @@ pub mod create_invite_code {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub entry_point: Option<String>,
@@ -2065,26 +2061,22 @@ pub mod create_invite_code {
         pub server_send_sms: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2GrowthCreateInviteCode {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub code: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_growth_create_invite_code: Option<Xwa2GrowthCreateInviteCode>,
@@ -2100,20 +2092,15 @@ pub mod create_marketing_campaign_action {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WhatsappMarketingMessagesCreate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub ad_campaign_group_id: Option<String>,
@@ -2136,6 +2123,7 @@ pub mod create_marketing_campaign_action {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub whatsapp_marketing_messages_create: Option<WhatsappMarketingMessagesCreate>,
@@ -2152,6 +2140,7 @@ pub mod create_newsletter {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub description: Option<String>,
@@ -2161,26 +2150,22 @@ pub mod create_newsletter {
         pub picture: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct State {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub r#type: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Description {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -2191,6 +2176,7 @@ pub mod create_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Name {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -2201,6 +2187,7 @@ pub mod create_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Picture {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub direct_path: Option<String>,
@@ -2211,6 +2198,7 @@ pub mod create_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Preview {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub direct_path: Option<String>,
@@ -2221,6 +2209,7 @@ pub mod create_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ThreadMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub creation_time: Option<i64>,
@@ -2243,6 +2232,7 @@ pub mod create_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Settings {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub r#type: Option<String>,
@@ -2251,6 +2241,7 @@ pub mod create_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ViewerMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub role: Option<String>,
@@ -2259,6 +2250,7 @@ pub mod create_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewsletterCreate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -2271,6 +2263,7 @@ pub mod create_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_create: Option<Xwa2NewsletterCreate>,
@@ -2286,14 +2279,8 @@ pub mod create_newsletter_admin_invite {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["newsletter_id", "user_id"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub newsletter_id: Option<String>,
@@ -2302,6 +2289,7 @@ pub mod create_newsletter_admin_invite {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewsletterAdminInviteCreate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -2310,6 +2298,7 @@ pub mod create_newsletter_admin_invite {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_admin_invite_create: Option<Xwa2NewsletterAdminInviteCreate>,
@@ -2325,14 +2314,8 @@ pub mod create_report_appeal {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["reason", "report_id"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub reason: Option<String>,
@@ -2341,6 +2324,7 @@ pub mod create_report_appeal {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Appeal {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub appeal_id: Option<String>,
@@ -2355,6 +2339,7 @@ pub mod create_report_appeal {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct AppealReasonOptions {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub label: Option<String>,
@@ -2363,6 +2348,7 @@ pub mod create_report_appeal {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct QuestionData {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2372,6 +2358,7 @@ pub mod create_report_appeal {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ReportedContentData {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2389,6 +2376,7 @@ pub mod create_report_appeal {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2CreateChannelReportAppealV2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub appeal: Option<Appeal>,
@@ -2411,6 +2399,7 @@ pub mod create_report_appeal {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_create_channel_report_appeal_v2: Option<Xwa2CreateChannelReportAppealV2>,
@@ -2427,25 +2416,21 @@ pub mod create_whats_app_ads_identity {
     pub const VARIABLE_KEYS: &[&str] = &["code", "phone_number"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Code {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub sensitive_string_value: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct PhoneNumber {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub sensitive_string_value: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub code: Option<Code>,
@@ -2454,12 +2439,14 @@ pub mod create_whats_app_ads_identity {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct CreateOrUpdateWhatsappAdsIdentity {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub create_or_update_whatsapp_ads_identity: Option<CreateOrUpdateWhatsappAdsIdentity>,
@@ -2475,14 +2462,8 @@ pub mod custom_label3pd_event {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["custom_labels", "expt_group"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub custom_labels: Option<String>,
@@ -2491,6 +2472,7 @@ pub mod custom_label3pd_event {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaGet3pdEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub ctwa_3pd_conversion_metadata: Option<String>,
@@ -2503,6 +2485,7 @@ pub mod custom_label3pd_event {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_get_3pd_event: Option<Vec<XwaGet3pdEvent>>,
@@ -2518,26 +2501,22 @@ pub mod delete_newsletter {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["newsletter_id"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub newsletter_id: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct State {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub r#type: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewsletterDeleteV2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -2546,6 +2525,7 @@ pub mod delete_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_delete_v2: Option<Xwa2NewsletterDeleteV2>,
@@ -2561,14 +2541,8 @@ pub mod demote_newsletter_admin {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["newsletter_id", "user_id"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub newsletter_id: Option<String>,
@@ -2577,6 +2551,7 @@ pub mod demote_newsletter_admin {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewsletterAdminDemote {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2586,6 +2561,7 @@ pub mod demote_newsletter_admin {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_admin_demote: Option<Xwa2NewsletterAdminDemote>,
@@ -2601,14 +2577,8 @@ pub mod edit_biz_profile {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["input", "lid"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<String>,
@@ -2617,6 +2587,7 @@ pub mod edit_biz_profile {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub edit_wa_web_biz_profile: Option<String>,
@@ -2632,20 +2603,15 @@ pub mod external_ctx_authorise_wa_chat {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaExternalCtxAuthoriseWaChat {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub partner_name: Option<String>,
@@ -2654,6 +2620,7 @@ pub mod external_ctx_authorise_wa_chat {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_external_ctx_authorise_wa_chat: Option<XwaExternalCtxAuthoriseWaChat>,
@@ -2670,25 +2637,21 @@ pub mod fetch_about_status {
     pub const VARIABLE_KEYS: &[&str] = &["user"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct User {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub user_id: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub user: Option<User>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Updates {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2698,12 +2661,14 @@ pub mod fetch_about_status {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2UsersUpdatesSince {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub updates: Option<Vec<Updates>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_users_updates_since: Option<Vec<Xwa2UsersUpdatesSince>>,
@@ -2719,14 +2684,8 @@ pub mod fetch_all_newsletters_metadata {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["fetch_status_metadata", "fetch_wamo_sub"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub fetch_status_metadata: Option<bool>,
@@ -2735,12 +2694,14 @@ pub mod fetch_all_newsletters_metadata {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct State {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub r#type: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct StatusMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub last_status_sent_time: Option<i64>,
@@ -2749,6 +2710,7 @@ pub mod fetch_all_newsletters_metadata {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Description {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -2759,6 +2721,7 @@ pub mod fetch_all_newsletters_metadata {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Name {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -2769,6 +2732,7 @@ pub mod fetch_all_newsletters_metadata {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Picture {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub direct_path: Option<String>,
@@ -2779,6 +2743,7 @@ pub mod fetch_all_newsletters_metadata {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Preview {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub direct_path: Option<String>,
@@ -2789,24 +2754,28 @@ pub mod fetch_all_newsletters_metadata {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ReactionCodes {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub value: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Settings {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub reaction_codes: Option<ReactionCodes>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WamoSub {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub plan_id: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ThreadMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub creation_time: Option<i64>,
@@ -2831,6 +2800,7 @@ pub mod fetch_all_newsletters_metadata {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Settings2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub r#type: Option<String>,
@@ -2839,6 +2809,7 @@ pub mod fetch_all_newsletters_metadata {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ViewerMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub role: Option<String>,
@@ -2849,6 +2820,7 @@ pub mod fetch_all_newsletters_metadata {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewsletterSubscribed {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -2863,6 +2835,7 @@ pub mod fetch_all_newsletters_metadata {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_subscribed: Option<Vec<Xwa2NewsletterSubscribed>>,
@@ -2878,14 +2851,8 @@ pub mod fetch_all_subgroups {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["group_id", "query_context", "sub_group_hint_id"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub group_id: Option<String>,
@@ -2896,6 +2863,7 @@ pub mod fetch_all_subgroups {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Subject {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub creation_time: Option<i64>,
@@ -2904,6 +2872,7 @@ pub mod fetch_all_subgroups {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct DefaultSubGroup {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -2912,12 +2881,14 @@ pub mod fetch_all_subgroups {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct MembershipApprovalRequests {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub total_count: Option<i64>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Properties {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub general_chat: Option<String>,
@@ -2928,6 +2899,7 @@ pub mod fetch_all_subgroups {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Node {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -2940,18 +2912,21 @@ pub mod fetch_all_subgroups {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Edges {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub node: Option<Node>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct SubGroups {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub edges: Option<Vec<Edges>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2GroupQueryById {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2965,6 +2940,7 @@ pub mod fetch_all_subgroups {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_group_query_by_id: Option<Xwa2GroupQueryById>,
@@ -2980,20 +2956,15 @@ pub mod fetch_bot_certificate_revocation_list {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["crl_name"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub crl_name: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2FetchFeaturePkiCrl {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub crl: Option<String>,
@@ -3002,6 +2973,7 @@ pub mod fetch_bot_certificate_revocation_list {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_fetch_feature_pki_crl: Option<Xwa2FetchFeaturePkiCrl>,
@@ -3017,20 +2989,15 @@ pub mod fetch_bot_profiles_gql {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["ids"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub ids: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Creator {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
@@ -3039,6 +3006,7 @@ pub mod fetch_bot_profiles_gql {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct LatestPublishedVersionForViewer {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3056,6 +3024,7 @@ pub mod fetch_bot_profiles_gql {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XfbFetchGenaiPersonas {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3073,6 +3042,7 @@ pub mod fetch_bot_profiles_gql {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xfb_fetch_genai_personas: Option<Vec<XfbFetchGenaiPersonas>>,
@@ -3088,17 +3058,12 @@ pub mod fetch_dynamic_ai_modes {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &[];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {}
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XfbMetaAiModes {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub is_experimental: Option<bool>,
@@ -3113,6 +3078,7 @@ pub mod fetch_dynamic_ai_modes {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xfb_meta_ai_modes: Option<Vec<XfbMetaAiModes>>,
@@ -3133,14 +3099,8 @@ pub mod fetch_group_info {
         "query_context",
     ];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -3153,6 +3113,7 @@ pub mod fetch_group_info {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct UsernameInfo {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3162,6 +3123,7 @@ pub mod fetch_group_info {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Creator {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -3174,6 +3136,7 @@ pub mod fetch_group_info {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Description {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub creation_time: Option<i64>,
@@ -3186,6 +3149,7 @@ pub mod fetch_group_info {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Node {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub display_name: Option<String>,
@@ -3200,6 +3164,7 @@ pub mod fetch_group_info {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Edges {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub group_history_sent: Option<String>,
@@ -3212,6 +3177,7 @@ pub mod fetch_group_info {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Participants {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub edges: Option<Vec<Edges>>,
@@ -3220,30 +3186,35 @@ pub mod fetch_group_info {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Ephemeral {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub expiration_time_in_sec: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct GrowthLocked2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub locked: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct LidMigrationState {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub addressing_mode: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct LimitSharing {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub limit_sharing_enabled: Option<bool>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Properties {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub allow_admin_reports: Option<bool>,
@@ -3290,6 +3261,7 @@ pub mod fetch_group_info {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Subject {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub creation_time: Option<i64>,
@@ -3300,6 +3272,7 @@ pub mod fetch_group_info {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2GroupQueryById {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3329,6 +3302,7 @@ pub mod fetch_group_info {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_group_query_by_id: Option<Xwa2GroupQueryById>,
@@ -3349,14 +3323,8 @@ pub mod fetch_group_info_includ_bots {
         "query_context",
     ];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -3369,6 +3337,7 @@ pub mod fetch_group_info_includ_bots {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct UsernameInfo {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3378,6 +3347,7 @@ pub mod fetch_group_info_includ_bots {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Creator {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -3390,6 +3360,7 @@ pub mod fetch_group_info_includ_bots {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Description {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub creation_time: Option<i64>,
@@ -3402,6 +3373,7 @@ pub mod fetch_group_info_includ_bots {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Participant {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3421,6 +3393,7 @@ pub mod fetch_group_info_includ_bots {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Edges {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub group_history_sent: Option<String>,
@@ -3433,6 +3406,7 @@ pub mod fetch_group_info_includ_bots {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Participants {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub edges: Option<Vec<Edges>>,
@@ -3441,30 +3415,35 @@ pub mod fetch_group_info_includ_bots {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Ephemeral {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub expiration_time_in_sec: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct GrowthLocked2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub locked: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct LidMigrationState {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub addressing_mode: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct LimitSharing {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub limit_sharing_enabled: Option<bool>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Properties {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub allow_admin_reports: Option<bool>,
@@ -3511,6 +3490,7 @@ pub mod fetch_group_info_includ_bots {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Subject {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub creation_time: Option<i64>,
@@ -3521,6 +3501,7 @@ pub mod fetch_group_info_includ_bots {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2GroupQueryById {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3550,6 +3531,7 @@ pub mod fetch_group_info_includ_bots {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_group_query_by_id: Option<Xwa2GroupQueryById>,
@@ -3565,14 +3547,8 @@ pub mod fetch_group_invite_code {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["id", "query_context"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -3581,6 +3557,7 @@ pub mod fetch_group_invite_code {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2GroupQueryById {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3592,6 +3569,7 @@ pub mod fetch_group_invite_code {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_group_query_by_id: Option<Xwa2GroupQueryById>,
@@ -3607,26 +3585,22 @@ pub mod fetch_group_is_internal {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["id"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Properties {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub internal: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2GroupQueryById {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3638,6 +3612,7 @@ pub mod fetch_group_is_internal {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_group_query_by_id: Option<Xwa2GroupQueryById>,
@@ -3654,12 +3629,14 @@ pub mod fetch_integrity_signals {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct IntegritySignals {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub use_case: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct QueryInput {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub integrity_signals: Option<IntegritySignals>,
@@ -3668,12 +3645,14 @@ pub mod fetch_integrity_signals {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Telemetry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub context: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub query_input: Option<Vec<QueryInput>>,
@@ -3681,20 +3660,15 @@ pub mod fetch_integrity_signals {
         pub telemetry: Option<Telemetry>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct IntegritySignalsInfo {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3706,6 +3680,7 @@ pub mod fetch_integrity_signals {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2FetchWaUsers {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3717,6 +3692,7 @@ pub mod fetch_integrity_signals {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_fetch_wa_users: Option<Vec<Xwa2FetchWaUsers>>,
@@ -3733,25 +3709,21 @@ pub mod fetch_new_chat_message_capping_info {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub r#type: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct SubscriptionStatus {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
@@ -3760,6 +3732,7 @@ pub mod fetch_new_chat_message_capping_info {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2MessageCappingInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub capping_status: Option<String>,
@@ -3782,6 +3755,7 @@ pub mod fetch_new_chat_message_capping_info {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_message_capping_info: Option<Xwa2MessageCappingInfo>,
@@ -3806,6 +3780,7 @@ pub mod fetch_newsletter {
     ];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub key: Option<String>,
@@ -3815,14 +3790,8 @@ pub mod fetch_newsletter {
         pub view_role: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub fetch_creation_time: Option<bool>,
@@ -3841,12 +3810,14 @@ pub mod fetch_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct State {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub r#type: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct StatusMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub last_status_sent_time: Option<i64>,
@@ -3855,6 +3826,7 @@ pub mod fetch_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Description {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -3865,6 +3837,7 @@ pub mod fetch_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Name {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -3875,6 +3848,7 @@ pub mod fetch_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Picture {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub direct_path: Option<String>,
@@ -3885,6 +3859,7 @@ pub mod fetch_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct PinnedMessages {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub expiry_ts: Option<i64>,
@@ -3893,6 +3868,7 @@ pub mod fetch_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Preview {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub direct_path: Option<String>,
@@ -3903,24 +3879,28 @@ pub mod fetch_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ReactionCodes {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub value: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Settings {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub reaction_codes: Option<ReactionCodes>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WamoSub {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub plan_id: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ThreadMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub creation_time: Option<i64>,
@@ -3949,6 +3929,7 @@ pub mod fetch_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Settings2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub r#type: Option<String>,
@@ -3957,6 +3938,7 @@ pub mod fetch_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ViewerMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub role: Option<String>,
@@ -3967,6 +3949,7 @@ pub mod fetch_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2Newsletter {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -3981,6 +3964,7 @@ pub mod fetch_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter: Option<Xwa2Newsletter>,
@@ -3996,20 +3980,15 @@ pub mod fetch_newsletter_admin_capabilities {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["newsletter_id"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub newsletter_id: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewsletterAdmin {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub capabilities: Option<String>,
@@ -4018,6 +3997,7 @@ pub mod fetch_newsletter_admin_capabilities {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_admin: Option<Xwa2NewsletterAdmin>,
@@ -4033,20 +4013,15 @@ pub mod fetch_newsletter_admin_info {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["newsletter_id"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub newsletter_id: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Picture {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub direct_path: Option<String>,
@@ -4055,6 +4030,7 @@ pub mod fetch_newsletter_admin_info {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct AdminProfile {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -4065,12 +4041,14 @@ pub mod fetch_newsletter_admin_info {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct AdminSettings {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub admin_profiles_enabled: Option<bool>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewsletterAdmin {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub admin_count: Option<i64>,
@@ -4083,6 +4061,7 @@ pub mod fetch_newsletter_admin_info {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_admin: Option<Xwa2NewsletterAdmin>,
@@ -4099,6 +4078,7 @@ pub mod fetch_newsletter_dehydrated {
     pub const VARIABLE_KEYS: &[&str] = &["fetch_pinned_messages", "fetch_wamo_sub", "input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub key: Option<String>,
@@ -4108,14 +4088,8 @@ pub mod fetch_newsletter_dehydrated {
         pub view_role: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub fetch_pinned_messages: Option<bool>,
@@ -4126,6 +4100,7 @@ pub mod fetch_newsletter_dehydrated {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct PinnedMessages {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub expiry_ts: Option<i64>,
@@ -4134,24 +4109,28 @@ pub mod fetch_newsletter_dehydrated {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ReactionCodes {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub value: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Settings {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub reaction_codes: Option<ReactionCodes>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WamoSub {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub plan_id: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ThreadMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub pinned_messages: Option<Vec<PinnedMessages>>,
@@ -4166,12 +4145,14 @@ pub mod fetch_newsletter_dehydrated {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ViewerMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub wamo_sub_status: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2Newsletter {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -4182,6 +4163,7 @@ pub mod fetch_newsletter_dehydrated {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter: Option<Xwa2Newsletter>,
@@ -4198,6 +4180,7 @@ pub mod fetch_newsletter_directory_categories_preview {
     pub const VARIABLE_KEYS: &[&str] = &["fetch_status_metadata", "input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub categories: Option<Vec<String>>,
@@ -4207,14 +4190,8 @@ pub mod fetch_newsletter_directory_categories_preview {
         pub per_category_limit: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub fetch_status_metadata: Option<bool>,
@@ -4223,6 +4200,7 @@ pub mod fetch_newsletter_directory_categories_preview {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct StatusMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub last_status_sent_time: Option<i64>,
@@ -4231,6 +4209,7 @@ pub mod fetch_newsletter_directory_categories_preview {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Description {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -4241,6 +4220,7 @@ pub mod fetch_newsletter_directory_categories_preview {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Name {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -4251,6 +4231,7 @@ pub mod fetch_newsletter_directory_categories_preview {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Picture {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub direct_path: Option<String>,
@@ -4261,6 +4242,7 @@ pub mod fetch_newsletter_directory_categories_preview {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ThreadMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub creation_time: Option<i64>,
@@ -4281,6 +4263,7 @@ pub mod fetch_newsletter_directory_categories_preview {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Newsletters {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -4291,6 +4274,7 @@ pub mod fetch_newsletter_directory_categories_preview {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Result {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub category: Option<String>,
@@ -4301,12 +4285,14 @@ pub mod fetch_newsletter_directory_categories_preview {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewslettersDirectoryCategoryPreview {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub result: Option<Vec<Result>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletters_directory_category_preview:
@@ -4324,6 +4310,7 @@ pub mod fetch_newsletter_directory_list {
     pub const VARIABLE_KEYS: &[&str] = &["fetch_status_metadata", "input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Filters {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub categories: Option<Vec<String>>,
@@ -4332,6 +4319,7 @@ pub mod fetch_newsletter_directory_list {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub filters: Option<Filters>,
@@ -4343,14 +4331,8 @@ pub mod fetch_newsletter_directory_list {
         pub view: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub fetch_status_metadata: Option<bool>,
@@ -4359,6 +4341,7 @@ pub mod fetch_newsletter_directory_list {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct PageInfo {
         #[serde(rename = "endCursor")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4375,6 +4358,7 @@ pub mod fetch_newsletter_directory_list {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct StatusMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub last_status_sent_time: Option<i64>,
@@ -4383,6 +4367,7 @@ pub mod fetch_newsletter_directory_list {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Description {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -4393,6 +4378,7 @@ pub mod fetch_newsletter_directory_list {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Name {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -4403,6 +4389,7 @@ pub mod fetch_newsletter_directory_list {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Picture {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub direct_path: Option<String>,
@@ -4413,6 +4400,7 @@ pub mod fetch_newsletter_directory_list {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ThreadMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub creation_time: Option<i64>,
@@ -4433,6 +4421,7 @@ pub mod fetch_newsletter_directory_list {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Result {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -4443,6 +4432,7 @@ pub mod fetch_newsletter_directory_list {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewslettersDirectoryList {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub page_info: Option<PageInfo>,
@@ -4451,6 +4441,7 @@ pub mod fetch_newsletter_directory_list {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletters_directory_list: Option<Xwa2NewslettersDirectoryList>,
@@ -4467,6 +4458,7 @@ pub mod fetch_newsletter_directory_search_results {
     pub const VARIABLE_KEYS: &[&str] = &["fetch_status_metadata", "input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub categories: Option<Vec<String>>,
@@ -4478,14 +4470,8 @@ pub mod fetch_newsletter_directory_search_results {
         pub start_cursor: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub fetch_status_metadata: Option<bool>,
@@ -4494,6 +4480,7 @@ pub mod fetch_newsletter_directory_search_results {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct PageInfo {
         #[serde(rename = "endCursor")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4510,6 +4497,7 @@ pub mod fetch_newsletter_directory_search_results {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct StatusMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub last_status_sent_time: Option<i64>,
@@ -4518,6 +4506,7 @@ pub mod fetch_newsletter_directory_search_results {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Description {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -4528,6 +4517,7 @@ pub mod fetch_newsletter_directory_search_results {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Name {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -4538,6 +4528,7 @@ pub mod fetch_newsletter_directory_search_results {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Picture {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub direct_path: Option<String>,
@@ -4548,6 +4539,7 @@ pub mod fetch_newsletter_directory_search_results {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ThreadMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub creation_time: Option<i64>,
@@ -4568,6 +4560,7 @@ pub mod fetch_newsletter_directory_search_results {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Result {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -4578,6 +4571,7 @@ pub mod fetch_newsletter_directory_search_results {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewslettersDirectorySearch {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub page_info: Option<PageInfo>,
@@ -4586,6 +4580,7 @@ pub mod fetch_newsletter_directory_search_results {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletters_directory_search: Option<Xwa2NewslettersDirectorySearch>,
@@ -4601,14 +4596,8 @@ pub mod fetch_newsletter_enforcements {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["locale", "newsletter_id"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub locale: Option<String>,
@@ -4617,6 +4606,7 @@ pub mod fetch_newsletter_enforcements {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct AppealReasonOptions {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub label: Option<String>,
@@ -4625,6 +4615,7 @@ pub mod fetch_newsletter_enforcements {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Picture {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub direct_path: Option<String>,
@@ -4633,6 +4624,7 @@ pub mod fetch_newsletter_enforcements {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct EnforcementTargetData {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4646,6 +4638,7 @@ pub mod fetch_newsletter_enforcements {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct IpViolationReportData {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub appeal_form_url: Option<String>,
@@ -4658,6 +4651,7 @@ pub mod fetch_newsletter_enforcements {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct EnforcementExtraData {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub enforcement_target_data: Option<EnforcementTargetData>,
@@ -4666,6 +4660,7 @@ pub mod fetch_newsletter_enforcements {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct EnforcementPolicyInformation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub admin_disclaimer: Option<String>,
@@ -4680,6 +4675,7 @@ pub mod fetch_newsletter_enforcements {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct AdminProfiles {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub appeal_creation_time: Option<i64>,
@@ -4702,12 +4698,14 @@ pub mod fetch_newsletter_enforcements {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct AppealExtraData {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub appeal_form_url: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct EnforcementTargetData2 {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4721,12 +4719,14 @@ pub mod fetch_newsletter_enforcements {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct EnforcingEntityData {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct EnforcementExtraData2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub appeal_extra_data: Option<AppealExtraData>,
@@ -4743,6 +4743,7 @@ pub mod fetch_newsletter_enforcements {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct BaseEnforcementData {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub appeal_creation_time: Option<i64>,
@@ -4765,6 +4766,7 @@ pub mod fetch_newsletter_enforcements {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Geosuspensions {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub base_enforcement_data: Option<BaseEnforcementData>,
@@ -4773,12 +4775,14 @@ pub mod fetch_newsletter_enforcements {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct EnforcementExtraData3 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub ip_violation_report_data: Option<IpViolationReportData>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ProfilePictureDeletions {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub appeal_creation_time: Option<i64>,
@@ -4801,6 +4805,7 @@ pub mod fetch_newsletter_enforcements {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct EnforcementExtraData4 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub appeal_extra_data: Option<AppealExtraData>,
@@ -4811,6 +4816,7 @@ pub mod fetch_newsletter_enforcements {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Suspensions {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub appeal_creation_time: Option<i64>,
@@ -4833,6 +4839,7 @@ pub mod fetch_newsletter_enforcements {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct BaseEnforcementData2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub appeal_creation_time: Option<i64>,
@@ -4855,6 +4862,7 @@ pub mod fetch_newsletter_enforcements {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ContentData {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4866,6 +4874,7 @@ pub mod fetch_newsletter_enforcements {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ViolatingMessages {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub base_enforcement_data: Option<BaseEnforcementData2>,
@@ -4874,6 +4883,7 @@ pub mod fetch_newsletter_enforcements {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2ChannelEnforcements {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub admin_profiles: Option<Vec<AdminProfiles>>,
@@ -4888,6 +4898,7 @@ pub mod fetch_newsletter_enforcements {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_channel_enforcements: Option<Xwa2ChannelEnforcements>,
@@ -4904,6 +4915,7 @@ pub mod fetch_newsletter_followers {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub count: Option<i64>,
@@ -4911,20 +4923,15 @@ pub mod fetch_newsletter_followers {
         pub newsletter_id: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Picture {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub direct_path: Option<String>,
@@ -4933,6 +4940,7 @@ pub mod fetch_newsletter_followers {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct AdminProfile {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -4943,6 +4951,7 @@ pub mod fetch_newsletter_followers {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct UsernameInfo {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4952,6 +4961,7 @@ pub mod fetch_newsletter_followers {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Node {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub display_name: Option<String>,
@@ -4964,6 +4974,7 @@ pub mod fetch_newsletter_followers {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Edges {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub admin_profile: Option<AdminProfile>,
@@ -4976,18 +4987,21 @@ pub mod fetch_newsletter_followers {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Followers {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub edges: Option<Vec<Edges>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewsletterFollowers {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub followers: Option<Followers>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_followers: Option<Xwa2NewsletterFollowers>,
@@ -5004,6 +5018,7 @@ pub mod fetch_newsletter_insights {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub metrics: Option<String>,
@@ -5011,20 +5026,15 @@ pub mod fetch_newsletter_insights {
         pub newsletter_id: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Values {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub country: Option<String>,
@@ -5037,6 +5047,7 @@ pub mod fetch_newsletter_insights {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Result {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -5045,12 +5056,14 @@ pub mod fetch_newsletter_insights {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct State {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub r#type: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewsletterAdminInsights {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub last_update_time: Option<i64>,
@@ -5065,6 +5078,7 @@ pub mod fetch_newsletter_insights {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_admin_insights: Option<Xwa2NewsletterAdminInsights>,
@@ -5080,20 +5094,15 @@ pub mod fetch_newsletter_is_domain_previewable {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["url_domains"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub url_domains: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct UrlPreviews {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub is_previewable: Option<bool>,
@@ -5102,12 +5111,14 @@ pub mod fetch_newsletter_is_domain_previewable {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewsletterMessageIntegrity {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub url_previews: Option<Vec<UrlPreviews>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_message_integrity: Option<Xwa2NewsletterMessageIntegrity>,
@@ -5124,6 +5135,7 @@ pub mod fetch_newsletter_message_reaction_sender_list {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -5131,20 +5143,15 @@ pub mod fetch_newsletter_message_reaction_sender_list {
         pub server_id: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Node {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -5153,18 +5160,21 @@ pub mod fetch_newsletter_message_reaction_sender_list {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Edges {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub node: Option<Node>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct SenderList {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub edges: Option<Vec<Edges>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Reactions {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub reaction_code: Option<String>,
@@ -5173,12 +5183,14 @@ pub mod fetch_newsletter_message_reaction_sender_list {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewslettersReactionSenderList {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub reactions: Option<Vec<Reactions>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletters_reaction_sender_list: Option<Xwa2NewslettersReactionSenderList>,
@@ -5194,20 +5206,15 @@ pub mod fetch_newsletter_pending_invites {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["newsletter_id"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub newsletter_id: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct User {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -5216,12 +5223,14 @@ pub mod fetch_newsletter_pending_invites {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct PendingAdminInvites {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub user: Option<User>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewsletterAdmin {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -5230,6 +5239,7 @@ pub mod fetch_newsletter_pending_invites {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_admin: Option<Xwa2NewsletterAdmin>,
@@ -5246,6 +5256,7 @@ pub mod fetch_newsletter_poll_voters {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub limit: Option<i64>,
@@ -5257,26 +5268,22 @@ pub mod fetch_newsletter_poll_voters {
         pub vote_hash: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Node {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Edges {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub action_time: Option<i64>,
@@ -5285,12 +5292,14 @@ pub mod fetch_newsletter_poll_voters {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct VoterList {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub edges: Option<Vec<Edges>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Votes {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub vote_hash: Option<String>,
@@ -5299,12 +5308,14 @@ pub mod fetch_newsletter_poll_voters {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct VoterList2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub votes: Option<Vec<Votes>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub voter_list: Option<VoterList2>,
@@ -5320,20 +5331,15 @@ pub mod fetch_newsletter_reports {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["locale"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub locale: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Appeal {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub appeal_id: Option<String>,
@@ -5348,6 +5354,7 @@ pub mod fetch_newsletter_reports {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct AppealReasonOptions {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub label: Option<String>,
@@ -5356,6 +5363,7 @@ pub mod fetch_newsletter_reports {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct QuestionData {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5365,6 +5373,7 @@ pub mod fetch_newsletter_reports {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ReportedContentData {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5382,6 +5391,7 @@ pub mod fetch_newsletter_reports {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ChannelsReports {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub appeal: Option<Appeal>,
@@ -5404,12 +5414,14 @@ pub mod fetch_newsletter_reports {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2ChannelsReports {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub channels_reports: Option<Vec<ChannelsReports>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_channels_reports: Option<Xwa2ChannelsReports>,
@@ -5425,17 +5437,12 @@ pub mod fetch_ohai_key_config {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &[];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {}
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct OhaiConfigs {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub aead_id: Option<String>,
@@ -5454,12 +5461,14 @@ pub mod fetch_ohai_key_config {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2OhaiConfigurations {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub ohai_configs: Option<Vec<OhaiConfigs>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_ohai_configurations: Option<Xwa2OhaiConfigurations>,
@@ -5475,17 +5484,12 @@ pub mod fetch_oidc_state {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &[];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {}
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xfb_wa_biz_get_oidc_state: Option<String>,
@@ -5502,25 +5506,21 @@ pub mod fetch_plaintext_link_preview {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub url: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewsletterLinkPreview {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub description: Option<String>,
@@ -5541,6 +5541,7 @@ pub mod fetch_plaintext_link_preview {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_link_preview: Option<Xwa2NewsletterLinkPreview>,
@@ -5557,6 +5558,7 @@ pub mod fetch_quick_promotions {
     pub const VARIABLE_KEYS: &[&str] = &["nux_ids", "trigger_context"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaSmbTriggerContext {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub app_version: Option<i64>,
@@ -5569,19 +5571,14 @@ pub mod fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct TriggerContext {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub wa_smb_trigger_context: Option<WaSmbTriggerContext>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub nux_ids: Option<Vec<String>>,
@@ -5590,6 +5587,7 @@ pub mod fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaBannerBackgroundColor {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub dark_mode_background_color: Option<String>,
@@ -5602,6 +5600,7 @@ pub mod fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ContentAttributes {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub wa_banner_background_color: Option<WaBannerBackgroundColor>,
@@ -5612,6 +5611,7 @@ pub mod fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Parameters {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub key: Option<String>,
@@ -5620,6 +5620,7 @@ pub mod fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Filters {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub filter_name: Option<String>,
@@ -5632,6 +5633,7 @@ pub mod fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Clauses {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub clause_type: Option<String>,
@@ -5640,6 +5642,7 @@ pub mod fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Clauses2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub clause_type: Option<String>,
@@ -5650,6 +5653,7 @@ pub mod fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Clauses3 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub clause_type: Option<String>,
@@ -5660,6 +5664,7 @@ pub mod fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Clauses4 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub clause_type: Option<String>,
@@ -5670,6 +5675,7 @@ pub mod fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Clauses5 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub clause_type: Option<String>,
@@ -5680,6 +5686,7 @@ pub mod fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Clauses6 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub clause_type: Option<String>,
@@ -5690,6 +5697,7 @@ pub mod fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Clauses7 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub clause_type: Option<String>,
@@ -5700,6 +5708,7 @@ pub mod fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ContextualFiltersForWaDoNotUse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub clause_type: Option<String>,
@@ -5710,18 +5719,21 @@ pub mod fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Content {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub text: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Title {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub text: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct PrimaryAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub title: Option<Title>,
@@ -5730,18 +5742,21 @@ pub mod fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaDarkModeMediaDetails {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub jpeg_thumbnail: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaLightModeMediaDetails {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub jpeg_thumbnail: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Creatives {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub accessibility_text_for_image: Option<String>,
@@ -5762,6 +5777,7 @@ pub mod fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaQpContentAttributesDoNotUse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
@@ -5770,6 +5786,7 @@ pub mod fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Node {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub ab_prop_name: Option<String>,
@@ -5796,6 +5813,7 @@ pub mod fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct TimeRange {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub end: Option<String>,
@@ -5804,6 +5822,7 @@ pub mod fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Edges {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub client_ttl_seconds: Option<i64>,
@@ -5820,12 +5839,14 @@ pub mod fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct EligiblePromotions {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub edges: Option<Vec<Edges>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct QuickPromotionBatchFetchRoot {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub eligible_promotions: Option<EligiblePromotions>,
@@ -5834,6 +5855,7 @@ pub mod fetch_quick_promotions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub quick_promotion_batch_fetch_root: Option<Vec<QuickPromotionBatchFetchRoot>>,
@@ -5849,17 +5871,12 @@ pub mod fetch_reachout_timelock {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &[];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {}
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2FetchAccountReachoutTimelock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub enforcement_type: Option<String>,
@@ -5870,6 +5887,7 @@ pub mod fetch_reachout_timelock {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_fetch_account_reachout_timelock: Option<Xwa2FetchAccountReachoutTimelock>,
@@ -5886,6 +5904,7 @@ pub mod fetch_recommended_newsletters {
     pub const VARIABLE_KEYS: &[&str] = &["fetch_status_metadata", "input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub country_codes: Option<String>,
@@ -5893,14 +5912,8 @@ pub mod fetch_recommended_newsletters {
         pub limit: Option<i64>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub fetch_status_metadata: Option<bool>,
@@ -5909,6 +5922,7 @@ pub mod fetch_recommended_newsletters {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct PageInfo {
         #[serde(rename = "endCursor")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5925,12 +5939,14 @@ pub mod fetch_recommended_newsletters {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct State {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub r#type: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct StatusMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub last_status_sent_time: Option<i64>,
@@ -5939,6 +5955,7 @@ pub mod fetch_recommended_newsletters {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Description {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -5949,6 +5966,7 @@ pub mod fetch_recommended_newsletters {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Name {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -5959,6 +5977,7 @@ pub mod fetch_recommended_newsletters {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Preview {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub direct_path: Option<String>,
@@ -5969,6 +5988,7 @@ pub mod fetch_recommended_newsletters {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ThreadMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub creation_time: Option<i64>,
@@ -5989,6 +6009,7 @@ pub mod fetch_recommended_newsletters {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Result {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -6001,6 +6022,7 @@ pub mod fetch_recommended_newsletters {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewslettersRecommended {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub page_info: Option<PageInfo>,
@@ -6009,6 +6031,7 @@ pub mod fetch_recommended_newsletters {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletters_recommended: Option<Xwa2NewslettersRecommended>,
@@ -6025,6 +6048,7 @@ pub mod fetch_similar_newsletters {
     pub const VARIABLE_KEYS: &[&str] = &["fetch_status_metadata", "input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub country_codes: Option<String>,
@@ -6034,14 +6058,8 @@ pub mod fetch_similar_newsletters {
         pub newsletter_id: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub fetch_status_metadata: Option<bool>,
@@ -6050,18 +6068,21 @@ pub mod fetch_similar_newsletters {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct State {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub r#type: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct StatusMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub last_status_server_id: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Name {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -6072,6 +6093,7 @@ pub mod fetch_similar_newsletters {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Picture {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub direct_path: Option<String>,
@@ -6082,6 +6104,7 @@ pub mod fetch_similar_newsletters {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ThreadMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<Name>,
@@ -6092,6 +6115,7 @@ pub mod fetch_similar_newsletters {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Result {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -6104,12 +6128,14 @@ pub mod fetch_similar_newsletters {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewslettersSimilar {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub result: Option<Vec<Result>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletters_similar: Option<Xwa2NewslettersSimilar>,
@@ -6125,14 +6151,8 @@ pub mod fetch_subgroup_suggestions {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["group_id", "query_context", "sub_group_hint_id"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub group_id: Option<String>,
@@ -6143,12 +6163,14 @@ pub mod fetch_subgroup_suggestions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Creator {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Description {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -6157,12 +6179,14 @@ pub mod fetch_subgroup_suggestions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Subject {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub value: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Node {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub creation_time: Option<i64>,
@@ -6183,18 +6207,21 @@ pub mod fetch_subgroup_suggestions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Edges {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub node: Option<Node>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct SubGroupSuggestions {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub edges: Option<Vec<Edges>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2GroupQueryById {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6206,6 +6233,7 @@ pub mod fetch_subgroup_suggestions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_group_query_by_id: Option<Xwa2GroupQueryById>,
@@ -6221,17 +6249,12 @@ pub mod fetch_subscription_entry_points {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &[];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {}
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct SubscriptionEntryPoints {
         #[serde(rename = "subscriptionType")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6245,6 +6268,7 @@ pub mod fetch_subscription_entry_points {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaSubscriptionEntryPoints {
         #[serde(rename = "subscriptionEntryPoints")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6252,6 +6276,7 @@ pub mod fetch_subscription_entry_points {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(rename = "waSubscriptionEntryPoints")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6269,25 +6294,21 @@ pub mod fetch_subscriptions {
     pub const VARIABLE_KEYS: &[&str] = &["data"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Data {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub platform: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub data: Option<Data>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct FeatureFlags {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub enabled: Option<bool>,
@@ -6300,6 +6321,7 @@ pub mod fetch_subscriptions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Subscriptions {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub creation_time: Option<i64>,
@@ -6320,6 +6342,7 @@ pub mod fetch_subscriptions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaGetSubscriptions {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub feature_flags: Option<Vec<FeatureFlags>>,
@@ -6328,6 +6351,7 @@ pub mod fetch_subscriptions {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_get_subscriptions: Option<XwaGetSubscriptions>,
@@ -6343,26 +6367,22 @@ pub mod fetch_text_status_list {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Emoji {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub content: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2TextStatusList {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub emoji: Option<Emoji>,
@@ -6377,6 +6397,7 @@ pub mod fetch_text_status_list {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_text_status_list: Option<Vec<Xwa2TextStatusList>>,
@@ -6392,17 +6413,12 @@ pub mod fetch_wass_bot_list_profiles_gql {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &[];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {}
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WassAccountListProfiles {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub bot_fbid: Option<String>,
@@ -6419,6 +6435,7 @@ pub mod fetch_wass_bot_list_profiles_gql {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub wass_account_list_profiles: Option<Vec<WassAccountListProfiles>>,
@@ -6434,14 +6451,8 @@ pub mod fetch_wass_bot_profile_gql {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["botFbid"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(rename = "botFbid")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6449,6 +6460,7 @@ pub mod fetch_wass_bot_profile_gql {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct GetWassAccountProfile {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub is_deprecated: Option<bool>,
@@ -6463,6 +6475,7 @@ pub mod fetch_wass_bot_profile_gql {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub get_wass_account_profile: Option<GetWassAccountProfile>,
@@ -6478,14 +6491,8 @@ pub mod get_access_token_from_oidc_code {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["code", "state"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub code: Option<String>,
@@ -6494,6 +6501,7 @@ pub mod get_access_token_from_oidc_code {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XfbWaBizGetTokenFromOidcCode {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub access_token: Option<String>,
@@ -6502,6 +6510,7 @@ pub mod get_access_token_from_oidc_code {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xfb_wa_biz_get_token_from_oidc_code: Option<XfbWaBizGetTokenFromOidcCode>,
@@ -6518,37 +6527,35 @@ pub mod get_account_nonce {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Identifier {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub scope: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub identifier: Option<Identifier>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Detail {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub nonce: Option<String>,
@@ -6557,12 +6564,14 @@ pub mod get_account_nonce {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XfbWaBizAccountNonce {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub detail: Option<Detail>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xfb_wa_biz_account_nonce: Option<XfbWaBizAccountNonce>,
@@ -6578,14 +6587,8 @@ pub mod get_fb_account_pages {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["userId"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(rename = "userId")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6593,12 +6596,14 @@ pub mod get_fb_account_pages {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ProfilePicture {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub uri: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Nodes {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -6611,12 +6616,14 @@ pub mod get_fb_account_pages {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct FacebookPages {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub nodes: Option<Vec<Nodes>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct User {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub facebook_pages: Option<FacebookPages>,
@@ -6625,6 +6632,7 @@ pub mod get_fb_account_pages {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub user: Option<User>,
@@ -6641,6 +6649,7 @@ pub mod get_numbers_for_brand_ids {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub brand_ids: Option<Vec<String>>,
@@ -6648,20 +6657,15 @@ pub mod get_numbers_for_brand_ids {
         pub lid_based_response: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct BrandIdsData {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub brand_id: Option<String>,
@@ -6674,12 +6678,14 @@ pub mod get_numbers_for_brand_ids {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaGetNumbersForBrandIds {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub brand_ids_data: Option<Vec<BrandIdsData>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_get_numbers_for_brand_ids: Option<XwaGetNumbersForBrandIds>,
@@ -6696,6 +6702,7 @@ pub mod get_privacy_lists {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct PrivacyContactListType {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub category: Option<String>,
@@ -6706,6 +6713,7 @@ pub mod get_privacy_lists {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct QueryInput {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub jid: Option<String>,
@@ -6714,25 +6722,21 @@ pub mod get_privacy_lists {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub query_input: Option<Vec<QueryInput>>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct UsernameInfo {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6742,6 +6746,7 @@ pub mod get_privacy_lists {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Contacts {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub jid: Option<String>,
@@ -6752,6 +6757,7 @@ pub mod get_privacy_lists {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct PrivacyContactList {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub contacts: Option<Vec<Contacts>>,
@@ -6760,6 +6766,7 @@ pub mod get_privacy_lists {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2FetchWaUsers {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6771,6 +6778,7 @@ pub mod get_privacy_lists {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_fetch_wa_users: Option<Vec<Xwa2FetchWaUsers>>,
@@ -6787,6 +6795,7 @@ pub mod get_privacy_settings {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct QueryInput {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub jid: Option<String>,
@@ -6795,25 +6804,21 @@ pub mod get_privacy_settings {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub query_input: Option<Vec<QueryInput>>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Settings {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub feature: Option<String>,
@@ -6822,12 +6827,14 @@ pub mod get_privacy_settings {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct PrivacySettings {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub settings: Option<Vec<Settings>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2FetchWaUsers {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6839,6 +6846,7 @@ pub mod get_privacy_settings {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_fetch_wa_users: Option<Vec<Xwa2FetchWaUsers>>,
@@ -6854,17 +6862,12 @@ pub mod get_username {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &[];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {}
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct UsernameInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub pin: Option<String>,
@@ -6875,12 +6878,14 @@ pub mod get_username {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2UsernameGet {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub username_info: Option<UsernameInfo>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_username_get: Option<Xwa2UsernameGet>,
@@ -6897,6 +6902,7 @@ pub mod get_waa_eligibility {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub flow_id: Option<String>,
@@ -6904,26 +6910,22 @@ pub mod get_waa_eligibility {
         pub request_id: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct EvalWaAdAccountEligibilityRules {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub eligibility_result: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub eval_wa_ad_account_eligibility_rules: Option<EvalWaAdAccountEligibilityRules>,
@@ -6940,31 +6942,28 @@ pub mod graph_ql_product_catalog_get_public_key {
     pub const VARIABLE_KEYS: &[&str] = &["request"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct PublicKey {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub biz_jid: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub public_key: Option<PublicKey>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub request: Option<Request>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct PublicKeyWithSignature {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub public_key_pem: Option<String>,
@@ -6973,6 +6972,7 @@ pub mod graph_ql_product_catalog_get_public_key {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaProductCatalogGetPublicKey {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub public_key_certificate_pem: Option<String>,
@@ -6981,6 +6981,7 @@ pub mod graph_ql_product_catalog_get_public_key {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_product_catalog_get_public_key: Option<XwaProductCatalogGetPublicKey>,
@@ -6997,6 +6998,7 @@ pub mod graph_ql_verify_postcode {
     pub const VARIABLE_KEYS: &[&str] = &["request"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct VerifyPostcode {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub biz_jid: Option<String>,
@@ -7005,25 +7007,21 @@ pub mod graph_ql_verify_postcode {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub verify_postcode: Option<VerifyPostcode>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub request: Option<Request>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct PostcodeVerificationResult {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub encrypted_location_name: Option<String>,
@@ -7032,12 +7030,14 @@ pub mod graph_ql_verify_postcode {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaProductCatalogGetVerifyPostcode {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub postcode_verification_result: Option<PostcodeVerificationResult>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_product_catalog_get_verify_postcode: Option<XwaProductCatalogGetVerifyPostcode>,
@@ -7054,6 +7054,7 @@ pub mod group_store_invite_sms {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub group_jid: Option<String>,
@@ -7061,26 +7062,22 @@ pub mod group_store_invite_sms {
         pub partcipants: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ParticipantResponses {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub error_code: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2GroupStoreInvitesSms {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub group_jid: Option<String>,
@@ -7089,6 +7086,7 @@ pub mod group_store_invite_sms {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_group_store_invites_sms: Option<Xwa2GroupStoreInvitesSms>,
@@ -7105,6 +7103,7 @@ pub mod group_suspension_appeal {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub appeal_reason: Option<String>,
@@ -7114,20 +7113,15 @@ pub mod group_suspension_appeal {
         pub group_jid: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaCreateGroupSuspensionAppeal {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub appeal_creation_time: Option<i64>,
@@ -7138,6 +7132,7 @@ pub mod group_suspension_appeal {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub wa_create_group_suspension_appeal: Option<WaCreateGroupSuspensionAppeal>,
@@ -7154,6 +7149,7 @@ pub mod integrity_challenge_response {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct PasskeyResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub prf_available: Option<String>,
@@ -7162,6 +7158,7 @@ pub mod integrity_challenge_response {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub challenge_type: Option<String>,
@@ -7169,20 +7166,15 @@ pub mod integrity_challenge_response {
         pub passkey_response: Option<PasskeyResponse>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2SubmitIntegrityChallengeResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub error_message: Option<String>,
@@ -7191,6 +7183,7 @@ pub mod integrity_challenge_response {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_submit_integrity_challenge_response: Option<Xwa2SubmitIntegrityChallengeResponse>,
@@ -7206,26 +7199,22 @@ pub mod join_newsletter {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["newsletter_id"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub newsletter_id: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct State {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub r#type: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewsletterJoinV2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -7234,6 +7223,7 @@ pub mod join_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_join_v2: Option<Xwa2NewsletterJoinV2>,
@@ -7249,26 +7239,22 @@ pub mod leave_newsletter {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["newsletter_id"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub newsletter_id: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct State {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub r#type: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewsletterLeaveV2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -7277,6 +7263,7 @@ pub mod leave_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_leave_v2: Option<Xwa2NewsletterLeaveV2>,
@@ -7292,17 +7279,12 @@ pub mod lid_change_notification {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &[];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {}
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NotifyLidChange {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub new: Option<String>,
@@ -7311,6 +7293,7 @@ pub mod lid_change_notification {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_notify_lid_change: Option<Xwa2NotifyLidChange>,
@@ -7327,6 +7310,7 @@ pub mod log_newsletter_exposures {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Exposures {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub capability: Option<String>,
@@ -7335,25 +7319,21 @@ pub mod log_newsletter_exposures {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub exposures: Option<Vec<Exposures>>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewsletterLogExposures {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -7361,6 +7341,7 @@ pub mod log_newsletter_exposures {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_log_exposures: Option<Xwa2NewsletterLogExposures>,
@@ -7376,14 +7357,8 @@ pub mod native_ml_model {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["client_capability_metadata", "model_request_metadatas"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub client_capability_metadata: Option<String>,
@@ -7392,6 +7367,7 @@ pub mod native_ml_model {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Assets {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub asset_handle: Option<String>,
@@ -7418,6 +7394,7 @@ pub mod native_ml_model {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Properties {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
@@ -7426,6 +7403,7 @@ pub mod native_ml_model {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Models {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub assets: Option<Vec<Assets>>,
@@ -7438,6 +7416,7 @@ pub mod native_ml_model {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct AimModelBatchedManifest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub asset_count: Option<i64>,
@@ -7454,6 +7433,7 @@ pub mod native_ml_model {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub aim_model_batched_manifest: Option<AimModelBatchedManifest>,
@@ -7469,14 +7449,8 @@ pub mod newsletter_add_paid_partnership_label {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["message_type", "newsletter_id", "server_id"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub message_type: Option<String>,
@@ -7487,12 +7461,14 @@ pub mod newsletter_add_paid_partnership_label {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewsletterLabelPaidPartnership {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_label_paid_partnership: Option<Xwa2NewsletterLabelPaidPartnership>,
@@ -7508,14 +7484,8 @@ pub mod newsletter_label_ai_content {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["message_type", "newsletter_id", "server_id"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub message_type: Option<String>,
@@ -7526,12 +7496,14 @@ pub mod newsletter_label_ai_content {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewsletterLabelAiContent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_label_ai_content: Option<Xwa2NewsletterLabelAiContent>,
@@ -7548,19 +7520,14 @@ pub mod newsletter_pin_messages {
     pub const VARIABLE_KEYS: &[&str] = &["input", "newsletter_id"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub message_ids: Option<Vec<String>>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
@@ -7569,6 +7536,7 @@ pub mod newsletter_pin_messages {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct PinnedMessages {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub expiry_ts: Option<i64>,
@@ -7577,12 +7545,14 @@ pub mod newsletter_pin_messages {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ThreadMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub pinned_messages: Option<Vec<PinnedMessages>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewsletterPinMessages {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -7591,6 +7561,7 @@ pub mod newsletter_pin_messages {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_pin_messages: Option<Xwa2NewsletterPinMessages>,
@@ -7607,14 +7578,8 @@ pub mod newsletter_question_response_state_update {
     pub const VARIABLE_KEYS: &[&str] =
         &["newsletter_id", "response_server_id", "server_id", "state"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub newsletter_id: Option<String>,
@@ -7627,12 +7592,14 @@ pub mod newsletter_question_response_state_update {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewsletterQuestionResponseStateUpdate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_question_response_state_update:
@@ -7650,19 +7617,14 @@ pub mod newsletter_unpin_messages {
     pub const VARIABLE_KEYS: &[&str] = &["input", "newsletter_id"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub message_ids: Option<Vec<String>>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
@@ -7671,6 +7633,7 @@ pub mod newsletter_unpin_messages {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct PinnedMessages {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub expiry_ts: Option<i64>,
@@ -7679,12 +7642,14 @@ pub mod newsletter_unpin_messages {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ThreadMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub pinned_messages: Option<Vec<PinnedMessages>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewsletterUnpinMessages {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -7693,6 +7658,7 @@ pub mod newsletter_unpin_messages {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_unpin_messages: Option<Xwa2NewsletterUnpinMessages>,
@@ -7708,23 +7674,19 @@ pub mod payments_passkey_has_credential {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &[];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {}
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2PaymentsPasskeyHasCredential {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub has_passkey: Option<bool>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_payments_passkey_has_credential: Option<Xwa2PaymentsPasskeyHasCredential>,
@@ -7741,6 +7703,7 @@ pub mod query_catalog {
     pub const VARIABLE_KEYS: &[&str] = &["request"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ProductCatalog {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub after: Option<String>,
@@ -7767,25 +7730,21 @@ pub mod query_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub product_catalog: Option<ProductCatalog>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub request: Option<Request>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Paging {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub after: Option<String>,
@@ -7794,6 +7753,7 @@ pub mod query_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ImporterAddress {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub city: Option<String>,
@@ -7810,6 +7770,7 @@ pub mod query_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ComplianceInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub country_code_origin: Option<String>,
@@ -7820,6 +7781,7 @@ pub mod query_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Images {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -7830,6 +7792,7 @@ pub mod query_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Videos {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -7840,6 +7803,7 @@ pub mod query_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Media {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub images: Option<Vec<Images>>,
@@ -7848,6 +7812,7 @@ pub mod query_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct SalePrice {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub end_date: Option<String>,
@@ -7858,6 +7823,7 @@ pub mod query_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct StatusInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub can_appeal: Option<bool>,
@@ -7866,6 +7832,7 @@ pub mod query_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Options {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
@@ -7874,6 +7841,7 @@ pub mod query_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Listing {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub is_available: Option<bool>,
@@ -7884,12 +7852,14 @@ pub mod query_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Availability {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub listing: Option<Vec<Listing>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ListingDetails {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub description: Option<String>,
@@ -7900,6 +7870,7 @@ pub mod query_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct OriginalDimensions {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub height: Option<i64>,
@@ -7908,6 +7879,7 @@ pub mod query_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ThumbnailMedia {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -7920,6 +7892,7 @@ pub mod query_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Options2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub thumbnail_media: Option<ThumbnailMedia>,
@@ -7928,6 +7901,7 @@ pub mod query_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Types {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
@@ -7936,6 +7910,7 @@ pub mod query_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct VariantProperties {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
@@ -7944,6 +7919,7 @@ pub mod query_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct VariantInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub availability: Option<Availability>,
@@ -7956,6 +7932,7 @@ pub mod query_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Products {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub belongs_to: Option<String>,
@@ -7998,6 +7975,7 @@ pub mod query_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ProductCatalog2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub paging: Option<Paging>,
@@ -8006,6 +7984,7 @@ pub mod query_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaProductCatalogGetProductCatalog {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -8015,6 +7994,7 @@ pub mod query_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_product_catalog_get_product_catalog: Option<XwaProductCatalogGetProductCatalog>,
@@ -8031,6 +8011,7 @@ pub mod query_catalog_has_categories {
     pub const VARIABLE_KEYS: &[&str] = &["request"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Categories {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub biz_jid: Option<String>,
@@ -8043,25 +8024,21 @@ pub mod query_catalog_has_categories {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub categories: Option<Categories>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub request: Option<Request>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Categories2 {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -8069,12 +8046,14 @@ pub mod query_catalog_has_categories {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaProductCatalogGetCategories {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub categories: Option<Vec<Categories2>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_product_catalog_get_categories: Option<XwaProductCatalogGetCategories>,
@@ -8091,6 +8070,7 @@ pub mod query_catalog_product {
     pub const VARIABLE_KEYS: &[&str] = &["request"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Product {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub direct_connection_encrypted_info: Option<String>,
@@ -8113,25 +8093,21 @@ pub mod query_catalog_product {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub product: Option<Product>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub request: Option<Request>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ImporterAddress {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub city: Option<String>,
@@ -8148,6 +8124,7 @@ pub mod query_catalog_product {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ComplianceInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub country_code_origin: Option<String>,
@@ -8158,6 +8135,7 @@ pub mod query_catalog_product {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Images {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -8168,6 +8146,7 @@ pub mod query_catalog_product {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Videos {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -8178,6 +8157,7 @@ pub mod query_catalog_product {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Media {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub images: Option<Vec<Images>>,
@@ -8186,6 +8166,7 @@ pub mod query_catalog_product {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct SalePrice {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub end_date: Option<String>,
@@ -8196,6 +8177,7 @@ pub mod query_catalog_product {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct StatusInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub can_appeal: Option<bool>,
@@ -8204,6 +8186,7 @@ pub mod query_catalog_product {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Options {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
@@ -8212,6 +8195,7 @@ pub mod query_catalog_product {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Listing {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub is_available: Option<bool>,
@@ -8222,12 +8206,14 @@ pub mod query_catalog_product {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Availability {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub listing: Option<Vec<Listing>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ListingDetails {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub description: Option<String>,
@@ -8238,6 +8224,7 @@ pub mod query_catalog_product {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct OriginalDimensions {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub height: Option<i64>,
@@ -8246,6 +8233,7 @@ pub mod query_catalog_product {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ThumbnailMedia {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -8258,6 +8246,7 @@ pub mod query_catalog_product {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Options2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub thumbnail_media: Option<ThumbnailMedia>,
@@ -8266,6 +8255,7 @@ pub mod query_catalog_product {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Types {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
@@ -8274,6 +8264,7 @@ pub mod query_catalog_product {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct VariantProperties {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
@@ -8282,6 +8273,7 @@ pub mod query_catalog_product {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct VariantInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub availability: Option<Availability>,
@@ -8294,6 +8286,7 @@ pub mod query_catalog_product {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Product2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub belongs_to: Option<String>,
@@ -8336,18 +8329,21 @@ pub mod query_catalog_product {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ProductCatalog {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub product: Option<Product2>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaProductCatalogGetProduct {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub product_catalog: Option<ProductCatalog>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_product_catalog_get_product: Option<XwaProductCatalogGetProduct>,
@@ -8364,6 +8360,7 @@ pub mod query_product_collections {
     pub const VARIABLE_KEYS: &[&str] = &["request"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Collections {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub after: Option<String>,
@@ -8388,25 +8385,21 @@ pub mod query_product_collections {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub collections: Option<Collections>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub request: Option<Request>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ImporterAddress {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub city: Option<String>,
@@ -8423,6 +8416,7 @@ pub mod query_product_collections {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ComplianceInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub country_code_origin: Option<String>,
@@ -8433,6 +8427,7 @@ pub mod query_product_collections {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Images {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -8443,6 +8438,7 @@ pub mod query_product_collections {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Videos {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -8453,6 +8449,7 @@ pub mod query_product_collections {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Media {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub images: Option<Vec<Images>>,
@@ -8461,6 +8458,7 @@ pub mod query_product_collections {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct SalePrice {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub end_date: Option<String>,
@@ -8471,6 +8469,7 @@ pub mod query_product_collections {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct StatusInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub can_appeal: Option<bool>,
@@ -8479,6 +8478,7 @@ pub mod query_product_collections {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Options {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
@@ -8487,6 +8487,7 @@ pub mod query_product_collections {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Listing {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub is_available: Option<bool>,
@@ -8497,12 +8498,14 @@ pub mod query_product_collections {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Availability {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub listing: Option<Vec<Listing>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ListingDetails {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub description: Option<String>,
@@ -8513,6 +8516,7 @@ pub mod query_product_collections {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct OriginalDimensions {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub height: Option<i64>,
@@ -8521,6 +8525,7 @@ pub mod query_product_collections {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ThumbnailMedia {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -8533,6 +8538,7 @@ pub mod query_product_collections {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Options2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub thumbnail_media: Option<ThumbnailMedia>,
@@ -8541,6 +8547,7 @@ pub mod query_product_collections {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Types {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
@@ -8549,6 +8556,7 @@ pub mod query_product_collections {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct VariantProperties {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
@@ -8557,6 +8565,7 @@ pub mod query_product_collections {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct VariantInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub availability: Option<Availability>,
@@ -8569,6 +8578,7 @@ pub mod query_product_collections {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Products {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub belongs_to: Option<String>,
@@ -8611,6 +8621,7 @@ pub mod query_product_collections {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct StatusInfo2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub can_appeal: Option<bool>,
@@ -8623,6 +8634,7 @@ pub mod query_product_collections {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Collections2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -8635,12 +8647,14 @@ pub mod query_product_collections {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Paging {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub after: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaProductCatalogGetCollections {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -8652,6 +8666,7 @@ pub mod query_product_collections {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_product_catalog_get_collections: Option<XwaProductCatalogGetCollections>,
@@ -8668,12 +8683,14 @@ pub mod query_product_list_catalog {
     pub const VARIABLE_KEYS: &[&str] = &["request"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Products {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ProductList {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub direct_connection_encrypted_info: Option<String>,
@@ -8688,25 +8705,21 @@ pub mod query_product_list_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub product_list: Option<ProductList>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub request: Option<Request>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ImporterAddress {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub city: Option<String>,
@@ -8723,6 +8736,7 @@ pub mod query_product_list_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ComplianceInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub country_code_origin: Option<String>,
@@ -8733,6 +8747,7 @@ pub mod query_product_list_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Images {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -8743,6 +8758,7 @@ pub mod query_product_list_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Videos {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -8753,6 +8769,7 @@ pub mod query_product_list_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Media {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub images: Option<Vec<Images>>,
@@ -8761,6 +8778,7 @@ pub mod query_product_list_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct SalePrice {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub end_date: Option<String>,
@@ -8771,6 +8789,7 @@ pub mod query_product_list_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct StatusInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub can_appeal: Option<bool>,
@@ -8779,6 +8798,7 @@ pub mod query_product_list_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Options {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
@@ -8787,6 +8807,7 @@ pub mod query_product_list_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Listing {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub is_available: Option<bool>,
@@ -8797,12 +8818,14 @@ pub mod query_product_list_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Availability {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub listing: Option<Vec<Listing>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ListingDetails {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub description: Option<String>,
@@ -8813,6 +8836,7 @@ pub mod query_product_list_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct OriginalDimensions {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub height: Option<i64>,
@@ -8821,6 +8845,7 @@ pub mod query_product_list_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ThumbnailMedia {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -8833,6 +8858,7 @@ pub mod query_product_list_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Options2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub thumbnail_media: Option<ThumbnailMedia>,
@@ -8841,6 +8867,7 @@ pub mod query_product_list_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Types {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
@@ -8849,6 +8876,7 @@ pub mod query_product_list_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct VariantProperties {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
@@ -8857,6 +8885,7 @@ pub mod query_product_list_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct VariantInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub availability: Option<Availability>,
@@ -8869,6 +8898,7 @@ pub mod query_product_list_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Products2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub belongs_to: Option<String>,
@@ -8911,12 +8941,14 @@ pub mod query_product_list_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ProductList2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub products: Option<Vec<Products2>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaProductCatalogGetProductList {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -8926,6 +8958,7 @@ pub mod query_product_list_catalog {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_product_catalog_get_product_list: Option<XwaProductCatalogGetProductList>,
@@ -8942,6 +8975,7 @@ pub mod query_product_single_collection {
     pub const VARIABLE_KEYS: &[&str] = &["request"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Collection {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub after: Option<String>,
@@ -8966,25 +9000,21 @@ pub mod query_product_single_collection {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub collection: Option<Collection>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub request: Option<Request>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ImporterAddress {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub city: Option<String>,
@@ -9001,6 +9031,7 @@ pub mod query_product_single_collection {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ComplianceInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub country_code_origin: Option<String>,
@@ -9011,6 +9042,7 @@ pub mod query_product_single_collection {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Images {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -9021,6 +9053,7 @@ pub mod query_product_single_collection {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Videos {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -9031,6 +9064,7 @@ pub mod query_product_single_collection {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Media {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub images: Option<Vec<Images>>,
@@ -9039,6 +9073,7 @@ pub mod query_product_single_collection {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct SalePrice {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub end_date: Option<String>,
@@ -9049,6 +9084,7 @@ pub mod query_product_single_collection {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct StatusInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub can_appeal: Option<bool>,
@@ -9057,6 +9093,7 @@ pub mod query_product_single_collection {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Options {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
@@ -9065,6 +9102,7 @@ pub mod query_product_single_collection {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Listing {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub is_available: Option<bool>,
@@ -9075,12 +9113,14 @@ pub mod query_product_single_collection {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Availability {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub listing: Option<Vec<Listing>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ListingDetails {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub description: Option<String>,
@@ -9091,6 +9131,7 @@ pub mod query_product_single_collection {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct OriginalDimensions {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub height: Option<i64>,
@@ -9099,6 +9140,7 @@ pub mod query_product_single_collection {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ThumbnailMedia {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -9111,6 +9153,7 @@ pub mod query_product_single_collection {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Options2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub thumbnail_media: Option<ThumbnailMedia>,
@@ -9119,6 +9162,7 @@ pub mod query_product_single_collection {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Types {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
@@ -9127,6 +9171,7 @@ pub mod query_product_single_collection {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct VariantProperties {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
@@ -9135,6 +9180,7 @@ pub mod query_product_single_collection {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct VariantInfo {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub availability: Option<Availability>,
@@ -9147,6 +9193,7 @@ pub mod query_product_single_collection {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Products {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub belongs_to: Option<String>,
@@ -9189,6 +9236,7 @@ pub mod query_product_single_collection {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct StatusInfo2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub can_appeal: Option<bool>,
@@ -9201,6 +9249,7 @@ pub mod query_product_single_collection {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Collection2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -9213,12 +9262,14 @@ pub mod query_product_single_collection {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Paging {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub after: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaProductCatalogGetSingleCollection {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub collection: Option<Collection2>,
@@ -9227,6 +9278,7 @@ pub mod query_product_single_collection {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_product_catalog_get_single_collection: Option<XwaProductCatalogGetSingleCollection>,
@@ -9243,6 +9295,7 @@ pub mod query_subgroup_participant_count {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub group_jid: Option<String>,
@@ -9252,20 +9305,15 @@ pub mod query_subgroup_participant_count {
         pub sub_group_jid_hint: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Node {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -9274,18 +9322,21 @@ pub mod query_subgroup_participant_count {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Edges {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub node: Option<Node>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct SubGroups {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub edges: Option<Vec<Edges>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2GroupQueryById {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -9297,6 +9348,7 @@ pub mod query_subgroup_participant_count {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_group_query_by_id: Option<Xwa2GroupQueryById>,
@@ -9312,26 +9364,22 @@ pub mod quick_promotion_action {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaQuickPromotionLogEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub client_mutation_id: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub wa_quick_promotion_log_event: Option<WaQuickPromotionLogEvent>,
@@ -9348,6 +9396,7 @@ pub mod report_product {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub jid: Option<String>,
@@ -9355,20 +9404,15 @@ pub mod report_product {
         pub product_id: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaWhatsappCatalogReportProduct {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -9378,6 +9422,7 @@ pub mod report_product {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_whatsapp_catalog_report_product: Option<XwaWhatsappCatalogReportProduct>,
@@ -9394,6 +9439,7 @@ pub mod request_client_logs_for_bug {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub bug_id: Option<String>,
@@ -9405,20 +9451,15 @@ pub mod request_client_logs_for_bug {
         pub up_to_timestamp_secs: Option<i64>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_request_client_logs_for_bug: Option<String>,
@@ -9434,17 +9475,12 @@ pub mod resolve_account_type_and_ad_page {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &[];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {}
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xfb_wa_biz_clear_oidc_preference: Option<String>,
@@ -9460,14 +9496,8 @@ pub mod resolve_account_type_and_ad_page_query {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["pageId"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(rename = "pageId")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -9475,6 +9505,7 @@ pub mod resolve_account_type_and_ad_page_query {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Page {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub can_viewer_do_actions: Option<bool>,
@@ -9483,6 +9514,7 @@ pub mod resolve_account_type_and_ad_page_query {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub page: Option<Page>,
@@ -9498,14 +9530,8 @@ pub mod revoke_newsletter_admin_invite {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["newsletter_id", "user_id"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub newsletter_id: Option<String>,
@@ -9514,6 +9540,7 @@ pub mod revoke_newsletter_admin_invite {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewsletterAdminInviteRevoke {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -9523,6 +9550,7 @@ pub mod revoke_newsletter_admin_invite {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_admin_invite_revoke: Option<Xwa2NewsletterAdminInviteRevoke>,
@@ -9538,14 +9566,8 @@ pub mod set_username {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["input", "reserved", "session_id", "source"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<String>,
@@ -9558,12 +9580,14 @@ pub mod set_username {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2UsernameSet {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub result: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_username_set: Option<Xwa2UsernameSet>,
@@ -9579,26 +9603,22 @@ pub mod set_username_key {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["pin"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub pin: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2UsernamePinSet {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub result: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_username_pin_set: Option<Xwa2UsernamePinSet>,
@@ -9614,14 +9634,8 @@ pub mod signup_metadata {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["phone_number", "signup_id"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub phone_number: Option<i64>,
@@ -9630,6 +9644,7 @@ pub mod signup_metadata {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaSignupMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -9640,6 +9655,7 @@ pub mod signup_metadata {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub wa_signup_metadata: Option<WaSignupMetadata>,
@@ -9655,20 +9671,15 @@ pub mod support_bug_report_submit {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaWaSupportBugReportSubmit {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub bug_report_id: Option<String>,
@@ -9683,6 +9694,7 @@ pub mod support_bug_report_submit {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_wa_support_bug_report_submit: Option<XwaWaSupportBugReportSubmit>,
@@ -9698,20 +9710,15 @@ pub mod support_contact_form_submit {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaWaSupportContactFormSubmit {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub error_code: Option<String>,
@@ -9726,6 +9733,7 @@ pub mod support_contact_form_submit {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_wa_support_contact_form_submit: Option<XwaWaSupportContactFormSubmit>,
@@ -9741,20 +9749,15 @@ pub mod support_message_feedback_submit {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XwaWaSupportMessageFeedbackSubmit {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub error_code: Option<String>,
@@ -9765,6 +9768,7 @@ pub mod support_message_feedback_submit {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_wa_support_message_feedback_submit: Option<XwaWaSupportMessageFeedbackSubmit>,
@@ -9780,26 +9784,22 @@ pub mod transfer_community_ownership {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct LidMigrationState {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub addressing_mode: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2GroupUpdateUsersRole {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub group_id: Option<String>,
@@ -9808,6 +9808,7 @@ pub mod transfer_community_ownership {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_group_update_users_role: Option<Xwa2GroupUpdateUsersRole>,
@@ -9823,14 +9824,8 @@ pub mod update_group_property {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["group_id", "update"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub group_id: Option<String>,
@@ -9839,6 +9834,7 @@ pub mod update_group_property {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2GroupUpdateProperty {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -9847,6 +9843,7 @@ pub mod update_group_property {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_group_update_property: Option<Xwa2GroupUpdateProperty>,
@@ -9863,6 +9860,7 @@ pub mod update_newsletter {
     pub const VARIABLE_KEYS: &[&str] = &["newsletter_id", "updates"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Updates {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub description: Option<String>,
@@ -9874,14 +9872,8 @@ pub mod update_newsletter {
         pub settings: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub newsletter_id: Option<String>,
@@ -9890,12 +9882,14 @@ pub mod update_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct State {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub r#type: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Description {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -9906,6 +9900,7 @@ pub mod update_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Name {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -9916,6 +9911,7 @@ pub mod update_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Picture {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub direct_path: Option<String>,
@@ -9926,6 +9922,7 @@ pub mod update_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Preview {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub direct_path: Option<String>,
@@ -9936,18 +9933,21 @@ pub mod update_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ReactionCodes {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub value: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Settings {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub reaction_codes: Option<ReactionCodes>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct ThreadMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub creation_time: Option<i64>,
@@ -9970,6 +9970,7 @@ pub mod update_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewsletterUpdate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -9980,6 +9981,7 @@ pub mod update_newsletter {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_update: Option<Xwa2NewsletterUpdate>,
@@ -9996,25 +9998,21 @@ pub mod update_newsletter_admin_profile_setting {
     pub const VARIABLE_KEYS: &[&str] = &["newsletter_id", "updates"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Settings {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub admin_profiles_enabled: Option<bool>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Updates {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub settings: Option<Settings>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub newsletter_id: Option<String>,
@@ -10023,12 +10021,14 @@ pub mod update_newsletter_admin_profile_setting {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct State {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub r#type: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewsletterUpdate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -10037,6 +10037,7 @@ pub mod update_newsletter_admin_profile_setting {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_update: Option<Xwa2NewsletterUpdate>,
@@ -10052,26 +10053,22 @@ pub mod update_newsletter_user_setting {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct State {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub r#type: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2NewsletterUpdateUserSetting {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
@@ -10080,6 +10077,7 @@ pub mod update_newsletter_user_setting {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_update_user_setting: Option<Xwa2NewsletterUpdateUserSetting>,
@@ -10095,26 +10093,22 @@ pub mod update_text_status {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2UpdateTextStatus {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub result: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_update_text_status: Option<Xwa2UpdateTextStatus>,
@@ -10130,14 +10124,8 @@ pub mod username_availability {
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["input", "session_id", "source"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<String>,
@@ -10148,6 +10136,7 @@ pub mod username_availability {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2UsernameCheck {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub result: Option<String>,
@@ -10156,6 +10145,7 @@ pub mod username_availability {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_username_check: Option<Xwa2UsernameCheck>,
@@ -10177,6 +10167,7 @@ pub mod usync {
     ];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub query_input: Option<String>,
@@ -10184,14 +10175,8 @@ pub mod usync {
         pub telemetry: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub include_about_status: Option<bool>,
@@ -10204,6 +10189,7 @@ pub mod usync {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct AboutStatusInfo {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -10217,6 +10203,7 @@ pub mod usync {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct UsernameInfo {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -10234,6 +10221,7 @@ pub mod usync {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Xwa2FetchWaUsers {
         #[serde(rename = "__typename")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -10251,6 +10239,7 @@ pub mod usync {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_fetch_wa_users: Option<Vec<Xwa2FetchWaUsers>>,
@@ -10267,6 +10256,7 @@ pub mod waa_onboarding {
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Input {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub flow_id: Option<String>,
@@ -10274,20 +10264,15 @@ pub mod waa_onboarding {
         pub request_id: Option<String>,
     }
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct CreateOrOnboardWaAdAccount {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub ad_account_id: Option<String>,
@@ -10296,6 +10281,7 @@ pub mod waa_onboarding {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub create_or_onboard_wa_ad_account: Option<CreateOrOnboardWaAdAccount>,
@@ -10311,17 +10297,12 @@ pub mod waffle_fx_service_data_query_v2 {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &[];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {}
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct FoaToWaLinkEligibility {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub is_eligible_to_link_to_linked_fb: Option<bool>,
@@ -10338,12 +10319,14 @@ pub mod waffle_fx_service_data_query_v2 {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaffleAfs {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub waffle_wes: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaffleXss {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub waffle_iaxe: Option<String>,
@@ -10352,6 +10335,7 @@ pub mod waffle_fx_service_data_query_v2 {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaffleSxs {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub waffle_da: Option<String>,
@@ -10362,6 +10346,7 @@ pub mod waffle_fx_service_data_query_v2 {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Services {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub foa_to_wa_link_eligibility: Option<FoaToWaLinkEligibility>,
@@ -10372,12 +10357,14 @@ pub mod waffle_fx_service_data_query_v2 {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaffleFxServiceData {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub services: Option<Services>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub waffle_fx_service_data: Option<WaffleFxServiceData>,
@@ -10393,17 +10380,12 @@ pub mod waffle_fxwamo_update_uoom {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &[];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {}
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xfb_waffle_fx_wamo_update_uoom: Option<String>,
@@ -10419,20 +10401,15 @@ pub mod waffle_xe {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct PurposePublicKeys {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub purpose_dummy_ciphertext: Option<String>,
@@ -10449,6 +10426,7 @@ pub mod waffle_xe {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaffleXas {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub waffle_xan: Option<String>,
@@ -10457,6 +10435,7 @@ pub mod waffle_xe {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaffleD {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub waffle_di: Option<String>,
@@ -10465,6 +10444,7 @@ pub mod waffle_xe {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaffleXps {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub waffle_hcbc: Option<String>,
@@ -10473,6 +10453,7 @@ pub mod waffle_xe {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct WaffleXeRoot {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub purpose_public_keys: Option<PurposePublicKeys>,
@@ -10485,6 +10466,7 @@ pub mod waffle_xe {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub waffle_xe_root: Option<WaffleXeRoot>,
@@ -10500,14 +10482,8 @@ pub mod use_passkey_upsell_eligibility_check {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["encryptedContext"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(rename = "encryptedContext")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -10515,6 +10491,7 @@ pub mod use_passkey_upsell_eligibility_check {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xfb_upsell_passkey_post_reauth: Option<String>,
@@ -10540,14 +10517,8 @@ pub mod use_wa_web_estimated_daily_reach {
         "targetingSpecAudience",
     ];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(rename = "audienceOptionAudience")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -10577,6 +10548,7 @@ pub mod use_wa_web_estimated_daily_reach {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct DailyOutcomesCurve {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub actions: Option<String>,
@@ -10599,18 +10571,21 @@ pub mod use_wa_web_estimated_daily_reach {
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct BudgetEstimateDataV2 {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub daily_outcomes_curve: Option<Vec<DailyOutcomesCurve>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Lwi {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub budget_estimate_data_v2: Option<BudgetEstimateDataV2>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub lwi: Option<Lwi>,
@@ -10626,26 +10601,22 @@ pub mod use_wa_web_smart_composer_coach_suggested_reply {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct XfbMetaAiBizAgentWaCoachSuggestedReply {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub success: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xfb_meta_ai_biz_agent_wa_coach_suggested_reply:
@@ -10662,26 +10633,22 @@ pub mod use_wa_web_smart_composer_report_used {
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
-    /// Variables for this operation, one field per variable the persisted document
-    /// declares.
-    ///
-    /// Deliberately not `Default`: the server rejects a persisted query whose
-    /// variables it cannot bind, so every variable is a decision a call site has to
-    /// write out, and `..Default::default()` would make skipping one invisible.
-    /// Passing `None` is still how a variable WhatsApp Web itself omits is omitted.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct MetaAiBizAgentWaSuggestedReplyUsed {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub success: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub meta_ai_biz_agent_wa_suggested_reply_used: Option<MetaAiBizAgentWaSuggestedReplyUsed>,

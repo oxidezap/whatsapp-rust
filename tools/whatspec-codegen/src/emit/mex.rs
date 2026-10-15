@@ -12,6 +12,10 @@ use crate::naming::{pascal_case, rust_ident, rust_lit, snake_case, unique_ident}
 const HEADER: &str = "\
 //! One module per persisted GraphQL operation: typed `Variables` + `Response`
 //! plus `DOC_ID`/`OPERATION_KIND`/`NAME`. Depends only on `serde`.
+//!
+//! Construct with `Default` and assign fields. New optional fields preserve this
+//! construction path. `None` omits a key; it supplies no protocol default.
+//! Shapes are inferred from a Web capture, not server-requiredness validation.
 
 #![allow(clippy::all)]
 
@@ -70,19 +74,6 @@ pub fn preserve_compatibility(ir: &mut MexIr) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Doc comment on every generated `Variables`.
-///
-/// It is the one place the no-`Default` decision is explained, because the
-/// generated file is where a reader meets it.
-const VARIABLES_DOC: &str = "\
-Variables for this operation, one field per variable the persisted document
-declares.
-
-Deliberately not `Default`: the server rejects a persisted query whose
-variables it cannot bind, so every variable is a decision a call site has to
-write out, and `..Default::default()` would make skipping one invisible.
-Passing `None` is still how a variable WhatsApp Web itself omits is omitted.";
-
 pub fn generate(ir: &MexIr) -> String {
     let mut out = super::header("typed mex operations", &ir.wa_version);
     out.push_str(HEADER);
@@ -96,8 +87,8 @@ pub fn generate(ir: &MexIr) -> String {
         // just as easily want the name `Response`.
         b.reserve("Variables");
         b.reserve("Response");
-        b.register("Variables", &op.variables_shape, true);
-        b.register("Response", &op.response, false);
+        b.register("Variables", &op.variables_shape);
+        b.register("Response", &op.response);
 
         let kind = op.operation_kind.as_str();
         out.push_str(&format!("\n/// `{}` ({kind}).\n", op.original_name));
@@ -135,10 +126,6 @@ pub fn generate(ir: &MexIr) -> String {
 struct StructDef {
     name: String,
     fields: Vec<(String, String, String)>,
-    /// `true` for an operation's own `Variables`, which is rendered without
-    /// `Default` so a call site cannot inherit `None` for a variable it never
-    /// considered; see [`VARIABLES_DOC`].
-    variables: bool,
 }
 
 impl StructDef {
@@ -155,17 +142,10 @@ impl StructDef {
 
     fn render(&self, indent: &str) -> String {
         let mut s = String::new();
-        if self.variables {
-            for line in VARIABLES_DOC.lines() {
-                s.push_str(&format!("{indent}/// {line}\n"));
-            }
-        }
-        let derives = if self.variables {
-            "Debug, Clone, Serialize, Deserialize"
-        } else {
-            "Debug, Clone, Default, Serialize, Deserialize"
-        };
-        s.push_str(&format!("{indent}#[derive({derives})]\n"));
+        s.push_str(&format!(
+            "{indent}#[derive(Debug, Clone, Default, Serialize, Deserialize)]\n"
+        ));
+        s.push_str(&format!("{indent}#[non_exhaustive]\n"));
         s.push_str(&format!("{indent}pub struct {} {{\n", self.name));
         for (rust_field, json_key, ty) in &self.fields {
             if rust_field.trim_start_matches("r#") != json_key {
@@ -204,14 +184,8 @@ impl Builder {
         self.reserved.insert(name.to_string());
     }
 
-    fn register(
-        &mut self,
-        name: &str,
-        fields: &BTreeMap<String, TypeNode>,
-        variables: bool,
-    ) -> String {
-        let mut def = self.struct_def(name, fields);
-        def.variables = variables;
+    fn register(&mut self, name: &str, fields: &BTreeMap<String, TypeNode>) -> String {
+        let def = self.struct_def(name, fields);
         self.intern(def, true)
     }
 
@@ -220,7 +194,6 @@ impl Builder {
         let mut def = StructDef {
             name: name.to_string(),
             fields: Vec::new(),
-            variables: false,
         };
         // `rust_ident` is not injective: `fooBar` and `foo_bar` are one Rust
         // field. Two of them in the same object would emit the field twice.
@@ -392,11 +365,8 @@ mod tests {
         assert!(nested < response);
     }
 
-    /// The bug this shape exists to prevent: a call site that names some
-    /// variables and inherits the rest, sending a persisted query fewer
-    /// variables than it declares.
     #[test]
-    fn variables_is_not_default_but_every_other_struct_is() {
+    fn all_shapes_are_non_exhaustive_and_default_constructible() {
         let code = generate(&ir(
             "FetchThing",
             op(
@@ -406,13 +376,13 @@ mod tests {
         ));
         assert!(
             code.contains(
-                "#[derive(Debug, Clone, Serialize, Deserialize)]\n    pub struct Variables {"
+                "#[derive(Debug, Clone, Default, Serialize, Deserialize)]\n    #[non_exhaustive]\n    pub struct Variables {"
             ),
             "{code}"
         );
         assert!(
             code.contains(
-                "#[derive(Debug, Clone, Default, Serialize, Deserialize)]\n    pub struct Node {"
+                "#[derive(Debug, Clone, Default, Serialize, Deserialize)]\n    #[non_exhaustive]\n    pub struct Node {"
             ),
             "{code}"
         );
@@ -433,16 +403,14 @@ mod tests {
         );
         assert!(
             code.contains(
-                "#[derive(Debug, Clone, Serialize, Deserialize)]\n    pub struct Variables {"
+                "#[derive(Debug, Clone, Default, Serialize, Deserialize)]\n    #[non_exhaustive]\n    pub struct Variables {"
             ),
             "{code}"
         );
     }
 
-    /// A nested object named `variables` must not inherit the required-field
-    /// rendering: only the operation's own variables are the wire's variables.
     #[test]
-    fn only_the_operations_own_variables_lose_default() {
+    fn nested_shapes_share_the_evolution_policy() {
         let code = generate(&ir(
             "FetchThing",
             op(
@@ -452,10 +420,32 @@ mod tests {
         ));
         assert!(
             code.contains(
-                "#[derive(Debug, Clone, Default, Serialize, Deserialize)]\n    pub struct Variables2 {"
+                "#[derive(Debug, Clone, Default, Serialize, Deserialize)]\n    #[non_exhaustive]\n    pub struct Variables2 {"
             ),
             "{code}"
         );
+    }
+
+    #[test]
+    fn added_fields_preserve_default_construction_and_existing_wire_types() {
+        let mut input = ir("FetchThing", op(&[("id", leaf("string"))], &[]));
+        let before = generate(&input);
+        input
+            .operations
+            .get_mut("FetchThing")
+            .unwrap()
+            .variables_shape
+            .insert("future_option".into(), leaf("boolean"));
+        let after = generate(&input);
+        for code in [&before, &after] {
+            assert!(code.contains("#[derive(Debug, Clone, Default, Serialize, Deserialize)]\n    #[non_exhaustive]\n    pub struct Variables"));
+            assert!(code.contains("pub id: Option<String>"));
+            assert_eq!(
+                code.matches("pub struct ").count(),
+                code.matches("#[non_exhaustive]").count()
+            );
+        }
+        assert!(after.contains("pub future_option: Option<bool>"));
     }
 
     #[test]

@@ -28,12 +28,10 @@ pub fn historical_props() -> [abprops::AbProp; 6] {
 
 #[test]
 fn customer_profile_candidates_still_serialize_as_an_array() {
-    let variables = mex::contact_manager_customer_profiles::Variables {
-        input: Some(mex::contact_manager_customer_profiles::Input {
-            candidate_lids: Some(vec!["123".into(), "456".into()]),
-            ..Default::default()
-        }),
-    };
+    let mut input = mex::contact_manager_customer_profiles::Input::default();
+    input.candidate_lids = Some(vec!["123".into(), "456".into()]);
+    let mut variables = mex::contact_manager_customer_profiles::Variables::default();
+    variables.input = Some(input);
     assert_eq!(
         serde_json::to_value(variables).unwrap(),
         serde_json::json!({"input": {"candidate_lids": ["123", "456"]}})

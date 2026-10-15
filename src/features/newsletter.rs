@@ -511,10 +511,11 @@ impl<'a> Newsletter<'a> {
             .client
             .mex()
             .execute(mex_request!(create_newsletter {
-                input: Some(create_newsletter::Input {
-                    name: Some(name.to_string()),
-                    description: description.map(str::to_string),
-                    picture: None,
+                input: Some({
+                    let mut value = create_newsletter::Input::default();
+                    value.name = Some(name.to_string());
+                    value.description = description.map(str::to_string);
+                    value
                 }),
             }))
             .await?;
@@ -590,11 +591,11 @@ impl<'a> Newsletter<'a> {
             .mex()
             .execute(mex_request!(update_newsletter {
                 newsletter_id: Some(jid.to_string()),
-                updates: Some(update_newsletter::Updates {
-                    name: name.map(str::to_string),
-                    description: description.map(str::to_string),
-                    picture: None,
-                    settings: None,
+                updates: Some({
+                    let mut value = update_newsletter::Updates::default();
+                    value.name = name.map(str::to_string);
+                    value.description = description.map(str::to_string);
+                    value
                 }),
             }))
             .await?;
@@ -1717,15 +1718,14 @@ fn picture_update_variables(jid: &Jid, jpeg: Option<&[u8]>) -> update_newsletter
     let picture = jpeg
         .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
         .unwrap_or_default();
-    update_newsletter::Variables {
-        newsletter_id: Some(jid.to_string()),
-        updates: Some(update_newsletter::Updates {
-            name: None,
-            description: None,
-            picture: Some(picture),
-            settings: None,
-        }),
-    }
+    let mut value = update_newsletter::Variables::default();
+    value.newsletter_id = Some(jid.to_string());
+    value.updates = Some({
+        let mut value = update_newsletter::Updates::default();
+        value.picture = Some(picture);
+        value
+    });
+    value
 }
 
 /// Variables for `WAWebMexFetchNewsletterJobQuery`, addressing a channel by
@@ -1735,54 +1735,58 @@ fn picture_update_variables(jid: &Jid, jpeg: Option<&[u8]>) -> update_newsletter
 /// WA Web puts each behind a feature flag and sends the flag's value either
 /// way. `view_role` is `GUEST` because WA Web maps an absent role to it.
 fn newsletter_variables(key: &str, key_type: &str) -> fetch_newsletter::Variables {
-    fetch_newsletter::Variables {
-        input: Some(fetch_newsletter::Input {
-            key: Some(key.to_string()),
-            r#type: Some(key_type.to_string()),
-            view_role: Some("GUEST".into()),
-        }),
-        fetch_viewer_metadata: Some(true),
-        fetch_full_image: Some(true),
-        fetch_creation_time: Some(true),
-        fetch_pinned_messages: Some(false),
-        fetch_status_metadata: Some(false),
-        fetch_wamo_sub: Some(false),
-    }
+    let mut value = fetch_newsletter::Variables::default();
+    value.input = Some({
+        let mut value = fetch_newsletter::Input::default();
+        value.key = Some(key.to_string());
+        value.r#type = Some(key_type.to_string());
+        value.view_role = Some("GUEST".into());
+        value
+    });
+    value.fetch_viewer_metadata = Some(true);
+    value.fetch_full_image = Some(true);
+    value.fetch_creation_time = Some(true);
+    value.fetch_pinned_messages = Some(false);
+    value.fetch_status_metadata = Some(false);
+    value.fetch_wamo_sub = Some(false);
+    value
 }
 
 fn delete_variables(jid: &Jid) -> delete_newsletter::Variables {
-    delete_newsletter::Variables {
-        newsletter_id: Some(jid.to_string()),
-    }
+    let mut value = delete_newsletter::Variables::default();
+    value.newsletter_id = Some(jid.to_string());
+    value
 }
 
 fn change_owner_variables(jid: &Jid, user: &Jid) -> change_newsletter_owner::Variables {
-    change_newsletter_owner::Variables {
-        newsletter_id: Some(jid.to_string()),
-        user_id: Some(user.to_string()),
-    }
+    let mut value = change_newsletter_owner::Variables::default();
+    value.newsletter_id = Some(jid.to_string());
+    value.user_id = Some(user.to_string());
+    value
 }
 
 fn demote_admin_variables(jid: &Jid, user: &Jid) -> demote_newsletter_admin::Variables {
-    demote_newsletter_admin::Variables {
-        newsletter_id: Some(jid.to_string()),
-        user_id: Some(user.to_string()),
-    }
+    let mut value = demote_newsletter_admin::Variables::default();
+    value.newsletter_id = Some(jid.to_string());
+    value.user_id = Some(user.to_string());
+    value
 }
 
 fn admin_info_variables(jid: &Jid) -> fetch_newsletter_admin_info::Variables {
-    fetch_newsletter_admin_info::Variables {
-        newsletter_id: Some(jid.to_string()),
-    }
+    let mut value = fetch_newsletter_admin_info::Variables::default();
+    value.newsletter_id = Some(jid.to_string());
+    value
 }
 
 fn followers_variables(jid: &Jid, count: u32) -> fetch_newsletter_followers::Variables {
-    fetch_newsletter_followers::Variables {
-        input: Some(fetch_newsletter_followers::Input {
-            newsletter_id: Some(jid.to_string()),
-            count: Some(count.into()),
-        }),
-    }
+    let mut value = fetch_newsletter_followers::Variables::default();
+    value.input = Some({
+        let mut value = fetch_newsletter_followers::Input::default();
+        value.newsletter_id = Some(jid.to_string());
+        value.count = Some(count.into());
+        value
+    });
+    value
 }
 
 fn mute_user_setting_variables(jid: &Jid, mute_type: &str, muted: bool) -> serde_json::Value {

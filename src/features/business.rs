@@ -581,22 +581,21 @@ fn collection_variables(jid: &Jid, options: &CollectionOptions) -> Value {
 /// Variables for `WAWebBizQueryOrderJobQuery`. This one uses the generated type:
 /// unlike the catalog query, its image dimensions really are JSON numbers.
 fn order_variables(jid: &Jid, order_id: &str, token: &str) -> biz_query_order::Variables {
-    biz_query_order::Variables {
-        request: Some(biz_query_order::Request {
-            order: Some(biz_query_order::Order {
-                id: Some(order_id.to_string()),
-                jid: Some(jid.to_string()),
-                token: Some(biz_query_order::Token {
-                    sensitive_string_value: Some(token.to_string()),
-                }),
-                image_dimensions: Some(biz_query_order::ImageDimensions {
-                    width: Some(DEFAULT_IMAGE_DIMENSION.into()),
-                    height: Some(DEFAULT_IMAGE_DIMENSION.into()),
-                }),
-                ..Default::default()
-            }),
-        }),
-    }
+    let mut token_value = biz_query_order::Token::default();
+    token_value.sensitive_string_value = Some(token.to_string());
+    let mut dimensions = biz_query_order::ImageDimensions::default();
+    dimensions.width = Some(DEFAULT_IMAGE_DIMENSION.into());
+    dimensions.height = Some(DEFAULT_IMAGE_DIMENSION.into());
+    let mut order = biz_query_order::Order::default();
+    order.id = Some(order_id.to_string());
+    order.jid = Some(jid.to_string());
+    order.token = Some(token_value);
+    order.image_dimensions = Some(dimensions);
+    let mut request = biz_query_order::Request::default();
+    request.order = Some(order);
+    let mut variables = biz_query_order::Variables::default();
+    variables.request = Some(request);
+    variables
 }
 
 /// Reads WhatsApp's scaled-integer money fields.

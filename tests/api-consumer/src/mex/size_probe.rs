@@ -6,8 +6,10 @@ use whatsapp_rust::{
 
 fn main() {
     let operation = mex_operation!(join_newsletter);
-    let request = operation.request(join_newsletter::Variables {
-        newsletter_id: Some(black_box("123456789@newsletter").into()),
+    let request = operation.request({
+        let mut value = join_newsletter::Variables::default();
+        value.newsletter_id = Some(black_box("123456789@newsletter").into());
+        value
     });
     black_box(request.doc());
     black_box(request.missing_variables().expect("serializable variables"));

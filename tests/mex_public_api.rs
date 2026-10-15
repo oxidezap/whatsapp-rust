@@ -32,8 +32,10 @@ fn descriptor_binds_same_module_metadata_and_variables() {
     assert_eq!(op.doc().name, join_newsletter::NAME);
     assert_eq!(op.doc().id, join_newsletter::DOC_ID);
     assert_eq!(op.declared_variables(), join_newsletter::VARIABLE_KEYS);
-    let request = op.request(join_newsletter::Variables {
-        newsletter_id: Some("123456789@newsletter".into()),
+    let request = op.request({
+        let mut value = join_newsletter::Variables::default();
+        value.newsletter_id = Some("123456789@newsletter".into());
+        value
     });
     assert_eq!(request.declared_variables(), op.declared_variables());
     assert_eq!(
@@ -46,19 +48,18 @@ fn descriptor_binds_same_module_metadata_and_variables() {
 fn macro_expansion_is_hygienic_through_a_renamed_crate_import() {
     use whatsapp_rust as wa;
     let op = wa::mex_operation!(wa::wacore::iq::mex_operations::join_newsletter);
-    let request = op.request(join_newsletter::Variables {
-        newsletter_id: None,
-    });
+    let request = op.request(join_newsletter::Variables::default());
     assert_eq!(request.doc().id, join_newsletter::DOC_ID);
     assert_eq!(wire(&request), br#"{"variables":{}}"#);
 }
 
 #[test]
 fn optional_omission_remains_a_diagnostic_not_a_construction_error() {
-    let request = mex_operation!(fetch_all_subgroups).request(fetch_all_subgroups::Variables {
-        group_id: Some("123456789@g.us".into()),
-        query_context: Some("INTERACTIVE".into()),
-        sub_group_hint_id: None,
+    let request = mex_operation!(fetch_all_subgroups).request({
+        let mut value = fetch_all_subgroups::Variables::default();
+        value.group_id = Some("123456789@g.us".into());
+        value.query_context = Some("INTERACTIVE".into());
+        value
     });
     assert_eq!(request.missing_variables().unwrap(), ["sub_group_hint_id"]);
     assert_eq!(
@@ -109,9 +110,74 @@ async fn public_execution(client: &whatsapp_rust::Client) -> Result<(), whatsapp
     let op = mex_operation!(join_newsletter);
     client
         .mex()
-        .execute(op.request(join_newsletter::Variables {
-            newsletter_id: None,
-        }))
+        .execute(op.request(join_newsletter::Variables::default()))
         .await?;
     Ok(())
+}
+
+#[test]
+fn generated_shapes_accept_additive_fields_without_coercing_known_fields() {
+    let variables: join_newsletter::Variables = serde_json::from_value(serde_json::json!({
+        "newsletter_id": "123456789@newsletter", "future_option": true
+    }))
+    .unwrap();
+    assert_eq!(
+        variables.newsletter_id.as_deref(),
+        Some("123456789@newsletter")
+    );
+    assert!(
+        serde_json::from_value::<join_newsletter::Variables>(serde_json::json!({
+            "newsletter_id": 123
+        }))
+        .is_err()
+    );
+
+    let response: join_newsletter::Response = serde_json::from_value(serde_json::json!({
+        "xwa2_newsletter_join_v2": {"state": {"type": "FUTURE_STATE", "future": true}},
+        "future_result": [1, 2]
+    }))
+    .unwrap();
+    assert_eq!(
+        response
+            .xwa2_newsletter_join_v2
+            .unwrap()
+            .state
+            .unwrap()
+            .r#type
+            .as_deref(),
+        Some("FUTURE_STATE")
+    );
+    assert!(
+        serde_json::from_value::<join_newsletter::Response>(serde_json::json!({
+            "xwa2_newsletter_join_v2": false
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn defaults_omit_keys_and_explicit_false_is_preserved() {
+    use whatsapp_rust::wacore::iq::mex_operations::fetch_all_newsletters_metadata as op;
+    let mut variables = op::Variables::default();
+    assert_eq!(
+        serde_json::to_value(&variables).unwrap(),
+        serde_json::json!({})
+    );
+    variables.fetch_status_metadata = Some(false);
+    assert_eq!(
+        serde_json::to_value(&variables).unwrap(),
+        serde_json::json!({"fetch_status_metadata": false})
+    );
+}
+
+#[test]
+fn historical_shapes_use_the_same_construction_path() {
+    use whatsapp_rust::wacore::iq::mex_operations::create_labyrinth_backup as op;
+    let mut variables = op::Variables::default();
+    variables.input = Some("opaque-input".into());
+    assert_eq!(
+        serde_json::to_value(&variables).unwrap(),
+        serde_json::json!({"input": "opaque-input"})
+    );
+    let _: op::Response = Default::default();
 }

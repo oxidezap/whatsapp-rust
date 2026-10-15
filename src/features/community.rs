@@ -541,10 +541,11 @@ impl<'a> Community<'a> {
             .client
             .mex()
             .execute(mex_request!(query_subgroup_participant_count {
-                input: Some(query_subgroup_participant_count::Input {
-                    group_jid: Some(community_jid.to_string()),
-                    query_context: Some(SUBGROUP_QUERY_CONTEXT.to_string()),
-                    sub_group_jid_hint: None,
+                input: Some({
+                    let mut value = query_subgroup_participant_count::Input::default();
+                    value.group_jid = Some(community_jid.to_string());
+                    value.query_context = Some(SUBGROUP_QUERY_CONTEXT.to_string());
+                    value
                 }),
             }))
             .await?;
@@ -1093,10 +1094,11 @@ mod tests {
     #[test]
     fn participant_count_input_carries_the_query_context() {
         let request = mex_request!(query_subgroup_participant_count {
-            input: Some(query_subgroup_participant_count::Input {
-                group_jid: Some(community_jid().to_string()),
-                query_context: Some(SUBGROUP_QUERY_CONTEXT.to_string()),
-                sub_group_jid_hint: None,
+            input: Some({
+                let mut value = query_subgroup_participant_count::Input::default();
+                value.group_jid = Some(community_jid().to_string());
+                value.query_context = Some(SUBGROUP_QUERY_CONTEXT.to_string());
+                value
             }),
         });
 

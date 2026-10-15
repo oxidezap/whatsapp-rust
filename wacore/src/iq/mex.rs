@@ -16,39 +16,9 @@
 //! </iq>
 //! ```
 //!
-//! # Declared variables are not necessarily required
-//!
-//! Generated `Variables` have no `Default`, so callers deliberately choose each
-//! field. `None` fields can be omitted from serialization, including optional
-//! variables omitted by WhatsApp Web. `VARIABLE_KEYS` lists declarations, not
-//! requiredness; neither construction nor execution validates key presence:
-//!
-//! ```compile_fail
-//! use wacore::iq::mex_operations::fetch_newsletter;
-//!
-//! // Names one variable and inherits six. `Variables` has no `Default`, so
-//! // this does not compile.
-//! let _ = fetch_newsletter::Variables {
-//!     fetch_full_image: Some(true),
-//!     ..Default::default()
-//! };
-//! ```
-//!
-//! Writing every field out compiles, and `VARIABLE_KEYS` is the same list for
-//! anything that has to check a payload it did not build from the type:
-//!
-//! ```
-//! use wacore::iq::mex_operations::fetch_all_newsletters_metadata as op;
-//!
-//! let variables = op::Variables {
-//!     fetch_status_metadata: Some(false),
-//!     fetch_wamo_sub: Some(false),
-//! };
-//! let payload = serde_json::to_value(&variables).expect("variables serialize");
-//! for key in op::VARIABLE_KEYS {
-//!     assert!(payload.get(key).is_some(), "{key} is missing");
-//! }
-//! ```
+//! Generated shapes and their construction policy live in
+//! [`crate::iq::mex_operations`]. `VARIABLE_KEYS` lists declarations, not
+//! requiredness; execution does not validate key presence.
 
 use crate::iq::spec::IqSpec;
 use crate::request::InfoQuery;

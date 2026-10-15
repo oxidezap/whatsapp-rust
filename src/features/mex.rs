@@ -13,9 +13,9 @@
 //! use whatsapp_rust::{Client, MexError, mex_operation,
 //!     wacore::iq::mex_operations::join_newsletter};
 //! # async fn join(client: &Client) -> Result<(), MexError> {
-//! let request = mex_operation!(join_newsletter).request(join_newsletter::Variables {
-//!     newsletter_id: Some("123456789@newsletter".into()),
-//! });
+//! let mut variables = join_newsletter::Variables::default();
+//! variables.newsletter_id = Some("123456789@newsletter".into());
+//! let request = mex_operation!(join_newsletter).request(variables);
 //! let response = client.mex().execute(request).await?;
 //! // Parse response.data in the domain layer, not a generated output mirror.
 //! # Ok(())
@@ -36,13 +36,13 @@
 //! ```compile_fail
 //! # async fn removed(client: &whatsapp_rust::Client) {
 //! use whatsapp_rust::{mex_operation, wacore::iq::mex_operations::get_username};
-//! client.mex().query(mex_operation!(get_username).request(get_username::Variables {})).await;
+//! client.mex().query(mex_operation!(get_username).request(get_username::Variables::default())).await;
 //! # }
 //! ```
 //! ```compile_fail
 //! # async fn removed(client: &whatsapp_rust::Client) {
 //! use whatsapp_rust::{mex_operation, wacore::iq::mex_operations::get_username};
-//! client.mex().mutate(mex_operation!(get_username).request(get_username::Variables {})).await;
+//! client.mex().mutate(mex_operation!(get_username).request(get_username::Variables::default())).await;
 //! # }
 //! ```
 //! ```compile_fail
@@ -159,16 +159,16 @@ impl<V> MexOperation<V> {
 /// ```
 /// use whatsapp_rust::{mex_operation, wacore::iq::mex_operations::join_newsletter};
 /// let op = mex_operation!(join_newsletter);
-/// let request = op.request(join_newsletter::Variables {
-///     newsletter_id: Some("123456789@newsletter".into()),
-/// });
+/// let mut variables = join_newsletter::Variables::default();
+/// variables.newsletter_id = Some("123456789@newsletter".into());
+/// let request = op.request(variables);
 /// assert_eq!(request.doc().id, join_newsletter::DOC_ID);
 /// ```
 ///
 /// Unrelated variables do not compile (use `raw_request` deliberately instead):
 /// ```compile_fail
 /// use whatsapp_rust::{mex_operation, wacore::iq::mex_operations::{join_newsletter, get_username}};
-/// mex_operation!(join_newsletter).request(get_username::Variables {});
+/// mex_operation!(join_newsletter).request(get_username::Variables::default());
 /// ```
 #[macro_export]
 macro_rules! mex_operation {
@@ -193,7 +193,7 @@ macro_rules! mex_operation {
 /// Metadata cannot be overwritten independently after construction:
 /// ```compile_fail
 /// use whatsapp_rust::{mex_operation, wacore::iq::mex_operations::join_newsletter};
-/// let mut request = mex_operation!(join_newsletter).request(join_newsletter::Variables { newsletter_id: None });
+/// let mut request = mex_operation!(join_newsletter).request(join_newsletter::Variables::default());
 /// request.doc.id = "another operation";
 /// ```
 #[derive(Debug, Clone)]
@@ -247,9 +247,15 @@ impl<V: Serialize> MexRequest<V> {
 // Internal construction sugar for domain callers. The comma form
 // deliberately uses raw variables. Public callers use mex_operation! instead.
 macro_rules! mex_request {
-    ($op:path { $($body:tt)* }) => {{
+    ($op:path {}) => {{
         use $op as __mex_op;
-        $crate::mex_operation!($op).request(__mex_op::Variables { $($body)* })
+        $crate::mex_operation!($op).request(__mex_op::Variables::default())
+    }};
+    ($op:path { $($field:ident: $value:expr),+ $(,)? }) => {{
+        use $op as __mex_op;
+        let mut variables = __mex_op::Variables::default();
+        $(variables.$field = $value;)*
+        $crate::mex_operation!($op).request(variables)
     }};
     ($op:path, $vars:expr $(,)?) => {{
         $crate::mex_operation!($op).raw_request($vars)
@@ -414,8 +420,10 @@ impl<'a> Mex<'a> {
     ) -> Result<NewChatMessageCapping, MexError> {
         let response = self
             .execute(mex_request!(fetch_new_chat_message_capping_info {
-                input: Some(fetch_new_chat_message_capping_info::Input {
-                    r#type: Some(NEW_CHAT_THREAD_CAPPING_TYPE.to_string()),
+                input: Some({
+                    let mut value = fetch_new_chat_message_capping_info::Input::default();
+                    value.r#type = Some(NEW_CHAT_THREAD_CAPPING_TYPE.to_string());
+                    value
                 }),
             }))
             .await?;
@@ -563,8 +571,10 @@ mod tests {
         let task = {
             let client = Arc::clone(&client);
             tokio::spawn(async move {
-                let request = crate::mex_operation!(op).request(op::Variables {
-                    newsletter_id: Some("123456789@newsletter".into()),
+                let request = crate::mex_operation!(op).request({
+                    let mut value = op::Variables::default();
+                    value.newsletter_id = Some("123456789@newsletter".into());
+                    value
                 });
                 client.mex().execute(request).await
             })
@@ -611,10 +621,11 @@ mod tests {
             tokio::spawn(async move {
                 client
                     .mex()
-                    .execute(crate::mex_operation!(op).request(op::Variables {
-                        group_id: Some("123456789@g.us".into()),
-                        query_context: Some("INTERACTIVE".into()),
-                        sub_group_hint_id: None,
+                    .execute(crate::mex_operation!(op).request({
+                        let mut value = op::Variables::default();
+                        value.group_id = Some("123456789@g.us".into());
+                        value.query_context = Some("INTERACTIVE".into());
+                        value
                     }))
                     .await
             })
@@ -708,7 +719,7 @@ mod tests {
         use wacore_binary::builder::NodeBuilder;
         let spec = MexQuerySpec::new(
             crate::mex_operation!(get_username).doc(),
-            &get_username::Variables {},
+            &get_username::Variables::default(),
         )
         .unwrap();
         for (payload, graphql) in [
@@ -926,8 +937,10 @@ mod tests {
     #[test]
     fn new_chat_capping_request_carries_the_thread_type() {
         let request = mex_request!(fetch_new_chat_message_capping_info {
-            input: Some(fetch_new_chat_message_capping_info::Input {
-                r#type: Some(NEW_CHAT_THREAD_CAPPING_TYPE.to_string()),
+            input: Some({
+                let mut value = fetch_new_chat_message_capping_info::Input::default();
+                value.r#type = Some(NEW_CHAT_THREAD_CAPPING_TYPE.to_string());
+                value
             }),
         });
 
