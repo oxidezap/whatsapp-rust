@@ -788,6 +788,10 @@ async fn execute_request_into_memory(
             Ok((_, Err(e))) => Err(e),
             Err(e) => Err(DownloadRequestError::other(e)),
         }
+    } else if hashes.budget.is_some() {
+        Err(DownloadRequestError::ResourcePolicy(
+            DownloadPolicyError::StreamingRequired,
+        ))
     } else {
         buffered_download_to_vec(http_client, runtime, request, hashes).await
     }
@@ -955,7 +959,13 @@ impl MediaDownloader {
         limits: DownloadLimits,
     ) -> std::result::Result<W, MediaDownloadError> {
         if limits.is_bounded() && !self.http_client.supports_streaming() {
-            return Err(DownloadPolicyError::StreamingRequired.into());
+            return Err(discard_failed_write(
+                &self.runtime,
+                writer,
+                DownloadRequestError::ResourcePolicy(DownloadPolicyError::StreamingRequired),
+            )
+            .await
+            .into());
         }
         let budget = limits.is_bounded().then(|| DownloadBudget::new(limits));
         let _cancel = CancelDownloadOnDrop(budget.clone());
@@ -1171,7 +1181,13 @@ impl Client {
         limits: DownloadLimits,
     ) -> std::result::Result<W, ClientDownloadError> {
         if limits.is_bounded() && !self.http_client.supports_streaming() {
-            return Err(DownloadPolicyError::StreamingRequired.into());
+            return Err(discard_failed_write(
+                &self.runtime,
+                writer,
+                DownloadRequestError::ResourcePolicy(DownloadPolicyError::StreamingRequired),
+            )
+            .await
+            .into());
         }
         let budget = limits.is_bounded().then(|| DownloadBudget::new(limits));
         let _cancel = CancelDownloadOnDrop(budget.clone());
@@ -1287,6 +1303,14 @@ async fn streaming_download_and_decrypt<W: DownloadWriter + MaybeSend + 'static>
     writer: W,
 ) -> Result<(W, std::result::Result<(), DownloadRequestError>)> {
     if !http_client.supports_streaming() {
+        if hashes.budget.is_some() {
+            return Ok((
+                writer,
+                Err(DownloadRequestError::ResourcePolicy(
+                    DownloadPolicyError::StreamingRequired,
+                )),
+            ));
+        }
         return buffered_download_and_decrypt(http_client, runtime, request, hashes, writer).await;
     }
 
@@ -2640,6 +2664,18 @@ mod tests {
                 DownloadPolicyError::StreamingRequired
             ))
         ));
+        assert!(http.urls().is_empty());
+        let mut sink = SharedWriter::new();
+        sink.write_all(b"stale output").unwrap();
+        let error = dl
+            .download_to_writer_with_limits(&params, sink.clone(), DownloadLimits::new(100, 100))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MediaDownloadError::ResourcePolicy(DownloadPolicyError::StreamingRequired)
+        ));
+        assert!(sink.contents().is_empty());
         assert!(http.urls().is_empty());
     }
 
