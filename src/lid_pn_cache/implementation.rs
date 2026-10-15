@@ -66,8 +66,8 @@ pub struct LidPnCache {
     /// mappings plus registry snapshot without a concurrent writer slipping
     /// between those steps.
     mutation: async_lock::Mutex<()>,
-    // Only writes from this instance can outrank its initial durable snapshot.
-    // Retained external-cache rows carry no such provenance. Drop this state
+    // This instance's startup writes break bootstrap ties. Retained external
+    // cache rows carry no such provenance. Drop this state
     // after bootstrap; ordinary learning never grows a permanent shadow index.
     startup_writes: std::sync::Mutex<Option<StartupWrites>>,
     startup_finished: AtomicBool,
@@ -137,7 +137,7 @@ enum MappingWrite {
     Live,
     WarmUp {
         preserve_lid: bool,
-        preserve_pn: bool,
+        live_pn_created_at: Option<i64>,
     },
 }
 
@@ -395,35 +395,45 @@ impl LidPnCache {
         _guard: &LidPnMutationGuard<'_>,
         write: MappingWrite,
     ) {
-        let (write_lid, write_pn, record_topology) = match write {
-            MappingWrite::Live => (true, true, true),
+        let (write_lid, live_pn_created_at, record_topology) = match write {
+            MappingWrite::Live => (true, None, true),
             MappingWrite::WarmUp {
                 preserve_lid,
-                preserve_pn,
-            } => (!preserve_lid, !preserve_pn, false),
+                live_pn_created_at,
+            } => (!preserve_lid, live_pn_created_at, false),
         };
         let previous_pn = self.pn_to_entry.get(&*entry.phone_number).await;
         let previous_lid = self.lid_to_entry.get(&*entry.lid).await;
+        // Live writes break equal-timestamp ties, never defeat newer PN rows.
+        // Once a newer snapshot row wins, later snapshot ties keep their usual
+        // input ordering rather than inheriting the original live preference.
+        let prefer_live_pn = previous_pn
+            .as_ref()
+            .is_some_and(|previous| live_pn_created_at == Some(previous.created_at));
         // A protected pair also supplies metadata when repairing its missing
         // counterpart. Unprotected external-cache rows follow durable timestamps.
         let entry = if !write_lid
             && let Some(existing) = &previous_lid
             && existing.phone_number == entry.phone_number
+            && existing.created_at >= entry.created_at
         {
             existing.as_ref()
-        } else if !write_pn
+        } else if prefer_live_pn
             && let Some(existing) = &previous_pn
             && existing.lid == entry.lid
+            && existing.created_at >= entry.created_at
         {
             existing.as_ref()
         } else {
             entry
         };
-        let should_update_pn = write_pn
-            && match &previous_pn {
-                Some(existing) => existing.created_at <= entry.created_at,
-                None => true,
-            };
+        let should_update_pn = match &previous_pn {
+            Some(existing) => {
+                existing.created_at < entry.created_at
+                    || (existing.created_at == entry.created_at && !prefer_live_pn)
+            }
+            None => true,
+        };
         let mapping_changed = (write_lid
             && previous_lid
                 .as_ref()
@@ -552,9 +562,9 @@ impl LidPnCache {
     /// Warm up the cache with entries from persistent storage.
     ///
     /// This should be called during client initialization to populate
-    /// the cache from the database. Writes from this instance take precedence
-    /// over its initial snapshot; retained external-cache rows can still be repaired.
-    /// Local hashes are rebuilt from the winning entries.
+    /// the cache from the database. Initial bootstrap preserves locally written
+    /// LID directions and prefers live PN entries on equal timestamps. Newer PN
+    /// timestamps still win. Local hashes are rebuilt from the winning entries.
     pub async fn warm_up(&self, entries: impl IntoIterator<Item = LidPnEntry>) {
         let start = wacore::time::Instant::now();
         let mut count = 0;
@@ -577,7 +587,7 @@ impl LidPnCache {
                 live_lids.insert(lid);
             }
         }
-        let mut live_phones = HashSet::with_capacity(writes.phones.len());
+        let mut live_phones = HashMap::with_capacity(writes.phones.len());
         for (phone, written) in writes.phones {
             if self
                 .pn_to_entry
@@ -585,14 +595,14 @@ impl LidPnCache {
                 .await
                 .is_some_and(|cached| same_entry(&cached, &written))
             {
-                live_phones.insert(phone);
+                live_phones.insert(phone, written.created_at);
             }
         }
 
         for entry in entries {
             let write = MappingWrite::WarmUp {
                 preserve_lid: live_lids.contains(&entry.lid),
-                preserve_pn: live_phones.contains(&entry.phone_number),
+                live_pn_created_at: live_phones.get(&entry.phone_number).copied(),
             };
             self.add_guarded_impl(&entry, &guard, write).await;
             touched.push(Arc::clone(&entry.lid));
@@ -861,17 +871,21 @@ mod tests {
 
     #[tokio::test]
     async fn warm_up_preserves_cached_mappings_and_metadata() {
-        for (stored_lid, stored_pn) in [("lid1", "old_pn"), ("old_lid", "pn1"), ("lid1", "pn1")] {
+        for (stored_lid, stored_pn, stored_at) in [
+            ("lid1", "old_pn", 20),
+            ("old_lid", "pn1", 10),
+            ("lid1", "pn1", 10),
+        ] {
             let cache = LidPnCache::new();
             let live = LidPnEntry::with_timestamp("lid1", "pn1", 10, LearningSource::Usync);
             cache.add(&live).await;
-            // Even a larger stored timestamp cannot supersede an identifier
-            // already learned in this process. The live pair is not durable yet.
+            // Reverse mappings keep the live write; PN mappings keep it on a
+            // timestamp tie. A strictly newer PN row is covered separately.
             cache
                 .warm_up([LidPnEntry::with_timestamp(
                     stored_lid,
                     stored_pn,
-                    20,
+                    stored_at,
                     LearningSource::Other,
                 )])
                 .await;
@@ -1157,6 +1171,79 @@ mod tests {
                         .can_skip_relearn(&durable.phone_number, &durable.lid)
                         .await
                 );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_up_pn_timestamps_are_independent_of_startup_order() {
+        for (source, live_at, stored_at, winner) in [
+            (LearningSource::MigrationSyncOld, 0, 20, "stored_lid"),
+            (LearningSource::BlocklistInactive, 0, 20, "stored_lid"),
+            (LearningSource::Usync, 10, 20, "stored_lid"),
+            (LearningSource::Usync, 10, 10, "live_lid"),
+            (LearningSource::Usync, 20, 10, "live_lid"),
+            (LearningSource::BlocklistInactive, 0, 0, "live_lid"),
+        ] {
+            for delayed in [false, true] {
+                let cache = LidPnCache::new();
+                let live = LidPnEntry::with_timestamp("live_lid", "pn1", live_at, source);
+                let stored = LidPnEntry::with_timestamp(
+                    "stored_lid",
+                    "pn1",
+                    stored_at,
+                    LearningSource::Other,
+                );
+                if delayed {
+                    cache.add(&live).await;
+                    cache.warm_up([stored.clone()]).await;
+                } else {
+                    cache.warm_up([stored.clone()]).await;
+                    cache.add(&live).await;
+                }
+                let expected = if winner == "live_lid" { &live } else { &stored };
+                let current = cache.get_entry_by_phone("pn1").await.unwrap();
+                assert_eq!(
+                    &*current.lid, winner,
+                    "source={source:?}, delayed={delayed}"
+                );
+                assert_eq!(current.phone_number, expected.phone_number);
+                assert_eq!(current.created_at, expected.created_at);
+                assert_eq!(current.learning_source, expected.learning_source);
+                for lid in ["live_lid", "stored_lid"] {
+                    assert_eq!(cache.get_phone_number(lid).await.as_deref(), Some("pn1"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_up_newer_pn_metadata_survives_live_reverse_protection() {
+        for other_at in [15, 20] {
+            let live = LidPnEntry::with_timestamp("lid1", "pn1", 10, LearningSource::Usync);
+            let newer = LidPnEntry::with_timestamp("lid1", "pn1", 20, LearningSource::Other);
+            let other = LidPnEntry::with_timestamp("lid2", "pn1", other_at, LearningSource::Other);
+            for entries in [
+                [newer.clone(), other.clone()],
+                [other.clone(), newer.clone()],
+            ] {
+                let expected = if other_at == 20 {
+                    entries.last().unwrap()
+                } else {
+                    &newer
+                };
+                let cache = LidPnCache::new();
+                cache.add(&live).await;
+                cache.warm_up(entries.clone()).await;
+                let current = cache.get_entry_by_phone("pn1").await.unwrap();
+                assert_eq!(current.lid, expected.lid);
+                assert_eq!(current.phone_number, expected.phone_number);
+                assert_eq!(current.created_at, expected.created_at);
+                assert_eq!(current.learning_source, expected.learning_source);
+                let reverse = cache.get_entry_by_lid("lid1").await.unwrap();
+                assert_eq!(reverse.phone_number, live.phone_number);
+                assert_eq!(reverse.created_at, live.created_at);
+                assert_eq!(reverse.learning_source, live.learning_source);
             }
         }
     }
