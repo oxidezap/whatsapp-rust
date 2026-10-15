@@ -288,6 +288,12 @@ pub struct Elapsed;
 
 /// Race a future against a timeout. Returns [`Elapsed`] if the duration
 /// expires before the future completes.
+///
+/// On expiry, drops the supplied future, including any undetached
+/// [`AbortHandle`] it owns. It does not otherwise cancel spawned tasks. Detached tasks and
+/// blocking work already submitted to an executor may continue. This helper
+/// does not wait for cancellation acknowledgement or impose a total deadline
+/// on cleanup performed elsewhere.
 pub async fn timeout<F, T>(rt: &dyn Runtime, duration: Duration, future: F) -> Result<T, Elapsed>
 where
     F: Future<Output = T>,

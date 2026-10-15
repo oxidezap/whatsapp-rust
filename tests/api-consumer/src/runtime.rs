@@ -88,3 +88,7 @@ mod local {
 
 #[cfg(target_arch = "wasm32")]
 pub use local::local_runtime_contract;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "runtime_lifecycle.rs"]
+mod lifecycle;

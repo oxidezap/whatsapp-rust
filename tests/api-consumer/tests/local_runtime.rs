@@ -4,3 +4,6 @@
 fn local_runtime_cancellation() {
     api_consumer::runtime::local_runtime_contract();
 }
+
+#[path = "../src/runtime_lifecycle.rs"]
+mod lifecycle;
