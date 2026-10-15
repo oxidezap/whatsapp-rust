@@ -45,12 +45,20 @@ mod imp {
     /// Live pre-decrypt refusals by a closed reason set. Successful flush retries
     /// are not refusals; each arrival that stops here increments exactly once.
     pub fn live_admission_refused(reason: super::LiveAdmissionRefusal) {
-        let reason = match reason {
-            super::LiveAdmissionRefusal::Capacity => "capacity",
-            super::LiveAdmissionRefusal::Receipts => "receipts",
-            super::LiveAdmissionRefusal::RetainedWrite => "retained_write",
+        // Literal labels let the metrics facade cache static keys without
+        // constructing an owned label vector on each refusal.
+        let counter = match reason {
+            super::LiveAdmissionRefusal::Capacity => {
+                counter!("wa_live_admission_refused_total", "reason" => "capacity")
+            }
+            super::LiveAdmissionRefusal::Receipts => {
+                counter!("wa_live_admission_refused_total", "reason" => "receipts")
+            }
+            super::LiveAdmissionRefusal::RetainedWrite => {
+                counter!("wa_live_admission_refused_total", "reason" => "retained_write")
+            }
         };
-        counter!("wa_live_admission_refused_total", "reason" => reason).increment(1);
+        counter.increment(1);
     }
     /// Outgoing send attempt by kind (`dm`/`group`/`status`).
     pub fn send(kind: &'static str) {
