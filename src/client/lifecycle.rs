@@ -10,6 +10,8 @@ use wacore::net::DisconnectReason;
 /// Observations made by this invocation of terminal shutdown.
 /// This is not a global durability fence: concurrent producers, callbacks,
 /// detached work and other teardown invocations are not joined by this report.
+/// Device and message-secret flushes have no total shutdown deadline here.
+/// A host timeout does not confirm cleanup or backend I/O has stopped.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct ShutdownReport {

@@ -72,60 +72,14 @@ in https://github.com/oxidezap/whatsapp-rust-docs.
 
 ## Public contract changes
 
-The README support tables are the entry point for crate, target, delivery-origin
-and capability scope. Keep them consistent with Rustdoc when changing a public
-contract. Consumer recipes and migrations still belong in the docs repository.
-A pre-1.0 policy is not an immutable release-candidate baseline; do not change
-`tools/xtask/compatibility.json` as a side effect of documenting support.
+Public modules, re-exports, generated models, macro output and dependency types
+in signatures carry source compatibility obligations, including behind features.
+Use the SDK's dependency re-exports to avoid version mismatches. Do not remove
+public paths or change construction without updating isolated consumers and
+providing a migration.
 
-Treat public modules, re-exports, generated code, macro output and dependency
-types in signatures as source compatibility obligations. Do not describe a
-feature-gated API as exempt from compatibility. Before changing visibility or
-construction, check the isolated consumers and provide a migration. Generated
-MEX models currently allow exhaustive construction; documentation does not make
-them non-exhaustive. Change their construction policy only in a dedicated API
-change with consumers and codegen updated together.
-
-Runtime, transport, HTTP, storage, hooks and neutral media ports remain open
-implementation points. Adding required trait methods or tightening thread bounds
-breaks downstream implementers. Prefer optional methods with honest defaults
-only when absence is safe. Do not silently default an atomic operation to
-sequential writes, advertise unsupported streaming, or return success for an
-unsupported durability capability. A future capability redesign must preserve
-core ownership and be justified independently of any bridge's naming needs.
-
-### Backend obligations and conformance
-
-Backends implement the five domain traits composed by `Backend`. Keep account
-and device scope on every read/write, including batch and detached operations.
-`AppSyncStore::commit_patch` must publish version and MAC changes atomically,
-including on cancellation. An error after a durability barrier can mean the
-complete commit is visible; it does not establish rollback or safe blind retry.
-`Ok` must reflect the backend's declared persistence boundary, not just enqueue.
-An NVS commit is not evidence of a multi-key atomic transaction. Do not retain a
-collection version while evicting MACs needed for its incremental baseline;
-capacity refusal must preserve the complete old state or use explicit recovery.
-
-Pending-inbound durability is optional and fails closed by default. Its bounded
-reads must reject oversized payloads before copying them, preserve exact/group
-alias semantics and share the required snapshot. Conditional mutation must
-compare revisions atomically and retain the payload/ownership lease through
-all detached workers and retries, including cancellation. Preserve conflicts;
-do not overwrite a successor's row. Batch overrides inherit these obligations.
-The builder probe rejects missing primitives but cannot certify arbitrary
-backend atomicity, crash behavior or custom batching.
-
-Reuse `wacore/tests/support/appstate_commit_contract.rs` and
-`wacore/tests/support/tc_token_contract.rs` for the contracts they actually cover.
-Their in-memory and SQLite runners show fixture setup and device-scope isolation.
-They are source test helpers, not a published conformance crate or a complete
-backend certification. Add cancellation, post-commit failure, bounded/CAS and
-backend-specific crash tests at the relevant boundary before claiming those
-properties for a custom adapter. Never substitute a passing compile probe for
-these behavioral checks.
-
-Transport factories must release a half-open dial when their future is dropped.
-Keep event receivers bounded according to the host's policy and preserve the
-closed `TransportEvent` contract; put extensible close detail in
-`DisconnectReason`. An abort callback requests cancellation, not confirmed task
-completion. Shutdown ownership and database close are separate boundaries.
+Runtime, transport, HTTP, storage, durability hooks and neutral media ports remain
+open implementation points. Required trait methods and tighter thread bounds
+break implementers. Add defaults only when absence has an honest, safe meaning;
+never replace atomic persistence with sequential writes or silently accept an
+unsupported capability. Batch overrides inherit the owning method's contracts.

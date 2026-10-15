@@ -1,3 +1,16 @@
+//! Select capture by origin; no single hook covers all incoming content.
+//!
+//! | Origin | Commit gate before ACK/receipt |
+//! | --- | --- |
+//! | Encrypted live/offline direct and group messages | [`InboundDurabilityHook`] |
+//! | Newsletter/channel messages and PDO recovery | No durable capture gate; event-only paths |
+//! | Group `w:gp2` notifications | [`crate::GroupNotificationDurabilityHook`] |
+//! | Admitted history chunks | [`HistorySyncCaptureHook`], registered separately |
+//! | Callbacks/event subscriptions | Observers, not durable capture |
+//!
+//! Each hook defines its own idempotence, cancellation and replay limits.
+//! Withholding an ACK/receipt does not promise indefinite retention or redelivery.
+
 use crate::client::Client;
 use anyhow::Result;
 use std::sync::Arc;

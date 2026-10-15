@@ -16,6 +16,10 @@ feature profile, MSRV and WASM checks. `cargo xt ci test-features PACKAGE` print
 the shareable native feature set. Keep external consumers outside the root
 dev-dependency graph so feature unification cannot hide missing requirements.
 
+For storage adapters, reuse the app-state/token helpers in `wacore/tests/support`
+and their SQLite runners. Builder probes do not certify backend correctness;
+add backend-specific cancellation and crash tests.
+
 ## Runtime and E2E tests
 
 `tests/e2e/src/lib.rs` supplies `TestClient`. Start the digest-pinned mock server

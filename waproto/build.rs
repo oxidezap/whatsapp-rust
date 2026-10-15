@@ -252,11 +252,8 @@ fn main() -> std::io::Result<()> {
             ".whatsapp.SenderKeyStateStructure.SenderSigningKey.private",
             "#[serde(skip)]",
         )
-        // Current memory policy: omit unknown-field storage, including in
-        // nested SessionStructure chains/message keys. This is global and also
-        // applies to network messages whose upstream encoder we do not control.
-        // Decode/re-encode is therefore lossy for unknown fields; forwarding
-        // consumers must retain original bytes (see the crate-level docs).
+        // Omit unknown-field storage to avoid retention costs in nested records.
+        // The wire round-trip policy is documented at crate level.
         .preserve_unknown_fields(false)
         .generate_with_setters(true)
         // Generate view types for zero-copy decoding.

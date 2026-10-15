@@ -410,6 +410,10 @@ pub type UploadBody = Box<dyn std::io::Read + Send>;
 /// body is complete. The bundled ureq host uses this bounded, best-effort
 /// behavior. For streaming responses, body read failures come from the reader.
 ///
+/// Streaming is a synchronous `Read + Send` extension requiring a blocking
+/// context. It does not guarantee asynchronous browser Fetch chunk streaming
+/// or a byte limit for buffered responses; those are host responsibilities.
+///
 /// Some HTTP libraries treat non-success statuses as errors by default; hosts
 /// must disable that behavior, for example with ureq's `http_status_as_error`.
 ///
