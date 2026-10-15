@@ -9,8 +9,8 @@ With the `metrics` feature, `wa_live_admission_refused_total` counts live
 processing attempts stopped before decrypt with an inbound durability hook.
 Its closed `reason` label is `capacity`, `receipts` or `retained_write`.
 The last includes failure to recover retained plaintext or a durable predecessor,
-including hook failure. Count only the final capacity refusal after any batch
-flush retry. A later redelivery may count again; this measures refused attempts,
+including hook failure and a failed pressure-triggered batch flush. Count only
+the final capacity refusal after any successful batch flush retry. A later redelivery may count again; this measures refused attempts,
 not unique messages or server redelivery latency. It is separate from
 `wa_recv_total`, whose outcomes describe decrypt processing. With metrics disabled,
 emission is an inline no-op. The counter has no per-session or message labels.

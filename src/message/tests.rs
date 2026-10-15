@@ -22539,8 +22539,30 @@ fn live_admission_refusal_metrics_regression() {
             }
             // Real encrypted receive processing against the in-memory test store.
             // This does not exercise a connected WhatsApp server.
-            for case in 0..4 {
-                let reason = if case == 3 { 1 } else { case };
+            #[derive(Debug, Clone, Copy)]
+            enum Case {
+                Capacity,
+                Receipts,
+                RetainedWrite,
+                RawReceipts,
+                RawRecovery,
+                OwnedDrainRecovery,
+                RawDrainRecovery,
+            }
+            for case in [
+                Case::Capacity,
+                Case::Receipts,
+                Case::RetainedWrite,
+                Case::RawReceipts,
+                Case::RawRecovery,
+                Case::OwnedDrainRecovery,
+                Case::RawDrainRecovery,
+            ] {
+                let reason = match case {
+                    Case::Capacity => 0,
+                    Case::Receipts | Case::RawReceipts => 1,
+                    _ => 2,
+                };
                 let (client, transport) = capturing_client("admission_metrics").await;
                 client
                     .inbound_durability_hook
@@ -22553,7 +22575,10 @@ fn live_admission_refusal_metrics_regression() {
                 let ciphertext = encrypt_group_text(&mut alice, &group, "admission metrics").await;
                 let id = "ADMISSION_METRICS";
                 let stanza = || group_skmsg_stanza(&group, &alice.jid, id, ciphertext.clone());
-                if case == 3 {
+                if matches!(
+                    case,
+                    Case::RawReceipts | Case::RawRecovery | Case::RawDrainRecovery
+                ) {
                     // Leave staged plaintext behind to exercise the earlier
                     // receipt-admission branch used by raw replay.
                     let retention = &client.inbound_commit_batch.live_retention;
@@ -22593,23 +22618,43 @@ fn live_admission_refusal_metrics_regression() {
                 } else {
                     Vec::new()
                 };
-                if reason == 2 {
+                if matches!(case, Case::OwnedDrainRecovery) {
+                    client.enter_drain_mode_for_tests();
+                    client.clone().handle_incoming_message(stanza()).await;
+                }
+                if matches!(
+                    case,
+                    Case::RetainedWrite
+                        | Case::RawRecovery
+                        | Case::OwnedDrainRecovery
+                        | Case::RawDrainRecovery
+                ) {
+                    if matches!(case, Case::RawDrainRecovery) {
+                        client.enter_drain_mode_for_tests();
+                    }
                     client
                         .inbound_commit_batch
                         .fail_commits
                         .store(true, Ordering::Release);
-                    client.clone().handle_incoming_message(stanza()).await;
-                    assert_eq!(
-                        counts(),
-                        before,
-                        "a post-decrypt write failure is not an admission refusal"
-                    );
+                    if matches!(case, Case::RetainedWrite) {
+                        client.clone().handle_incoming_message(stanza()).await;
+                        assert_eq!(
+                            counts(),
+                            before,
+                            "a post-decrypt write failure is not an admission refusal"
+                        );
+                    }
                 }
                 for attempt in 1..=2 {
                     client.clone().handle_incoming_message(stanza()).await;
                     let mut expected = before;
                     expected[reason] += attempt;
-                    assert_eq!(counts(), expected, "one reason per refused arrival");
+                    assert_eq!(
+                        counts(),
+                        expected,
+                        "one reason per refused arrival in {case:?}"
+                    );
+                    crate::test_utils::wait_for_outbound_tasks(&client).await;
                     assert_eq!(message_acks_for(&transport.sent(), id), 0);
                     assert_eq!(delivery_receipts_for(&transport.sent(), id), 0);
                 }
@@ -22621,6 +22666,13 @@ fn live_admission_refusal_metrics_regression() {
                     .store(false, Ordering::Release);
                 let before_recovery = counts();
                 client.clone().handle_incoming_message(stanza()).await;
+                if matches!(case, Case::OwnedDrainRecovery | Case::RawDrainRecovery) {
+                    assert!(
+                        client
+                            .flush_inbound_commits_under_permit(true, None, None)
+                            .await
+                    );
+                }
                 crate::test_utils::wait_for_outbound_tasks(&client).await;
                 assert_eq!(
                     counts(),
@@ -22631,43 +22683,79 @@ fn live_admission_refusal_metrics_regression() {
             }
             // A full drain batch can release capacity and admit the same arrival.
             // The first failed reservation must not increment the refusal metric.
-            let client = crate::test_utils::create_test_client_with_backend(Arc::new(
-                wacore::store::in_memory::InMemoryBackend::new(),
-            ))
-            .await;
-            client.enter_drain_mode_for_tests();
-            client
-                .inbound_durability_hook
-                .set(Arc::new(Hook))
-                .ok()
-                .unwrap();
-            let group: Jid = "120363000000000093@g.us".parse().unwrap();
-            let mut alice = joined_group_sender(&client, "100000000000011@lid", &group).await;
-            let before = counts();
-            for index in 0..4 {
-                let ciphertext = encrypt_group_text(&mut alice, &group, "flush retry").await;
-                let mut info = (*group_message_info(
-                    &format!("METRICS_FLUSH_{index}"),
-                    &group,
-                    &alice.jid,
-                    false,
+            for failed_flush in [false, true] {
+                let client = crate::test_utils::create_test_client_with_backend(Arc::new(
+                    wacore::store::in_memory::InMemoryBackend::new(),
                 ))
-                .clone();
-                info.push_name = "n".repeat(1024 * 1024).into();
-                process_group_classified_with_sessions(
-                    &client,
-                    Arc::new(info),
-                    &alice.jid,
-                    vec![],
-                    vec![skmsg_payload_from_bytes(ciphertext)],
-                )
                 .await;
-            }
-            assert_eq!(counts(), before, "successful flush retry is not a refusal");
-            assert!(
+                client.enter_drain_mode_for_tests();
                 client
-                    .flush_inbound_commits_under_permit(true, None, None)
-                    .await
-            );
+                    .inbound_durability_hook
+                    .set(Arc::new(Hook))
+                    .ok()
+                    .unwrap();
+                let group: Jid = "120363000000000093@g.us".parse().unwrap();
+                let mut alice = joined_group_sender(&client, "100000000000011@lid", &group).await;
+                let before = counts();
+                for index in 0..4 {
+                    let ciphertext = encrypt_group_text(&mut alice, &group, "flush retry").await;
+                    let mut info = (*group_message_info(
+                        &format!("METRICS_FLUSH_{index}"),
+                        &group,
+                        &alice.jid,
+                        false,
+                    ))
+                    .clone();
+                    info.push_name = "n".repeat(1024 * 1024).into();
+                    if index == 3 {
+                        client
+                            .inbound_commit_batch
+                            .fail_commits
+                            .store(failed_flush, Ordering::Release);
+                    }
+                    let info = Arc::new(info);
+                    process_group_classified_with_sessions(
+                        &client,
+                        info.clone(),
+                        &alice.jid,
+                        vec![],
+                        vec![skmsg_payload_from_bytes(ciphertext.clone())],
+                    )
+                    .await;
+                    if index == 3 && failed_flush {
+                        let mut expected = before;
+                        expected[2] += 1;
+                        assert_eq!(
+                            counts(),
+                            expected,
+                            "failed pressure flush is retained_write, not capacity"
+                        );
+                        client
+                            .inbound_commit_batch
+                            .fail_commits
+                            .store(false, Ordering::Release);
+                        process_group_classified_with_sessions(
+                            &client,
+                            info,
+                            &alice.jid,
+                            vec![],
+                            vec![skmsg_payload_from_bytes(ciphertext)],
+                        )
+                        .await;
+                    }
+                }
+                let mut expected = before;
+                expected[2] += u64::from(failed_flush);
+                assert_eq!(
+                    counts(),
+                    expected,
+                    "successful flush retry is not a refusal"
+                );
+                assert!(
+                    client
+                        .flush_inbound_commits_under_permit(true, None, None)
+                        .await
+                );
+            }
         });
 }
