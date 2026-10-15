@@ -5,8 +5,8 @@ mod tests {
     use std::sync::Arc;
     use whatsapp_rust::anyhow::{self, Result};
     use whatsapp_rust::download::{
-        ClientDownloadError, DownloadParams, DownloadWriter, MediaDownloadError, MediaDownloader,
-        MediaRoute, MediaType,
+        ClientDownloadError, DownloadLimits, DownloadParams, DownloadPolicyError, DownloadWriter,
+        MediaDownloadError, MediaDownloader, MediaRoute, MediaType,
     };
     use whatsapp_rust::http::{HttpClient, HttpRequest, HttpResponse, HttpStatusError};
     use whatsapp_rust::store::persistence_manager::PersistenceManager;
@@ -116,7 +116,10 @@ mod tests {
             proto_.file_sha256 = Some(vec![0; 32]);
             proto_
         };
-        let error: ClientDownloadError = client.download(&message).await.unwrap_err();
+        let error: ClientDownloadError = client
+            .download(&message, Default::default())
+            .await
+            .unwrap_err();
         assert!(matches!(error, ClientDownloadError::ReferenceRejected(_)));
         assert_eq!((&error as &(dyn Error + 'static)).http_status(), Some(410));
         assert_eq!(
@@ -134,7 +137,10 @@ mod tests {
         let params =
             DownloadParams::encrypted("/d", &[1; 32], &[2; 32], &[3; 32], 16, MediaType::Image)
                 .unwrap();
-        let error: ClientDownloadError = client.download(&params).await.unwrap_err();
+        let error: ClientDownloadError = client
+            .download(&params, Default::default())
+            .await
+            .unwrap_err();
         assert!(matches!(
             error,
             ClientDownloadError::MediaSession {
@@ -148,7 +154,7 @@ mod tests {
         ));
 
         let error = client
-            .download_to_writer(&params, Cursor::new(Vec::new()))
+            .download_to_writer(&params, Cursor::new(Vec::new()), Default::default())
             .await
             .unwrap_err();
         assert!(matches!(error, ClientDownloadError::MediaSession { .. }));
@@ -157,8 +163,10 @@ mod tests {
             Arc::new(TokioRuntime),
             MediaRoute::new(Vec::new()),
         );
-        let independent_error: MediaDownloadError =
-            independent.download(&params).await.unwrap_err();
+        let independent_error: MediaDownloadError = independent
+            .download(&params, Default::default())
+            .await
+            .unwrap_err();
         assert!(matches!(independent_error, MediaDownloadError::NoHosts));
     }
 
@@ -200,13 +208,38 @@ mod tests {
             ] {
                 let params =
                     DownloadParams::plaintext("/file", &hash, data.len() as u64, kind).unwrap();
-                assert_eq!(downloader.download(&params).await.unwrap(), data);
+                assert_eq!(
+                    downloader
+                        .download(&params, Default::default())
+                        .await
+                        .unwrap(),
+                    data
+                );
                 let writer = downloader
-                    .download_to_writer(&params, Cursor::new(vec![0xff; 128]))
+                    .download_to_writer(&params, Cursor::new(vec![0xff; 128]), Default::default())
                     .await
                     .unwrap();
                 assert_eq!(writer.position(), 0);
                 assert_eq!(writer.into_inner(), data);
+                let limits = DownloadLimits::new(data.len() as u64, data.len() as u64);
+                if streaming {
+                    assert_eq!(downloader.download(&params, limits).await.unwrap(), data);
+                    assert!(matches!(
+                        downloader
+                            .download(&params, DownloadLimits::new(1, 1))
+                            .await,
+                        Err(MediaDownloadError::ResourcePolicy(
+                            DownloadPolicyError::LimitExceeded { .. }
+                        ))
+                    ));
+                } else {
+                    assert!(matches!(
+                        downloader.download(&params, limits).await,
+                        Err(MediaDownloadError::ResourcePolicy(
+                            DownloadPolicyError::StreamingRequired
+                        ))
+                    ));
+                }
             }
         }
     }
@@ -262,7 +295,7 @@ mod tests {
                 };
                 let client = client_with_http(AcceptedBody(streaming)).await;
                 let error = client
-                    .download_to_writer(&message, writer())
+                    .download_to_writer(&message, writer(), Default::default())
                     .await
                     .unwrap_err();
                 let ClientDownloadError::WriterIo(cause) = error else {
@@ -280,7 +313,7 @@ mod tests {
                     MediaRoute::new(Vec::new()),
                 );
                 let error = independent
-                    .download_to_writer(&message, writer())
+                    .download_to_writer(&message, writer(), Default::default())
                     .await
                     .unwrap_err();
                 let MediaDownloadError::WriterIo(cause) = error else {
@@ -303,12 +336,15 @@ mod tests {
             DownloadParams::encrypted("/d", &[1; 32], &[2; 32], &[3; 32], 16, MediaType::Image)
                 .unwrap();
         assert!(matches!(
-            client.download(&params).await.unwrap_err(),
+            client
+                .download(&params, Default::default())
+                .await
+                .unwrap_err(),
             ClientDownloadError::MediaSession { .. }
         ));
         assert!(matches!(
             client
-                .download_to_writer(&params, Cursor::new(Vec::new()))
+                .download_to_writer(&params, Cursor::new(Vec::new()), Default::default())
                 .await
                 .unwrap_err(),
             ClientDownloadError::MediaSession { .. }

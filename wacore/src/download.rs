@@ -1,6 +1,3 @@
-mod budget;
-pub use budget::{DownloadBudget, DownloadLimits, DownloadPolicyError, MediaByteDomain};
-
 use crate::libsignal::crypto::{
     DecryptionError as AesCbcDecryptionError, Error as CryptoError, aes_256_cbc_decrypt_in_place,
     hmac_sha256_two_part,

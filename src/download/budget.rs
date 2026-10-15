@@ -2,10 +2,16 @@
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
 
-/// Application policy, independent of message lengths and HTTP headers.
-/// Existing download entry points remain unlimited. Choose both limits for a
-/// bounded operation; wire bytes include CBC padding and the trailing MAC.
-/// Both totals include failed attempts, so host failover cannot reset the budget.
+/// Per-download application policy, independent of declared sizes and headers.
+///
+/// `Default::default()` adds no media-layer byte cap. The examined Web full-download
+/// path does not apply its upload-size gates; HTTP adapters may have separate caps.
+/// [`Self::new`] bounds wire bytes, including padding and MAC, and plaintext bytes.
+/// Both totals include failed attempts. This optional application policy prevents
+/// failover from multiplying the requested budget; it is not a Web retry rule.
+/// Bounded downloads require a streaming HTTP adapter and fail before HTTP when
+/// unavailable. Dropping the future stops work at the next I/O boundary; it
+/// cannot interrupt a blocked adapter read or guarantee sink cleanup.
 /// Limits count bytes consumed by the media layer and emitted to the sink, not
 /// adapter/TLS buffers, allocator capacity, or RSS. A small budget therefore also
 /// needs a bounded streaming adapter and a destination suited to the platform.
@@ -21,15 +27,15 @@ impl DownloadLimits {
         }
     }
 
-    pub const fn unlimited() -> Self {
+    pub(super) const fn unlimited() -> Self {
         Self { bounds: None }
     }
 
-    pub const fn is_bounded(self) -> bool {
+    pub(super) const fn is_bounded(self) -> bool {
         self.bounds.is_some()
     }
 
-    pub fn plaintext_capacity(self, declared: u64) -> u64 {
+    pub(super) fn plaintext_capacity(self, declared: u64) -> u64 {
         self.bounds
             .map_or(declared, |(_, limit)| declared.min(limit))
     }
@@ -69,13 +75,13 @@ struct State {
 /// Reads allow a one-byte overflow probe, which is never forwarded. Cancellation
 /// takes effect before the next I/O call and cannot interrupt a blocked read.
 #[derive(Clone)]
-pub struct DownloadBudget {
+pub(super) struct DownloadBudget {
     limits: DownloadLimits,
     state: Option<Arc<Mutex<State>>>,
 }
 
 impl DownloadBudget {
-    pub fn new(limits: DownloadLimits) -> Self {
+    pub(super) fn new(limits: DownloadLimits) -> Self {
         Self {
             limits,
             state: limits
@@ -86,7 +92,7 @@ impl DownloadBudget {
 
     /// Cancel a bounded operation at its next I/O boundary. Unlimited budgets
     /// have no shared state and do not support cancellation.
-    pub fn cancel(&self) {
+    pub(super) fn cancel(&self) {
         let Some(state) = &self.state else {
             return;
         };
@@ -97,7 +103,7 @@ impl DownloadBudget {
     }
 
     /// Check before starting other blocking I/O owned by this operation.
-    pub fn check_cancelled(&self) -> Result<(), DownloadPolicyError> {
+    pub(super) fn check_cancelled(&self) -> Result<(), DownloadPolicyError> {
         if let Some(state) = &self.state
             && state
                 .lock()
@@ -109,14 +115,14 @@ impl DownloadBudget {
         Ok(())
     }
 
-    pub fn reader<R: Read>(&self, inner: R) -> impl Read + use<R> {
+    pub(super) fn reader<R: Read>(&self, inner: R) -> impl Read + use<R> {
         BudgetReader {
             inner,
             budget: self.clone(),
         }
     }
 
-    pub fn writer<W: Write>(&self, inner: W) -> impl Write + use<W> {
+    pub(super) fn writer<W: Write>(&self, inner: W) -> impl Write + use<W> {
         BudgetWriter {
             inner,
             budget: self.clone(),

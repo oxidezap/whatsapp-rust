@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use wacore::net::{HttpClient, HttpRequest, HttpResponse, StreamingHttpResponse, UploadBody};
 use wacore::stats::HttpResourceReport;
 
-/// Matches `MAX_FILE_SIZE_BYTES` in `WAWebServerPropConstants` (2 GiB).
+/// Default per-response transport cap (2 GiB), independent of media policy.
 /// Overrides ureq's 10 MiB default on `read_to_vec()`.
 pub const DEFAULT_MAX_BODY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
@@ -27,7 +27,7 @@ pub struct UreqHttpClient {
     agent: ureq::Agent,
     /// Total-bytes cap for both [`UreqHttpClient::execute`] and the reader from
     /// [`UreqHttpClient::execute_streaming`]. Bounds an in-memory sink so a
-    /// hostile CDN can't drive it to OOM; defaults to WA's 2 GiB max file size.
+    /// hostile CDN can't grow it indefinitely; defaults to this adapter's 2 GiB cap.
     max_body_bytes: u64,
     /// Provenance of `agent`: true when built by [`build_agent`]. The pool
     /// report is a constant of that config, so [`UreqHttpClient::resource_report`]

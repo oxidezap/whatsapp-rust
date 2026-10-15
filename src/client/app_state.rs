@@ -914,7 +914,7 @@ impl Client {
 
         let mut pre_downloaded = HashMap::with_capacity(jobs.len());
         let results = futures::stream::iter(jobs.into_iter().map(|(ext, kind)| async move {
-            let bytes = self.download(&ext).await;
+            let bytes = self.download(&ext, Default::default()).await;
             // directPath presence was checked when the job was built.
             (ext.direct_path, kind, bytes)
         }))

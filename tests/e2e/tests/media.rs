@@ -244,14 +244,17 @@ async fn test_upload_then_download_image() -> anyhow::Result<()> {
     // DownloadParams uses the same canonical entry as message types.
     let downloaded = client
         .client
-        .download(&DownloadParams::encrypted(
-            &upload.direct_path,
-            &upload.media_key,
-            &upload.file_sha256,
-            &upload.file_enc_sha256,
-            upload.file_length,
-            MediaType::Image,
-        )?)
+        .download(
+            &DownloadParams::encrypted(
+                &upload.direct_path,
+                &upload.media_key,
+                &upload.file_sha256,
+                &upload.file_enc_sha256,
+                upload.file_length,
+                MediaType::Image,
+            )?,
+            Default::default(),
+        )
         .await?;
 
     assert_eq!(
@@ -277,14 +280,17 @@ async fn test_upload_then_download_video() -> anyhow::Result<()> {
 
     let downloaded = client
         .client
-        .download(&DownloadParams::encrypted(
-            &upload.direct_path,
-            &upload.media_key,
-            &upload.file_sha256,
-            &upload.file_enc_sha256,
-            upload.file_length,
-            MediaType::Video,
-        )?)
+        .download(
+            &DownloadParams::encrypted(
+                &upload.direct_path,
+                &upload.media_key,
+                &upload.file_sha256,
+                &upload.file_enc_sha256,
+                upload.file_length,
+                MediaType::Video,
+            )?,
+            Default::default(),
+        )
         .await?;
 
     assert_eq!(downloaded, original);
@@ -307,14 +313,17 @@ async fn test_upload_then_download_document() -> anyhow::Result<()> {
 
     let downloaded = client
         .client
-        .download(&DownloadParams::encrypted(
-            &upload.direct_path,
-            &upload.media_key,
-            &upload.file_sha256,
-            &upload.file_enc_sha256,
-            upload.file_length,
-            MediaType::Document,
-        )?)
+        .download(
+            &DownloadParams::encrypted(
+                &upload.direct_path,
+                &upload.media_key,
+                &upload.file_sha256,
+                &upload.file_enc_sha256,
+                upload.file_length,
+                MediaType::Document,
+            )?,
+            Default::default(),
+        )
         .await?;
 
     assert_eq!(downloaded, original);
@@ -350,7 +359,7 @@ async fn test_upload_then_download_via_downloadable_trait() -> anyhow::Result<()
 
     let downloaded = client
         .client
-        .download(&img_msg as &dyn Downloadable)
+        .download(&img_msg as &dyn Downloadable, Default::default())
         .await?;
     assert_eq!(downloaded, original);
 
@@ -383,6 +392,7 @@ async fn test_upload_then_download_to_writer() -> anyhow::Result<()> {
                 MediaType::Image,
             )?,
             cursor,
+            Default::default(),
         )
         .await?;
 
@@ -434,11 +444,15 @@ async fn test_download_after_disconnect_with_injected_route() -> anyhow::Result<
         Arc::new(TokioRuntime),
         route.clone(),
     );
-    let downloaded = downloader.download(&params).await?;
+    let downloaded = downloader.download(&params, Default::default()).await?;
     assert_eq!(downloaded, original);
 
     let cursor = downloader
-        .download_to_writer(&params, std::io::Cursor::new(Vec::<u8>::new()))
+        .download_to_writer(
+            &params,
+            std::io::Cursor::new(Vec::<u8>::new()),
+            Default::default(),
+        )
         .await?;
     assert_eq!(cursor.into_inner(), original);
 
@@ -447,14 +461,18 @@ async fn test_download_after_disconnect_with_injected_route() -> anyhow::Result<
         Arc::new(TokioRuntime),
         MediaRoute::new(route.hosts),
     );
-    let downloaded = hosts_only.download(&params).await?;
+    let downloaded = hosts_only.download(&params, Default::default()).await?;
     assert_eq!(
         downloaded, original,
         "the CDN authorizes a download by its signed path, not by the session token"
     );
 
     let cursor = hosts_only
-        .download_to_writer(&params, std::io::Cursor::new(Vec::<u8>::new()))
+        .download_to_writer(
+            &params,
+            std::io::Cursor::new(Vec::<u8>::new()),
+            Default::default(),
+        )
         .await?;
     assert_eq!(cursor.into_inner(), original);
 
@@ -508,7 +526,10 @@ async fn test_send_image_message() -> anyhow::Result<()> {
         info!("B received image from {:?}", info.source);
 
         // B downloads the received image
-        let downloaded = client_b.client.download(img as &dyn Downloadable).await?;
+        let downloaded = client_b
+            .client
+            .download(img as &dyn Downloadable, Default::default())
+            .await?;
         assert_eq!(
             downloaded, original,
             "Downloaded image should match original"
@@ -553,7 +574,10 @@ async fn test_send_video_message() -> anyhow::Result<()> {
         assert_eq!(vid.seconds, Some(15));
         assert_eq!(vid.mimetype.as_deref(), Some("video/mp4"));
 
-        let downloaded = client_b.client.download(vid as &dyn Downloadable).await?;
+        let downloaded = client_b
+            .client
+            .download(vid as &dyn Downloadable, Default::default())
+            .await?;
         assert_eq!(downloaded, original);
     } else {
         panic!("Expected video Message event");
@@ -597,7 +621,10 @@ async fn test_send_document_message() -> anyhow::Result<()> {
         assert_eq!(doc.file_name.as_deref(), Some("report.pdf"));
         assert_eq!(doc.mimetype.as_deref(), Some("application/pdf"));
 
-        let downloaded = client_b.client.download(doc as &dyn Downloadable).await?;
+        let downloaded = client_b
+            .client
+            .download(doc as &dyn Downloadable, Default::default())
+            .await?;
         assert_eq!(downloaded, original);
     } else {
         panic!("Expected document Message event");
@@ -638,7 +665,10 @@ async fn test_send_audio_message() -> anyhow::Result<()> {
         assert_eq!(audio.seconds, Some(30));
         assert_eq!(audio.ptt, Some(false));
 
-        let downloaded = client_b.client.download(audio as &dyn Downloadable).await?;
+        let downloaded = client_b
+            .client
+            .download(audio as &dyn Downloadable, Default::default())
+            .await?;
         assert_eq!(downloaded, original);
     } else {
         panic!("Expected audio Message event");
@@ -680,7 +710,10 @@ async fn test_send_ptt_voice_message() -> anyhow::Result<()> {
         assert_eq!(audio.seconds, Some(5));
         assert_eq!(audio.mimetype.as_deref(), Some("audio/ogg; codecs=opus"));
 
-        let downloaded = client_b.client.download(audio as &dyn Downloadable).await?;
+        let downloaded = client_b
+            .client
+            .download(audio as &dyn Downloadable, Default::default())
+            .await?;
         assert_eq!(downloaded, original);
     } else {
         panic!("Expected PTT audio Message event");
@@ -722,7 +755,10 @@ async fn test_send_image_bidirectional() -> anyhow::Result<()> {
         let msg = &m.message;
         let img = msg.image_message.as_option().unwrap();
         assert_eq!(img.caption.as_deref(), Some("From A"));
-        let downloaded = client_b.client.download(img as &dyn Downloadable).await?;
+        let downloaded = client_b
+            .client
+            .download(img as &dyn Downloadable, Default::default())
+            .await?;
         assert_eq!(downloaded, data_a);
     }
 
@@ -745,7 +781,10 @@ async fn test_send_image_bidirectional() -> anyhow::Result<()> {
         let msg = &m.message;
         let img = msg.image_message.as_option().unwrap();
         assert_eq!(img.caption.as_deref(), Some("From B"));
-        let downloaded = client_a.client.download(img as &dyn Downloadable).await?;
+        let downloaded = client_a
+            .client
+            .download(img as &dyn Downloadable, Default::default())
+            .await?;
         assert_eq!(downloaded, data_b);
     }
 
@@ -782,7 +821,10 @@ async fn test_send_multiple_media_types() -> anyhow::Result<()> {
     if let Some(m) = event.messages().find(|m| m.message.image_message.is_set()) {
         let msg = &m.message;
         let img = msg.image_message.as_option().unwrap();
-        let dl = client_b.client.download(img as &dyn Downloadable).await?;
+        let dl = client_b
+            .client
+            .download(img as &dyn Downloadable, Default::default())
+            .await?;
         assert_eq!(dl, img_data);
     }
 
@@ -806,7 +848,10 @@ async fn test_send_multiple_media_types() -> anyhow::Result<()> {
     {
         let msg = &m.message;
         let doc = msg.document_message.as_option().unwrap();
-        let dl = client_b.client.download(doc as &dyn Downloadable).await?;
+        let dl = client_b
+            .client
+            .download(doc as &dyn Downloadable, Default::default())
+            .await?;
         assert_eq!(dl, doc_data);
     }
 
@@ -827,7 +872,10 @@ async fn test_send_multiple_media_types() -> anyhow::Result<()> {
     if let Some(m) = event.messages().find(|m| m.message.audio_message.is_set()) {
         let msg = &m.message;
         let audio = msg.audio_message.as_option().unwrap();
-        let dl = client_b.client.download(audio as &dyn Downloadable).await?;
+        let dl = client_b
+            .client
+            .download(audio as &dyn Downloadable, Default::default())
+            .await?;
         assert_eq!(dl, aud_data);
     }
 
@@ -853,14 +901,17 @@ async fn test_upload_download_large_file() -> anyhow::Result<()> {
 
     let downloaded = client
         .client
-        .download(&DownloadParams::encrypted(
-            &upload.direct_path,
-            &upload.media_key,
-            &upload.file_sha256,
-            &upload.file_enc_sha256,
-            upload.file_length,
-            MediaType::Document,
-        )?)
+        .download(
+            &DownloadParams::encrypted(
+                &upload.direct_path,
+                &upload.media_key,
+                &upload.file_sha256,
+                &upload.file_enc_sha256,
+                upload.file_length,
+                MediaType::Document,
+            )?,
+            Default::default(),
+        )
         .await?;
 
     assert_eq!(downloaded.len(), original.len());
@@ -891,14 +942,17 @@ async fn test_multiple_uploads_reuse_media_conn() -> anyhow::Result<()> {
         // Verify round-trip
         let downloaded = client
             .client
-            .download(&DownloadParams::encrypted(
-                &resp.direct_path,
-                &resp.media_key,
-                &resp.file_sha256,
-                &resp.file_enc_sha256,
-                resp.file_length,
-                MediaType::Image,
-            )?)
+            .download(
+                &DownloadParams::encrypted(
+                    &resp.direct_path,
+                    &resp.media_key,
+                    &resp.file_sha256,
+                    &resp.file_enc_sha256,
+                    resp.file_length,
+                    MediaType::Image,
+                )?,
+                Default::default(),
+            )
             .await?;
         assert_eq!(downloaded, data);
     }
@@ -940,7 +994,10 @@ async fn test_send_image_no_caption() -> anyhow::Result<()> {
             img.caption.is_none() || img.caption.as_deref() == Some(""),
             "Caption should be absent or empty"
         );
-        let downloaded = client_b.client.download(img as &dyn Downloadable).await?;
+        let downloaded = client_b
+            .client
+            .download(img as &dyn Downloadable, Default::default())
+            .await?;
         assert_eq!(downloaded, original);
     }
 

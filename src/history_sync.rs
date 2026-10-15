@@ -411,7 +411,7 @@ impl Client {
             // pre-sizes its fresh retry buffer from the declared file length.
             // Reuse it here so a ~1 MiB history blob does not climb the Vec
             // doubling ladder (1 MiB -> 2 MiB) on every successful download.
-            match self.download(&notification).await {
+            match self.download(&notification, Default::default()).await {
                 Ok(bytes) => {
                     log::info!("Successfully downloaded history sync blob.");
                     // Payload accounting uses logical compressed bytes for

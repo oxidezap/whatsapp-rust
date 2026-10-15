@@ -10,10 +10,10 @@ fn send(_: impl Future + Send) {}
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn native_futures(client: &Client, downloader: &MediaDownloader, media: &dyn Downloadable) {
-    send(client.download(media));
-    send(client.download_to_writer(media, Cursor::new(Vec::new())));
-    send(downloader.download(media));
-    send(downloader.download_to_writer(media, Cursor::new(Vec::new())));
+    send(client.download(media, Default::default()));
+    send(client.download_to_writer(media, Cursor::new(Vec::new()), Default::default()));
+    send(downloader.download(media, Default::default()));
+    send(downloader.download_to_writer(media, Cursor::new(Vec::new()), Default::default()));
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -79,10 +79,10 @@ mod browser {
 
     pub fn browser_futures(client: &Client, downloader: &MediaDownloader, media: &LocalMedia) {
         let sink = Rc::new(RefCell::new(Cursor::new(Vec::new())));
-        local(client.download(media));
-        local(client.download_to_writer(media, LocalWriter(sink.clone())));
-        local(downloader.download(media));
-        local(downloader.download_to_writer(media, LocalWriter(sink)));
+        local(client.download(media, Default::default()));
+        local(client.download_to_writer(media, LocalWriter(sink.clone()), Default::default()));
+        local(downloader.download(media, Default::default()));
+        local(downloader.download_to_writer(media, LocalWriter(sink), Default::default()));
     }
 }
 
@@ -109,7 +109,7 @@ pub use browser::*;
 ///     }
 /// }
 /// fn rejected(downloader: &MediaDownloader, media: &dyn Downloadable) {
-///     let _ = downloader.download_to_writer(media, LocalSink(Cursor::new(vec![]), Rc::new(())));
+///     let _ = downloader.download_to_writer(media, LocalSink(Cursor::new(vec![]), Rc::new(())), Default::default());
 /// }
 /// ```
 ///
