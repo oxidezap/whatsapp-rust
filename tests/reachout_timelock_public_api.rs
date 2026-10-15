@@ -7,12 +7,11 @@ fn accept_pull_state(_: &ReachoutTimelock) {}
 
 #[test]
 fn reachout_timelock_push_uses_the_existing_pull_type() {
-    // Existing aliases and struct-literal construction remain source-compatible.
-    let state = FeatureReachoutTimelock {
-        enforcement_type: Some("BIZ_QUALITY".into()),
-        is_active: Some(true),
-        time_enforcement_ends: Some("1704153600".into()),
-    };
+    // The facade aliases retain the generated pull type's construction policy.
+    let mut state = FeatureReachoutTimelock::default();
+    state.enforcement_type = Some("BIZ_QUALITY".into());
+    state.is_active = Some(true);
+    state.time_enforcement_ends = Some("1704153600".into());
     let event =
         Event::ReachoutTimelockUpdate(ReachoutTimelockUpdate::builder().state(state).build());
     let interest = EventInterest::of(&[EventKind::ReachoutTimelockUpdate]);
