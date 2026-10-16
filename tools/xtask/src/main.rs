@@ -7,9 +7,9 @@ mod package_consumers;
 mod size;
 mod size_baseline;
 mod workflow;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(
@@ -54,9 +54,7 @@ enum Task {
     },
 }
 fn main() -> Result<std::process::ExitCode> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()?;
+    let root = workspace_root(Path::new(env!("CARGO_MANIFEST_DIR")))?;
     let status = match Args::parse().task {
         Task::Sha256 { value, hex } => {
             println!("{}", xtask_support::hash_input(&value, hex)?);
@@ -79,6 +77,29 @@ fn main() -> Result<std::process::ExitCode> {
         Task::Ci { task } => ci::run(&root, task)?,
     };
     Ok(std::process::ExitCode::from(status))
+}
+
+fn workspace_root(manifest: &Path) -> Result<PathBuf> {
+    // A preserved bootstrap can run after checkout removes its original crate directory.
+    Ok(manifest
+        .ancestors()
+        .nth(2)
+        .context("xtask workspace root")?
+        .canonicalize()?)
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    #[test]
+    fn workspace_root_survives_a_checkout_without_the_bootstrap_crate() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest = root.path().join("tools/xtask");
+        assert!(!manifest.exists());
+        assert_eq!(
+            super::workspace_root(&manifest).unwrap(),
+            root.path().canonicalize().unwrap()
+        );
+    }
 }
 fn descriptor(root: &Path, stem: &str, source_info: bool) -> Result<()> {
     xtask_support::descriptor(

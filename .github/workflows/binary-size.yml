@@ -49,7 +49,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@master
@@ -73,22 +73,27 @@ jobs:
           prefix-key: ${{ runner.os }}-cargo-binary-size
           cache-targets: "true"
 
+      # Keep the bootstrap executable when switching to an older PR tree.
+      - name: Build size workflow tooling
+        run: |
+          cargo build --locked -p whatsapp-xtask
+          install -m 755 target/debug/whatsapp-xtask "$RUNNER_TEMP/size-xtask"
       - name: Prepare frozen PR comparison
-        run: cargo run --locked --quiet -p whatsapp-xtask -- ci workflow size-prepare
+        run: '"$RUNNER_TEMP/size-xtask" ci workflow size-prepare'
 
       # measure_binary_size builds an example, which pulls the cpal dev-dependency (alsa-sys).
       - name: Install ALSA dev headers
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev unzip
       - name: Measure binary size
         run: |
-          cargo run --locked --quiet -p whatsapp-xtask -- ci measure-binary-size --gate-only --out-dir size-out
+          "$RUNNER_TEMP/size-xtask" ci measure-binary-size --gate-only --out-dir size-out --event-head "$HEAD_SHA"
           git diff --exit-code
 
       - name: Download validated PR base measurement
         id: baseline
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: cargo run --locked --quiet -p whatsapp-xtask -- ci workflow size-baseline
+        run: '"$RUNNER_TEMP/size-xtask" ci workflow size-baseline'
       # Informational (job summary); the real gate is the report script below.
       # Tolerates the window before the first push run creates the series.
       - name: Compare against gh-pages series
@@ -111,7 +116,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: cargo run --locked --quiet -p whatsapp-xtask -- ci workflow size-override
+        run: '"$RUNNER_TEMP/size-xtask" ci workflow size-override'
       # No GH_TOKEN here: the report script is PR-controlled code.
       - name: Generate report and evaluate gate
         id: report
@@ -119,14 +124,14 @@ jobs:
           BASE_DIR: ${{ steps.baseline.outputs.dir }}
           ALLOW_SIZE_INCREASE: ${{ steps.override.outputs.allow }}
         run: |
-          cargo run --locked --quiet -p whatsapp-xtask -- ci binary-size-report --head size-out --out-dir size-out
-          cargo run --locked --quiet -p whatsapp-xtask -- ci workflow append-summary size-out/report.md
+          "$RUNNER_TEMP/size-xtask" ci binary-size-report --head size-out --out-dir size-out
+          "$RUNNER_TEMP/size-xtask" ci workflow append-summary size-out/report.md
       # This probe selects diagnostics; the unconditional final enforcement
       # below still fails the job on the canonical size-out/gate.txt result.
       - name: Check whether size diagnostics are needed
         id: budget
         continue-on-error: true
-        run: cargo run --locked --quiet -p whatsapp-xtask -- ci workflow size-gate
+        run: '"$RUNNER_TEMP/size-xtask" ci workflow size-gate'
       - name: Install cargo-bloat and cargo-llvm-lines for a failed budget
         if: steps.budget.outcome == 'failure'
         env:
@@ -138,7 +143,7 @@ jobs:
       - name: Diagnose the measured binary
         if: steps.budget.outcome == 'failure'
         run: |
-          cargo run --locked --quiet -p whatsapp-xtask -- ci measure-binary-size --skip-build --out-dir size-diagnostics
+          "$RUNNER_TEMP/size-xtask" ci measure-binary-size --skip-build --out-dir size-diagnostics --event-head "$HEAD_SHA"
           git diff --exit-code
       - name: Upload size artifacts
         if: ${{ !cancelled() }}
@@ -162,10 +167,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: cargo run --locked --quiet -p whatsapp-xtask -- ci workflow size-comment
+        run: '"$RUNNER_TEMP/size-xtask" ci workflow size-comment'
       - name: Enforce size budget
         if: ${{ always() && !cancelled() }}
-        run: cargo run --locked --quiet -p whatsapp-xtask -- ci workflow size-gate
+        run: '"$RUNNER_TEMP/size-xtask" ci workflow size-gate'
   binary-size-push:
     # Dispatch only publishes from main so stray branches can't pollute the series.
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')

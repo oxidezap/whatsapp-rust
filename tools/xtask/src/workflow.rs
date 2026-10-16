@@ -87,15 +87,6 @@ fn prepare_size_comparison(root: &Path, base: &str, head: &str) -> Result<()> {
             "size comparison requires full commit SHAs"
         );
     }
-    let actual = capture(
-        Command::new("git")
-            .current_dir(root)
-            .args(["rev-parse", "HEAD"]),
-    )?;
-    ensure!(
-        std::str::from_utf8(&actual.stdout)?.trim() == head,
-        "size comparison must start at the event's head"
-    );
     let status = capture(
         Command::new("git")
             .current_dir(root)
@@ -105,6 +96,9 @@ fn prepare_size_comparison(root: &Path, base: &str, head: &str) -> Result<()> {
         status.stdout.is_empty(),
         "size comparison requires a clean checkout"
     );
+    run(Command::new("git")
+        .current_dir(root)
+        .args(["checkout", "--detach", head]))?;
     // Never use the moving merge ref: it can include main commits absent from the baseline.
     run(Command::new("git").current_dir(root).args([
         "-c",
@@ -483,6 +477,9 @@ mod tests {
         git(root, &["commit", "-qm", "PR change"]);
         let head = git(root, &["rev-parse", "HEAD"]);
         assert!(!root.join("base-only").exists());
+        git(root, &["switch", "-q", "main"]);
+        git(root, &["merge", "--no-edit", "--no-ff", &head]);
+        assert!(root.join("later-main").exists());
         prepare_size_comparison(root, &base, &head).unwrap();
         assert_eq!(git(root, &["show", "HEAD:base-only"]), "base");
         assert_eq!(git(root, &["show", "HEAD:head-only"]), "head");
@@ -507,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn size_comparison_refuses_conflicts_and_wrong_starting_heads() {
+    fn size_comparison_refuses_conflicts_and_invalid_heads() {
         let dir = size_repository();
         let root = dir.path();
         std::fs::write(root.join("shared"), "base\n").unwrap();
@@ -517,7 +514,8 @@ mod tests {
         std::fs::write(root.join("shared"), "head\n").unwrap();
         git(root, &["commit", "-qam", "head change"]);
         let head = git(root, &["rev-parse", "HEAD"]);
-        assert!(prepare_size_comparison(root, &base, &base).is_err());
+        assert!(prepare_size_comparison(root, &base, &"0".repeat(40)).is_err());
+        assert_eq!(git(root, &["rev-parse", "HEAD"]), head);
         assert!(prepare_size_comparison(root, "--help", &head).is_err());
         assert!(prepare_size_comparison(root, &base, &head).is_err());
         assert_eq!(git(root, &["status", "--porcelain"]), "UU shared");

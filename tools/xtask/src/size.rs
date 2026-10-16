@@ -94,7 +94,13 @@ impl MeasurementTools for SystemTools {
     }
 }
 
-pub fn measure(root: &Path, out: &Path, skip: bool, gate_only: bool) -> Result<()> {
+pub fn measure(
+    root: &Path,
+    out: &Path,
+    skip: bool,
+    gate_only: bool,
+    event_head: Option<&str>,
+) -> Result<()> {
     let target = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or(root.join("target"));
@@ -104,6 +110,7 @@ pub fn measure(root: &Path, out: &Path, skip: bool, gate_only: bool) -> Result<(
         &target.join("release/examples/demo"),
         skip,
         gate_only,
+        event_head,
         &mut SystemTools,
     )
 }
@@ -114,6 +121,7 @@ fn measure_with(
     binary: &Path,
     skip: bool,
     gate_only: bool,
+    event_head: Option<&str>,
     tools: &mut impl MeasurementTools,
 ) -> Result<()> {
     std::fs::create_dir_all(out)?;
@@ -177,8 +185,15 @@ fn measure_with(
         "crates",
         i64::try_from(count)?,
     ));
+    ensure!(
+        event_head
+            .is_none_or(|sha| sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit())),
+        "event head must be a full commit SHA"
+    );
     let meta = json!({
         "commit": tools.text(root, "git", &["rev-parse", "HEAD"])?.trim(),
+        "event_head": event_head,
+        "tree": tools.text(root, "git", &["rev-parse", "HEAD^{tree}"])?.trim(),
         "rustc": tools.text(root, "rustc", &["--version"])?.trim(),
         "diagnostics": if gate_only { "omitted" } else { "complete" },
     });
@@ -313,6 +328,8 @@ fn validate_metrics(metrics: &[Metric]) -> Result<()> {
 #[derive(Deserialize)]
 struct Metadata {
     commit: String,
+    #[serde(default)]
+    event_head: Option<String>,
     rustc: String,
     #[serde(default)]
     diagnostics: Option<DiagnosticCoverage>,
@@ -336,6 +353,9 @@ fn metadata(directory: &Path) -> Result<Metadata> {
     ensure!(
         meta.commit.len() == 40
             && meta.commit.bytes().all(|b| b.is_ascii_hexdigit())
+            && meta.event_head.as_deref().is_none_or(
+                |sha| sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+            )
             && !meta.rustc.trim().is_empty(),
         "invalid size metadata"
     );
@@ -528,7 +548,7 @@ pub fn report(head_dir: &Path, base_dir: Option<&Path>, out: &Path) -> Result<()
         lines.push(if allow{"The `size-increase-ok` label is set, so the gate is not enforced for this PR."}else{"If this increase is expected (toolchain or dependency bump, accepted feature cost), add the `size-increase-ok` label and re-run the failed job."}.into());
     }
     let baseline = base_meta.commit;
-    let head = meta.commit;
+    let head = meta.event_head.unwrap_or(meta.commit);
     lines.push(String::new());
     lines.push(format!("Baseline: `{}` · Head: `{}` · [Graphs](https://oxidezap.github.io/whatsapp-rust/dev/binary-size/)",baseline.chars().take(9).collect::<String>(),head.chars().take(9).collect::<String>()));
     write(&out.join("report.md"), (lines.join("\n") + "\n").as_bytes())?;
@@ -552,13 +572,13 @@ mod tests {
         let tasks: Vec<_> = workflow
             .lines()
             .map(str::trim)
-            .filter(|line| line.contains("whatsapp-xtask"))
+            .filter(|line| line.starts_with("cargo ") && line.contains("whatsapp-xtask"))
             .collect();
         assert!(!tasks.is_empty());
         assert!(
             tasks
                 .iter()
-                .all(|line| line.contains("cargo run --locked --quiet -p whatsapp-xtask --"))
+                .all(|line| line.split_whitespace().any(|arg| arg == "--locked"))
         );
         assert_eq!(workflow.matches("git diff --exit-code").count(), 3);
     }
@@ -688,12 +708,72 @@ mod tests {
             (root, binary)
         }
         #[test]
+        fn merged_measurement_preserves_the_reviewed_head_in_artifacts_and_report() {
+            let (root, binary) = fixture();
+            let base = root.path().join("base");
+            let head = root.path().join("head");
+            let out = root.path().join("report");
+            let reviewed = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            measure_with(
+                root.path(),
+                &base,
+                &binary,
+                false,
+                true,
+                None,
+                &mut Tools::default(),
+            )
+            .unwrap();
+            measure_with(
+                root.path(),
+                &head,
+                &binary,
+                false,
+                true,
+                Some(reviewed),
+                &mut Tools::default(),
+            )
+            .unwrap();
+            let meta = read_json(&head.join("size-meta.json")).unwrap();
+            assert_eq!(meta["event_head"], reviewed);
+            assert_ne!(meta["commit"], reviewed);
+            assert!(meta["tree"].as_str().is_some());
+            report(&head, Some(&base), &out).unwrap();
+            assert!(
+                std::fs::read_to_string(out.join("report.md"))
+                    .unwrap()
+                    .contains("Head: `aaaaaaaaa`")
+            );
+            assert!(
+                measure_with(
+                    root.path(),
+                    &head,
+                    &binary,
+                    false,
+                    true,
+                    Some("--bad"),
+                    &mut Tools::default()
+                )
+                .is_err()
+            );
+            assert!(!head.join("size-meta.json").exists());
+        }
+        #[test]
         fn gate_only_preserves_real_binary_metrics_and_removes_stale_diagnostics() {
             let (root, binary) = fixture();
             let before = xtask_support::sha256(&std::fs::read(&binary).unwrap());
             let out = root.path().join("out");
             let mut full_tools = Tools::default();
-            measure_with(root.path(), &out, &binary, false, false, &mut full_tools).unwrap();
+            measure_with(
+                root.path(),
+                &out,
+                &binary,
+                false,
+                false,
+                None,
+                &mut full_tools,
+            )
+            .unwrap();
             let full = metrics(&out).unwrap();
             assert_eq!(
                 full_tools.calls,
@@ -714,7 +794,16 @@ mod tests {
                 fail: Some("bloat"),
                 ..Tools::default()
             };
-            measure_with(root.path(), &out, &binary, false, true, &mut gate_tools).unwrap();
+            measure_with(
+                root.path(),
+                &out,
+                &binary,
+                false,
+                true,
+                None,
+                &mut gate_tools,
+            )
+            .unwrap();
             let cheap = metrics(&out).unwrap();
             assert_eq!(cheap.len(), 4);
             assert_eq!(
@@ -757,7 +846,8 @@ mod tests {
                     ..Tools::default()
                 };
                 assert!(
-                    measure_with(root.path(), &out, &binary, false, false, &mut tools).is_err()
+                    measure_with(root.path(), &out, &binary, false, false, None, &mut tools)
+                        .is_err()
                 );
                 assert!(!out.join("gate.txt").exists());
                 assert!(!out.join("size-meta.json").exists());
@@ -773,6 +863,7 @@ mod tests {
                 &binary,
                 false,
                 true,
+                None,
                 &mut Tools::default(),
             )
             .unwrap();
@@ -794,6 +885,7 @@ mod tests {
                     &binary,
                     true,
                     false,
+                    None,
                     &mut tools,
                 );
                 assert_eq!(result.is_err(), fail.is_some());

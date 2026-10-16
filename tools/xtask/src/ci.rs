@@ -74,6 +74,9 @@ pub enum Task {
         /// Measure the linked binary and dependency count without bloat/llvm-lines.
         #[arg(long)]
         gate_only: bool,
+        /// Reviewed PR head, distinct from a locally reconstructed merge commit.
+        #[arg(long)]
+        event_head: Option<String>,
     },
     /// Write the size gate and report; budget failure stays in gate.txt for the workflow.
     BinarySizeReport {
@@ -299,7 +302,8 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
             out_dir,
             skip_build,
             gate_only,
-        } => super::size::measure(root, &out_dir, skip_build, gate_only)?,
+            event_head,
+        } => super::size::measure(root, &out_dir, skip_build, gate_only, event_head.as_deref())?,
         Task::BinarySizeReport {
             head,
             base,
