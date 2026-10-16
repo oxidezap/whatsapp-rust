@@ -47,6 +47,9 @@ jobs:
       pull-requests: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Match the event's baseline instead of including later main commits.
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - uses: dtolnay/rust-toolchain@master
         with:
