@@ -4,7 +4,7 @@
 mod fixture_util;
 
 use anyhow::{Result, ensure};
-use whatsapp_rust::bench_support::connected_idle::{BackendFixture, LANES, Session};
+use whatsapp_rust::bench_support::connected_idle::{BackendFixture, LANES, MESSAGES, Session};
 
 #[tokio::test(start_paused = true)]
 async fn connected_activity_and_idle_lifecycle() -> Result<()> {
@@ -130,6 +130,10 @@ async fn activity_setup_excludes_initialization_from_maintenance() -> Result<()>
         let session = Session::connect(backend.backend()).await?;
         let activity = session.prepare_activity().await?;
         session.receive_activity(activity).await?;
+        ensure!(
+            session.delivery_receipts() == MESSAGES,
+            "activity published before all pending-row cleanup and delivery receipts finished"
+        );
         let initialization_iqs = session.initialization_iqs();
         ensure!(
             initialization_iqs > 0,

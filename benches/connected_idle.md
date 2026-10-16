@@ -56,6 +56,11 @@ Boolean arguments mean `false = InMemoryBackend`, `true = file-backed SQLite`.
 * `activity_peak`: setup builds/connects the client, establishes keys and prepares
   ciphertext/history **outside** the measured region. The timed region receives
   the prepared workload, finishes offline drain and flushes library work.
+  Completion includes delivery receipts for every distinct workload ID reaching
+  the synthetic transport. Hook/event publication happens before conditional
+  pending-row deletion, so publication and an empty outbound scope alone cannot
+  fence the activity. Individual and aggregate receipts share this barrier;
+  duplicate IDs cannot cover a missing receipt. Cleanup remains measured here.
 * `cache_maintenance_after_activity`: connection **and activity** are setup;
   setup also joins finite construction/post-login tasks and their finite children.
   Registration happens before spawn under `bench-harness`, with RAII completion

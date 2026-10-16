@@ -208,6 +208,7 @@ impl Session {
             active: AtomicUsize::new(0),
             pongs: AtomicUsize::new(0),
             initialization_iqs: AtomicUsize::new(0),
+            delivery_receipts: Mutex::new([false; MESSAGES]),
         });
         let counts = Arc::new(Counts::default());
         let client = ClientBuilder::new()
@@ -401,6 +402,12 @@ impl Session {
             self.counts.history.load(Ordering::Relaxed) == 1,
             "history parsing did not dispatch"
         );
+        // Hook publication precedes conditional pending-row cleanup. An empty
+        // outbound scope can therefore be observed before receipts are even
+        // scheduled. Observe every workload ID on the wire before settling it.
+        self.wait_until(|| self.delivery_receipts() == MESSAGES)
+            .await
+            .context("activity receipts did not finish pending-row cleanup")?;
         self.settle().await?;
         Ok(())
     }
@@ -433,10 +440,15 @@ impl Session {
     async fn settle(&self) -> Result<()> {
         self.wait_until(|| self.client.response_waiters_guard().is_empty())
             .await?;
-        self.client
+        let outbound = self
+            .client
             .outbound_flush
             .flush(&*self.client.runtime, DEADLINE)
             .await;
+        ensure!(
+            outbound == crate::flush_scope::DrainOutcome::Completed,
+            "fixture outbound work did not finish: {outbound:?}"
+        );
         self.client.flush_signal_cache_batch_safe().await?;
         self.wait_until(|| self.wire.server_rx.is_empty()).await?;
         tokio::task::yield_now().await;
@@ -514,6 +526,18 @@ impl Session {
     /// Lifecycle tests use this to reject initialization leaking into maintenance.
     pub fn initialization_iqs(&self) -> usize {
         self.wire.initialization_iqs.load(Ordering::Relaxed)
+    }
+
+    /// Distinct workload IDs whose delivery receipts reached the transport.
+    /// Publication alone does not prove their durable pending rows were removed.
+    pub fn delivery_receipts(&self) -> usize {
+        self.wire
+            .delivery_receipts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|seen| **seen)
+            .count()
     }
 
     /// Requested capacity of the drain-only encoding buffer; not total heap or RSS.
@@ -611,9 +635,46 @@ struct Wire {
     active: AtomicUsize,
     pongs: AtomicUsize,
     initialization_iqs: AtomicUsize,
+    delivery_receipts: Mutex<[bool; MESSAGES]>,
 }
 
 impl Wire {
+    fn observe_delivery_receipt(&self, node: &Node) {
+        // Delivery may be individual or aggregated. Ignore history, ACKs and
+        // retry/read receipts; duplicate IDs cannot satisfy a missing delivery.
+        if node.tag != "receipt"
+            || node
+                .attrs()
+                .optional_string("type")
+                .is_some_and(|kind| kind != "inactive")
+        {
+            return;
+        }
+        let mut seen = self
+            .delivery_receipts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut record = |item: &Node| {
+            if let Some(index) = item.attrs().optional_string("id").and_then(|id| {
+                id.strip_prefix("IDLE-")
+                    .and_then(|index| index.parse::<usize>().ok())
+            }) && let Some(slot) = seen.get_mut(index)
+            {
+                *slot = true;
+            }
+        };
+        record(node);
+        if let Some(items) = node
+            .children()
+            .and_then(|children| children.iter().find(|child| child.tag == "list"))
+            .and_then(Node::children)
+        {
+            for item in items.iter().filter(|item| item.tag == "item") {
+                record(item);
+            }
+        }
+    }
+
     fn frame(&self, body: &[u8]) -> Result<(Option<Bytes>, Option<Node>, bool)> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         match std::mem::replace(&mut *state, State::Closed) {
@@ -745,6 +806,9 @@ impl Transport for Wire {
                 | usize::from(remaining[2]);
             ensure!(remaining.len() >= 3 + length, "truncated fixture frame");
             let (response, node, logged_in) = self.frame(&remaining[3..3 + length])?;
+            if let Some(node) = &node {
+                self.observe_delivery_receipt(node);
+            }
             remaining = &remaining[3 + length..];
             if let Some(response) = response {
                 self.server_tx
