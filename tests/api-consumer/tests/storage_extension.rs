@@ -326,6 +326,10 @@ fn opaque_database_causes_keep_the_legacy_text_fallback() {
     }
     let permanent = StoreError::Database(Box::new(BackendFailure));
     assert!(!permanent.is_database_busy_or_locked());
+    let nested = StoreError::Connection(Box::new(OpaqueContext(StoreError::Database(Box::new(
+        BackendFailure,
+    )))));
+    assert!(nested.is_database_busy_or_locked());
     // Opaque messages cannot distinguish contention from unrelated wording.
     let ambiguous = StoreError::Database(Box::new(std::io::Error::other(
         "busy worker count is invalid",

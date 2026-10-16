@@ -52,23 +52,26 @@ impl StoreError {
     /// Recognizes exhausted contention retries and rejects known non-database
     /// error variants without inspecting their messages.
     ///
-    /// `Database` and `Connection` carry opaque backend causes. Unless their
-    /// source chain contains another typed `StoreError`, this compatibility
-    /// fallback looks for "busy" or "locked" in source messages, ignoring case.
+    /// `Database` and `Connection` carry opaque backend causes. A more specific
+    /// `StoreError` in their source chain overrides message hints. Otherwise this
+    /// compatibility fallback looks for "busy" or "locked" in opaque source
+    /// messages, ignoring case, including through nested database wrappers.
     /// It can misclassify unrelated backend messages and cannot establish retry
     /// safety. Backends should use the specific error variants when available.
     /// SQLite's Diesel adapter loses BUSY/LOCKED codes, so opaque source-text
     /// detection remains necessary there.
     pub fn is_database_busy_or_locked(&self) -> bool {
-        let mut layer: &(dyn std::error::Error + 'static) = match self {
-            Self::RetriesExhausted { .. } => return true,
-            Self::Database(source) | Self::Connection(source) => source.as_ref(),
-            _ => return false,
-        };
+        let mut layer: &(dyn std::error::Error + 'static) = self;
         let mut text_indicates_contention = false;
         loop {
-            if let Some(typed) = layer.downcast_ref::<Self>() {
-                return typed.is_database_busy_or_locked();
+            match layer.downcast_ref::<Self>() {
+                Some(Self::RetriesExhausted { .. }) => return true,
+                Some(Self::Database(source) | Self::Connection(source)) => {
+                    layer = source.as_ref();
+                    continue;
+                }
+                Some(_) => return false,
+                None => {}
             }
             let message = layer.to_string().to_lowercase();
             text_indicates_contention |= message.contains("locked") || message.contains("busy");
