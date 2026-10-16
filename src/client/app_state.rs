@@ -9,7 +9,7 @@ use wacore::appstate_sync::AppStateMutationPersistence;
 fn external_blob_resolver(
     blobs: &HashMap<String, bytes::Bytes>,
 ) -> impl Fn(&wa::ExternalBlobReference) -> Result<bytes::Bytes> + '_ {
-    |ext| {
+    move |ext| {
         let path = ext
             .direct_path
             .as_ref()
