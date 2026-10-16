@@ -88,19 +88,6 @@ fn workspace_root(manifest: &Path) -> Result<PathBuf> {
         .canonicalize()?)
 }
 
-#[cfg(test)]
-mod bootstrap_tests {
-    #[test]
-    fn workspace_root_survives_a_checkout_without_the_bootstrap_crate() {
-        let root = tempfile::tempdir().unwrap();
-        let manifest = root.path().join("tools/xtask");
-        assert!(!manifest.exists());
-        assert_eq!(
-            super::workspace_root(&manifest).unwrap(),
-            root.path().canonicalize().unwrap()
-        );
-    }
-}
 fn descriptor(root: &Path, stem: &str, source_info: bool) -> Result<()> {
     xtask_support::descriptor(
         &root.join(format!("{stem}.proto")),
@@ -129,4 +116,18 @@ fn worker(root: &Path, task: &str, args: &[std::ffi::OsString]) -> Result<u8> {
         .code()
         .and_then(|code| u8::try_from(code).ok())
         .unwrap_or(1))
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    #[test]
+    fn workspace_root_survives_a_checkout_without_the_bootstrap_crate() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest = root.path().join("tools/xtask");
+        assert!(!manifest.exists());
+        assert_eq!(
+            super::workspace_root(&manifest).unwrap(),
+            root.path().canonicalize().unwrap()
+        );
+    }
 }
