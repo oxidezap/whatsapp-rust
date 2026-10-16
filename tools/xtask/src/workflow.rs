@@ -26,6 +26,8 @@ pub enum Task {
     GithubRelease,
     /// Validate a main dispatch's compiler before it reaches rustup or the measurement process.
     SizeToolchain,
+    /// Merge the event's frozen base into its exact head before size measurement.
+    SizePrepare,
     /// Download the PR base's validated main measurement, independent of graph publication.
     SizeBaseline {
         #[arg(long, default_value = "size-out")]
@@ -77,6 +79,45 @@ fn quiet(command: &mut Command) -> Result<bool> {
 }
 fn env(name: &str) -> Result<String> {
     std::env::var(name).with_context(|| format!("{name} must be set"))
+}
+fn prepare_size_comparison(root: &Path, base: &str, head: &str) -> Result<()> {
+    for sha in [base, head] {
+        ensure!(
+            sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "size comparison requires full commit SHAs"
+        );
+    }
+    let actual = capture(
+        Command::new("git")
+            .current_dir(root)
+            .args(["rev-parse", "HEAD"]),
+    )?;
+    ensure!(
+        std::str::from_utf8(&actual.stdout)?.trim() == head,
+        "size comparison must start at the event's head"
+    );
+    let status = capture(
+        Command::new("git")
+            .current_dir(root)
+            .args(["status", "--porcelain"]),
+    )?;
+    ensure!(
+        status.stdout.is_empty(),
+        "size comparison requires a clean checkout"
+    );
+    // Never use the moving merge ref: it can include main commits absent from the baseline.
+    run(Command::new("git").current_dir(root).args([
+        "-c",
+        "user.name=Size comparison",
+        "-c",
+        "user.email=size-comparison@users.noreply.github.com",
+        "-c",
+        "commit.gpgsign=false",
+        "merge",
+        "--no-edit",
+        "--no-ff",
+        base,
+    ]))
 }
 fn version_valid(version: &str) -> bool {
     regex::Regex::new(r"^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$")
@@ -298,6 +339,9 @@ pub fn run_task(root: &Path, task: Task) -> Result<()> {
             output("toolchain", selected)?;
             output("publish", if publish { "true" } else { "false" })?;
         }
+        Task::SizePrepare => {
+            prepare_size_comparison(root, &env("BASE_SHA")?, &env("HEAD_SHA")?)?;
+        }
         Task::SizeBaseline { head, out_dir } => {
             let repo = env("GITHUB_REPOSITORY")?;
             super::size_baseline::download(
@@ -397,6 +441,88 @@ pub fn run_task(root: &Path, task: Task) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn git(root: &Path, args: &[&str]) -> String {
+        String::from_utf8(
+            capture(Command::new("git").current_dir(root).args(args))
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned()
+    }
+
+    fn size_repository() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        git(root, &["config", "user.name", "Test"]);
+        git(root, &["config", "user.email", "test@example.invalid"]);
+        git(root, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("shared"), "common\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "common"]);
+        git(root, &["branch", "pr"]);
+        dir
+    }
+
+    #[test]
+    fn size_comparison_includes_frozen_base_but_excludes_later_main_commits() {
+        let dir = size_repository();
+        let root = dir.path();
+        std::fs::write(root.join("base-only"), "base\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "frozen base"]);
+        let base = git(root, &["rev-parse", "HEAD"]);
+        std::fs::write(root.join("later-main"), "unrelated\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "later main"]);
+        git(root, &["switch", "-q", "pr"]);
+        std::fs::write(root.join("head-only"), "head\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "PR change"]);
+        let head = git(root, &["rev-parse", "HEAD"]);
+        assert!(!root.join("base-only").exists());
+        prepare_size_comparison(root, &base, &head).unwrap();
+        assert_eq!(git(root, &["show", "HEAD:base-only"]), "base");
+        assert_eq!(git(root, &["show", "HEAD:head-only"]), "head");
+        assert!(!root.join("later-main").exists());
+        assert_eq!(git(root, &["status", "--porcelain"]), "");
+    }
+
+    #[test]
+    fn size_comparison_preserves_a_current_head_and_refuses_dirty_checkouts() {
+        let dir = size_repository();
+        let root = dir.path();
+        let base = git(root, &["rev-parse", "HEAD"]);
+        std::fs::write(root.join("head-only"), "head\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "PR change"]);
+        let head = git(root, &["rev-parse", "HEAD"]);
+        std::fs::write(root.join("uncommitted"), "dirty\n").unwrap();
+        assert!(prepare_size_comparison(root, &base, &head).is_err());
+        std::fs::remove_file(root.join("uncommitted")).unwrap();
+        prepare_size_comparison(root, &base, &head).unwrap();
+        assert_eq!(git(root, &["rev-parse", "HEAD"]), head);
+    }
+
+    #[test]
+    fn size_comparison_refuses_conflicts_and_wrong_starting_heads() {
+        let dir = size_repository();
+        let root = dir.path();
+        std::fs::write(root.join("shared"), "base\n").unwrap();
+        git(root, &["commit", "-qam", "base change"]);
+        let base = git(root, &["rev-parse", "HEAD"]);
+        git(root, &["switch", "-q", "pr"]);
+        std::fs::write(root.join("shared"), "head\n").unwrap();
+        git(root, &["commit", "-qam", "head change"]);
+        let head = git(root, &["rev-parse", "HEAD"]);
+        assert!(prepare_size_comparison(root, &base, &base).is_err());
+        assert!(prepare_size_comparison(root, "--help", &head).is_err());
+        assert!(prepare_size_comparison(root, &base, &head).is_err());
+        assert_eq!(git(root, &["status", "--porcelain"]), "UU shared");
+    }
+
     #[test]
     fn size_compiler_override_is_dispatch_only_and_does_not_publish() {
         let default = "nightly-2026-06-16";

@@ -41,6 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
     permissions:
       contents: read
       actions: read
@@ -48,8 +49,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # Match the event's baseline instead of including later main commits.
           ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -71,6 +72,9 @@ jobs:
         with:
           prefix-key: ${{ runner.os }}-cargo-binary-size
           cache-targets: "true"
+
+      - name: Prepare frozen PR comparison
+        run: cargo run --locked --quiet -p whatsapp-xtask -- ci workflow size-prepare
 
       # measure_binary_size builds an example, which pulls the cpal dev-dependency (alsa-sys).
       - name: Install ALSA dev headers
