@@ -917,7 +917,7 @@ mod tests {
                 .attr("type", "inactive")
                 .children([NodeBuilder::new("list")
                     .children([
-                        NodeBuilder::new("item").attr("id", "IDLE-0").build(),
+                        NodeBuilder::new("item").attr("id", "IDLE-1").build(),
                         NodeBuilder::new("item").attr("id", "IDLE-1").build(),
                         NodeBuilder::new("item").attr("id", "IDLE-2").build(),
                     ])
@@ -948,7 +948,8 @@ mod tests {
     #[test]
     fn unrelated_invalid_and_out_of_range_ids_do_not_count() {
         let wire = wire();
-        for id in ["HISTORY-0", "IDLE-invalid", "IDLE-256", "IDLE-"] {
+        let out_of_range = format!("IDLE-{MESSAGES}");
+        for id in ["HISTORY-0", "IDLE-invalid", out_of_range.as_str(), "IDLE-"] {
             wire.observe_delivery_receipt(&NodeBuilder::new("receipt").attr("id", id).build());
         }
         wire.observe_delivery_receipt(&NodeBuilder::new("receipt").build());
