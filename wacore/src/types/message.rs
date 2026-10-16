@@ -1,3 +1,18 @@
+//! Message metadata and envelope types.
+//!
+//! Open envelope enums can gain named variants. Keep `_` even when handling
+//! `Unknown` explicitly; adding a named wire value must not break consumers.
+//! ```compile_fail,E0004
+//! use wacore::types::message::StanzaMessageType as T;
+//! fn known(value: T) -> bool {
+//!     match value {
+//!         T::Text | T::Media | T::MediaNotify | T::Pay | T::Poll
+//!         | T::Reaction | T::Event => true,
+//!         T::Unknown(_) => false,
+//!     }
+//! }
+//! ```
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use wacore_binary::{CompactString, Jid, JidExt, MessageId, MessageServerId};
@@ -71,18 +86,6 @@ pub enum PushPriority {
 // enum catalog, so a variant added upstream arrives on the next sync instead of
 // being noticed by hand. Re-exported here because this is where the types that
 // use them live, and moving the path would break consumers for no gain.
-/// Open envelope enums can gain named variants. Keep `_` even when handling
-/// `Unknown` explicitly; adding a named wire value must not break consumers.
-/// ```compile_fail,E0004
-/// use wacore::types::message::StanzaMessageType as T;
-/// fn known(value: T) -> bool {
-///     match value {
-///         T::Text | T::Media | T::MediaNotify | T::Pay | T::Poll
-///         | T::Reaction | T::Event => true,
-///         T::Unknown(_) => false,
-///     }
-/// }
-/// ```
 pub use crate::types::wire_enums::{EncMediaType, PollType, StanzaMessageType};
 
 /// Whether an envelope's declared type agrees with the server's request to
