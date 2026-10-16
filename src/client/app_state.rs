@@ -6,6 +6,21 @@ use crate::request::DEFAULT_IQ_TIMEOUT;
 use std::borrow::Cow;
 use wacore::appstate_sync::AppStateMutationPersistence;
 
+fn external_blob_resolver(
+    blobs: &HashMap<String, bytes::Bytes>,
+) -> impl Fn(&wa::ExternalBlobReference) -> Result<bytes::Bytes> + '_ {
+    |ext| {
+        let path = ext
+            .direct_path
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("external blob has no directPath"))?;
+        blobs
+            .get(path)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("external blob not pre-downloaded: {path}"))
+    }
+}
+
 struct AppStateClientPersistence {
     client: std::sync::Weak<Client>,
     persistence: Arc<PersistenceManager>,
@@ -2202,20 +2217,7 @@ impl Client {
             // concurrently (independent CDN GETs, keyed by directPath).
             let pre_downloaded = self.pre_download_external_blobs(&patch_lists).await;
 
-            let download = |ext: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
-                if let Some(path) = &ext.direct_path {
-                    if let Some(bytes) = pre_downloaded.get(path) {
-                        Ok(bytes.clone())
-                    } else {
-                        Err(anyhow::anyhow!(
-                            "external blob not pre-downloaded: {}",
-                            path
-                        ))
-                    }
-                } else {
-                    Err(anyhow::anyhow!("external blob has no directPath"))
-                }
-            };
+            let download = external_blob_resolver(&pre_downloaded);
 
             // Request any missing decode keys and wait for them BEFORE processing. Inline
             // each list's external blobs first so the SNAPSHOT's key_id (inside the blob,
@@ -2610,20 +2612,7 @@ impl Client {
                 .pre_download_external_blobs(std::slice::from_ref(&pl))
                 .await;
 
-            let download = |ext: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
-                if let Some(path) = &ext.direct_path {
-                    if let Some(bytes) = pre_downloaded.get(path) {
-                        Ok(bytes.clone())
-                    } else {
-                        Err(anyhow::anyhow!(
-                            "external blob not pre-downloaded: {}",
-                            path
-                        ))
-                    }
-                } else {
-                    Err(anyhow::anyhow!("external blob has no directPath"))
-                }
-            };
+            let download = external_blob_resolver(&pre_downloaded);
 
             // Request any missing decode keys and wait for them BEFORE processing. Inline
             // the blobs first so the SNAPSHOT's key_id (inside its external blob, not the
@@ -3259,16 +3248,7 @@ impl Client {
             let pre_downloaded = self
                 .pre_download_external_blobs(std::slice::from_ref(&list))
                 .await;
-            let download = |ext: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
-                let path = ext
-                    .direct_path
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("external blob has no directPath"))?;
-                pre_downloaded
-                    .get(path)
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("external blob not pre-downloaded: {path}"))
-            };
+            let download = external_blob_resolver(&pre_downloaded);
             let replaying_snapshot = list.snapshot.is_some() || list.snapshot_ref.is_some();
             let proc = self.get_app_state_processor();
             match proc.process_parsed_patch_list(list, &download, true).await {
@@ -4755,6 +4735,26 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_blob_resolution_preserves_bytes_and_missing_path_errors() {
+        let blobs = HashMap::from([("/snapshot".into(), bytes::Bytes::from_static(b"snapshot"))]);
+        let resolve = external_blob_resolver(&blobs);
+        let mut reference = wa::ExternalBlobReference::default();
+        assert_eq!(
+            resolve(&reference).unwrap_err().to_string(),
+            "external blob has no directPath"
+        );
+        reference.direct_path = Some("/missing".into());
+        assert_eq!(
+            resolve(&reference).unwrap_err().to_string(),
+            "external blob not pre-downloaded: /missing"
+        );
+        reference.direct_path = Some("/snapshot".into());
+        let resolved = resolve(&reference).unwrap();
+        assert_eq!(resolved, blobs["/snapshot"]);
+        assert_eq!(resolved.as_ptr(), blobs["/snapshot"].as_ptr());
+    }
 
     #[tokio::test]
     async fn recovery_from_retired_request_generation_does_not_advance_state() {
