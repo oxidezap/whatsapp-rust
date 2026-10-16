@@ -862,3 +862,96 @@ impl Transport for Wire {
         self.server_tx.close();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wire() -> Wire {
+        let (server_tx, server_rx) = async_channel::bounded(1);
+        Wire {
+            state: Mutex::new(State::Hello),
+            server_tx,
+            server_rx,
+            active: AtomicUsize::new(0),
+            pongs: AtomicUsize::new(0),
+            initialization_iqs: AtomicUsize::new(0),
+            delivery_receipts: Mutex::new([false; MESSAGES]),
+        }
+    }
+
+    fn count(wire: &Wire) -> usize {
+        wire.delivery_receipts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|seen| **seen)
+            .count()
+    }
+
+    #[test]
+    fn duplicate_receipts_cannot_replace_a_missing_delivery() {
+        let wire = wire();
+        for index in 0..MESSAGES - 1 {
+            let receipt = NodeBuilder::new("receipt")
+                .attr("id", format!("IDLE-{index}"))
+                .build();
+            wire.observe_delivery_receipt(&receipt);
+            wire.observe_delivery_receipt(&receipt);
+        }
+        assert_eq!(count(&wire), MESSAGES - 1);
+        wire.observe_delivery_receipt(
+            &NodeBuilder::new("receipt")
+                .attr("id", format!("IDLE-{}", MESSAGES - 1))
+                .build(),
+        );
+        assert_eq!(count(&wire), MESSAGES);
+    }
+
+    #[test]
+    fn aggregate_receipt_counts_root_and_list_ids_once() {
+        let wire = wire();
+        wire.observe_delivery_receipt(
+            &NodeBuilder::new("receipt")
+                .attr("id", "IDLE-0")
+                .attr("type", "inactive")
+                .children([NodeBuilder::new("list")
+                    .children([
+                        NodeBuilder::new("item").attr("id", "IDLE-0").build(),
+                        NodeBuilder::new("item").attr("id", "IDLE-1").build(),
+                        NodeBuilder::new("item").attr("id", "IDLE-2").build(),
+                    ])
+                    .build()])
+                .build(),
+        );
+        assert_eq!(count(&wire), 3);
+    }
+
+    #[test]
+    fn read_retry_and_ack_do_not_count_as_delivery() {
+        let wire = wire();
+        for kind in ["read", "retry"] {
+            wire.observe_delivery_receipt(
+                &NodeBuilder::new("receipt")
+                    .attr("id", "IDLE-0")
+                    .attr("type", kind)
+                    .children([NodeBuilder::new("list")
+                        .children([NodeBuilder::new("item").attr("id", "IDLE-1").build()])
+                        .build()])
+                    .build(),
+            );
+        }
+        wire.observe_delivery_receipt(&NodeBuilder::new("ack").attr("id", "IDLE-0").build());
+        assert_eq!(count(&wire), 0);
+    }
+
+    #[test]
+    fn unrelated_invalid_and_out_of_range_ids_do_not_count() {
+        let wire = wire();
+        for id in ["HISTORY-0", "IDLE-invalid", "IDLE-256", "IDLE-"] {
+            wire.observe_delivery_receipt(&NodeBuilder::new("receipt").attr("id", id).build());
+        }
+        wire.observe_delivery_receipt(&NodeBuilder::new("receipt").build());
+        assert_eq!(count(&wire), 0);
+    }
+}
