@@ -53,10 +53,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # target does not provide. This future wraps the platform's real setTimeout.
 gloo-timers = { version = "0.4", features = ["futures"] }
 
-# 0.6 defaults to caller-provided host hooks. Keep the validated JS-backed
-# 0.5 ABI when fresh downstream resolution widens Diesel's transitive range.
+# Diesel 2.3.14 accepts the 0.6 ABI; explicitly select the browser host hooks.
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
-sqlite-wasm-rs = { version = "0.6.1", default-features = false }
+sqlite-wasm-rs = { version = "0.6.1", default-features = false, features = ["wasm-bindgen"] }
 
 [[bench]]
 name = "signal_flush"
