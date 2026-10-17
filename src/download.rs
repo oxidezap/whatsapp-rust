@@ -1238,9 +1238,6 @@ impl Client {
         downloadable: &dyn Downloadable,
         memory: memory::MemoryBudget,
     ) -> std::result::Result<MemoryWriter, ClientDownloadError> {
-        if !self.http_client.supports_streaming() {
-            return Err(DownloadPolicyError::StreamingRequired.into());
-        }
         Ok(MemoryWriter::bounded(
             downloadable.file_length().unwrap_or(0),
             memory,
@@ -1421,7 +1418,11 @@ where
     Finish: FnOnce(W) -> T + MaybeSend + 'static,
 {
     if !http_client.supports_streaming() {
-        if hashes.budget.is_some() {
+        if hashes
+            .budget
+            .as_ref()
+            .is_some_and(DownloadBudget::is_bounded)
+        {
             return Ok(WriterAttempt::Failed(
                 writer,
                 DownloadRequestError::ResourcePolicy(DownloadPolicyError::StreamingRequired),
@@ -1556,6 +1557,16 @@ where
     T: MaybeSend + 'static,
     Finish: FnOnce(W) -> T + MaybeSend + 'static,
 {
+    use std::io::Write;
+
+    if let Some(budget) = &hashes.budget
+        && let Err(error) = budget.check_cancelled()
+    {
+        return Ok(WriterAttempt::Failed(
+            writer,
+            DownloadRequestError::ResourcePolicy(error),
+        ));
+    }
     let mut body = match buffered_download_body(http_client, request).await {
         Ok(body) => body,
         Err(err) => return Ok(WriterAttempt::Failed(writer, err)),
@@ -1567,11 +1578,25 @@ where
     Ok(wacore::runtime::blocking(&**runtime, move || {
         let mut writer = writer;
         let result = (|| {
+            let budget = hashes
+                .budget
+                .clone()
+                .unwrap_or_else(|| DownloadBudget::new(DownloadLimits::unlimited()));
+            budget
+                .check_cancelled()
+                .map_err(DownloadRequestError::ResourcePolicy)?;
             decrypt_or_validate_buffered_body(&mut body, &decryption, &hashes)?;
             clear_writer(&mut writer).map_err(DownloadRequestError::writer_io)?;
-            writer
+            // Cancellation-only budgets allow buffered adapters. The retained
+            // MemoryWriter allocation still enforces its shared app-state quota;
+            // the adapter owns the transient HTTP response allocation.
+            budget
+                .writer(WriterIoOrigin(&mut writer))
                 .write_all(&body)
-                .map_err(DownloadRequestError::writer_io)?;
+                .map_err(|error| DownloadRequestError::streamed(error.into()))?;
+            budget
+                .check_cancelled()
+                .map_err(DownloadRequestError::ResourcePolicy)?;
             finish_verified_write(&mut writer)
         })();
 
@@ -2764,6 +2789,10 @@ mod tests {
             &self,
             request: crate::http::HttpRequest,
         ) -> Result<crate::http::HttpResponse> {
+            assert!(
+                !self.streaming,
+                "streaming adapter must use execute_streaming"
+            );
             self.record(&request.url);
             let (status_code, body) = self.respond(&request.url);
             Ok(crate::http::HttpResponse::new(status_code, body))
@@ -2779,12 +2808,27 @@ mod tests {
             &self,
             request: crate::http::HttpRequest,
         ) -> Result<wacore::net::StreamingHttpResponse> {
+            assert!(self.streaming, "buffered adapter must use execute");
             self.record(&request.url);
             let (status_code, body) = self.respond(&request.url);
             Ok(wacore::net::StreamingHttpResponse::new(
                 status_code,
                 Box::new(Cursor::new(body)),
             ))
+        }
+    }
+
+    // Exercise the trait defaults used by browser adapters as well as an
+    // adapter that explicitly reports its streaming capability.
+    struct BufferedOnlyHttp(Arc<RoutedHttpClient>);
+
+    #[async_trait::async_trait]
+    impl HttpClient for BufferedOnlyHttp {
+        async fn execute(
+            &self,
+            request: crate::http::HttpRequest,
+        ) -> Result<crate::http::HttpResponse> {
+            self.0.execute(request).await
         }
     }
 
@@ -2871,6 +2915,230 @@ mod tests {
             output.capacity() <= data.len(),
             "a bogus declared size must not reserve more output than the wire budget can produce"
         );
+    }
+
+    #[tokio::test]
+    async fn prepared_memory_downloads_support_both_http_contracts() {
+        let data = b"synthetic app-state blob";
+        let (mut params, encrypted) = encrypted_params(data);
+        for streaming in [false, true] {
+            for declared in [0, 1, data.len() as u64] {
+                params.file_length = declared;
+                let http = if streaming {
+                    RoutedHttpClient::streaming(Vec::new(), (200, encrypted.clone()))
+                } else {
+                    RoutedHttpClient::new(Vec::new(), (200, encrypted.clone()))
+                };
+                let adapter: Arc<dyn HttpClient> = if streaming {
+                    http.clone()
+                } else {
+                    Arc::new(BufferedOnlyHttp(http.clone()))
+                };
+                let client =
+                    crate::test_utils::create_test_client_with_http("prepared-memory", adapter)
+                        .await;
+                *client.media_conn.write().await = Some(media_conn("auth", &["cdn.example"]));
+                let memory = memory::MemoryBudget::new(data.len());
+                let writer = client
+                    .prepare_memory_download(&params, memory.clone())
+                    .unwrap();
+                let out = client
+                    .download_prepared_memory(&params, writer)
+                    .await
+                    .unwrap();
+                assert_eq!(out.as_ref(), data);
+                assert_eq!(http.urls().len(), 1);
+                assert_eq!(memory.used(), data.len());
+                let retained = out.slice(1..2);
+                drop(out);
+                assert_eq!(memory.used(), data.len());
+                drop(retained);
+                assert_eq!(memory.used(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_memory_downloads_preserve_quota_failures() {
+        let data = b"synthetic quota boundary";
+        let (mut params, encrypted) = encrypted_params(data);
+        for streaming in [false, true] {
+            let http = if streaming {
+                RoutedHttpClient::streaming(Vec::new(), (200, encrypted.clone()))
+            } else {
+                RoutedHttpClient::new(Vec::new(), (200, encrypted.clone()))
+            };
+            let client = crate::test_utils::create_test_client_with_http(
+                "prepared-memory-quota",
+                http.clone(),
+            )
+            .await;
+            *client.media_conn.write().await =
+                Some(media_conn("auth", &["first.example", "second.example"]));
+            let memory = memory::MemoryBudget::new(data.len() - 1);
+            params.file_length = data.len() as u64;
+            assert!(matches!(
+                client.prepare_memory_download(&params, memory.clone()),
+                Err(ClientDownloadError::ResourcePolicy(
+                    DownloadPolicyError::MemoryBudgetExceeded { .. }
+                ))
+            ));
+            assert!(http.urls().is_empty());
+            assert_eq!(memory.used(), 0);
+            params.file_length = 0;
+            let writer = client
+                .prepare_memory_download(&params, memory.clone())
+                .unwrap();
+            let error = client
+                .download_prepared_memory(&params, writer)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                ClientDownloadError::ResourcePolicy(
+                    DownloadPolicyError::MemoryBudgetExceeded { .. }
+                )
+            ));
+            assert_eq!(
+                http.urls().len(),
+                1,
+                "quota failure must not retry another host"
+            );
+            assert_eq!(memory.used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_memory_downloads_retry_and_release_failed_attempts() {
+        let data = b"synthetic authenticated body";
+        let (params, encrypted) = encrypted_params(data);
+        let mut corrupt = encrypted.clone();
+        corrupt[0] ^= 1;
+        for streaming in [false, true] {
+            for (status, body) in [(200, corrupt.clone()), (503, Vec::new())] {
+                for recover in [false, true] {
+                    let routes = vec![("first.example", status, body.clone())];
+                    let fallback = if recover {
+                        (200, encrypted.clone())
+                    } else {
+                        (status, body.clone())
+                    };
+                    let http = if streaming {
+                        RoutedHttpClient::streaming(routes, fallback)
+                    } else {
+                        RoutedHttpClient::new(routes, fallback)
+                    };
+                    let client = crate::test_utils::create_test_client_with_http(
+                        "prepared-memory-retry",
+                        http.clone(),
+                    )
+                    .await;
+                    *client.media_conn.write().await =
+                        Some(media_conn("auth", &["first.example", "second.example"]));
+                    let memory = memory::MemoryBudget::new(data.len());
+                    let writer = client
+                        .prepare_memory_download(&params, memory.clone())
+                        .unwrap();
+                    let result = client.download_prepared_memory(&params, writer).await;
+                    if recover {
+                        assert_eq!(result.unwrap().as_ref(), data);
+                    } else {
+                        let error = result.unwrap_err();
+                        assert!(matches!(error, ClientDownloadError::HostsUnreachable(_)));
+                        assert_eq!(error.http_status(), (status == 503).then_some(503));
+                    }
+                    assert_eq!(http.urls().len(), 2);
+                    assert_eq!(memory.used(), 0);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_memory_download_releases_quota_after_buffered_transport_failure() {
+        let (params, _) = encrypted_params(b"synthetic transport failure");
+        let client =
+            crate::test_utils::create_test_client_with_failing_http("prepared-transport").await;
+        *client.media_conn.write().await = Some(media_conn("auth", &["cdn.example"]));
+        let memory = memory::MemoryBudget::new(64);
+        let writer = client
+            .prepare_memory_download(&params, memory.clone())
+            .unwrap();
+        let error = client
+            .download_prepared_memory(&params, writer)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ClientDownloadError::HostsUnreachable(_)));
+        assert_eq!(error.http_status(), None);
+        assert_eq!(memory.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_only_buffered_download_stops_before_http() {
+        let (params, encrypted) = encrypted_params(b"cancelled");
+        let http = RoutedHttpClient::new(Vec::new(), (200, encrypted));
+        let runtime: Arc<dyn Runtime> = Arc::new(crate::TokioRuntime);
+        let adapter: Arc<dyn HttpClient> = http.clone();
+        let budget = DownloadBudget::cancellable(DownloadLimits::default());
+        budget.cancel();
+        let request = plaintext_request("https://cdn.example/cancelled".into());
+        let (_, result) = streaming_download_and_decrypt(
+            &adapter,
+            &runtime,
+            &request,
+            ExpectedMediaHashes {
+                budget: Some(budget),
+                ..ExpectedMediaHashes::from_downloadable(&params)
+            },
+            Cursor::new(Vec::new()),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result,
+            Err(DownloadRequestError::ResourcePolicy(
+                DownloadPolicyError::Cancelled
+            ))
+        ));
+        assert!(http.urls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_buffered_http_prevents_output_publication() {
+        struct CancelResponse(DownloadBudget);
+        #[async_trait::async_trait]
+        impl HttpClient for CancelResponse {
+            async fn execute(
+                &self,
+                _: crate::http::HttpRequest,
+            ) -> Result<crate::http::HttpResponse> {
+                self.0.cancel();
+                Ok(crate::http::HttpResponse::new(200, b"download me".to_vec()))
+            }
+        }
+        let budget = DownloadBudget::cancellable(DownloadLimits::default());
+        let adapter: Arc<dyn HttpClient> = Arc::new(CancelResponse(budget.clone()));
+        let runtime: Arc<dyn Runtime> = Arc::new(crate::TokioRuntime);
+        let request = plaintext_request("https://cdn.example/cancelled".into());
+        let (writer, result) = streaming_download_and_decrypt(
+            &adapter,
+            &runtime,
+            &request,
+            ExpectedMediaHashes {
+                budget: Some(budget),
+                ..Default::default()
+            },
+            Cursor::new(Vec::new()),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result,
+            Err(DownloadRequestError::ResourcePolicy(
+                DownloadPolicyError::Cancelled
+            ))
+        ));
+        assert!(writer.into_inner().is_empty());
     }
 
     #[tokio::test]

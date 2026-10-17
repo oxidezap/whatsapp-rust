@@ -16,7 +16,9 @@ struct BlobHttp {
 #[async_trait::async_trait]
 impl HttpClient for BlobHttp {
     async fn execute(&self, _: HttpRequest) -> Result<HttpResponse> {
-        panic!("bounded prefetch must not buffer HTTP")
+        assert!(!self.streaming, "streaming adapters must not buffer HTTP");
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(HttpResponse::new(200, self.body.clone()))
     }
 
     fn supports_streaming(&self) -> bool {
@@ -194,10 +196,35 @@ async fn completed_blobs_remain_charged_across_prefetch_batches() {
 }
 
 #[tokio::test]
-async fn oversized_declared_blob_and_nonstreaming_adapter_fail_before_http() {
+async fn snapshot_and_mutation_prefetch_support_buffered_and_streaming_http() {
+    for streaming in [false, true] {
+        let (snapshot, body) = fixture(32);
+        let mut mutation = snapshot.clone();
+        mutation.direct_path = Some("/synthetic-mutations".into());
+        let mut patch_list = list(snapshot.clone());
+        let mut patch = wa::SyncdPatch::default();
+        patch.external_mutations = Some(mutation.clone()).into();
+        patch_list.patches.push(patch);
+        let (client, http) = client(64, 2, body, streaming).await;
+        let blobs = client.pre_download_external_blobs(&[patch_list]).await;
+        assert_eq!(blobs.len(), 2);
+        {
+            let resolve = external_blob_resolver(&blobs);
+            assert_eq!(resolve(&snapshot).unwrap().as_ref(), &[7; 32]);
+            assert_eq!(resolve(&mutation).unwrap().as_ref(), &[7; 32]);
+        }
+        assert_eq!(http.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(client.cache_config.app_state_downloads.budget().used(), 64);
+        drop(blobs);
+        assert_eq!(client.cache_config.app_state_downloads.budget().used(), 0);
+    }
+}
+
+#[tokio::test]
+async fn oversized_declared_blob_fails_before_http_with_either_adapter() {
     for streaming in [true, false] {
         let (reference, body) = fixture(32);
-        let (client, http) = client(if streaming { 31 } else { 64 }, 1, body, streaming).await;
+        let (client, http) = client(31, 1, body, streaming).await;
         let blobs = client
             .pre_download_external_blobs(&[list(reference.clone())])
             .await;
