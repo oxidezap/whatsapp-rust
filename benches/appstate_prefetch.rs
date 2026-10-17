@@ -1,31 +1,13 @@
 //! Retained app-state blobs through production admission, streaming and verification.
 
 use std::sync::Arc;
-use whatsapp_rust::bench_support::{PrefetchHarness, StreamingDecryptHarness};
+use whatsapp_rust::bench_support::PrefetchHarness;
 
 #[global_allocator]
 static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
 
 fn main() {
     divan::main();
-}
-
-// These synchronous controls expose crypto/output costs without the runtime
-// internals that prevent useful callgraphs for the end-to-end cases.
-#[divan::bench(args = [65536, 1048576], sample_count = 1000, sample_size = 1)]
-fn streaming_vec(bencher: divan::Bencher, bytes: usize) {
-    let fixture = StreamingDecryptHarness::new(bytes).expect("streaming fixture");
-    bencher.bench_local(|| fixture.decrypt_vec().expect("verified streaming decrypt"));
-}
-
-#[divan::bench(args = [65536, 1048576], sample_count = 1000, sample_size = 1)]
-fn streaming_accounted(bencher: divan::Bencher, bytes: usize) {
-    let fixture = StreamingDecryptHarness::new(bytes).expect("streaming fixture");
-    bencher.bench_local(|| {
-        fixture
-            .decrypt_accounted()
-            .expect("verified accounted decrypt")
-    });
 }
 
 #[divan::bench(args = [65536, 1048576], sample_count = 1000, sample_size = 1)]

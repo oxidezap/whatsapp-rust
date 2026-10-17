@@ -31,39 +31,6 @@ env:
   MALLOC_TOP_PAD_: "131072"
 
 jobs:
-  bot-context-walltime:
-    name: Bot helpers native walltime
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2026-06-16
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: protoc@${{ env.PROTOC_VERSION }},cargo-codspeed@5.0.2
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: bot-context-walltime
-          cache-targets: "false"
-      - name: Record measured source and host
-        run: |
-          git rev-parse HEAD
-          rustc -Vv
-          lscpu
-      - name: Build native bot helper controls
-        run: cargo codspeed build -m walltime -p whatsapp-rust --features bench-harness --bench bot_context_reply
-      - name: Measure matched bot helper controls
-        uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369 # v5.4.2
-        with:
-          mode: walltime
-          runner-version: "5.4.2"
-          run: cargo codspeed run -p whatsapp-rust --bench bot_context_reply
-
   prefetch-walltime:
     name: Prefetch native walltime
     runs-on: ubuntu-24.04

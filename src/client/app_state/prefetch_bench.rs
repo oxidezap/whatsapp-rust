@@ -1,32 +1,11 @@
-//! Production prefetch entry for native regression probes.
+//! Production app-state prefetch fixture for benchmarks.
 
 use crate::Client;
-use crate::bench_support::StreamingBodyHttp;
-use crate::download::ClientDownloadError;
 use anyhow::{Result, ensure};
 use bytes::Bytes;
 use std::sync::Arc;
 use wacore::appstate::patch_decode::{PatchList, WAPatchName};
 use waproto::whatsapp as wa;
-
-// Both map representations let the identical fixture run on the pre-budget base.
-trait Payload {
-    fn verified_bytes(&self) -> Result<&[u8]>;
-}
-
-impl Payload for Bytes {
-    fn verified_bytes(&self) -> Result<&[u8]> {
-        Ok(self)
-    }
-}
-
-impl Payload for Result<Bytes, Arc<ClientDownloadError>> {
-    fn verified_bytes(&self) -> Result<&[u8]> {
-        self.as_ref()
-            .map(Bytes::as_ref)
-            .map_err(|error| anyhow::Error::new(Arc::clone(error)))
-    }
-}
 
 /// Four retained, authenticated blobs using the production app-state prefetch.
 pub struct PrefetchHarness {
@@ -41,7 +20,7 @@ impl PrefetchHarness {
         let encrypted =
             wacore::upload::encrypt_media(&plaintext, wacore::download::MediaType::AppState)?;
         let client = crate::bench_support::build_offline_client_with_http(Arc::new(
-            StreamingBodyHttp::new(encrypted.data_to_upload.into()),
+            StreamingBodyHttp(encrypted.data_to_upload.into()),
         ))
         .await;
         // Client construction schedules finite retention/cache initialization.
@@ -94,10 +73,36 @@ impl PrefetchHarness {
         ensure!(blobs.len() == 4, "prefetch lost a blob");
         for blob in blobs.values() {
             ensure!(
-                blob.verified_bytes()? == self.plaintext,
+                blob.as_ref()
+                    .map_err(|error| anyhow::Error::new(Arc::clone(error)))?
+                    .as_ref()
+                    == self.plaintext,
                 "prefetch plaintext mismatch"
             );
         }
         Ok(())
+    }
+}
+
+struct StreamingBodyHttp(Bytes);
+
+#[async_trait::async_trait]
+impl crate::http::HttpClient for StreamingBodyHttp {
+    async fn execute(&self, _: crate::http::HttpRequest) -> Result<crate::http::HttpResponse> {
+        anyhow::bail!("benchmark expects streaming HTTP")
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn execute_streaming(
+        &self,
+        _: crate::http::HttpRequest,
+    ) -> Result<wacore::net::StreamingHttpResponse> {
+        Ok(wacore::net::StreamingHttpResponse::new(
+            200,
+            Box::new(std::io::Cursor::new(self.0.clone())),
+        ))
     }
 }

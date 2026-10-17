@@ -4,7 +4,6 @@ mod ci;
 mod compatibility;
 mod consumers;
 mod package_consumers;
-mod runtime_probes;
 mod size;
 mod size_baseline;
 mod workflow;

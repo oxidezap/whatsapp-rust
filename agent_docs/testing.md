@@ -40,18 +40,10 @@ receive layout audit is `audit_receive_future_and_struct_layouts`; run it with
 `--features bench-harness -- --ignored --nocapture`. Use `client_receive` and
 `examples/receive_footprint.rs` for CPU and requested-heap measurements.
 `benches/connected_idle.md` describes connected retention measurement.
-`benches/runtime_regression.md` defines paired runtime timing and requested-heap
-probes, including authenticated app-state application and concurrent clients.
 
-Async memory changes need both representation and execution checks. Measure the
-concrete production future and the allocations made by its first poll. A small
-wrapper can still allocate a large inner future. Split at ownership or I/O phase
-boundaries, keep each boxed phase bounded, and preserve the original error and
-durability ordering. Use the runtime's target-correct future aliases when type
-erasure is required. Avoid blanket boxing and platform-specific execution paths
-without measured evidence. Check native feature profiles and WASM when changing
-shared orchestration, then benchmark affected host hot paths separately from
-allocator instrumentation.
+For async memory changes, test the concrete inner future and its first-poll
+allocations. Keep the download admission, retained-buffer and cancellation tests.
+Use `appstate_prefetch` for native prefetch timing; simulation omits syscall time.
 
 ## Layout and binary budgets
 

@@ -1377,34 +1377,6 @@ impl<'a> Groups<'a> {
         Box::pin(self.routing_info_from_source(jid, cached)).await
     }
 
-    #[cfg(feature = "bench-harness")]
-    pub(crate) async fn routing_info_unboxed_control(
-        &self,
-        jid: &Jid,
-    ) -> Result<Arc<GroupRoutingInfo>, GroupError> {
-        self.routing_info_with_freshness_unboxed_control(
-            jid,
-            crate::cache::Freshness::CachePreferred,
-        )
-        .await
-    }
-
-    #[cfg(feature = "bench-harness")]
-    async fn routing_info_with_freshness_unboxed_control(
-        &self,
-        jid: &Jid,
-        freshness: crate::cache::Freshness,
-    ) -> Result<Arc<GroupRoutingInfo>, GroupError> {
-        let cache = self.client.get_group_cache();
-        let mut cached = cache.get(jid).await;
-        if freshness == crate::cache::Freshness::CachePreferred
-            && let Some(cached) = cached.take()
-        {
-            return Ok(cached);
-        }
-        self.routing_info_from_source(jid, cached).await
-    }
-
     #[expect(
         clippy::manual_async_fn,
         reason = "the explicit async block keeps the network-bound state machine out of line"

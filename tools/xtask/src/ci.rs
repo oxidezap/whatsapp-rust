@@ -8,11 +8,6 @@ use xtask_support::{capture, write};
 
 #[derive(Subcommand)]
 pub enum Task {
-    /// Record native latency and whole-process Rust heap for the runtime fixtures.
-    RuntimeProbes {
-        #[arg(long)]
-        out_dir: PathBuf,
-    },
     /// Prove SDK and host-contract removals fail downstream compilation.
     CompatibilityControls {
         #[arg(long, value_enum)]
@@ -215,10 +210,6 @@ fn timed_report(
 
 pub fn run(root: &Path, task: Task) -> Result<u8> {
     match task {
-        Task::RuntimeProbes { out_dir } => {
-            super::runtime_probes::run(root, &out_dir)?;
-            return Ok(0);
-        }
         Task::Consumers { task } => return super::consumers::run(root, task),
         Task::CompatibilityControls { lane, toolchain } => {
             super::compatibility::controls(root, lane, &toolchain)?;

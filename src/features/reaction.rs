@@ -68,48 +68,6 @@ impl Client {
         self.send(request).await
     }
 
-    // Keep the pre-boundary routing getter inside this control's coroutine.
-    // It isolates the cold routing frame on the current send implementation.
-    #[cfg(feature = "bench-harness")]
-    pub(crate) async fn reaction_unboxed_control(
-        &self,
-        chat: impl Into<Jid>,
-        target_key: wa::MessageKey,
-        emoji: &str,
-    ) -> Result<SendResult, SendError> {
-        let chat = &chat.into();
-        let request = if chat.is_group()
-            && self
-                .is_community_announce_group_unboxed_control(chat)
-                .await?
-        {
-            self.prepare_enc_reaction(chat, target_key, emoji).await?
-        } else {
-            plain_reaction_request(chat, target_key, emoji)
-        };
-        self.send(request).await
-    }
-
-    #[cfg(feature = "bench-harness")]
-    async fn is_community_announce_group_unboxed_control(
-        &self,
-        chat: &Jid,
-    ) -> Result<bool, crate::features::GroupError> {
-        if let Some(flag) = self
-            .groups()
-            .routing_info_unboxed_control(chat)
-            .await?
-            .is_community_announce
-        {
-            return Ok(flag);
-        }
-        Ok(self
-            .groups()
-            .fetch_metadata(chat)
-            .await?
-            .is_default_sub_group)
-    }
-
     /// Whether `chat` is a Community Announcement Group (WA Web `isCag`).
     ///
     /// Served from the cached/persisted group metadata; a blob persisted
