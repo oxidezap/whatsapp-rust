@@ -36,6 +36,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-16
@@ -69,7 +71,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
@@ -112,5 +114,5 @@ jobs:
         run: target/debug/whatsapp-xtask ci compatibility-controls --lane "$LANE" --toolchain "$TOOLCHAIN"
       - name: Record exact source commit
         env:
-          EXPECTED_SHA: ${{ github.sha }}
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: target/debug/whatsapp-xtask ci workflow qualification-sha

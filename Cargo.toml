@@ -438,6 +438,11 @@ harness = false
 required-features = ["bench-harness"]
 
 [[bench]]
+name = "appstate_prefetch"
+harness = false
+required-features = ["bench-harness"]
+
+[[bench]]
 name = "client_group_scale"
 harness = false
 required-features = ["bench-harness"]

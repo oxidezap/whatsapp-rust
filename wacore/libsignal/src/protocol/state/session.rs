@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
+mod stored_session;
+
 use std::result::Result;
 use std::sync::Arc;
 
@@ -280,16 +282,6 @@ impl SessionState {
         self.skipped
             .iter()
             .any(|keys| keys.as_ref().is_some_and(|keys| !keys.is_empty()))
-    }
-
-    /// The protobuf with the skipped keys put back, for encoding. Borrowed
-    /// when there is nothing to put back, which is every chain of an in-order
-    /// conversation; a clone with the backlog reassembled otherwise.
-    fn protobuf(&self) -> std::borrow::Cow<'_, SessionStructure> {
-        if !self.has_skipped_keys() {
-            return std::borrow::Cow::Borrowed(&self.session);
-        }
-        std::borrow::Cow::Owned(self.to_protobuf())
     }
 
     /// The protobuf with the skipped keys put back, owned.
@@ -1084,7 +1076,7 @@ struct ArchivedSession(Box<[u8]>);
 /// Append `msg`'s encoding to `out`.
 ///
 /// Direct buffa calls, on the same grounds as `serialize_into_inner` below:
-/// the session storage protos are encoded only inside this file, so this
+/// the session storage protos are encoded only inside this module, so this
 /// duplicates nothing — `serialize_into_inner` already instantiates
 /// `SessionStructure`'s encode tree here. A `waproto::codec` pin would add a
 /// second copy of that tree to `waproto`, which is the cost the rule exists to
@@ -1098,6 +1090,14 @@ fn encode_message(msg: &impl Message, out: &mut Vec<u8>) {
 }
 
 impl ArchivedSession {
+    fn encode_state(state: &SessionState) -> Self {
+        let mut cache = buffa::SizeCache::new();
+        let session = stored_session::StoredSession::new(state, &mut cache);
+        let mut buf = Vec::with_capacity(session.len());
+        session.write_to(&mut cache, &mut buf);
+        Self(buf.into_boxed_slice())
+    }
+
     fn encode(session: &SessionStructure) -> Self {
         let mut buf = Vec::new();
         encode_message(session, &mut buf);
@@ -1295,7 +1295,7 @@ impl SessionRecord {
             };
             let mut state = SessionState::from_session_structure(session);
             state.fast_forward_sender_chain_or_drop(ceiling);
-            *archived = ArchivedSession::encode(&state.into_protobuf());
+            *archived = ArchivedSession::encode_state(&state);
         }
         self.lease.waive();
     }
@@ -1594,7 +1594,7 @@ impl SessionRecord {
                 sessions.pop();
             }
             current_session.clear_unacknowledged_pre_key_message();
-            sessions.insert(0, ArchivedSession::encode(&current_session.into_protobuf()));
+            sessions.insert(0, ArchivedSession::encode_state(&current_session));
             true
         } else {
             false
@@ -1631,25 +1631,12 @@ impl SessionRecord {
     fn serialize_into_inner(&self, buf: &mut Vec<u8>, incarnation: Option<&[u8; 16]>) {
         use buffa::encoding::{Tag, WireType, encode_varint, varint_len};
 
-        fn write_len_delimited(
-            field: u32,
-            msg: &impl Message,
-            msg_len: usize,
-            cache: &mut buffa::SizeCache,
-            buf: &mut Vec<u8>,
-        ) {
-            Tag::new(field, WireType::LengthDelimited).encode(buf);
-            encode_varint(msg_len as u64, buf);
-            msg.write_to(cache, buf);
-        }
-
         let mut cache = buffa::SizeCache::new();
-        // Borrowed unless a receiver chain holds skipped keys, in which case
-        // the backlog is reassembled into a clone for the encoder.
-        let current = self.current_session.as_ref().map(|s| s.protobuf());
-        let current_msg_len = current
-            .as_deref()
-            .map(|s| s.compute_size(&mut cache) as usize);
+        let current = self
+            .current_session
+            .as_ref()
+            .map(|state| stored_session::StoredSession::new(state, &mut cache));
+        let current_msg_len = current.as_ref().map(stored_session::StoredSession::len);
         let current_len = current_msg_len
             .map(|msg_len| 1 + varint_len(msg_len as u64) + msg_len)
             .unwrap_or(0);
@@ -1682,10 +1669,12 @@ impl SessionRecord {
         buf.clear();
         buf.reserve(current_len + previous_len + reserved_len + incarnation_len);
 
-        if let Some(session) = current.as_deref()
+        if let Some(session) = current.as_ref()
             && let Some(msg_len) = current_msg_len
         {
-            write_len_delimited(1, session, msg_len, &mut cache, buf);
+            Tag::new(1, WireType::LengthDelimited).encode(buf);
+            encode_varint(msg_len as u64, buf);
+            session.write_to(&mut cache, buf);
         }
         for archived in self.previous_sessions.iter() {
             let bytes = archived.as_bytes();
@@ -2451,6 +2440,45 @@ mod tests {
             proto.needs_refresh = Some(seed.is_multiple_of(2));
             proto.alice_base_key = Some(vec![seed.wrapping_add(3); 33]);
             proto
+        }
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn store_encoding_matches_generated_backlogs_and_archives() {
+        for chains in [0, 1, 5] {
+            for count in [0, 1, 4, 40, 129] {
+                let mut session = make_cache_shape_session(3, chains, 2);
+                session.pending_key_exchange = MessageField::some(Default::default());
+                session.pending_pre_key = MessageField::some(Default::default());
+                for chain in &mut session.receiver_chains {
+                    chain.message_keys = (0..count)
+                        .map(|index| {
+                            let mut key = session_structure::chain::MessageKey::default();
+                            key.index = Some([0, 127, 128, u32::MAX][index % 4]);
+                            if index % 3 == 0 {
+                                key.cipher_key = Some(bytes::Bytes::from(vec![1; 32]));
+                                key.mac_key = Some(bytes::Bytes::from(vec![2; 32]));
+                                key.iv = Some(bytes::Bytes::from(vec![3; 16]));
+                            } else {
+                                key.seed = Some(bytes::Bytes::from(vec![7; 32]));
+                            }
+                            key
+                        })
+                        .collect();
+                }
+                let mut proto = waproto::whatsapp::RecordStructure::default();
+                proto.current_session = MessageField::some(session);
+                proto.previous_sessions = vec![make_cache_shape_session(5, 1, 0)];
+                let expected = proto.encode_to_vec();
+                let record = SessionRecord::deserialize(&expected).expect("synthetic session");
+                let mut encoded = vec![0xFF; 200];
+                for _ in 0..2 {
+                    record.serialize_into_for_store(&mut encoded, &[9; 16]);
+                    assert_eq!(encoded, expected, "chains={chains} keys={count}");
+                }
+                assert_eq!(record.serialize().expect("serialize"), expected);
+            }
         }
     }
 

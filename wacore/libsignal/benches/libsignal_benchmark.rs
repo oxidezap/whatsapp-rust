@@ -837,8 +837,7 @@ fn setup_session_with_backlog() -> SessionRecord {
     })
 }
 
-/// Store-flush cost of a session with a skipped-key backlog. The empty-backlog
-/// case is a borrow of the in-memory protobuf; this is the path that rebuilds it.
+/// Store-flush cost of a session with a skipped-key backlog.
 #[divan::bench]
 fn bench_session_serialize_with_backlog(bencher: divan::Bencher) {
     bencher

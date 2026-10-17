@@ -2,6 +2,19 @@
 
 use super::*;
 
+// Guard the allocation inside Client::edit_message, in addition to callers'
+// wrapper futures. A small public wrapper can hide a much larger inner box.
+fn bounded_edit_request_future<F: Future>(future: F) -> F {
+    const {
+        let budget = if usize::BITS == 64 { 2048 } else { 1024 };
+        assert!(
+            size_of::<F>() <= budget,
+            "edit request future exceeds its allocation budget"
+        );
+    }
+    future
+}
+
 impl Client {
     /// Send a pre-marshaled stanza through the noise socket.
     ///
@@ -206,7 +219,10 @@ impl Client {
         &'a self,
         request: crate::EditRequest<'a>,
     ) -> Result<crate::SendResult, crate::SendError> {
-        Box::pin(self.edit_request_inner(request)).await
+        Box::pin(bounded_edit_request_future(
+            self.edit_request_inner(request),
+        ))
+        .await
     }
 
     async fn edit_request_inner(
@@ -224,16 +240,16 @@ impl Client {
                     "invalid original creator".into(),
                 ));
             }
-            return self
-                .edit_message_encrypted_inner(
-                    to.clone(),
-                    id,
-                    secret.as_bytes(),
-                    Arc::unwrap_or_clone(request.content),
-                    Some(creator),
-                    stanza_id,
-                )
-                .await;
+            // Secret-specific routing must not enlarge the ordinary edit frame.
+            return Box::pin(self.edit_message_encrypted_inner(
+                to.clone(),
+                id,
+                secret.as_bytes(),
+                Arc::unwrap_or_clone(request.content),
+                Some(creator),
+                stanza_id,
+            ))
+            .await;
         }
         if to.is_group() && self.is_community_announce_group(to).await? {
             return Err(crate::SendError::InvalidRequest(
@@ -243,7 +259,7 @@ impl Client {
         self.edit_message_inner(
             to.clone(),
             id,
-            Arc::unwrap_or_clone(request.content),
+            move || Arc::unwrap_or_clone(request.content),
             stanza_id,
         )
         .await
@@ -269,7 +285,7 @@ impl Client {
         self.edit_message_inner(
             to.into(),
             id.into_string(),
-            new_content,
+            move || new_content,
             options.stanza_id.map(crate::StanzaId::into_string),
         )
         .await
@@ -277,12 +293,14 @@ impl Client {
 
     /// Shared edit-send flow for the canonical request and explicit raw path.
     /// `request_id` borrows the outer stanza id; `None` generates a fresh id.
+    /// Defer unwrapping shared content until routing finishes, while raw callers
+    /// can transfer their owned content without another allocation.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.edit", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     async fn edit_message_inner(
         &self,
         to: Jid,
         original_id: String,
-        new_content: wa::Message,
+        new_content: impl FnOnce() -> wa::Message,
         request_id: Option<String>,
     ) -> Result<crate::send::SendResult, crate::send::SendError> {
         // WhatsApp Web uses getMeUserLidOrJidForChat(chat, EditMessage) which
@@ -306,7 +324,7 @@ impl Client {
             &to,
             original_id,
             participant,
-            new_content,
+            new_content(),
             wacore::time::now_millis(),
         );
 
@@ -771,6 +789,23 @@ fn build_secret_message_edit(
 #[cfg(test)]
 mod secret_message_edit_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ordinary_edit_inner_frame_is_bounded_and_preserves_login_validation() {
+        let client = crate::test_utils::create_test_client().await;
+        let chat = Jid::pn("15550000001");
+        let id = crate::MessageId::new("FRAME-REGRESSION").unwrap();
+        let target = crate::MessageRef::new(&chat, id, None, true).unwrap();
+        let future = client.edit_request_inner(crate::EditRequest::new(target, {
+            let mut content = wa::Message::default();
+            content.conversation = Some("replacement".into());
+            content
+        }));
+        let bytes = size_of_val(&future);
+        let budget = if usize::BITS == 64 { 2048 } else { 1024 };
+        assert!(bytes <= budget, "inner edit frame: {bytes} > {budget}");
+        assert!(matches!(future.await, Err(crate::SendError::NotLoggedIn)));
+    }
 
     #[test]
     fn secret_edit_content_kind_and_hkdf_stay_paired() {

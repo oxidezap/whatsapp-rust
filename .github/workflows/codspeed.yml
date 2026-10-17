@@ -31,6 +31,41 @@ env:
   MALLOC_TOP_PAD_: "131072"
 
 jobs:
+  prefetch-walltime:
+    name: Prefetch native walltime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@${{ env.PROTOC_VERSION }},cargo-codspeed@5.0.2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: prefetch-walltime
+          cache-targets: "false"
+      - name: Record measured source and host
+        run: |
+          git rev-parse HEAD
+          rustc -Vv
+          lscpu
+      - name: Build native prefetch benchmarks
+        run: cargo codspeed build -m walltime -p whatsapp-rust --features bench-harness --bench appstate_prefetch
+      # Simulation omits syscall and scheduling costs. Keep native results
+      # separately visible; a shared runner does not establish equivalence.
+      - name: Measure native prefetch
+        uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369 # v5.4.2
+        with:
+          mode: walltime
+          runner-version: "5.4.2"
+          run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
+
   benchmarks:
     name: Run CodSpeed benchmarks (${{ matrix.shard.name }})
     runs-on: ubuntu-24.04
@@ -78,6 +113,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@master
@@ -207,6 +243,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@master

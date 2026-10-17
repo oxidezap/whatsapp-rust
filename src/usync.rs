@@ -543,11 +543,11 @@ impl Client {
                     return Err(e.into());
                 }
             }
-            self.clear_device_record(
+            Box::pin(self.clear_device_record(
                 &reset.user.user,
                 reset.user.server.as_str(),
                 &reset.previous,
-            )
+            ))
             .await;
             if reset.invalidate_registry {
                 self.invalidate_device_cache_guarded(&reset.user.user, guard)

@@ -945,7 +945,7 @@ impl Client {
         // re-ask it. A later chunk failing does not unanswer an earlier one.
         let mut fetched = Ok(());
         for batch in jids_needing_sessions.chunks(crate::session::SESSION_CHECK_BATCH_SIZE) {
-            match self.fetch_and_establish_sessions(batch).await {
+            match Box::pin(self.fetch_and_establish_sessions(batch)).await {
                 Ok(_) => {
                     if let Some(lease) = &mut lease {
                         lease.mark_completed(batch);
@@ -979,9 +979,10 @@ impl Client {
             return Ok(0);
         }
 
-        let prekey_bundles = match self
-            .fetch_pre_keys(jids, Some(wacore::iq::prekeys::PreKeyFetchReason::Identity))
-            .await
+        let prekey_bundles = match Box::pin(
+            self.fetch_pre_keys(jids, Some(wacore::iq::prekeys::PreKeyFetchReason::Identity)),
+        )
+        .await
         {
             Ok(bundles) => bundles,
             // A `406` means the server no longer knows these devices, so the
@@ -1080,9 +1081,13 @@ impl Client {
 
         for jid in jids {
             if let Some(bundle) = prekey_bundles.bundles.get(jid) {
-                match self
-                    .install_prekey_bundle_cached(jid, bundle, &mut adapter, &mut rng)
-                    .await
+                match Box::pin(self.install_prekey_bundle_cached(
+                    jid,
+                    bundle,
+                    &mut adapter,
+                    &mut rng,
+                ))
+                .await
                 {
                     Ok(_) => {
                         success_count += 1;

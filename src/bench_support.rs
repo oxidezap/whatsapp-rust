@@ -26,6 +26,7 @@
 //! Only compiled under the non-default `bench-harness` feature.
 
 pub mod connected_idle;
+pub use crate::client::PrefetchHarness;
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -224,6 +225,10 @@ struct Fixture {
 }
 
 async fn build_offline_client() -> Arc<Client> {
+    build_offline_client_with_http(Arc::new(NoopHttpClient)).await
+}
+
+pub(crate) async fn build_offline_client_with_http(http: Arc<dyn HttpClient>) -> Arc<Client> {
     let pm = Arc::new(
         PersistenceManager::new(Arc::new(InMemoryBackend::new()))
             .await
@@ -235,7 +240,7 @@ async fn build_offline_client() -> Arc<Client> {
         .with_runtime(TokioRuntime)
         .with_persistence_manager(pm)
         .with_transport_factory(SinkTransportFactory)
-        .with_http_client(NoopHttpClient)
+        .with_http_client_arc(http)
         .build()
         .await
         .expect("offline client")

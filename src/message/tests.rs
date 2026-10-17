@@ -16137,6 +16137,29 @@ mod pdo_alias_tests {
     const OWN: &str = "15550001002@s.whatsapp.net";
 
     #[test]
+    fn pdo_alias_fingerprint_avoids_geometric_growth_for_quoted_replies() {
+        let mut message = wa::Message::default();
+        let mut quoted = wa::Message::default();
+        quoted.conversation = Some("q".repeat(2500));
+        let mut context = wa::ContextInfo::default();
+        context.quoted_message = buffa::MessageField::some(quoted);
+        let mut text = wa::message::ExtendedTextMessage::default();
+        text.text = Some("r".repeat(2000));
+        text.context_info = buffa::MessageField::some(context);
+        message.extended_text_message = buffa::MessageField::some(text);
+        let encoded = waproto::codec::message_to_vec(&message);
+        let expected = MessageDispatch::fingerprint_encoded(&encoded, false);
+        let max = crate::test_alloc::min_max_block(6000, || {
+            let mut scratch = Vec::new();
+            assert_eq!(
+                MessageDispatch::fingerprint_into(&message, &mut scratch),
+                expected
+            );
+        });
+        assert!(max <= 6000, "fingerprinting requested a {max}-byte block");
+    }
+
+    #[test]
     fn pdo_alias_fingerprint_reuses_scratch_without_message_sized_blocks() {
         let message = {
             let mut proto = wa::Message::default();
@@ -22769,4 +22792,33 @@ fn live_admission_refusal_metrics_regression() {
                 );
             }
         });
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn session_store_encoding_does_not_rebuild_skipped_key_arrays() {
+    use buffa::{Message as _, MessageField};
+    let mut chain = wa::session_structure::Chain::default();
+    for index in 0..40 {
+        let mut key = wa::session_structure::chain::MessageKey::default();
+        key.index = Some(index);
+        key.seed = Some(bytes::Bytes::from(vec![7; 32]));
+        chain.message_keys.push(key);
+    }
+    let mut session = wa::SessionStructure::default();
+    session.session_version = Some(3);
+    session.receiver_chains.push(chain);
+    let mut record = wa::RecordStructure::default();
+    record.current_session = MessageField::some(session);
+    let encoded = record.encode_to_vec();
+    let record = SessionRecord::deserialize(&encoded).expect("synthetic stored session");
+    let mut output = Vec::with_capacity(encoded.len());
+    let max = crate::test_alloc::min_max_block(1024, || {
+        record.serialize_into_for_store(&mut output, &[9; 16]);
+    });
+    assert_eq!(output, encoded);
+    assert!(
+        max <= 1024,
+        "store encoding allocated a {max}-byte temporary"
+    );
 }

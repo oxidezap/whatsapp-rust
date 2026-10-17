@@ -31,6 +31,8 @@ jobs:
         lane: [native, msrv]
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       # xtask has a higher tooling floor than the published crates. Build the
       # driver once with nightly, then it explicitly selects the host toolchain.
       - uses: dtolnay/rust-toolchain@master

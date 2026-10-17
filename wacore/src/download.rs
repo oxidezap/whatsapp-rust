@@ -16,6 +16,7 @@ use waproto::whatsapp::message::HistorySyncNotification;
 
 const MEDIA_MAC_SIZE: usize = 10;
 const AES_BLOCK_SIZE: usize = 16;
+const SHA256_BLOCK_SIZE: usize = 64;
 const STREAM_CHUNK_SIZE: usize = 8 * 1024;
 /// Bytes held back from processing while streaming: until the reader hits EOF,
 /// the last `MEDIA_MAC_SIZE + AES_BLOCK_SIZE` bytes seen might be the final
@@ -869,7 +870,7 @@ impl DownloadUtils {
         // and is kept to exactly `STREAM_CHUNK_SIZE` rather than that plus the
         // carry, so the stack this holds on an embedded target is no more than
         // the read buffer alone used to be. A refill after a carry just reads
-        // that much less; the carry is at most 41 bytes, so a whole number of
+        // that much less; the carry is at most 89 bytes, so a whole number of
         // blocks is always processable and the loop always advances.
         let mut buf = [0u8; STREAM_CHUNK_SIZE];
         let mut filled = 0usize;
@@ -890,7 +891,9 @@ impl DownloadUtils {
             if filled <= WITHHELD {
                 continue;
             }
-            let processable = (filled - WITHHELD) - ((filled - WITHHELD) % AES_BLOCK_SIZE);
+            // SHA-256 blocks also contain whole AES blocks. Keeping both hash
+            // streams block-aligned avoids buffering partial blocks on every refill.
+            let processable = (filled - WITHHELD) - ((filled - WITHHELD) % SHA256_BLOCK_SIZE);
             if processable == 0 {
                 continue;
             }
@@ -904,8 +907,7 @@ impl DownloadUtils {
             writer.write_all(&buf[..processable])?;
             bytes_written += processable as u64;
 
-            // Compact the carry to the front. It is at most 41 bytes, so this
-            // is a register-sized move rather than a shift of the whole buffer.
+            // Only the bounded carry moves, rather than the whole buffer.
             buf.copy_within(processable..filled, 0);
             filled -= processable;
         }
@@ -1339,10 +1341,13 @@ mod tests {
             }
         }
 
-        for len in [0, 1, 15, 16, 17, 8191, 8192, 8193, 32781] {
+        for len in [
+            0, 1, 15, 16, 17, 25, 26, 27, 63, 64, 65, 79, 80, 81, 89, 90, 91, 127, 128, 129, 8127,
+            8128, 8129, 8191, 8192, 8193, 32781,
+        ] {
             let plaintext = vec![0x59; len];
             let enc = crate::upload::encrypt_media(&plaintext, MediaType::Image).unwrap();
-            for chunk in [1, 7, 10, 16, 31, 8192] {
+            for chunk in [1, 7, 10, 16, 31, 63, 64, 65, 89, 90, 127, 128, 129, 8192] {
                 let mut output = Cursor::new(Vec::new());
                 let written = DownloadUtils::decrypt_stream_to_writer_with_hashes(
                     ShortReads {
@@ -1424,6 +1429,60 @@ mod tests {
                     Some(Sha256::digest(plaintext).as_slice()),
                 )
                 .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn streamed_batches_still_require_complete_authenticated_input() {
+        let plaintext = vec![0x59; 20_000];
+        let enc = crate::upload::encrypt_media(&plaintext, MediaType::Image).unwrap();
+        let decode = |data: &[u8], encrypted_hash: &[u8], plaintext_hash: &[u8]| {
+            let mut output = Vec::new();
+            let result = DownloadUtils::decrypt_stream_to_writer_with_hashes(
+                data,
+                &enc.media_key,
+                MediaType::Image,
+                Some(encrypted_hash),
+                Some(plaintext_hash),
+                &mut output,
+            );
+            (result, output)
+        };
+        for removed in 1..=128 {
+            let (result, _) = decode(
+                &enc.data_to_upload[..enc.data_to_upload.len() - removed],
+                &enc.file_enc_sha256,
+                &enc.file_sha256,
+            );
+            assert!(result.is_err(), "accepted a prefix missing {removed} bytes");
+        }
+        let mut corrupt = enc.data_to_upload.clone();
+        corrupt[8192] ^= 1;
+        let (result, output) = decode(&corrupt, &enc.file_enc_sha256, &enc.file_sha256);
+        assert!(!output.is_empty(), "fixture must exercise emitted batches");
+        assert!(matches!(
+            result.unwrap_err().downcast_ref::<MediaDecryptionError>(),
+            Some(MediaDecryptionError::InvalidMac)
+        ));
+        for (encrypted, plaintext_hash, expected) in [
+            (
+                &[0; 32],
+                &enc.file_sha256,
+                MediaDecryptionError::EncryptedSha256Mismatch,
+            ),
+            (
+                &enc.file_enc_sha256,
+                &[0; 32],
+                MediaDecryptionError::PlaintextSha256Mismatch,
+            ),
+        ] {
+            let (result, _) = decode(&enc.data_to_upload, encrypted, plaintext_hash);
+            let error = result.unwrap_err();
+            let actual = error.downcast_ref::<MediaDecryptionError>().unwrap();
+            assert_eq!(
+                std::mem::discriminant(actual),
+                std::mem::discriminant(&expected)
             );
         }
     }

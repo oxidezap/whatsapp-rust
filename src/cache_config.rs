@@ -9,6 +9,56 @@ use crate::cache_store::TypedCache;
 pub use wacore::msg_secret::{MsgSecretPolicy, MsgSecretRetention, OriginalMessageResolver};
 pub use wacore::store::cache::CacheStore;
 
+/// Resource policy for app-state external blobs. The byte limit covers buffer
+/// capacity retained by all concurrent prefetches on one client, including
+/// completed blobs and their shared byte slices until their last owner drops.
+/// It excludes HTTP/TLS and
+/// decoded protobuf storage. Bounded prefetch requires a streaming HTTP adapter.
+/// Cancelled jobs release reservations when the executor drops their closure or
+/// reaches a cancellation checkpoint. Blocked I/O cannot be interrupted.
+///
+/// ```
+/// use std::num::NonZeroUsize;
+/// use whatsapp_rust::{AppStateDownloadConfig, CacheConfig};
+/// let mut config = CacheConfig::default();
+/// config.app_state_downloads = AppStateDownloadConfig::new(32 * 1024, NonZeroUsize::MIN);
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct AppStateDownloadConfig {
+    max_bytes: usize,
+    concurrency: std::num::NonZeroUsize,
+}
+
+impl AppStateDownloadConfig {
+    /// Default policy is 64 MiB and four downloads. Smaller hosts should set
+    /// their available blob capacity explicitly through `CacheConfig`.
+    ///
+    /// Zero bytes refuses nonempty blobs. Exhaustion is an error, never a wait
+    /// for blobs that the current batch itself still owns.
+    pub const fn new(max_bytes: usize, concurrency: std::num::NonZeroUsize) -> Self {
+        Self {
+            max_bytes,
+            concurrency,
+        }
+    }
+
+    pub const fn max_bytes(self) -> usize {
+        self.max_bytes
+    }
+    pub const fn concurrency(self) -> std::num::NonZeroUsize {
+        self.concurrency
+    }
+}
+
+impl Default for AppStateDownloadConfig {
+    fn default() -> Self {
+        Self::new(
+            64 * 1024 * 1024,
+            std::num::NonZeroUsize::new(4).expect("four is nonzero"),
+        )
+    }
+}
+
 /// Configuration for a single cache instance.
 ///
 /// Controls the expiry timeout and maximum capacity of an in-process cache.
@@ -173,6 +223,8 @@ impl CacheStores {
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct CacheConfig {
+    /// Shared app-state blob memory and download concurrency policy.
+    pub app_state_downloads: AppStateDownloadConfig,
     /// Group metadata cache (time_to_live). Default: 1h TTL, 250 entries.
     pub group_cache: CacheEntryConfig,
     /// Device registry cache (time_to_live): one entry per contact whose
@@ -372,6 +424,7 @@ impl CacheConfig {
 impl std::fmt::Debug for CacheConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CacheConfig")
+            .field("app_state_downloads", &self.app_state_downloads)
             .field("group_cache", &self.group_cache)
             .field("device_registry_cache", &self.device_registry_cache)
             .field("lid_pn_cache", &self.lid_pn_cache)
@@ -435,6 +488,7 @@ impl Default for CacheConfig {
         let five_min = Some(Duration::from_secs(300));
 
         Self {
+            app_state_downloads: AppStateDownloadConfig::default(),
             group_cache: CacheEntryConfig::new(one_hour, 250),
             // One entry per contact. 5000 was below an account in a few
             // dozen mid-sized groups, whose every memo recompute then paid a
@@ -487,8 +541,8 @@ impl Default for CacheConfig {
 /// holds the full construction config. Only the group-cache store is kept:
 /// the device-registry and LID-PN stores are owned by their live caches after
 /// construction, and keeping another `Arc` here would pin them for no reason.
-#[derive(Clone)]
 pub(crate) struct RuntimeCacheConfig {
+    pub(crate) app_state_downloads: crate::client::AppStateDownloads,
     pub(crate) group_cache: CacheEntryConfig,
     pub(crate) group_cache_store: Option<Arc<dyn CacheStore>>,
     pub(crate) recent_messages_enabled: bool,
@@ -503,6 +557,7 @@ pub(crate) struct RuntimeCacheConfig {
 impl From<&CacheConfig> for RuntimeCacheConfig {
     fn from(config: &CacheConfig) -> Self {
         Self {
+            app_state_downloads: crate::client::AppStateDownloads::new(config.app_state_downloads),
             group_cache: config.group_cache.clone(),
             group_cache_store: config.cache_stores.group_cache.clone(),
             recent_messages_enabled: config.recent_messages.capacity > 0,
@@ -547,8 +602,8 @@ mod tests {
             size_of::<CacheConfig>()
         );
         assert!(
-            size_of::<RuntimeCacheConfig>() <= 136,
-            "runtime config grew to {} B (budget 136)",
+            size_of::<RuntimeCacheConfig>() <= 136 + size_of::<crate::client::AppStateDownloads>(),
+            "runtime config grew to {} B beyond the base and shared blob policy",
             size_of::<RuntimeCacheConfig>()
         );
     }

@@ -782,11 +782,11 @@ impl Client {
             proto_
         };
 
-        let msg = {
+        let msg = Box::new({
             let mut proto_ = wa::Message::default();
             proto_.protocol_message = buffa::MessageField::some(protocol_message);
             proto_
-        };
+        });
 
         info!(
             "Asking {} to send back the {} collection after a snapshot we could not validate",
@@ -794,8 +794,7 @@ impl Client {
             collection
         );
 
-        self.ensure_e2e_sessions(std::slice::from_ref(&peer_target))
-            .await?;
+        Box::pin(self.ensure_e2e_sessions(std::slice::from_ref(&peer_target))).await?;
 
         // Marked before the send, not after. The reply is handled on the inbound
         // path by a different task, and a primary that answers quickly can be

@@ -1372,7 +1372,9 @@ impl<'a> Groups<'a> {
             return Ok(cached);
         }
 
-        self.routing_info_from_source(jid, cached).await
+        // Cache hits must not reserve the network/storage state machine in
+        // every caller's future. Allocate that phase only on a miss/refresh.
+        Box::pin(self.routing_info_from_source(jid, cached)).await
     }
 
     #[expect(

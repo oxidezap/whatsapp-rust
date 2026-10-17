@@ -1843,51 +1843,66 @@ impl Client {
         let sync_generation = task_generation;
         #[cfg(feature = "bench-harness")]
         let sync_startup = startup_task.child();
-        self.runtime.spawn_detached(Box::pin(async move {
-            #[cfg(feature = "bench-harness")]
-            let _startup_task = sync_startup;
-            if sync_client.connection_generation.load(Ordering::SeqCst) != sync_generation {
-                debug!("App state sync cancelled: connection generation changed");
-                return;
-            }
-
-            // Any critical collection the bootstrap handed over goes
-            // first: it is the one the account actually needs.
-            let mut to_sync = critical_retry;
-            to_sync.extend([
-                WAPatchName::RegularLow,
-                WAPatchName::RegularHigh,
-                WAPatchName::Regular,
-            ]);
-            let requested = to_sync.clone();
-            let scope = sync_client.sync_scope(None);
-            let result = sync_client.sync_collections_batched(to_sync, scope).await;
-
-            let complete =
-                !critical_refused && result.as_ref().is_ok_and(|outcome| outcome.all_synced());
-
-            // Settled before the report, because reporting dispatches to
-            // consumer handlers synchronously and one of them
-            // disconnecting would retire the scope and take this
-            // decision with it — leaving an unfinished bootstrap
-            // unarmed, which is the failure this path exists to prevent.
-            // `settle_bootstrap` is what makes the "only for this
-            // connection" part impossible to forget.
-            sync_client.settle_bootstrap(scope, !complete);
-
-            // A refused critical collection is not in `requested` and
-            // never will be retried, but it is why the bootstrap is
-            // unfinished. Handing that to the scheduler keeps a later
-            // clean round from standing the gate down on its behalf.
-            sync_client.report_background_sync_stranded(
-                "non-critical app state sync",
-                scope,
-                SyncSettles::InitialSync,
-                &requested,
+        self.runtime
+            .spawn_detached(Box::pin(sync_client.run_background_app_state_sync(
+                sync_generation,
+                critical_retry,
                 critical_refused,
-                result,
-            );
-        }));
+                #[cfg(feature = "bench-harness")]
+                sync_startup,
+            )));
+    }
+
+    async fn run_background_app_state_sync(
+        self: Arc<Self>,
+        task_generation: u64,
+        critical_retry: Vec<WAPatchName>,
+        critical_refused: bool,
+        #[cfg(feature = "bench-harness")] sync_startup: bench_startup::StartupTask,
+    ) {
+        #[cfg(feature = "bench-harness")]
+        let _startup_task = sync_startup;
+        if self.connection_generation.load(Ordering::SeqCst) != task_generation {
+            debug!("App state sync cancelled: connection generation changed");
+            return;
+        }
+
+        // Any critical collection the bootstrap handed over goes
+        // first: it is the one the account actually needs.
+        let mut to_sync = critical_retry;
+        to_sync.extend([
+            WAPatchName::RegularLow,
+            WAPatchName::RegularHigh,
+            WAPatchName::Regular,
+        ]);
+        let requested = to_sync.clone();
+        let scope = self.sync_scope(None);
+        let result = Box::pin(self.sync_collections_batched(to_sync, scope)).await;
+
+        let complete =
+            !critical_refused && result.as_ref().is_ok_and(|outcome| outcome.all_synced());
+
+        // Settled before the report, because reporting dispatches to
+        // consumer handlers synchronously and one of them
+        // disconnecting would retire the scope and take this
+        // decision with it, leaving an unfinished bootstrap
+        // unarmed, which is the failure this path exists to prevent.
+        // `settle_bootstrap` is what makes the "only for this
+        // connection" part impossible to forget.
+        self.settle_bootstrap(scope, !complete);
+
+        // A refused critical collection is not in `requested` and
+        // never will be retried, but it is why the bootstrap is
+        // unfinished. Handing that to the scheduler keeps a later
+        // clean round from standing the gate down on its behalf.
+        self.report_background_sync_stranded(
+            "non-critical app state sync",
+            scope,
+            SyncSettles::InitialSync,
+            &requested,
+            critical_refused,
+            result,
+        );
     }
 
     /// Ack entry point for callers that already share the node: the waiter
@@ -2715,6 +2730,47 @@ mod tests {
             "post-login future grew to {largest} B (spawned: {spawned:?}); \
              the limit is {MAX_POST_LOGIN_FUTURE_BYTES} B",
         );
+    }
+
+    #[tokio::test]
+    async fn background_sync_bounds_both_spawn_and_first_poll_allocations() {
+        let client = crate::test_utils::create_test_client().await;
+        let generation = client.connection_generation.load(Ordering::Acquire);
+        let future = client.clone().run_background_app_state_sync(
+            generation,
+            Vec::new(),
+            false,
+            #[cfg(feature = "bench-harness")]
+            client.bench_startup.begin(),
+        );
+        let size = size_of_val(&future);
+        assert!(size <= 512, "background sync task is {size} B");
+        let mut future = Box::pin(future);
+        let mut context = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        let largest =
+            crate::test_alloc::min_max_block(usize::MAX, || future.as_mut().poll(&mut context));
+        assert!(
+            largest <= 2048,
+            "background sync moved a {largest} B allocation into its first poll"
+        );
+    }
+
+    #[tokio::test]
+    async fn retired_background_sync_cannot_request_or_rearm_bootstrap() {
+        let client = crate::test_utils::create_test_client().await;
+        let generation = client.connection_generation.load(Ordering::Acquire);
+        let armed_before = client.needs_initial_full_sync.is_armed();
+        client
+            .clone()
+            .run_background_app_state_sync(
+                generation.wrapping_add(1),
+                vec![WAPatchName::CriticalBlock],
+                true,
+                #[cfg(feature = "bench-harness")]
+                client.bench_startup.begin(),
+            )
+            .await;
+        assert_eq!(client.needs_initial_full_sync.is_armed(), armed_before);
     }
 
     /// One streaming IQ on a client whose transport is a channel the test

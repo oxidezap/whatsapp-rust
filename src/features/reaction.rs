@@ -13,7 +13,7 @@ use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
 
 use crate::client::Client;
-use crate::send::{SendError, SendResult};
+use crate::send::{SendError, SendRequest, SendResult};
 
 impl Client {
     /// React using the message's chat/author scope. Newsletter reactions use
@@ -58,15 +58,14 @@ impl Client {
         emoji: &str,
     ) -> Result<SendResult, SendError> {
         let chat = &chat.into();
-        if chat.is_group() && self.is_community_announce_group(chat).await? {
-            return self.send_enc_reaction(chat, target_key, emoji).await;
-        }
-        let reaction = wacore::proto_helpers::build_reaction_message(
-            target_key,
-            emoji,
-            wacore::time::now_millis(),
-        );
-        self.send_message(chat, reaction).await
+        let request = if chat.is_group() && self.is_community_announce_group(chat).await? {
+            // Secret lookup and encrypted-envelope construction are CAG-only.
+            // Keep their frame out of ordinary DM/group reaction futures.
+            Box::pin(self.prepare_enc_reaction(chat, target_key, emoji)).await?
+        } else {
+            plain_reaction_request(chat, target_key, emoji)
+        };
+        self.send(request).await
     }
 
     /// Whether `chat` is a Community Announcement Group (WA Web `isCag`).
@@ -86,19 +85,24 @@ impl Client {
         {
             return Ok(flag);
         }
-        Ok(self
-            .groups()
-            .fetch_metadata(chat)
-            .await?
-            .is_default_sub_group)
+        // The full metadata response/state is needed only when the routing
+        // flag is absent. Keep that cold phase out of warm/DM reaction frames.
+        Box::pin(async {
+            Ok(self
+                .groups()
+                .fetch_metadata(chat)
+                .await?
+                .is_default_sub_group)
+        })
+        .await
     }
 
-    async fn send_enc_reaction(
+    async fn prepare_enc_reaction(
         &self,
         chat: &Jid,
         mut target_key: wa::MessageKey,
         emoji: &str,
-    ) -> Result<SendResult, SendError> {
+    ) -> Result<SendRequest, SendError> {
         let (author, secret) = self
             .resolve_outgoing_addon_parent(chat, &target_key)
             .await?;
@@ -130,17 +134,36 @@ impl Client {
             target_key.participant = Some(author.to_non_ad_string());
         }
 
-        let message = {
-            let mut proto = wa::Message::default();
-            proto.enc_reaction_message = MessageField::some({
-                let mut proto = wa::message::EncReactionMessage::default();
-                proto.target_message_key = MessageField::some(target_key);
-                proto.enc_payload = Some(enc_payload);
-                proto.enc_iv = Some(iv.to_vec());
-                proto
-            });
-            proto
-        };
-        self.send_message(chat, message).await
+        Ok(encrypted_reaction_request(
+            chat,
+            target_key,
+            enc_payload,
+            &iv,
+        ))
     }
+}
+
+// Construct full protobufs outside async bodies so their uninitialized slots
+// do not remain in every suspended reaction future after sharing the content.
+fn plain_reaction_request(chat: &Jid, key: wa::MessageKey, emoji: &str) -> SendRequest {
+    let message =
+        wacore::proto_helpers::build_reaction_message(key, emoji, wacore::time::now_millis());
+    SendRequest::new(chat, message)
+}
+
+fn encrypted_reaction_request(
+    chat: &Jid,
+    key: wa::MessageKey,
+    payload: Vec<u8>,
+    iv: &[u8],
+) -> SendRequest {
+    let mut message = wa::Message::default();
+    message.enc_reaction_message = MessageField::some({
+        let mut reaction = wa::message::EncReactionMessage::default();
+        reaction.target_message_key = MessageField::some(key);
+        reaction.enc_payload = Some(payload);
+        reaction.enc_iv = Some(iv.to_vec());
+        reaction
+    });
+    SendRequest::new(chat, message)
 }

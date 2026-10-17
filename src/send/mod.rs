@@ -2660,10 +2660,23 @@ impl Client {
     ///
     /// `borrowed_stanza_id` names the outer stanza after another message, so
     /// the pipeline binds no ID-keyed state to it. `None` uses a fresh ID.
-    pub(crate) async fn send_built_message(
+    pub(crate) fn send_built_message(
         &self,
         to: Jid,
         message: wa::Message,
+        edit: EditAttribute,
+        borrowed_stanza_id: Option<String>,
+    ) -> impl Future<Output = Result<SendResult, SendError>> + '_ {
+        // Own the protobuf outside the coroutine. Edit/revoke callers otherwise
+        // retain its inline tree in every enclosing send future.
+        let message = std::sync::Arc::new(message);
+        self.send_shared_built_message(to, message, edit, borrowed_stanza_id)
+    }
+
+    async fn send_shared_built_message(
+        &self,
+        to: Jid,
+        message: std::sync::Arc<wa::Message>,
         edit: EditAttribute,
         borrowed_stanza_id: Option<String>,
     ) -> Result<SendResult, SendError> {
@@ -2674,7 +2687,6 @@ impl Client {
         let borrowed_message_id = borrowed_stanza_id.is_some();
         let request_id = borrowed_stanza_id
             .unwrap_or_else(|| self.generate_message_id_at(sent_at.unix_secs_u64()));
-        let message = std::sync::Arc::new(message);
         let result_to = to.clone();
         let recipient_fanout = self
             .send_message_impl(
@@ -2743,6 +2755,15 @@ impl Client {
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.impl", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
     pub(crate) async fn send_message_impl(
+        &self,
+        to: Jid,
+        message: &wa::Message,
+        options: SendPipelineOptions<'_>,
+    ) -> Result<Option<RecipientFanout>, anyhow::Error> {
+        Box::pin(self.send_message_impl_inner(to, message, options)).await
+    }
+
+    async fn send_message_impl_inner(
         &self,
         to: Jid,
         message: &wa::Message,
@@ -2926,7 +2947,7 @@ impl Client {
         // schedule the coalesced write-behind; a send that raised either lease
         // flushes synchronously, and a persistence failure must abort the send
         // rather than transmit an advance we couldn't save.
-        self.persist_signal_state_pre_wire().await?;
+        Box::pin(self.persist_signal_state_pre_wire()).await?;
 
         // A borrowed id must not register a phash ack-waiter: the waiter map is
         // keyed by outer stanza id, so it would overwrite the original send's
@@ -3027,10 +3048,15 @@ impl Client {
 
         let send = match send_scope {
             Some((generation, socket)) => {
-                self.send_node_observed_in_scope(stanza_to_send, send_observer, generation, socket)
-                    .await
+                Box::pin(self.send_node_observed_in_scope(
+                    stanza_to_send,
+                    send_observer,
+                    generation,
+                    socket,
+                ))
+                .await
             }
-            None => self.send_node_observed(stanza_to_send, send_observer).await,
+            None => Box::pin(self.send_node_observed(stanza_to_send, send_observer)).await,
         };
         if let Err(e) = send {
             if let Some(msg_id) = ack_message_id {
@@ -3049,28 +3075,28 @@ impl Client {
             if let Some(sender) = sender {
                 let is_bot_chat = tc_issue_target.is_bot();
                 let class = wacore::msg_secret::classify(message, is_bot_chat);
-                self.persist_outbound_msg_secret(
+                Box::pin(self.persist_outbound_msg_secret(
                     &tc_issue_target,
                     &sender,
                     request_id,
                     secret,
                     class,
                     sent_at,
-                )
+                ))
                 .await;
             }
         }
 
         if let Some(update) = skdm_update {
-            self.update_sender_key_devices(
+            Box::pin(self.update_sender_key_devices(
                 &update.to_str,
                 &update.devices,
                 update.topology_generation,
                 Some(&update.group_info),
-            )
+            ))
             .await;
             for user in &update.stale_users {
-                self.invalidate_device_cache(user).await;
+                Box::pin(self.invalidate_device_cache(user)).await;
             }
         }
         // Warm marking is visible; a waiting cold send may now re-resolve.
@@ -4117,8 +4143,22 @@ mod tests {
 
     use super::*;
     use crate::test_utils::wait_for_lock_waiter;
+    use std::mem::size_of_val;
     use std::str::FromStr;
     use wacore::proto_helpers::MessageBuilderExt;
+
+    #[tokio::test]
+    async fn boxed_send_future_layout_is_bounded() {
+        let client = crate::test_utils::create_test_client().await;
+        let message = wa::Message::default();
+        let future = client.send_message_impl_inner(
+            "559900000001@s.whatsapp.net".parse().unwrap(),
+            &message,
+            SendPipelineOptions::default(),
+        );
+        let size = size_of_val(&future);
+        assert!(size <= 2048, "boxed send phase grew to {size} B");
+    }
 
     #[test]
     fn group_history_device_coverage_rejects_omitted_users_and_own_account() {

@@ -465,8 +465,8 @@ pub(crate) mod resend_rate_limiter;
 
 pub mod cache_config;
 pub use cache_config::{
-    CacheConfig, CacheEntryConfig, CacheStores, MsgSecretPolicy, MsgSecretRetention,
-    OriginalMessageResolver,
+    AppStateDownloadConfig, CacheConfig, CacheEntryConfig, CacheStores, MsgSecretPolicy,
+    MsgSecretRetention, OriginalMessageResolver,
 };
 pub mod cache_store;
 pub(crate) mod pending_device_sync;

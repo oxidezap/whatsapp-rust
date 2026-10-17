@@ -13,6 +13,8 @@
 //! now owns socket teardown (takes + disconnects) so whichever path clears
 //! the transport also closes it.
 
+use anyhow::Context;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use wacore::time::Instant;
@@ -121,21 +123,13 @@ async fn concurrent_disconnect_with_pending_receipts() -> anyhow::Result<()> {
             .send_message(alice_jid.clone(), text_msg(&format!("b->a #{i}")))
             .await?;
     }
-    for i in 0..N {
-        let expected_ab = format!("a->b #{i}");
-        bob.wait_for_event(10, |e| {
-            e.messages()
-                .any(|m| m.message.conversation.as_deref() == Some(expected_ab.as_str()))
-        })
-        .await?;
-        let expected_ba = format!("b->a #{i}");
-        alice
-            .wait_for_event(10, |e| {
-                e.messages()
-                    .any(|m| m.message.conversation.as_deref() == Some(expected_ba.as_str()))
-            })
-            .await?;
-    }
+    // Retries can deliver #0 after #1/#2. A predicate wait discards unmatched
+    // events, so waiting for each number in order can lose already-delivered
+    // messages. Require all six decrypted messages without assuming arrival order.
+    tokio::try_join!(
+        wait_for_received_texts(&mut bob, "a->b", N),
+        wait_for_received_texts(&mut alice, "b->a", N),
+    )?;
 
     let a = Arc::clone(&alice.client);
     let b = Arc::clone(&bob.client);
@@ -151,5 +145,27 @@ async fn concurrent_disconnect_with_pending_receipts() -> anyhow::Result<()> {
         elapsed < Duration::from_secs(6),
         "disconnect with pending receipts took {elapsed:?} (budget: 6s)"
     );
+    Ok(())
+}
+
+async fn wait_for_received_texts(
+    client: &mut TestClient,
+    prefix: &str,
+    count: usize,
+) -> anyhow::Result<()> {
+    let mut pending: HashSet<_> = (0..count).map(|i| format!("{prefix} #{i}")).collect();
+    let result = client
+        .wait_for_event(10, |event| {
+            for message in event.messages() {
+                if !message.info.source.is_from_me
+                    && let Some(text) = message.message.conversation.as_deref()
+                {
+                    pending.remove(text);
+                }
+            }
+            pending.is_empty()
+        })
+        .await;
+    result.with_context(|| format!("Missing decrypted {prefix} messages: {pending:?}"))?;
     Ok(())
 }

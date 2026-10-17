@@ -383,6 +383,11 @@ pub struct StreamingHttpResponse {
     pub body: Box<dyn std::io::Read + Send>,
 }
 
+/// An adapter-owned lease held through a streaming request's blocking I/O.
+/// Acquisition happens before a blocking worker is occupied; dropping this
+/// value releases the adapter's resource reservation.
+pub type StreamingRequestPermit = Box<dyn crate::sync_marker::MaybeSend>;
+
 impl StreamingHttpResponse {
     /// Return a response's status and body reader, including for 4xx/5xx.
     /// Errors encountered while reading the body remain reader errors.
@@ -439,6 +444,16 @@ pub trait HttpClient: crate::sync_marker::MaybeSendSync {
     /// Whether this client supports synchronous streaming downloads.
     fn supports_streaming(&self) -> bool {
         false
+    }
+
+    /// Optional asynchronous resource admission before streaming I/O.
+    /// The default returns no future and allocates nothing. Download callers
+    /// await this before entering a blocking worker, then keep the permit until
+    /// the response body and connection are released, including cancellation.
+    fn streaming_admission(
+        &self,
+    ) -> Option<crate::runtime::BoxFuture<'_, Result<StreamingRequestPermit>>> {
+        None
     }
 
     /// Synchronous streaming variant — returns a reader over the response body.

@@ -41,6 +41,10 @@ receive layout audit is `audit_receive_future_and_struct_layouts`; run it with
 `examples/receive_footprint.rs` for CPU and requested-heap measurements.
 `benches/connected_idle.md` describes connected retention measurement.
 
+For async memory changes, test the concrete inner future and its first-poll
+allocations. Keep the download admission, retained-buffer and cancellation tests.
+Use `appstate_prefetch` for native prefetch timing; simulation omits syscall time.
+
 ## Layout and binary budgets
 
 Exact size assertions protect representation contracts. Other layout tests use

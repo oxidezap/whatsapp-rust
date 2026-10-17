@@ -335,7 +335,7 @@ pub(crate) async fn create_test_client_with_runtime(
     .await
 }
 
-async fn create_test_client_with_config_and_runtime(
+pub(crate) async fn create_test_client_with_config_and_runtime(
     name: &str,
     http_client: Arc<dyn HttpClient>,
     cache_config: crate::cache_config::CacheConfig,

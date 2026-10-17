@@ -213,7 +213,11 @@ pub mod codec {
     /// Append the encoded message to `out`. Infallible into a `Vec`.
     #[inline(never)]
     pub fn message_encode_into(msg: &whatsapp::Message, out: &mut Vec<u8>) {
-        msg.encode(out);
+        let mut cache = buffa::SizeCache::new();
+        let size = buffa::checked_encode_size(msg.compute_size(&mut cache))
+            .unwrap_or_else(|_| buffa::encode_size_overflow());
+        out.reserve_exact(size as usize);
+        msg.write_to(&mut cache, out);
     }
 
     #[inline(never)]
@@ -770,6 +774,35 @@ pub mod codec {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
+    #[test]
+    fn message_append_encoding_reserves_only_the_required_capacity() {
+        use super::{codec, whatsapp as wa};
+        use buffa::MessageField;
+        let quoted = wa::Message {
+            conversation: Some("q".repeat(2500)),
+            ..Default::default()
+        };
+        let context = wa::ContextInfo {
+            quoted_message: MessageField::some(quoted),
+            ..Default::default()
+        };
+        let text = wa::message::ExtendedTextMessage {
+            text: Some("r".repeat(2000)),
+            context_info: MessageField::some(context),
+            ..Default::default()
+        };
+        let message = wa::Message {
+            extended_text_message: MessageField::some(text),
+            ..Default::default()
+        };
+        let expected = codec::message_to_vec(&message);
+        let mut output = Vec::from([0xAA; 16]);
+        codec::message_encode_into(&message, &mut output);
+        assert_eq!(&output[..16], &[0xAA; 16]);
+        assert_eq!(&output[16..], expected);
+        assert!(output.capacity() <= 6000, "capacity {}", output.capacity());
+    }
+
     use super::whatsapp as wa;
     use buffa::Message;
     use buffa::view::MessageView;

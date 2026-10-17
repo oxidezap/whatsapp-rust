@@ -1,9 +1,11 @@
 mod accessors;
 mod adapters;
 mod app_state;
+#[cfg(feature = "bench-harness")]
+pub use app_state::prefetch_bench::PrefetchHarness;
 pub(crate) use app_state::{
-    AppStateDispatchOutcome, BatchedSyncOutcome, BatchedSyncRequest, CriticalSyncPlan, SyncScope,
-    SyncSettles, fingerprint_id, redact_jid,
+    AppStateDispatchOutcome, AppStateDownloads, BatchedSyncOutcome, BatchedSyncRequest,
+    CriticalSyncPlan, SyncScope, SyncSettles, fingerprint_id, redact_jid,
 };
 #[cfg(test)]
 pub(crate) use app_state::{SyncHolder, batched_sync_outcome_tests::batch_result};

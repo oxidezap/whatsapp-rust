@@ -242,6 +242,14 @@ fn lookup_app_state_key(
         .ok_or(crate::appstate::AppStateError::KeyNotFound)
 }
 
+// Only one owner holds the collection state across snapshot and patch phases.
+// Their futures borrow this small state instead of embedding each other's locals.
+struct PatchListProgress {
+    state: HashState,
+    committed_state: HashState,
+    new_mutations: Vec<Mutation>,
+}
+
 /// Download and inline any external snapshot/mutation blobs referenced by `pl`,
 /// resolving each reference via `download`.
 ///
@@ -1002,7 +1010,7 @@ impl AppStateProcessor {
         validate_macs: bool,
     ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
         download_external_blobs(&mut pl, download)?;
-        self.process_patch_list(pl, validate_macs).await
+        Box::pin(self.process_patch_list(pl, validate_macs)).await
     }
 
     /// Process already-parsed patch lists and download any external blobs.
@@ -1075,7 +1083,7 @@ impl AppStateProcessor {
             return Ok((Vec::new(), state, pl));
         }
 
-        self.process_patch_list(pl, validate_macs).await
+        Box::pin(self.process_patch_list(pl, validate_macs)).await
     }
 
     /// Process one patch list whose external blobs have already been inlined.
@@ -1092,13 +1100,16 @@ impl AppStateProcessor {
         // Arc so each blocking closure's handoff is a refcount bump, not a map copy.
         let keys_map = Arc::new(self.prefetch_keys(&pl).await?);
 
-        let mut state = self
+        let state = self
             .backend
             .get_version(pl.name.as_str())
             .await?
             .unwrap_or_default();
-        let mut committed_state = state.clone();
-        let mut new_mutations: Vec<Mutation> = Vec::new();
+        let mut progress = Box::new(PatchListProgress {
+            committed_state: state.clone(),
+            state,
+            new_mutations: Vec::new(),
+        });
         let collection = pl.name;
         let collection_name = pl.name.as_str();
 
@@ -1110,78 +1121,25 @@ impl AppStateProcessor {
         // are requested only at version 0.
         let snapshot_fresh = pl.snapshot.as_ref().is_some_and(|snapshot| {
             let snapshot_version = snapshot.version.as_option().and_then(|v| v.version).unwrap_or(0);
-            if snapshot_is_stale(state.version, snapshot_version) {
+            if snapshot_is_stale(progress.state.version, snapshot_version) {
                 log::warn!(
                     target: "AppState",
                     "Skipping stale snapshot for {collection_name}: incoming v{snapshot_version} <= persisted v{}",
-                    state.version
+                    progress.state.version
                 );
                 return false;
             }
             true
         });
         if snapshot_fresh && let Some(snapshot) = pl.snapshot.take() {
-            let keys_map = Arc::clone(&keys_map);
-            let collection_name_owned = collection_name.to_string();
-
-            // Offload CPU-intensive snapshot processing to a blocking thread. The
-            // snapshot moves into the closure (its 'static bound used to force a
-            // multi-MB deep clone on bootstrap) and comes back via the return tuple
-            // because the caller still reads pl.snapshot (get_missing_key_ids).
-            let result = crate::runtime::blocking(&*self.runtime, move || {
-                let mut snapshot_state = HashState::default();
-                let result = process_snapshot(
-                    &snapshot,
-                    &mut snapshot_state,
-                    |key_id| lookup_app_state_key(&keys_map, key_id),
-                    validate_macs,
-                    &collection_name_owned,
-                )?;
-                Ok::<_, crate::appstate::AppStateError>((result, snapshot_state, snapshot))
-            })
-            .await
-            // Carried as itself rather than flattened to a string: a snapshot MAC
-            // that does not match is the one error with an answer -- asking the
-            // primary for the collection -- and a caller can only tell it apart
-            // from a missing key or a bad decode by downcasting to it.
-            .map_err(anyhow::Error::new)?;
-
-            let (snapshot_result, snapshot_state, snapshot) = result;
-            pl.snapshot = Some(snapshot);
-            state = snapshot_state;
-
-            // A snapshot is a fresh baseline, so wipe the collection's prior mutation
-            // MACs first (unconditionally, even if the snapshot has none) — leftover
-            // index->value entries would corrupt the next patch's ltHash.
-            //
-            // Commit the version LAST. If clear/put fails on a transient store error,
-            // an already-advanced version would make the retry treat this same snapshot
-            // as stale (snapshot_is_stale) and skip it, stranding the old MACs forever.
-            self.backend.clear_mutation_macs(collection_name).await?;
-            if !snapshot_result.mutation_macs.is_empty() {
-                self.backend
-                    .put_mutation_macs(
-                        collection_name,
-                        state.version,
-                        &snapshot_result.mutation_macs,
-                    )
-                    .await?;
-            }
-            state.bootstrapped |= !pl.has_more_patches;
-            self.persist_mutation_effects(&snapshot_result.mutations)
-                .await?;
-            self.backend
-                .set_version(collection_name, state.clone())
-                .await?;
-            // Snapshot owns the whole collection: move its Vec into the empty
-            // accumulator rather than extend, which would allocate + copy a second
-            // collection-sized buffer at the memory peak. is_empty falls back to extend.
-            if new_mutations.is_empty() {
-                new_mutations = snapshot_result.mutations;
-            } else {
-                new_mutations.extend(snapshot_result.mutations);
-            }
-            committed_state = state.clone();
+            Box::pin(self.apply_patch_list_snapshot(
+                snapshot,
+                &mut pl,
+                keys_map.clone(),
+                &mut progress,
+                validate_macs,
+            ))
+            .await?;
         }
 
         // WA Web AntiTampering: an unsynced collection (empty ltHash) can only be
@@ -1191,7 +1149,7 @@ impl AppStateProcessor {
         // the version so the next sync no longer requests a snapshot. Mark the
         // collection retryable instead; the version stays 0, so the refetch re-requests
         // a snapshot. (whatsmeow/WA Web force a snapshot re-sync here.)
-        if state.version == 0 && state.hash == [0u8; 128] {
+        if progress.state.version == 0 && progress.state.hash == [0u8; 128] {
             let first_version = pl
                 .patches
                 .first()
@@ -1207,7 +1165,7 @@ impl AppStateProcessor {
                     code: 0,
                     text: "empty lthash".to_string(),
                 });
-                return Ok((new_mutations, state, pl));
+                return Ok((progress.new_mutations, progress.state, pl));
             }
             // Reached here with an empty baseline and no snapshot applied (a snapshot
             // would have advanced the version off 0): a genesis patch (v1), or no
@@ -1220,137 +1178,58 @@ impl AppStateProcessor {
             if let Err(error) = self.backend.clear_mutation_macs(collection_name).await {
                 return Err(committed_mutations_error(
                     error.into(),
-                    new_mutations,
-                    &committed_state,
+                    progress.new_mutations,
+                    &progress.committed_state,
                     collection,
                 ));
             }
         }
 
-        let collection_name_owned = collection_name.to_string();
-
-        // Each patch moves into its blocking closure and comes back via the return
-        // tuple: the 'static bound used to force a full deep clone per patch
-        // (multi-MB once external mutations are inlined), and the caller still
-        // reads pl.patches afterwards (get_missing_key_ids).
         let patches = std::mem::take(&mut pl.patches);
         let mut processed_patches = Vec::with_capacity(patches.len());
         for patch in patches {
-            let need_db_lookup = collect_unique_index_macs(&patch.mutations);
-
-            // Fetch previous value MACs in one backend round-trip instead of a
-            // spawn_blocking + query per mutation (N+1).
-            let db_prev: HashMap<IndexMac, Vec<u8>> = match self
-                .backend
-                .get_mutation_macs(collection_name, &need_db_lookup)
-                .await
+            match Box::pin(self.apply_patch_list_patch(
+                patch,
+                collection_name,
+                keys_map.clone(),
+                &mut progress,
+                validate_macs,
+                !pl.has_more_patches,
+            ))
+            .await
             {
-                Ok(previous) => previous,
+                Ok(patch) => processed_patches.push(patch),
                 Err(error) => {
                     return Err(committed_mutations_error(
-                        error.into(),
-                        new_mutations,
-                        &committed_state,
+                        error,
+                        progress.new_mutations,
+                        &progress.committed_state,
                         collection,
                     ));
                 }
-            };
-
-            let state_clone = state.clone();
-            let keys = keys_map.clone();
-            let coll = collection_name_owned.clone();
-
-            // Offload CPU-intensive patch processing to a blocking thread
-            let processed = crate::runtime::blocking(&*self.runtime, move || {
-                let get_prev_value_mac =
-                    |index_mac: &[u8]| -> Result<Option<Vec<u8>>, crate::appstate::AppStateError> {
-                        Ok(<&IndexMac>::try_from(index_mac)
-                            .ok()
-                            .and_then(|k| db_prev.get(k))
-                            .cloned())
-                    };
-
-                let mut state = state_clone;
-                let result = process_patch(
-                    &patch,
-                    &mut state,
-                    |key_id| lookup_app_state_key(&keys, key_id),
-                    get_prev_value_mac,
-                    validate_macs,
-                    &coll,
-                )?;
-                Ok::<_, crate::appstate::AppStateError>((result, patch))
-            })
-            .await;
-            let (result, patch) = match processed {
-                Ok(processed) => processed,
-                Err(error) => {
-                    return Err(committed_mutations_error(
-                        anyhow!("{}", error),
-                        new_mutations,
-                        &committed_state,
-                        collection,
-                    ));
-                }
-            };
-            processed_patches.push(patch);
-
-            // Update local state with the result from the blocking task
-            state = result.state;
-
-            // Persist state and MACs: one backend call per patch, so a
-            // transactional backend commits the version with the MACs it
-            // pairs with instead of paying three round trips.
-            state.bootstrapped |= !pl.has_more_patches;
-            if let Err(error) = self.persist_mutation_effects(&result.mutations).await {
-                return Err(committed_mutations_error(
-                    error,
-                    new_mutations,
-                    &committed_state,
-                    collection,
-                ));
             }
-            if let Err(error) = self
-                .backend
-                .commit_patch(
-                    collection_name,
-                    state.clone(),
-                    &result.removed_index_macs,
-                    &result.added_macs,
-                )
-                .await
-            {
-                return Err(committed_mutations_error(
-                    error.into(),
-                    new_mutations,
-                    &committed_state,
-                    collection,
-                ));
-            }
-            new_mutations.extend(result.mutations);
-            committed_state = state.clone();
         }
         pl.patches = processed_patches;
 
         // Handle case where we only have a snapshot and no patches
         if pl.patches.is_empty() && pl.snapshot.is_some() {
-            state.bootstrapped |= !pl.has_more_patches;
+            progress.state.bootstrapped |= !pl.has_more_patches;
             if let Err(error) = self
                 .backend
-                .set_version(collection_name, state.clone())
+                .set_version(collection_name, progress.state.clone())
                 .await
             {
                 return Err(committed_mutations_error(
                     error.into(),
-                    new_mutations,
-                    &committed_state,
+                    progress.new_mutations,
+                    &progress.committed_state,
                     collection,
                 ));
             }
         } else if pl.patches.is_empty()
             && !pl.has_more_patches
             && pl.snapshot_ref.is_none()
-            && !state.bootstrapped
+            && !progress.state.bootstrapped
             && pl.error.is_none()
         {
             // The server answered with nothing to apply and nothing still to
@@ -1379,13 +1258,13 @@ impl AppStateProcessor {
             //
             // A collection already marked is skipped: every sync of a quiet one
             // ends here, and has nothing to record.
-            state.bootstrapped = true;
+            progress.state.bootstrapped = true;
             self.backend
-                .set_version(collection_name, state.clone())
+                .set_version(collection_name, progress.state.clone())
                 .await?;
         }
 
-        Ok((new_mutations, state, pl))
+        Ok((progress.new_mutations, progress.state, pl))
     }
 
     /// Build and encode a SyncdPatch for sending mutations to the server.
@@ -1479,6 +1358,152 @@ impl AppStateProcessor {
             }
         }
         Ok(missing)
+    }
+
+    async fn apply_patch_list_snapshot(
+        &self,
+        snapshot: wa::SyncdSnapshot,
+        pl: &mut PatchList,
+        keys_map: Arc<HashMap<Vec<u8>, Arc<ExpandedAppStateKeys>>>,
+        progress: &mut PatchListProgress,
+        validate_macs: bool,
+    ) -> Result<()> {
+        let collection_name = pl.name.as_str();
+        let collection_name_owned = collection_name.to_string();
+
+        // Offload CPU-intensive snapshot processing to a blocking thread. The
+        // snapshot moves into the closure (its 'static bound used to force a
+        // multi-MB deep clone on bootstrap) and comes back via the return tuple
+        // because the caller still reads pl.snapshot (get_missing_key_ids).
+        let result = crate::runtime::blocking(&*self.runtime, move || {
+            let mut snapshot_state = HashState::default();
+            let result = process_snapshot(
+                &snapshot,
+                &mut snapshot_state,
+                |key_id| lookup_app_state_key(&keys_map, key_id),
+                validate_macs,
+                &collection_name_owned,
+            )?;
+            Ok::<_, crate::appstate::AppStateError>((result, snapshot_state, snapshot))
+        })
+        .await
+        // Carried as itself rather than flattened to a string: a snapshot MAC
+        // that does not match is the one error with an answer -- asking the
+        // primary for the collection -- and a caller can only tell it apart
+        // from a missing key or a bad decode by downcasting to it.
+        .map_err(anyhow::Error::new)?;
+
+        let (snapshot_result, snapshot_state, snapshot) = result;
+        pl.snapshot = Some(snapshot);
+        progress.state = snapshot_state;
+
+        // A snapshot is a fresh baseline, so wipe the collection's prior mutation
+        // MACs first, even when the snapshot has none. Leftover
+        // index->value entries would corrupt the next patch's ltHash.
+        //
+        // Commit the version LAST. If clear/put fails on a transient store error,
+        // an already-advanced version would make the retry treat this same snapshot
+        // as stale (snapshot_is_stale) and skip it, stranding the old MACs forever.
+        self.backend.clear_mutation_macs(collection_name).await?;
+        if !snapshot_result.mutation_macs.is_empty() {
+            self.backend
+                .put_mutation_macs(
+                    collection_name,
+                    progress.state.version,
+                    &snapshot_result.mutation_macs,
+                )
+                .await?;
+        }
+        progress.state.bootstrapped |= !pl.has_more_patches;
+        self.persist_mutation_effects(&snapshot_result.mutations)
+            .await?;
+        self.backend
+            .set_version(collection_name, progress.state.clone())
+            .await?;
+        // Snapshot owns the whole collection: move its Vec into the empty
+        // accumulator rather than extend, which would allocate + copy a second
+        // collection-sized buffer at the memory peak. is_empty falls back to extend.
+        if progress.new_mutations.is_empty() {
+            progress.new_mutations = snapshot_result.mutations;
+        } else {
+            progress.new_mutations.extend(snapshot_result.mutations);
+        }
+        progress.committed_state = progress.state.clone();
+        Ok(())
+    }
+
+    async fn apply_patch_list_patch(
+        &self,
+        patch: wa::SyncdPatch,
+        collection_name: &str,
+        keys_map: Arc<HashMap<Vec<u8>, Arc<ExpandedAppStateKeys>>>,
+        progress: &mut PatchListProgress,
+        validate_macs: bool,
+        final_page: bool,
+    ) -> Result<wa::SyncdPatch> {
+        let need_db_lookup = collect_unique_index_macs(&patch.mutations);
+
+        // Fetch previous value MACs in one backend round-trip instead of a
+        // spawn_blocking + query per mutation (N+1).
+        let db_prev: HashMap<IndexMac, Vec<u8>> = match self
+            .backend
+            .get_mutation_macs(collection_name, &need_db_lookup)
+            .await
+        {
+            Ok(previous) => previous,
+            Err(error) => return Err(error.into()),
+        };
+
+        let state_clone = progress.state.clone();
+        let keys = keys_map;
+        let coll = collection_name.to_string();
+
+        // Offload CPU-intensive patch processing to a blocking thread
+        let processed = crate::runtime::blocking(&*self.runtime, move || {
+            let get_prev_value_mac =
+                |index_mac: &[u8]| -> Result<Option<Vec<u8>>, crate::appstate::AppStateError> {
+                    Ok(<&IndexMac>::try_from(index_mac)
+                        .ok()
+                        .and_then(|k| db_prev.get(k))
+                        .cloned())
+                };
+
+            let mut state = state_clone;
+            let result = process_patch(
+                &patch,
+                &mut state,
+                |key_id| lookup_app_state_key(&keys, key_id),
+                get_prev_value_mac,
+                validate_macs,
+                &coll,
+            )?;
+            Ok::<_, crate::appstate::AppStateError>((result, patch))
+        })
+        .await;
+        let (result, patch) = match processed {
+            Ok(processed) => processed,
+            Err(error) => return Err(anyhow!("{}", error)),
+        };
+
+        // Update local state with the result from the blocking task
+        progress.state = result.state;
+
+        // Persist state and MACs: one backend call per patch, so a
+        // transactional backend commits the version with the MACs it
+        // pairs with instead of paying three round trips.
+        progress.state.bootstrapped |= final_page;
+        self.persist_mutation_effects(&result.mutations).await?;
+        self.backend
+            .commit_patch(
+                collection_name,
+                progress.state.clone(),
+                &result.removed_index_macs,
+                &result.added_macs,
+            )
+            .await?;
+        progress.new_mutations.extend(result.mutations);
+        progress.committed_state = progress.state.clone();
+        Ok(patch)
     }
 
     /// Inline the patch list's external blobs, then report which referenced decode keys
@@ -1763,5 +1788,84 @@ mod key_cache_tests {
 
         assert_eq!(cache.len(), 1);
         assert!(cache.get(&[7]).is_some());
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod future_layout_tests {
+    use super::*;
+    use crate::runtime::{AbortHandle, Runtime};
+    use std::future::Future;
+    use std::mem::{size_of, size_of_val};
+    use std::pin::Pin;
+    use std::time::Duration;
+
+    struct LayoutRuntime;
+    #[async_trait]
+    impl Runtime for LayoutRuntime {
+        fn spawn(&self, _: Pin<Box<dyn Future<Output = ()> + Send>>) -> AbortHandle {
+            unreachable!()
+        }
+        fn sleep(&self, _: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            unreachable!()
+        }
+        fn spawn_blocking(
+            &self,
+            _: Box<dyn FnOnce() + Send>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            unreachable!()
+        }
+        fn yield_now(&self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+            None
+        }
+    }
+
+    #[test]
+    fn boxed_processing_phases_and_their_state_have_small_layouts() {
+        let processor = AppStateProcessor::new(
+            Arc::new(crate::store::InMemoryBackend::new()),
+            Arc::new(LayoutRuntime),
+        );
+        let mut pl = PatchList {
+            name: WAPatchName::Regular,
+            has_more_patches: false,
+            patches: Vec::new(),
+            snapshot: None,
+            snapshot_ref: None,
+            error: None,
+        };
+        let keys = Arc::new(HashMap::new());
+        let mut progress = PatchListProgress {
+            state: HashState::default(),
+            committed_state: HashState::default(),
+            new_mutations: Vec::new(),
+        };
+        let snapshot = {
+            let future = processor.apply_patch_list_snapshot(
+                wa::SyncdSnapshot::default(),
+                &mut pl,
+                keys.clone(),
+                &mut progress,
+                true,
+            );
+            size_of_val(&future)
+        };
+        let patch = {
+            let future = processor.apply_patch_list_patch(
+                wa::SyncdPatch::default(),
+                "regular",
+                keys,
+                &mut progress,
+                true,
+                true,
+            );
+            size_of_val(&future)
+        };
+        let list = size_of_val(&processor.process_patch_list(pl, true));
+        assert!(size_of::<PatchListProgress>() <= 512);
+        assert!(
+            snapshot <= 2048 && patch <= 2048 && list <= 2048,
+            "snapshot={snapshot}, patch={patch}, controller={list}"
+        );
     }
 }

@@ -691,12 +691,15 @@ impl Client {
         // write left every IQ, the keepalive ping among them, waiting forever,
         // and the keepalive's dead-socket watchdog with it. Dropping the
         // exchange mid-send is safe: the waiter guard deregisters on drop.
-        let exchange = async {
+        // The timeout owns two states for its input while pinning it. Keep the
+        // registration and response wait in one small allocation instead of
+        // embedding both copies in every IQ caller's coroutine.
+        let exchange = Box::pin(async move {
             let _waiter_guard = self
                 .register_and_send(req_id, send_fn, on_sent, waiter)
                 .await?;
             rx.await.map_err(|_| IqError::InternalChannelClosed)
-        };
+        });
 
         futures::select! {
             result = rt_timeout(&*self.runtime, timeout, exchange).fuse() => {

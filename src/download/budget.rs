@@ -1,5 +1,6 @@
 //! Byte accounting for media readers and writers, independent of an HTTP runtime.
 use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Per-download application policy, independent of declared sizes and headers.
@@ -62,6 +63,10 @@ pub enum DownloadPolicyError {
     LimitExceeded { domain: MediaByteDomain, limit: u64 },
     #[error("bounded media downloads require a streaming HTTP adapter")]
     StreamingRequired,
+    #[error("media buffer memory budget exceeded ({limit} bytes)")]
+    MemoryBudgetExceeded { limit: usize },
+    #[error("could not allocate the media buffer")]
+    AllocationFailed,
     #[error("media download cancelled")]
     Cancelled,
 }
@@ -78,9 +83,14 @@ fn policy_io(error: DownloadPolicyError) -> io::Error {
 
 #[derive(Default)]
 struct State {
+    counters: Mutex<Counters>,
+    cancelled: AtomicBool,
+}
+
+#[derive(Default)]
+struct Counters {
     wire: u64,
     plaintext: u64,
-    cancelled: bool,
 }
 
 /// One operation's accounting, shared across readers, writers and retries.
@@ -92,80 +102,87 @@ struct State {
 #[derive(Clone)]
 pub(super) struct DownloadBudget {
     limits: DownloadLimits,
-    state: Option<Arc<Mutex<State>>>,
+    state: Option<Arc<State>>,
 }
 
 impl DownloadBudget {
-    pub(super) fn new(limits: DownloadLimits) -> Self {
+    pub(super) fn cancellable(limits: DownloadLimits) -> Self {
         Self {
             limits,
-            state: limits
-                .is_bounded()
-                .then(|| Arc::new(Mutex::new(State::default()))),
+            state: Some(Arc::new(State::default())),
         }
     }
 
-    /// Cancel a bounded operation at its next I/O boundary. Unlimited budgets
-    /// have no shared state and do not support cancellation.
+    pub(super) fn is_bounded(&self) -> bool {
+        self.limits.is_bounded()
+    }
+
+    pub(super) fn new(limits: DownloadLimits) -> Self {
+        Self {
+            limits,
+            state: limits.is_bounded().then(|| Arc::new(State::default())),
+        }
+    }
+
+    /// Cancel at the next I/O boundary when constructed with shared state.
     pub(super) fn cancel(&self) {
         let Some(state) = &self.state else {
             return;
         };
-        state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .cancelled = true;
+        state.cancelled.store(true, Ordering::Release);
     }
 
     /// Check before starting other blocking I/O owned by this operation.
     pub(super) fn check_cancelled(&self) -> Result<(), DownloadPolicyError> {
         if let Some(state) = &self.state
-            && state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .cancelled
+            && state.cancelled.load(Ordering::Acquire)
         {
             return Err(DownloadPolicyError::Cancelled);
         }
         Ok(())
     }
 
-    pub(super) fn reader<R: Read>(&self, inner: R) -> impl Read + use<R> {
+    pub(super) fn reader<R: Read>(&self, inner: R) -> impl Read + use<'_, R> {
         BudgetReader {
             inner,
-            budget: self.clone(),
+            budget: self,
         }
     }
 
-    pub(super) fn writer<W: Write>(&self, inner: W) -> impl Write + use<W> {
+    pub(super) fn writer<W: Write>(&self, inner: W) -> impl Write + use<'_, W> {
         BudgetWriter {
             inner,
-            budget: self.clone(),
+            budget: self,
         }
     }
 
     fn remaining(&self, domain: MediaByteDomain) -> io::Result<u64> {
+        self.check_cancelled().map_err(policy_io)?;
+        let Some((wire, plaintext)) = self.limits.bounds else {
+            return Ok(u64::MAX);
+        };
         let Some(state) = &self.state else {
             return Ok(u64::MAX);
         };
         let state = state
+            .counters
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.cancelled {
-            return Err(policy_io(DownloadPolicyError::Cancelled));
-        }
-        Ok(match (self.limits.bounds, domain) {
-            (Some((limit, _)), MediaByteDomain::Wire) => limit.saturating_sub(state.wire),
-            (Some((_, limit)), MediaByteDomain::Plaintext) => limit.saturating_sub(state.plaintext),
-            (None, _) => u64::MAX,
+        Ok(match domain {
+            MediaByteDomain::Wire => wire.saturating_sub(state.wire),
+            MediaByteDomain::Plaintext => plaintext.saturating_sub(state.plaintext),
         })
     }
 
     fn charge(&self, domain: MediaByteDomain, n: usize) {
+        if !self.limits.is_bounded() {
+            return;
+        }
         let Some(state) = &self.state else {
             return;
         };
         let mut state = state
+            .counters
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let count = match domain {
@@ -187,12 +204,12 @@ impl DownloadBudget {
     }
 }
 
-struct BudgetReader<R> {
+struct BudgetReader<'a, R> {
     inner: R,
-    budget: DownloadBudget,
+    budget: &'a DownloadBudget,
 }
 
-impl<R: Read> Read for BudgetReader<R> {
+impl<R: Read> Read for BudgetReader<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -217,12 +234,12 @@ impl<R: Read> Read for BudgetReader<R> {
     }
 }
 
-struct BudgetWriter<W> {
+struct BudgetWriter<'a, W> {
     inner: W,
-    budget: DownloadBudget,
+    budget: &'a DownloadBudget,
 }
 
-impl<W: Write> Write for BudgetWriter<W> {
+impl<W: Write> Write for BudgetWriter<'_, W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let remaining = self.budget.remaining(MediaByteDomain::Plaintext)?;
         if buf.len() as u64 > remaining {
@@ -280,7 +297,8 @@ mod tests {
             .reader(Cursor::new(b"ab"))
             .read_exact(&mut [0; 2])
             .unwrap();
-        let mut retry = budget.clone().reader(Cursor::new(b"cde"));
+        let retry_budget = budget.clone();
+        let mut retry = retry_budget.reader(Cursor::new(b"cde"));
         retry.read_exact(&mut [0; 2]).unwrap();
         assert!(matches!(
             policy(&retry.read(&mut [0]).unwrap_err()),
@@ -337,5 +355,33 @@ mod tests {
         let budget = DownloadBudget::new(DownloadLimits::new(19, 19));
         assert!(io::copy(&mut budget.reader(&mut source), &mut io::sink()).is_err());
         assert_eq!(source.0, 20);
+    }
+
+    #[test]
+    fn cancellation_only_io_does_not_wait_for_byte_accounting() {
+        let budget = DownloadBudget::cancellable(DownloadLimits::default());
+        let state = budget.state.as_ref().unwrap();
+        let held = state.counters.lock().unwrap();
+        let worker_budget = budget.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut bytes = [0; 4];
+            worker_budget
+                .reader(Cursor::new(b"test"))
+                .read_exact(&mut bytes)
+                .unwrap();
+            let mut sink = Vec::new();
+            worker_budget.writer(&mut sink).write_all(&bytes).unwrap();
+            tx.send(sink).unwrap();
+        });
+        let completed = rx.recv_timeout(std::time::Duration::from_secs(1));
+        drop(held);
+        worker.join().unwrap();
+        assert_eq!(completed.unwrap(), b"test");
+        budget.cancel();
+        assert_eq!(
+            policy(&budget.reader(io::empty()).read(&mut [0]).unwrap_err()),
+            DownloadPolicyError::Cancelled
+        );
     }
 }

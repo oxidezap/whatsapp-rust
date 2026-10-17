@@ -168,6 +168,23 @@ impl Client {
         }
     }
 
+    /// Copy only the download route from a live cache entry. Warm downloads
+    /// need neither an owned auth token nor an intermediate host-vector clone.
+    pub(crate) async fn cached_download_route(
+        &self,
+    ) -> Result<Option<crate::download::MediaRoute>, IqError> {
+        let generation = self.connection_generation.load(Ordering::Acquire);
+        let route = self
+            .media_conn
+            .read()
+            .await
+            .as_ref()
+            .filter(|conn| !conn.is_expired())
+            .map(crate::download::MediaRoute::from);
+        self.check_media_conn_generation(generation)?;
+        Ok(route)
+    }
+
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(
@@ -453,6 +470,41 @@ mod tests {
     use std::time::Duration;
     use wacore_binary::builder::NodeBuilder;
     use wacore_binary::node::Node;
+
+    #[tokio::test]
+    async fn cached_download_route_preserves_order_expiry_and_generation_fence() {
+        let (client, _) = create_iq_test_client().await;
+        *client.media_conn.write().await = Some(MediaConn {
+            auth: "synthetic-auth-not-needed-for-downloads".into(),
+            ttl: 3600,
+            auth_ttl: Some(1200),
+            hosts: vec![
+                MediaConnHost::new("first.invalid".into()),
+                MediaConnHost::new("second.invalid".into()),
+            ],
+            fetched_at: Instant::now(),
+        });
+        let route = client.cached_download_route().await.unwrap().unwrap();
+        assert_eq!(
+            route
+                .hosts
+                .iter()
+                .map(|h| h.hostname.as_str())
+                .collect::<Vec<_>>(),
+            ["first.invalid", "second.invalid"]
+        );
+        client.media_conn.write().await.as_mut().unwrap().auth_ttl = Some(0);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(client.cached_download_route().await.unwrap().is_none());
+        client.media_conn.write().await.as_mut().unwrap().auth_ttl = Some(1200);
+        let held = client.media_conn.write().await;
+        let mut pending = Box::pin(client.cached_download_route());
+        assert!(futures::poll!(&mut pending).is_pending());
+        client.connection_generation.fetch_add(1, Ordering::AcqRel);
+        drop(held);
+        assert!(matches!(pending.await, Err(IqError::NotConnected)));
+        assert!(client.media_conn_flight.lock().unwrap().is_none());
+    }
 
     /// Callers in one burst: parallel AppState collections plus simultaneous
     /// media downloads all ask for the connection at once on a cold cache.

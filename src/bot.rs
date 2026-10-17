@@ -160,32 +160,37 @@ impl MessageContext {
         }
     }
 
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.send_message", level = "debug", skip_all, fields(chat = %self.info.source.chat.observe()), err(Debug)))]
-    pub async fn send_message(
+    /// Put the protobuf in its shared request before constructing the future.
+    pub fn send_message(
         &self,
         message: wa::Message,
+    ) -> impl Future<Output = Result<crate::send::SendResult, crate::send::SendError>> + '_ {
+        self.send_prepared_message(crate::SendRequest::new(&self.info.source.chat, message))
+    }
+
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.send_message", level = "debug", skip_all, fields(chat = %self.info.source.chat.observe()), err(Debug)))]
+    async fn send_prepared_message(
+        &self,
+        request: crate::SendRequest,
     ) -> Result<crate::send::SendResult, crate::send::SendError> {
-        self.client
-            .send_message(&self.info.source.chat, message)
-            .await
+        self.client.send(request).await
     }
 
     /// Reply with plain text in the same chat, without quoting.
-    pub async fn reply(
+    pub fn reply(
         &self,
         text: impl Into<String>,
-    ) -> Result<crate::send::SendResult, crate::send::SendError> {
-        self.send_message(wa::Message::text(text)).await
+    ) -> impl Future<Output = Result<crate::send::SendResult, crate::send::SendError>> + '_ {
+        self.send_message(wa::Message::text(text))
     }
 
     /// Reply with plain text, quoting the received message.
-    pub async fn reply_quoting(
+    pub fn reply_quoting(
         &self,
         text: impl Into<String>,
-    ) -> Result<crate::send::SendResult, crate::send::SendError> {
+    ) -> impl Future<Output = Result<crate::send::SendResult, crate::send::SendError>> + '_ {
         let context = self.build_quote_context();
         self.send_message(wa::Message::text_with_context(text, context))
-            .await
     }
 
     pub fn build_quote_context(&self) -> wa::ContextInfo {
@@ -238,19 +243,25 @@ impl MessageContext {
         key
     }
 
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.edit_message", level = "debug", skip_all, fields(chat = %self.info.source.chat.observe()), err(Debug)))]
     /// Edit a message of ours in this chat; see [`Client::edit_message`] for
     /// what the returned result describes.
-    pub async fn edit_message(
+    pub fn edit_message(
         &self,
         original_message_id: crate::MessageId,
         new_message: wa::Message,
+    ) -> impl Future<Output = Result<crate::send::SendResult, crate::send::SendError>> + '_ {
+        let request =
+            crate::MessageRef::new(&self.info.source.chat, original_message_id, None, true)
+                .map(|target| crate::EditRequest::new(target, new_message));
+        self.edit_prepared_message(request)
+    }
+
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.edit_message", level = "debug", skip_all, fields(chat = %self.info.source.chat.observe()), err(Debug)))]
+    async fn edit_prepared_message(
+        &self,
+        request: Result<crate::EditRequest<'_>, crate::MessageRefError>,
     ) -> Result<crate::send::SendResult, crate::send::SendError> {
-        let target =
-            crate::MessageRef::new(&self.info.source.chat, original_message_id, None, true)?;
-        self.client
-            .edit_message(crate::EditRequest::new(target, new_message))
-            .await
+        self.client.edit_message(request?).await
     }
 
     /// Revoke the addressed message using its original author/from-me scope.
@@ -406,7 +417,7 @@ impl BotHandle {
     }
 }
 
-impl std::future::Future for BotHandle {
+impl Future for BotHandle {
     type Output = BotRunOutcome;
 
     fn poll(
@@ -434,7 +445,7 @@ impl std::future::Future for BotHandle {
 /// CPU-relevant work of a session would be missing from the hook on the
 /// common `bot.run().await` launch path. `Bot::spawn` needs no equivalent:
 /// it routes the same loop through `Runtime::spawn`.
-async fn run_metered<F: std::future::Future>(
+async fn run_metered<F: Future>(
     fut: F,
     instrument: Option<Arc<dyn wacore::stats::TaskInstrument>>,
 ) -> F::Output {
@@ -2637,6 +2648,47 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn context_send_helpers_keep_protobufs_out_of_future_frames() {
+        fn check(name: &str, future: impl Future) {
+            let bytes = size_of_val(&future);
+            let budget = if usize::BITS == 64 { 2048 } else { 1024 };
+            assert!(
+                bytes <= budget,
+                "{name} future is {bytes} bytes (budget {budget})"
+            );
+        }
+
+        let ctx = test_context_with_info(react_info(
+            "100000000001@s.whatsapp.net",
+            "100000000001@s.whatsapp.net",
+            "SYNTHETIC-INBOUND",
+            false,
+        ))
+        .await;
+        check(
+            "send",
+            ctx.send_message(wa::Message::text("synthetic send")),
+        );
+        check("reply", ctx.reply("synthetic reply"));
+        check("quoted reply", ctx.reply_quoting("synthetic quoted reply"));
+        check(
+            "edit",
+            ctx.edit_message(
+                crate::MessageId::new("SYNTHETIC-ORIGINAL").expect("synthetic message id"),
+                wa::Message::text("synthetic edit"),
+            ),
+        );
+        let target = ctx.message_ref().expect("synthetic target");
+        check("reaction key", ctx.client.message_ref_addon_key(&target));
+        check(
+            "raw reaction",
+            ctx.client
+                .send_reaction_raw(&ctx.info.source.chat, target.to_raw_key(), "🦀"),
+        );
+        check("reaction", ctx.react("🦀"));
     }
 
     #[tokio::test]

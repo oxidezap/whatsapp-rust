@@ -43,6 +43,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-16
@@ -70,6 +72,7 @@ jobs:
       # .git/config for that.
       - uses: actions/checkout@v7
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -86,6 +89,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-16
@@ -114,6 +119,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Reclaim unused Android SDK space
         run: |
           df -h /
@@ -192,6 +199,8 @@ jobs:
     # critical path for nothing. Here it runs beside everything else.
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-16
@@ -231,6 +240,8 @@ jobs:
     # workspace recompile with voip on, not the deps. The heavy relay e2e tests stay out of `--lib`.
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Reclaim unused Android SDK space
         run: |
           df -h /
@@ -292,6 +303,8 @@ jobs:
       RUSTDOCFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Reclaim unused Android SDK space
         run: |
           df -h /
@@ -332,6 +345,8 @@ jobs:
       crates: ${{ steps.crates.outputs.crates }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-16
@@ -357,6 +372,8 @@ jobs:
         crate: ${{ fromJSON(needs.feature-matrix-crates.outputs.crates) }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       # No Android SDK reclaim here, unlike the three jobs that build the whole
       # workspace. A runner starts this leg with 87G free and one crate's
       # `check` comes nowhere near it, so the `rm -rf` bought 10G nothing asked
@@ -409,6 +426,8 @@ jobs:
       NEXTEST_PROFILE: ci
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       # Pinned rather than `@stable`: this version is the workspace MSRV
       # (`rust-version` in the root Cargo.toml). To raise the floor, bump both
       # together — a floating `stable` would silently let the declared MSRV rot.
