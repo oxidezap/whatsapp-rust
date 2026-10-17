@@ -99,10 +99,7 @@ fn lookup_bytes(key: &[u8]) -> Option<TokenKind> {
             if meta >> 11 == 31 {
                 let off = TOK_OFF[h] as usize;
                 if TOK_BLOB[off] as usize == len
-                    && TOK_BLOB[off + 1..off + 1 + len]
-                        .iter()
-                        .zip(key)
-                        .all(|(a, b)| a == b)
+                    && &TOK_BLOB[off + 1..off + 1 + len] == key
                 {
                     return Some(decode_kind(meta & 0x7FF));
                 }
