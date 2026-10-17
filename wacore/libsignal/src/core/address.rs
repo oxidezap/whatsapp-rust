@@ -135,7 +135,7 @@ impl AddressBuf {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn push_str(&mut self, s: &str) {
         match &mut self.0 {
             AddressRepr::Inline { bytes, len } => {
