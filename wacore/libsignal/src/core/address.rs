@@ -135,6 +135,7 @@ impl AddressBuf {
         }
     }
 
+    #[inline]
     pub fn push_str(&mut self, s: &str) {
         match &mut self.0 {
             AddressRepr::Inline { bytes, len } => {
@@ -269,6 +270,75 @@ impl fmt::Display for ProtocolAddress {
 
 #[cfg(test)]
 mod address_buffer_tests {
+
+    #[test]
+    fn every_fragment_boundary_preserves_utf8_and_spill() {
+        for prefix_len in 0..=INLINE_CAPACITY + 1 {
+            for fragment in ["", "a", "é", "✅", "🎉", "é✅🎉"] {
+                let prefix = "a".repeat(prefix_len);
+                let expected = format!("{prefix}{fragment}");
+                for split in expected
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .chain([expected.len()])
+                {
+                    let mut buf = AddressBuf::empty();
+                    buf.push_str(&expected[..split]);
+                    buf.push_str(&expected[split..]);
+                    assert_eq!(buf.as_str(), expected);
+                    assert_eq!(buf.is_inline(), expected.len() <= INLINE_CAPACITY);
+                    buf.clear();
+                    buf.push('é');
+                    assert_eq!(buf.as_str(), "é");
+                    assert_eq!(format!("{buf:?}"), "\"é\"");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_suffix_width_preserves_name_and_value() {
+        let devices = [
+            0,
+            1,
+            9,
+            10,
+            99,
+            100,
+            999,
+            1_000,
+            9_999,
+            10_000,
+            99_999,
+            100_000,
+            999_999,
+            1_000_000,
+            9_999_999,
+            10_000_000,
+            99_999_999,
+            100_000_000,
+            999_999_999,
+            1_000_000_000,
+            u32::MAX,
+        ];
+        for device in devices {
+            for name_len in 0..=INLINE_CAPACITY + 1 {
+                let name = "a".repeat(name_len);
+                let expected = format!("{name}.{device}");
+                let address = ProtocolAddress::new(&name, device.into());
+                assert_eq!(address.name(), name);
+                assert_eq!(address.as_str(), expected);
+                assert_eq!(address.device_id(), device.into());
+                assert_eq!(address.buf.is_inline(), expected.len() <= INLINE_CAPACITY);
+
+                let mut reused = ProtocolAddress::new(&"z".repeat(100), device.into());
+                reused.reset_with(|buf| buf.push_str(&name));
+                assert_eq!(address, reused);
+                assert_eq!(address.cmp(&reused), std::cmp::Ordering::Equal);
+                assert_eq!(hash_of(&address), hash_of(&reused));
+            }
+        }
+    }
 
     /// Every comparison reads the rendered string, so an address with no name
     /// yet still has to carry its device. Two unnamed addresses that differ
