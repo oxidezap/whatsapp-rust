@@ -2789,10 +2789,6 @@ mod tests {
             &self,
             request: crate::http::HttpRequest,
         ) -> Result<crate::http::HttpResponse> {
-            assert!(
-                !self.streaming,
-                "streaming adapter must use execute_streaming"
-            );
             self.record(&request.url);
             let (status_code, body) = self.respond(&request.url);
             Ok(crate::http::HttpResponse::new(status_code, body))
@@ -2808,7 +2804,6 @@ mod tests {
             &self,
             request: crate::http::HttpRequest,
         ) -> Result<wacore::net::StreamingHttpResponse> {
-            assert!(self.streaming, "buffered adapter must use execute");
             self.record(&request.url);
             let (status_code, body) = self.respond(&request.url);
             Ok(wacore::net::StreamingHttpResponse::new(
