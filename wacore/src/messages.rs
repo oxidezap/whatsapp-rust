@@ -534,7 +534,14 @@ impl MessageUtils {
             jid.push_phash_form_to(&mut arena);
             ranges.push((start as u32, arena.len() as u32));
         }
-        // The offsets above only ever grow, so one check on the finished arena
+        Self::hash_participant_ranges(&arena, &mut ranges)
+    }
+
+    // Keep the sort and hash shared across the public iterator API's
+    // monomorphizations; only rendering the input depends on the iterator.
+    #[inline(never)]
+    fn hash_participant_ranges(arena: &str, ranges: &mut [(u32, u32)]) -> Result<CompactString> {
+        // The rendered offsets only ever grow, so one check on the finished arena
         // covers every one of them: if the whole arena addresses in a `u32`,
         // then so did each `start` and `end` recorded from it. A device set
         // that large cannot come from a group -- it would need ~100M JIDs --
@@ -562,7 +569,7 @@ impl MessageUtils {
         // only bought a string match and a per-`update` enum dispatch, plus two
         // fallible steps that could not fail once the name was a literal.
         let mut h = Sha256::new();
-        for &(start, end) in &ranges {
+        for &(start, end) in ranges.iter() {
             h.update(&arena[start as usize..end as usize]);
         }
 
@@ -2376,6 +2383,14 @@ mod parse_message_info_tests {
 
         assert_eq!(
             MessageUtils::participant_list_hash(&devices).unwrap(),
+            expected
+        );
+        assert_eq!(
+            MessageUtils::participant_list_hash(devices.as_slice()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            MessageUtils::participant_list_hash(devices.iter().rev()).unwrap(),
             expected
         );
     }
