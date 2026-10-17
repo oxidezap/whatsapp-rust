@@ -253,6 +253,13 @@ impl Session {
     /// Established Signal material and synthetic encryption are fixture setup, not
     /// part of the CodSpeed timed region. The peer is dropped before this returns.
     pub async fn prepare_activity(&self) -> Result<Activity> {
+        // The active IQ does not join passive prekey generation/upload. Fence
+        // it before preparing input, so setup cannot pay a variable fraction
+        // of that work and leave the rest inside the activity measurement.
+        // The post-login parent still waits for our withheld offline marker.
+        tokio::time::timeout(DEADLINE, self.client.bench_startup.wait_before_offline())
+            .await
+            .context("pre-offline startup tasks did not finish")?;
         use wacore::libsignal::protocol::{create_sender_key_distribution_message, group_encrypt};
         super::seed_registry(&self.client, super::PEER_USER, &[0]).await;
         super::seed_registry(&self.client, super::OWN_USER, &[0, 1]).await;
@@ -378,6 +385,10 @@ impl Session {
     /// workers. History enters the production inline-history parser/task (no HTTP).
     /// Finish the server's offline phase and wait for commit/event/receipt work.
     pub async fn receive_activity(&self, activity: Activity) -> Result<()> {
+        ensure!(
+            self.client.bench_startup.pending_before_offline() == 0,
+            "pre-offline startup entered activity measurement"
+        );
         for node in activity.stanzas {
             self.wire.reply(node).await?;
         }
@@ -866,6 +877,32 @@ impl Transport for Wire {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn prepared_activity_joins_passive_startup_but_preserves_offline_drain() -> Result<()> {
+        #[cfg(feature = "sqlite-storage")]
+        let backends = [BackendFixture::memory(), BackendFixture::sqlite().await?];
+        #[cfg(not(feature = "sqlite-storage"))]
+        let backends = [BackendFixture::memory()];
+        for backend in backends {
+            let session = Session::connect(backend.backend()).await?;
+            let activity = session.prepare_activity().await?;
+            ensure!(session.client.bench_startup.pending_before_offline() == 0);
+            ensure!(session.client.bench_startup.pending() > 0);
+            ensure!(
+                !session
+                    .client
+                    .offline_sync_completed
+                    .load(Ordering::Acquire)
+            );
+            session.receive_activity(activity).await?;
+            ensure!(session.client.bench_startup.pending() == 0);
+            ensure!(session.delivery_receipts() == MESSAGES);
+            session.shutdown().await?;
+            backend.cleanup()?;
+        }
+        Ok(())
+    }
 
     fn wire() -> Wire {
         let (server_tx, server_rx) = async_channel::bounded(1);

@@ -1338,7 +1338,7 @@ impl Client {
         let startup_task = self.bench_startup.begin();
         self.runtime.spawn_detached(Box::pin(async move {
             #[cfg(feature = "bench-harness")]
-            let _startup_task = startup_task;
+            let mut _startup_task = startup_task;
             // Update LID if changed (moved here to avoid blocking the read loop
             // on Device snapshot + write lock).
             if let Some(lid) = lid_from_server {
@@ -1488,6 +1488,8 @@ impl Client {
 
             // === Wait for offline sync to complete ===
             // The server sends <ib><offline count="X"/></ib> after we exit passive mode.
+            #[cfg(feature = "bench-harness")]
+            _startup_task.finish_before_offline();
             client_clone.wait_for_offline_delivery_end().await;
 
             // Check if connection was replaced while waiting
