@@ -404,10 +404,10 @@ fn calc_e1_inner(
     e1
 }
 
-/// Per-subframe E1 by computing an extended E1_ once then offsetting per subframe. Returns the
-/// `numlags * numsubfrs` row-major block, built by copying each subframe's window out of the
-/// extended row (again: fully written, so never zeroed first).
-fn calc_e1(
+/// Extended E1 row shared by all subframes. Subframe `sf` starts at
+/// `(numsubfrs - 1 - sf) * lag_subfrlen`; reading that window directly avoids copying the
+/// overlapping energies into a separate row-major allocation.
+fn calc_e1_extended(
     ltpbuf: &[f32],
     ltpbuf_len: usize,
     numsubfrs: usize,
@@ -415,20 +415,9 @@ fn calc_e1(
     maxpitch: i32,
     lag_subfrlen: usize,
 ) -> Vec<f32> {
-    let numlags = (maxpitch - minpitch + 1) as usize;
     let maxpitch_ = maxpitch + (numsubfrs as i32 - 1) * lag_subfrlen as i32;
-    let numlags_ = (maxpitch_ - minpitch + 1) as usize;
     let t = ltpbuf_len - lag_subfrlen;
-    let e1_ext = calc_e1_inner(ltpbuf, t, minpitch, maxpitch_, lag_subfrlen);
-    let mut e1 = Vec::with_capacity(numlags * numsubfrs);
-    // Subframe `sf` reads the extended row shifted back by `sf` lag subframes; the last one lands
-    // exactly on index 0, so the window never runs off the front.
-    let mut offset = numlags_ - numlags;
-    for _ in 0..numsubfrs {
-        e1.extend_from_slice(&e1_ext[offset..offset + numlags]);
-        offset = offset.saturating_sub(lag_subfrlen);
-    }
-    e1
+    calc_e1_inner(ltpbuf, t, minpitch, maxpitch_, lag_subfrlen)
 }
 
 fn dot_prod(a: &[f32], b: &[f32], n: usize) -> f32 {
@@ -795,7 +784,7 @@ fn pitch_with_search(
     let stage1_len = pitch_downsample(&stage1, l + offset, &mut stage1_ds);
 
     let numlags0 = NUM_LAGS_STAGE1;
-    let e1 = calc_e1(
+    let e1 = calc_e1_extended(
         &stage1_ds,
         stage1_len,
         numsubfrs,
@@ -823,8 +812,9 @@ fn pitch_with_search(
     let numlags = numlags0;
     for sf in 0..numsubfrs {
         let sqrt_e2 = (e2[sf] + 1e-30).sqrt();
+        let e1_sf = &e1[(numsubfrs - 1 - sf) * LAG_SUBFRLEN_STAGE1 as usize..];
         for i in 0..numlags {
-            let sqrt_e1 = (e1[sf * numlags + i] + 1e-30).sqrt();
+            let sqrt_e1 = (e1_sf[i] + 1e-30).sqrt();
             let tmp = 0.5 * (sqrt_e1 + sqrt_e2);
             e[sf * numlags + i] = tmp * tmp;
         }
@@ -898,7 +888,7 @@ fn pitch_with_search(
     let track_idx = get_maxi_k(&utils, search.survivors);
 
     // Recompute full-res E1 over the HP signal.
-    let e1_fs = calc_e1(
+    let e1_fs = calc_e1_extended(
         ltp_buf_hp,
         l - look,
         numsubfrs,
@@ -924,7 +914,7 @@ fn pitch_with_search(
         let mut mask = 1u16;
         let c_ptr = offset_c + sf * numlags_c;
         let e_ptr = offset_e + sf * numlags_e;
-        let e1_ptr = offset_e + sf * numlags_e;
+        let e1_ptr = offset_e + (numsubfrs - 1 - sf) * LAG_SUBFRLEN as usize;
         let h_ptr = sf * NUMLAGS_FS;
         // ltp_buf_ptr = &ltp_buf_hp[L - look + (sf - numsubfrs)*LAG_SUBFRLEN]
         let ltp_off = ((l - look) as i32 + (sf as i32 - numsubfrs as i32) * LAG_SUBFRLEN) as usize;
