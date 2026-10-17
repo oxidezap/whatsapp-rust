@@ -12,8 +12,9 @@ pub use wacore::store::cache::CacheStore;
 /// Resource policy for app-state external blobs. The byte limit covers buffer
 /// capacity retained by all concurrent prefetches on one client, including
 /// completed blobs and their shared byte slices until their last owner drops.
-/// It excludes HTTP/TLS and
-/// decoded protobuf storage. Bounded prefetch requires a streaming HTTP adapter.
+/// Both streaming and buffered HTTP adapters are supported. The limit excludes
+/// HTTP/TLS and decoded protobuf storage, including the full transient response
+/// allocated by a buffered adapter before the retained output is checked.
 /// Cancelled jobs release reservations when the executor drops their closure or
 /// reaches a cancellation checkpoint. Blocked I/O cannot be interrupted.
 ///
