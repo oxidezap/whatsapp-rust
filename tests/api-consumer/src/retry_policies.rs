@@ -1,8 +1,9 @@
 //! Migration examples compile with defaults and plugins disabled, including wasm.
 use std::sync::Arc;
+use whatsapp_rust::bot::Bot;
 use whatsapp_rust::{
-    Bot, Client, ClientBuilder, DecryptFailureAdmission, DecryptFailureContext,
-    DecryptFailureDecision, RetryAdmission, RetryContext, RetryDecision,
+    Client, ClientBuilder, DecryptFailureAdmission, DecryptFailureContext, DecryptFailureDecision,
+    RetryAdmission, RetryContext, RetryDecision,
 };
 
 pub struct Policy;
