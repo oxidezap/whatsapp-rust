@@ -725,8 +725,12 @@ impl Client {
         // DMs are never gated: dropping their retries has no safe SKDM fallback.
         if uses_sender_key
             && !is_peer
-            && let Some(policy) = self.retry_admission.get()
-            && !policy.admit(&info.chat, &info.requester, retry_count)
+            && let Some(policy) = self.retry_admission.as_ref()
+            && policy.decide(&crate::RetryContext {
+                chat: &info.chat,
+                requester: &info.requester,
+                retry_count,
+            }) == crate::RetryDecision::Drop
         {
             debug!(
                 "Retry receipt from {} in {} dropped by RetryAdmission policy",

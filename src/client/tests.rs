@@ -3806,8 +3806,14 @@ fn client_size_pins_runtime_cache_config_saving() {
     expected += size_of::<std::sync::OnceLock<Arc<dyn crate::HistorySyncCaptureHook>>>();
     // Independent group capture adds one immutable hook cell; keep the fixed base.
     expected += size_of::<std::sync::OnceLock<Arc<dyn crate::GroupNotificationDurabilityHook>>>();
-    // Opt-in outbound retry admission adds one immutable hook cell; keep the fixed base.
-    expected += size_of::<std::sync::OnceLock<Arc<dyn crate::DecryptFailureAdmission>>>();
+    // Immutable retry policies and handler map replace their synchronization cells.
+    // Account for the actual representations without changing the fixed base.
+    expected += size_of::<Option<Arc<dyn crate::DecryptFailureAdmission>>>();
+    expected -= size_of::<std::sync::OnceLock<Arc<dyn crate::RetryAdmission>>>()
+        - size_of::<Option<Arc<dyn crate::RetryAdmission>>>();
+
+    expected -= size_of::<std::sync::OnceLock<HashMap<String, Arc<dyn EncHandler>>>>()
+        - size_of::<Option<HashMap<String, Arc<dyn EncHandler>>>>();
     // The detached storage owner now also owns the reusable arena, replacing
     // its former inline async mutex. Account for the actual attachment rather
     // than raising the fixed Client base; retention includes test-only gates.

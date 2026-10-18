@@ -433,8 +433,12 @@ impl Client {
         if automatic
             && !info.source.is_from_me
             && !crate::retry::retry_receipt_always_suppressed(info)
-            && let Some(policy) = self.decrypt_failure_admission.get()
-            && !policy.admit(&info.source.chat, &info.source.sender)
+            && let Some(policy) = self.decrypt_failure_admission.as_ref()
+            && policy.decide(&crate::DecryptFailureContext {
+                chat: &info.source.chat,
+                sender: &info.source.sender,
+                retry_count,
+            }) == crate::DecryptFailureDecision::AcknowledgeWithoutRetry
         {
             debug!(
                 "[msg:{}] retry receipt to {} in {} dropped by DecryptFailureAdmission policy",

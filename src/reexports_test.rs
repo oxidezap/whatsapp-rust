@@ -68,13 +68,8 @@ fn hook_impl_is_object_safe_and_constructible() {
 struct AdmitAll;
 
 impl whatsapp_rust::RetryAdmission for AdmitAll {
-    fn admit(
-        &self,
-        _chat: &whatsapp_rust::Jid,
-        _requester: &whatsapp_rust::Jid,
-        _retry_count: u8,
-    ) -> bool {
-        true
+    fn decide(&self, _: &whatsapp_rust::RetryContext<'_>) -> whatsapp_rust::RetryDecision {
+        whatsapp_rust::RetryDecision::Accept
     }
 }
 
@@ -95,8 +90,11 @@ fn bytes_and_chrono_reexports_are_usable() {
 struct AdmitAllDecryptFailures;
 
 impl whatsapp_rust::DecryptFailureAdmission for AdmitAllDecryptFailures {
-    fn admit(&self, _chat: &whatsapp_rust::Jid, _sender: &whatsapp_rust::Jid) -> bool {
-        true
+    fn decide(
+        &self,
+        _: &whatsapp_rust::DecryptFailureContext<'_>,
+    ) -> whatsapp_rust::DecryptFailureDecision {
+        whatsapp_rust::DecryptFailureDecision::RequestRetry
     }
 }
 

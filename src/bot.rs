@@ -1349,6 +1349,40 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         self
     }
 
+    /// Configure the synchronous retry admission policy before services start.
+    /// The last registration wins.
+    pub fn with_retry_admission<A: crate::RetryAdmission + 'static>(mut self, policy: A) -> Self {
+        self.client_builder = self.client_builder.with_retry_admission(policy);
+        self
+    }
+
+    /// Share a policy across clients. The last registration wins.
+    pub fn with_retry_admission_arc(mut self, policy: Arc<dyn crate::RetryAdmission>) -> Self {
+        self.client_builder = self.client_builder.with_retry_admission_arc(policy);
+        self
+    }
+
+    /// Configure the synchronous decrypt failure admission policy before services start.
+    /// The last registration wins.
+    pub fn with_decrypt_failure_admission<A: crate::DecryptFailureAdmission + 'static>(
+        mut self,
+        policy: A,
+    ) -> Self {
+        self.client_builder = self.client_builder.with_decrypt_failure_admission(policy);
+        self
+    }
+
+    /// Share a policy across clients. The last registration wins.
+    pub fn with_decrypt_failure_admission_arc(
+        mut self,
+        policy: Arc<dyn crate::DecryptFailureAdmission>,
+    ) -> Self {
+        self.client_builder = self
+            .client_builder
+            .with_decrypt_failure_admission_arc(policy);
+        self
+    }
+
     /// Pace first and reconnect run-loop dials with a synchronous host policy.
     /// See [`ConnectAdmission`] for cancellation and reservation limits.
     pub fn with_connect_admission<A>(mut self, admission: A) -> Self
@@ -2383,6 +2417,47 @@ mod tests {
             client.history_sync_capture_hook.get().unwrap(),
             &hook
         ));
+    }
+
+    #[tokio::test]
+    async fn retry_policies_survive_bot_typestate_transitions() {
+        struct Policy;
+        impl crate::RetryAdmission for Policy {
+            fn decide(&self, _: &crate::RetryContext<'_>) -> crate::RetryDecision {
+                crate::RetryDecision::Accept
+            }
+        }
+        impl crate::DecryptFailureAdmission for Policy {
+            fn decide(
+                &self,
+                _: &crate::DecryptFailureContext<'_>,
+            ) -> crate::DecryptFailureDecision {
+                crate::DecryptFailureDecision::RequestRetry
+            }
+        }
+        let retry: Arc<dyn crate::RetryAdmission> = Arc::new(Policy);
+        let decrypt: Arc<dyn crate::DecryptFailureAdmission> = Arc::new(Policy);
+        let bot = Bot::builder()
+            .with_retry_admission(Policy)
+            .with_decrypt_failure_admission(Policy)
+            .with_retry_admission_arc(retry.clone())
+            .with_decrypt_failure_admission_arc(decrypt.clone())
+            .with_backend_arc(create_test_sqlite_backend().await)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            bot.client().retry_admission.as_ref().unwrap(),
+            &retry
+        ));
+        assert!(Arc::ptr_eq(
+            bot.client().decrypt_failure_admission.as_ref().unwrap(),
+            &decrypt
+        ));
+        bot.client().shutdown().await;
     }
 
     #[tokio::test]

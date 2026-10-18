@@ -4,7 +4,13 @@ use anyhow::Result;
 use std::sync::Arc;
 use wacore_binary::Node;
 
-/// Trait for handling custom encrypted message types.
+/// Handle custom encrypted payload types registered through the client/bot builder.
+///
+/// Handlers run in detached runtime tasks. An error is logged; it does not
+/// trigger a built-in retry, nack or transport ack. For a custom-only envelope,
+/// the handler owns the response. Mixed envelopes may still be acknowledged
+/// by the built-in payload path. This is not an inbound durability hook and
+/// completion is not part of the plugin host's tracked-task drain.
 ///
 /// Mirrors the wasm-portability convention of the sibling extension points
 /// (EventHandler, SendContextResolver): the `MaybeSendSync` supertrait keeps the
@@ -96,7 +102,7 @@ mod tests {
         assert!(
             bot.client()
                 .custom_enc_handlers
-                .get()
+                .as_ref()
                 .unwrap()
                 .contains_key("frskmsg")
         );
@@ -127,7 +133,7 @@ mod tests {
 
         // Verify both handlers were registered
         let client = bot.client();
-        let handlers = client.custom_enc_handlers.get().unwrap();
+        let handlers = client.custom_enc_handlers.as_ref().unwrap();
         assert!(handlers.contains_key("frskmsg"));
         assert!(handlers.contains_key("customtype"));
         assert_eq!(handlers.len(), 2);
@@ -152,6 +158,6 @@ mod tests {
             .expect("Failed to build bot");
 
         // Keep the hot-path map unallocated when no extension uses it.
-        assert!(bot.client().custom_enc_handlers.get().is_none());
+        assert!(bot.client().custom_enc_handlers.as_ref().is_none());
     }
 }

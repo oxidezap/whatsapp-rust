@@ -5,7 +5,7 @@
 //! whose sessions never establish can retry on every message, driving the
 //! repair path (markForgetSenderKey, key-bundle processing, resend) at storm
 //! rate. That cost only shows up at bot send volume, so the policy lives here in
-//! the bot rather than in the SDK: the core stays WA Web compliant, and this
+//! the bot rather than in the SDK: the core retains its default behavior, and this
 //! opt-in bounds the storm for deployments that want it.
 //!
 //! This mirrors the mechanism proposed in oxidezap/whatsapp-rust#982 by
@@ -96,7 +96,7 @@ impl RetryQuarantine {
     }
 }
 
-impl RetryAdmission for RetryQuarantine {
+impl RetryQuarantine {
     fn admit(&self, chat: &Jid, requester: &Jid, _retry_count: u8) -> bool {
         if self.burst == 0.0 {
             return true;
@@ -125,6 +125,16 @@ impl RetryAdmission for RetryQuarantine {
     }
 }
 
+impl RetryAdmission for RetryQuarantine {
+    fn decide(&self, context: &whatsapp_rust::RetryContext<'_>) -> whatsapp_rust::RetryDecision {
+        if self.admit(context.chat, context.requester, context.retry_count) {
+            whatsapp_rust::RetryDecision::Accept
+        } else {
+            whatsapp_rust::RetryDecision::Drop
+        }
+    }
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -142,7 +152,10 @@ fn main() {
             }
         };
 
+        // Share the budget before construction; atomics inside the policy allow live tuning.
+        let quarantine = Arc::new(RetryQuarantine::new(2, 2, 32_768));
         let bot = match Bot::builder()
+            .with_retry_admission_arc(quarantine.clone())
             .with_backend(store)
             .on_qr_code(|code, _timeout| async move {
                 info!("scan to pair:\n{code}");
@@ -159,15 +172,6 @@ fn main() {
                 return;
             }
         };
-
-        // Opt in before connecting. Without this call the client keeps its
-        // default behavior (every retry receipt admitted, matching WA Web).
-        // burst 2, refill 2/day, up to 32768 tracked pairs.
-        let quarantine = Arc::new(RetryQuarantine::new(2, 2, 32_768));
-        if !bot.client().set_retry_admission(quarantine.clone()) {
-            error!("retry admission policy was already set");
-            return;
-        }
 
         bot.run().await;
         info!(

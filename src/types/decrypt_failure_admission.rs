@@ -1,39 +1,37 @@
 use wacore_binary::Jid;
 
-/// Opt-in policy that decides whether a message we failed to decrypt gets an
-/// outbound retry receipt, or is acked and dropped without one.
+/// Borrowed metadata for an eligible automatic decrypt-failure retry.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug)]
+pub struct DecryptFailureContext<'a> {
+    pub chat: &'a Jid,
+    pub sender: &'a Jid,
+    /// Attempt number after per-message accounting, including refused attempts.
+    pub retry_count: u8,
+}
+
+/// Result of [`DecryptFailureAdmission::decide`].
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecryptFailureDecision {
+    RequestRetry,
+    /// Skip the retry receipt, but transport-acknowledge and emit the
+    /// undecryptable event. The first-attempt phone recovery still runs.
+    AcknowledgeWithoutRetry,
+}
+
+/// Synchronous, operator-owned gate on automatic outbound retry receipts.
 ///
-/// By default every decrypt failure asks the sender to re-encrypt, capped at
-/// `MAX_DECRYPT_RETRIES` per message id, matching WhatsApp Web. That cap is per
-/// message, not per sender: a cohort of senders whose sessions with us are
-/// broken makes every one of their messages fail, so in a large, busy group the
-/// retry receipts we emit scale with the group's message volume. A bot account
-/// emitting retry receipts at that rate has been locked by the server.
+/// Configure through `ClientBuilder::with_decrypt_failure_admission` or
+/// `BotBuilder::with_decrypt_failure_admission`. Without a policy, eligible
+/// decrypt failures request a retry up to the per-message cap. Own messages,
+/// explicit retry requests, permanently suppressed bot retries and attempts
+/// past the cap bypass this policy and never consume its budget.
 ///
-/// A `DecryptFailureAdmission` policy is the seam for bot-scale deployments
-/// that want to bound that outbound volume (e.g. a token bucket per sender),
-/// without the SDK itself diverging from WA Web. Leaving it unset keeps the
-/// default behavior; the check is a single [`std::sync::OnceLock::get`].
-///
-/// When the policy returns `false`, the retry receipt is skipped but the
-/// stanza is still transport-acked, so the server stops redelivering it. The
-/// `UndecryptableMessage` event is dispatched either way. A dropped message is
-/// not requested again, so a policy should refill over time to keep genuine
-/// recovery possible. A refused first attempt still sends the one-shot PDO
-/// request to our primary phone, as the default path does.
-///
-/// [`admit`](DecryptFailureAdmission::admit) runs inline on the receive path:
-/// it must be a fast, local decision with no I/O or blocking.
-///
-/// Scope: consulted only on the automatic decrypt-failure path, for messages
-/// from other accounts, after the per-message cap: redeliveries already past
-/// `MAX_DECRYPT_RETRIES` never reach the policy. Our own devices' messages
-/// (`is_from_me`) and explicit retry requests are never consulted either.
+/// Make a fast local decision without I/O or blocking. Refusal still consumes
+/// a per-message attempt, retains first-attempt phone recovery and acknowledges
+/// the stanza. The server therefore stops redelivering it; refusal can lose
+/// recovery of this message. Live tuning belongs inside the policy.
 pub trait DecryptFailureAdmission: wacore::sync_marker::MaybeSendSync {
-    /// Return `true` to send the retry receipt (default behavior), `false` to
-    /// ack the stanza without one.
-    ///
-    /// `chat` is the conversation the message arrived in (the group, or the
-    /// peer for a DM) and `sender` the sending device.
-    fn admit(&self, chat: &Jid, sender: &Jid) -> bool;
+    fn decide(&self, context: &DecryptFailureContext<'_>) -> DecryptFailureDecision;
 }

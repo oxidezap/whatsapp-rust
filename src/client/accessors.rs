@@ -48,15 +48,8 @@ impl Client {
     /// [`ClientBuilder::with_enc_handler`] or [`ClientBuilder::with_enc_handler_arc`].
     pub fn has_enc_handler(&self, payload_type: &str) -> bool {
         self.custom_enc_handlers
-            .get()
+            .as_ref()
             .is_some_and(|handlers| handlers.contains_key(payload_type))
-    }
-
-    pub(crate) fn install_enc_handlers(
-        &self,
-        handlers: HashMap<String, Arc<dyn EncHandler>>,
-    ) -> bool {
-        self.custom_enc_handlers.set(handlers).is_ok()
     }
 
     pub(crate) fn initialized_group_cache(&self) -> Option<&Arc<GroupCache>> {
@@ -337,39 +330,6 @@ impl Client {
     /// bucket on its next access.
     pub fn set_resend_rate_limit(&self, burst: u32, refill_per_min: u32) {
         self.resend_rate_limiter.set_rate(burst, refill_per_min);
-    }
-
-    /// Register a [`RetryAdmission`] policy: an opt-in gate that can drop inbound
-    /// group/status retry receipts from other accounts before any repair work
-    /// runs. Unset (the default) admits every receipt, matching WhatsApp Web,
-    /// with zero overhead on the receive path.
-    ///
-    /// Set once, before connecting; a later call is ignored and returns `false`
-    /// (the already-registered policy stays in effect). Live tuning belongs
-    /// inside the policy itself (e.g. atomics), not in re-registration. See
-    /// `examples/retry_quarantine.rs`.
-    ///
-    /// [`RetryAdmission`]: crate::types::retry_admission::RetryAdmission
-    pub fn set_retry_admission(
-        &self,
-        policy: Arc<dyn crate::types::retry_admission::RetryAdmission>,
-    ) -> bool {
-        self.retry_admission.set(policy).is_ok()
-    }
-
-    /// Register a [`DecryptFailureAdmission`] policy: an opt-in gate that can
-    /// skip the outbound retry receipt for a message we failed to decrypt. The
-    /// stanza is still acked and `UndecryptableMessage` still dispatched. Unset
-    /// (the default) requests a retry for every failure, matching WhatsApp Web.
-    ///
-    /// Set once, before connecting; a later call is ignored and returns `false`.
-    ///
-    /// [`DecryptFailureAdmission`]: crate::types::decrypt_failure_admission::DecryptFailureAdmission
-    pub fn set_decrypt_failure_admission(
-        &self,
-        policy: Arc<dyn crate::types::decrypt_failure_admission::DecryptFailureAdmission>,
-    ) -> bool {
-        self.decrypt_failure_admission.set(policy).is_ok()
     }
 
     /// Cumulative wire I/O and activity counters for this client session.
@@ -666,7 +626,7 @@ impl Client {
                 plugin_event_router.queued_payload_bytes,
             ),
             chatstate_handlers,
-            custom_enc_handlers: self.custom_enc_handlers.get().map_or(0, |m| m.len()),
+            custom_enc_handlers: self.custom_enc_handlers.as_ref().map_or(0, |m| m.len()),
             stanza_interceptors: self.stanza_interceptors().len(),
             core_event_handlers: self.core.event_bus.memory_stats(),
         }

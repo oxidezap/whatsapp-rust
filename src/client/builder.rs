@@ -192,6 +192,8 @@ pub struct ClientBuilder {
     group_notification_durability_hook: Option<Arc<dyn GroupNotificationDurabilityHook>>,
     history_sync_admission: Option<Arc<dyn HistorySyncAdmission>>,
     connect_admission: Option<Arc<dyn ConnectAdmission>>,
+    retry_admission: Option<Arc<dyn crate::RetryAdmission>>,
+    decrypt_failure_admission: Option<Arc<dyn crate::DecryptFailureAdmission>>,
     task_instrument: Option<Arc<dyn wacore::stats::TaskInstrument>>,
     alloc_meter: Option<Arc<wacore::stats::AllocMeter>>,
     #[cfg(feature = "client-lifecycle")]
@@ -228,6 +230,8 @@ impl ClientBuilder {
             group_notification_durability_hook: None,
             history_sync_admission: None,
             connect_admission: None,
+            retry_admission: None,
+            decrypt_failure_admission: None,
             task_instrument: None,
             alloc_meter: None,
             #[cfg(feature = "client-lifecycle")]
@@ -448,6 +452,36 @@ impl ClientBuilder {
         admission: Arc<dyn HistorySyncAdmission>,
     ) -> Self {
         self.history_sync_admission = Some(admission);
+        self
+    }
+
+    /// Configure the synchronous retry admission policy before services start.
+    /// The last registration wins. Live tuning belongs inside the policy.
+    pub fn with_retry_admission<A: crate::RetryAdmission + 'static>(self, policy: A) -> Self {
+        self.with_retry_admission_arc(Arc::new(policy))
+    }
+
+    /// Share a policy across clients. The last registration wins.
+    pub fn with_retry_admission_arc(mut self, policy: Arc<dyn crate::RetryAdmission>) -> Self {
+        self.retry_admission = Some(policy);
+        self
+    }
+
+    /// Configure the synchronous decrypt failure admission policy before services start.
+    /// The last registration wins. Live tuning belongs inside the policy.
+    pub fn with_decrypt_failure_admission<A: crate::DecryptFailureAdmission + 'static>(
+        self,
+        policy: A,
+    ) -> Self {
+        self.with_decrypt_failure_admission_arc(Arc::new(policy))
+    }
+
+    /// Share a policy across clients. The last registration wins.
+    pub fn with_decrypt_failure_admission_arc(
+        mut self,
+        policy: Arc<dyn crate::DecryptFailureAdmission>,
+    ) -> Self {
+        self.decrypt_failure_admission = Some(policy);
         self
     }
 
@@ -733,6 +767,10 @@ impl ClientBuilder {
                 noise_cert_policy: options.noise_cert_policy,
                 history_sync_admission: self.history_sync_admission,
                 connect_admission: self.connect_admission,
+                custom_enc_handlers: (!self.custom_enc_handlers.is_empty())
+                    .then_some(self.custom_enc_handlers),
+                retry_admission: self.retry_admission,
+                decrypt_failure_admission: self.decrypt_failure_admission,
             },
         );
         let client = assembly.client();
@@ -767,17 +805,14 @@ impl ClientBuilder {
         #[cfg(feature = "client-lifecycle")]
         let mut construction = ClientConstructionGuard::new(Arc::clone(&client));
 
-        if !self.custom_enc_handlers.is_empty() {
-            let _ = client.install_enc_handlers(self.custom_enc_handlers);
-        }
         if let Some(hook) = self.inbound_durability_hook {
             let _ = client.inbound_durability_hook.set(hook);
         }
-        if let Some(hook) = self.group_notification_durability_hook {
-            let _ = client.group_notification_durability_hook.set(hook);
-        }
         if let Some(hook) = self.history_sync_capture_hook {
             let _ = client.history_sync_capture_hook.set(hook);
+        }
+        if let Some(hook) = self.group_notification_durability_hook {
+            let _ = client.group_notification_durability_hook.set(hook);
         }
         if options.skip_history_sync {
             client.set_skip_history_sync(true);
@@ -1007,6 +1042,10 @@ impl Drop for ClientConstructionGuard {
 
 #[derive(Default)]
 pub(super) struct ClientExtensions {
+    pub(super) custom_enc_handlers: Option<HashMap<String, Arc<dyn EncHandler>>>,
+    pub(super) retry_admission: Option<Arc<dyn crate::RetryAdmission>>,
+    pub(super) decrypt_failure_admission: Option<Arc<dyn crate::DecryptFailureAdmission>>,
+
     #[cfg(feature = "client-lifecycle")]
     pub(super) lifecycle: Option<Arc<LifecycleRegistration>>,
     #[cfg(feature = "plugins")]
@@ -1234,6 +1273,44 @@ mod tests {
             .with_persistence_manager(persistence_manager)
             .with_transport_factory(MockTransportFactory::new())
             .with_http_client(MockHttpClient)
+    }
+
+    struct RetryPolicy;
+    impl crate::RetryAdmission for RetryPolicy {
+        fn decide(&self, _: &crate::RetryContext<'_>) -> crate::RetryDecision {
+            crate::RetryDecision::Drop
+        }
+    }
+    struct DecryptPolicy;
+    impl crate::DecryptFailureAdmission for DecryptPolicy {
+        fn decide(&self, _: &crate::DecryptFailureContext<'_>) -> crate::DecryptFailureDecision {
+            crate::DecryptFailureDecision::AcknowledgeWithoutRetry
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_policies_are_assembled_with_last_registration_winning() {
+        let retry: Arc<dyn crate::RetryAdmission> = Arc::new(RetryPolicy);
+        let decrypt: Arc<dyn crate::DecryptFailureAdmission> = Arc::new(DecryptPolicy);
+        let client = complete_builder()
+            .await
+            .with_retry_admission(RetryPolicy)
+            .with_retry_admission_arc(retry.clone())
+            .with_decrypt_failure_admission(DecryptPolicy)
+            .with_decrypt_failure_admission_arc(decrypt.clone())
+            .build()
+            .await
+            .unwrap()
+            .into_client();
+        assert!(Arc::ptr_eq(
+            client.retry_admission.as_ref().unwrap(),
+            &retry
+        ));
+        assert!(Arc::ptr_eq(
+            client.decrypt_failure_admission.as_ref().unwrap(),
+            &decrypt
+        ));
+        client.shutdown().await;
     }
 
     #[tokio::test]

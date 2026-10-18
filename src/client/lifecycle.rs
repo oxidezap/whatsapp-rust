@@ -520,6 +520,9 @@ impl Client {
             lifecycle,
             #[cfg(feature = "plugins")]
             plugin_host,
+            custom_enc_handlers,
+            retry_admission,
+            decrypt_failure_admission,
             noise_cert_policy,
             history_sync_admission,
             connect_admission,
@@ -735,12 +738,12 @@ impl Client {
             app_state_key_share_prepare_test_failures: AtomicU32::new(0),
             #[cfg(test)]
             chatstate_events_built: AtomicU32::new(0),
-            custom_enc_handlers: std::sync::OnceLock::new(),
+            custom_enc_handlers,
             inbound_durability_hook: std::sync::OnceLock::new(),
             history_sync_capture_hook: std::sync::OnceLock::new(),
             group_notification_durability_hook: std::sync::OnceLock::new(),
-            retry_admission: std::sync::OnceLock::new(),
-            decrypt_failure_admission: std::sync::OnceLock::new(),
+            retry_admission,
+            decrypt_failure_admission,
             history_sync_admission,
             connect_admission,
             chatstate_handler_count: Arc::new(AtomicUsize::new(0)),
@@ -2925,6 +2928,7 @@ mod tests {
                     noise_cert_policy: wacore::handshake::NoiseCertPolicy::default(),
                     history_sync_admission: None,
                     connect_admission: None,
+                    ..Default::default()
                 },
             )
         };

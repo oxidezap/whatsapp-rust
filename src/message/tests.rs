@@ -5857,6 +5857,16 @@ async fn capturing_client_with_cache_config(
     Arc<Client>,
     Arc<crate::transport::mock::CapturingMockTransport>,
 ) {
+    capturing_client_configured(test_id, |builder| builder.with_cache_config(cache_config)).await
+}
+
+async fn capturing_client_configured(
+    test_id: &str,
+    configure: impl FnOnce(crate::client::ClientBuilder) -> crate::client::ClientBuilder,
+) -> (
+    Arc<Client>,
+    Arc<crate::transport::mock::CapturingMockTransport>,
+) {
     use crate::socket::NoiseSocket;
     use crate::store::SqliteStore;
     use crate::store::persistence_manager::PersistenceManager;
@@ -5886,16 +5896,17 @@ async fn capturing_client_with_cache_config(
     );
     let factory = CapturingMockTransportFactory::new();
     let transport = factory.transport();
-    let (client, _sync_rx) = Client::builder()
-        .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
-        .with_persistence_manager(pm)
-        .with_transport_factory_arc(Arc::new(factory))
-        .with_http_client_arc(Arc::new(MockHttpClient))
-        .with_cache_config(cache_config)
-        .build()
-        .await
-        .expect("test client should build")
-        .into_parts();
+    let (client, _sync_rx) = configure(
+        Client::builder()
+            .with_runtime_arc(Arc::new(crate::runtime_impl::TokioRuntime))
+            .with_persistence_manager(pm)
+            .with_transport_factory_arc(Arc::new(factory))
+            .with_http_client_arc(Arc::new(MockHttpClient)),
+    )
+    .build()
+    .await
+    .expect("test client should build")
+    .into_parts();
 
     let key = [0u8; 32];
     let write_key = NoiseCipher::new(&key).expect("32-byte key");
@@ -9662,21 +9673,14 @@ async fn custom_handler_only_skips_fallback_ack() {
         }
     }
 
-    let (client, transport) = capturing_client("msmsg_custom").await;
     let calls = Arc::new(AsyncMutex::new(0usize));
     let handler = Arc::new(NoopHandler {
         calls: Arc::clone(&calls),
     });
-    // custom_enc_handlers is set-once (immutable after build); capturing_client
-    // builds via Client::builder and leaves it unset, so set it here.
-    let mut handlers = HashMap::new();
-    handlers.insert("frskmsg".to_string(), handler as Arc<dyn EncHandler>);
-    // set() returns Err(map) on the already-set path; the map isn't Debug, so
-    // assert via is_ok() rather than expect().
-    assert!(
-        client.custom_enc_handlers.set(handlers).is_ok(),
-        "custom_enc_handlers not yet set"
-    );
+    let (client, transport) = capturing_client_configured("msmsg_custom", |builder| {
+        builder.with_enc_handler_arc("frskmsg", handler)
+    })
+    .await;
 
     let node = NodeBuilder::new("message")
         .attr("from", "5511777776666@s.whatsapp.net")
@@ -17296,11 +17300,18 @@ impl PdoRetryFixture {
     const ID: &'static str = "SYNTHETIC_SELF_PING";
 
     async fn new() -> Self {
+        Self::configured(|builder| builder).await
+    }
+
+    async fn configured(
+        configure: impl FnOnce(crate::ClientBuilder) -> crate::ClientBuilder,
+    ) -> Self {
         use buffa::Message as _;
         use wacore::messages::{MessageUtils, wrap_device_sent};
         use wacore::types::events::ChannelEventHandler;
 
-        let (client, transport) = capturing_client("pdo_pairwise_retry").await;
+        let (client, transport) =
+            capturing_client_configured("pdo_pairwise_retry", configure).await;
         client
             .persistence_manager
             .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
@@ -22855,12 +22866,16 @@ struct FixedDecryptFailureAdmission {
 }
 
 impl crate::DecryptFailureAdmission for FixedDecryptFailureAdmission {
-    fn admit(&self, chat: &Jid, sender: &Jid) -> bool {
+    fn decide(&self, context: &crate::DecryptFailureContext<'_>) -> crate::DecryptFailureDecision {
         self.calls
             .lock()
             .expect("calls lock")
-            .push((chat.clone(), sender.clone()));
-        self.verdict
+            .push((context.chat.clone(), context.sender.clone()));
+        if self.verdict {
+            crate::DecryptFailureDecision::RequestRetry
+        } else {
+            crate::DecryptFailureDecision::AcknowledgeWithoutRetry
+        }
     }
 }
 
@@ -22878,17 +22893,23 @@ async fn run_decrypt_failure_with_policy(
     verdict: Option<bool>,
     is_from_me: bool,
 ) -> DecryptFailureOutcome {
-    let (client, transport) = capturing_client(test_id).await;
     let recorder = Arc::new(EventRecorder::default());
-    client.subscribe_handler(recorder.clone()).detach();
     let policy = verdict.map(|verdict| {
-        let policy = Arc::new(FixedDecryptFailureAdmission {
+        Arc::new(FixedDecryptFailureAdmission {
             verdict,
             calls: std::sync::Mutex::new(Vec::new()),
-        });
-        assert!(client.set_decrypt_failure_admission(policy.clone()));
-        policy
+        })
     });
+
+    let (client, transport) = capturing_client_configured(test_id, |builder| {
+        if let Some(policy) = &policy {
+            builder.with_decrypt_failure_admission_arc(policy.clone())
+        } else {
+            builder
+        }
+    })
+    .await;
+    client.subscribe_handler(recorder.clone()).detach();
 
     let sender: Jid = "5511777776666@s.whatsapp.net".parse().expect("sender");
     let info = Arc::new(MessageInfo {
@@ -22974,30 +22995,19 @@ async fn decrypt_failure_admission_skips_own_messages() {
     assert!(out.retry_sent);
 }
 
-#[tokio::test]
-async fn decrypt_failure_admission_registers_once() {
-    let (client, _transport) = capturing_client("dfa_once").await;
-    let policy = || {
-        Arc::new(FixedDecryptFailureAdmission {
-            verdict: true,
-            calls: std::sync::Mutex::new(Vec::new()),
-        })
-    };
-    assert!(client.set_decrypt_failure_admission(policy()));
-    assert!(!client.set_decrypt_failure_admission(policy()));
-}
-
 /// The policy is consulted only while the per-message cap still allows a
 /// retry: capped redeliveries go straight to the PDO fallback without
 /// spending admission budget.
 #[tokio::test]
 async fn decrypt_failure_admission_not_consulted_past_cap() {
-    let (client, _transport) = capturing_client("dfa_cap").await;
     let policy = Arc::new(FixedDecryptFailureAdmission {
         verdict: false,
         calls: std::sync::Mutex::new(Vec::new()),
     });
-    assert!(client.set_decrypt_failure_admission(policy.clone()));
+    let (client, _transport) = capturing_client_configured("dfa_cap", |b| {
+        b.with_decrypt_failure_admission_arc(policy.clone())
+    })
+    .await;
     let sender: Jid = "5511777776666@s.whatsapp.net".parse().expect("sender");
     let info = Arc::new(MessageInfo {
         id: "DFACAP".into(),
@@ -23025,15 +23035,17 @@ async fn decrypt_failure_admission_not_consulted_past_cap() {
 /// retry paths.
 async fn decrypt_failure_ack_recipient(test_id: &str, verdict: Option<bool>) -> Option<String> {
     use crate::types::events::DecryptFailMode;
-    let (client, transport) = capturing_client(test_id).await;
-    if let Some(verdict) = verdict {
-        assert!(
-            client.set_decrypt_failure_admission(Arc::new(FixedDecryptFailureAdmission {
+    let (client, transport) = capturing_client_configured(test_id, |builder| {
+        if let Some(verdict) = verdict {
+            builder.with_decrypt_failure_admission(FixedDecryptFailureAdmission {
                 verdict,
                 calls: std::sync::Mutex::new(Vec::new()),
-            }))
-        );
-    }
+            })
+        } else {
+            builder
+        }
+    })
+    .await;
     let sender_ratchet = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>()).public_key;
     let sender_identity = IdentityKeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
     let receiver_identity = IdentityKeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
@@ -23107,12 +23119,14 @@ async fn decrypt_failure_refused_ack_preserves_stanza_recipient() {
 #[tokio::test]
 async fn decrypt_failure_admission_skips_suppressed_bot_retries() {
     use crate::types::events::DecryptFailMode;
-    let (client, _transport) = capturing_client("dfa_bot").await;
     let policy = Arc::new(FixedDecryptFailureAdmission {
         verdict: true,
         calls: std::sync::Mutex::new(Vec::new()),
     });
-    assert!(client.set_decrypt_failure_admission(policy.clone()));
+    let (client, _transport) = capturing_client_configured("dfa_bot", |b| {
+        b.with_decrypt_failure_admission_arc(policy.clone())
+    })
+    .await;
     let bot: Jid = "200000000000002@bot".parse().expect("bot");
     let group_bot = Arc::new(MessageInfo {
         id: "DFABOTGRP".into(),
@@ -23147,5 +23161,159 @@ async fn decrypt_failure_admission_skips_suppressed_bot_retries() {
     assert_eq!(
         *policy.calls.lock().expect("calls lock"),
         vec![(bot.clone(), bot)]
+    );
+}
+
+#[tokio::test]
+async fn decrypt_failure_admission_explicit_requests_bypass_policy() {
+    let policy = Arc::new(FixedDecryptFailureAdmission {
+        verdict: false,
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    let (client, _) = capturing_client_configured("dfa_explicit", |b| {
+        b.with_decrypt_failure_admission_arc(policy.clone())
+    })
+    .await;
+    let node = NodeBuilder::new("message")
+        .attr("id", "EXPLICIT-POLICY-BYPASS")
+        .attr("from", "12025550111:7@s.whatsapp.net")
+        .attr("type", "text")
+        .build();
+    let result = client
+        .request_message_retry(
+            &node.as_node_ref(),
+            crate::features::RetryRequestOptions::new().with_reason(RetryReason::BadMac),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        result,
+        crate::features::RetryRequestOutcome::Sent { retry_count: 1, .. }
+    ));
+    assert!(policy.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn decrypt_failure_admission_first_refusal_keeps_one_phone_recovery() {
+    let policy = Arc::new(FixedDecryptFailureAdmission {
+        verdict: false,
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    let fixture =
+        PdoRetryFixture::configured(|b| b.with_decrypt_failure_admission_arc(policy.clone())).await;
+    let mut info = fixture
+        .client
+        .parse_message_info(fixture.failed_group.get())
+        .await
+        .unwrap();
+    // Exercise an incoming failure with the fixture's established phone session.
+    info.source.is_from_me = false;
+    let info = Arc::new(info);
+    let key = wacore::types::message::ChatMessageId::new(info.source.chat.clone(), info.id.clone());
+    fixture.client.pdo_pending_requests.remove(&key).await;
+    assert!(
+        fixture
+            .client
+            .run_retry_receipt(&info, RetryReason::BadMac, DecryptFailMode::Show)
+            .await
+    );
+    let request = fixture
+        .client
+        .pdo_pending_requests
+        .get(&key)
+        .await
+        .expect("first refusal still requests phone recovery")
+        .1
+        .request_id
+        .clone();
+    assert!(
+        fixture
+            .client
+            .run_retry_receipt(&info, RetryReason::BadMac, DecryptFailMode::Show)
+            .await
+    );
+    assert_eq!(
+        fixture
+            .client
+            .pdo_pending_requests
+            .get(&key)
+            .await
+            .unwrap()
+            .1
+            .request_id,
+        request
+    );
+    assert!(
+        retry_receipt_key_bundles_for(&fixture.transport.sent(), PdoRetryFixture::ID).is_empty()
+    );
+    assert_eq!(policy.calls.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn retry_admission_only_consults_eligible_remote_sender_key_receipts() {
+    struct Policy(std::sync::Mutex<Vec<(Jid, Jid, u8)>>);
+    impl crate::RetryAdmission for Policy {
+        fn decide(&self, context: &crate::RetryContext<'_>) -> crate::RetryDecision {
+            self.0.lock().unwrap().push((
+                context.chat.clone(),
+                context.requester.clone(),
+                context.retry_count,
+            ));
+            crate::RetryDecision::Drop
+        }
+    }
+    let policy = Arc::new(Policy(std::sync::Mutex::new(Vec::new())));
+    let (client, transport) = capturing_client_configured("retry_admission", |b| {
+        b.with_retry_admission_arc(policy.clone())
+    })
+    .await;
+    let group: Jid = "120363000000000071@g.us".parse().unwrap();
+    let remote: Jid = "777000000000103@lid".parse().unwrap();
+    let own = client
+        .persistence_manager
+        .get_device_snapshot()
+        .pn
+        .as_ref()
+        .unwrap()
+        .clone();
+    for (chat, participant, count) in [
+        (group.clone(), Some(remote.clone()), 1u8),
+        ("status@broadcast".parse().unwrap(), Some(remote.clone()), 2),
+        (remote.clone(), None, 1),
+        (group.clone(), Some(own), 1),
+        (group.clone(), Some(remote.clone()), 255),
+    ] {
+        let mut builder = NodeBuilder::new("receipt").children([NodeBuilder::new("retry")
+            .attr("id", "POLICY-ROUTE")
+            .attr("count", count)
+            .build()]);
+        if let Some(participant) = &participant {
+            builder = builder.attr("participant", participant);
+        }
+        let node = node_to_arc(builder.build());
+        let receipt = wacore::types::events::Receipt::builder()
+            .source(crate::types::message::MessageSource {
+                chat: chat.clone(),
+                sender: participant.unwrap_or(chat.clone()),
+                is_group: chat.is_group(),
+                ..Default::default()
+            })
+            .message_ids(vec!["POLICY-ROUTE".into()])
+            .timestamp(wacore::time::now_utc())
+            .r#type(crate::types::presence::ReceiptType::Retry)
+            .offline(false)
+            .build();
+        client.handle_retry_receipt(&receipt, &node).await.unwrap();
+    }
+    assert_eq!(
+        *policy.0.lock().unwrap(),
+        vec![
+            (group, remote.clone(), 1),
+            ("status@broadcast".parse().unwrap(), remote, 2)
+        ]
+    );
+    assert!(
+        transport.sent().is_empty(),
+        "refusal and missing-cache bypasses do not resend"
     );
 }

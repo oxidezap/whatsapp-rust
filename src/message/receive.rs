@@ -387,7 +387,7 @@ impl Client {
         // Custom enc handlers are set once at Bot::build and immutable after, so
         // read the map lock-free once instead of acquiring an async RwLock guard
         // per enc node. `None` (the common zero-handler bot) skips the lookup.
-        let custom_enc_handlers = self.custom_enc_handlers.get();
+        let custom_enc_handlers = self.custom_enc_handlers.as_ref();
 
         for (enc_index, enc_node) in all_enc_nodes.iter().enumerate() {
             max_sender_retry_count = max_sender_retry_count.max(sender_retry_count(enc_node));

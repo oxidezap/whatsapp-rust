@@ -2109,10 +2109,9 @@ pub struct Client {
     /// `agent_docs/architecture.md`.
     pub(crate) subsystems: subsystem::Subsystems,
 
-    /// Custom handlers for encrypted message types. Set once at `Bot::build` and
-    /// immutable afterward, so the receive hot path reads it with a plain
-    /// `OnceLock::get` (no lock) and no per-node guard acquisition.
-    pub(crate) custom_enc_handlers: std::sync::OnceLock<HashMap<String, Arc<dyn EncHandler>>>,
+    /// Custom encrypted-payload handlers, fixed during assembly.
+    /// An absent map skips lookups on the receive path.
+    pub(crate) custom_enc_handlers: Option<HashMap<String, Arc<dyn EncHandler>>>,
 
     /// Optional inbound durability hook. When set, the transport ack for a
     /// decrypted user message is deferred until the hook commits it, converting
@@ -2130,19 +2129,11 @@ pub struct Client {
     pub(crate) history_sync_capture_hook:
         std::sync::OnceLock<Arc<dyn crate::types::durability_hook::HistorySyncCaptureHook>>,
 
-    /// Optional retry-receipt admission policy (see
-    /// [`crate::types::retry_admission::RetryAdmission`]): an operator opt-in to
-    /// drop some group/status retries. `None` (default) keeps WA Web behavior
-    /// with a single lock-free `OnceLock::get` on the receive path.
-    pub(crate) retry_admission:
-        std::sync::OnceLock<Arc<dyn crate::types::retry_admission::RetryAdmission>>,
+    /// Optional retry admission, fixed during assembly.
+    pub(crate) retry_admission: Option<Arc<dyn crate::RetryAdmission>>,
 
-    /// Optional outbound retry-receipt admission policy (see
-    /// [`crate::types::decrypt_failure_admission::DecryptFailureAdmission`]).
-    /// `None` (default) requests a retry for every decrypt failure.
-    pub(crate) decrypt_failure_admission: std::sync::OnceLock<
-        Arc<dyn crate::types::decrypt_failure_admission::DecryptFailureAdmission>,
-    >,
+    /// Optional decrypt failure admission, fixed during assembly.
+    pub(crate) decrypt_failure_admission: Option<Arc<dyn crate::DecryptFailureAdmission>>,
 
     /// Optional run-loop dial admission policy, fixed during assembly.
     pub(crate) connect_admission:

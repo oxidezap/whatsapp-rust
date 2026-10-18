@@ -501,13 +501,15 @@ pub use client::{
 };
 pub use client::{NodeFilter, NodeWaiter};
 pub use types::connect_admission::ConnectAdmission;
-pub use types::decrypt_failure_admission::DecryptFailureAdmission;
+pub use types::decrypt_failure_admission::{
+    DecryptFailureAdmission, DecryptFailureContext, DecryptFailureDecision,
+};
 pub use types::durability_hook::{HistorySyncCaptureHook, InboundDurabilityHook};
 pub use types::group_notification_durability::GroupNotificationDurabilityHook;
 pub use types::history_sync_admission::{
     HistorySyncAdmission, HistorySyncDecision, HistorySyncMetadata,
 };
-pub use types::retry_admission::RetryAdmission;
+pub use types::retry_admission::{RetryAdmission, RetryContext, RetryDecision};
 pub mod download;
 pub mod error;
 pub use error::{ErrorChainExt, ServerRejection, Sources};
