@@ -152,7 +152,7 @@ fn main() {
             }
         };
 
-        // Share the budget before construction; atomics inside the policy allow live tuning.
+        // Retain a handle to read the quarantine counter after the bot stops.
         let quarantine = Arc::new(RetryQuarantine::new(2, 2, 32_768));
         let bot = match Bot::builder()
             .with_retry_admission_arc(quarantine.clone())

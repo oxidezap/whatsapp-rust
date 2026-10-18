@@ -61,6 +61,11 @@ impl DecryptFailureAdmission for LocalPolicy {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+pub fn local(state: std::rc::Rc<std::cell::Cell<usize>>) -> ClientBuilder {
+    Client::builder().with_decrypt_failure_admission(LocalPolicy(state))
+}
+
 #[test]
 fn migration_builders_accept_owned_and_shared_policies() {
     let _ = owned();

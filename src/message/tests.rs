@@ -9708,12 +9708,10 @@ async fn custom_handler_only_skips_fallback_ack() {
             )
         })
         .await;
-        assert!(
-            client
-                .classify_incoming_message(&custom_handler_stanza())
-                .await
-                .is_some()
-        );
+        client
+            .clone()
+            .handle_incoming_message(custom_handler_stanza())
+            .await;
         tokio::time::timeout(std::time::Duration::from_secs(5), entered.recv())
             .await
             .unwrap()
@@ -9747,12 +9745,10 @@ async fn custom_handler_best_effort_is_not_joined_or_cancelled_by_shutdown() {
         )
     })
     .await;
-    assert!(
-        client
-            .classify_incoming_message(&custom_handler_stanza())
-            .await
-            .is_some()
-    );
+    client
+        .clone()
+        .handle_incoming_message(custom_handler_stanza())
+        .await;
     tokio::time::timeout(std::time::Duration::from_secs(5), entered.recv())
         .await
         .unwrap()
@@ -23346,6 +23342,11 @@ async fn retry_admission_only_consults_eligible_remote_sender_key_receipts() {
     for (chat, participant, count) in [
         (group.clone(), Some(remote.clone()), 1u8),
         ("status@broadcast".parse().unwrap(), Some(remote.clone()), 2),
+        (
+            "1234567890@broadcast".parse().unwrap(),
+            Some(remote.clone()),
+            1,
+        ),
         (remote.clone(), None, 1),
         (group.clone(), Some(own), 1),
         (group.clone(), Some(remote.clone()), 255),

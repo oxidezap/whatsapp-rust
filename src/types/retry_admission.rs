@@ -23,9 +23,10 @@ pub enum RetryDecision {
 ///
 /// Configure through `ClientBuilder::with_retry_admission` or
 /// `BotBuilder::with_retry_admission`. Without a policy, eligible receipts enter
-/// repair. Own companion devices and DM retries bypass this policy because
-/// dropping them has no sender-key fallback. The policy runs after routing and
-/// unknown-device validation, before key installation, group repair and resend.
+/// repair. Only group and status receipts from other accounts reach this policy.
+/// Own-account devices (including the primary), DMs and broadcast-list retries
+/// bypass it. The policy runs after routing and unknown-device validation,
+/// before key installation, group repair and resend.
 ///
 /// Make a fast local decision without I/O or blocking. A dropped request is not
 /// queued by this client; allow recovery over time when imposing a budget.
