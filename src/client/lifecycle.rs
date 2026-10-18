@@ -520,6 +520,9 @@ impl Client {
             lifecycle,
             #[cfg(feature = "plugins")]
             plugin_host,
+            inbound_durability_hook,
+            history_sync_capture_hook,
+            group_notification_durability_hook,
             custom_enc_handlers,
             retry_admission,
             decrypt_failure_admission,
@@ -739,9 +742,15 @@ impl Client {
             #[cfg(test)]
             chatstate_events_built: AtomicU32::new(0),
             custom_enc_handlers,
-            inbound_durability_hook: std::sync::OnceLock::new(),
-            history_sync_capture_hook: std::sync::OnceLock::new(),
-            group_notification_durability_hook: std::sync::OnceLock::new(),
+            inbound_durability_hook: inbound_durability_hook
+                .map(std::sync::OnceLock::from)
+                .unwrap_or_default(),
+            history_sync_capture_hook: history_sync_capture_hook
+                .map(std::sync::OnceLock::from)
+                .unwrap_or_default(),
+            group_notification_durability_hook: group_notification_durability_hook
+                .map(std::sync::OnceLock::from)
+                .unwrap_or_default(),
             retry_admission,
             decrypt_failure_admission,
             history_sync_admission,
@@ -1696,7 +1705,7 @@ impl Client {
     /// loop, and flush what is still pending.
     ///
     /// The report covers SDK-owned inbound/outbound buffers and persistence.
-    /// Detached [`EncHandler`](crate::types::enc_handler::EncHandler) tasks are
+    /// Detached [`EncHandler`] tasks are
     /// not joined or cancelled. Applications own their completion and can use
     /// [`Self::shutdown_signal`] to coordinate it.
     ///

@@ -186,14 +186,9 @@ pub struct ClientBuilder {
     transport_factory: Option<Arc<dyn TransportFactory>>,
     http_client: Option<Arc<dyn HttpClient>>,
     options: ClientOptions,
-    custom_enc_handlers: HashMap<String, Arc<dyn EncHandler>>,
-    inbound_durability_hook: Option<Arc<dyn InboundDurabilityHook>>,
-    history_sync_capture_hook: Option<Arc<dyn HistorySyncCaptureHook>>,
-    group_notification_durability_hook: Option<Arc<dyn GroupNotificationDurabilityHook>>,
-    history_sync_admission: Option<Arc<dyn HistorySyncAdmission>>,
-    connect_admission: Option<Arc<dyn ConnectAdmission>>,
-    retry_admission: Option<Arc<dyn crate::RetryAdmission>>,
-    decrypt_failure_admission: Option<Arc<dyn crate::DecryptFailureAdmission>>,
+    // Keep unused extension configuration to one null pointer. The typed
+    // assembly payload is allocated only when an extension is registered.
+    extensions: Option<Box<ClientExtensions>>,
     task_instrument: Option<Arc<dyn wacore::stats::TaskInstrument>>,
     alloc_meter: Option<Arc<wacore::stats::AllocMeter>>,
     #[cfg(feature = "client-lifecycle")]
@@ -224,14 +219,7 @@ impl ClientBuilder {
             transport_factory: None,
             http_client: None,
             options: ClientOptions::default(),
-            custom_enc_handlers: HashMap::new(),
-            inbound_durability_hook: None,
-            history_sync_capture_hook: None,
-            group_notification_durability_hook: None,
-            history_sync_admission: None,
-            connect_admission: None,
-            retry_admission: None,
-            decrypt_failure_admission: None,
+            extensions: None,
             task_instrument: None,
             alloc_meter: None,
             #[cfg(feature = "client-lifecycle")]
@@ -243,6 +231,10 @@ impl ClientBuilder {
             #[cfg(feature = "voip-control")]
             voip_media_backend: None,
         }
+    }
+
+    fn extensions_mut(&mut self) -> &mut ClientExtensions {
+        self.extensions.get_or_insert_default()
     }
 
     pub(crate) fn task_instrument(&self) -> Option<Arc<dyn wacore::stats::TaskInstrument>> {
@@ -361,7 +353,9 @@ impl ClientBuilder {
     where
         H: EncHandler + 'static,
     {
-        self.custom_enc_handlers
+        self.extensions_mut()
+            .custom_enc_handlers
+            .get_or_insert_default()
             .insert(payload_type.into(), Arc::new(handler));
         self
     }
@@ -374,7 +368,9 @@ impl ClientBuilder {
         payload_type: impl Into<String>,
         handler: Arc<dyn EncHandler>,
     ) -> Self {
-        self.custom_enc_handlers
+        self.extensions_mut()
+            .custom_enc_handlers
+            .get_or_insert_default()
             .insert(payload_type.into(), handler);
         self
     }
@@ -384,7 +380,7 @@ impl ClientBuilder {
     where
         H: InboundDurabilityHook + 'static,
     {
-        self.inbound_durability_hook = Some(Arc::new(hook));
+        self.extensions_mut().inbound_durability_hook = Some(Arc::new(hook));
         self
     }
 
@@ -393,7 +389,7 @@ impl ClientBuilder {
         mut self,
         hook: Arc<dyn InboundDurabilityHook>,
     ) -> Self {
-        self.inbound_durability_hook = Some(hook);
+        self.extensions_mut().inbound_durability_hook = Some(hook);
         self
     }
 
@@ -403,7 +399,7 @@ impl ClientBuilder {
     where
         Gh: GroupNotificationDurabilityHook + 'static,
     {
-        self.group_notification_durability_hook = Some(Arc::new(hook));
+        self.extensions_mut().group_notification_durability_hook = Some(Arc::new(hook));
         self
     }
 
@@ -412,7 +408,7 @@ impl ClientBuilder {
         mut self,
         hook: Arc<dyn GroupNotificationDurabilityHook>,
     ) -> Self {
-        self.group_notification_durability_hook = Some(hook);
+        self.extensions_mut().group_notification_durability_hook = Some(hook);
         self
     }
 
@@ -422,7 +418,7 @@ impl ClientBuilder {
     where
         H: HistorySyncCaptureHook + 'static,
     {
-        self.history_sync_capture_hook = Some(Arc::new(hook));
+        self.extensions_mut().history_sync_capture_hook = Some(Arc::new(hook));
         self
     }
 
@@ -432,7 +428,7 @@ impl ClientBuilder {
         mut self,
         hook: Arc<dyn HistorySyncCaptureHook>,
     ) -> Self {
-        self.history_sync_capture_hook = Some(hook);
+        self.extensions_mut().history_sync_capture_hook = Some(hook);
         self
     }
 
@@ -442,7 +438,7 @@ impl ClientBuilder {
     where
         A: HistorySyncAdmission + 'static,
     {
-        self.history_sync_admission = Some(Arc::new(admission));
+        self.extensions_mut().history_sync_admission = Some(Arc::new(admission));
         self
     }
 
@@ -451,7 +447,7 @@ impl ClientBuilder {
         mut self,
         admission: Arc<dyn HistorySyncAdmission>,
     ) -> Self {
-        self.history_sync_admission = Some(admission);
+        self.extensions_mut().history_sync_admission = Some(admission);
         self
     }
 
@@ -463,7 +459,7 @@ impl ClientBuilder {
 
     /// Share a policy across clients. The last registration wins.
     pub fn with_retry_admission_arc(mut self, policy: Arc<dyn crate::RetryAdmission>) -> Self {
-        self.retry_admission = Some(policy);
+        self.extensions_mut().retry_admission = Some(policy);
         self
     }
 
@@ -481,7 +477,7 @@ impl ClientBuilder {
         mut self,
         policy: Arc<dyn crate::DecryptFailureAdmission>,
     ) -> Self {
-        self.decrypt_failure_admission = Some(policy);
+        self.extensions_mut().decrypt_failure_admission = Some(policy);
         self
     }
 
@@ -491,13 +487,13 @@ impl ClientBuilder {
     where
         A: ConnectAdmission + 'static,
     {
-        self.connect_admission = Some(Arc::new(admission));
+        self.extensions_mut().connect_admission = Some(Arc::new(admission));
         self
     }
 
     /// Share a host's dial budget across clients. Manual `connect()` is unaffected.
     pub fn with_connect_admission_arc(mut self, admission: Arc<dyn ConnectAdmission>) -> Self {
-        self.connect_admission = Some(admission);
+        self.extensions_mut().connect_admission = Some(admission);
         self
     }
 
@@ -702,7 +698,11 @@ impl ClientBuilder {
                 return Err(ClientBuilderError::InvalidPluginTaskDrainTimeout);
             }
 
-            if self.inbound_durability_hook.is_some() {
+            if self
+                .extensions
+                .as_deref()
+                .is_some_and(|extensions| extensions.inbound_durability_hook.is_some())
+            {
                 probe_durability_backend(&persistence_manager.backend(), &runtime).await?;
             }
 
@@ -765,12 +765,10 @@ impl ClientBuilder {
                 #[cfg(feature = "plugins")]
                 plugin_host,
                 noise_cert_policy: options.noise_cert_policy,
-                history_sync_admission: self.history_sync_admission,
-                connect_admission: self.connect_admission,
-                custom_enc_handlers: (!self.custom_enc_handlers.is_empty())
-                    .then_some(self.custom_enc_handlers),
-                retry_admission: self.retry_admission,
-                decrypt_failure_admission: self.decrypt_failure_admission,
+                ..self
+                    .extensions
+                    .map(|extensions| *extensions)
+                    .unwrap_or_default()
             },
         );
         let client = assembly.client();
@@ -805,15 +803,6 @@ impl ClientBuilder {
         #[cfg(feature = "client-lifecycle")]
         let mut construction = ClientConstructionGuard::new(Arc::clone(&client));
 
-        if let Some(hook) = self.inbound_durability_hook {
-            let _ = client.inbound_durability_hook.set(hook);
-        }
-        if let Some(hook) = self.history_sync_capture_hook {
-            let _ = client.history_sync_capture_hook.set(hook);
-        }
-        if let Some(hook) = self.group_notification_durability_hook {
-            let _ = client.group_notification_durability_hook.set(hook);
-        }
         if options.skip_history_sync {
             client.set_skip_history_sync(true);
         }
@@ -1042,6 +1031,9 @@ impl Drop for ClientConstructionGuard {
 
 #[derive(Default)]
 pub(super) struct ClientExtensions {
+    pub(super) inbound_durability_hook: Option<Arc<dyn InboundDurabilityHook>>,
+    pub(super) history_sync_capture_hook: Option<Arc<dyn HistorySyncCaptureHook>>,
+    pub(super) group_notification_durability_hook: Option<Arc<dyn GroupNotificationDurabilityHook>>,
     pub(super) custom_enc_handlers: Option<HashMap<String, Arc<dyn EncHandler>>>,
     pub(super) retry_admission: Option<Arc<dyn crate::RetryAdmission>>,
     pub(super) decrypt_failure_admission: Option<Arc<dyn crate::DecryptFailureAdmission>>,
@@ -1643,34 +1635,103 @@ mod tests {
         assert_eq!(decisions.load(Ordering::SeqCst), 1);
     }
 
+    #[test]
+    fn unused_extension_configuration_allocates_nothing() {
+        assert_eq!(
+            crate::test_alloc::min_allocs(0, ClientExtensions::default),
+            0
+        );
+        assert_eq!(crate::test_alloc::min_allocs(0, ClientBuilder::new), 0);
+        assert_eq!(
+            crate::test_alloc::min_allocs(2, || ClientBuilder::new()
+                .with_retry_admission(RetryPolicy)),
+            2
+        );
+        let shared: Arc<dyn crate::RetryAdmission> = Arc::new(RetryPolicy);
+        assert_eq!(
+            crate::test_alloc::min_allocs(1, || ClientBuilder::new()
+                .with_retry_admission_arc(shared.clone())),
+            1
+        );
+        let builder = ClientBuilder::new();
+        assert!(builder.extensions.is_none());
+        assert_eq!(size_of_val(&builder.extensions), size_of::<usize>());
+        eprintln!(
+            "ClientBuilder={} B; optional extension config={} B; configured payload={} B",
+            size_of::<ClientBuilder>(),
+            size_of_val(&builder.extensions),
+            size_of::<ClientExtensions>()
+        );
+        let extensions = ClientExtensions::default();
+        assert!(extensions.retry_admission.is_none());
+        assert!(extensions.decrypt_failure_admission.is_none());
+        assert!(extensions.custom_enc_handlers.is_none());
+        #[cfg(feature = "plugins")]
+        assert!(extensions.plugin_host.is_none());
+        #[cfg(feature = "client-lifecycle")]
+        assert!(extensions.lifecycle.is_none());
+        // Positive control: an owned opt-in policy does allocate its Arc.
+        assert_eq!(
+            crate::test_alloc::min_allocs(1, || ClientExtensions {
+                retry_admission: Some(Arc::new(RetryPolicy)),
+                ..Default::default()
+            }),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn assembly_is_inert_until_started() {
+        struct Policy(Arc<AtomicUsize>);
+        impl crate::RetryAdmission for Policy {
+            fn decide(&self, _: &crate::RetryContext<'_>) -> crate::RetryDecision {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                crate::RetryDecision::Accept
+            }
+        }
+        impl crate::DecryptFailureAdmission for Policy {
+            fn decide(
+                &self,
+                _: &crate::DecryptFailureContext<'_>,
+            ) -> crate::DecryptFailureDecision {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                crate::DecryptFailureDecision::RequestRetry
+            }
+        }
         let persistence_manager = Arc::new(
             PersistenceManager::new(crate::test_utils::create_test_backend().await)
                 .await
                 .expect("persistence manager"),
         );
-        let spawns = Arc::new(AtomicUsize::new(0));
-        let runtime = Arc::new(CountingRuntime {
-            spawns: Arc::clone(&spawns),
-        }) as Arc<dyn Runtime>;
-
-        let assembly = Client::assemble(
-            runtime,
-            persistence_manager,
-            Arc::new(MockTransportFactory::new()),
-            Arc::new(MockHttpClient),
-            None,
-            CacheConfig::default(),
-            ClientExtensions::default(),
-        );
-        assert_eq!(spawns.load(Ordering::SeqCst), 0);
-
-        let build = assembly.start();
-        // Two spawns: the LID-PN warm-up, and the startup retention sweep that
-        // reaps rows expired while the process was closed.
-        assert_eq!(spawns.load(Ordering::SeqCst), 2);
-        build.into_client().signal_shutdown_sync();
+        for configured in [false, true] {
+            let spawns = Arc::new(AtomicUsize::new(0));
+            let decisions = Arc::new(AtomicUsize::new(0));
+            let runtime = Arc::new(CountingRuntime {
+                spawns: spawns.clone(),
+            }) as Arc<dyn Runtime>;
+            let mut extensions = ClientExtensions::default();
+            if configured {
+                let policy = Arc::new(Policy(decisions.clone()));
+                extensions.retry_admission = Some(policy.clone());
+                extensions.decrypt_failure_admission = Some(policy);
+            }
+            let assembly = Client::assemble(
+                runtime,
+                persistence_manager.clone(),
+                Arc::new(MockTransportFactory::new()),
+                Arc::new(MockHttpClient),
+                None,
+                CacheConfig::default(),
+                extensions,
+            );
+            assert_eq!(spawns.load(Ordering::SeqCst), 0);
+            let build = assembly.start();
+            // Existing LID-PN warm-up and startup retention sweep only, with or
+            // without synchronous policies. Construction never dispatches them.
+            assert_eq!(spawns.load(Ordering::SeqCst), 2);
+            assert_eq!(decisions.load(Ordering::SeqCst), 0);
+            build.into_client().signal_shutdown_sync();
+        }
     }
 
     #[tokio::test]

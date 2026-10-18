@@ -3823,6 +3823,21 @@ fn client_size_pins_runtime_cache_config_saving() {
         )
         .unwrap();
 
+    let retry_slot = size_of::<Option<Arc<dyn crate::RetryAdmission>>>();
+    let decrypt_slot = size_of::<Option<Arc<dyn crate::DecryptFailureAdmission>>>();
+    let handler_slot = size_of::<Option<HashMap<String, Arc<dyn EncHandler>>>>();
+    let legacy_slots = size_of::<std::sync::OnceLock<Arc<dyn crate::RetryAdmission>>>()
+        + size_of::<std::sync::OnceLock<Arc<dyn crate::DecryptFailureAdmission>>>()
+        + size_of::<std::sync::OnceLock<HashMap<String, Arc<dyn EncHandler>>>>();
+    let slots = retry_slot + decrypt_slot + handler_slot;
+    assert_eq!(retry_slot, 2 * size_of::<usize>());
+    assert_eq!(decrypt_slot, 2 * size_of::<usize>());
+    assert!(slots < legacy_slots);
+    eprintln!(
+        "Client={} B; retry/decrypt/handler slots={retry_slot}/{decrypt_slot}/{handler_slot} B; previous slots={legacy_slots} B; current slots={slots} B",
+        size_of::<Client>()
+    );
+
     assert_eq!(
         size_of::<Client>(),
         expected,
