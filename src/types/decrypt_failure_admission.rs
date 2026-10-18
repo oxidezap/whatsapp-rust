@@ -32,6 +32,9 @@ pub enum DecryptFailureDecision {
 /// a per-message attempt, retains first-attempt phone recovery and acknowledges
 /// the stanza. The server therefore stops redelivering it; refusal can lose
 /// recovery of this message. Live tuning belongs inside the policy.
+/// The callback must return a decision. Panics are not translated into a
+/// fallback verdict. They follow the application's panic strategy; with
+/// unwinding enabled, they propagate through the task invoking the policy.
 pub trait DecryptFailureAdmission: wacore::sync_marker::MaybeSendSync {
     fn decide(&self, context: &DecryptFailureContext<'_>) -> DecryptFailureDecision;
 }

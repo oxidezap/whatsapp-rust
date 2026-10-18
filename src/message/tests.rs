@@ -9650,63 +9650,130 @@ async fn mixed_recognized_and_unknown_enc_still_classifies() {
     assert!(classified.group_payloads.is_empty());
 }
 
-/// A custom handler owns its ack; the fallback must not double-ack.
+struct ControlledEncHandler {
+    entered: async_channel::Sender<()>,
+    release: async_channel::Receiver<()>,
+    finished: async_channel::Sender<()>,
+    fail: bool,
+}
+
+#[async_trait::async_trait]
+impl crate::types::enc_handler::EncHandler for ControlledEncHandler {
+    async fn handle(
+        &self,
+        _: Arc<Client>,
+        _: &wacore_binary::Node,
+        _: &MessageInfo,
+    ) -> anyhow::Result<()> {
+        let _finished = scopeguard::guard((), |()| {
+            let _ = self.finished.try_send(());
+        });
+        self.entered.send(()).await?;
+        self.release.recv().await?;
+        anyhow::ensure!(!self.fail, "synthetic custom handler failure");
+        Ok(())
+    }
+}
+
+fn custom_handler_stanza() -> Arc<OwnedNodeRef> {
+    node_to_arc(
+        NodeBuilder::new("message")
+            .attr("from", "5511777776666@s.whatsapp.net")
+            .attr("id", "CUSTOM1")
+            .attr("type", "text")
+            .children([NodeBuilder::new("enc")
+                .attr("type", "frskmsg")
+                .bytes(vec![0u8; 8])
+                .build()])
+            .build(),
+    )
+}
+
+/// Success and error both leave the custom-only envelope's response to its owner.
 #[tokio::test]
 async fn custom_handler_only_skips_fallback_ack() {
-    use crate::types::enc_handler::EncHandler;
-    use async_lock::Mutex as AsyncMutex;
-
-    #[derive(Default)]
-    struct NoopHandler {
-        calls: Arc<AsyncMutex<usize>>,
+    for fail in [false, true] {
+        let (entered_tx, entered) = async_channel::bounded(1);
+        let (release, release_rx) = async_channel::bounded(1);
+        let (finished_tx, finished) = async_channel::bounded(1);
+        let (client, transport) = capturing_client_configured("msmsg_custom", |builder| {
+            builder.with_enc_handler(
+                "frskmsg",
+                ControlledEncHandler {
+                    entered: entered_tx,
+                    release: release_rx,
+                    finished: finished_tx,
+                    fail,
+                },
+            )
+        })
+        .await;
+        assert!(
+            client
+                .classify_incoming_message(&custom_handler_stanza())
+                .await
+                .is_some()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        release.send(()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), finished.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            transport.sent().is_empty(),
+            "custom handler completion must not synthesize ACK, NACK or retry, fail={fail}"
+        );
     }
-    #[async_trait::async_trait]
-    impl EncHandler for NoopHandler {
-        async fn handle(
-            &self,
-            _client: Arc<Client>,
-            _enc_node: &wacore_binary::Node,
-            _info: &MessageInfo,
-        ) -> anyhow::Result<()> {
-            *self.calls.lock().await += 1;
-            Ok(())
-        }
-    }
+}
 
-    let calls = Arc::new(AsyncMutex::new(0usize));
-    let handler = Arc::new(NoopHandler {
-        calls: Arc::clone(&calls),
-    });
-    let (client, transport) = capturing_client_configured("msmsg_custom", |builder| {
-        builder.with_enc_handler_arc("frskmsg", handler)
+#[tokio::test]
+async fn custom_handler_best_effort_is_not_joined_or_cancelled_by_shutdown() {
+    let (entered_tx, entered) = async_channel::bounded(1);
+    let (release, release_rx) = async_channel::bounded(1);
+    let (finished_tx, finished) = async_channel::bounded(1);
+    let (client, transport) = capturing_client_configured("custom_shutdown", |builder| {
+        builder.with_enc_handler(
+            "frskmsg",
+            ControlledEncHandler {
+                entered: entered_tx,
+                release: release_rx,
+                finished: finished_tx,
+                fail: false,
+            },
+        )
     })
     .await;
-
-    let node = NodeBuilder::new("message")
-        .attr("from", "5511777776666@s.whatsapp.net")
-        .attr("id", "CUSTOM1")
-        .attr("type", "text")
-        .children([NodeBuilder::new("enc")
-            .attr("type", "frskmsg")
-            .bytes(vec![0u8; 8])
-            .build()])
-        .build();
-    let owned = node_to_arc(node);
-    let classified = client.classify_incoming_message(&owned).await;
     assert!(
-        classified.is_some(),
-        "custom-handled enc must not be short-circuited by the fallback guard"
+        client
+            .classify_incoming_message(&custom_handler_stanza())
+            .await
+            .is_some()
     );
-
-    // Let the detached handler + any rogue spawned task run.
-    for _ in 0..16 {
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let report = tokio::time::timeout(std::time::Duration::from_secs(5), client.shutdown())
+        .await
+        .expect("SDK-owned drains do not join the custom handler");
+    assert!(matches!(
+        report.outbound,
+        crate::client::DrainOutcome::Completed
+    ));
     assert!(
-        find_message_ack(&transport.sent()).is_none(),
-        "custom-handled enc must not get a fallback transport ack from classify"
+        finished.try_recv().is_err(),
+        "the paused handler is neither completed nor cancelled"
     );
-    assert_eq!(*calls.lock().await, 1, "custom handler must be invoked");
+    release.send(()).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), finished.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(transport.sent().is_empty());
 }
 
 /// Security regression: a self-only `app_state_sync_key_share` protocol
@@ -23316,4 +23383,70 @@ async fn retry_admission_only_consults_eligible_remote_sender_key_receipts() {
         transport.sent().is_empty(),
         "refusal and missing-cache bypasses do not resend"
     );
+}
+
+struct PanickingAdmission;
+impl crate::DecryptFailureAdmission for PanickingAdmission {
+    fn decide(&self, _: &crate::DecryptFailureContext<'_>) -> crate::DecryptFailureDecision {
+        panic!("synthetic decrypt admission panic")
+    }
+}
+impl crate::RetryAdmission for PanickingAdmission {
+    fn decide(&self, _: &crate::RetryContext<'_>) -> crate::RetryDecision {
+        panic!("synthetic retry admission panic")
+    }
+}
+
+#[tokio::test]
+#[should_panic(expected = "synthetic decrypt admission panic")]
+async fn decrypt_failure_admission_panic_is_not_a_fallback_verdict() {
+    let (client, _) = capturing_client_configured("decrypt_policy_panic", |b| {
+        b.with_decrypt_failure_admission(PanickingAdmission)
+    })
+    .await;
+    let sender: Jid = "777000000000103@lid".parse().unwrap();
+    let info = Arc::new(MessageInfo {
+        id: "PANIC-POLICY".into(),
+        source: crate::types::message::MessageSource {
+            chat: sender.clone(),
+            sender,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    client
+        .run_retry_receipt(&info, RetryReason::BadMac, DecryptFailMode::Show)
+        .await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "synthetic retry admission panic")]
+async fn retry_admission_panic_is_not_a_fallback_verdict() {
+    let (client, _) = capturing_client_configured("retry_policy_panic", |b| {
+        b.with_retry_admission(PanickingAdmission)
+    })
+    .await;
+    let sender: Jid = "777000000000103@lid".parse().unwrap();
+    let node = node_to_arc(
+        NodeBuilder::new("receipt")
+            .attr("participant", &sender)
+            .children([NodeBuilder::new("retry")
+                .attr("id", "PANIC-POLICY")
+                .attr("count", 1)
+                .build()])
+            .build(),
+    );
+    let receipt = wacore::types::events::Receipt::builder()
+        .source(crate::types::message::MessageSource {
+            chat: "120363000000000071@g.us".parse().unwrap(),
+            sender,
+            is_group: true,
+            ..Default::default()
+        })
+        .message_ids(vec!["PANIC-POLICY".into()])
+        .timestamp(wacore::time::now_utc())
+        .r#type(crate::types::presence::ReceiptType::Retry)
+        .offline(false)
+        .build();
+    client.handle_retry_receipt(&receipt, &node).await.unwrap();
 }

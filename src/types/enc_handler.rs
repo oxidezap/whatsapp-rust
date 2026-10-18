@@ -6,7 +6,8 @@ use wacore_binary::Node;
 
 /// Handle custom encrypted payload types registered through the client/bot builder.
 ///
-/// Handlers run in detached runtime tasks. An error is logged; it does not
+/// Handlers are best-effort application work in detached runtime tasks.
+/// Shutdown does not join or cancel them. An error is logged; it does not
 /// trigger a built-in retry, nack or transport ack. For a custom-only envelope,
 /// the handler owns the response. Mixed envelopes may still be acknowledged
 /// by the built-in payload path. This is not an inbound durability hook and

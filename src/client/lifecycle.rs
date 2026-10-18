@@ -1695,6 +1695,11 @@ impl Client {
     /// End this client's session for good: close the socket, stop the run
     /// loop, and flush what is still pending.
     ///
+    /// The report covers SDK-owned inbound/outbound buffers and persistence.
+    /// Detached [`EncHandler`](crate::types::enc_handler::EncHandler) tasks are
+    /// not joined or cancelled. Applications own their completion and can use
+    /// [`Self::shutdown_signal`] to coordinate it.
+    ///
     /// Terminal, not a pause. The shutdown it fires is published once and for
     /// all, so afterwards [`run`](Self::run) returns immediately and
     /// [`connect`](Self::connect) refuses with [`ConnectError::Shutdown`] — a

@@ -31,6 +31,9 @@ pub enum RetryDecision {
 /// queued by this client; allow recovery over time when imposing a budget.
 /// Live tuning belongs inside the policy, for example with atomics.
 /// See `examples/retry_quarantine.rs` for a bounded token bucket.
+/// The callback must return a decision. Panics are not translated into a
+/// fallback verdict. They follow the application's panic strategy; with
+/// unwinding enabled, they propagate through the task invoking the policy.
 pub trait RetryAdmission: wacore::sync_marker::MaybeSendSync {
     fn decide(&self, context: &RetryContext<'_>) -> RetryDecision;
 }
