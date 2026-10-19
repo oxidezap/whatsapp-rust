@@ -411,6 +411,8 @@ impl Client {
         let group_distribution_locks = self.group_distribution_locks.capacity_stats().await;
         // One awaited walk: a lane's queue length is a channel counter, so this
         // reads each lane once and allocates nothing.
+        let (inbound_chat_budgets, inbound_chat_charged_bytes, inbound_ack_charged_bytes) =
+            self.inbound_queue_budgets.memory_stats();
         let (chat_lanes, chat_lane_backlog) = self
             .chat_lanes
             .fold_entries((0u64, 0u64), |(lanes, backlog), _, lane| {
@@ -577,7 +579,9 @@ impl Client {
             ensure_inflight: self.ensure_inflight.len() as u64,
             group_metadata_inflight: self.group_metadata_inflight.len() as u64,
             chat_lanes,
-            inbound_chat_budgets: self.inbound_queue_budgets.chat_budget_count(),
+            inbound_chat_budgets,
+            inbound_chat_charged_bytes,
+            inbound_ack_charged_bytes,
             pending_call_offers: self.pending_call_offers.len() as u64,
             chat_lane_backlog,
             group_distribution_locks: group_distribution_locks.entries,

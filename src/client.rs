@@ -666,7 +666,12 @@ pub struct MemoryReport {
     pub group_metadata_inflight: u64,
     pub chat_lanes: u64,
     /// Live per-chat byte budgets, including backing slices surviving lane eviction.
-    pub inbound_chat_budgets: u64,
+    pub inbound_chat_budgets: CollectionStats,
+    /// Charged backing storage, including in-flight nodes and escaped slices.
+    /// Conservatively charges at least 1 KiB per owner; excludes decoded trees.
+    pub inbound_chat_charged_bytes: u64,
+    /// Charged compact ACK storage, including in-flight transport ownership.
+    pub inbound_ack_charged_bytes: u64,
     /// Incoming offers still inside the handler, awaiting signaling or identity work.
     pub pending_call_offers: u64,
     /// Inbound messages queued behind their chat's lane worker, summed over
@@ -805,7 +810,7 @@ pub struct SubsystemMemory {
 impl MemoryReport {
     /// Common byte-carrying collections used by both totals and `Display`.
     /// Feature-specific collections stay beside their gated report section.
-    fn collections(&self) -> [(&'static str, &CollectionStats); 19] {
+    fn collections(&self) -> [(&'static str, &CollectionStats); 20] {
         [
             ("group_cache:", &self.group_cache),
             ("device_registry_cache:", &self.device_registry_cache),
@@ -826,6 +831,7 @@ impl MemoryReport {
             ("offline_receipts:", &self.offline_receipt_buffer),
             ("core_event_handlers:", &self.core_event_handlers),
             ("status_privacy:", &self.status_privacy),
+            ("inbound_chat_budgets:", &self.inbound_chat_budgets),
         ]
     }
 
@@ -843,6 +849,9 @@ impl MemoryReport {
     /// Sum of every estimated byte figure in the report.
     pub fn total_estimated_bytes(&self) -> u64 {
         let total: u64 = self.collections().iter().map(|(_, c)| c.bytes).sum();
+        let total = total
+            .saturating_add(self.inbound_chat_charged_bytes)
+            .saturating_add(self.inbound_ack_charged_bytes);
         let total = self.subsystems.iter().fold(total, |sum, retained| {
             sum.saturating_add(retained.stats.bytes)
         });
@@ -985,7 +994,16 @@ impl std::fmt::Display for MemoryReport {
         )?;
         writeln!(f, "  skdm_warm_memo:         {}", self.skdm_warm_memo)?;
         writeln!(f, "--- Byte-bounded receive queues ---")?;
-        writeln!(f, "  inbound_chat_budgets:   {}", self.inbound_chat_budgets)?;
+        writeln!(
+            f,
+            "  inbound_chat_bytes:     {}",
+            self.inbound_chat_charged_bytes
+        )?;
+        writeln!(
+            f,
+            "  inbound_ack_bytes:      {}",
+            self.inbound_ack_charged_bytes
+        )?;
         writeln!(f, "  chat_lane_backlog:      {}", self.chat_lane_backlog)?;
         writeln!(f, "  transport_ack_queue:    {}", self.transport_ack_queue)?;
         writeln!(f, "--- Unbounded collections ---")?;

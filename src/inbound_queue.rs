@@ -112,11 +112,27 @@ impl Default for QueueBudgets {
     }
 }
 impl QueueBudgets {
-    pub(crate) fn chat_budget_count(&self) -> u64 {
-        self.per_chat
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .len() as u64
+    pub(crate) fn memory_stats(&self) -> (wacore::stats::CollectionStats, u64, u64) {
+        use wacore::stats::HeapSize;
+        let entries = self.per_chat.lock().unwrap_or_else(|p| p.into_inner());
+        let registry_bytes = wacore::stats::hash_table_bytes(
+            entries.capacity(),
+            size_of::<(wacore_binary::jid::Jid, std::sync::Weak<ByteBudget>)>(),
+        ) + entries
+            .keys()
+            .map(|chat| {
+                // The map and live budget each own the chat key. Include the budget
+                // allocation and Arc header without upgrading/dropping under this lock.
+                2 * chat.heap_bytes() + size_of::<ByteBudget>() + 2 * size_of::<usize>()
+            })
+            .sum::<usize>()
+            + size_of::<BudgetRegistry>()
+            + 2 * size_of::<usize>();
+        (
+            wacore::stats::CollectionStats::new(entries.len() as u64, registry_bytes as u64),
+            GLOBAL_CHAT_BYTES.saturating_sub(self.chat.available()) as u64,
+            ACK_BYTES.saturating_sub(self.ack.available()) as u64,
+        )
     }
 
     pub(crate) fn chat_budget(&self, chat: &wacore_binary::jid::Jid) -> Arc<ByteBudget> {
@@ -624,6 +640,20 @@ mod overload_tests {
         drop(rx);
         client.notify_connection_shutdown();
         client.chat_lanes.clear().await; // the exact cleanup operation bypassing evict_guard
+        let ack_lease = reserve(&client.inbound_queue_budgets.ack, 4).unwrap();
+        let report = client.memory_report().await;
+        assert_eq!(report.chat_lane_backlog, 0);
+        assert_eq!(report.inbound_chat_budgets.entries, 1);
+        assert!(report.inbound_chat_budgets.bytes > 0);
+        assert_eq!(report.inbound_chat_charged_bytes, 1024);
+        assert_eq!(report.inbound_ack_charged_bytes, 1024);
+        let total = report.total_estimated_bytes();
+        let mut without_queues = report;
+        without_queues.inbound_chat_budgets.bytes = 0;
+        without_queues.inbound_chat_charged_bytes = 0;
+        without_queues.inbound_ack_charged_bytes = 0;
+        assert!(total >= without_queues.total_estimated_bytes() + 2048);
+        drop(ack_lease);
         client.connection_generation.fetch_add(1, Ordering::AcqRel);
         client.reset_connection_shutdown();
         let mut cancelled = false;
@@ -645,6 +675,9 @@ mod overload_tests {
         assert_eq!(replacement.byte_budget.available(), 0);
         drop(slice);
         assert_eq!(replacement.byte_budget.available(), 1024);
+        let report = client.memory_report().await;
+        assert_eq!(report.inbound_chat_charged_bytes, 0);
+        assert_eq!(report.inbound_ack_charged_bytes, 0);
     }
 
     #[tokio::test(start_paused = true)]
