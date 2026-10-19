@@ -1076,6 +1076,7 @@ impl Client {
                     continue;
                 }
 
+                let shutdown = client.connection_shutdown_signal();
                 for ack in batch.drain(..) {
                     if ack.shutdown.is_fired() {
                         continue;
@@ -1099,7 +1100,10 @@ impl Client {
                 // EnteredSpan is not Send and cannot cross the await.
                 let frame_count = frames.len();
                 let send_and_report = async {
-                    match client.send_raw_bytes_burst(&mut frames, &mut results).await {
+                    match client
+                        .send_raw_bytes_burst_scoped(&mut frames, &mut results, Some(&shutdown))
+                        .await
+                    {
                         Ok(()) => {
                             for result in results.drain(..) {
                                 if let Err(e) = result

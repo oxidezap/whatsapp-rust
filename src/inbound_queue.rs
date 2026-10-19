@@ -407,7 +407,7 @@ mod overload_tests {
             !client
                 .inbound_queue_budgets
                 .draining
-                .load(std::sync::atomic::Ordering::Acquire)
+                .load(Ordering::Acquire)
         );
     }
 
@@ -447,7 +447,7 @@ mod overload_tests {
             client
                 .inbound_queue_budgets
                 .draining
-                .load(std::sync::atomic::Ordering::Acquire)
+                .load(Ordering::Acquire)
         );
         assert!(!client.connection_shutdown_signal().is_fired());
         let other = crate::test_utils::node_to_owned_ref(

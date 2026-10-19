@@ -282,6 +282,10 @@ async fn process_queued(
     // backlog would stop reporting the single pathological message
     // this guard exists to catch.
     let start = wacore::time::Instant::now();
+    // Classification can drop the parsed node before its heavy processing
+    // finishes. Keep this admission charged until the whole handler completes;
+    // escaped slices independently retain the same charge for longer.
+    let _backing = msg_node.backing_bytes();
     if msg_node.tag() == StanzaTag::Notification.as_str() {
         client
             .process_queued_group_notification(msg_node, spawn_generation, shutdown)

@@ -70,6 +70,16 @@ impl Client {
         frames: &mut Vec<P>,
         results: &mut Vec<crate::socket::error::EncryptSendResult>,
     ) -> Result<(), ClientError> {
+        self.send_raw_bytes_burst_scoped(frames, results, None)
+            .await
+    }
+
+    pub(crate) async fn send_raw_bytes_burst_scoped<P: Into<bytes::Bytes>>(
+        &self,
+        frames: &mut Vec<P>,
+        results: &mut Vec<crate::socket::error::EncryptSendResult>,
+        shutdown: Option<&wacore::runtime::ShutdownSignal>,
+    ) -> Result<(), ClientError> {
         results.clear();
         let noise_socket = match self.get_noise_socket() {
             Ok(socket) => socket,
@@ -78,6 +88,13 @@ impl Client {
                 return Err(error);
             }
         };
+        // Capture the socket before checking the original scope. A reconnect
+        // after this check can only leave us sending to the old socket; it can
+        // never redirect an old ACK onto the replacement connection.
+        if shutdown.is_some_and(wacore::runtime::ShutdownSignal::is_fired) {
+            frames.clear();
+            return Err(ClientError::NotConnected);
+        }
         if frames.len() == 1 {
             let plaintext = frames.pop().expect("length checked");
             results.push(noise_socket.encrypt_and_send(plaintext.into()).await);

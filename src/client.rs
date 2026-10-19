@@ -667,8 +667,7 @@ pub struct MemoryReport {
     /// Incoming offers still inside the handler, awaiting signaling or identity work.
     pub pending_call_offers: u64,
     /// Inbound messages queued behind their chat's lane worker, summed over
-    /// every lane. The lanes are capacity-bounded; their queues are not, and
-    /// Queued messages retain compact byte-budgeted copies of their frames.
+    /// every lane. Queued messages retain compact byte-budgeted frame copies.
     /// A stalled worker can fill its lane, but cannot grow it indefinitely.
     pub chat_lane_backlog: u64,
     pub group_distribution_locks: u64,
