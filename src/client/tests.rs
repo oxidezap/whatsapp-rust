@@ -3990,6 +3990,7 @@ async fn active_chat_lane_survives_capacity_pressure() {
         let (queue_tx, queue_rx) = async_channel::unbounded();
         (
             ChatLane {
+                generation: 0,
                 enqueue_lock: Arc::new(Mutex::new(())),
                 queue_tx,
                 byte_budget: Arc::new(crate::inbound_queue::ByteBudget::new(
@@ -5539,6 +5540,7 @@ async fn memory_report_sums_chat_lane_backlog() {
     let chat: Jid = "120363000000000042@g.us".parse().unwrap();
     let (queue_tx, _queue_rx) = async_channel::unbounded();
     let lane = ChatLane {
+        generation: 0,
         enqueue_lock: Arc::new(Mutex::new(())),
         queue_tx,
         byte_budget: Arc::new(crate::inbound_queue::ByteBudget::new(

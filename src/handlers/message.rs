@@ -116,6 +116,12 @@ impl MessageHandler {
             return true;
         }
 
+        // An initializer can publish after cleanup cleared the cache. Refuse
+        // fresh work on that retired worker and use the ordinary replacement path.
+        if lane.generation != generation {
+            lane.queue_tx.close();
+        }
+
         let node = match lane.try_enqueue_scoped(
             node,
             scope.map_or_else(
@@ -276,6 +282,7 @@ fn create_chat_lane(
         .detach();
 
     ChatLane {
+        generation: spawn_generation,
         enqueue_lock,
         queue_tx: tx,
         byte_budget,
@@ -345,6 +352,48 @@ mod tests {
     use crate::test_utils::node_to_owned_ref;
     use wacore_binary::builder::NodeBuilder;
     use wacore_binary::jid::Jid;
+
+    #[tokio::test]
+    async fn a_late_initializer_cannot_admit_fresh_work_to_a_retired_worker() {
+        let client = crate::test_utils::create_test_client().await;
+        let chat: Jid = "120363000000042@g.us".parse().unwrap();
+        let running = Arc::new(async_lock::Mutex::new(()));
+        let blocked = running.lock().await;
+        let retired = create_chat_lane(
+            &client,
+            Arc::default(),
+            Arc::clone(&running),
+            Arc::new(crate::inbound_queue::ByteBudget::new(
+                crate::inbound_queue::CHAT_BYTES,
+            )),
+        );
+        client.notify_connection_shutdown();
+        client.chat_lanes.clear().await;
+        client
+            .connection_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        client.reset_connection_shutdown();
+        // Finish the old cache initializer after the reconnect's clear.
+        client
+            .chat_lanes
+            .insert(chat.clone(), retired.clone())
+            .await;
+        let mut cancelled = false;
+        MessageHandler::handle_inline(
+            Arc::clone(&client),
+            message_for(&chat, "fresh"),
+            &mut cancelled,
+        )
+        .await;
+        assert!(!cancelled);
+        let fresh = client.chat_lanes.get(&chat).await.unwrap();
+        assert!(!fresh.queue_tx.same_channel(&retired.queue_tx));
+        assert!(retired.queue_tx.is_closed());
+        assert_eq!(retired.queue_tx.len(), 0);
+        assert_eq!(fresh.queue_tx.len(), 1);
+        fresh.queue_tx.close();
+        drop(blocked);
+    }
 
     #[tokio::test]
     async fn a_real_chat_lane_bounds_a_burst_behind_a_blocked_worker() {

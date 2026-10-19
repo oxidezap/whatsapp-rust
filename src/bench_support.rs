@@ -1845,6 +1845,7 @@ impl InboundQueueHarness {
         let (queue_tx, rx) = async_channel::bounded(crate::inbound_queue::CHAT_QUEUE_ITEMS);
         let rx = crate::inbound_queue::DrainingReceiver(rx);
         let lane = ChatLane {
+            generation: 0,
             queue_tx,
             enqueue_lock: Arc::default(),
             worker_running: Arc::default(),

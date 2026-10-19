@@ -474,6 +474,7 @@ use wacore::runtime::Runtime;
 /// Keyed by `Jid` to avoid per-message `to_string()` allocation.
 #[derive(Clone)]
 pub(crate) struct ChatLane {
+    pub generation: u64,
     pub enqueue_lock: Arc<Mutex<()>>,
     pub queue_tx: async_channel::Sender<QueuedChatMessage>,
     pub byte_budget: Arc<crate::inbound_queue::ByteBudget>,

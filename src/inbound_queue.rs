@@ -234,6 +234,7 @@ mod tests {
         let (queue_tx, rx) = async_channel::bounded(items);
         (
             ChatLane {
+                generation: 0,
                 queue_tx,
                 enqueue_lock: Arc::new(Mutex::new(())),
                 worker_running: Arc::new(Mutex::new(())),
@@ -488,6 +489,7 @@ mod overload_tests {
         let (queue_tx, rx) = async_channel::bounded(1);
         let rx = DrainingReceiver(rx);
         let lane = ChatLane {
+            generation: 0,
             queue_tx,
             enqueue_lock: Arc::default(),
             worker_running: Arc::default(),
@@ -590,6 +592,7 @@ mod overload_tests {
         let client = crate::test_utils::create_test_client().await;
         let (queue_tx, rx) = async_channel::bounded(1);
         let lane = ChatLane {
+            generation: 0,
             queue_tx,
             enqueue_lock: Arc::default(),
             worker_running: Arc::default(),
@@ -633,6 +636,7 @@ mod overload_tests {
         let (queue_tx, rx) = async_channel::bounded(1);
         let rx = DrainingReceiver(rx);
         let lane = ChatLane {
+            generation: 0,
             queue_tx,
             enqueue_lock: Arc::default(),
             worker_running: Arc::default(),
