@@ -137,6 +137,46 @@ pub(crate) fn retain_ack(bytes: Vec<u8>, lease: ByteLease) -> bytes::Bytes {
     })
 }
 
+impl crate::client::Client {
+    /// Freeze admissions, but keep reading IQ replies while accepted work drains.
+    /// Disconnecting immediately could replay the same burst forever without
+    /// letting even its admitted prefix become durable.
+    pub(crate) fn drain_overloaded_inbound(self: &Arc<Self>) {
+        use std::sync::atomic::Ordering;
+        if self
+            .inbound_queue_budgets
+            .draining
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        self.inbound_queue_budgets.work.close();
+        log::warn!(
+            "Inbound queue overloaded; draining before reconnect (chat bytes available: {}, ACK bytes available: {})",
+            self.inbound_queue_budgets.chat.available(),
+            self.inbound_queue_budgets.ack.available()
+        );
+        let client = Arc::clone(self);
+        let generation = self.connection_generation.load(Ordering::Acquire);
+        self.runtime.spawn_detached(Box::pin(async move {
+            let grace = std::time::Duration::from_secs(5);
+            client
+                .inbound_queue_budgets
+                .work
+                .flush(&*client.runtime, grace)
+                .await;
+            if client.connection_generation.load(Ordering::Acquire) != generation {
+                return;
+            }
+            client.flush_inbound_commits_bounded(grace).await;
+            client.outbound_flush.flush(&*client.runtime, grace).await;
+            if client.connection_generation.load(Ordering::Acquire) == generation {
+                client.notify_connection_shutdown();
+            }
+        }));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,46 +370,6 @@ mod tests {
         assert_eq!(global.available(), 1024);
         drop(sender);
         assert_eq!(global.available(), 2048);
-    }
-}
-
-impl crate::client::Client {
-    /// Freeze admissions, but keep reading IQ replies while accepted work drains.
-    /// Disconnecting immediately could replay the same burst forever without
-    /// letting even its admitted prefix become durable.
-    pub(crate) fn drain_overloaded_inbound(self: &Arc<Self>) {
-        use std::sync::atomic::Ordering;
-        if self
-            .inbound_queue_budgets
-            .draining
-            .swap(true, Ordering::AcqRel)
-        {
-            return;
-        }
-        self.inbound_queue_budgets.work.close();
-        log::warn!(
-            "Inbound queue overloaded; draining before reconnect (chat bytes available: {}, ACK bytes available: {})",
-            self.inbound_queue_budgets.chat.available(),
-            self.inbound_queue_budgets.ack.available()
-        );
-        let client = Arc::clone(self);
-        let generation = self.connection_generation.load(Ordering::Acquire);
-        self.runtime.spawn_detached(Box::pin(async move {
-            let grace = std::time::Duration::from_secs(5);
-            client
-                .inbound_queue_budgets
-                .work
-                .flush(&*client.runtime, grace)
-                .await;
-            if client.connection_generation.load(Ordering::Acquire) != generation {
-                return;
-            }
-            client.flush_inbound_commits_bounded(grace).await;
-            client.outbound_flush.flush(&*client.runtime, grace).await;
-            if client.connection_generation.load(Ordering::Acquire) == generation {
-                client.notify_connection_shutdown();
-            }
-        }));
     }
 }
 

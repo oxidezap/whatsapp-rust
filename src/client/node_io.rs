@@ -957,7 +957,7 @@ impl Client {
 
     /// Possibly send a deferred ack: either immediately or through the ack
     /// worker. Handlers can cancel by setting `cancelled` to true.
-    /// Uses Arc<OwnedNodeRef> so queueing does not clone the node.
+    /// Encodes before queue admission, so deferred ACKs retain no payload node.
     ///
     /// The deferred path feeds one persistent worker rather than spawning a
     /// task per ack, which also makes acks leave in arrival order.
