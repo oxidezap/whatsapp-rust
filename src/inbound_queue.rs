@@ -457,7 +457,7 @@ mod overload_tests {
             node,
             &mut cancelled,
         );
-        futures::pin_mut!(future);
+        let mut future = Box::pin(future);
         assert!(futures::poll!(&mut future).is_pending());
         client.notify_connection_shutdown();
         client.reset_connection_shutdown();
