@@ -236,6 +236,9 @@ pub(crate) fn retain_ack(bytes: Vec<u8>, lease: ByteLease) -> bytes::Bytes {
 impl crate::client::Client {
     /// Reuse the original ACK queue's lazy cell for all receive-queue state.
     /// Once created, budgets survive every connection/lane reset.
+    // Keep one copy of this access/initialization path under LTO: chat and ACK
+    // call sites need the same controller, not duplicated initialization code.
+    #[inline(never)]
     pub(crate) fn inbound_queues(&self) -> &QueueBudgets {
         self.inbound_queues.get_or_init(Box::default)
     }
