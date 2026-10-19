@@ -18,6 +18,10 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Record tested revision
+        run: git rev-parse HEAD
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-16

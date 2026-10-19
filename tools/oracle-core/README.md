@@ -92,6 +92,14 @@ This JavaScript snapshot is newer than the pinned `JgwtTQVeWPm` engine. It
 establishes the inspected bridge behavior, not full-call compatibility or server
 behavior. Runtime conformance still requires the exact WASM in `wasm.lock.json`.
 
+The pinned `JgwtTQVeWPm` bytes are preserved in the `bundle-store` asset
+`wasm-60c151934cdcd6a1ac7dc8e705e8b9f9d73ef785efc3a268b687e5bc76a05310.tar.xz`,
+whose archive SHA-256 is
+`bc84395c074b7ca0175ba284eb780a24e921341a68106b883d62d58ab5c1b3dd`.
+The module's own SHA-256 is independently pinned in `wasm.lock.json`.
+Use `Runtime::try_process_queued_calls` and `try_settle` when collecting evidence;
+their compatibility wrappers log errors, which cannot establish a successful drain.
+
 ### Following a capture forward
 
 WhatsApp renames these files on every rollout, so the ids below are the capture

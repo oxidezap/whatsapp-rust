@@ -938,6 +938,15 @@ impl Runtime {
     /// Returns whether the module had the entry point at all; a single-threaded
     /// module has nothing to drain and reports `false`.
     pub fn process_queued_calls(&mut self) -> bool {
+        self.try_process_queued_calls().unwrap_or_else(|error| {
+            self.store.data().log(format!("{error:#}"));
+            true
+        })
+    }
+
+    /// Drain queued work, propagating guest traps. Evidence-producing callers
+    /// must use this instead of treating a failed drain as an empty queue.
+    pub fn try_process_queued_calls(&mut self) -> Result<bool> {
         const LEGACY: &str = "emscripten_main_thread_process_queued_calls";
         const MAILBOX: &str = "_emscripten_check_mailbox";
 
@@ -963,12 +972,11 @@ impl Runtime {
         // fix is to drain off the blocking path. `draining_the_proxy_queue_*`
         // in `tests/threading.rs` pins this down.
         let mut drained = false;
+        let mut errors = Vec::new();
 
         if let Some(mailbox) = self.instance.get_func(&mut self.store, MAILBOX) {
-            // Best-effort by nature: a failure here is the guest's, so it is
-            // logged rather than propagated.
             if let Err(error) = self.call_func(mailbox, &[], &mut []) {
-                self.store.data().log(format!("{MAILBOX} failed: {error}"));
+                errors.push(format!("{MAILBOX} failed: {error:#}"));
             }
             drained = true;
         }
@@ -977,13 +985,14 @@ impl Runtime {
             && let Some(func) = self.instance.get_func(&mut self.store, LEGACY)
         {
             if let Err(error) = self.call_func(func, &[], &mut []) {
-                self.store.data().log(format!("{LEGACY} failed: {error}"));
+                errors.push(format!("{LEGACY} failed: {error:#}"));
             }
             drained = true;
         }
 
         self.sync_memory();
-        drained
+        anyhow::ensure!(errors.is_empty(), "{}", errors.join("; "));
+        Ok(drained)
     }
 
     /// Waits for threads to go idle, draining the main thread's queue as it
@@ -993,16 +1002,25 @@ impl Runtime {
     /// `quiesce` can return "idle" with work still queued: the workers really
     /// are done, and what remains is waiting on a main thread that never runs.
     pub fn settle(&mut self, timeout: std::time::Duration) -> bool {
+        self.try_settle(timeout).unwrap_or_else(|error| {
+            self.store.data().log(format!("settle failed: {error:#}"));
+            false
+        })
+    }
+
+    /// Wait for idle while propagating failures to drain queued guest work.
+    /// A timeout returns `Ok(false)`; a guest trap returns an error.
+    pub fn try_settle(&mut self, timeout: std::time::Duration) -> Result<bool> {
         /// Short enough that a reply is not left sitting, long enough that
         /// draining does not dominate the run.
         const TICK: std::time::Duration = std::time::Duration::from_millis(20);
 
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            self.process_queued_calls();
+            self.try_process_queued_calls()?;
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
-                return false;
+                return Ok(false);
             }
             if self.quiesce(TICK.min(remaining)) {
                 // One last drain: a thread that finished during the wait may
@@ -1010,10 +1028,10 @@ impl Runtime {
                 // reply may have started a new worker. Recheck quiescence
                 // rather than returning idle with a worker running; the
                 // deadline above still bounds a guest that keeps spawning.
-                if self.process_queued_calls() {
+                if self.try_process_queued_calls()? {
                     continue;
                 }
-                return true;
+                return Ok(true);
             }
         }
     }
@@ -1440,8 +1458,7 @@ mod diagnostic_tests {
         );
     }
 
-    #[test]
-    fn queued_guest_calls_acquire_a_turn() {
+    fn mailbox_module(traps: bool) -> Vec<u8> {
         use wasm_encoder::{
             CodeSection, ExportKind, ExportSection, Function, FunctionSection, Module, TypeSection,
         };
@@ -1452,6 +1469,9 @@ mod diagnostic_tests {
         let mut exports = ExportSection::new();
         exports.export("_emscripten_check_mailbox", ExportKind::Func, 0);
         let mut function = Function::new([]);
+        if traps {
+            function.instructions().unreachable();
+        }
         function.instructions().end();
         let mut code = CodeSection::new();
         code.function(&function);
@@ -1461,7 +1481,29 @@ mod diagnostic_tests {
             .section(&functions)
             .section(&exports)
             .section(&code);
-        let mut runtime = Runtime::instantiate(&module.finish()).unwrap();
+        module.finish()
+    }
+
+    #[test]
+    fn a_failed_drain_is_not_evidence_of_an_empty_queue() {
+        let mut runtime = Runtime::instantiate(&mailbox_module(true)).unwrap();
+        let error = runtime.try_process_queued_calls().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("_emscripten_check_mailbox failed")
+        );
+        assert!(
+            runtime
+                .try_settle(std::time::Duration::from_millis(20))
+                .is_err()
+        );
+        assert!(!runtime.settle(std::time::Duration::from_millis(20)));
+    }
+
+    #[test]
+    fn queued_guest_calls_acquire_a_turn() {
+        let mut runtime = Runtime::instantiate(&mailbox_module(false)).unwrap();
         runtime.shared().scheduler.enable();
         runtime.shared().scheduler.acquire(99);
         assert!(runtime.process_queued_calls());

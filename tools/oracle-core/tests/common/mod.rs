@@ -41,18 +41,25 @@ pub struct EngineLock(#[allow(dead_code)] TcpListener);
 /// Failure to acquire exclusivity is an infrastructure failure, never permission
 /// to run another engine concurrently.
 pub fn engine_lock() -> EngineLock {
-    let deadline = Instant::now() + WAIT;
+    acquire_engine_lock(LOCK_PORT, WAIT).unwrap_or_else(|error| {
+        panic!("oracle infrastructure failure: acquiring engine lock: {error}")
+    })
+}
+
+/// Acquire an engine port, failing closed when its deadline expires.
+pub fn acquire_engine_lock(port: u16, wait: Duration) -> std::io::Result<EngineLock> {
+    let deadline = Instant::now() + wait;
 
     loop {
-        match TcpListener::bind(("127.0.0.1", LOCK_PORT)) {
-            Ok(listener) => return EngineLock(listener),
+        match TcpListener::bind(("127.0.0.1", port)) {
+            Ok(listener) => return Ok(EngineLock(listener)),
             Err(error)
                 if error.kind() == std::io::ErrorKind::AddrInUse && Instant::now() < deadline =>
             {
                 std::thread::sleep(Duration::from_millis(200));
             }
             Err(error) => {
-                panic!("oracle infrastructure failure: acquiring engine lock: {error}");
+                return Err(error);
             }
         }
     }

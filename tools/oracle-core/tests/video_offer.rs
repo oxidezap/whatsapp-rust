@@ -23,13 +23,18 @@ fn video_offer_matches_the_vendor_engine() -> Result<()> {
     let _serial = common::threaded_guard();
     let bytes = common::capture(CAPTURE)?.with_context(|| format!("missing {CAPTURE}"))?;
     assert_eq!(hex::encode(Sha256::digest(&bytes)), CAPTURE_SHA);
+    eprintln!(
+        "oracle capture={CAPTURE} capture_sha256={CAPTURE_SHA} bytes={}",
+        bytes.len()
+    );
 
     let mut runtime = Runtime::instantiate(&bytes)?;
     runtime.set_thread_policy(ThreadPolicy::Spawn);
     runtime.set_main_thread_registration(true);
     runtime.run_ctors()?;
     runtime.attach_log_ring(4 << 20)?;
-    let init = runtime.call_embind(
+    let init = common::evidence::call(
+        &mut runtime,
         "initVoipStack",
         &[
             Value::Str("15550002222@c.us".into()),
@@ -45,7 +50,8 @@ fn video_offer_matches_the_vendor_engine() -> Result<()> {
         runtime.engine_log()
     );
 
-    let outcome = runtime.call_embind(
+    let outcome = common::evidence::call(
+        &mut runtime,
         "startVoipCall",
         &[
             Value::Str("11223344556677@lid".into()),
@@ -58,22 +64,17 @@ fn video_offer_matches_the_vendor_engine() -> Result<()> {
         ],
     );
     runtime.refuel();
-    runtime.settle(std::time::Duration::from_secs(8));
-    runtime.refuel();
     assert_eq!(
         outcome.as_ref().ok().and_then(|value| value.as_int()),
         Some(0),
         "startVoipCall: {outcome:?}"
     );
-    assert!(
-        !runtime.signaling()?.is_empty(),
-        "the engine should emit a video offer: {:?}",
-        runtime.engine_log()
-    );
+    let sent =
+        common::evidence::wait_for_signaling(&mut runtime, std::time::Duration::from_secs(8))?;
     common::evidence::check_log(
         runtime.engine_log_overflowed()?,
         runtime.memory_view_is_coherent(),
-        true,
+        !sent.is_empty(),
     )
     .unwrap_or_else(|kind| common::evidence::fail(kind, "video offer evidence"));
 
@@ -96,7 +97,6 @@ fn video_offer_matches_the_vendor_engine() -> Result<()> {
         ],
         "a changed stub-dependent path must fail here, not bless new geometry"
     );
-    let sent = runtime.signaling()?;
     let node = marshal::unmarshal_ref(&sent[0].stanza[1..])?;
     assert_eq!(node.tag, "offer");
     let children = node.children().context("offer children")?;

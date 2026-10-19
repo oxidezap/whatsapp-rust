@@ -60,7 +60,11 @@ const QUIET: Duration = Duration::from_millis(300);
 
 /// Start one fresh engine. Startup failure is infrastructure evidence, not a retry.
 fn engine() -> Runtime {
-    match engine_with(ThreadPolicy::Spawn) {
+    engine_with(ThreadPolicy::Spawn)
+}
+
+fn engine_with(policy: ThreadPolicy) -> Runtime {
+    match try_engine(policy) {
         Ok(runtime) => runtime,
         Err(EngineError::Unavailable) => evidence::fail(Failure::MissingCapture, VOIP),
         Err(EngineError::Broken(why) | EngineError::InitFailed(why)) => {
@@ -76,7 +80,7 @@ enum EngineError {
     InitFailed(String),
 }
 
-fn engine_with(policy: ThreadPolicy) -> Result<Runtime, EngineError> {
+fn try_engine(policy: ThreadPolicy) -> Result<Runtime, EngineError> {
     let Some(bytes) =
         common::capture(VOIP).map_err(|error| EngineError::Broken(error.to_string()))?
     else {
@@ -108,7 +112,8 @@ fn engine_with(policy: ThreadPolicy) -> Result<Runtime, EngineError> {
     // The media stack must actually come up: with it down the parser never
     // reaches the call stack and every assertion here would be about a dead
     // engine. `0` is success; `120011` is PJSIP being denied a thread.
-    let init = runtime.call_embind(
+    let init = common::evidence::call(
+        &mut runtime,
         "initVoipStack",
         &[
             Value::Str(format!("{CALLEE}@c.us")),
@@ -151,7 +156,9 @@ fn wait_for_line(runtime: &mut Runtime, needle: &str) -> bool {
         {
             return true;
         }
-        runtime.process_queued_calls();
+        runtime.try_process_queued_calls().unwrap_or_else(|error| {
+            common::evidence::fail(common::evidence::Failure::Infrastructure, error)
+        });
         std::thread::sleep(Duration::from_millis(20));
     }
     false
@@ -170,25 +177,14 @@ fn jid(user: &str) -> Jid {
     Jid::new(user, Server::Pn)
 }
 
-/// The stanza shape the engine's parser accepts.
-///
-/// Established against the engine's own log, one complaint at a time:
-///
-/// - `call-id` on the **`<call>`**, not on the `<offer>`. With it on the offer
-///   the parser reports `empty call-id`.
-/// - `<voip_settings>` as a **sibling** of `<offer>`. Nested inside it, the
-///   parser reports `missing voip_settings`.
-/// - JIDs passed as `Jid`, not as text: the codec encodes them with the
-///   JID_PAIR token and the engine reads them back that way.
-/// - `<voip_settings uncompressed="1">`. Without the attribute the engine reads
-///   the blob as compressed and rejects the whole offer with
-///   `unexpected compressed voip params`. whatsapp-rust sets the same attribute
-///   when it builds an accept, which is where the answer came from.
-/// - `t` on the guest's clock, via `virtual_unix_time`. The host clock is
-///   virtual and starts in 2021, so a real timestamp is in the future.
-fn offer_stanza(now: u64) -> Node {
-    let caller = jid(CALLER);
-    let offer = NodeBuilder::new("offer")
+/// Native input is the offer child selected by WAWebHandleVoipCall.callParser,
+/// not its enclosing call stanza. The Web bridge serializes that child intact.
+/// Keep call-id/call-creator and settings on the offer, as in the preserved
+/// dispatcher and WAWebVoipStackInterfaceWeb. See README.md for source pins.
+fn offer_stanza() -> Node {
+    NodeBuilder::new("offer")
+        .attr("call-id", CALL_ID)
+        .attr("call-creator", jid(CALLER))
         .children([
             NodeBuilder::new("audio")
                 .attr("enc", "opus")
@@ -196,16 +192,6 @@ fn offer_stanza(now: u64) -> Node {
                 .build(),
             NodeBuilder::new("net").attr("medium", "3").build(),
             NodeBuilder::new("encopt").attr("keygen", "2").build(),
-        ])
-        .build();
-
-    NodeBuilder::new("call")
-        .attr("from", caller.clone())
-        .attr("call-id", CALL_ID)
-        .attr("call-creator", caller)
-        .attr("t", now.to_string())
-        .children([
-            offer,
             NodeBuilder::new("voip_settings")
                 .attr("uncompressed", "1")
                 .bytes(VOIP_SETTINGS.to_vec())
@@ -235,23 +221,25 @@ fn serialize(node: &Node, keep_flag: bool) -> String {
     base64::engine::general_purpose::STANDARD.encode(payload)
 }
 
-/// Delivers an offer and returns the engine log lines it produced.
-fn offer_for(runtime: &Runtime) -> Node {
-    offer_stanza(runtime.virtual_unix_time())
+fn deliver(runtime: &mut Runtime, stanza: String) -> Vec<String> {
+    let args = offer_arguments(stanza, runtime.virtual_unix_time());
+    deliver_arguments(runtime, args)
 }
 
-fn deliver(runtime: &mut Runtime, stanza: String) -> Vec<String> {
+fn deliver_arguments(runtime: &mut Runtime, args: [Value; 9]) -> Vec<String> {
     let mark = runtime.engine_log().len();
     runtime.clear_calls();
 
+    let stanza = args[0].as_str().expect("serialized offer");
     let input_hash = hex::encode(Sha256::digest(stanza.as_bytes()));
-    eprintln!("oracle input_base64={stanza}");
-    let outcome = runtime.call_embind(
-        "handleIncomingSignalingOffer",
-        &offer_arguments(stanza, runtime.virtual_unix_time()),
+    eprintln!(
+        "oracle input_base64={stanza} bridge_arguments={:?}",
+        &args[1..]
     );
+    let outcome = common::evidence::call(runtime, "handleIncomingSignalingOffer", &args);
     runtime.refuel();
     let settled = wait_for_reaction(runtime, mark);
+    common::evidence::record(runtime);
     let lines = runtime.engine_log_from(mark);
     let overflowed = runtime
         .engine_log_overflowed()
@@ -265,6 +253,15 @@ fn deliver(runtime: &mut Runtime, stanza: String) -> Vec<String> {
         evidence::fail(
             Failure::Infrastructure,
             format!("offer call trapped: {error:#}"),
+        );
+    }
+    if lines
+        .iter()
+        .any(|line| line.contains("check_locking_order"))
+    {
+        evidence::fail(
+            Failure::Infrastructure,
+            "engine lock watchdog interrupted the scenario",
         );
     }
     lines
@@ -297,6 +294,27 @@ fn native_offer_arguments_preserve_the_web_wid_abi() {
     assert_eq!(jid(CALLER).to_string(), "15550001111@s.whatsapp.net");
 }
 
+/// The original failing fixture passed the call envelope instead of voipNode.
+#[test]
+#[ignore = "real threads; see the module docs"]
+fn an_enclosing_call_is_rejected_as_a_native_offer() {
+    let _serial = threaded_guard();
+    let mut runtime = engine();
+    let envelope = NodeBuilder::new("call")
+        .attr("from", jid(CALLER))
+        .children([offer_stanza()])
+        .build();
+    let payload = serialize(&envelope, true);
+    let lines = deliver(&mut runtime, payload);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("conversion_result FAILED")),
+        "the native bridge should reject the envelope: {lines:?}"
+    );
+    assert!(!reached_call_stack(&lines));
+}
+
 /// Waits until the engine stops writing about what it was just asked to do.
 ///
 /// The engine hands offer processing to its event thread, so the call returning
@@ -317,7 +335,9 @@ fn wait_for_reaction(runtime: &mut Runtime, mark: usize) -> bool {
         // only the host takes it out. Waiting for quiet without draining reports
         // "the engine did nothing" about a run in which it queued the answer and
         // nobody collected it.
-        runtime.process_queued_calls();
+        runtime.try_process_queued_calls().unwrap_or_else(|error| {
+            common::evidence::fail(common::evidence::Failure::Infrastructure, error)
+        });
         let len = runtime.engine_log().len();
 
         if len != last_len {
@@ -358,7 +378,7 @@ fn arguments_are_in_the_documented_order() {
     let _serial = threaded_guard();
     let mut runtime = engine();
     let lines = {
-        let payload = serialize(&offer_for(&runtime), true);
+        let payload = serialize(&offer_stanza(), true);
         deliver(&mut runtime, payload)
     };
 
@@ -390,10 +410,10 @@ fn reached_call_stack(lines: &[String]) -> bool {
 #[ignore = "real threads; see the module docs"]
 fn engine_accepts_the_framed_encoding() {
     let _serial = threaded_guard();
-    let mut runtime = engine();
 
     let framed = {
-        let payload = serialize(&offer_for(&runtime), true);
+        let mut runtime = engine();
+        let payload = serialize(&offer_stanza(), true);
         deliver(&mut runtime, payload)
     };
     assert!(
@@ -402,12 +422,20 @@ fn engine_accepts_the_framed_encoding() {
     );
 
     let unframed = {
-        let payload = serialize(&offer_for(&runtime), false);
+        let mut runtime = engine();
+        let payload = serialize(&offer_stanza(), false);
         deliver(&mut runtime, payload)
     };
     assert!(
         !reached_call_stack(&unframed),
         "dropping the flag byte should not reach the call stack: {unframed:?}"
+    );
+    assert!(
+        unframed
+            .iter()
+            .any(|line| line.contains("conversion_result FAILED")
+                || line.contains("invalid list size")),
+        "the negative control needs an explicit parser rejection: {unframed:?}"
     );
 }
 
@@ -442,8 +470,8 @@ fn engine_survives_malformed_offers() {
         ),
         (
             "truncated stanza",
-            Box::new(|runtime: &Runtime| {
-                let full = serialize(&offer_for(runtime), true);
+            Box::new(|_: &Runtime| {
+                let full = serialize(&offer_stanza(), true);
                 full[..full.len() / 2].to_owned()
             }),
         ),
@@ -458,7 +486,7 @@ fn engine_survives_malformed_offers() {
         // still answers afterwards is its business; whether the host survives
         // is ours.
         runtime.refuel();
-        let probe = runtime.call_embind("getWebP2PVirtualIpv4", &[]);
+        let probe = common::evidence::call(&mut runtime, "getWebP2PVirtualIpv4", &[]);
         match probe {
             Ok(value) => assert_eq!(
                 value,
@@ -494,7 +522,7 @@ fn offer_handling_is_deterministic() {
     let _serial = threaded_guard();
     let observe = || {
         let mut runtime = engine();
-        let stanza = serialize(&offer_for(&runtime), true);
+        let stanza = serialize(&offer_stanza(), true);
         let lines = deliver(&mut runtime, stanza);
         assert!(
             lines
@@ -543,9 +571,7 @@ fn events(lines: Vec<String>) -> Vec<String> {
 #[ignore = "real threads; see the module docs"]
 fn media_stack_reports_its_failure() {
     let _serial = threaded_guard();
-    let Ok(runtime) = engine_with(ThreadPolicy::Refuse) else {
-        evidence::fail(Failure::MissingCapture, VOIP);
-    };
+    let runtime = engine_with(ThreadPolicy::Refuse);
     let log = runtime.engine_log();
 
     let failure = log
@@ -636,7 +662,11 @@ fn the_memory_watch_names_the_moment() {
 
     // The workers poll, so they reach a host call within milliseconds; this is
     // waiting for the report rather than for anything to happen.
-    runtime.settle(Duration::from_secs(2));
+    runtime
+        .try_settle(Duration::from_secs(2))
+        .unwrap_or_else(|error| {
+            common::evidence::fail(common::evidence::Failure::Infrastructure, error)
+        });
 
     // From the watch, not from the host log: the log refuses new lines once
     // full, and this report was being written past that point and discarded.
@@ -755,7 +785,7 @@ fn a_well_formed_offer_reaches_the_call_stack() {
     let _serial = threaded_guard();
     let mut runtime = engine();
     let lines = {
-        let payload = serialize(&offer_for(&runtime), true);
+        let payload = serialize(&offer_stanza(), true);
         deliver(&mut runtime, payload)
     };
 
@@ -781,14 +811,15 @@ fn non_numeric_timestamps_are_rejected() {
     let mark = runtime.engine_log().len();
 
     let mut args = offer_arguments(
-        serialize(&offer_for(&runtime), true),
+        serialize(&offer_stanza(), true),
         runtime.virtual_unix_time(),
     );
     args[3] = Value::Str("not-a-number".to_owned());
     args[4] = Value::Str("also-not".to_owned());
-    let _ = runtime.call_embind("handleIncomingSignalingOffer", &args);
+    let _ = common::evidence::call(&mut runtime, "handleIncomingSignalingOffer", &args);
     runtime.refuel();
 
+    common::evidence::record(&runtime);
     let lines = runtime.engine_log_from(mark);
     assert!(
         lines
@@ -798,28 +829,18 @@ fn non_numeric_timestamps_are_rejected() {
     );
 }
 
-/// `call-id` belongs on the `<call>`. This pins the difference, because the
-/// attribute name is the same in both places and only the position matters.
+/// The native offer requires its own call-id. Removing only that attribute
+/// must produce a rejection, rather than an accepted anonymous call.
 #[test]
 #[ignore = "real threads; see the module docs"]
-fn call_id_must_sit_on_the_call_element() {
+fn a_native_offer_without_a_call_id_is_rejected() {
     let _serial = threaded_guard();
     let mut runtime = engine();
-
-    let misplaced = NodeBuilder::new("call")
-        .attr("from", jid(CALLER))
-        .attr("t", "1735689600")
-        .children([NodeBuilder::new("offer")
-            .attr("call-id", CALL_ID)
-            .attr("call-creator", jid(CALLER))
-            .build()])
-        .build();
-
-    let lines = deliver(&mut runtime, serialize(&misplaced, true));
-    assert!(
-        lines.iter().any(|line| line.contains("empty call-id")),
-        "expected the parser to miss a call-id on the offer: {lines:?}"
-    );
+    let mut missing = offer_stanza();
+    missing.attrs.0.retain(|(key, _)| key != "call-id");
+    let lines = deliver(&mut runtime, serialize(&missing, true));
+    assert!(lines.iter().any(|line| line.contains("empty call-id") || line.contains("conversion_result FAILED")),
+        "the native bridge must reject the missing call-id: {lines:?}");
 }
 
 /// The engine accepts the offer outright: status 0, no parser complaint.
@@ -832,7 +853,7 @@ fn call_id_must_sit_on_the_call_element() {
 fn a_well_formed_offer_is_accepted() {
     let _serial = threaded_guard();
     let mut runtime = engine();
-    let payload = serialize(&offer_for(&runtime), true);
+    let payload = serialize(&offer_stanza(), true);
     let lines = deliver(&mut runtime, payload);
 
     // A missing line proves nothing once the ring has wrapped: the reader can
@@ -873,11 +894,12 @@ fn settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call() {
     let _serial = common::engine_lock();
     let mut runtime = engine();
 
-    let payload = serialize(&offer_for(&runtime), true);
+    let payload = serialize(&offer_stanza(), true);
     let _ = deliver(&mut runtime, payload);
 
     let mark = runtime.engine_log().len();
-    let _ = runtime.call_embind(
+    let _ = common::evidence::call(
+        &mut runtime,
         "startVoipCall",
         &[
             Value::Str(PEER_LID.to_owned()),
@@ -890,8 +912,13 @@ fn settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call() {
         ],
     );
     runtime.refuel();
-    runtime.settle(Duration::from_secs(5));
+    runtime
+        .try_settle(Duration::from_secs(5))
+        .unwrap_or_else(|error| {
+            common::evidence::fail(common::evidence::Failure::Infrastructure, error)
+        });
 
+    common::evidence::record(&runtime);
     let lines = runtime.engine_log_from(mark);
 
     // What this used to assert, and what it took to get here.
@@ -960,13 +987,13 @@ fn settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call() {
 fn an_incoming_offer_reports_its_participants() {
     let _serial = threaded_guard();
     let mut runtime = engine();
-    let payload = serialize(&offer_for(&runtime), true);
+    let payload = serialize(&offer_stanza(), true);
     let lines = deliver(&mut runtime, payload);
     for line in &lines {
         eprintln!("  | {}", line.trim());
     }
 
-    let info = runtime.call_embind("getCallInfo", &[]);
+    let info = common::evidence::call(&mut runtime, "getCallInfo", &[]);
     runtime.refuel();
     let Some(json) = info.as_ref().ok().and_then(|value| value.as_str()) else {
         evidence::fail(Failure::Infrastructure, format!("getCallInfo: {info:?}"));
@@ -998,20 +1025,15 @@ fn an_unmarked_settings_blob_is_rejected() {
     let _serial = threaded_guard();
     let mut runtime = engine();
 
-    let caller = jid(CALLER);
-    let unmarked = NodeBuilder::new("call")
-        .attr("from", caller.clone())
-        .attr("call-id", CALL_ID)
-        .attr("call-creator", caller)
-        .attr("t", runtime.virtual_unix_time().to_string())
-        .children([
-            NodeBuilder::new("offer").build(),
-            // Same bytes, without the attribute that says they are plain.
-            NodeBuilder::new("voip_settings")
-                .bytes(VOIP_SETTINGS.to_vec())
-                .build(),
-        ])
-        .build();
+    let mut unmarked = offer_stanza();
+    let Some(wacore_binary::node::NodeContent::Nodes(children)) = &mut unmarked.content else {
+        panic!("offer fixture has no children");
+    };
+    children
+        .iter_mut()
+        .find(|node| node.tag == "voip_settings")
+        .expect("settings fixture")
+        .attrs = Default::default();
 
     let payload = serialize(&unmarked, true);
     let lines = deliver(&mut runtime, payload);
@@ -1034,8 +1056,11 @@ fn an_unmarked_settings_blob_is_rejected() {
 fn the_caller_comes_from_the_argument_not_the_stanza() {
     let _serial = threaded_guard();
     let mut runtime = engine();
-    let payload = serialize(&offer_for(&runtime), true);
-    let lines = deliver(&mut runtime, payload);
+    let payload = serialize(&offer_stanza(), true);
+    let mut args = offer_arguments(payload, runtime.virtual_unix_time());
+    // Deliberately different from the stanza's CALLER.
+    args[7] = Value::Str("15550003333@c.us".to_owned());
+    let lines = deliver_arguments(&mut runtime, args);
 
     if runtime.engine_log_overflowed().expect("overflow probe") {
         evidence::fail(Failure::Overflow, "engine log wrapped");
@@ -1046,9 +1071,8 @@ fn the_caller_comes_from_the_argument_not_the_stanza() {
         .find(|line| line.contains("Offer from:"))
         .unwrap_or_else(|| panic!("engine logged no offer line: {lines:?}"));
 
-    let tail = &CALLER[CALLER.len() - 4..];
     assert!(
-        offer_line.contains(tail),
+        offer_line.contains("3333"),
         "the caller should reach the engine, got {offer_line:?}"
     );
     // The failure this pins: an empty argument 8 reads as user zero.
@@ -1082,7 +1106,8 @@ fn the_engine_starts_an_outgoing_call() {
     let mut runtime = engine();
 
     let mark = runtime.engine_log().len();
-    let outcome = runtime.call_embind(
+    let outcome = common::evidence::call(
+        &mut runtime,
         "startVoipCall",
         &[
             // Every JID in LID form: the engine enforces it outright —
@@ -1100,8 +1125,13 @@ fn the_engine_starts_an_outgoing_call() {
         ],
     );
     runtime.refuel();
-    runtime.settle(std::time::Duration::from_secs(5));
+    runtime
+        .try_settle(std::time::Duration::from_secs(5))
+        .unwrap_or_else(|error| {
+            common::evidence::fail(common::evidence::Failure::Infrastructure, error)
+        });
 
+    common::evidence::record(&runtime);
     let lines = runtime.engine_log_from(mark);
     if runtime.engine_log_overflowed().expect("overflow probe") {
         evidence::fail(Failure::Overflow, "engine log wrapped");
@@ -1188,14 +1218,18 @@ fn the_engine_accepts_the_init_sequence_whatsapp_web_performs() {
     let _serial = common::engine_lock();
     let mut runtime = engine();
 
-    let hide_ip = runtime.call_embind("setHideMyIp", &[Value::Bool(false)]);
+    let hide_ip = common::evidence::call(&mut runtime, "setHideMyIp", &[Value::Bool(false)]);
     runtime.refuel();
     assert!(
         hide_ip.is_ok(),
         "setHideMyIp should be accepted: {hide_ip:?}"
     );
 
-    let medium = runtime.call_embind("updateNetworkMedium", &[Value::Int(1), Value::Int(0)]);
+    let medium = common::evidence::call(
+        &mut runtime,
+        "updateNetworkMedium",
+        &[Value::Int(1), Value::Int(0)],
+    );
     runtime.refuel();
     assert_eq!(
         medium.as_ref().ok().and_then(|value| value.as_int()),
@@ -1205,14 +1239,15 @@ fn the_engine_accepts_the_init_sequence_whatsapp_web_performs() {
 
     // The JS worker thread the engine hands back a handle for, and the pthread
     // id behind it — `JsWorkerThread.js` needs both to build its message port.
-    let worker = runtime.call_embind("startJsWorkerThread", &[]);
+    let worker = common::evidence::call(&mut runtime, "startJsWorkerThread", &[]);
     runtime.refuel();
     let Some(handle) = worker.as_ref().ok().and_then(|value| value.as_int()) else {
         panic!("startJsWorkerThread should return a handle: {worker:?}");
     };
     assert!(handle != 0, "the handle should be a real pointer");
 
-    let pthread = runtime.call_embind("getJsWorkerPThreadId", &[Value::Int(handle)]);
+    let pthread =
+        common::evidence::call(&mut runtime, "getJsWorkerPThreadId", &[Value::Int(handle)]);
     runtime.refuel();
     assert!(
         pthread
@@ -1226,7 +1261,8 @@ fn the_engine_accepts_the_init_sequence_whatsapp_web_performs() {
     // Config the server would have supplied. Empty is the honest answer with no
     // server attached, and worth pinning: it is why `elected_relay_idx` is -1
     // and why no offer can carry a relay.
-    let param = runtime.call_embind(
+    let param = common::evidence::call(
+        &mut runtime,
         "getVoipParam",
         &[Value::Str("options.caller_timeout".to_owned())],
     );
@@ -1257,7 +1293,7 @@ fn the_engine_reports_a_self_participant_for_an_outgoing_call() {
 
     // Nothing before the call: this is what makes the post-call dump evidence
     // about *this* call rather than pre-existing state.
-    let before = runtime.call_embind("getCallInfo", &[]);
+    let before = common::evidence::call(&mut runtime, "getCallInfo", &[]);
     runtime.refuel();
     assert_eq!(
         before.as_ref().ok().and_then(|value| value.as_str()),
@@ -1265,7 +1301,8 @@ fn the_engine_reports_a_self_participant_for_an_outgoing_call() {
         "with no call in flight the engine should report nothing: {before:?}"
     );
 
-    let _ = runtime.call_embind(
+    let _ = common::evidence::call(
+        &mut runtime,
         "startVoipCall",
         &[
             Value::Str(PEER_LID.to_owned()),
@@ -1278,9 +1315,13 @@ fn the_engine_reports_a_self_participant_for_an_outgoing_call() {
         ],
     );
     runtime.refuel();
-    runtime.settle(std::time::Duration::from_secs(5));
+    runtime
+        .try_settle(std::time::Duration::from_secs(5))
+        .unwrap_or_else(|error| {
+            common::evidence::fail(common::evidence::Failure::Infrastructure, error)
+        });
 
-    let info = runtime.call_embind("getCallInfo", &[]);
+    let info = common::evidence::call(&mut runtime, "getCallInfo", &[]);
     runtime.refuel();
     let Some(json) = info.as_ref().ok().and_then(|value| value.as_str()) else {
         evidence::fail(Failure::Infrastructure, format!("getCallInfo: {info:?}"));
@@ -1315,7 +1356,8 @@ fn a_phone_number_peer_is_refused_because_this_build_enforces_lid() {
     let mut runtime = engine();
 
     let mark = runtime.engine_log().len();
-    let outcome = runtime.call_embind(
+    let outcome = common::evidence::call(
+        &mut runtime,
         "startVoipCall",
         &[
             Value::Str("11223344556677@s.whatsapp.net".to_owned()),
@@ -1328,8 +1370,13 @@ fn a_phone_number_peer_is_refused_because_this_build_enforces_lid() {
         ],
     );
     runtime.refuel();
-    runtime.settle(Duration::from_secs(5));
+    runtime
+        .try_settle(Duration::from_secs(5))
+        .unwrap_or_else(|error| {
+            common::evidence::fail(common::evidence::Failure::Infrastructure, error)
+        });
 
+    common::evidence::record(&runtime);
     let lines = runtime.engine_log_from(mark);
     if runtime.engine_log_overflowed().expect("overflow probe") {
         evidence::fail(Failure::Overflow, "engine log wrapped");
@@ -1360,7 +1407,7 @@ fn an_offers_settings_blob_becomes_readable_through_get_voip_param() {
     let mut runtime = engine();
 
     let read = |runtime: &mut Runtime, name: &str| -> Option<String> {
-        let value = runtime.call_embind("getVoipParam", &[Value::Str(name.to_owned())]);
+        let value = common::evidence::call(runtime, "getVoipParam", &[Value::Str(name.to_owned())]);
         runtime.refuel();
         value
             .ok()
@@ -1372,7 +1419,7 @@ fn an_offers_settings_blob_becomes_readable_through_get_voip_param() {
     let name = "options.enable_48khz_rtp_clock";
     let before = read(&mut runtime, name);
 
-    let payload = serialize(&offer_for(&runtime), true);
+    let payload = serialize(&offer_stanza(), true);
     let _ = deliver(&mut runtime, payload);
 
     let after = read(&mut runtime, name);
@@ -1393,86 +1440,66 @@ fn an_offers_settings_blob_becomes_readable_through_get_voip_param() {
     );
 }
 
-/// Does an offer's settings blob move the bytes that block an outgoing offer?
-///
-/// `make_and_cache_offer` fails at `offer.cc:430` when both terms of a guard are
-/// zero. One of them is `ctx[662166]`, read straight off the call context. The
-/// other is `arg2`, which comes from `params[3856]` — and `params` is
-/// `wa_call_start_call`'s own first argument, *not* the context, so the reading
-/// of `ctx[3856]` below is of a different object and means nothing on its own.
-/// It is measured anyway because it costs nothing and its stability is worth
-/// knowing.
-///
-/// An incoming offer *does* configure the engine: values from its
-/// `<voip_settings>` blob are readable through `getVoipParam` afterwards. So the
-/// question is whether that channel reaches `ctx[662166]`.
-///
-/// The context is reachable at `*(u32*)1719816`; the engine gets there the same
-/// way, through the function `getCallInfo` calls. Re-derived for the
-/// `JgwtTQVeWPm` capture along the route the previous one recorded:
-/// `oracle xref <module> getCallInfo` names the registration site (func 1200),
-/// whose body pushes the table slot it registers (764), and that slot holds
-/// func 1141 — 145 instructions, the same shape as the previous capture's
-/// 1108 — which calls func 11591, seven instructions opening with
-/// `i32.const 1719816 / i32.load`.
-///
-/// **The two offsets below have not been carried forward.** They came out of
-/// `make_and_cache_offer` in the previous capture, and that function is one of
-/// the ones this rollout rewrote: it does not survive `unwasm`'s fingerprint,
-/// so there is no mechanical route from the old numbers to new ones. Reading
-/// them anyway would ask a live object for two bytes at offsets derived from
-/// different code, and a pair of zeroes read from the wrong place looks exactly
-/// like the answer this test is pinning — which is how a test comes to pass for
-/// a stanza that never parsed. So it refuses instead, and says why.
+/// The current capture's offer guard is count != 0 || ctx[1568] != 0.
+/// Function 12564, body bytes 5385915..5389659, reads that flag at
+/// 0x522fef..0x522ff8 and returns 70008 on the zero/zero branch at 0x52300a.
+/// Its only direct caller, 11745 at 0x491ec9, passes the global context from
+/// *(u32*)1719816 and a destination count assembled at 0x491e21..0x491e3b.
+/// The old ctx[3856]/ctx[662166] probe described a different binary and object.
+/// Pin both functions and the context getter before reading the current flag.
 #[test]
 #[ignore = "real threads; see the module docs"]
-fn an_offer_does_not_move_the_bytes_that_gate_the_outgoing_offer() {
-    /// Set once `make_and_cache_offer`'s guard has been located in this capture
-    /// and the two offsets read out of it.
-    const OFFSETS_REDERIVED: Option<(u32, u32)> = None;
-
-    let Some((settings_offset, guard_offset)) = OFFSETS_REDERIVED else {
-        evidence::fail(
-            Failure::Unqualified,
-            "the offer-guard offsets (3856, 662166) were read out of \
-             D5pLH9sfOOl's make_and_cache_offer, which JgwtTQVeWPm rewrote. \
-             Re-derive them before trusting this probe.",
+fn incoming_settings_preserve_the_current_offer_guard_flag() {
+    let _serial = threaded_guard();
+    let bytes = common::capture(VOIP)
+        .expect("capture integrity")
+        .unwrap_or_else(|| evidence::fail(Failure::MissingCapture, VOIP));
+    for (index, expected) in [
+        (
+            12564,
+            "655f4f886b7614da939113787adcd4570746a8fb953b22c7adf2429ee9d52af5",
+        ),
+        (
+            11745,
+            "7c80c7d76bce45a5bcc332d69bdb3ad7f4bd37c77eeeead8504e1db39f758e82",
+        ),
+        (
+            11591,
+            "b2957dabb3d7bccbcbb238acef86ac12ca4bde09ae8c360081e30fd37cffa9ae",
+        ),
+    ] {
+        assert_eq!(
+            oracle_core::derive::function_body_sha256(&bytes, index).expect("guard selector"),
+            expected,
+            "capture changed; re-derive the guard and context address together"
         );
-    };
-
-    let _serial = common::engine_lock();
+    }
     let mut runtime = engine();
-
-    let guard_bytes = |runtime: &Runtime| -> Option<(u8, u8)> {
-        let ctx = runtime
+    let flag = |runtime: &Runtime| {
+        let pointer = runtime
             .read(1_719_816, 4)
-            .ok()
-            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))?;
+            .unwrap_or_else(|error| evidence::fail(Failure::Infrastructure, error));
+        let ctx = u32::from_le_bytes(pointer.try_into().expect("four-byte context pointer"));
         if ctx < 0x10000 {
-            return None;
+            evidence::fail(Failure::Infrastructure, "no call context");
         }
-        Some((
-            *runtime.read(ctx + settings_offset, 1).ok()?.first()?,
-            *runtime.read(ctx + guard_offset, 1).ok()?.first()?,
-        ))
+        runtime
+            .read(ctx.checked_add(1568).expect("guard address"), 1)
+            .unwrap_or_else(|error| evidence::fail(Failure::Infrastructure, error))[0]
     };
-
-    let Some(before) = guard_bytes(&runtime) else {
-        evidence::fail(Failure::Infrastructure, "no call context yet");
-    };
-
-    let payload = serialize(&offer_for(&runtime), true);
-    let _ = deliver(&mut runtime, payload);
-
-    let after = guard_bytes(&runtime);
-    eprintln!("guard bytes (3856, 662166): before={before:?} after={after:?}");
-
-    // Pinned as the current answer: configuring through an offer does not
-    // reach these. If this starts failing, the settings channel does move them
-    // and the outgoing blocker is reachable from here.
+    let before = flag(&runtime);
+    let lines = deliver(&mut runtime, serialize(&offer_stanza(), true));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("wa_call_handle_incoming_xmpp_offer() status 0")),
+        "the settings observation requires an accepted offer: {lines:?}"
+    );
+    let after = flag(&runtime);
+    eprintln!("oracle guard_offset=1568 before={before} after={after}");
+    assert_eq!(before, 0);
     assert_eq!(
-        after,
-        Some((0, 0)),
-        "an offer moved ctx[662166] — the settings channel reaches the guard"
+        after, before,
+        "incoming settings changed the pinned offer guard flag"
     );
 }
