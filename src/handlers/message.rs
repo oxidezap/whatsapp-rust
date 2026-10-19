@@ -81,15 +81,7 @@ impl MessageHandler {
         let lane = client
             .chat_lanes
             .get_with_by_ref(&chat_jid, async {
-                let budget = client
-                    .inbound_queue_budgets
-                    .per_chat
-                    .get_with_by_ref(&chat_jid, async {
-                        Arc::new(crate::inbound_queue::ByteBudget::new(
-                            crate::inbound_queue::CHAT_BYTES,
-                        ))
-                    })
-                    .await;
+                let budget = client.inbound_queue_budgets.chat_budget(&chat_jid);
                 create_chat_lane(
                     &client,
                     Arc::new(async_lock::Mutex::new(())),

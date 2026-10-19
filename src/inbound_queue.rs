@@ -12,24 +12,62 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+type BudgetRegistry = std::sync::Mutex<
+    std::collections::HashMap<wacore_binary::jid::Jid, std::sync::Weak<ByteBudget>>,
+>;
+
+struct BudgetRegistration {
+    registry: std::sync::Weak<BudgetRegistry>,
+    chat: wacore_binary::jid::Jid,
+}
+
 /// A non-waiting byte counter. One lease is the only way to return a charge.
 /// Unlike a runtime semaphore this also works when tokio-runtime is disabled.
-pub(crate) struct ByteBudget(AtomicUsize);
+pub(crate) struct ByteBudget {
+    available: AtomicUsize,
+    registration: Option<BudgetRegistration>,
+}
 impl ByteBudget {
     pub(crate) fn new(bytes: usize) -> Self {
-        Self(AtomicUsize::new(bytes))
+        Self {
+            available: AtomicUsize::new(bytes),
+            registration: None,
+        }
     }
     pub(crate) fn available(&self) -> usize {
-        self.0.load(Ordering::Relaxed)
+        self.available.load(Ordering::Relaxed)
     }
 }
+impl Drop for ByteBudget {
+    fn drop(&mut self) {
+        let address = self as *const Self;
+        let Some(registration) = &self.registration else {
+            return;
+        };
+        let Some(registry) = registration.registry.upgrade() else {
+            return;
+        };
+        let mut entries = registry.lock().unwrap_or_else(|p| p.into_inner());
+        // A failed Weak::upgrade can install a replacement while this destructor
+        // waits for the lock. Never remove that new budget's registration.
+        if entries
+            .get(&registration.chat)
+            .is_some_and(|entry| entry.as_ptr() == address)
+        {
+            entries.remove(&registration.chat);
+        }
+    }
+}
+
 pub(crate) struct ByteLease {
     budget: Arc<ByteBudget>,
     bytes: usize,
 }
 impl Drop for ByteLease {
     fn drop(&mut self) {
-        self.budget.0.fetch_add(self.bytes, Ordering::Relaxed);
+        self.budget
+            .available
+            .fetch_add(self.bytes, Ordering::Relaxed);
     }
 }
 
@@ -59,28 +97,52 @@ pub(crate) struct QueueBudgets {
     pub chat: Arc<ByteBudget>,
     pub ack: Arc<ByteBudget>,
     pub work: Arc<crate::flush_scope::FlushScope>,
-    pub per_chat: crate::cache::Cache<wacore_binary::jid::Jid, Arc<ByteBudget>>,
+    per_chat: Arc<BudgetRegistry>,
     pub draining: std::sync::atomic::AtomicBool,
 }
 impl Default for QueueBudgets {
     fn default() -> Self {
-        Self::with_chat_capacity(crate::cache_config::CacheConfig::default().chat_lanes_capacity)
-    }
-}
-impl QueueBudgets {
-    pub(crate) fn with_chat_capacity(capacity: u64) -> Self {
         Self {
             chat: Arc::new(ByteBudget::new(GLOBAL_CHAT_BYTES)),
             ack: Arc::new(ByteBudget::new(ACK_BYTES)),
             work: Arc::default(),
-            // Unlike lane workers, byte ownership survives connection cleanup.
-            // A lease pins this entry until its final backing slice is released.
-            per_chat: crate::cache::Cache::builder()
-                .max_capacity(capacity.max(1))
-                .evict_guard(|budget: &Arc<ByteBudget>| Arc::strong_count(budget) <= 1)
-                .build(),
+            per_chat: Arc::default(),
             draining: false.into(),
         }
+    }
+}
+impl QueueBudgets {
+    pub(crate) fn chat_budget_count(&self) -> u64 {
+        self.per_chat
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len() as u64
+    }
+
+    pub(crate) fn chat_budget(&self, chat: &wacore_binary::jid::Jid) -> Arc<ByteBudget> {
+        self.chat_budget_with_limit(chat, CHAT_BYTES)
+    }
+
+    fn chat_budget_with_limit(
+        &self,
+        chat: &wacore_binary::jid::Jid,
+        bytes: usize,
+    ) -> Arc<ByteBudget> {
+        let mut entries = self.per_chat.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(budget) = entries.get(chat).and_then(std::sync::Weak::upgrade) {
+            return budget;
+        }
+        // Only live lanes/byte leases own a strong reference. Their final drop
+        // removes this weak entry, so sequential chat churn leaves no tombstones.
+        let budget = Arc::new(ByteBudget {
+            available: AtomicUsize::new(bytes),
+            registration: Some(BudgetRegistration {
+                registry: Arc::downgrade(&self.per_chat),
+                chat: chat.clone(),
+            }),
+        });
+        entries.insert(chat.clone(), Arc::downgrade(&budget));
+        budget
     }
 }
 
@@ -88,7 +150,7 @@ pub(crate) fn reserve(budget: &Arc<ByteBudget>, bytes: usize) -> Option<ByteLeas
     // A minimum charge also bounds the number of tiny queued or in-flight nodes.
     let charge = bytes.max(1024);
     budget
-        .0
+        .available
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |available| {
             available.checked_sub(charge)
         })
@@ -253,6 +315,55 @@ mod tests {
                 .bytes(vec![id as u8; bytes])
                 .build(),
         )
+    }
+
+    #[test]
+    fn chat_budget_registry_follows_live_owners_without_weak_tombstones() {
+        let budgets = QueueBudgets::default();
+        let chat: wacore_binary::jid::Jid = "120363000000042@g.us".parse().unwrap();
+        let budget = budgets.chat_budget_with_limit(&chat, 2048);
+        let same = budgets.chat_budget(&chat);
+        assert!(Arc::ptr_eq(&budget, &same));
+        let retained = retain_node(&node(1, 4), &budgets.chat, &budget, Arc::default()).unwrap();
+        drop(budget);
+        drop(same);
+        assert_eq!(budgets.per_chat.lock().unwrap().len(), 1);
+        drop(retained);
+        assert!(budgets.per_chat.lock().unwrap().is_empty());
+        for id in 0..128 {
+            let chat = format!("12036300000{id:04}@g.us").parse().unwrap();
+            drop(budgets.chat_budget(&chat));
+            assert!(budgets.per_chat.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn an_old_budget_destructor_cannot_remove_its_concurrent_replacement() {
+        let budgets = QueueBudgets::default();
+        let chat: wacore_binary::jid::Jid = "120363000000042@g.us".parse().unwrap();
+        let old = budgets.chat_budget(&chat);
+        let weak = Arc::downgrade(&old);
+        let registry = Arc::clone(&budgets.per_chat);
+        let mut entries = registry.lock().unwrap();
+        let dropping = std::thread::spawn(move || drop(old));
+        while weak.strong_count() != 0 {
+            std::thread::yield_now();
+        }
+        let replacement = Arc::new(ByteBudget {
+            available: AtomicUsize::new(CHAT_BYTES),
+            registration: Some(BudgetRegistration {
+                registry: Arc::downgrade(&registry),
+                chat: chat.clone(),
+            }),
+        });
+        entries.insert(chat.clone(), Arc::downgrade(&replacement));
+        drop(entries);
+        dropping.join().unwrap();
+        let found = budgets.chat_budget(&chat);
+        assert!(Arc::ptr_eq(&found, &replacement));
+        drop(found);
+        drop(replacement);
+        assert!(registry.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -479,13 +590,10 @@ mod overload_tests {
     async fn escaped_chat_bytes_keep_the_same_budget_across_connection_cache_clear() {
         let client = crate::test_utils::create_test_client().await;
         let chat: wacore_binary::jid::Jid = "120363000000042@g.us".parse().unwrap();
-        let budget = Arc::new(ByteBudget::new(1024));
-        let weak = Arc::downgrade(&budget);
-        client
+        let budget = client
             .inbound_queue_budgets
-            .per_chat
-            .insert(chat.clone(), Arc::clone(&budget))
-            .await;
+            .chat_budget_with_limit(&chat, 1024);
+        let weak = Arc::downgrade(&budget);
         let (queue_tx, rx) = async_channel::bounded(1);
         let rx = DrainingReceiver(rx);
         let lane = ChatLane {

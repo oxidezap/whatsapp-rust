@@ -665,6 +665,8 @@ pub struct MemoryReport {
     /// Groups with a metadata query in flight; normally zero.
     pub group_metadata_inflight: u64,
     pub chat_lanes: u64,
+    /// Live per-chat byte budgets, including backing slices surviving lane eviction.
+    pub inbound_chat_budgets: u64,
     /// Incoming offers still inside the handler, awaiting signaling or identity work.
     pub pending_call_offers: u64,
     /// Inbound messages queued behind their chat's lane worker, summed over
@@ -983,6 +985,7 @@ impl std::fmt::Display for MemoryReport {
         )?;
         writeln!(f, "  skdm_warm_memo:         {}", self.skdm_warm_memo)?;
         writeln!(f, "--- Byte-bounded receive queues ---")?;
+        writeln!(f, "  inbound_chat_budgets:   {}", self.inbound_chat_budgets)?;
         writeln!(f, "  chat_lane_backlog:      {}", self.chat_lane_backlog)?;
         writeln!(f, "  transport_ack_queue:    {}", self.transport_ack_queue)?;
         writeln!(f, "--- Unbounded collections ---")?;
