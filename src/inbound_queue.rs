@@ -219,7 +219,12 @@ mod tests {
         assert_eq!(global.available(), 1024);
         drop(clone);
         assert_eq!(global.available(), 1024);
+        assert!(
+            Arc::strong_count(&lane.enqueue_lock) > 1,
+            "escaped slices must pin the per-chat budget against cache eviction"
+        );
         drop(slice);
+        assert_eq!(Arc::strong_count(&lane.enqueue_lock), 1);
         assert_eq!(global.available(), 2048);
     }
 
@@ -409,6 +414,17 @@ mod overload_tests {
                 .draining
                 .load(Ordering::Acquire)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_work_cannot_hold_the_overload_drain_open_forever() {
+        let client = crate::test_utils::create_test_client().await;
+        let work = client.inbound_queue_budgets.work.try_track().unwrap();
+        client.drain_overloaded_inbound();
+        wacore::runtime::wait_for_shutdown(&client.connection_shutdown_signal()).await;
+        assert_eq!(client.inbound_queue_budgets.work.pending(), 1);
+        drop(work);
+        assert_eq!(client.inbound_queue_budgets.work.pending(), 0);
     }
 
     #[tokio::test(start_paused = true)]

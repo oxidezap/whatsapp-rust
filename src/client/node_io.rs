@@ -2558,6 +2558,26 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn stale_ack_burst_cannot_use_a_replacement_connection_scope() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let old = client.connection_shutdown_signal();
+        client.notify_connection_shutdown();
+        client.reset_connection_shutdown();
+        let before = transport.sent().len();
+        let mut frames = vec![bytes::Bytes::from_static(b"stale")];
+        let mut results = Vec::new();
+        assert!(matches!(
+            client
+                .send_raw_bytes_burst_scoped(&mut frames, &mut results, Some(&old))
+                .await,
+            Err(ClientError::NotConnected)
+        ));
+        assert!(frames.is_empty());
+        assert!(results.is_empty());
+        assert_eq!(transport.sent().len(), before);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn deferred_ack_queue_keeps_only_compact_records_and_overload_is_nonblocking() {
         use crate::test_utils::{create_iq_test_client, node_to_owned_ref};
