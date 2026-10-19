@@ -1872,7 +1872,7 @@ pub struct Client {
 
     /// Per-chat lane combining enqueue lock + message queue into a single cached entry.
     /// One cache lookup instead of two per incoming message.
-    pub(crate) chat_lanes: Cache<Jid, ChatLane>,
+    pub(crate) chat_lanes: crate::inbound_queue::ChatLaneCache,
     pub(crate) inbound_queue_budgets: crate::inbound_queue::QueueBudgets,
     pub(crate) pending_call_offers: crate::handlers::call::pending_offers::PendingOffers,
 

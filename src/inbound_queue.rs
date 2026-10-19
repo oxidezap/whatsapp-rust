@@ -25,7 +25,7 @@ struct BudgetRegistration {
 /// Unlike a runtime semaphore this also works when tokio-runtime is disabled.
 pub(crate) struct ByteBudget {
     available: AtomicUsize,
-    registration: Option<BudgetRegistration>,
+    registration: Option<Box<BudgetRegistration>>,
 }
 impl ByteBudget {
     pub(crate) fn new(bytes: usize) -> Self {
@@ -93,6 +93,49 @@ const GLOBAL_CHAT_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const ACK_QUEUE_ITEMS: usize = 256;
 const ACK_BYTES: usize = 256 * 1024;
 
+/// The lane index is empty until the first chat. Keep that cache's structural
+/// allocation out of idle clients; byte budgets remain eagerly available.
+/// Initialization is synchronous and single-flight, before any enqueue/await.
+pub(crate) struct ChatLaneCache {
+    cache: std::sync::OnceLock<
+        Box<crate::cache::Cache<wacore_binary::jid::Jid, crate::client::ChatLane>>,
+    >,
+    capacity: u64,
+}
+impl ChatLaneCache {
+    pub(crate) fn new(capacity: u64) -> Self {
+        Self {
+            cache: std::sync::OnceLock::new(),
+            capacity: capacity.max(1),
+        }
+    }
+    pub(crate) fn initialized(
+        &self,
+    ) -> Option<&crate::cache::Cache<wacore_binary::jid::Jid, crate::client::ChatLane>> {
+        self.cache.get().map(Box::as_ref)
+    }
+    pub(crate) async fn clear(&self) {
+        if let Some(cache) = self.initialized() {
+            cache.clear().await;
+        }
+    }
+}
+impl std::ops::Deref for ChatLaneCache {
+    type Target = crate::cache::Cache<wacore_binary::jid::Jid, crate::client::ChatLane>;
+    fn deref(&self) -> &Self::Target {
+        self.cache.get_or_init(|| {
+            Box::new(
+                crate::cache::Cache::builder()
+                    .max_capacity(self.capacity)
+                    .evict_guard(|lane: &crate::client::ChatLane| {
+                        Arc::strong_count(&lane.enqueue_lock) <= 1
+                    })
+                    .build(),
+            )
+        })
+    }
+}
+
 pub(crate) struct QueueBudgets {
     pub chat: Arc<ByteBudget>,
     pub ack: Arc<ByteBudget>,
@@ -123,7 +166,10 @@ impl QueueBudgets {
             .map(|chat| {
                 // The map and live budget each own the chat key. Include the budget
                 // allocation and Arc header without upgrading/dropping under this lock.
-                2 * chat.heap_bytes() + size_of::<ByteBudget>() + 2 * size_of::<usize>()
+                2 * chat.heap_bytes()
+                    + size_of::<ByteBudget>()
+                    + size_of::<BudgetRegistration>()
+                    + 2 * size_of::<usize>()
             })
             .sum::<usize>()
             + size_of::<BudgetRegistry>()
@@ -152,10 +198,10 @@ impl QueueBudgets {
         // removes this weak entry, so sequential chat churn leaves no tombstones.
         let budget = Arc::new(ByteBudget {
             available: AtomicUsize::new(bytes),
-            registration: Some(BudgetRegistration {
+            registration: Some(Box::new(BudgetRegistration {
                 registry: Arc::downgrade(&self.per_chat),
                 chat: chat.clone(),
-            }),
+            })),
         });
         entries.insert(chat.clone(), Arc::downgrade(&budget));
         budget
@@ -333,6 +379,15 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn reporting_and_cleanup_do_not_allocate_an_unused_lane_index() {
+        let client = crate::test_utils::create_test_client().await;
+        assert!(client.chat_lanes.initialized().is_none());
+        assert_eq!(client.memory_report().await.chat_lanes, 0);
+        client.chat_lanes.clear().await;
+        assert!(client.chat_lanes.initialized().is_none());
+    }
+
     #[test]
     fn chat_budget_registry_follows_live_owners_without_weak_tombstones() {
         let budgets = QueueBudgets::default();
@@ -367,10 +422,10 @@ mod tests {
         }
         let replacement = Arc::new(ByteBudget {
             available: AtomicUsize::new(CHAT_BYTES),
-            registration: Some(BudgetRegistration {
+            registration: Some(Box::new(BudgetRegistration {
                 registry: Arc::downgrade(&registry),
                 chat: chat.clone(),
-            }),
+            })),
         });
         entries.insert(chat.clone(), Arc::downgrade(&replacement));
         drop(entries);

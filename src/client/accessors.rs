@@ -413,15 +413,19 @@ impl Client {
         // reads each lane once and allocates nothing.
         let (inbound_chat_budgets, inbound_chat_charged_bytes, inbound_ack_charged_bytes) =
             self.inbound_queue_budgets.memory_stats();
-        let (chat_lanes, chat_lane_backlog) = self
-            .chat_lanes
-            .fold_entries((0u64, 0u64), |(lanes, backlog), _, lane| {
-                (
-                    lanes + 1,
-                    backlog.saturating_add(u64::try_from(lane.queue_tx.len()).unwrap_or(u64::MAX)),
-                )
-            })
-            .await;
+        let (chat_lanes, chat_lane_backlog) = if let Some(lanes) = self.chat_lanes.initialized() {
+            lanes
+                .fold_entries((0u64, 0u64), |(lanes, backlog), _, lane| {
+                    (
+                        lanes + 1,
+                        backlog
+                            .saturating_add(u64::try_from(lane.queue_tx.len()).unwrap_or(u64::MAX)),
+                    )
+                })
+                .await
+        } else {
+            (0, 0)
+        };
 
         // Each count read into a local so no two guards are ever held at once.
         let response_waiters = self.response_waiters_guard().len();

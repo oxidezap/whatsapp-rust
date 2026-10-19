@@ -627,10 +627,7 @@ impl Client {
             ensure_inflight: Arc::default(),
             group_metadata_inflight: Arc::default(),
             inbound_queue_budgets: Default::default(),
-            chat_lanes: Cache::builder()
-                .max_capacity(cache_config.chat_lanes_capacity.max(1))
-                .evict_guard(|lane: &ChatLane| Arc::strong_count(&lane.enqueue_lock) <= 1)
-                .build(),
+            chat_lanes: crate::inbound_queue::ChatLaneCache::new(cache_config.chat_lanes_capacity),
             lid_pn_cache: Arc::new(LidPnCache::with_config(
                 &cache_config.lid_pn_cache,
                 cache_config.cache_stores.lid_pn_cache.clone(),

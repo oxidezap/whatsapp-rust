@@ -3804,6 +3804,8 @@ fn client_size_pins_runtime_cache_config_saving() {
     }
     expected += size_of::<AppStateDownloads>();
     expected += size_of::<crate::inbound_queue::QueueBudgets>();
+    expected = expected - size_of::<Cache<Jid, ChatLane>>()
+        + size_of::<crate::inbound_queue::ChatLaneCache>();
     expected += size_of::<std::sync::OnceLock<Arc<dyn crate::HistorySyncCaptureHook>>>();
     // Independent group capture adds one immutable hook cell; keep the fixed base.
     expected += size_of::<std::sync::OnceLock<Arc<dyn crate::GroupNotificationDurabilityHook>>>();
