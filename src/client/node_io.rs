@@ -2559,6 +2559,14 @@ impl Client {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn production_ack_worker_has_a_bounded_channel() {
+        let client = crate::test_utils::create_test_client().await;
+        let tx = client.start_transport_ack_worker();
+        assert_eq!(tx.capacity(), Some(256));
+        tx.close();
+    }
+
+    #[tokio::test]
     async fn stale_ack_burst_cannot_use_a_replacement_connection_scope() {
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
         let old = client.connection_shutdown_signal();

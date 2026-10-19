@@ -335,6 +335,42 @@ mod tests {
     use wacore_binary::builder::NodeBuilder;
     use wacore_binary::jid::Jid;
 
+    #[tokio::test]
+    async fn a_real_chat_lane_bounds_a_burst_behind_a_blocked_worker() {
+        let client = crate::test_utils::create_test_client().await;
+        let running = Arc::new(async_lock::Mutex::new(()));
+        let blocked = running.lock().await;
+        let lane = create_chat_lane(
+            &client,
+            Arc::default(),
+            Arc::clone(&running),
+            Arc::new(crate::inbound_queue::ByteBudget::new(
+                crate::inbound_queue::CHAT_BYTES,
+            )),
+        );
+        let mut accepted = 0;
+        for id in 0..128 {
+            let node = node_to_owned_ref(
+                &NodeBuilder::new("message")
+                    .attr("from", "120363000000042@g.us")
+                    .attr("id", id.to_string())
+                    .bytes(vec![id as u8; 64 * 1024])
+                    .build(),
+            );
+            if lane.try_enqueue(node).is_ok() {
+                accepted += 1;
+            }
+        }
+        assert_eq!(lane.queue_tx.capacity(), Some(64));
+        assert_eq!(accepted, 64);
+        assert_eq!(lane.queue_tx.len(), 64);
+        let retained = 32 * 1024 * 1024 - client.inbound_queue_budgets.chat.available();
+        assert!((4 * 1024 * 1024..5 * 1024 * 1024).contains(&retained));
+        eprintln!("production lane: {accepted}/128 accepted, {retained} charged bytes");
+        lane.queue_tx.close();
+        drop(blocked);
+    }
+
     fn message_for(chat: &Jid, id: &str) -> Arc<wacore_binary::OwnedNodeRef> {
         node_to_owned_ref(
             &NodeBuilder::new("message")
