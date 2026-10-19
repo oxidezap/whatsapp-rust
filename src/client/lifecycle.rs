@@ -309,14 +309,16 @@ impl Client {
     /// The previous notifier's subscribers have already been woken (either
     /// by notify on disconnect, or by falling out of scope).
     pub(crate) fn reset_connection_shutdown(&self) {
+        let mut connection = self
+            .connection_shutdown
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        connection.notify();
+        *connection = wacore::runtime::ShutdownNotifier::new();
         self.inbound_queue_budgets.work.reopen();
         self.inbound_queue_budgets
             .draining
             .store(false, Ordering::Release);
-        *self
-            .connection_shutdown
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = wacore::runtime::ShutdownNotifier::new();
     }
 
     pub(crate) fn is_shutting_down(&self) -> bool {
@@ -624,7 +626,9 @@ impl Client {
                 .build(),
             ensure_inflight: Arc::default(),
             group_metadata_inflight: Arc::default(),
-            inbound_queue_budgets: Default::default(),
+            inbound_queue_budgets: crate::inbound_queue::QueueBudgets::with_chat_capacity(
+                cache_config.chat_lanes_capacity,
+            ),
             chat_lanes: Cache::builder()
                 .max_capacity(cache_config.chat_lanes_capacity.max(1))
                 .evict_guard(|lane: &ChatLane| Arc::strong_count(&lane.enqueue_lock) <= 1)

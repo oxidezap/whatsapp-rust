@@ -1000,28 +1000,30 @@ impl ReceiveHarness {
     /// chat lanes, driving the lane workers to process them, and flush outbound receipts.
     pub fn enqueue_and_drain(&self, nodes: &[Arc<wacore_binary::OwnedNodeRef>]) {
         self.runtime.block_on(async {
-            let target = self.messages_delivered() + nodes.len() as u64;
-            for node in nodes {
-                let mut cancelled = false;
-                let accepted = crate::handlers::message::MessageHandler::handle_inline(
-                    Arc::clone(&self.client),
-                    Arc::clone(node),
-                    &mut cancelled,
-                )
-                .await;
-                assert!(accepted && !cancelled, "message enqueue failed");
-            }
-            tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                while self.messages_delivered() < target {
-                    tokio::task::yield_now().await;
+            for window in nodes.chunks(crate::inbound_queue::CHAT_QUEUE_ITEMS) {
+                let target = self.messages_delivered() + window.len() as u64;
+                for node in window {
+                    let mut cancelled = false;
+                    let accepted = crate::handlers::message::MessageHandler::handle_inline(
+                        Arc::clone(&self.client),
+                        Arc::clone(node),
+                        &mut cancelled,
+                    )
+                    .await;
+                    assert!(accepted && !cancelled, "message enqueue failed");
                 }
-            })
-            .await
-            .expect("lane delivery timed out: a decrypt, commit, or worker failed");
-            self.client
-                .outbound_flush
-                .flush(&*self.client.runtime, std::time::Duration::from_secs(5))
-                .await;
+                tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                    while self.messages_delivered() < target {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("lane delivery timed out: a decrypt, commit, or worker failed");
+                self.client
+                    .outbound_flush
+                    .flush(&*self.client.runtime, std::time::Duration::from_secs(5))
+                    .await;
+            }
         });
     }
 
@@ -1288,8 +1290,12 @@ impl MultiLaneReceiveHarness {
     /// their respective chat lanes, await their processing, and flush outbound receipts.
     pub fn enqueue_and_drain(&self, nodes: &[Arc<wacore_binary::OwnedNodeRef>]) {
         self.runtime.block_on(async {
-            let target = self.enqueue_batch(nodes).await;
-            self.drain_until(target).await;
+            // Throughput inputs must respect the admission window; overload is
+            // measured separately with a deliberately blocked receiver.
+            for window in nodes.chunks(crate::inbound_queue::CHAT_QUEUE_ITEMS) {
+                let target = self.enqueue_batch(window).await;
+                self.drain_until(target).await;
+            }
         });
     }
 

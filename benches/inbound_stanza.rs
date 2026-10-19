@@ -54,10 +54,9 @@ static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
 const SAMPLE_COUNT: u32 = 20;
 const SAMPLE_SIZE: u32 = 50;
 
-/// A reconnect drains its offline queue in one go. 500 is the size at which the
-/// per-item cost of a drain is clearly separated from the fixed cost of
-/// entering it.
-const BURST: usize = 500;
+/// Stay below the ACK admission window. These rows have new names because a
+/// 128-stanza window is not comparable to the former 500-stanza burst.
+const BURST: usize = 128;
 
 /// One harness for every row, so no row pays for a second fixture. Unlike the
 /// message rows these stanzas carry no ratchet state, so sharing cannot cross
@@ -81,10 +80,12 @@ fn bench_one(
     let subscription = subscribed.then(|| harness.subscribe_stanza_events());
     let before = harness.stanza_events();
     let mut submitted = 0u64;
-    bencher.bench_local(|| {
-        submitted += 1;
-        harness.process_nowait(black_box(Arc::clone(&node)));
-    });
+    bencher
+        .with_inputs(|| harness.flush())
+        .bench_local_values(|()| {
+            submitted += 1;
+            harness.process_nowait(black_box(Arc::clone(&node)));
+        });
     let delivered = harness.stanza_events() - before;
     // Dropping it before the flush keeps the assertion below about what this
     // row submitted.
@@ -104,10 +105,12 @@ fn bench_burst(
     let subscription = harness.subscribe_stanza_events();
     let before = harness.stanza_events();
     let mut submitted = 0u64;
-    bencher.bench_local(|| {
-        submitted += BURST as u64;
-        harness.process_burst(black_box(&burst));
-    });
+    bencher
+        .with_inputs(|| harness.flush())
+        .bench_local_values(|()| {
+            submitted += BURST as u64;
+            harness.process_burst(black_box(&burst));
+        });
     let delivered = harness.stanza_events() - before;
     drop(subscription);
     harness.flush();
@@ -166,22 +169,22 @@ fn ack_subscribed(bencher: divan::Bencher) {
 // no-subscriber shape is already covered per stanza above. Divide every column
 // by `BURST` for the per-item figure.
 #[divan::bench(sample_count = 10, sample_size = 1)]
-fn burst_receipt(bencher: divan::Bencher) {
+fn bounded_window_receipt(bencher: divan::Bencher) {
     bench_burst(bencher, harness().receipt_stanza(), 1);
 }
 
 #[divan::bench(sample_count = 10, sample_size = 1)]
-fn burst_presence(bencher: divan::Bencher) {
+fn bounded_window_presence(bencher: divan::Bencher) {
     bench_burst(bencher, harness().presence_stanza(), 1);
 }
 
 #[divan::bench(sample_count = 10, sample_size = 1)]
-fn burst_notification(bencher: divan::Bencher) {
+fn bounded_window_notification(bencher: divan::Bencher) {
     bench_burst(bencher, harness().notification_stanza(), 1);
 }
 
 #[divan::bench(sample_count = 10, sample_size = 1)]
-fn burst_ack(bencher: divan::Bencher) {
+fn bounded_window_ack(bencher: divan::Bencher) {
     bench_burst(bencher, harness().ack_stanza(), 1);
 }
 

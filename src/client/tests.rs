@@ -4338,7 +4338,7 @@ async fn every_send_path_is_observed_exactly_as_it_reached_the_wire() {
         .attr("from", "5550000@g.us")
         .build();
     client
-        .send_ack_for(&incoming.as_node_ref())
+        .send_ack_for(&incoming.as_node_ref(), None)
         .await
         .expect("ack must send");
 
@@ -4983,7 +4983,7 @@ async fn test_send_ack_for_returns_error_when_disconnected() {
         .attr("participant", "236395184570386@lid")
         .build();
 
-    let result = client.send_ack_for(&receipt.as_node_ref()).await;
+    let result = client.send_ack_for(&receipt.as_node_ref(), None).await;
     assert!(
         matches!(result, Err(ClientError::NotConnected)),
         "send_ack_for must return Err(NotConnected) when disconnected, got: {result:?}"
@@ -5094,7 +5094,7 @@ async fn test_send_ack_for_returns_ok_on_expected_disconnect() {
         .attr("id", "TEST-RECEIPT-ID")
         .build();
 
-    let result = client.send_ack_for(&receipt.as_node_ref()).await;
+    let result = client.send_ack_for(&receipt.as_node_ref(), None).await;
     assert!(
         result.is_ok(),
         "send_ack_for should return Ok during expected disconnect"

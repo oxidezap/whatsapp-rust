@@ -49,11 +49,15 @@ impl MessageHandler {
         cancelled: &mut bool,
         scope: Option<NotificationScope<'_>>,
     ) -> bool {
-        let shutdown = client.connection_shutdown_signal();
+        let shutdown = scope.map_or_else(
+            || client.connection_shutdown_signal(),
+            NotificationScope::shutdown,
+        );
         let generation = client
             .connection_generation
             .load(std::sync::atomic::Ordering::Acquire);
         if shutdown.is_fired()
+            || scope.is_some_and(|scope| !scope.is_current(&client))
             || client
                 .inbound_queue_budgets
                 .draining
@@ -77,13 +81,20 @@ impl MessageHandler {
         let lane = client
             .chat_lanes
             .get_with_by_ref(&chat_jid, async {
+                let budget = client
+                    .inbound_queue_budgets
+                    .per_chat
+                    .get_with_by_ref(&chat_jid, async {
+                        Arc::new(crate::inbound_queue::ByteBudget::new(
+                            crate::inbound_queue::CHAT_BYTES,
+                        ))
+                    })
+                    .await;
                 create_chat_lane(
                     &client,
                     Arc::new(async_lock::Mutex::new(())),
                     Arc::new(async_lock::Mutex::new(())),
-                    Arc::new(crate::inbound_queue::ByteBudget::new(
-                        crate::inbound_queue::CHAT_BYTES,
-                    )),
+                    budget,
                 )
             })
             .await;
@@ -121,7 +132,7 @@ impl MessageHandler {
                 warn!("Failed to enqueue message for processing: {e}");
                 // Cancel ack so server redelivers
                 *cancelled = true;
-                client.drain_overloaded_inbound();
+                client.drain_overloaded_inbound(&shutdown);
                 return true;
             }
         };
@@ -166,7 +177,7 @@ impl MessageHandler {
         ) {
             warn!("Failed to enqueue message for processing: {e}");
             *cancelled = true;
-            client.drain_overloaded_inbound();
+            client.drain_overloaded_inbound(&shutdown);
         }
 
         true
@@ -518,6 +529,16 @@ mod tests {
     #[test]
     fn queued_chat_message_keeps_four_handles() {
         assert_eq!(size_of::<QueuedChatMessage>(), 4 * size_of::<usize>());
+    }
+
+    #[cfg(feature = "bench-harness")]
+    #[test]
+    fn worker_throughput_fixture_drains_a_large_single_chat_burst_in_windows() {
+        let harness = crate::bench_support::MultiLaneReceiveHarness::new(1);
+        let before = harness.messages_delivered();
+        harness.enqueue_and_drain(&harness.generate_burst(1, 256));
+        assert_eq!(harness.messages_delivered() - before, 256);
+        harness.close_lanes();
     }
 
     #[cfg(feature = "bench-harness")]
