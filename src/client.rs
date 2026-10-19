@@ -476,8 +476,8 @@ use wacore::runtime::Runtime;
 pub(crate) struct ChatLane {
     pub enqueue_lock: Arc<Mutex<()>>,
     pub queue_tx: async_channel::Sender<QueuedChatMessage>,
-    pub byte_budget: Arc<tokio::sync::Semaphore>,
-    pub global_budget: Arc<tokio::sync::Semaphore>,
+    pub byte_budget: Arc<crate::inbound_queue::ByteBudget>,
+    pub global_budget: Arc<crate::inbound_queue::ByteBudget>,
     pub work: Arc<crate::flush_scope::FlushScope>,
     /// Held by the lane's worker for as long as it runs; a replacement
     /// worker takes it before its first message. Why it is shared across

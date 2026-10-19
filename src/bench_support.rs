@@ -1842,7 +1842,7 @@ impl InboundQueueHarness {
             queue_tx,
             enqueue_lock: Arc::default(),
             worker_running: Arc::default(),
-            byte_budget: Arc::new(tokio::sync::Semaphore::new(
+            byte_budget: Arc::new(crate::inbound_queue::ByteBudget::new(
                 crate::inbound_queue::CHAT_BYTES,
             )),
             global_budget: Arc::clone(&budgets.chat),
@@ -1859,7 +1859,7 @@ impl InboundQueueHarness {
         assert_eq!(accepted, crate::inbound_queue::CHAT_QUEUE_ITEMS);
         assert_eq!(rx.len(), accepted);
         drop(rx);
-        assert_eq!(budgets.chat.available_permits(), 32 * 1024 * 1024);
+        assert_eq!(budgets.chat.available(), 32 * 1024 * 1024);
         accepted
     }
 }

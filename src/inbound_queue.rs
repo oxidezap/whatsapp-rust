@@ -10,7 +10,28 @@
 //! still serving IQs, then recycles the connection. Drain deadlines are finite;
 //! permanently stalled processing cannot be promised progress or delivery.
 use std::sync::Arc;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// A non-waiting byte counter. One lease is the only way to return a charge.
+/// Unlike a runtime semaphore this also works when tokio-runtime is disabled.
+pub(crate) struct ByteBudget(AtomicUsize);
+impl ByteBudget {
+    pub(crate) fn new(bytes: usize) -> Self {
+        Self(AtomicUsize::new(bytes))
+    }
+    pub(crate) fn available(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+pub(crate) struct ByteLease {
+    budget: Arc<ByteBudget>,
+    bytes: usize,
+}
+impl Drop for ByteLease {
+    fn drop(&mut self) {
+        self.budget.0.fetch_add(self.bytes, Ordering::Relaxed);
+    }
+}
 
 /// Channel storage outlives its worker while a cached sender exists. Close and
 /// drain it even if the worker future is dropped before its first poll.
@@ -35,34 +56,43 @@ pub(crate) const ACK_QUEUE_ITEMS: usize = 256;
 const ACK_BYTES: usize = 256 * 1024;
 
 pub(crate) struct QueueBudgets {
-    pub chat: Arc<Semaphore>,
-    pub ack: Arc<Semaphore>,
+    pub chat: Arc<ByteBudget>,
+    pub ack: Arc<ByteBudget>,
     pub work: Arc<crate::flush_scope::FlushScope>,
     pub draining: std::sync::atomic::AtomicBool,
 }
 impl Default for QueueBudgets {
     fn default() -> Self {
         Self {
-            chat: Arc::new(Semaphore::new(GLOBAL_CHAT_BYTES)),
-            ack: Arc::new(Semaphore::new(ACK_BYTES)),
+            chat: Arc::new(ByteBudget::new(GLOBAL_CHAT_BYTES)),
+            ack: Arc::new(ByteBudget::new(ACK_BYTES)),
             work: Arc::default(),
             draining: false.into(),
         }
     }
 }
 
-pub(crate) fn reserve(budget: &Arc<Semaphore>, bytes: usize) -> Option<OwnedSemaphorePermit> {
+pub(crate) fn reserve(budget: &Arc<ByteBudget>, bytes: usize) -> Option<ByteLease> {
     // A minimum charge also bounds the number of tiny queued or in-flight nodes.
-    let charge = u32::try_from(bytes.max(1024)).ok()?;
-    Arc::clone(budget).try_acquire_many_owned(charge).ok()
+    let charge = bytes.max(1024);
+    budget
+        .0
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |available| {
+            available.checked_sub(charge)
+        })
+        .ok()?;
+    Some(ByteLease {
+        budget: Arc::clone(budget),
+        bytes: charge,
+    })
 }
 
 /// The permits belong to the backing bytes, including slices handed to consumers.
 /// Releasing a worker or cancelling its future cannot release them prematurely.
 struct RetainedBytes {
     bytes: bytes::Bytes,
-    _global: OwnedSemaphorePermit,
-    _chat: Option<OwnedSemaphorePermit>,
+    _global: ByteLease,
+    _chat: Option<ByteLease>,
     _liveness: Option<Arc<async_lock::Mutex<()>>>,
 }
 impl AsRef<[u8]> for RetainedBytes {
@@ -73,8 +103,8 @@ impl AsRef<[u8]> for RetainedBytes {
 
 pub(crate) fn retain_node(
     node: &wacore_binary::OwnedNodeRef,
-    global: &Arc<Semaphore>,
-    chat: &Arc<Semaphore>,
+    global: &Arc<ByteBudget>,
+    chat: &Arc<ByteBudget>,
     liveness: Arc<async_lock::Mutex<()>>,
 ) -> Option<wacore_binary::OwnedNodeRef> {
     let bytes = node.backing_bytes();
@@ -98,7 +128,7 @@ pub(crate) struct QueuedAck {
     pub shutdown: wacore::runtime::ShutdownSignal,
 }
 
-pub(crate) fn retain_ack(bytes: Vec<u8>, lease: OwnedSemaphorePermit) -> bytes::Bytes {
+pub(crate) fn retain_ack(bytes: Vec<u8>, lease: ByteLease) -> bytes::Bytes {
     bytes::Bytes::from_owner(RetainedBytes {
         bytes: bytes.into(),
         _global: lease,
@@ -115,7 +145,7 @@ mod tests {
     use wacore_binary::builder::NodeBuilder;
 
     fn lane(
-        global: &Arc<Semaphore>,
+        global: &Arc<ByteBudget>,
         bytes: usize,
         items: usize,
     ) -> (ChatLane, DrainingReceiver<QueuedChatMessage>) {
@@ -125,7 +155,7 @@ mod tests {
                 queue_tx,
                 enqueue_lock: Arc::new(Mutex::new(())),
                 worker_running: Arc::new(Mutex::new(())),
-                byte_budget: Arc::new(Semaphore::new(bytes)),
+                byte_budget: Arc::new(ByteBudget::new(bytes)),
                 global_budget: Arc::clone(global),
                 work: Arc::default(),
             },
@@ -156,7 +186,7 @@ mod tests {
         eprintln!(
             "baseline: 128 distinct payloads, {baseline_payload} payload bytes, capacity None"
         );
-        let global = Arc::new(Semaphore::new(1024 * 1024));
+        let global = Arc::new(ByteBudget::new(1024 * 1024));
         let (lane, rx) = lane(&global, 256 * 1024, CHAT_QUEUE_ITEMS);
         let mut accepted = 0;
         for id in 0..128 {
@@ -168,16 +198,16 @@ mod tests {
         assert_eq!(rx.len(), 3);
         eprintln!(
             "bounded: {accepted} distinct payloads, {} charged bytes",
-            1024 * 1024 - global.available_permits()
+            1024 * 1024 - global.available()
         );
-        assert!(global.available_permits() >= 768 * 1024);
+        assert!(global.available() >= 768 * 1024);
         drop(rx);
-        assert_eq!(global.available_permits(), 1024 * 1024);
+        assert_eq!(global.available(), 1024 * 1024);
     }
 
     #[test]
     fn in_flight_nodes_and_escaped_slices_keep_their_charge() {
-        let global = Arc::new(Semaphore::new(2048));
+        let global = Arc::new(ByteBudget::new(2048));
         let (lane, rx) = lane(&global, 2048, 1);
         lane.try_enqueue(node(1, 4)).unwrap();
         let queued = rx.try_recv().unwrap();
@@ -186,16 +216,16 @@ mod tests {
             .slice_bytes(queued.node.content_bytes().unwrap());
         let clone = Arc::clone(&queued.node);
         drop(queued);
-        assert_eq!(global.available_permits(), 1024);
+        assert_eq!(global.available(), 1024);
         drop(clone);
-        assert_eq!(global.available_permits(), 1024);
+        assert_eq!(global.available(), 1024);
         drop(slice);
-        assert_eq!(global.available_permits(), 2048);
+        assert_eq!(global.available(), 2048);
     }
 
     #[test]
     fn busy_chat_leaves_capacity_for_another_chat_and_recovers_in_order() {
-        let global = Arc::new(Semaphore::new(4096));
+        let global = Arc::new(ByteBudget::new(4096));
         let (busy, busy_rx) = lane(&global, 2048, 2);
         let (other, other_rx) = lane(&global, 2048, 2);
         busy.try_enqueue(node(1, 4)).unwrap();
@@ -224,28 +254,28 @@ mod tests {
             );
         }
         drop(other_rx);
-        assert_eq!(global.available_permits(), 4096);
+        assert_eq!(global.available(), 4096);
     }
 
     #[test]
     fn item_limit_and_closed_lane_fail_without_leaking_or_double_charging() {
-        let global = Arc::new(Semaphore::new(4096));
+        let global = Arc::new(ByteBudget::new(4096));
         let (lane, rx) = lane(&global, 4096, 1);
         lane.try_enqueue(node(1, 4)).unwrap();
         assert!(lane.try_enqueue(node(2, 4)).is_err());
-        assert_eq!(global.available_permits(), 3072);
+        assert_eq!(global.available(), 3072);
         rx.close();
         assert!(matches!(
             lane.try_enqueue(node(3, 4)),
             Err(async_channel::TrySendError::Closed(_))
         ));
         drop(rx);
-        assert_eq!(global.available_permits(), 4096);
+        assert_eq!(global.available(), 4096);
     }
 
     #[test]
     fn global_budget_applies_across_lanes_and_reservation_failure_rolls_back() {
-        let global = Arc::new(Semaphore::new(2048));
+        let global = Arc::new(ByteBudget::new(2048));
         let (a, a_rx) = lane(&global, 4096, 8);
         let (b, b_rx) = lane(&global, 4096, 8);
         a.try_enqueue(node(1, 4)).unwrap();
@@ -254,15 +284,31 @@ mod tests {
         drop(a_rx);
         b.try_enqueue(node(3, 4)).unwrap();
         drop(b_rx);
-        assert_eq!(global.available_permits(), 2048);
-        let empty = Arc::new(Semaphore::new(0));
+        assert_eq!(global.available(), 2048);
+        let empty = Arc::new(ByteBudget::new(0));
         assert!(retain_node(&node(1, 4), &global, &empty, Arc::default()).is_none());
-        assert_eq!(global.available_permits(), 2048);
+        assert_eq!(global.available(), 2048);
+    }
+
+    #[tokio::test]
+    async fn worker_cancelled_before_first_poll_drains_its_cached_sender() {
+        let global = Arc::new(ByteBudget::new(2048));
+        let (lane, rx) = lane(&global, 2048, 2);
+        lane.try_enqueue(node(1, 4)).unwrap();
+        let task = tokio::spawn(async move {
+            let _rx = rx;
+            std::future::pending::<()>().await;
+        });
+        task.abort();
+        let _ = task.await;
+        assert!(lane.queue_tx.is_closed());
+        assert_eq!(lane.queue_tx.len(), 0);
+        assert_eq!(global.available(), 2048);
     }
 
     #[tokio::test]
     async fn cancellation_releases_owned_nodes_but_ack_bytes_follow_the_sender() {
-        let global = Arc::new(Semaphore::new(2048));
+        let global = Arc::new(ByteBudget::new(2048));
         let (lane, rx) = lane(&global, 2048, 2);
         lane.try_enqueue(node(1, 4)).unwrap();
         let queued = rx.try_recv().unwrap();
@@ -272,13 +318,13 @@ mod tests {
         });
         task.abort();
         let _ = task.await;
-        assert_eq!(global.available_permits(), 2048);
+        assert_eq!(global.available(), 2048);
         let ack = retain_ack(vec![1; 64], reserve(&global, 64).unwrap());
         let sender = ack.clone();
         drop(ack);
-        assert_eq!(global.available_permits(), 1024);
+        assert_eq!(global.available(), 1024);
         drop(sender);
-        assert_eq!(global.available_permits(), 2048);
+        assert_eq!(global.available(), 2048);
     }
 }
 
@@ -296,6 +342,11 @@ impl crate::client::Client {
             return;
         }
         self.inbound_queue_budgets.work.close();
+        log::warn!(
+            "Inbound queue overloaded; draining before reconnect (chat bytes available: {}, ACK bytes available: {})",
+            self.inbound_queue_budgets.chat.available(),
+            self.inbound_queue_budgets.ack.available()
+        );
         let client = Arc::clone(self);
         let generation = self.connection_generation.load(Ordering::Acquire);
         self.runtime.spawn_detached(Box::pin(async move {
@@ -370,7 +421,7 @@ mod overload_tests {
             queue_tx,
             enqueue_lock: Arc::default(),
             worker_running: Arc::default(),
-            byte_budget: Arc::new(Semaphore::new(CHAT_BYTES)),
+            byte_budget: Arc::new(ByteBudget::new(CHAT_BYTES)),
             global_budget: Arc::clone(&client.inbound_queue_budgets.chat),
             work: Arc::clone(&client.inbound_queue_budgets.work),
         };

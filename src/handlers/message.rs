@@ -77,7 +77,7 @@ impl MessageHandler {
                     &client,
                     Arc::new(async_lock::Mutex::new(())),
                     Arc::new(async_lock::Mutex::new(())),
-                    Arc::new(tokio::sync::Semaphore::new(
+                    Arc::new(crate::inbound_queue::ByteBudget::new(
                         crate::inbound_queue::CHAT_BYTES,
                     )),
                 )
@@ -188,7 +188,7 @@ fn create_chat_lane(
     client: &Arc<Client>,
     enqueue_lock: Arc<async_lock::Mutex<()>>,
     worker_running: Arc<async_lock::Mutex<()>>,
-    byte_budget: Arc<tokio::sync::Semaphore>,
+    byte_budget: Arc<crate::inbound_queue::ByteBudget>,
 ) -> ChatLane {
     let (tx, rx) =
         async_channel::bounded::<QueuedChatMessage>(crate::inbound_queue::CHAT_QUEUE_ITEMS);
@@ -513,7 +513,7 @@ mod tests {
             &client,
             Arc::new(async_lock::Mutex::new(())),
             Arc::new(async_lock::Mutex::new(())),
-            Arc::new(tokio::sync::Semaphore::new(
+            Arc::new(crate::inbound_queue::ByteBudget::new(
                 crate::inbound_queue::CHAT_BYTES,
             )),
         );
@@ -548,7 +548,7 @@ mod tests {
             &client,
             Arc::new(async_lock::Mutex::new(())),
             Arc::new(async_lock::Mutex::new(())),
-            Arc::new(tokio::sync::Semaphore::new(
+            Arc::new(crate::inbound_queue::ByteBudget::new(
                 crate::inbound_queue::CHAT_BYTES,
             )),
         );

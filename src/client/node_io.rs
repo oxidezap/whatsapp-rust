@@ -2593,10 +2593,7 @@ mod tests {
         assert_eq!(ack_node.tag(), "ack");
         assert!(ack_node.content_bytes().is_none());
         drop(ack);
-        assert_eq!(
-            client.inbound_queue_budgets.ack.available_permits(),
-            256 * 1024
-        );
+        assert_eq!(client.inbound_queue_budgets.ack.available(), 256 * 1024);
     }
 
     #[tokio::test(start_paused = true)]
