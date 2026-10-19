@@ -157,7 +157,7 @@ impl crate::client::Client {
             self.inbound_queue_budgets.ack.available()
         );
         let client = Arc::clone(self);
-        let generation = self.connection_generation.load(Ordering::Acquire);
+        let shutdown = self.connection_shutdown_signal();
         self.runtime.spawn_detached(Box::pin(async move {
             let grace = std::time::Duration::from_secs(5);
             client
@@ -165,12 +165,12 @@ impl crate::client::Client {
                 .work
                 .flush(&*client.runtime, grace)
                 .await;
-            if client.connection_generation.load(Ordering::Acquire) != generation {
+            if shutdown.is_fired() {
                 return;
             }
             client.flush_inbound_commits_bounded(grace).await;
             client.outbound_flush.flush(&*client.runtime, grace).await;
-            if client.connection_generation.load(Ordering::Acquire) == generation {
+            if !shutdown.is_fired() {
                 client.notify_connection_shutdown();
             }
         }));
@@ -425,6 +425,47 @@ mod overload_tests {
         assert_eq!(client.inbound_queue_budgets.work.pending(), 1);
         drop(work);
         assert_eq!(client.inbound_queue_budgets.work.pending(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_waiting_admission_cannot_cross_a_reconnect() {
+        let client = crate::test_utils::create_test_client().await;
+        let (queue_tx, rx) = async_channel::bounded(1);
+        let lane = ChatLane {
+            queue_tx,
+            enqueue_lock: Arc::default(),
+            worker_running: Arc::default(),
+            byte_budget: Arc::new(ByteBudget::new(CHAT_BYTES)),
+            global_budget: Arc::clone(&client.inbound_queue_budgets.chat),
+            work: Arc::clone(&client.inbound_queue_budgets.work),
+        };
+        let lock = Arc::clone(&lane.enqueue_lock);
+        let guard = lock.lock().await;
+        client
+            .chat_lanes
+            .insert("120363000000042@g.us".parse().unwrap(), lane)
+            .await;
+        let node = crate::test_utils::node_to_owned_ref(
+            &NodeBuilder::new("message")
+                .attr("from", "120363000000042@g.us")
+                .attr("id", "old")
+                .build(),
+        );
+        let mut cancelled = false;
+        let future = crate::handlers::message::MessageHandler::handle_inline(
+            Arc::clone(&client),
+            node,
+            &mut cancelled,
+        );
+        futures::pin_mut!(future);
+        assert!(futures::poll!(&mut future).is_pending());
+        client.notify_connection_shutdown();
+        client.reset_connection_shutdown();
+        client.connection_generation.fetch_add(1, Ordering::AcqRel);
+        drop(guard);
+        assert!(future.await);
+        assert!(cancelled);
+        assert!(rx.is_empty());
     }
 
     #[tokio::test(start_paused = true)]

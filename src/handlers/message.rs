@@ -49,7 +49,11 @@ impl MessageHandler {
         cancelled: &mut bool,
         scope: Option<NotificationScope<'_>>,
     ) -> bool {
-        if client.connection_shutdown_signal().is_fired()
+        let shutdown = client.connection_shutdown_signal();
+        let generation = client
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        if shutdown.is_fired()
             || client
                 .inbound_queue_budgets
                 .draining
@@ -90,7 +94,13 @@ impl MessageHandler {
 
         // A lane lookup or enqueue lock can resume after reconnection. Do not
         // admit an old notification to a worker created by the new connection.
-        if scope.is_some_and(|scope| !scope.is_current(&client)) {
+        if shutdown.is_fired()
+            || client
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                != generation
+            || scope.is_some_and(|scope| !scope.is_current(&client))
+        {
             *cancelled = true;
             return true;
         }
@@ -137,7 +147,13 @@ impl MessageHandler {
                     .await
             }
         };
-        if scope.is_some_and(|scope| !scope.is_current(&client)) {
+        if shutdown.is_fired()
+            || client
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                != generation
+            || scope.is_some_and(|scope| !scope.is_current(&client))
+        {
             *cancelled = true;
             return true;
         }
