@@ -184,3 +184,11 @@ fn burst_notification(bencher: divan::Bencher) {
 fn burst_ack(bencher: divan::Bencher) {
     bench_burst(bencher, harness().ack_stanza(), 1);
 }
+
+/// Memory records the compact retained payload allocations; Simulation records
+/// admission/copy/decode work. This is not a wall-clock proof of boundedness.
+#[divan::bench(sample_count = 10, sample_size = 1)]
+fn blocked_chat_queue(bencher: divan::Bencher) {
+    let fixture = whatsapp_rust::bench_support::InboundQueueHarness::default();
+    bencher.bench_local(|| black_box(fixture.saturate()));
+}

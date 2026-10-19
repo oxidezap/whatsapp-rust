@@ -1808,3 +1808,58 @@ async fn build_scale_fixture(
     install_offline_socket(&client).await;
     (client, group_list, own_pn)
 }
+
+/// Deterministic blocked-worker fixture for CodSpeed Memory and Simulation.
+/// Payload construction stays outside the measured admission loop.
+pub struct InboundQueueHarness {
+    nodes: Vec<Arc<wacore_binary::OwnedNodeRef>>,
+}
+impl Default for InboundQueueHarness {
+    fn default() -> Self {
+        use wacore_binary::builder::NodeBuilder;
+        Self {
+            nodes: (0..128)
+                .map(|id| {
+                    decoded(
+                        &NodeBuilder::new("message")
+                            .attr("from", "120363000000042@g.us")
+                            .attr("id", id.to_string())
+                            .bytes(vec![id as u8; 64 * 1024])
+                            .build(),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+impl InboundQueueHarness {
+    /// The receiver deliberately never polls. Admission must finish without it.
+    pub fn saturate(&self) -> usize {
+        let budgets = crate::inbound_queue::QueueBudgets::default();
+        let (queue_tx, rx) = async_channel::bounded(crate::inbound_queue::CHAT_QUEUE_ITEMS);
+        let rx = crate::inbound_queue::DrainingReceiver(rx);
+        let lane = ChatLane {
+            queue_tx,
+            enqueue_lock: Arc::default(),
+            worker_running: Arc::default(),
+            byte_budget: Arc::new(tokio::sync::Semaphore::new(
+                crate::inbound_queue::CHAT_BYTES,
+            )),
+            global_budget: Arc::clone(&budgets.chat),
+            work: Arc::clone(&budgets.work),
+        };
+        let accepted = self
+            .nodes
+            .iter()
+            .filter(|node| {
+                lane.try_enqueue_scoped(Arc::clone(node), wacore::runtime::ShutdownSignal::never())
+                    .is_ok()
+            })
+            .count();
+        assert_eq!(accepted, crate::inbound_queue::CHAT_QUEUE_ITEMS);
+        assert_eq!(rx.len(), accepted);
+        drop(rx);
+        assert_eq!(budgets.chat.available_permits(), 32 * 1024 * 1024);
+        accepted
+    }
+}

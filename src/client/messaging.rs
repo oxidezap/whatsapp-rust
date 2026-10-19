@@ -35,9 +35,7 @@ impl Client {
         let noise_socket = self.get_noise_socket()?;
         // Wire bytes and the last-sent timestamp are recorded by the noise
         // sender task at the actual transport write.
-        noise_socket
-            .encrypt_and_send(bytes::Bytes::from(plaintext))
-            .await?;
+        noise_socket.encrypt_and_send(plaintext.into()).await?;
         Ok(())
     }
 
@@ -67,9 +65,9 @@ impl Client {
     /// [`MAX_INLINE_BURST`](Self::MAX_INLINE_BURST), so it does not allocate
     /// either; beyond that the spill is one allocation, which is what the
     /// previous `join_all` cost every time.
-    pub(crate) async fn send_raw_bytes_burst(
+    pub(crate) async fn send_raw_bytes_burst<P: Into<bytes::Bytes>>(
         &self,
-        frames: &mut Vec<Vec<u8>>,
+        frames: &mut Vec<P>,
         results: &mut Vec<crate::socket::error::EncryptSendResult>,
     ) -> Result<(), ClientError> {
         results.clear();
@@ -82,11 +80,7 @@ impl Client {
         };
         if frames.len() == 1 {
             let plaintext = frames.pop().expect("length checked");
-            results.push(
-                noise_socket
-                    .encrypt_and_send(bytes::Bytes::from(plaintext))
-                    .await,
-            );
+            results.push(noise_socket.encrypt_and_send(plaintext.into()).await);
             return Ok(());
         }
         // Every frame is enqueued before any is awaited, which is what lets the
@@ -107,10 +101,7 @@ impl Client {
                 frames_after_enqueue_failed += 1;
                 continue;
             }
-            match noise_socket
-                .enqueue_send(bytes::Bytes::from(plaintext))
-                .await
-            {
+            match noise_socket.enqueue_send(plaintext.into()).await {
                 Ok(receiver) => receivers.push(receiver),
                 Err(_) => frames_after_enqueue_failed = 1,
             }

@@ -309,6 +309,10 @@ impl Client {
     /// The previous notifier's subscribers have already been woken (either
     /// by notify on disconnect, or by falling out of scope).
     pub(crate) fn reset_connection_shutdown(&self) {
+        self.inbound_queue_budgets.work.reopen();
+        self.inbound_queue_budgets
+            .draining
+            .store(false, Ordering::Release);
         *self
             .connection_shutdown
             .lock()
@@ -620,6 +624,7 @@ impl Client {
                 .build(),
             ensure_inflight: Arc::default(),
             group_metadata_inflight: Arc::default(),
+            inbound_queue_budgets: Default::default(),
             chat_lanes: Cache::builder()
                 .max_capacity(cache_config.chat_lanes_capacity.max(1))
                 .evict_guard(|lane: &ChatLane| Arc::strong_count(&lane.enqueue_lock) <= 1)

@@ -476,6 +476,9 @@ use wacore::runtime::Runtime;
 pub(crate) struct ChatLane {
     pub enqueue_lock: Arc<Mutex<()>>,
     pub queue_tx: async_channel::Sender<QueuedChatMessage>,
+    pub byte_budget: Arc<tokio::sync::Semaphore>,
+    pub global_budget: Arc<tokio::sync::Semaphore>,
+    pub work: Arc<crate::flush_scope::FlushScope>,
     /// Held by the lane's worker for as long as it runs; a replacement
     /// worker takes it before its first message. Why it is shared across
     /// lane generations is explained at `create_chat_lane`.
@@ -496,11 +499,46 @@ impl ChatLane {
         node: Arc<wacore_binary::OwnedNodeRef>,
         shutdown: wacore::runtime::ShutdownSignal,
     ) -> Result<(), async_channel::TrySendError<QueuedChatMessage>> {
-        self.queue_tx.try_send(QueuedChatMessage {
+        let queued = QueuedChatMessage {
             node,
             shutdown,
             lane_liveness: Arc::clone(&self.enqueue_lock),
-        })
+            work: None,
+        };
+        if self.queue_tx.is_closed() {
+            return Err(async_channel::TrySendError::Closed(queued));
+        }
+        if self.queue_tx.is_full() {
+            return Err(async_channel::TrySendError::Full(queued));
+        }
+        let Some(retained) = crate::inbound_queue::retain_node(
+            &queued.node,
+            &self.global_budget,
+            &self.byte_budget,
+            Arc::clone(&self.enqueue_lock),
+        ) else {
+            return Err(async_channel::TrySendError::Full(queued));
+        };
+        let Some(work) = self.work.try_track() else {
+            return Err(async_channel::TrySendError::Full(queued));
+        };
+        let original = queued.node;
+        self.queue_tx
+            .try_send(QueuedChatMessage {
+                node: Arc::new(retained),
+                work: Some(work),
+                ..queued
+            })
+            .map_err(|error| match error {
+                async_channel::TrySendError::Full(mut queued) => {
+                    queued.node = original;
+                    async_channel::TrySendError::Full(queued)
+                }
+                async_channel::TrySendError::Closed(mut queued) => {
+                    queued.node = original;
+                    async_channel::TrySendError::Closed(queued)
+                }
+            })
     }
 }
 
@@ -508,6 +546,7 @@ pub(crate) struct QueuedChatMessage {
     pub shutdown: wacore::runtime::ShutdownSignal,
     pub node: Arc<wacore_binary::OwnedNodeRef>,
     pub lane_liveness: Arc<Mutex<()>>,
+    pub work: Option<crate::flush_scope::FlushGuard>,
 }
 
 const APP_STATE_RETRY_MAX_ATTEMPTS: u32 = 6;
@@ -629,9 +668,8 @@ pub struct MemoryReport {
     pub pending_call_offers: u64,
     /// Inbound messages queued behind their chat's lane worker, summed over
     /// every lane. The lanes are capacity-bounded; their queues are not, and
-    /// each queued message retains its whole frame, so a worker that is stuck
-    /// (a slow durability hook, a hung decrypt) shows up here as a backlog
-    /// that grows with the chat's inbound rate.
+    /// Queued messages retain compact byte-budgeted copies of their frames.
+    /// A stalled worker can fill its lane, but cannot grow it indefinitely.
     pub chat_lane_backlog: u64,
     pub group_distribution_locks: u64,
     /// Cumulative capacity evictions; poll successive reports to derive a rate.
@@ -645,11 +683,10 @@ pub struct MemoryReport {
     /// Groups whose sender-key distribution is memoised as already warm.
     pub skdm_warm_memo: u64,
     // -- Unbounded collections --
-    /// Deferred acks queued for the transport-ack worker. Unbounded, and each
-    /// entry retains the full inbound node plus a flush guard, so a stalled
-    /// transport shows up here as a growing backlog.
+    /// Deferred encoded ACKs, bounded by item count and retained byte budget.
+    /// Full incoming payload nodes are never retained by this queue.
     pub transport_ack_queue: usize,
-    /// Delivery receipts queued for their worker, same shape as above.
+    /// Delivery receipts queued for their worker, bounded by draining/lifecycle.
     pub delivery_receipt_queue: usize,
     pub response_waiters: usize,
     pub node_waiters: usize,
@@ -847,8 +884,6 @@ impl MemoryReport {
             ),
             ("ensure_inflight", self.ensure_inflight),
             ("group_metadata_inflight", self.group_metadata_inflight),
-            ("chat_lane_backlog", self.chat_lane_backlog),
-            ("transport_ack_queue", n(self.transport_ack_queue)),
             ("delivery_receipt_queue", n(self.delivery_receipt_queue)),
             ("response_waiters", n(self.response_waiters)),
             ("node_waiters", n(self.node_waiters)),
@@ -947,9 +982,10 @@ impl std::fmt::Display for MemoryReport {
             self.session_recreate_history
         )?;
         writeln!(f, "  skdm_warm_memo:         {}", self.skdm_warm_memo)?;
-        writeln!(f, "--- Unbounded collections ---")?;
+        writeln!(f, "--- Byte-bounded receive queues ---")?;
         writeln!(f, "  chat_lane_backlog:      {}", self.chat_lane_backlog)?;
         writeln!(f, "  transport_ack_queue:    {}", self.transport_ack_queue)?;
+        writeln!(f, "--- Unbounded collections ---")?;
         writeln!(
             f,
             "  delivery_receipt_queue: {}",
@@ -1815,6 +1851,7 @@ pub struct Client {
     /// Per-chat lane combining enqueue lock + message queue into a single cached entry.
     /// One cache lookup instead of two per incoming message.
     pub(crate) chat_lanes: Cache<Jid, ChatLane>,
+    pub(crate) inbound_queue_budgets: crate::inbound_queue::QueueBudgets,
     pub(crate) pending_call_offers: crate::handlers::call::pending_offers::PendingOffers,
 
     /// Cache for LID to Phone Number mappings (bidirectional).
@@ -2045,12 +2082,8 @@ pub struct Client {
     /// [`Self::delivery_receipt_queue`]. Deferred acks used to be one spawned
     /// task each; the queue also gives them FIFO order, which the spawns did
     /// not guarantee.
-    pub(crate) transport_ack_queue: std::sync::OnceLock<
-        async_channel::Sender<(
-            Arc<wacore_binary::OwnedNodeRef>,
-            crate::flush_scope::FlushGuard,
-        )>,
-    >,
+    pub(crate) transport_ack_queue:
+        std::sync::OnceLock<async_channel::Sender<crate::inbound_queue::QueuedAck>>,
     /// Contacts with active presence subscriptions that must be re-subscribed on reconnect.
     pub(crate) presence_subscriptions: Arc<std::sync::Mutex<HashSet<Jid>>>,
     /// Metrics for granular offline sync logging

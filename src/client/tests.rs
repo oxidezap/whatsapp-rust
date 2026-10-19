@@ -3803,6 +3803,7 @@ fn client_size_pins_runtime_cache_config_saving() {
         expected += size_of::<Arc<bench_startup::StartupTasks>>();
     }
     expected += size_of::<AppStateDownloads>();
+    expected += size_of::<crate::inbound_queue::QueueBudgets>();
     expected += size_of::<std::sync::OnceLock<Arc<dyn crate::HistorySyncCaptureHook>>>();
     // Independent group capture adds one immutable hook cell; keep the fixed base.
     expected += size_of::<std::sync::OnceLock<Arc<dyn crate::GroupNotificationDurabilityHook>>>();
@@ -3991,6 +3992,11 @@ async fn active_chat_lane_survives_capacity_pressure() {
             ChatLane {
                 enqueue_lock: Arc::new(Mutex::new(())),
                 queue_tx,
+                byte_budget: Arc::new(tokio::sync::Semaphore::new(
+                    crate::inbound_queue::CHAT_BYTES,
+                )),
+                global_budget: crate::inbound_queue::QueueBudgets::default().chat,
+                work: Arc::default(),
                 worker_running: Arc::new(Mutex::new(())),
             },
             queue_rx,
@@ -5414,22 +5420,12 @@ async fn memory_report_display_sections_stay_aligned() {
         );
     }
 
-    // The lanes are capped; their queues are not, so the backlog belongs with
-    // the drain-bounded collections, not beside the lane count.
-    let capacity_start = rendered
-        .find("--- Capacity-only caches ---")
-        .expect("capacity section");
-    let unbounded_start = rendered
-        .find("--- Unbounded collections ---")
-        .expect("unbounded section");
-    assert!(
-        !rendered[capacity_start..unbounded_start].contains("chat_lane_backlog:"),
-        "chat_lane_backlog must not render as capacity-bounded, got:\n{rendered}"
-    );
-    assert!(
-        rendered[unbounded_start..signal_start].contains("chat_lane_backlog:"),
-        "chat_lane_backlog must render under the unbounded heading, got:\n{rendered}"
-    );
+    let bounded_start = rendered
+        .find("--- Byte-bounded receive queues ---")
+        .unwrap();
+    let unbounded_start = rendered.find("--- Unbounded collections ---").unwrap();
+    assert!(rendered[bounded_start..unbounded_start].contains("chat_lane_backlog:"));
+    assert!(!rendered[unbounded_start..signal_start].contains("chat_lane_backlog:"));
 
     // The last two `collections()` entries are transient retention, one section
     // each. Their order is what the two boundary constants encode, so a cache
@@ -5533,9 +5529,7 @@ async fn memory_report_counts_lid_pn_side_maps() {
     assert!(names.contains(&"lid_pn_persisted_entries"));
 }
 
-/// A lane's queue is unbounded and each queued message retains its frame, so
-/// a stuck worker is a backlog the report has to show; the lane count alone
-/// reads the same whether the queues are empty or a million deep.
+/// Backlog remains visible even though admission is now structurally bounded.
 #[tokio::test]
 async fn memory_report_sums_chat_lane_backlog() {
     let client = crate::test_utils::create_test_client_with_name("chat_lane_backlog").await;
@@ -5547,6 +5541,11 @@ async fn memory_report_sums_chat_lane_backlog() {
     let lane = ChatLane {
         enqueue_lock: Arc::new(Mutex::new(())),
         queue_tx,
+        byte_budget: Arc::new(tokio::sync::Semaphore::new(
+            crate::inbound_queue::CHAT_BYTES,
+        )),
+        global_budget: Arc::clone(&client.inbound_queue_budgets.chat),
+        work: Arc::clone(&client.inbound_queue_budgets.work),
         worker_running: Arc::new(Mutex::new(())),
     };
     client.chat_lanes.insert(chat.clone(), lane.clone()).await;
@@ -5556,17 +5555,17 @@ async fn memory_report_sums_chat_lane_backlog() {
             .attr("id", id)
             .build();
         lane.try_enqueue(node_to_owned_ref(node))
-            .expect("an unbounded lane queue accepts every message");
+            .expect("three messages fit the bounded lane");
     }
 
     let report = client.memory_report().await;
     assert_eq!(report.chat_lanes, 1);
     assert_eq!(report.chat_lane_backlog, 3);
     assert!(
-        report
+        !report
             .unbounded_counts()
             .contains(&("chat_lane_backlog", 3)),
-        "the backlog is a drain-bounded collection, so the soak compares it"
+        "a byte-bounded backlog is excluded from unbounded growth checks"
     );
 }
 

@@ -477,6 +477,7 @@ pub mod types;
 
 pub mod client;
 pub(crate) mod flush_scope;
+mod inbound_queue;
 /// Shared base error for transport/connection concerns; the per-domain error
 /// types embed it.
 pub use client::ClientError;

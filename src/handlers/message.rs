@@ -49,6 +49,15 @@ impl MessageHandler {
         cancelled: &mut bool,
         scope: Option<NotificationScope<'_>>,
     ) -> bool {
+        if client.connection_shutdown_signal().is_fired()
+            || client
+                .inbound_queue_budgets
+                .draining
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            *cancelled = true;
+            return true;
+        }
         let chat_jid = match node.attrs().optional_jid("from") {
             // Normalize AD metadata so the same chat always maps to one lane
             Some(jid) if jid.device > 0 || jid.agent > 0 => jid.to_non_ad(),
@@ -68,6 +77,9 @@ impl MessageHandler {
                     &client,
                     Arc::new(async_lock::Mutex::new(())),
                     Arc::new(async_lock::Mutex::new(())),
+                    Arc::new(tokio::sync::Semaphore::new(
+                        crate::inbound_queue::CHAT_BYTES,
+                    )),
                 )
             })
             .await;
@@ -99,6 +111,7 @@ impl MessageHandler {
                 warn!("Failed to enqueue message for processing: {e}");
                 // Cancel ack so server redelivers
                 *cancelled = true;
+                client.drain_overloaded_inbound();
                 return true;
             }
         };
@@ -118,6 +131,7 @@ impl MessageHandler {
                             &client,
                             Arc::clone(&lane.enqueue_lock),
                             Arc::clone(&lane.worker_running),
+                            Arc::clone(&lane.byte_budget),
                         )
                     })
                     .await
@@ -136,6 +150,7 @@ impl MessageHandler {
         ) {
             warn!("Failed to enqueue message for processing: {e}");
             *cancelled = true;
+            client.drain_overloaded_inbound();
         }
 
         true
@@ -173,8 +188,11 @@ fn create_chat_lane(
     client: &Arc<Client>,
     enqueue_lock: Arc<async_lock::Mutex<()>>,
     worker_running: Arc<async_lock::Mutex<()>>,
+    byte_budget: Arc<tokio::sync::Semaphore>,
 ) -> ChatLane {
-    let (tx, rx) = async_channel::unbounded::<QueuedChatMessage>();
+    let (tx, rx) =
+        async_channel::bounded::<QueuedChatMessage>(crate::inbound_queue::CHAT_QUEUE_ITEMS);
+    let rx = crate::inbound_queue::DrainingReceiver(rx);
 
     let client_for_worker = client.clone();
     let spawn_generation = client
@@ -233,6 +251,9 @@ fn create_chat_lane(
     ChatLane {
         enqueue_lock,
         queue_tx: tx,
+        byte_budget,
+        global_budget: Arc::clone(&client.inbound_queue_budgets.chat),
+        work: Arc::clone(&client.inbound_queue_budgets.work),
         worker_running,
     }
 }
@@ -245,6 +266,7 @@ async fn process_queued(
         shutdown,
         node: msg_node,
         lane_liveness, // Prevents capacity eviction until processing finishes.
+        work,
     }: QueuedChatMessage,
     spawn_generation: u64,
 ) -> bool {
@@ -282,6 +304,7 @@ async fn process_queued(
         );
     }
     drop(lane_liveness);
+    drop(work);
     true
 }
 
@@ -490,6 +513,9 @@ mod tests {
             &client,
             Arc::new(async_lock::Mutex::new(())),
             Arc::new(async_lock::Mutex::new(())),
+            Arc::new(tokio::sync::Semaphore::new(
+                crate::inbound_queue::CHAT_BYTES,
+            )),
         );
         let task_size = sizes.lock().unwrap().pop().unwrap();
         lane.queue_tx.close();
@@ -522,6 +548,9 @@ mod tests {
             &client,
             Arc::new(async_lock::Mutex::new(())),
             Arc::new(async_lock::Mutex::new(())),
+            Arc::new(tokio::sync::Semaphore::new(
+                crate::inbound_queue::CHAT_BYTES,
+            )),
         );
         let chat_lane_task_size = sizes.lock().unwrap().pop().unwrap();
 
@@ -530,6 +559,7 @@ mod tests {
             shutdown: wacore::runtime::ShutdownSignal::never(),
             node: Arc::clone(&dummy_node),
             lane_liveness: Arc::new(async_lock::Mutex::new(())),
+            work: None,
         };
         let process_queued_fut = process_queued(&client, queued, 0);
         let process_queued_size = size_of_val(&process_queued_fut);
@@ -795,6 +825,7 @@ mod tests {
                     node,
                     shutdown: client.connection_shutdown_signal(),
                     lane_liveness: Arc::new(async_lock::Mutex::new(())),
+                    work: None,
                 },
                 generation
             )
