@@ -513,11 +513,11 @@ mod tests {
         }
     }
 
-    // Exact and width independent: the entry carries the enqueue-time shutdown handle.
+    // Exact and width independent: node, shutdown, lane liveness and drain guard.
     // Rebaseline per [layout asserts](../../agent_docs/testing.md).
     #[test]
-    fn queued_chat_message_keeps_three_handles() {
-        assert_eq!(size_of::<QueuedChatMessage>(), 3 * size_of::<usize>());
+    fn queued_chat_message_keeps_four_handles() {
+        assert_eq!(size_of::<QueuedChatMessage>(), 4 * size_of::<usize>());
     }
 
     #[cfg(feature = "bench-harness")]
