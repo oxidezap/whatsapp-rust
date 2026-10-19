@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use oracle_core::Catalog;
 
+pub mod evidence;
+
 /// Chosen from the IANA dynamic range and otherwise arbitrary. Collides only
 /// with something else that picked the same number, which would show up as
 /// these tests serialising against it rather than as a wrong result.
@@ -32,25 +34,25 @@ const LOCK_PORT: u16 = 47_921;
 const WAIT: Duration = Duration::from_secs(600);
 
 /// Held for as long as a test needs exclusive use of a VoIP engine.
-pub struct EngineLock(#[allow(dead_code)] Option<TcpListener>);
+pub struct EngineLock(#[allow(dead_code)] TcpListener);
 
 /// Blocks until no other test process is running an engine.
 ///
-/// Falls through rather than failing if the wait runs out: a test that then
-/// contends is a flaky test, but a test suite that refuses to run is worse, and
-/// the timeout is far longer than any legitimate hold.
+/// Failure to acquire exclusivity is an infrastructure failure, never permission
+/// to run another engine concurrently.
 pub fn engine_lock() -> EngineLock {
     let deadline = Instant::now() + WAIT;
 
     loop {
         match TcpListener::bind(("127.0.0.1", LOCK_PORT)) {
-            Ok(listener) => return EngineLock(Some(listener)),
-            Err(_) if Instant::now() < deadline => {
+            Ok(listener) => return EngineLock(listener),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AddrInUse && Instant::now() < deadline =>
+            {
                 std::thread::sleep(Duration::from_millis(200));
             }
             Err(error) => {
-                eprintln!("engine lock timed out ({error}); running unserialised");
-                return EngineLock(None);
+                panic!("oracle infrastructure failure: acquiring engine lock: {error}");
             }
         }
     }
@@ -78,18 +80,17 @@ pub fn capture(id: &str) -> Result<Option<Vec<u8>>> {
         return Ok(None);
     };
     let entry = catalog.resolve(id)?;
-    std::fs::read(&entry.path)
+    oracle_core::catalog::read_pinned_capture(id, &entry.path)
         .with_context(|| format!("reading capture {}", entry.path.display()))
         .map(Some)
 }
 
-/// Holds the per-binary lock and attempts the cross-process engine lock, so
-/// Wasmtime engines stay serialised within a test binary and, while the lock
-/// is held, across binaries. See `engine_lock` for the timeout fall-through.
+/// Holds both locks. The local mutex protects no state; recovering it after a
+/// test panic is safe because each scenario constructs and drops its own engine.
 pub fn threaded_guard() -> (std::sync::MutexGuard<'static, ()>, EngineLock) {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let local = LOCK
         .lock()
-        .expect("engine test panicked while holding its lock");
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     (local, engine_lock())
 }

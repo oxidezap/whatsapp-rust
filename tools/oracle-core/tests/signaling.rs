@@ -10,7 +10,7 @@
 //!
 //! ```js
 //! handleIncomingSignalingOffer(serializeVoipWapNode(node), ...)
-//! // serializeVoipWapNode = base64(encodeStanza(node) minus its flag byte)
+//! // Web bridge = base64(encodeStanza(node)), including the flag byte
 //! ```
 //!
 //! All identities are fictitious.
@@ -26,46 +26,18 @@
 //!
 //! `--test-threads 1` matters: several engines at once still contend for cores.
 //!
-//! # What it took to make them reliable
+//! The slow gate runs each scenario in a fresh process through nextest. Engine
+//! startup, traps, missing captures and incomplete logs are failures. No retry
+//! can turn a failed observation into conformance evidence.
 //!
-//! Four separate problems, each measured rather than guessed:
-//!
-//! - **Startup raced about one time in nine.** `initVoipStack` finishes in
-//!   ~5 ms, and the trap landed with 99.6% of the fuel untouched and the media
-//!   init already logged as complete — a race between the calling thread and
-//!   `call_event_proc` starting. `schedule.rs` now lets only one guest thread
-//!   execute at a time, which took the rate to roughly 1 in 40; six retries in
-//!   `engine()` cover the remainder.
-//! - **Offer handling is asynchronous.** The call returning says nothing about
-//!   whether the event thread has done the work, so `wait_for_reaction` waits
-//!   for the log to grow and then go quiet instead of sleeping a fixed amount.
-//! - **Startup is not one burst of logging**, so "the log went quiet" is not
-//!   "startup finished". Under load the gap between the media stack finishing
-//!   and `call_event_proc` starting exceeds `QUIET`, and an offer delivered
-//!   into it is handled by an engine that has not finished starting.
-//!   `engine_with` waits for `call_event_proc resumed` — the last line startup
-//!   writes — and treats not reaching it as a failed startup.
-//! - **The engine's lock watchdog fires on the offer path**, about one run in
-//!   four, and it is ours: `schedule.rs` lets a worker hold a lock across its
-//!   whole turn, so the main thread meets the engine's locks in an order its
-//!   design does not admit. The run is identical to a good one and then stops
-//!   one line short of `wa_call_handle_incoming_xmpp_offer() status 0`. See
-//!   `deliver_without_a_lock_inversion`, which retries on exactly that
-//!   complaint and on nothing else.
-//!
-//! The last two are why this file used to say "not because they are unreliable
-//! — because they are slow", while `a_well_formed_offer_is_accepted` failed
-//! about one run in four. It was both.
-//!
-//! `examples/init_stress.rs` measures the startup race if the rate needs
-//! rechecking after a capture update.
-
 mod common;
 
 use base64::Engine as _;
 use std::time::Duration;
 
+use common::evidence::{self, Failure};
 use oracle_core::{Runtime, ThreadPolicy, Value};
+use sha2::{Digest, Sha256};
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::jid::Server;
 use wacore_binary::{Jid, Node, marshal};
@@ -86,34 +58,15 @@ const REACT_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long the log must stay unchanged before the reaction counts as over.
 const QUIET: Duration = Duration::from_millis(300);
 
-/// A VoIP module with its log ring attached and its stack initialised.
-///
-/// Threads are on: without them PJSIP's init fails and signaling never reaches
-/// the call stack, so every test here would be exercising a dead engine.
-///
-/// Bringing the media stack up starts a real worker pool, and under a loaded
-/// machine that occasionally does not complete. Retrying on a fresh instance is
-/// honest — the failure is resource contention in the host, not a property of
-/// the module — and keeps a heavy integration test usable rather than flaky.
-fn engine() -> Option<Runtime> {
-    // 0.11^6 ≈ 1.8e-6. See the module docs for where 0.11 comes from.
-    const ATTEMPTS: usize = 6;
-
-    for attempt in 1..=ATTEMPTS {
-        match engine_with(ThreadPolicy::Spawn) {
-            Ok(runtime) => return Some(runtime),
-            // No capture: nothing to retry.
-            Err(EngineError::Unavailable) => return None,
-            Err(EngineError::Broken(why)) => panic!("loading VoIP capture: {why}"),
-            Err(EngineError::InitFailed(why)) if attempt < ATTEMPTS => {
-                eprintln!("media stack did not come up (attempt {attempt}): {why}");
-            }
-            Err(EngineError::InitFailed(why)) => {
-                panic!("media stack failed to initialise after {ATTEMPTS} attempts: {why}")
-            }
+/// Start one fresh engine. Startup failure is infrastructure evidence, not a retry.
+fn engine() -> Runtime {
+    match engine_with(ThreadPolicy::Spawn) {
+        Ok(runtime) => runtime,
+        Err(EngineError::Unavailable) => evidence::fail(Failure::MissingCapture, VOIP),
+        Err(EngineError::Broken(why) | EngineError::InitFailed(why)) => {
+            evidence::fail(Failure::Infrastructure, why)
         }
     }
-    None
 }
 
 enum EngineError {
@@ -130,7 +83,13 @@ fn engine_with(policy: ThreadPolicy) -> Result<Runtime, EngineError> {
         return Err(EngineError::Unavailable);
     };
 
-    let mut runtime = Runtime::instantiate(&bytes).expect("instantiate");
+    eprintln!(
+        "oracle capture={VOIP} capture_sha256={} bytes={} source=wasm.lock.json",
+        hex::encode(Sha256::digest(&bytes)),
+        bytes.len()
+    );
+    let mut runtime = Runtime::instantiate(&bytes)
+        .map_err(|error| EngineError::Broken(format!("instantiate: {error:#}")))?;
     runtime.set_thread_policy(policy);
     // Register as the main runtime thread with `can_block = 0`, as the browser
     // does — the futex the engine compiles reaches `memory.atomic.wait32` with
@@ -140,121 +99,40 @@ fn engine_with(policy: ThreadPolicy) -> Result<Runtime, EngineError> {
     // engine hand work to this thread, and work handed over and never collected
     // reads as an engine that did nothing.
     runtime.set_main_thread_registration(true);
-    runtime.run_ctors().expect("ctors");
+    runtime
+        .run_ctors()
+        .map_err(|error| EngineError::Broken(format!("ctors: {error:#}")))?;
     runtime
         .attach_log_ring(LOG_RING)
-        .expect("engine should accept a log ring");
+        .map_err(|error| EngineError::Broken(format!("log ring: {error:#}")))?;
     // The media stack must actually come up: with it down the parser never
     // reaches the call stack and every assertion here would be about a dead
     // engine. `0` is success; `120011` is PJSIP being denied a thread.
     let init = runtime.call_embind(
         "initVoipStack",
         &[
-            // `"0"` and `"{}"` are not what `voipInit` wants — it takes three
-            // legacy-form JIDs (user, user device, user device LID), as
-            // `WAWeb/Voip/Init.js` shows and as `examples/outgoing_call.rs`
-            // passes. Correcting it here was tried and reverted: the incoming
-            // offer still ends as `Missed` with an identical log, and the suite
-            // started overrunning, so it bought nothing and cost time. Worth
-            // revisiting only alongside a fix that needs the real identity.
-            Value::Str(jid(CALLEE).to_string()),
-            Value::Str("0".to_owned()),
-            Value::Str("{}".to_owned()),
+            Value::Str(format!("{CALLEE}@c.us")),
+            Value::Str(format!("{CALLEE}:0@c.us")),
+            Value::Str("99887766554433:0@lid".to_owned()),
         ],
     );
     runtime.refuel();
     if policy == ThreadPolicy::Spawn
         && init.as_ref().ok().and_then(|value| value.as_int()) != Some(0)
     {
-        return Err(EngineError::InitFailed(format!("{init:?}")));
+        return Err(EngineError::InitFailed(format!(
+            "init={init:?} log={:?}",
+            runtime.engine_log()
+        )));
     }
-    // Wait for the media stack to finish announcing itself rather than for the
-    // threads to finish: PJSIP's worker is a loop bounded only by its fuel, so
-    // a full quiesce would always time out.
-    wait_for_reaction(&mut runtime, 0);
-
-    // And then wait for the *event thread*, which is a different thing and is
-    // what an offer is handed to.
-    //
-    // `wait_for_reaction` waits for the log to go quiet, and startup is not one
-    // continuous burst of logging: under load it can pause for longer than
-    // `QUIET` between the media stack finishing and `call_event_proc` starting.
-    // An offer delivered into that gap is handled by a half-started engine,
-    // which does not look like a timing problem at all — it looks like the
-    // engine refusing the stanza:
-    //
-    //     record_incoming_msg: no active call
-    //     Application settings not loaded
-    //     Failed to get voip storage dir
-    //
-    // and `wa_call_handle_incoming_xmpp_offer() status 0` never appears. That
-    // is what made `a_well_formed_offer_is_accepted` and
-    // `offer_handling_is_deterministic` fail about one run in seven, on a suite
-    // documented as slow but not flaky.
-    //
-    // `call_event_proc resumed` is the last line startup writes, at the default
-    // log level, and it means the event thread is running and idle. Not
-    // reaching it is a failed startup like any other, so it goes back through
-    // the retry above rather than into a test.
+    // The event worker must announce readiness before delivering a scenario.
     if policy == ThreadPolicy::Spawn && !wait_for_line(&mut runtime, "call_event_proc resumed") {
-        return Err(EngineError::InitFailed(
-            "the event thread never announced itself".to_owned(),
-        ));
+        return Err(EngineError::InitFailed(format!(
+            "the event thread never announced itself: {:?}",
+            runtime.engine_log()
+        )));
     }
     Ok(runtime)
-}
-
-/// Delivers an offer on a fresh engine until the engine's own lock watchdog
-/// stays quiet, and returns what it logged.
-///
-/// **What is being retried is a harness artifact, not a verdict.** A run that
-/// ends like this —
-///
-/// ```text
-/// events/eve  EVENT: Call missed by the user
-///   wa_os.cc  Mutex scope=0, priority=1: name=, owner=thr0x14b00c, taken=1
-///   wa_os.cc  check_locking_order wrong order for mutex scope=0, priority=0
-/// ```
-///
-/// is byte-for-byte identical to a good one up to that point and then stops:
-/// `wa_call_handle_incoming_xmpp_offer() status 0`, the line the synchronous
-/// call writes on its way out, never arrives. The engine caught a lock-order
-/// inversion and dumped its mutexes instead of finishing.
-///
-/// It is ours. `schedule.rs` runs one guest thread at a time, so a worker can
-/// hold a lock across its whole turn and the main thread meets the engine's
-/// locks in an order its design does not admit. `schedule.rs` says the
-/// lock-order complaints are "a symptom of something else"; this is the
-/// something else, and it is the scheduler that buys everything around it.
-///
-/// So the retry is conditioned on that complaint and nothing else. An engine
-/// that answers — with any status, including a refusal — is returned as it is,
-/// and the test judges it.
-fn deliver_without_a_lock_inversion(runtime: &mut Runtime, stanza: &str) -> Vec<String> {
-    // Four, not more. Each attempt builds a fresh engine and `engine()` retries
-    // startup six times inside that, so the two multiply; measured, four
-    // rounds of `a_well_formed_offer_is_accepted` passed in 37-53 s each,
-    // which is two or three attempts.
-    const ATTEMPTS: usize = 4;
-
-    for attempt in 1..=ATTEMPTS {
-        let lines = deliver(runtime, stanza.to_owned());
-        if !lines
-            .iter()
-            .any(|line| line.contains("check_locking_order"))
-        {
-            return lines;
-        }
-        if attempt == ATTEMPTS {
-            return lines;
-        }
-        eprintln!("lock-order inversion handling the offer (attempt {attempt}); fresh engine");
-        let Some(fresh) = engine() else {
-            return lines;
-        };
-        *runtime = fresh;
-    }
-    unreachable!("the loop returns on its last attempt")
 }
 
 /// Waits for a line to appear in the engine's log, draining as it goes.
@@ -277,18 +155,6 @@ fn wait_for_line(runtime: &mut Runtime, needle: &str) -> bool {
         std::thread::sleep(Duration::from_millis(20));
     }
     false
-}
-
-macro_rules! engine_or_skip {
-    () => {
-        match engine() {
-            Some(runtime) => runtime,
-            None => {
-                eprintln!("skipping: no capture (set WA_WASM_DIR)");
-                return;
-            }
-        }
-    };
 }
 
 /// Serialises the tests that start real guest threads.
@@ -357,11 +223,8 @@ fn offer_stanza(now: u64) -> Node {
 const VOIP_SETTINGS: &[u8] =
     br#"{"encode":{"use_mlow_codec_v1":"false"},"options":{"enable_48khz_rtp_clock":"false"}}"#;
 
-/// Serializes a node the way the bridge does.
-///
-/// `keep_flag` selects whether the transport flag byte survives. The JS glue
-/// drops it, but the engine's reader only accepts the payload *with* it — see
-/// `engine_accepts_the_framed_encoding`.
+/// Web serializes the full stanza. The flagless form is a negative fixture.
+/// See the preserved Web bridge evidence in README.md.
 fn serialize(node: &Node, keep_flag: bool) -> String {
     let encoded = marshal::marshal(node).expect("marshal");
     let payload = if keep_flag {
@@ -378,46 +241,60 @@ fn offer_for(runtime: &Runtime) -> Node {
 }
 
 fn deliver(runtime: &mut Runtime, stanza: String) -> Vec<String> {
-    // Deliberately *not* draining the proxy queue first, and it is worth
-    // knowing why. Work the engine parks for the main thread during startup
-    // looks like something that should run before the offer, so running it
-    // here was tried: `a_well_formed_offer_is_accepted` then fails four times
-    // out of four, where it had been failing about one in five. Whatever that
-    // queued work does, doing it immediately before the offer is worse than
-    // leaving it, which also says the half-started engine below is not simply
-    // "the queue had not been drained".
     let mark = runtime.engine_log().len();
     runtime.clear_calls();
 
-    let _ = runtime.call_embind(
+    let input_hash = hex::encode(Sha256::digest(stanza.as_bytes()));
+    eprintln!("oracle input_base64={stanza}");
+    let outcome = runtime.call_embind(
         "handleIncomingSignalingOffer",
-        &[
-            Value::Str(stanza),
-            Value::Str("web".to_owned()),
-            Value::Str("2.3000.0".to_owned()),
-            // Arguments 4 and 5 are the stanza's `e` and `t` timestamps, read
-            // with stoull. Anything non-numeric raises std::invalid_argument.
-            Value::Str(runtime.virtual_unix_time().to_string()),
-            Value::Str(runtime.virtual_unix_time().to_string()),
-            // Both bools tried in both positions: neither changes the outcome,
-            // and flipping the first leaves `call_wakeup_source` at 0 in the
-            // field stats — so it is probably not `is_offline`, whatever
-            // WhatsApp Web's parameter names suggest.
-            Value::Bool(false),
-            Value::Bool(false),
-            // The caller, as `t.peer_jid.toString()` in WhatsApp Web's own
-            // `WAWeb/Handle/VoipCallOffer.js`. The engine takes the caller from
-            // here rather than from the stanza: with this empty it logs the
-            // offer as coming from `0@s.whatsapp.net`.
-            Value::Str(jid(CALLER).to_string()),
-            // `f = u[1].tcToken` in the same file — the trusted-contact token,
-            // legitimately absent here.
-            Value::Bytes(Vec::new()),
-        ],
+        &offer_arguments(stanza, runtime.virtual_unix_time()),
     );
     runtime.refuel();
-    wait_for_reaction(runtime, mark);
-    runtime.engine_log_from(mark)
+    let settled = wait_for_reaction(runtime, mark);
+    let lines = runtime.engine_log_from(mark);
+    let overflowed = runtime
+        .engine_log_overflowed()
+        .unwrap_or_else(|error| evidence::fail(Failure::Infrastructure, error));
+    eprintln!(
+        "oracle input_sha256={input_hash} capture={VOIP} outcome={outcome:?} settled={settled} overflowed={overflowed} log={lines:?}"
+    );
+    evidence::check_log(overflowed, runtime.memory_view_is_coherent(), settled)
+        .unwrap_or_else(|kind| evidence::fail(kind, "incomplete offer evidence"));
+    if let Err(error) = outcome {
+        evidence::fail(
+            Failure::Infrastructure,
+            format!("offer call trapped: {error:#}"),
+        );
+    }
+    lines
+}
+
+/// WID strings belong to the native ABI. Wire JIDs remain canonical. In the
+/// preserved Web bridge, argument 8 is peer_jid.toString(), whose PN suffix is
+/// c.us. Using Rust Jid::to_string() here changes the input being tested.
+fn offer_arguments(stanza: String, now: u64) -> [Value; 9] {
+    [
+        Value::Str(stanza),
+        Value::Str("web".to_owned()),
+        Value::Str("2.3000.0".to_owned()),
+        Value::Str(now.to_string()),
+        Value::Str(now.to_string()),
+        Value::Bool(false),
+        Value::Bool(false),
+        Value::Str(format!("{CALLER}@c.us")),
+        Value::Bytes(Vec::new()),
+    ]
+}
+
+#[test]
+fn native_offer_arguments_preserve_the_web_wid_abi() {
+    let args = offer_arguments("fixture".to_owned(), 1_609_459_200);
+    assert_eq!(args[0], Value::Str("fixture".to_owned()));
+    assert_eq!(args[3], Value::Str("1609459200".to_owned()));
+    assert_eq!(args[4], args[3]);
+    assert_eq!(args[7], Value::Str("15550001111@c.us".to_owned()));
+    assert_eq!(jid(CALLER).to_string(), "15550001111@s.whatsapp.net");
 }
 
 /// Waits until the engine stops writing about what it was just asked to do.
@@ -426,7 +303,7 @@ fn deliver(runtime: &mut Runtime, stanza: String) -> Vec<String> {
 /// says nothing about whether it finished. A fixed sleep is wrong in both
 /// directions — too short under load, wasted otherwise — so this waits for the
 /// log to grow and then go quiet. Returns early on the common path.
-fn wait_for_reaction(runtime: &mut Runtime, mark: usize) {
+fn wait_for_reaction(runtime: &mut Runtime, mark: usize) -> bool {
     let deadline = std::time::Instant::now() + REACT_TIMEOUT;
     let mut last_len = runtime.engine_log().len();
     let mut unchanged_since = std::time::Instant::now();
@@ -450,9 +327,10 @@ fn wait_for_reaction(runtime: &mut Runtime, mark: usize) {
         }
         // Something was written, and nothing has been for a while.
         if len > mark && unchanged_since.elapsed() >= QUIET {
-            return;
+            return true;
         }
     }
+    false
 }
 
 /// The engine writes diagnostics into a host-supplied buffer. Everything else
@@ -461,7 +339,7 @@ fn wait_for_reaction(runtime: &mut Runtime, mark: usize) {
 #[ignore = "real threads; see the module docs"]
 fn the_engine_log_is_readable() {
     let _serial = threaded_guard();
-    let runtime = engine_or_skip!();
+    let runtime = engine();
     let log = runtime.engine_log();
 
     assert!(!log.is_empty(), "engine produced no log output");
@@ -478,7 +356,7 @@ fn the_engine_log_is_readable() {
 #[ignore = "real threads; see the module docs"]
 fn arguments_are_in_the_documented_order() {
     let _serial = threaded_guard();
-    let mut runtime = engine_or_skip!();
+    let mut runtime = engine();
     let lines = {
         let payload = serialize(&offer_for(&runtime), true);
         deliver(&mut runtime, payload)
@@ -507,18 +385,12 @@ fn reached_call_stack(lines: &[String]) -> bool {
         .any(|line| line.contains("VOIP STAC") && line.contains(CALL_ID))
 }
 
-/// The encoding the engine's reader accepts.
-///
-/// The JS glue drops the transport flag byte before base64-encoding, but the
-/// engine's own reader wants it: without it the payload is off by one from the
-/// start and the stanza never reaches the call stack. Compared by how far each
-/// gets rather than by a specific error string, since the reader reports
-/// different failures depending on what the shifted bytes happen to decode to.
+/// The Web bridge includes the flag byte; its removal is a negative control.
 #[test]
 #[ignore = "real threads; see the module docs"]
 fn engine_accepts_the_framed_encoding() {
     let _serial = threaded_guard();
-    let mut runtime = engine_or_skip!();
+    let mut runtime = engine();
 
     let framed = {
         let payload = serialize(&offer_for(&runtime), true);
@@ -578,10 +450,7 @@ fn engine_survives_malformed_offers() {
     ];
 
     for (label, build) in cases {
-        let Some(mut runtime) = engine() else {
-            eprintln!("skipping: no capture (set WA_WASM_DIR)");
-            return;
-        };
+        let mut runtime = engine();
         let payload = build(&runtime);
         let _ = deliver(&mut runtime, payload);
 
@@ -603,7 +472,7 @@ fn engine_survives_malformed_offers() {
     }
 
     // The host is still able to bring up a working engine afterwards.
-    let mut fresh = engine().expect("host should still work");
+    let mut fresh = engine();
     assert_eq!(
         fresh.call_embind("getWebP2PVirtualIpv4", &[]).ok(),
         Some(Value::Str("192.0.2.1".to_owned()))
@@ -623,18 +492,20 @@ fn engine_survives_malformed_offers() {
 #[ignore = "real threads; see the module docs"]
 fn offer_handling_is_deterministic() {
     let _serial = threaded_guard();
-    let Some(mut first) = engine() else {
-        eprintln!("skipping: no capture (set WA_WASM_DIR)");
-        return;
+    let observe = || {
+        let mut runtime = engine();
+        let stanza = serialize(&offer_for(&runtime), true);
+        let lines = deliver(&mut runtime, stanza);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("wa_call_handle_incoming_xmpp_offer() status 0")),
+            "determinism requires two accepted offers: {lines:?}"
+        );
+        events(lines)
     };
-    let mut second = engine().expect("second instance");
-
-    let stanza = serialize(&offer_for(&first), true);
-    // Both sides through the lock-watchdog retry: an inversion stops the
-    // reaction one line short of `status 0`, and comparing an abandoned run
-    // against a completed one is not a determinism result either way.
-    let a = events(deliver_without_a_lock_inversion(&mut first, &stanza));
-    let b = events(deliver_without_a_lock_inversion(&mut second, &stanza));
+    let a = observe();
+    let b = observe();
 
     assert_eq!(a, b, "two runs reached different engine events");
     assert!(!a.is_empty(), "no events recorded at all");
@@ -643,10 +514,8 @@ fn offer_handling_is_deterministic() {
 /// The lines that say what the engine decided, with everything timing-derived
 /// dropped.
 ///
-/// The `!` the engine writes into a line's prefix is dropped too: it marks a
-/// line the ring buffer lost, not a different decision, and two runs that
-/// decided the same thing must compare equal whether or not one of them dropped
-/// a line on the way.
+/// Overflow is rejected before comparing events. The engine's severity marker
+/// is excluded from this comparison of decisions.
 fn events(lines: Vec<String>) -> Vec<String> {
     const MARKERS: [&str; 5] = [
         "handleIncomingSignalingOffer from",
@@ -675,8 +544,7 @@ fn events(lines: Vec<String>) -> Vec<String> {
 fn media_stack_reports_its_failure() {
     let _serial = threaded_guard();
     let Ok(runtime) = engine_with(ThreadPolicy::Refuse) else {
-        eprintln!("skipping: no capture (set WA_WASM_DIR)");
-        return;
+        evidence::fail(Failure::MissingCapture, VOIP);
     };
     let log = runtime.engine_log();
 
@@ -700,7 +568,7 @@ fn media_stack_reports_its_failure() {
 #[ignore = "real threads; see the module docs"]
 fn the_log_reader_returns_only_the_log() {
     let _serial = threaded_guard();
-    let runtime = engine_or_skip!();
+    let runtime = engine();
     let lines = runtime.engine_log();
 
     assert!(!lines.is_empty(), "engine produced no log");
@@ -733,7 +601,7 @@ fn the_log_reader_returns_only_the_log() {
 #[ignore = "real threads; see the module docs"]
 fn guest_threads_are_not_serialised() {
     let _serial = threaded_guard();
-    let runtime = engine_or_skip!();
+    let runtime = engine();
 
     let peak = runtime.max_threads_in_wasm();
     eprintln!("most guest threads executing at once: {peak}");
@@ -758,7 +626,7 @@ fn guest_threads_are_not_serialised() {
 #[ignore = "real threads; see the module docs"]
 fn the_memory_watch_names_the_moment() {
     let _serial = threaded_guard();
-    let mut runtime = engine_or_skip!();
+    let mut runtime = engine();
 
     assert!(runtime.watch_memory(), "no static data to watch");
     let (at, len) = runtime.coherence_witness().expect("witness");
@@ -800,7 +668,7 @@ fn the_memory_watch_names_the_moment() {
 #[ignore = "real threads; see the module docs"]
 fn an_incoherent_memory_view_withholds_the_log() {
     let _serial = threaded_guard();
-    let mut runtime = engine_or_skip!();
+    let mut runtime = engine();
 
     let (at, len) = runtime
         .coherence_witness()
@@ -851,8 +719,7 @@ fn no_ring_means_no_log() {
     let Some(bytes) =
         common::capture(VOIP).unwrap_or_else(|error| panic!("loading {VOIP}: {error:#}"))
     else {
-        eprintln!("skipping: no capture (set WA_WASM_DIR)");
-        return;
+        evidence::fail(Failure::MissingCapture, VOIP);
     };
     let mut runtime = Runtime::instantiate(&bytes).expect("instantiate");
     runtime.run_ctors().expect("ctors");
@@ -870,7 +737,7 @@ fn no_ring_means_no_log() {
 #[ignore = "real threads; see the module docs"]
 fn overflow_is_observable() {
     let _serial = threaded_guard();
-    let mut runtime = engine_or_skip!();
+    let mut runtime = engine();
     // A ring this size does not wrap during startup, so this pins the
     // "no overflow" reading; the accessor existing is what lets a caller with a
     // smaller ring notice the opposite.
@@ -886,7 +753,7 @@ fn overflow_is_observable() {
 #[ignore = "real threads; see the module docs"]
 fn a_well_formed_offer_reaches_the_call_stack() {
     let _serial = threaded_guard();
-    let mut runtime = engine_or_skip!();
+    let mut runtime = engine();
     let lines = {
         let payload = serialize(&offer_for(&runtime), true);
         deliver(&mut runtime, payload)
@@ -910,29 +777,16 @@ fn a_well_formed_offer_reaches_the_call_stack() {
 #[ignore = "real threads; see the module docs"]
 fn non_numeric_timestamps_are_rejected() {
     let _serial = threaded_guard();
-    let mut runtime = engine_or_skip!();
+    let mut runtime = engine();
     let mark = runtime.engine_log().len();
 
-    let _ = runtime.call_embind(
-        "handleIncomingSignalingOffer",
-        &[
-            Value::Str(serialize(&offer_for(&runtime), true)),
-            Value::Str("web".to_owned()),
-            Value::Str("2.3000.0".to_owned()),
-            Value::Str("not-a-number".to_owned()),
-            Value::Str("also-not".to_owned()),
-            Value::Bool(false),
-            Value::Bool(false),
-            // The caller, as `t.peer_jid.toString()` in WhatsApp Web's own
-            // `WAWeb/Handle/VoipCallOffer.js`. The engine takes the caller from
-            // here rather than from the stanza: with this empty it logs the
-            // offer as coming from `0@s.whatsapp.net`.
-            Value::Str(jid(CALLER).to_string()),
-            // `f = u[1].tcToken` in the same file — the trusted-contact token,
-            // legitimately absent here.
-            Value::Bytes(Vec::new()),
-        ],
+    let mut args = offer_arguments(
+        serialize(&offer_for(&runtime), true),
+        runtime.virtual_unix_time(),
     );
+    args[3] = Value::Str("not-a-number".to_owned());
+    args[4] = Value::Str("also-not".to_owned());
+    let _ = runtime.call_embind("handleIncomingSignalingOffer", &args);
     runtime.refuel();
 
     let lines = runtime.engine_log_from(mark);
@@ -950,7 +804,7 @@ fn non_numeric_timestamps_are_rejected() {
 #[ignore = "real threads; see the module docs"]
 fn call_id_must_sit_on_the_call_element() {
     let _serial = threaded_guard();
-    let mut runtime = engine_or_skip!();
+    let mut runtime = engine();
 
     let misplaced = NodeBuilder::new("call")
         .attr("from", jid(CALLER))
@@ -977,17 +831,16 @@ fn call_id_must_sit_on_the_call_element() {
 #[ignore = "real threads; see the module docs"]
 fn a_well_formed_offer_is_accepted() {
     let _serial = threaded_guard();
-    let mut runtime = engine_or_skip!();
+    let mut runtime = engine();
     let payload = serialize(&offer_for(&runtime), true);
-    let lines = deliver_without_a_lock_inversion(&mut runtime, &payload);
+    let lines = deliver(&mut runtime, payload);
 
     // A missing line proves nothing once the ring has wrapped: the reader can
     // only return what is still in the buffer. Asserting through an overflow
     // reports "the engine refused" for a run in which it may well have
     // accepted, which is the kind of wrong answer an oracle must not give.
     if runtime.engine_log_overflowed().expect("overflow probe") {
-        eprintln!("engine log overflowed; nothing can be concluded from absence");
-        return;
+        evidence::fail(Failure::Overflow, "engine log wrapped");
     }
 
     assert!(
@@ -1018,17 +871,9 @@ fn a_well_formed_offer_is_accepted() {
 #[ignore = "real threads; see the module docs"]
 fn settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call() {
     let _serial = common::engine_lock();
-    let Some(mut runtime) = engine_with_identity() else {
-        eprintln!("skipping: no capture (set WA_WASM_DIR)");
-        return;
-    };
+    let mut runtime = engine();
 
     let payload = serialize(&offer_for(&runtime), true);
-    // Plain `deliver`, not the lock-watchdog retry. What this asserts is that
-    // the *sequence* does not shred the engine's log, which an inversion does
-    // not affect — and routing it through the retry cost twenty minutes on its
-    // own, because a fresh engine per attempt compounds with the six startup
-    // retries inside `engine()`.
     let _ = deliver(&mut runtime, payload);
 
     let mark = runtime.engine_log().len();
@@ -1095,7 +940,7 @@ fn settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call() {
 
     // And anything the engine did write has the shape of engine output.
     assert!(
-        lines.is_empty() || structured > 0,
+        !lines.is_empty() && structured > 0,
         "the log has lines but none of them are engine output: {lines:?}"
     );
 }
@@ -1114,7 +959,7 @@ fn settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call() {
 #[ignore = "real threads; see the module docs"]
 fn an_incoming_offer_reports_its_participants() {
     let _serial = threaded_guard();
-    let mut runtime = engine_or_skip!();
+    let mut runtime = engine();
     let payload = serialize(&offer_for(&runtime), true);
     let lines = deliver(&mut runtime, payload);
     for line in &lines {
@@ -1124,12 +969,13 @@ fn an_incoming_offer_reports_its_participants() {
     let info = runtime.call_embind("getCallInfo", &[]);
     runtime.refuel();
     let Some(json) = info.as_ref().ok().and_then(|value| value.as_str()) else {
-        eprintln!("engine reported no call after the offer: {info:?}");
-        return;
+        evidence::fail(Failure::Infrastructure, format!("getCallInfo: {info:?}"));
     };
     if json.is_empty() {
-        eprintln!("engine holds no call state after the offer");
-        return;
+        evidence::fail(
+            Failure::Mismatch,
+            "engine holds no call state after the offer",
+        );
     }
 
     let has_self = json.contains("\"is_self\": true");
@@ -1150,7 +996,7 @@ fn an_incoming_offer_reports_its_participants() {
 #[ignore = "real threads; see the module docs"]
 fn an_unmarked_settings_blob_is_rejected() {
     let _serial = threaded_guard();
-    let mut runtime = engine_or_skip!();
+    let mut runtime = engine();
 
     let caller = jid(CALLER);
     let unmarked = NodeBuilder::new("call")
@@ -1187,13 +1033,12 @@ fn an_unmarked_settings_blob_is_rejected() {
 #[ignore = "real threads; see the module docs"]
 fn the_caller_comes_from_the_argument_not_the_stanza() {
     let _serial = threaded_guard();
-    let mut runtime = engine_or_skip!();
+    let mut runtime = engine();
     let payload = serialize(&offer_for(&runtime), true);
     let lines = deliver(&mut runtime, payload);
 
     if runtime.engine_log_overflowed().expect("overflow probe") {
-        eprintln!("engine log overflowed; nothing can be concluded from absence");
-        return;
+        evidence::fail(Failure::Overflow, "engine log wrapped");
     }
 
     let offer_line = lines
@@ -1232,114 +1077,97 @@ fn the_caller_comes_from_the_argument_not_the_stanza() {
 #[test]
 #[ignore = "real threads; see the module docs"]
 fn the_engine_starts_an_outgoing_call() {
-    /// The engine's worker pool outlives its `Runtime` — a PJSIP worker is a
-    /// loop bounded only by fuel — so a run that follows several other engine
-    /// tests competes with threads that have not finished dying. Retried for
-    /// the same reason startup is.
-    const ATTEMPTS: usize = 4;
-
     let _serial = threaded_guard();
 
-    for attempt in 1..=ATTEMPTS {
-        let Some(mut runtime) = engine_with_identity() else {
-            eprintln!("skipping: no capture (set WA_WASM_DIR)");
-            return;
-        };
+    let mut runtime = engine();
 
-        let mark = runtime.engine_log().len();
-        let outcome = runtime.call_embind(
-            "startVoipCall",
-            &[
-                // Every JID in LID form: the engine enforces it outright —
-                // `start_precall peer_participant_jids must be LID, enforce LID
-                // for all calls` — and a phone-number JID fails with 70008.
-                Value::Str(PEER_LID.to_owned()),
-                // The peer's devices, in device-LID form. Empty, this returns
-                // -1 with nothing written to the log at all.
-                Value::StringList(vec![PEER_LID_DEVICE.to_owned()]),
-                Value::Str("0011223344556677".to_owned()),
-                Value::Bool(false),
-                Value::Str(PEER_LID.to_owned()),
-                Value::Bool(false),
-                Value::Bytes(Vec::new()),
-            ],
-        );
-        runtime.refuel();
-        runtime.settle(std::time::Duration::from_secs(5));
+    let mark = runtime.engine_log().len();
+    let outcome = runtime.call_embind(
+        "startVoipCall",
+        &[
+            // Every JID in LID form: the engine enforces it outright —
+            // `start_precall peer_participant_jids must be LID, enforce LID
+            // for all calls` — and a phone-number JID fails with 70008.
+            Value::Str(PEER_LID.to_owned()),
+            // The peer's devices, in device-LID form. Empty, this returns
+            // -1 with nothing written to the log at all.
+            Value::StringList(vec![PEER_LID_DEVICE.to_owned()]),
+            Value::Str("0011223344556677".to_owned()),
+            Value::Bool(false),
+            Value::Str(PEER_LID.to_owned()),
+            Value::Bool(false),
+            Value::Bytes(Vec::new()),
+        ],
+    );
+    runtime.refuel();
+    runtime.settle(std::time::Duration::from_secs(5));
 
-        let lines = runtime.engine_log_from(mark);
-        if runtime.engine_log_overflowed().expect("overflow probe") {
-            eprintln!("engine log overflowed; nothing can be concluded from absence");
-            return;
-        }
-
-        let started = lines.iter().any(|line| line.contains("Call start"));
-        if !started && attempt < ATTEMPTS {
-            eprintln!("call did not start (attempt {attempt}): {outcome:?}");
-            continue;
-        }
-        assert!(
-            started,
-            "the engine should start the call after {ATTEMPTS} attempts: \
-             {outcome:?} {lines:?}"
-        );
-
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("start_precall begin")),
-            "and reach precall setup: {lines:?}"
-        );
-        // The call is genuinely being built by this point: media is negotiated
-        // per participant, per stream. This is the deepest the engine has been
-        // driven.
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("call_generate_ssrc_for_participant")),
-            "media SSRCs should be generated for the participants: {lines:?}"
-        );
-        for stream in ["audio", "video", "screen_share"] {
-            assert!(
-                lines
-                    .iter()
-                    .any(|line| line.contains(&format!("{stream} stream"))),
-                "an SSRC should be generated for the {stream} stream: {lines:?}"
-            );
-        }
-        assert!(
-            !lines
-                .iter()
-                .any(|line| line.contains("peer_participant_jids must be LID")),
-            "the JIDs should satisfy the LID requirement: {lines:?}"
-        );
-        // The call reaches the state a ringing outbound call is in. Everything
-        // before this is setup; this is the engine committing to the call.
-        assert!(
-            lines.iter().any(|line| line.contains("[None -> Calling]")),
-            "the call should enter the Calling state: {lines:?}"
-        );
-
-        // And then it stops. This pins the blocker rather than endorsing it:
-        // `make_and_cache_offer` (offer.cc) returns 70008.
-        //
-        // 70008 is shared by several guards. This test observes the failure
-        // and lack of a send, but does not locate the guard in the pinned capture.
-        // Read `make_and_cache_offer` in that capture and mark its call sites
-        // with `oracle instrument --calls-in FUNC`; a body marker cannot tell
-        // which caller ran. Do not carry old-capture indices into this module.
-        //
-        // When this assertion starts failing, the blocker is gone: replace it
-        // with one that expects an offer on the wire.
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("make_and_cache_offer failed: 70008")),
-            "the known blocker should still be the one that stops the call; if this \
-             fails, the offer path may now work — check for outgoing signaling: {lines:?}"
-        );
-        return;
+    let lines = runtime.engine_log_from(mark);
+    if runtime.engine_log_overflowed().expect("overflow probe") {
+        evidence::fail(Failure::Overflow, "engine log wrapped");
     }
+
+    let started = lines.iter().any(|line| line.contains("Call start"));
+    assert!(
+        started,
+        "the engine should start the call: \
+             {outcome:?} {lines:?}"
+    );
+
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("start_precall begin")),
+        "and reach precall setup: {lines:?}"
+    );
+    // The call is genuinely being built by this point: media is negotiated
+    // per participant, per stream. This is the deepest the engine has been
+    // driven.
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("call_generate_ssrc_for_participant")),
+        "media SSRCs should be generated for the participants: {lines:?}"
+    );
+    for stream in ["audio", "video", "screen_share"] {
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(&format!("{stream} stream"))),
+            "an SSRC should be generated for the {stream} stream: {lines:?}"
+        );
+    }
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("peer_participant_jids must be LID")),
+        "the JIDs should satisfy the LID requirement: {lines:?}"
+    );
+    // The call reaches the state a ringing outbound call is in. Everything
+    // before this is setup; this is the engine committing to the call.
+    assert!(
+        lines.iter().any(|line| line.contains("[None -> Calling]")),
+        "the call should enter the Calling state: {lines:?}"
+    );
+
+    // And then it stops. This pins the blocker rather than endorsing it:
+    // `make_and_cache_offer` (offer.cc) returns 70008.
+    //
+    // 70008 is shared by several guards. This test observes the failure
+    // and lack of a send, but does not locate the guard in the pinned capture.
+    // Read `make_and_cache_offer` in that capture and mark its call sites
+    // with `oracle instrument --calls-in FUNC`; a body marker cannot tell
+    // which caller ran. Do not carry old-capture indices into this module.
+    //
+    // When this assertion starts failing, the blocker is gone: replace it
+    // with one that expects an offer on the wire.
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("make_and_cache_offer failed: 70008")),
+        "the known blocker should still be the one that stops the call; if this \
+             fails, the offer path may now work — check for outgoing signaling: {lines:?}"
+    );
 }
 
 /// The init sequence WhatsApp Web actually performs, and the handles it gets.
@@ -1358,10 +1186,7 @@ fn the_engine_starts_an_outgoing_call() {
 #[ignore = "brings up the media stack; slow"]
 fn the_engine_accepts_the_init_sequence_whatsapp_web_performs() {
     let _serial = common::engine_lock();
-    let Some(mut runtime) = engine_with_identity() else {
-        eprintln!("skipping: no capture (set WA_WASM_DIR)");
-        return;
-    };
+    let mut runtime = engine();
 
     let hide_ip = runtime.call_embind("setHideMyIp", &[Value::Bool(false)]);
     runtime.refuel();
@@ -1428,10 +1253,7 @@ fn the_engine_accepts_the_init_sequence_whatsapp_web_performs() {
 #[ignore = "brings up the media stack; slow"]
 fn the_engine_reports_a_self_participant_for_an_outgoing_call() {
     let _serial = common::engine_lock();
-    let Some(mut runtime) = engine_with_identity() else {
-        eprintln!("skipping: no capture (set WA_WASM_DIR)");
-        return;
-    };
+    let mut runtime = engine();
 
     // Nothing before the call: this is what makes the post-call dump evidence
     // about *this* call rather than pre-existing state.
@@ -1461,25 +1283,7 @@ fn the_engine_reports_a_self_participant_for_an_outgoing_call() {
     let info = runtime.call_embind("getCallInfo", &[]);
     runtime.refuel();
     let Some(json) = info.as_ref().ok().and_then(|value| value.as_str()) else {
-        // A trap here is the corruption `tools/oracle-core/tests/signaling.rs` describes, not a new
-        // fault. The shared stack is *not* the reason, though it was written
-        // down as one here: every guest thread does start from the main
-        // thread's stack pointer, but giving each worker its own 4 MiB stack —
-        // confirmed from inside the guest with `stackSave` — changes nothing.
-        // What actually stops the engine is static data being corrupted at
-        // runtime, which shows up as a set profiler flag at 0x14B958 and an
-        // out-of-linear-memory pointer in `pthread + 112`. The mechanism is
-        // still open.
-        //
-        // Reported and skipped rather than asserted, because a red suite here
-        // would say "the self participant is missing" about a run that never
-        // got far enough to have one. That makes this test vacuous whenever it
-        // takes this path — it is a placeholder for the assertion below, not
-        // evidence for it.
-        eprintln!(
-            "getCallInfo could not answer — see tools/oracle-core/tests/signaling.rs, threads share one stack: {info:?}"
-        );
-        return;
+        evidence::fail(Failure::Infrastructure, format!("getCallInfo: {info:?}"));
     };
 
     assert!(
@@ -1496,37 +1300,6 @@ fn the_engine_reports_a_self_participant_for_an_outgoing_call() {
 const PEER_LID: &str = "11223344556677@lid";
 const PEER_LID_DEVICE: &str = "11223344556677:0@lid";
 
-/// An engine whose identity is set up the way WhatsApp Web sets it up.
-fn engine_with_identity() -> Option<Runtime> {
-    const ATTEMPTS: usize = 6;
-
-    for _ in 0..ATTEMPTS {
-        let bytes =
-            common::capture(VOIP).unwrap_or_else(|error| panic!("loading {VOIP}: {error:#}"))?;
-
-        let mut runtime = Runtime::instantiate(&bytes).expect("instantiate");
-        runtime.set_thread_policy(ThreadPolicy::Spawn);
-        runtime.run_ctors().expect("ctors");
-        runtime.attach_log_ring(LOG_RING).expect("log ring");
-
-        let init = runtime.call_embind(
-            "initVoipStack",
-            &[
-                Value::Str(format!("{CALLEE}@c.us")),
-                Value::Str(format!("{CALLEE}:0@c.us")),
-                // The device LID. Fictitious, like every identity in these
-                // tests.
-                Value::Str("99887766554433:0@lid".to_owned()),
-            ],
-        );
-        runtime.refuel();
-        if init.as_ref().ok().and_then(|value| value.as_int()) == Some(0) {
-            return Some(runtime);
-        }
-    }
-    None
-}
-
 /// This build refuses a phone-number peer: calls must be placed to LIDs.
 ///
 /// It matters beyond this repository. `~/projects/meowmeow-node-wasm` places
@@ -1539,17 +1312,14 @@ fn engine_with_identity() -> Option<Runtime> {
 #[ignore = "real threads; see the module docs"]
 fn a_phone_number_peer_is_refused_because_this_build_enforces_lid() {
     let _serial = common::engine_lock();
-    let Some(mut runtime) = engine_with_identity() else {
-        eprintln!("skipping: no capture (set WA_WASM_DIR)");
-        return;
-    };
+    let mut runtime = engine();
 
     let mark = runtime.engine_log().len();
     let outcome = runtime.call_embind(
         "startVoipCall",
         &[
             Value::Str("11223344556677@s.whatsapp.net".to_owned()),
-            Value::StringList(vec!["11223344556677:0@s.whatsapp.net".to_owned()]),
+            Value::StringList(vec!["11223344556677:0@c.us".to_owned()]),
             Value::Str("0011223344556677".to_owned()),
             Value::Bool(false),
             Value::Str("11223344556677@s.whatsapp.net".to_owned()),
@@ -1562,8 +1332,7 @@ fn a_phone_number_peer_is_refused_because_this_build_enforces_lid() {
 
     let lines = runtime.engine_log_from(mark);
     if runtime.engine_log_overflowed().expect("overflow probe") {
-        eprintln!("engine log overflowed; nothing can be concluded from absence");
-        return;
+        evidence::fail(Failure::Overflow, "engine log wrapped");
     }
 
     assert!(
@@ -1588,10 +1357,7 @@ fn a_phone_number_peer_is_refused_because_this_build_enforces_lid() {
 #[ignore = "real threads; see the module docs"]
 fn an_offers_settings_blob_becomes_readable_through_get_voip_param() {
     let _serial = common::engine_lock();
-    let Some(mut runtime) = engine_with_identity() else {
-        eprintln!("skipping: no capture (set WA_WASM_DIR)");
-        return;
-    };
+    let mut runtime = engine();
 
     let read = |runtime: &mut Runtime, name: &str| -> Option<String> {
         let value = runtime.call_embind("getVoipParam", &[Value::Str(name.to_owned())]);
@@ -1666,19 +1432,16 @@ fn an_offer_does_not_move_the_bytes_that_gate_the_outgoing_offer() {
     const OFFSETS_REDERIVED: Option<(u32, u32)> = None;
 
     let Some((settings_offset, guard_offset)) = OFFSETS_REDERIVED else {
-        eprintln!(
-            "skipping: the offer-guard offsets (3856, 662166) were read out of \
+        evidence::fail(
+            Failure::Unqualified,
+            "the offer-guard offsets (3856, 662166) were read out of \
              D5pLH9sfOOl's make_and_cache_offer, which JgwtTQVeWPm rewrote. \
-             Re-derive them before trusting this probe."
+             Re-derive them before trusting this probe.",
         );
-        return;
     };
 
     let _serial = common::engine_lock();
-    let Some(mut runtime) = engine_with_identity() else {
-        eprintln!("skipping: no capture (set WA_WASM_DIR)");
-        return;
-    };
+    let mut runtime = engine();
 
     let guard_bytes = |runtime: &Runtime| -> Option<(u8, u8)> {
         let ctx = runtime
@@ -1695,8 +1458,7 @@ fn an_offer_does_not_move_the_bytes_that_gate_the_outgoing_offer() {
     };
 
     let Some(before) = guard_bytes(&runtime) else {
-        eprintln!("skipping: no call context yet");
-        return;
+        evidence::fail(Failure::Infrastructure, "no call context yet");
     };
 
     let payload = serialize(&offer_for(&runtime), true);

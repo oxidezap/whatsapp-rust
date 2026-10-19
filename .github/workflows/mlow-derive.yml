@@ -23,7 +23,7 @@ jobs:
           toolchain: nightly-2026-06-16
       - uses: taiki-e/install-action@v2
         with:
-          tool: protoc@3.25.3
+          tool: protoc@3.25.3,cargo-nextest
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: . -> target
@@ -33,21 +33,18 @@ jobs:
         run: cargo test --locked -p whatsapp-xtask -p xtask-support
       - name: Test oracle task utilities
         run: cargo test --release --locked -p whatsapp-oracle-task
-      - name: Run complete VoIP conformance gate
-        if: github.event_name != 'schedule'
-        run: cargo xt oracle conformance
       - name: Run complete VoIP conformance gate with slow signaling
-        if: github.event_name == 'schedule'
         run: cargo xt oracle conformance --slow
       - uses: actions/upload-artifact@v7
         # Early failures can precede derivation. Preserve partial evidence on
         # failure, but a successful gate must still produce uploadable evidence.
-        if: ${{ always() && (success() || hashFiles('.derive-mlow/specs/*.json', '.derive-mlow/wasm/*.log', '.derive-mlow/wasm/*/manifest.json') != '') }}
+        if: ${{ always() && (success() || hashFiles('.derive-mlow/specs/*.json', '.derive-mlow/wasm/*.log', '.derive-mlow/wasm/*/manifest.json', 'target/nextest/oracle/junit.xml') != '') }}
         with:
           name: voip-conformance-evidence
           path: |
             .derive-mlow/specs/*.json
             .derive-mlow/wasm/*.log
             .derive-mlow/wasm/*/manifest.json
+            target/nextest/oracle/junit.xml
           if-no-files-found: error
           include-hidden-files: true

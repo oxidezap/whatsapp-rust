@@ -24,54 +24,58 @@ fn video_offer_matches_the_vendor_engine() -> Result<()> {
     let bytes = common::capture(CAPTURE)?.with_context(|| format!("missing {CAPTURE}"))?;
     assert_eq!(hex::encode(Sha256::digest(&bytes)), CAPTURE_SHA);
 
-    let mut runtime = None;
-    for _ in 0..6 {
-        let mut candidate = Runtime::instantiate(&bytes)?;
-        candidate.set_thread_policy(ThreadPolicy::Spawn);
-        candidate.set_main_thread_registration(true);
-        candidate.run_ctors()?;
-        candidate.attach_log_ring(4 << 20)?;
-        let init = candidate.call_embind(
-            "initVoipStack",
-            &[
-                Value::Str("15550002222@c.us".into()),
-                Value::Str("15550002222:0@c.us".into()),
-                Value::Str("99887766554433:0@lid".into()),
-            ],
-        );
-        candidate.refuel();
-        if init.as_ref().ok().and_then(|value| value.as_int()) == Some(0) {
-            runtime = Some(candidate);
-            break;
-        }
-    }
-    let mut runtime = runtime.context("initVoipStack never returned 0")?;
+    let mut runtime = Runtime::instantiate(&bytes)?;
+    runtime.set_thread_policy(ThreadPolicy::Spawn);
+    runtime.set_main_thread_registration(true);
+    runtime.run_ctors()?;
+    runtime.attach_log_ring(4 << 20)?;
+    let init = runtime.call_embind(
+        "initVoipStack",
+        &[
+            Value::Str("15550002222@c.us".into()),
+            Value::Str("15550002222:0@c.us".into()),
+            Value::Str("99887766554433:0@lid".into()),
+        ],
+    );
+    runtime.refuel();
+    assert_eq!(
+        init.as_ref().ok().and_then(|value| value.as_int()),
+        Some(0),
+        "oracle infrastructure failure: init={init:?} log={:?}",
+        runtime.engine_log()
+    );
 
-    let mut started = false;
-    for _ in 0..3 {
-        let outcome = runtime.call_embind(
-            "startVoipCall",
-            &[
-                Value::Str("11223344556677@lid".into()),
-                Value::StringList(vec!["11223344556677:0@lid".into()]),
-                Value::Str("0011223344556677".into()),
-                Value::Bool(true),
-                Value::Str("11223344556677@lid".into()),
-                Value::Bool(false),
-                Value::Bytes(vec![0xa5; 32]),
-            ],
-        );
-        runtime.refuel();
-        runtime.settle(std::time::Duration::from_secs(8));
-        runtime.refuel();
-        if outcome.as_ref().ok().and_then(|value| value.as_int()) == Some(0)
-            && !runtime.signaling()?.is_empty()
-        {
-            started = true;
-            break;
-        }
-    }
-    assert!(started, "the engine should emit a video offer");
+    let outcome = runtime.call_embind(
+        "startVoipCall",
+        &[
+            Value::Str("11223344556677@lid".into()),
+            Value::StringList(vec!["11223344556677:0@lid".into()]),
+            Value::Str("0011223344556677".into()),
+            Value::Bool(true),
+            Value::Str("11223344556677@lid".into()),
+            Value::Bool(false),
+            Value::Bytes(vec![0xa5; 32]),
+        ],
+    );
+    runtime.refuel();
+    runtime.settle(std::time::Duration::from_secs(8));
+    runtime.refuel();
+    assert_eq!(
+        outcome.as_ref().ok().and_then(|value| value.as_int()),
+        Some(0),
+        "startVoipCall: {outcome:?}"
+    );
+    assert!(
+        !runtime.signaling()?.is_empty(),
+        "the engine should emit a video offer: {:?}",
+        runtime.engine_log()
+    );
+    common::evidence::check_log(
+        runtime.engine_log_overflowed()?,
+        runtime.memory_view_is_coherent(),
+        true,
+    )
+    .unwrap_or_else(|kind| common::evidence::fail(kind, "video offer evidence"));
 
     let mut stubs = runtime.stubs_called();
     stubs.sort();

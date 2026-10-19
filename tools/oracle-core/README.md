@@ -56,6 +56,42 @@ module so slowly that a run looks hung.
 Tests skip when a module they need is absent, and **a skipped run is not a
 passing run** — check for `skipping:` in the output before trusting green.
 
+The slow signaling gate is stricter. Run it with `cargo xt oracle conformance
+--slow`; it requires every capture and runs each signaling/video scenario in a
+fresh process through nextest's `oracle` profile, serially and without retries.
+Pull requests, pushes, manual runs and the weekly schedule select this gate. Its JUnit
+report retains successful and failed scenario output in the CI evidence artifact.
+Missing captures, overflow, unavailable memory evidence, startup failures and
+unqualified probes fail the gate rather than returning a passing test. Assertion
+failures remain protocol mismatches; a quiet log is only a prerequisite for the
+scenario's explicit outcome assertion.
+
+Native bridge strings and wire JIDs have different representations. The
+preserved Web caller passes `peer_jid.toString()` to the incoming-offer bridge;
+`WAWebWid` normalizes PN users to `c.us` for this representation. Keep canonical
+`s.whatsapp.net` JIDs in encoded nodes. The Web bridge base64-encodes the full
+`encodeStanza` output, including its flag byte; the Windows helper
+`WAWebSerializeVoipWapNode` removes that byte and is a different path.
+
+These distinctions were checked in whatspec commit
+`587a514bf2032286c6d6d6622e4420281460db20`, schema `4.3.0`, WA snapshot
+`2.3000.1047483476`, 579 bundles, set hash
+`05609307e68b0f6ccfd2a121a573049999e38b752cfe7155ebbe5c661805751b`.
+All bundle sizes and SHA-256 hashes were verified against its lock. Complete
+AST-extracted modules and byte ranges in the unmodified inputs:
+
+| Module | Bundle SHA-256 | Byte range |
+| --- | --- | --- |
+| `WAWebVoipStackInterfaceWeb` | `431712818bb02e6d5cb2ae144decac6448b5245a6bef4c27d793d6267b6c7fe9` | 113185..140304 |
+| `WAWebHandleVoipCallOffer` | `ab02ff22d8f464fdf7ebfdfb0b2f8d380c2595dd232c10f5499be1d3790dec08` | 920..7440 |
+| `WAWebWid` | `09d91fdc4089c50ab1d35dd6c796ee82ef4c3296710316d20383c85738b871b8` | 2728079..2737165 |
+
+The immutable source archive is
+[`bundles-2.3000.1047483476-05609307e68b0f6ccfd2a121a573049999e38b752cfe7155ebbe5c661805751b.tar.xz`](https://github.com/oxidezap/whatspec/releases/download/bundle-store/bundles-2.3000.1047483476-05609307e68b0f6ccfd2a121a573049999e38b752cfe7155ebbe5c661805751b.tar.xz).
+This JavaScript snapshot is newer than the pinned `JgwtTQVeWPm` engine. It
+establishes the inspected bridge behavior, not full-call compatibility or server
+behavior. Runtime conformance still requires the exact WASM in `wasm.lock.json`.
+
 ### Following a capture forward
 
 WhatsApp renames these files on every rollout, so the ids below are the capture
