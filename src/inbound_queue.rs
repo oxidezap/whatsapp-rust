@@ -25,7 +25,7 @@ struct BudgetRegistration {
 /// Unlike a runtime semaphore this also works when tokio-runtime is disabled.
 pub(crate) struct ByteBudget {
     available: AtomicUsize,
-    registration: Option<Box<BudgetRegistration>>,
+    registration: Option<BudgetRegistration>,
 }
 impl ByteBudget {
     pub(crate) fn new(bytes: usize) -> Self {
@@ -93,50 +93,8 @@ const GLOBAL_CHAT_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const ACK_QUEUE_ITEMS: usize = 256;
 const ACK_BYTES: usize = 256 * 1024;
 
-/// The lane index is empty until the first chat. Keep that cache's structural
-/// allocation out of idle clients; byte budgets remain eagerly available.
-/// Initialization is synchronous and single-flight, before any enqueue/await.
-pub(crate) struct ChatLaneCache {
-    cache: std::sync::OnceLock<
-        Box<crate::cache::Cache<wacore_binary::jid::Jid, crate::client::ChatLane>>,
-    >,
-    capacity: u64,
-}
-impl ChatLaneCache {
-    pub(crate) fn new(capacity: u64) -> Self {
-        Self {
-            cache: std::sync::OnceLock::new(),
-            capacity: capacity.max(1),
-        }
-    }
-    pub(crate) fn initialized(
-        &self,
-    ) -> Option<&crate::cache::Cache<wacore_binary::jid::Jid, crate::client::ChatLane>> {
-        self.cache.get().map(Box::as_ref)
-    }
-    pub(crate) async fn clear(&self) {
-        if let Some(cache) = self.initialized() {
-            cache.clear().await;
-        }
-    }
-}
-impl std::ops::Deref for ChatLaneCache {
-    type Target = crate::cache::Cache<wacore_binary::jid::Jid, crate::client::ChatLane>;
-    fn deref(&self) -> &Self::Target {
-        self.cache.get_or_init(|| {
-            Box::new(
-                crate::cache::Cache::builder()
-                    .max_capacity(self.capacity)
-                    .evict_guard(|lane: &crate::client::ChatLane| {
-                        Arc::strong_count(&lane.enqueue_lock) <= 1
-                    })
-                    .build(),
-            )
-        })
-    }
-}
-
 pub(crate) struct QueueBudgets {
+    pub ack_queue: std::sync::OnceLock<async_channel::Sender<QueuedAck>>,
     pub chat: Arc<ByteBudget>,
     pub ack: Arc<ByteBudget>,
     pub work: Arc<crate::flush_scope::FlushScope>,
@@ -146,6 +104,7 @@ pub(crate) struct QueueBudgets {
 impl Default for QueueBudgets {
     fn default() -> Self {
         Self {
+            ack_queue: std::sync::OnceLock::new(),
             chat: Arc::new(ByteBudget::new(GLOBAL_CHAT_BYTES)),
             ack: Arc::new(ByteBudget::new(ACK_BYTES)),
             work: Arc::default(),
@@ -166,14 +125,15 @@ impl QueueBudgets {
             .map(|chat| {
                 // The map and live budget each own the chat key. Include the budget
                 // allocation and Arc header without upgrading/dropping under this lock.
-                2 * chat.heap_bytes()
-                    + size_of::<ByteBudget>()
-                    + size_of::<BudgetRegistration>()
-                    + 2 * size_of::<usize>()
+                2 * chat.heap_bytes() + size_of::<ByteBudget>() + 2 * size_of::<usize>()
             })
             .sum::<usize>()
             + size_of::<BudgetRegistry>()
-            + 2 * size_of::<usize>();
+            + 2 * size_of::<usize>()
+            // Controller, global counters and work scope are counted once.
+            + size_of::<Self>()
+            + 2 * (size_of::<ByteBudget>() + 2 * size_of::<usize>())
+            + size_of::<crate::flush_scope::FlushScope>() + 2 * size_of::<usize>();
         (
             wacore::stats::CollectionStats::new(entries.len() as u64, registry_bytes as u64),
             GLOBAL_CHAT_BYTES.saturating_sub(self.chat.available()) as u64,
@@ -198,10 +158,10 @@ impl QueueBudgets {
         // removes this weak entry, so sequential chat churn leaves no tombstones.
         let budget = Arc::new(ByteBudget {
             available: AtomicUsize::new(bytes),
-            registration: Some(Box::new(BudgetRegistration {
+            registration: Some(BudgetRegistration {
                 registry: Arc::downgrade(&self.per_chat),
                 chat: chat.clone(),
-            })),
+            }),
         });
         entries.insert(chat.clone(), Arc::downgrade(&budget));
         budget
@@ -274,6 +234,12 @@ pub(crate) fn retain_ack(bytes: Vec<u8>, lease: ByteLease) -> bytes::Bytes {
 }
 
 impl crate::client::Client {
+    /// Reuse the original ACK queue's lazy cell for all receive-queue state.
+    /// Once created, budgets survive every connection/lane reset.
+    pub(crate) fn inbound_queues(&self) -> &QueueBudgets {
+        self.inbound_queues.get_or_init(Box::default)
+    }
+
     /// Freeze admissions, but keep reading IQ replies while accepted work drains.
     /// Disconnecting immediately could replay the same burst forever without
     /// letting even its admitted prefix become durable.
@@ -288,27 +254,22 @@ impl crate::client::Client {
                 .connection_shutdown
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            if shutdown.is_fired()
-                || self
-                    .inbound_queue_budgets
-                    .draining
-                    .swap(true, Ordering::AcqRel)
-            {
+            if shutdown.is_fired() || self.inbound_queues().draining.swap(true, Ordering::AcqRel) {
                 return;
             }
-            self.inbound_queue_budgets.work.close();
+            self.inbound_queues().work.close();
         }
         log::warn!(
             "Inbound queue overloaded; draining before reconnect (chat bytes available: {}, ACK bytes available: {})",
-            self.inbound_queue_budgets.chat.available(),
-            self.inbound_queue_budgets.ack.available()
+            self.inbound_queues().chat.available(),
+            self.inbound_queues().ack.available()
         );
         let client = Arc::clone(self);
         let shutdown = shutdown.clone();
         self.runtime.spawn_detached(Box::pin(async move {
             let grace = std::time::Duration::from_secs(5);
             client
-                .inbound_queue_budgets
+                .inbound_queues()
                 .work
                 .flush(&*client.runtime, grace)
                 .await;
@@ -380,12 +341,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reporting_and_cleanup_do_not_allocate_an_unused_lane_index() {
+    async fn reporting_and_cleanup_do_not_allocate_unused_queue_state() {
         let client = crate::test_utils::create_test_client().await;
-        assert!(client.chat_lanes.initialized().is_none());
-        assert_eq!(client.memory_report().await.chat_lanes, 0);
+        assert!(client.inbound_queues.get().is_none());
+        let report = client.memory_report().await;
+        assert_eq!(report.inbound_chat_budgets.bytes, 0);
+        assert_eq!(report.transport_ack_queue, 0);
         client.chat_lanes.clear().await;
-        assert!(client.chat_lanes.initialized().is_none());
+        assert!(client.inbound_queues.get().is_none());
     }
 
     #[test]
@@ -422,10 +385,10 @@ mod tests {
         }
         let replacement = Arc::new(ByteBudget {
             available: AtomicUsize::new(CHAT_BYTES),
-            registration: Some(Box::new(BudgetRegistration {
+            registration: Some(BudgetRegistration {
                 registry: Arc::downgrade(&registry),
                 chat: chat.clone(),
-            })),
+            }),
         });
         entries.insert(chat.clone(), Arc::downgrade(&replacement));
         drop(entries);
@@ -611,13 +574,8 @@ mod overload_tests {
         client.reset_connection_shutdown();
         assert!(old.is_fired());
         client.drain_overloaded_inbound(&old);
-        assert!(
-            !client
-                .inbound_queue_budgets
-                .draining
-                .load(Ordering::Acquire)
-        );
-        assert!(client.inbound_queue_budgets.work.try_track().is_some());
+        assert!(!client.inbound_queues().draining.load(Ordering::Acquire));
+        assert!(client.inbound_queues().work.try_track().is_some());
         assert!(client.outbound_flush.try_track().is_some());
         assert!(!client.connection_shutdown_signal().is_fired());
     }
@@ -625,20 +583,20 @@ mod overload_tests {
     #[tokio::test]
     async fn retired_overload_drain_cannot_close_fresh_outbound_admission() {
         let client = crate::test_utils::create_test_client().await;
-        let work = client.inbound_queue_budgets.work.try_track().unwrap();
+        let work = client.inbound_queues().work.try_track().unwrap();
         let old = client.connection_shutdown_signal();
         client.drain_overloaded_inbound(&old);
-        while client.inbound_queue_budgets.work.flush_waiters() == 0 {
+        while client.inbound_queues().work.flush_waiters() == 0 {
             tokio::task::yield_now().await;
         }
         client.reset_connection_shutdown();
         client.outbound_flush.reopen();
         drop(work);
-        while client.inbound_queue_budgets.work.flush_waiters() != 0 {
+        while client.inbound_queues().work.flush_waiters() != 0 {
             tokio::task::yield_now().await;
         }
         assert!(client.outbound_flush.try_track().is_some());
-        assert!(client.inbound_queue_budgets.work.try_track().is_some());
+        assert!(client.inbound_queues().work.try_track().is_some());
         assert!(!client.connection_shutdown_signal().is_fired());
     }
 
@@ -661,9 +619,7 @@ mod overload_tests {
     async fn escaped_chat_bytes_keep_the_same_budget_across_connection_cache_clear() {
         let client = crate::test_utils::create_test_client().await;
         let chat: wacore_binary::jid::Jid = "120363000000042@g.us".parse().unwrap();
-        let budget = client
-            .inbound_queue_budgets
-            .chat_budget_with_limit(&chat, 1024);
+        let budget = client.inbound_queues().chat_budget_with_limit(&chat, 1024);
         let weak = Arc::downgrade(&budget);
         let (queue_tx, rx) = async_channel::bounded(1);
         let rx = DrainingReceiver(rx);
@@ -673,8 +629,8 @@ mod overload_tests {
             enqueue_lock: Arc::default(),
             worker_running: Arc::default(),
             byte_budget: budget,
-            global_budget: Arc::clone(&client.inbound_queue_budgets.chat),
-            work: Arc::clone(&client.inbound_queue_budgets.work),
+            global_budget: Arc::clone(&client.inbound_queues().chat),
+            work: Arc::clone(&client.inbound_queues().work),
         };
         let message = || {
             crate::test_utils::node_to_owned_ref(
@@ -695,7 +651,7 @@ mod overload_tests {
         drop(rx);
         client.notify_connection_shutdown();
         client.chat_lanes.clear().await; // the exact cleanup operation bypassing evict_guard
-        let ack_lease = reserve(&client.inbound_queue_budgets.ack, 4).unwrap();
+        let ack_lease = reserve(&client.inbound_queues().ack, 4).unwrap();
         let report = client.memory_report().await;
         assert_eq!(report.chat_lane_backlog, 0);
         assert_eq!(report.inbound_chat_budgets.entries, 1);
@@ -746,10 +702,10 @@ mod overload_tests {
     #[tokio::test(start_paused = true)]
     async fn overload_keeps_iq_routing_alive_until_accepted_work_finishes() {
         let client = crate::test_utils::create_test_client().await;
-        let work = client.inbound_queue_budgets.work.try_track().unwrap();
+        let work = client.inbound_queues().work.try_track().unwrap();
         client.drain_overloaded_inbound(&client.connection_shutdown_signal());
         client.drain_overloaded_inbound(&client.connection_shutdown_signal()); // one drain per connection
-        assert!(client.inbound_queue_budgets.work.try_track().is_none());
+        assert!(client.inbound_queues().work.try_track().is_none());
         assert!(!client.connection_shutdown_signal().is_fired());
         let (tx, rx) = futures::channel::oneshot::channel();
         client
@@ -771,24 +727,19 @@ mod overload_tests {
         // Wait on the real signal rather than assume a number of scheduler yields.
         wacore::runtime::wait_for_shutdown(&client.connection_shutdown_signal()).await;
         client.reset_connection_shutdown();
-        assert!(client.inbound_queue_budgets.work.try_track().is_some());
-        assert!(
-            !client
-                .inbound_queue_budgets
-                .draining
-                .load(Ordering::Acquire)
-        );
+        assert!(client.inbound_queues().work.try_track().is_some());
+        assert!(!client.inbound_queues().draining.load(Ordering::Acquire));
     }
 
     #[tokio::test(start_paused = true)]
     async fn stalled_work_cannot_hold_the_overload_drain_open_forever() {
         let client = crate::test_utils::create_test_client().await;
-        let work = client.inbound_queue_budgets.work.try_track().unwrap();
+        let work = client.inbound_queues().work.try_track().unwrap();
         client.drain_overloaded_inbound(&client.connection_shutdown_signal());
         wacore::runtime::wait_for_shutdown(&client.connection_shutdown_signal()).await;
-        assert_eq!(client.inbound_queue_budgets.work.pending(), 1);
+        assert_eq!(client.inbound_queues().work.pending(), 1);
         drop(work);
-        assert_eq!(client.inbound_queue_budgets.work.pending(), 0);
+        assert_eq!(client.inbound_queues().work.pending(), 0);
     }
 
     #[tokio::test]
@@ -801,8 +752,8 @@ mod overload_tests {
             enqueue_lock: Arc::default(),
             worker_running: Arc::default(),
             byte_budget: Arc::new(ByteBudget::new(CHAT_BYTES)),
-            global_budget: Arc::clone(&client.inbound_queue_budgets.chat),
-            work: Arc::clone(&client.inbound_queue_budgets.work),
+            global_budget: Arc::clone(&client.inbound_queues().chat),
+            work: Arc::clone(&client.inbound_queues().work),
         };
         let lock = Arc::clone(&lane.enqueue_lock);
         let guard = lock.lock().await;
@@ -845,8 +796,8 @@ mod overload_tests {
             enqueue_lock: Arc::default(),
             worker_running: Arc::default(),
             byte_budget: Arc::new(ByteBudget::new(CHAT_BYTES)),
-            global_budget: Arc::clone(&client.inbound_queue_budgets.chat),
-            work: Arc::clone(&client.inbound_queue_budgets.work),
+            global_budget: Arc::clone(&client.inbound_queues().chat),
+            work: Arc::clone(&client.inbound_queues().work),
         };
         let node = || {
             crate::test_utils::node_to_owned_ref(
@@ -866,12 +817,7 @@ mod overload_tests {
         )
         .await;
         assert!(cancelled);
-        assert!(
-            client
-                .inbound_queue_budgets
-                .draining
-                .load(Ordering::Acquire)
-        );
+        assert!(client.inbound_queues().draining.load(Ordering::Acquire));
         assert!(!client.connection_shutdown_signal().is_fired());
         let other = crate::test_utils::node_to_owned_ref(
             &NodeBuilder::new("message")

@@ -315,8 +315,8 @@ impl Client {
             .unwrap_or_else(|p| p.into_inner());
         connection.notify();
         *connection = wacore::runtime::ShutdownNotifier::new();
-        self.inbound_queue_budgets.work.reopen();
-        self.inbound_queue_budgets
+        self.inbound_queues().work.reopen();
+        self.inbound_queues()
             .draining
             .store(false, Ordering::Release);
     }
@@ -626,8 +626,10 @@ impl Client {
                 .build(),
             ensure_inflight: Arc::default(),
             group_metadata_inflight: Arc::default(),
-            inbound_queue_budgets: Default::default(),
-            chat_lanes: crate::inbound_queue::ChatLaneCache::new(cache_config.chat_lanes_capacity),
+            chat_lanes: Cache::builder()
+                .max_capacity(cache_config.chat_lanes_capacity.max(1))
+                .evict_guard(|lane: &ChatLane| Arc::strong_count(&lane.enqueue_lock) <= 1)
+                .build(),
             lid_pn_cache: Arc::new(LidPnCache::with_config(
                 &cache_config.lid_pn_cache,
                 cache_config.cache_stores.lid_pn_cache.clone(),
@@ -718,7 +720,7 @@ impl Client {
             history_sync_activity: Arc::new(crate::sync_task::HistorySyncActivity::new()),
             outbound_flush: Arc::new(crate::flush_scope::FlushScope::new()),
             delivery_receipt_queue: std::sync::OnceLock::new(),
-            transport_ack_queue: std::sync::OnceLock::new(),
+            inbound_queues: std::sync::OnceLock::new(),
             presence_subscriptions: Arc::new(std::sync::Mutex::new(HashSet::new())),
             socket_ready_notifier: event_listener::Event::new(),
             is_ready: AtomicBool::new(false),

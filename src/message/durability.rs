@@ -630,7 +630,11 @@ mod tests {
         }
         assert!(client.delivery_receipt_queue.get().is_none());
         assert!(
-            client.transport_ack_queue.get().is_none(),
+            client
+                .inbound_queues
+                .get()
+                .and_then(|q| q.ack_queue.get())
+                .is_none(),
             "a successful subset hook must not acknowledge the retained group"
         );
         let backend = client.persistence_manager.backend();
@@ -644,7 +648,11 @@ mod tests {
         assert!(client.ack_or_replay_to_hook(&info).await);
         assert!(
             client.delivery_receipt_queue.get().is_some()
-                || client.transport_ack_queue.get().is_some(),
+                || client
+                    .inbound_queues
+                    .get()
+                    .and_then(|q| q.ack_queue.get())
+                    .is_some(),
             "only the complete replay may schedule the stanza acknowledgement"
         );
         assert!(

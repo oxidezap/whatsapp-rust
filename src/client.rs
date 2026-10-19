@@ -665,7 +665,8 @@ pub struct MemoryReport {
     /// Groups with a metadata query in flight; normally zero.
     pub group_metadata_inflight: u64,
     pub chat_lanes: u64,
-    /// Live per-chat byte budgets, including backing slices surviving lane eviction.
+    /// Live per-chat budgets, including backing slices surviving lane eviction.
+    /// Bytes include the shared queue controller and budget/registry overhead.
     pub inbound_chat_budgets: CollectionStats,
     /// Charged backing storage, including in-flight nodes and escaped slices.
     /// Conservatively charges at least 1 KiB per owner; excludes decoded trees.
@@ -1872,8 +1873,7 @@ pub struct Client {
 
     /// Per-chat lane combining enqueue lock + message queue into a single cached entry.
     /// One cache lookup instead of two per incoming message.
-    pub(crate) chat_lanes: crate::inbound_queue::ChatLaneCache,
-    pub(crate) inbound_queue_budgets: crate::inbound_queue::QueueBudgets,
+    pub(crate) chat_lanes: Cache<Jid, ChatLane>,
     pub(crate) pending_call_offers: crate::handlers::call::pending_offers::PendingOffers,
 
     /// Cache for LID to Phone Number mappings (bidirectional).
@@ -2100,12 +2100,11 @@ pub struct Client {
             crate::flush_scope::FlushGuard,
         )>,
     >,
-    /// Feed of the persistent transport-ack worker, mirroring
+    /// Lazy receive-queue controller and persistent transport-ack feed, mirroring
     /// [`Self::delivery_receipt_queue`]. Deferred acks used to be one spawned
     /// task each; the queue also gives them FIFO order, which the spawns did
     /// not guarantee.
-    pub(crate) transport_ack_queue:
-        std::sync::OnceLock<async_channel::Sender<crate::inbound_queue::QueuedAck>>,
+    pub(crate) inbound_queues: std::sync::OnceLock<Box<crate::inbound_queue::QueueBudgets>>,
     /// Contacts with active presence subscriptions that must be re-subscribed on reconnect.
     pub(crate) presence_subscriptions: Arc<std::sync::Mutex<HashSet<Jid>>>,
     /// Metrics for granular offline sync logging

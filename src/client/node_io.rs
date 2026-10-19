@@ -993,14 +993,15 @@ impl Client {
             }
         };
         let Some(lease) =
-            crate::inbound_queue::reserve(&self.inbound_queue_budgets.ack, bytes.capacity())
+            crate::inbound_queue::reserve(&self.inbound_queues().ack, bytes.capacity())
         else {
             warn!("Transport ACK byte budget exhausted; recycling connection");
             self.drain_overloaded_inbound(shutdown);
             return;
         };
         let tx = self
-            .transport_ack_queue
+            .inbound_queues()
+            .ack_queue
             .get_or_init(|| self.start_transport_ack_worker());
         if tx
             .try_send(crate::inbound_queue::QueuedAck {
@@ -2576,7 +2577,7 @@ mod tests {
         use wacore_binary::builder::NodeBuilder;
         let (client, _transport) = create_iq_test_client().await;
         let (tx, rx) = async_channel::bounded(1);
-        assert!(client.transport_ack_queue.set(tx).is_ok());
+        assert!(client.inbound_queues().ack_queue.set(tx).is_ok());
         let old = client.connection_shutdown_signal();
         client.reset_connection_shutdown();
         let receipt = node_to_owned_ref(
@@ -2587,14 +2588,9 @@ mod tests {
         );
         client.maybe_deferred_ack(receipt, &old).await;
         assert!(rx.is_empty());
-        assert!(
-            !client
-                .inbound_queue_budgets
-                .draining
-                .load(Ordering::Acquire)
-        );
+        assert!(!client.inbound_queues().draining.load(Ordering::Acquire));
         assert!(client.outbound_flush.try_track().is_some());
-        assert_eq!(client.inbound_queue_budgets.ack.available(), 256 * 1024);
+        assert_eq!(client.inbound_queues().ack.available(), 256 * 1024);
     }
 
     #[tokio::test]
@@ -2631,7 +2627,7 @@ mod tests {
         use wacore_binary::builder::NodeBuilder;
         let (client, _transport) = create_iq_test_client().await;
         let (tx, rx) = async_channel::bounded(1);
-        assert!(client.transport_ack_queue.set(tx).is_ok());
+        assert!(client.inbound_queues().ack_queue.set(tx).is_ok());
         let receipt = || {
             node_to_owned_ref(
                 &NodeBuilder::new("receipt")
@@ -2654,12 +2650,7 @@ mod tests {
         client
             .maybe_deferred_ack(receipt(), &client.connection_shutdown_signal())
             .await;
-        assert!(
-            client
-                .inbound_queue_budgets
-                .draining
-                .load(Ordering::Acquire)
-        );
+        assert!(client.inbound_queues().draining.load(Ordering::Acquire));
         assert_eq!(rx.len(), 1);
         let ack = rx.try_recv().unwrap();
         assert!(ack.bytes.len() < 256);
@@ -2668,7 +2659,7 @@ mod tests {
         assert_eq!(ack_node.tag(), "ack");
         assert!(ack_node.content_bytes().is_none());
         drop(ack);
-        assert_eq!(client.inbound_queue_budgets.ack.available(), 256 * 1024);
+        assert_eq!(client.inbound_queues().ack.available(), 256 * 1024);
     }
 
     #[tokio::test(start_paused = true)]

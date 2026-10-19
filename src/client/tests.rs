@@ -3803,9 +3803,6 @@ fn client_size_pins_runtime_cache_config_saving() {
         expected += size_of::<Arc<bench_startup::StartupTasks>>();
     }
     expected += size_of::<AppStateDownloads>();
-    expected += size_of::<crate::inbound_queue::QueueBudgets>();
-    expected = expected - size_of::<Cache<Jid, ChatLane>>()
-        + size_of::<crate::inbound_queue::ChatLaneCache>();
     expected += size_of::<std::sync::OnceLock<Arc<dyn crate::HistorySyncCaptureHook>>>();
     // Independent group capture adds one immutable hook cell; keep the fixed base.
     expected += size_of::<std::sync::OnceLock<Arc<dyn crate::GroupNotificationDurabilityHook>>>();
@@ -5548,8 +5545,8 @@ async fn memory_report_sums_chat_lane_backlog() {
         byte_budget: Arc::new(crate::inbound_queue::ByteBudget::new(
             crate::inbound_queue::CHAT_BYTES,
         )),
-        global_budget: Arc::clone(&client.inbound_queue_budgets.chat),
-        work: Arc::clone(&client.inbound_queue_budgets.work),
+        global_budget: Arc::clone(&client.inbound_queues().chat),
+        work: Arc::clone(&client.inbound_queues().work),
         worker_running: Arc::new(Mutex::new(())),
     };
     client.chat_lanes.insert(chat.clone(), lane.clone()).await;

@@ -59,7 +59,7 @@ impl MessageHandler {
         if shutdown.is_fired()
             || scope.is_some_and(|scope| !scope.is_current(&client))
             || client
-                .inbound_queue_budgets
+                .inbound_queues()
                 .draining
                 .load(std::sync::atomic::Ordering::Acquire)
         {
@@ -81,7 +81,7 @@ impl MessageHandler {
         let lane = client
             .chat_lanes
             .get_with_by_ref(&chat_jid, async {
-                let budget = client.inbound_queue_budgets.chat_budget(&chat_jid);
+                let budget = client.inbound_queues().chat_budget(&chat_jid);
                 create_chat_lane(
                     &client,
                     Arc::new(async_lock::Mutex::new(())),
@@ -278,8 +278,8 @@ fn create_chat_lane(
         enqueue_lock,
         queue_tx: tx,
         byte_budget,
-        global_budget: Arc::clone(&client.inbound_queue_budgets.chat),
-        work: Arc::clone(&client.inbound_queue_budgets.work),
+        global_budget: Arc::clone(&client.inbound_queues().chat),
+        work: Arc::clone(&client.inbound_queues().work),
         worker_running,
     }
 }
@@ -416,7 +416,7 @@ mod tests {
         assert_eq!(lane.queue_tx.capacity(), Some(64));
         assert_eq!(accepted, 64);
         assert_eq!(lane.queue_tx.len(), 64);
-        let retained = 32 * 1024 * 1024 - client.inbound_queue_budgets.chat.available();
+        let retained = 32 * 1024 * 1024 - client.inbound_queues().chat.available();
         assert!((4 * 1024 * 1024..5 * 1024 * 1024).contains(&retained));
         eprintln!("production lane: {accepted}/128 accepted, {retained} charged bytes");
         lane.queue_tx.close();
