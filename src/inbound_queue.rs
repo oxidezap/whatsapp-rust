@@ -647,6 +647,14 @@ mod overload_tests {
         assert!(report.inbound_chat_budgets.bytes > 0);
         assert_eq!(report.inbound_chat_charged_bytes, 1024);
         assert_eq!(report.inbound_ack_charged_bytes, 1024);
+        let registry_line = report
+            .to_string()
+            .lines()
+            .find(|line| line.contains("inbound_chat_budgets:"))
+            .expect("the retained registry must be attributable in logged reports")
+            .to_owned();
+        assert!(registry_line.contains("1 entries"));
+        assert!(registry_line.contains(&format!("{} B", report.inbound_chat_budgets.bytes)));
         let total = report.total_estimated_bytes();
         let mut without_queues = report;
         without_queues.inbound_chat_budgets.bytes = 0;

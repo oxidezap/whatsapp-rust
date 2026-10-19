@@ -994,6 +994,7 @@ impl std::fmt::Display for MemoryReport {
         )?;
         writeln!(f, "  skdm_warm_memo:         {}", self.skdm_warm_memo)?;
         writeln!(f, "--- Byte-bounded receive queues ---")?;
+        line(f, "inbound_chat_budgets:", &self.inbound_chat_budgets)?;
         writeln!(
             f,
             "  inbound_chat_bytes:     {}",
