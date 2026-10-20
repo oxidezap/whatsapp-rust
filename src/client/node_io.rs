@@ -992,17 +992,33 @@ impl Client {
                 return;
             }
         };
-        let Some(lease) =
-            crate::inbound_queue::reserve(&self.inbound_queues().ack, bytes.capacity())
-        else {
-            warn!("Transport ACK byte budget exhausted; recycling connection");
-            self.drain_overloaded_inbound(shutdown);
-            return;
-        };
+        drop(node);
         let tx = self
             .inbound_queues()
             .ack_queue
             .get_or_init(|| self.start_transport_ack_worker());
+        let mut lease = crate::inbound_queue::reserve(&self.inbound_queues().ack, bytes.capacity());
+        for _ in 0..crate::inbound_queue::SATURATION_RETRY_TURNS {
+            if lease.is_some() && !tx.is_full() {
+                break;
+            }
+            // Release a tentative reservation before letting the ready worker
+            // drain. Waiting for capacity instead could starve IQ replies.
+            drop(lease.take());
+            crate::inbound_queue::yield_for_capacity(&*self.runtime).await;
+            if shutdown.is_fired() || self.outbound_teardown_in_progress() {
+                return;
+            }
+            lease = crate::inbound_queue::reserve(&self.inbound_queues().ack, bytes.capacity());
+        }
+        if shutdown.is_fired() || self.outbound_teardown_in_progress() {
+            return;
+        }
+        let Some(lease) = lease else {
+            warn!("Transport ACK byte budget exhausted; recycling connection");
+            self.drain_overloaded_inbound(shutdown);
+            return;
+        };
         if tx
             .try_send(crate::inbound_queue::QueuedAck {
                 bytes: crate::inbound_queue::retain_ack(bytes, lease),
@@ -2571,6 +2587,97 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn an_ack_capacity_retry_releases_its_source_and_keeps_its_original_scope() {
+        use crate::test_utils::{create_iq_test_client, node_to_owned_ref};
+        use wacore_binary::builder::NodeBuilder;
+        let (client, _transport) = create_iq_test_client().await;
+        let (tx, rx) = async_channel::bounded(1);
+        assert!(client.inbound_queues().ack_queue.set(tx).is_ok());
+        let receipt = || {
+            node_to_owned_ref(
+                &NodeBuilder::new("receipt")
+                    .attr("from", "120363000000042@g.us")
+                    .attr("id", "retry")
+                    .bytes(vec![42; 128 * 1024])
+                    .build(),
+            )
+        };
+        let shutdown = client.connection_shutdown_signal();
+        client.maybe_deferred_ack(receipt(), &shutdown).await;
+        let node = receipt();
+        let weak = Arc::downgrade(&node);
+        let mut retry = Box::pin(client.maybe_deferred_ack(node, &shutdown));
+        assert!(futures::poll!(&mut retry).is_pending());
+        assert!(
+            weak.upgrade().is_none(),
+            "a capacity yield must not retain the payload"
+        );
+        client.reset_connection_shutdown();
+        drop(rx.try_recv().unwrap());
+        retry.await;
+        assert!(rx.is_empty());
+        assert_eq!(client.inbound_queues().ack.available(), 256 * 1024);
+        assert!(!client.inbound_queues().draining.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn a_ready_ack_worker_can_drain_a_non_yielding_offline_burst() {
+        ready_ack_backlog(false).await;
+    }
+
+    #[tokio::test]
+    async fn reader_scheduled_ack_batches_progress_without_reconnecting() {
+        ready_ack_backlog(true).await;
+    }
+
+    async fn ready_ack_backlog(reader_yields: bool) {
+        use crate::test_utils::{create_iq_test_client, node_to_owned_ref};
+        use wacore_binary::builder::NodeBuilder;
+        let (client, transport) = create_iq_test_client().await;
+        let shutdown = client.connection_shutdown_signal();
+        let count = if reader_yields { 600 } else { 512 };
+        for id in 0..count {
+            let receipt = node_to_owned_ref(
+                &NodeBuilder::new("receipt")
+                    .attr("from", "120363000000042@g.us")
+                    .attr("id", id.to_string())
+                    .build(),
+            );
+            client.maybe_deferred_ack(receipt, &shutdown).await;
+            assert!(
+                !client.inbound_queues().draining.load(Ordering::Acquire),
+                "healthy burst overloaded at {id}"
+            );
+            if reader_yields
+                && ((id + 1) as u32).is_multiple_of(client.runtime.yield_frequency())
+                && let Some(turn) = client.runtime.yield_now()
+            {
+                turn.await;
+            }
+        }
+        client
+            .outbound_flush
+            .flush(&*client.runtime, Duration::from_secs(5))
+            .await;
+        let frames = transport.sent();
+        assert_eq!(frames.len(), count);
+        for (id, plaintext) in crate::test_utils::decrypt_wire_frames(&frames, &[0; 32])
+            .into_iter()
+            .enumerate()
+        {
+            let unpacked = wacore_binary::util::unpack(&plaintext).unwrap();
+            let ack = wacore_binary::OwnedNodeRef::new(unpacked.into_owned()).unwrap();
+            assert_eq!(ack.tag(), "ack");
+            assert_eq!(
+                ack.attrs().optional_string("id").as_deref(),
+                Some(id.to_string().as_str())
+            );
+        }
+        assert!(!shutdown.is_fired());
+        assert_eq!(client.inbound_queues().ack.available(), 256 * 1024);
+    }
+
     #[tokio::test]
     async fn deferred_ack_admission_rejects_the_dispatchers_retired_scope() {
         use crate::test_utils::{create_iq_test_client, node_to_owned_ref};

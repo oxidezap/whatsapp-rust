@@ -114,13 +114,10 @@ impl MessageHandler {
             lane.queue_tx.close();
         }
 
-        let node = match lane.try_enqueue_scoped(
-            node,
-            scope.map_or_else(
-                wacore::runtime::ShutdownSignal::never,
-                NotificationScope::shutdown,
-            ),
-        ) {
+        let node = match lane
+            .enqueue_scoped(node, shutdown.clone(), &*client.runtime)
+            .await
+        {
             Ok(()) => return true,
             // The worker went idle and closed its queue (see
             // `LANE_IDLE_TIMEOUT`). Replace the lane; the successor worker
@@ -166,13 +163,10 @@ impl MessageHandler {
             *cancelled = true;
             return true;
         }
-        if let Err(e) = fresh.try_enqueue_scoped(
-            node,
-            scope.map_or_else(
-                wacore::runtime::ShutdownSignal::never,
-                NotificationScope::shutdown,
-            ),
-        ) {
+        if let Err(e) = fresh
+            .enqueue_scoped(node, shutdown.clone(), &*client.runtime)
+            .await
+        {
             warn!("Failed to enqueue message for processing: {e}");
             *cancelled = true;
             client.drain_overloaded_inbound(&shutdown);

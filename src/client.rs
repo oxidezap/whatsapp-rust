@@ -487,6 +487,33 @@ pub(crate) struct ChatLane {
 }
 
 impl ChatLane {
+    /// A full queue may only mean its ready worker has not had a turn yet.
+    /// Give it bounded turns; never wait for capacity on the IQ-serving reader.
+    pub(crate) async fn enqueue_scoped(
+        &self,
+        mut node: Arc<wacore_binary::OwnedNodeRef>,
+        mut shutdown: wacore::runtime::ShutdownSignal,
+        runtime: &dyn Runtime,
+    ) -> Result<(), async_channel::TrySendError<QueuedChatMessage>> {
+        let mut turns = crate::inbound_queue::SATURATION_RETRY_TURNS;
+        loop {
+            let queued = match self.try_enqueue_scoped(node, shutdown) {
+                Err(async_channel::TrySendError::Full(queued)) => queued,
+                result => return result,
+            };
+            if turns == 0 || queued.shutdown.is_fired() {
+                return Err(async_channel::TrySendError::Full(queued));
+            }
+            crate::inbound_queue::yield_for_capacity(runtime).await;
+            if queued.shutdown.is_fired() {
+                return Err(async_channel::TrySendError::Full(queued));
+            }
+            turns -= 1;
+            node = queued.node;
+            shutdown = queued.shutdown;
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn try_enqueue(
         &self,

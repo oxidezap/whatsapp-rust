@@ -92,6 +92,28 @@ pub(crate) const CHAT_BYTES: usize = 16 * 1024 * 1024;
 const GLOBAL_CHAT_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const ACK_QUEUE_ITEMS: usize = 256;
 const ACK_BYTES: usize = 256 * 1024;
+// Allow the worker, socket sender and completion wakeups to run. This is a
+// fixed scheduling allowance, never a wait for capacity or a processing result.
+pub(crate) const SATURATION_RETRY_TURNS: usize = 4;
+
+/// Some runtimes omit periodic reader yields. Saturation still needs an actual
+/// scheduling point before retrying, without waiting for the worker to finish.
+pub(crate) async fn yield_for_capacity(runtime: &dyn wacore::runtime::Runtime) {
+    if let Some(turn) = runtime.yield_now() {
+        turn.await;
+    } else {
+        let mut yielded = false;
+        futures::future::poll_fn(|cx| {
+            if std::mem::replace(&mut yielded, true) {
+                std::task::Poll::Ready(())
+            } else {
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+    }
+}
 
 pub(crate) struct QueueBudgets {
     pub ack_queue: std::sync::OnceLock<async_channel::Sender<QueuedAck>>,
@@ -341,6 +363,73 @@ mod tests {
                 .bytes(vec![id as u8; bytes])
                 .build(),
         )
+    }
+
+    #[tokio::test]
+    async fn an_offline_batch_can_handoff_a_full_lane_to_its_ready_worker() {
+        ready_chat_backlog(false).await;
+    }
+
+    #[tokio::test]
+    async fn reader_scheduled_offline_batches_progress_without_reconnecting() {
+        ready_chat_backlog(true).await;
+    }
+
+    async fn ready_chat_backlog(reader_yields: bool) {
+        let client = crate::test_utils::create_test_client().await;
+        let (lane, rx) = lane(&client.inbound_queues().chat, CHAT_BYTES, CHAT_QUEUE_ITEMS);
+        let budget = Arc::clone(&lane.byte_budget);
+        client
+            .chat_lanes
+            .insert("120363000000042@g.us".parse().unwrap(), lane)
+            .await;
+        let worker = tokio::spawn(async move {
+            for id in 0..600 {
+                let queued = rx.recv().await.unwrap();
+                assert_eq!(
+                    queued.node.attrs().optional_string("id").as_deref(),
+                    Some(id.to_string().as_str())
+                );
+            }
+        });
+        // Three 200-stanza batches. The adversarial case omits the real reader's
+        // periodic yields; neither case may recycle a connection with ready work.
+        for id in 0..600 {
+            let mut cancelled = false;
+            crate::handlers::message::MessageHandler::handle_inline(
+                Arc::clone(&client),
+                node(id, 0),
+                &mut cancelled,
+            )
+            .await;
+            assert!(!cancelled, "healthy batch cancelled at {id}");
+            if reader_yields
+                && ((id + 1) as u32).is_multiple_of(client.runtime.yield_frequency())
+                && let Some(turn) = client.runtime.yield_now()
+            {
+                turn.await;
+            }
+        }
+        worker.await.unwrap();
+        assert!(!client.inbound_queues().draining.load(Ordering::Acquire));
+        assert!(!client.connection_shutdown_signal().is_fired());
+        assert_eq!(budget.available(), CHAT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn a_lane_capacity_retry_cannot_admit_work_after_reconnect() {
+        let client = crate::test_utils::create_test_client().await;
+        let (lane, rx) = lane(&client.inbound_queues().chat, CHAT_BYTES, 1);
+        lane.try_enqueue(node(0, 0)).unwrap();
+        let shutdown = client.connection_shutdown_signal();
+        let mut retry = Box::pin(lane.enqueue_scoped(node(1, 0), shutdown, &*client.runtime));
+        assert!(futures::poll!(&mut retry).is_pending());
+        client.reset_connection_shutdown();
+        drop(rx.try_recv().unwrap());
+        assert!(retry.await.is_err());
+        assert!(rx.is_empty());
+        assert_eq!(lane.byte_budget.available(), CHAT_BYTES);
+        assert!(!client.inbound_queues().draining.load(Ordering::Acquire));
     }
 
     #[tokio::test]

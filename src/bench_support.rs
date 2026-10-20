@@ -1124,15 +1124,19 @@ impl ReceiveHarness {
     }
 
     /// Run a whole batch of stanzas under one `block_on`, as an offline drain
-    /// does: the read loop hands the queue over without yielding to anything
-    /// else between items, so the per-item cost includes whatever the ack
-    /// worker gets to do in the gaps.
+    /// does, including the reader's runtime-defined cooperative yields so lane
+    /// and ACK workers get the same scheduling opportunities as production.
     pub fn process_burst(&self, nodes: &[Arc<wacore_binary::OwnedNodeRef>]) {
         self.runtime.block_on(async {
-            for node in nodes {
+            for (index, node) in nodes.iter().enumerate() {
                 Arc::clone(&self.client)
                     .process_node(Arc::clone(node))
                     .await;
+                if ((index + 1) as u32).is_multiple_of(self.client.runtime.yield_frequency())
+                    && let Some(turn) = self.client.runtime.yield_now()
+                {
+                    turn.await;
+                }
             }
         });
     }
