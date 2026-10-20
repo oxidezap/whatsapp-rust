@@ -296,7 +296,7 @@ embind signature:
   *version*, which is how they were identified.
 - **The stanza encoding.** WhatsApp Web's bridge calls
   `handleIncomingSignalingOffer(serializeVoipWapNode(node), ...)`, and that
-  helper is `base64(encodeStanza(node))` with the transport flag byte dropped.
+  helper is `base64(encodeStanza(node))`, including the transport flag byte.
   Dropping it makes the engine's reader fail at the first token
   (`invalid list size`); keeping it parses cleanly. Only the real implementation
   could settle that one-byte question.

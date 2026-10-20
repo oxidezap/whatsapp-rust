@@ -2,9 +2,9 @@ name: VoIP conformance
 
 on:
   push:
-    paths: ['wacore/src/voip/mlow/**', 'scripts/mlow-vectors/**', 'tools/oracle-*/**', 'tools/xtask*/**', 'Cargo.toml', 'Cargo.lock', '.cargo/config.toml', '.github/workflows/mlow-derive.yml']
+    paths: ['wacore/src/voip/mlow/**', 'scripts/mlow-vectors/**', 'tools/oracle-*/**', 'tools/xtask*/**', 'Cargo.toml', 'Cargo.lock', '.cargo/config.toml', '.config/nextest.toml', '.github/workflows/mlow-derive.yml']
   pull_request:
-    paths: ['wacore/src/voip/mlow/**', 'scripts/mlow-vectors/**', 'tools/oracle-*/**', 'tools/xtask*/**', 'Cargo.toml', 'Cargo.lock', '.cargo/config.toml', '.github/workflows/mlow-derive.yml']
+    paths: ['wacore/src/voip/mlow/**', 'scripts/mlow-vectors/**', 'tools/oracle-*/**', 'tools/xtask*/**', 'Cargo.toml', 'Cargo.lock', '.cargo/config.toml', '.config/nextest.toml', '.github/workflows/mlow-derive.yml']
   workflow_dispatch:
   schedule:
     - cron: '19 6 * * 1'
