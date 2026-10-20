@@ -78,18 +78,25 @@ fn video_offer_matches_the_vendor_engine() -> Result<()> {
     // The signaling callback precedes delivery of the last call event. Wait
     // for that event before comparing exact stub counters.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-    while runtime
-        .stubs_called()
-        .iter()
-        .find(|(name, _)| name == "env::on_call_event_js_sync")
-        .map_or(0, |(_, count)| *count)
-        < 3
-    {
-        runtime.try_process_queued_calls()?;
-        anyhow::ensure!(
-            std::time::Instant::now() < deadline,
-            "oracle Infrastructure: final call event deadline expired"
-        );
+    let call_events = |runtime: &Runtime| {
+        runtime
+            .stubs_called()
+            .iter()
+            .find(|(name, _)| name == "env::on_call_event_js_sync")
+            .map_or(0, |(_, count)| *count)
+    };
+    while call_events(&runtime) < 3 {
+        if let Err(error) = runtime.try_process_queued_calls() {
+            common::evidence::record(&runtime);
+            return Err(error);
+        }
+        if std::time::Instant::now() >= deadline {
+            common::evidence::record(&runtime);
+            anyhow::bail!(
+                "oracle Infrastructure: final call event deadline expired after {} call events",
+                call_events(&runtime)
+            );
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     common::evidence::record(&runtime);

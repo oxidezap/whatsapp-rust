@@ -1009,7 +1009,8 @@ impl Runtime {
     }
 
     /// Wait for idle while propagating failures to drain queued guest work.
-    /// A timeout returns `Ok(false)`; a guest trap returns an error.
+    /// A timeout or unobservable queue state returns `Ok(false)`; a guest trap
+    /// returns an error. An exported drainer does not expose queue emptiness.
     pub fn try_settle(&mut self, timeout: std::time::Duration) -> Result<bool> {
         /// Short enough that a reply is not left sitting, long enough that
         /// draining does not dominate the run.
@@ -1023,12 +1024,12 @@ impl Runtime {
                 return Ok(false);
             }
             if self.quiesce(TICK.min(remaining)) {
-                // One last drain: a thread that finished during the wait may
-                // have queued its reply on the way out, and running that
-                // reply may have started a new worker. Recheck quiescence
-                // rather than returning idle with a worker running; the
-                // deadline above still bounds a guest that keeps spawning.
-                self.try_process_queued_calls()?;
+                // A worker started by this drain can queue a reply and exit
+                // before the idle check. Without an observable queue-empty
+                // condition, even zero live workers cannot confirm settling.
+                if self.try_process_queued_calls()? {
+                    return Ok(false);
+                }
                 if self.quiesce(std::time::Duration::ZERO) {
                     return Ok(true);
                 }
@@ -1502,8 +1503,18 @@ mod diagnostic_tests {
     }
 
     #[test]
-    fn an_idle_mailbox_can_settle() {
+    fn an_idle_mailbox_cannot_confirm_queue_emptiness() {
         let mut runtime = Runtime::instantiate(&mailbox_module(false)).unwrap();
+        assert!(
+            !runtime
+                .try_settle(std::time::Duration::from_millis(100))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_module_without_proxying_can_settle() {
+        let mut runtime = Runtime::instantiate(&wasm_encoder::Module::new().finish()).unwrap();
         assert!(
             runtime
                 .try_settle(std::time::Duration::from_millis(100))

@@ -876,6 +876,15 @@ fn a_native_offer_without_a_call_id_is_rejected() {
     let lines = deliver(&mut runtime, serialize(&missing, true));
     assert!(lines.iter().any(|line| line.contains("empty call-id") || line.contains("conversion_result FAILED")),
         "the native bridge must reject the missing call-id: {lines:?}");
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("init_local_state begins")),
+        "an offer without a call-id initialized call state: {lines:?}"
+    );
+    let info = common::evidence::call(&mut runtime, "getCallInfo", &[]).expect("call state query");
+    runtime.refuel();
+    assert_eq!(info.as_str(), Some(""), "an anonymous call was retained");
 }
 
 /// A parsed offer without relays reaches the call stack, then fails with
