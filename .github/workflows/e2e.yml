@@ -30,8 +30,15 @@ env:
 jobs:
   e2e:
     name: E2E Tests
-    # Fork PRs get no secrets, so they can't pull the private mock-server image.
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    # Forks and Dependabot cannot use the Actions secret for the private image.
+    # Check the PR author too, so a human-triggered update cannot opt a
+    # Dependabot PR into this credentialed job. Re-runs retain github.actor.
+    # Keep this at job level: service credentials are validated before steps.
+    if: >-
+      ${{ github.actor != 'dependabot[bot]' &&
+          (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository &&
+            github.event.pull_request.user.login != 'dependabot[bot]')) }}
     runs-on: ubuntu-latest
     services:
       mock-server:
