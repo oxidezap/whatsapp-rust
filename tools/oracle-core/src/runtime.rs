@@ -671,7 +671,7 @@ impl Runtime {
         let _turn = shared.scheduler.turn(0);
         let outcome = func
             .call(&mut self.store, args, results)
-            .map_err(|error| anyhow!("{error}"));
+            .map_err(|error| anyhow!("{error:#}"));
         // Same reason as `call` and `call_table`: an embind constructor,
         // method or invoker can grow an ordinary exported memory, and a stale
         // window makes every pointer allocated in the new pages look out of
@@ -1028,10 +1028,10 @@ impl Runtime {
                 // reply may have started a new worker. Recheck quiescence
                 // rather than returning idle with a worker running; the
                 // deadline above still bounds a guest that keeps spawning.
-                if self.try_process_queued_calls()? {
-                    continue;
+                self.try_process_queued_calls()?;
+                if self.quiesce(std::time::Duration::ZERO) {
+                    return Ok(true);
                 }
-                return Ok(true);
             }
         }
     }
@@ -1499,6 +1499,16 @@ mod diagnostic_tests {
                 .is_err()
         );
         assert!(!runtime.settle(std::time::Duration::from_millis(20)));
+    }
+
+    #[test]
+    fn an_idle_mailbox_can_settle() {
+        let mut runtime = Runtime::instantiate(&mailbox_module(false)).unwrap();
+        assert!(
+            runtime
+                .try_settle(std::time::Duration::from_millis(100))
+                .unwrap()
+        );
     }
 
     #[test]
