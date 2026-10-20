@@ -90,6 +90,9 @@ fn video_offer_matches_the_vendor_engine() -> Result<()> {
             common::evidence::record(&runtime);
             return Err(error);
         }
+        if call_events(&runtime) >= 3 {
+            break;
+        }
         if std::time::Instant::now() >= deadline {
             common::evidence::record(&runtime);
             anyhow::bail!(
