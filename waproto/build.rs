@@ -111,13 +111,20 @@ fn main() -> std::io::Result<()> {
 
     // Codegen reads the spliced descriptor, so local fields reach the Rust API
     // with the same guarantees as upstream ones. `buffa_build` registers this
-    // path as rerun-if-changed, so rewriting it unconditionally would bump its
-    // mtime on every build and leave the crate permanently dirty.
+    // path as rerun-if-changed, and cargo reruns the script when it is newer
+    // than the start of this run. So it is written only when its content
+    // changes, and dated like the descriptor it derives from: a file stamped
+    // with the current time would rerun the script on the next build.
     let descriptor = out_path.join("whatsapp.local.desc");
     #[allow(clippy::disallowed_methods)]
     let encoded = fds.encode_to_vec();
     if !std::fs::read(&descriptor).is_ok_and(|current| current == encoded) {
         std::fs::write(&descriptor, &encoded)?;
+        let source = std::fs::metadata("src/whatsapp.desc")?.modified()?;
+        std::fs::File::options()
+            .write(true)
+            .open(&descriptor)?
+            .set_modified(source)?;
     }
 
     buffa_build::Config::new()
