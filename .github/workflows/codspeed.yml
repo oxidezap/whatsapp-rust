@@ -210,11 +210,15 @@ jobs:
   # separate job so the unit-bench job above stays fast and mock-server-free.
   integration-benchmarks:
     name: Run CodSpeed integration benchmarks
-    # Fork PRs get no secrets, so they can't pull the private mock-server image.
+    # Forks and Dependabot cannot use the Actions secret for the private image.
     # `credentials.password` rejects the empty string while the job template is
     # being prepared, so the job fails before any step runs and a step-level
     # `if:` cannot save it — the guard has to sit here. Same condition as e2e.yml.
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    if: >-
+      ${{ github.actor != 'dependabot[bot]' &&
+          (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository &&
+            github.event.pull_request.user.login != 'dependabot[bot]')) }}
     runs-on: ubuntu-24.04
     # These benches drive the real client (connect/reconnect handshakes) under
     # Valgrind, so they are slow; cap the job so a stuck run can't hang CI

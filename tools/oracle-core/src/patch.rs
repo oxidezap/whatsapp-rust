@@ -366,10 +366,14 @@ fn read_layout(bytes: &[u8]) -> Result<Layout> {
                     defined_types.push(index.context("reading function type")?);
                 }
             }
-            Payload::CodeSectionStart { range, .. } => {
-                // `range` covers the entries; back up over the id and size so
-                // the whole section can be replaced as a unit.
-                code_section = to_range(range)?;
+            Payload::CodeSectionStart {
+                unchecked_range, ..
+            } => {
+                code_section = to_range(unchecked_range)?;
+                anyhow::ensure!(
+                    code_section.end <= bytes.len(),
+                    "code section extends past the module"
+                );
             }
             Payload::CodeSectionEntry(body) => {
                 let range = to_range(body.range())?;
@@ -904,7 +908,7 @@ fn rewrite(
 
     let mut out = Vec::with_capacity(bytes.len() + 1024);
     out.extend_from_slice(&bytes[..layout.code_section.start]);
-    // `CodeSectionStart::range` covers the entries only, so the id and size
+    // `CodeSectionStart::unchecked_range` covers the entries only, so the id and size
     // prefix sit just before it. Emitting the section through wasm-encoder
     // writes both afresh, which is what absorbs a length prefix that grew.
     let prefix = section_prefix_start(bytes, layout.code_section.start);
