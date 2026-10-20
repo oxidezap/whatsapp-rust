@@ -30,6 +30,7 @@ fn video_offer_matches_the_vendor_engine() -> Result<()> {
 
     let mut runtime = Runtime::instantiate(&bytes)?;
     runtime.set_thread_policy(ThreadPolicy::Spawn);
+    runtime.demand_strict_turns();
     runtime.set_main_thread_registration(true);
     runtime.run_ctors()?;
     runtime.attach_log_ring(4 << 20)?;
@@ -69,8 +70,29 @@ fn video_offer_matches_the_vendor_engine() -> Result<()> {
         Some(0),
         "startVoipCall: {outcome:?}"
     );
-    let sent =
-        common::evidence::wait_for_signaling(&mut runtime, std::time::Duration::from_secs(8))?;
+    let sent = common::evidence::wait_for_signaling(
+        &mut runtime,
+        std::time::Duration::from_secs(8),
+        "0011223344556677",
+    )?;
+    // The signaling callback precedes delivery of the last call event. Wait
+    // for that event before comparing exact stub counters.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while runtime
+        .stubs_called()
+        .iter()
+        .find(|(name, _)| name == "env::on_call_event_js_sync")
+        .map_or(0, |(_, count)| *count)
+        < 3
+    {
+        runtime.try_process_queued_calls()?;
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "oracle Infrastructure: final call event deadline expired"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    common::evidence::record(&runtime);
     common::evidence::check_log(
         runtime.engine_log_overflowed()?,
         runtime.memory_view_is_coherent(),

@@ -6,11 +6,10 @@
 //! hit, and the subsystem that failed, so the assertions are about behaviour
 //! instead of about "the call returned void".
 //!
-//! Argument order and encoding both come from WhatsApp Web's own bridge:
+//! Argument order and framing follow the preserved Web bridge:
 //!
 //! ```js
-//! handleIncomingSignalingOffer(serializeVoipWapNode(node), ...)
-//! // Web bridge = base64(encodeStanza(node)), including the flag byte
+//! handleIncomingSignalingOffer(base64(encodeStanza(node)), ...)
 //! ```
 //!
 //! All identities are fictitious.
@@ -95,6 +94,8 @@ fn try_engine(policy: ThreadPolicy) -> Result<Runtime, EngineError> {
     let mut runtime = Runtime::instantiate(&bytes)
         .map_err(|error| EngineError::Broken(format!("instantiate: {error:#}")))?;
     runtime.set_thread_policy(policy);
+    // Bound turn contention while the registered main thread polls startup.
+    runtime.demand_strict_turns();
     // Register as the main runtime thread with `can_block = 0`, as the browser
     // does — the futex the engine compiles reaches `memory.atomic.wait32` with
     // `1`, and off the main browser thread that blocks rather than throwing.
@@ -164,6 +165,15 @@ fn wait_for_line(runtime: &mut Runtime, needle: &str) -> bool {
     false
 }
 
+fn check_evidence(runtime: &mut Runtime, complete: bool) {
+    common::evidence::record(runtime);
+    let overflowed = runtime
+        .engine_log_overflowed()
+        .unwrap_or_else(|error| evidence::fail(Failure::Infrastructure, error));
+    evidence::check_log(overflowed, runtime.memory_view_is_coherent(), complete)
+        .unwrap_or_else(|kind| evidence::fail(kind, "incomplete operation evidence"));
+}
+
 /// Serialises the tests that start real guest threads.
 ///
 /// Each one brings up a PJSIP worker pool, and cargo runs tests in parallel by
@@ -174,7 +184,7 @@ fn wait_for_line(runtime: &mut Runtime, needle: &str) -> bool {
 use common::threaded_guard;
 
 fn jid(user: &str) -> Jid {
-    Jid::new(user, Server::Pn)
+    Jid::new(user, Server::Lid).with_device(1)
 }
 
 /// Native input is the offer child selected by WAWebHandleVoipCall.callParser,
@@ -192,6 +202,10 @@ fn offer_stanza() -> Node {
                 .build(),
             NodeBuilder::new("net").attr("medium", "3").build(),
             NodeBuilder::new("encopt").attr("keygen", "2").build(),
+            NodeBuilder::new("enc")
+                .attr("count", "0")
+                .bytes(vec![0x42; 32])
+                .build(),
             NodeBuilder::new("voip_settings")
                 .attr("uncompressed", "1")
                 .bytes(VOIP_SETTINGS.to_vec())
@@ -200,12 +214,8 @@ fn offer_stanza() -> Node {
         .build()
 }
 
-/// The settings blob, in whatsapp-rust's standard-Opus form.
-/// Adding `caller_timeout`/`callee_timeout` under `options` was tried, on the
-/// theory that an empty ring window would explain the immediate miss —
-/// `getVoipParam("options.caller_timeout")` does read back empty. It changes
-/// nothing: the offer still ends `term_reason 27`. Kept in whatsapp-rust's
-/// standard form.
+/// Synthetic standard-Opus settings. Relays are intentionally absent so the
+/// native rejection and cleanup can be checked without a live relay service.
 const VOIP_SETTINGS: &[u8] =
     br#"{"encode":{"use_mlow_codec_v1":"false"},"options":{"enable_48khz_rtp_clock":"false"}}"#;
 
@@ -267,52 +277,82 @@ fn deliver_arguments(runtime: &mut Runtime, args: [Value; 9]) -> Vec<String> {
     lines
 }
 
-/// WID strings belong to the native ABI. Wire JIDs remain canonical. In the
-/// preserved Web bridge, argument 8 is peer_jid.toString(), whose PN suffix is
-/// c.us. Using Rust Jid::to_string() here changes the input being tested.
+/// The Web bridge passes elapsed milliseconds before the Unix timestamp.
+/// A fresh synthetic offer has elapsed time zero. Both the creator and peer
+/// use LIDs, which this capture can convert to native device JIDs.
 fn offer_arguments(stanza: String, now: u64) -> [Value; 9] {
     [
         Value::Str(stanza),
         Value::Str("web".to_owned()),
         Value::Str("2.3000.0".to_owned()),
-        Value::Str(now.to_string()),
+        Value::Str("0".to_owned()),
         Value::Str(now.to_string()),
         Value::Bool(false),
         Value::Bool(false),
-        Value::Str(format!("{CALLER}@c.us")),
+        Value::Str(format!("{CALLER}:1@lid")),
         Value::Bytes(Vec::new()),
     ]
 }
 
 #[test]
-fn native_offer_arguments_preserve_the_web_wid_abi() {
+fn native_offer_arguments_preserve_timestamp_units_and_lid_identity() {
     let args = offer_arguments("fixture".to_owned(), 1_609_459_200);
     assert_eq!(args[0], Value::Str("fixture".to_owned()));
-    assert_eq!(args[3], Value::Str("1609459200".to_owned()));
-    assert_eq!(args[4], args[3]);
-    assert_eq!(args[7], Value::Str("15550001111@c.us".to_owned()));
-    assert_eq!(jid(CALLER).to_string(), "15550001111@s.whatsapp.net");
+    assert_eq!(args[3], Value::Str("0".to_owned()));
+    assert_eq!(args[4], Value::Str("1609459200".to_owned()));
+    assert_eq!(args[7], Value::Str("15550001111:1@lid".to_owned()));
+    assert_eq!(jid(CALLER).to_string(), "15550001111:1@lid");
+    assert_eq!(
+        Jid::new(CALLER, Server::Pn).to_string(),
+        "15550001111@s.whatsapp.net"
+    );
 }
 
-/// The original failing fixture passed the call envelope instead of voipNode.
+/// A PN creator is stripped during conversion, then ignored by the peer guard.
 #[test]
 #[ignore = "real threads; see the module docs"]
-fn an_enclosing_call_is_rejected_as_a_native_offer() {
+fn a_phone_number_call_creator_is_stripped_and_ignored() {
     let _serial = threaded_guard();
     let mut runtime = engine();
-    let envelope = NodeBuilder::new("call")
-        .attr("from", jid(CALLER))
-        .children([offer_stanza()])
+    let offer = NodeBuilder::new("offer")
+        .attr("call-id", CALL_ID)
+        .attr("call-creator", Jid::new(CALLER, Server::Pn).with_device(1))
+        .children([
+            NodeBuilder::new("audio")
+                .attr("enc", "opus")
+                .attr("rate", "16000")
+                .build(),
+            NodeBuilder::new("net").attr("medium", "3").build(),
+            NodeBuilder::new("encopt").attr("keygen", "2").build(),
+            NodeBuilder::new("voip_settings")
+                .attr("uncompressed", "1")
+                .bytes(VOIP_SETTINGS.to_vec())
+                .build(),
+        ])
         .build();
-    let payload = serialize(&envelope, true);
+    let payload = serialize(&offer, true);
     let lines = deliver(&mut runtime, payload);
     assert!(
         lines
             .iter()
-            .any(|line| line.contains("conversion_result FAILED")),
-        "the native bridge should reject the envelope: {lines:?}"
+            .any(|line| line
+                .contains("returned null for attribute 'call-creator', stripping attribute")),
+        "creator conversion: {lines:?}"
     );
-    assert!(!reached_call_stack(&lines));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("mismatched peer id and creator id, ignore message")),
+        "creator guard: {lines:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("init_local_state begins")),
+        "an ignored offer initialized call state: {lines:?}"
+    );
+    let info = common::evidence::call(&mut runtime, "getCallInfo", &[]).expect("call state query");
+    assert_eq!(info.as_str(), Some(""));
 }
 
 /// Waits until the engine stops writing about what it was just asked to do.
@@ -527,8 +567,8 @@ fn offer_handling_is_deterministic() {
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("wa_call_handle_incoming_xmpp_offer() status 0")),
-            "determinism requires two accepted offers: {lines:?}"
+                .any(|line| line.contains("wa_call_handle_incoming_xmpp_offer() status 70020")),
+            "determinism requires two missing-relay rejections: {lines:?}"
         );
         events(lines)
     };
@@ -608,33 +648,23 @@ fn the_log_reader_returns_only_the_log() {
     }
 }
 
-/// Guest threads are **not** serialised, and this pins that down.
-///
-/// `schedule.rs` is supposed to run one guest thread at a time, and several
-/// safety arguments in this codebase lean on it — `HostState::read`'s SAFETY
-/// note among them. It does not hold: a thread acquires the turn once around
-/// its whole routine, and `yield_point` hands it on only while some other
-/// thread is blocked in its own first `acquire`, so once every worker has
-/// forced past `TURN_TIMEOUT` nothing waits and nothing yields.
-///
-/// Asserted the way it actually is, rather than the way it should be, because a
-/// permanently red test teaches nobody anything and a silent one hides this
-/// entirely. **If this test starts failing, the scheduler has been fixed** —
-/// which is good news, and the thing to do is update it along with the notes in
-/// `AGENTS.md`, `threads.rs` and `examples/ring_corruption.rs` that all say
-/// otherwise.
+/// Record observed concurrency without treating one schedule as a safety proof.
+/// A peak of one is possible; the scheduler's timeout escape still permits
+/// overlap on other schedules. See the host contract in AGENTS.md.
 #[test]
 #[ignore = "real threads; see the module docs"]
-fn guest_threads_are_not_serialised() {
+fn guest_thread_concurrency_is_observable() {
     let _serial = threaded_guard();
     let runtime = engine();
-
     let peak = runtime.max_threads_in_wasm();
     eprintln!("most guest threads executing at once: {peak}");
+    assert!(peak >= 1, "guest execution was not observed");
     assert!(
-        peak > 1,
-        "the scheduler now serialises guest threads — see this test's docs, \
-         several comments claim the opposite and need updating"
+        runtime
+            .logs()
+            .iter()
+            .any(|line| line.contains("entering routine")),
+        "no worker entered guest code"
     );
 }
 
@@ -662,11 +692,16 @@ fn the_memory_watch_names_the_moment() {
 
     // The workers poll, so they reach a host call within milliseconds; this is
     // waiting for the report rather than for anything to happen.
-    runtime
-        .try_settle(Duration::from_secs(2))
-        .unwrap_or_else(|error| {
-            common::evidence::fail(common::evidence::Failure::Infrastructure, error)
-        });
+    let deadline = std::time::Instant::now() + REACT_TIMEOUT;
+    while runtime.watch_report().is_empty() {
+        runtime
+            .try_process_queued_calls()
+            .unwrap_or_else(|error| evidence::fail(Failure::Infrastructure, error));
+        if std::time::Instant::now() >= deadline {
+            evidence::fail(Failure::Infrastructure, "memory watch deadline expired");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     // From the watch, not from the host log: the log refuses new lines once
     // full, and this report was being written past that point and discarded.
@@ -799,7 +834,7 @@ fn a_well_formed_offer_reaches_the_call_stack() {
     );
 }
 
-/// Argument 4 and 5 must be numeric.
+/// Elapsed milliseconds and the Unix timestamp must both be numeric.
 ///
 /// The signature is five consecutive strings, so nothing distinguishes them;
 /// the engine reports `stoull: no conversion` when they are not timestamps.
@@ -843,14 +878,11 @@ fn a_native_offer_without_a_call_id_is_rejected() {
         "the native bridge must reject the missing call-id: {lines:?}");
 }
 
-/// The engine accepts the offer outright: status 0, no parser complaint.
-///
-/// This is the difference `uncompressed="1"` makes. Without it the same stanza
-/// comes back as `70004` with `unexpected compressed voip params`, because the
-/// engine reads the settings blob as compressed data.
+/// A parsed offer without relays reaches the call stack, then fails with
+/// status 70020. A parser failure must never satisfy this rejection check.
 #[test]
 #[ignore = "real threads; see the module docs"]
-fn a_well_formed_offer_is_accepted() {
+fn an_offer_without_relays_is_rejected_after_parsing() {
     let _serial = threaded_guard();
     let mut runtime = engine();
     let payload = serialize(&offer_stanza(), true);
@@ -867,30 +899,29 @@ fn a_well_formed_offer_is_accepted() {
     assert!(
         lines
             .iter()
-            .any(|line| line.contains("wa_call_handle_incoming_xmpp_offer() status 0")),
-        "engine did not accept the offer: {lines:?}"
+            .any(|line| line.contains("wa_call_handle_incoming_xmpp_offer() status 70020")),
+        "engine did not report the missing-relay rejection: {lines:?}"
     );
     assert!(
-        !lines.iter().any(|line| line.contains("voip params")),
+        !lines
+            .iter()
+            .any(|line| line.contains("unexpected compressed voip params")),
         "settings blob was rejected: {lines:?}"
+    );
+    assert!(reached_call_stack(&lines));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("process_offer: handle_relay_info failed")),
+        "missing-relay diagnostic: {lines:?}"
     );
 }
 
-/// Does an incoming offer leave settings behind that an outgoing call can use?
-///
-/// An outgoing call fails in `make_and_cache_offer` at `offer.cc:430`, whose
-/// guard reads two bytes of the call context — `+3856` and `+662166` — and both
-/// are zero. Nothing in the module carries the `options.*` names that
-/// `getVoipParam` answers to, so those come from the server's
-/// `<voip_settings>` blob; on the incoming path the engine says as much, with
-/// `Application settings not loaded`.
-///
-/// An incoming offer *does* carry that blob. If handling one caches settings,
-/// an outgoing call made afterwards should get past the guard. This is the
-/// cheapest test of "both blockers are the same missing configuration".
+/// An incoming offer followed by an outgoing call must preserve guest memory.
+/// Requiring an outgoing signaling callback also proves that queued work ran.
 #[test]
 #[ignore = "real threads; see the module docs"]
-fn settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call() {
+fn an_offer_then_outgoing_call_preserves_guest_memory() {
     let _serial = common::engine_lock();
     let mut runtime = engine();
 
@@ -912,11 +943,10 @@ fn settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call() {
         ],
     );
     runtime.refuel();
-    runtime
-        .try_settle(Duration::from_secs(5))
-        .unwrap_or_else(|error| {
-            common::evidence::fail(common::evidence::Failure::Infrastructure, error)
-        });
+    let sent =
+        common::evidence::wait_for_signaling(&mut runtime, REACT_TIMEOUT, "0011223344556677")
+            .unwrap_or_else(|error| evidence::fail(Failure::Infrastructure, error));
+    check_evidence(&mut runtime, !sent.is_empty());
 
     common::evidence::record(&runtime);
     let lines = runtime.engine_log_from(mark);
@@ -972,19 +1002,10 @@ fn settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call() {
     );
 }
 
-/// Does the *incoming* path end up with a self participant?
-///
-/// The outgoing path does not: `make_and_cache_offer` fails because the group's
-/// cached self pointer is null, even though `getCallInfo` marks a participant
-/// `is_self`. Whether the same is true after an accepted incoming offer is the
-/// cheapest way to tell a systemic gap from something specific to originating a
-/// call — and the two paths build the call through different code.
-///
-/// This asserts what the engine reports rather than a desired outcome; it is a
-/// probe kept honest by being a test.
+/// Missing relays must produce an explicit rejection and leave no active call.
 #[test]
 #[ignore = "real threads; see the module docs"]
-fn an_incoming_offer_reports_its_participants() {
+fn a_missing_relay_rejection_clears_incoming_call_state() {
     let _serial = threaded_guard();
     let mut runtime = engine();
     let payload = serialize(&offer_stanza(), true);
@@ -998,22 +1019,21 @@ fn an_incoming_offer_reports_its_participants() {
     let Some(json) = info.as_ref().ok().and_then(|value| value.as_str()) else {
         evidence::fail(Failure::Infrastructure, format!("getCallInfo: {info:?}"));
     };
-    if json.is_empty() {
-        evidence::fail(
-            Failure::Mismatch,
-            "engine holds no call state after the offer",
-        );
-    }
-
-    let has_self = json.contains("\"is_self\": true");
-    let uuid_set = !json.contains("\"self_participant_uuid\": \"\"");
-    eprintln!("incoming path: is_self={has_self} self_participant_uuid_set={uuid_set}");
-
-    // The engine must at least be able to say who we are; without that the
-    // incoming path cannot answer a call either.
     assert!(
-        has_self,
-        "no participant marked as ourselves after an accepted offer: {json}"
+        lines
+            .iter()
+            .any(|line| line.contains("wa_call_handle_incoming_xmpp_offer() status 70020")),
+        "expected missing-relay rejection: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("[ReceivedCall -> None]")),
+        "call teardown did not finish: {lines:?}"
+    );
+    assert!(
+        json.is_empty(),
+        "a rejected offer retained active call state: {json}"
     );
 }
 
@@ -1059,7 +1079,7 @@ fn the_caller_comes_from_the_argument_not_the_stanza() {
     let payload = serialize(&offer_stanza(), true);
     let mut args = offer_arguments(payload, runtime.virtual_unix_time());
     // Deliberately different from the stanza's CALLER.
-    args[7] = Value::Str("15550003333@c.us".to_owned());
+    args[7] = Value::Str("15550003333:1@lid".to_owned());
     let lines = deliver_arguments(&mut runtime, args);
 
     if runtime.engine_log_overflowed().expect("overflow probe") {
@@ -1125,11 +1145,10 @@ fn the_engine_starts_an_outgoing_call() {
         ],
     );
     runtime.refuel();
-    runtime
-        .try_settle(std::time::Duration::from_secs(5))
-        .unwrap_or_else(|error| {
-            common::evidence::fail(common::evidence::Failure::Infrastructure, error)
-        });
+    let sent =
+        common::evidence::wait_for_signaling(&mut runtime, REACT_TIMEOUT, "0011223344556677")
+            .unwrap_or_else(|error| evidence::fail(Failure::Infrastructure, error));
+    check_evidence(&mut runtime, !sent.is_empty());
 
     common::evidence::record(&runtime);
     let lines = runtime.engine_log_from(mark);
@@ -1180,24 +1199,11 @@ fn the_engine_starts_an_outgoing_call() {
         "the call should enter the Calling state: {lines:?}"
     );
 
-    // And then it stops. This pins the blocker rather than endorsing it:
-    // `make_and_cache_offer` (offer.cc) returns 70008.
-    //
-    // 70008 is shared by several guards. This test observes the failure
-    // and lack of a send, but does not locate the guard in the pinned capture.
-    // Read `make_and_cache_offer` in that capture and mark its call sites
-    // with `oracle instrument --calls-in FUNC`; a body marker cannot tell
-    // which caller ran. Do not carry old-capture indices into this module.
-    //
-    // When this assertion starts failing, the blocker is gone: replace it
-    // with one that expects an offer on the wire.
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.contains("make_and_cache_offer failed: 70008")),
-        "the known blocker should still be the one that stops the call; if this \
-             fails, the offer path may now work — check for outgoing signaling: {lines:?}"
-    );
+    assert_eq!(sent.len(), 1, "one outgoing offer callback");
+    assert_eq!(sent[0].call_id, "0011223344556677");
+    assert_eq!(sent[0].peer_jid, PEER_LID);
+    let offer = marshal::unmarshal_packed_ref(&sent[0].stanza).expect("outgoing stanza");
+    assert_eq!(offer.tag, "offer");
 }
 
 /// The init sequence WhatsApp Web actually performs, and the handles it gets.
@@ -1209,9 +1215,7 @@ fn the_engine_starts_an_outgoing_call() {
 /// built on, so the base of the P2P data path — had never been exercised at
 /// all.
 ///
-/// None of this unblocks an outgoing offer. It is pinned because the surface it
-/// covers only became reachable once the worker threads stopped dying, and a
-/// regression there would silently take it away again.
+/// These API results are independent of the separate outgoing-offer scenario.
 #[test]
 #[ignore = "brings up the media stack; slow"]
 fn the_engine_accepts_the_init_sequence_whatsapp_web_performs() {
@@ -1274,17 +1278,8 @@ fn the_engine_accepts_the_init_sequence_whatsapp_web_performs() {
     );
 }
 
-/// `getCallInfo` is the only window into the engine's own view of a call.
-///
-/// The call context reaches the guest through a wasm global, and the module
-/// exports no globals, so the host cannot read it. This function takes no
-/// arguments and reads that context itself, which makes it the whole of the
-/// available observability — worth pinning, because most of this investigation
-/// was spent inferring from disassembly what one call reports directly.
-///
-/// What it reports is also the current puzzle: the participant list *does*
-/// carry a `is_self: true` entry for our own LID, yet `make_and_cache_offer`
-/// fails because the group's cached self pointer is null.
+/// After an outgoing offer callback, call state must contain both participants
+/// and identify our own LID as self.
 #[test]
 #[ignore = "brings up the media stack; slow"]
 fn the_engine_reports_a_self_participant_for_an_outgoing_call() {
@@ -1315,11 +1310,10 @@ fn the_engine_reports_a_self_participant_for_an_outgoing_call() {
         ],
     );
     runtime.refuel();
-    runtime
-        .try_settle(std::time::Duration::from_secs(5))
-        .unwrap_or_else(|error| {
-            common::evidence::fail(common::evidence::Failure::Infrastructure, error)
-        });
+    let sent =
+        common::evidence::wait_for_signaling(&mut runtime, REACT_TIMEOUT, "0011223344556677")
+            .unwrap_or_else(|error| evidence::fail(Failure::Infrastructure, error));
+    check_evidence(&mut runtime, !sent.is_empty());
 
     let info = common::evidence::call(&mut runtime, "getCallInfo", &[]);
     runtime.refuel();
@@ -1341,17 +1335,10 @@ fn the_engine_reports_a_self_participant_for_an_outgoing_call() {
 const PEER_LID: &str = "11223344556677@lid";
 const PEER_LID_DEVICE: &str = "11223344556677:0@lid";
 
-/// This build refuses a phone-number peer: calls must be placed to LIDs.
-///
-/// It matters beyond this repository. `~/projects/meowmeow-node-wasm` places
-/// calls against an older module and passes `…@s.whatsapp.net` as the peer, so
-/// anyone porting that recipe here will hit this and have no idea why. The
-/// engine says it plainly — `peer_participant_jids must be LID, enforce LID for
-/// all calls` — and that sentence is the ground truth whatsapp-rust has to
-/// match.
+/// This capture rejects a PN device JID in the native bridge, before precall.
 #[test]
 #[ignore = "real threads; see the module docs"]
-fn a_phone_number_peer_is_refused_because_this_build_enforces_lid() {
+fn a_phone_number_device_is_refused_by_the_native_bridge() {
     let _serial = common::engine_lock();
     let mut runtime = engine();
 
@@ -1360,21 +1347,18 @@ fn a_phone_number_peer_is_refused_because_this_build_enforces_lid() {
         &mut runtime,
         "startVoipCall",
         &[
-            Value::Str("11223344556677@s.whatsapp.net".to_owned()),
+            Value::Str("11223344556677@c.us".to_owned()),
             Value::StringList(vec!["11223344556677:0@c.us".to_owned()]),
             Value::Str("0011223344556677".to_owned()),
             Value::Bool(false),
-            Value::Str("11223344556677@s.whatsapp.net".to_owned()),
+            Value::Str("11223344556677@c.us".to_owned()),
             Value::Bool(false),
             Value::Bytes(Vec::new()),
         ],
     );
     runtime.refuel();
-    runtime
-        .try_settle(Duration::from_secs(5))
-        .unwrap_or_else(|error| {
-            common::evidence::fail(common::evidence::Failure::Infrastructure, error)
-        });
+    let complete = wait_for_line(&mut runtime, "voipBridgeJidToDeviceJID returned null");
+    check_evidence(&mut runtime, complete);
 
     common::evidence::record(&runtime);
     let lines = runtime.engine_log_from(mark);
@@ -1383,26 +1367,17 @@ fn a_phone_number_peer_is_refused_because_this_build_enforces_lid() {
     }
 
     assert!(
-        lines.iter().any(|line| line.contains("must be LID")),
-        "the engine should refuse a phone-number peer and say so: {outcome:?} {lines:?}"
+        outcome.as_ref().ok().and_then(|value| value.as_int()) == Some(-1)
+            && lines.iter().any(|line| line
+                .contains("voipBridgeJidToDeviceJID returned null for: 11223344556677:0@c.us")),
+        "the native bridge should refuse the PN device and say so: {outcome:?} {lines:?}"
     );
 }
 
-/// Does the `<voip_settings>` blob in an offer end up where `getVoipParam` reads?
-///
-/// An outgoing call is blocked by configuration this build no longer takes at
-/// init — `getVoipParam("options.*")` answers empty, and an older module got
-/// the same values as `initVoipStack` arguments. An incoming offer does carry a
-/// settings blob, and the engine parses it (mislabelling it compressed gets the
-/// whole offer rejected), so the question is whether handling one leaves those
-/// values readable.
-///
-/// If it does, feeding a synthetic offer is a way to configure the engine
-/// without a server. If it does not, settings arrive by some other channel and
-/// that is worth knowing before building anything on this idea.
+/// A rejected offer must not expose its settings as active call configuration.
 #[test]
 #[ignore = "real threads; see the module docs"]
-fn an_offers_settings_blob_becomes_readable_through_get_voip_param() {
+fn a_rejected_offers_settings_are_not_exposed_through_get_voip_param() {
     let _serial = common::engine_lock();
     let mut runtime = engine();
 
@@ -1420,14 +1395,17 @@ fn an_offers_settings_blob_becomes_readable_through_get_voip_param() {
     let before = read(&mut runtime, name);
 
     let payload = serialize(&offer_stanza(), true);
-    let _ = deliver(&mut runtime, payload);
+    let lines = deliver(&mut runtime, payload);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("wa_call_handle_incoming_xmpp_offer() status 70020")),
+        "expected completed rejection: {lines:?}"
+    );
 
     let after = read(&mut runtime, name);
     eprintln!("getVoipParam({name}): before={before:?} after={after:?}");
 
-    // It does. An incoming offer configures the engine, and the values it
-    // carries are readable afterwards — so a synthetic offer is a way to set
-    // voip params without a server, which is what this build otherwise lacks.
     assert_eq!(
         before.as_deref(),
         Some(""),
@@ -1435,8 +1413,8 @@ fn an_offers_settings_blob_becomes_readable_through_get_voip_param() {
     );
     assert_eq!(
         after.as_deref(),
-        Some("false"),
-        "the offer's settings blob should be readable through getVoipParam"
+        Some(""),
+        "a rejected offer must not expose active settings"
     );
 }
 
@@ -1449,7 +1427,7 @@ fn an_offers_settings_blob_becomes_readable_through_get_voip_param() {
 /// Pin both functions and the context getter before reading the current flag.
 #[test]
 #[ignore = "real threads; see the module docs"]
-fn incoming_settings_preserve_the_current_offer_guard_flag() {
+fn rejected_incoming_settings_preserve_the_current_offer_guard_flag() {
     let _serial = threaded_guard();
     let bytes = common::capture(VOIP)
         .expect("capture integrity")
@@ -1488,12 +1466,13 @@ fn incoming_settings_preserve_the_current_offer_guard_flag() {
             .unwrap_or_else(|error| evidence::fail(Failure::Infrastructure, error))[0]
     };
     let before = flag(&runtime);
-    let lines = deliver(&mut runtime, serialize(&offer_stanza(), true));
+    let payload = serialize(&offer_stanza(), true);
+    let lines = deliver(&mut runtime, payload);
     assert!(
         lines
             .iter()
-            .any(|line| line.contains("wa_call_handle_incoming_xmpp_offer() status 0")),
-        "the settings observation requires an accepted offer: {lines:?}"
+            .any(|line| line.contains("wa_call_handle_incoming_xmpp_offer() status 70020")),
+        "the settings observation requires the completed missing-relay rejection: {lines:?}"
     );
     let after = flag(&runtime);
     eprintln!("oracle guard_offset=1568 before={before} after={after}");

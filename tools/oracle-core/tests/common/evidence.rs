@@ -61,11 +61,19 @@ pub fn record(runtime: &Runtime) {
 pub fn wait_for_signaling(
     runtime: &mut Runtime,
     timeout: Duration,
+    call_id: &str,
 ) -> anyhow::Result<Vec<SignalingCall>> {
     let deadline = Instant::now() + timeout;
     loop {
-        runtime.try_process_queued_calls()?;
-        let sent = runtime.signaling()?;
+        if let Err(error) = runtime.try_process_queued_calls() {
+            record(runtime);
+            return Err(error);
+        }
+        let sent: Vec<_> = runtime
+            .signaling()?
+            .into_iter()
+            .filter(|call| call.call_id == call_id)
+            .collect();
         if !sent.is_empty() {
             record(runtime);
             for call in &sent {
@@ -77,10 +85,10 @@ pub fn wait_for_signaling(
             }
             return Ok(sent);
         }
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "oracle Infrastructure: no signaling callback before deadline"
-        );
+        if Instant::now() >= deadline {
+            record(runtime);
+            anyhow::bail!("oracle Infrastructure: no signaling callback before deadline");
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
 }

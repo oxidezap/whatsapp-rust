@@ -83,7 +83,9 @@ AST-extracted modules and byte ranges in the unmodified inputs:
 | Module | Bundle SHA-256 | Byte range |
 | --- | --- | --- |
 | `WAWebVoipStackInterfaceWeb` | `431712818bb02e6d5cb2ae144decac6448b5245a6bef4c27d793d6267b6c7fe9` | 113185..140304 |
+| `WAWebHandleVoipCall` | `9b681e073f14f9d50e3dc12b456e4f980b554eff4d58827bc91c90a697e9ca38` | 526377..541162 |
 | `WAWebHandleVoipCallOffer` | `ab02ff22d8f464fdf7ebfdfb0b2f8d380c2595dd232c10f5499be1d3790dec08` | 920..7440 |
+| `WAWebVoipValidateAndDecryptEnc` | `9b681e073f14f9d50e3dc12b456e4f980b554eff4d58827bc91c90a697e9ca38` | 5486913..5490169 |
 | `WAWebWid` | `09d91fdc4089c50ab1d35dd6c796ee82ef4c3296710316d20383c85738b871b8` | 2728079..2737165 |
 
 The immutable source archive is
@@ -91,6 +93,19 @@ The immutable source archive is
 This JavaScript snapshot is newer than the pinned `JgwtTQVeWPm` engine. It
 establishes the inspected bridge behavior, not full-call compatibility or server
 behavior. Runtime conformance still requires the exact WASM in `wasm.lock.json`.
+The signaling fixtures use matching creator/peer LIDs. This capture rejects
+PN device identities in the native bridge. Argument 4 is elapsed milliseconds,
+defaulting to zero, and argument 5 is a Unix timestamp in seconds. Passing the
+Unix timestamp as elapsed time makes a fresh offer appear expired. The native
+fixture carries a synthetic 32-byte call key in `<enc>`, matching the stage
+after `WAWebVoipValidateAndDecryptEnc` replaces Signal ciphertext with decrypted
+content. It does not exercise Signal decryption.
+The fresh incoming fixture deliberately has no relay allocation. Its expected
+outcome is native status `70020` after parsing, the missing-relay diagnostic,
+and completed call cleanup. The suite checks that rejected settings are not exposed through
+`getVoipParam` and no active call remains. Outgoing audio and video scenarios require actual signaling
+callbacks. These observations do not qualify an accepted incoming media call.
+
 
 The pinned `JgwtTQVeWPm` bytes are preserved in the `bundle-store` asset
 `wasm-60c151934cdcd6a1ac7dc8e705e8b9f9d73ef785efc3a268b687e5bc76a05310.tar.xz`,
@@ -294,9 +309,9 @@ embind signature:
 - **The argument order.** `handleIncomingSignalingOffer` starts with five
   consecutive strings; the log echoes arguments 2 and 3 as *platform* and
   *version*, which is how they were identified.
-- **The stanza encoding.** WhatsApp Web's bridge calls
-  `handleIncomingSignalingOffer(serializeVoipWapNode(node), ...)`, and that
-  helper is `base64(encodeStanza(node))`, including the transport flag byte.
+- **The stanza encoding.** The preserved Web bridge passes
+  `base64(encodeStanza(node))` to `handleIncomingSignalingOffer`, including
+  the transport flag byte. `serializeVoipWapNode` is the Windows helper.
   Dropping it makes the engine's reader fail at the first token
   (`invalid list size`); keeping it parses cleanly. Only the real implementation
   could settle that one-byte question.
