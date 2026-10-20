@@ -13,20 +13,14 @@ fn modified(path: &Path) -> SystemTime {
 
 #[test]
 fn descriptor_cache_repairs_timestamps_and_preserves_content_changes() {
-    let unique = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "waproto-descriptor-{}-{unique}",
-        std::process::id()
-    ));
-    fs::create_dir(&dir).unwrap();
+    let dir = std::env::temp_dir().join(format!("waproto-descriptor-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
     let source = dir.join("source.desc");
     let output = dir.join("local.desc");
     fs::write(&source, b"source").unwrap();
-    let past = SystemTime::now() - Duration::from_secs(60);
-    let future = SystemTime::now() + Duration::from_secs(3600);
+    let created = modified(&source);
+    let past = created - Duration::from_secs(60);
+    let future = created + Duration::from_secs(3600);
     let set_source = |time| {
         fs::File::options()
             .write(true)
@@ -57,7 +51,7 @@ fn descriptor_cache_repairs_timestamps_and_preserves_content_changes() {
     set_source(future);
     descriptor::write(&output, b"first", &source).unwrap();
     assert_eq!(modified(&output), modified(&source));
-    assert!(modified(&output) > SystemTime::now());
+    assert!(modified(&output) > created);
 
     // Real encoded changes must replace the cache even when the source mtime is unchanged.
     descriptor::write(&output, b"second", &source).unwrap();
