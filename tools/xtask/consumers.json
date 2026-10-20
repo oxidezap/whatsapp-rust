@@ -623,5 +623,55 @@
         }
       }
     ]
+  },
+  {
+    "manifest": "tests/sqlite-interop/Cargo.toml",
+    "locked": false,
+    "commands": [
+      {
+        "lanes": [
+          "native",
+          "msrv"
+        ],
+        "mode": "test",
+        "features": [
+          "bundled"
+        ],
+        "test": "interop"
+      },
+      {
+        "lanes": [
+          "native",
+          "msrv"
+        ],
+        "mode": "test",
+        "features": [
+          "sqlcipher"
+        ],
+        "test": "interop"
+      }
+    ]
+  },
+  {
+    "manifest": "tests/sqlite-sdk-browser/Cargo.toml",
+    "locked": false,
+    "commands": [
+      {
+        "lanes": [
+          "native",
+          "msrv"
+        ],
+        "mode": "test",
+        "test": "browser"
+      },
+      {
+        "lanes": [
+          "wasm"
+        ],
+        "mode": "test",
+        "test": "browser",
+        "wasm_test": true
+      }
+    ]
   }
 ]

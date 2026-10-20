@@ -169,6 +169,10 @@ zerocopy = { version = "0.8.55", default-features = false, features = ["derive"]
 zlib-rs = { version = "0.6.6", default-features = false, features = ["std", "rust-allocator"] }
 
 [features]
+# Browser randomness and, when selected, SQLite's wasm-bindgen host hooks.
+# Keep this opt-in separate from sqlite-storage: enabling it for native
+# consumers with rusqlite 0.40 would reintroduce the wsqlite3 links conflict.
+js = ["wacore/js", "whatsapp-rust-sqlite-storage?/js"]
 debug-snapshots = ["wacore/debug-snapshots"]
 # Typed interop with the decoded legacy SessionRecord v1 model, for migrating
 # externally produced auth state. Off by default so native clients carry no

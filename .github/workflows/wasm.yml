@@ -69,7 +69,10 @@ jobs:
       - name: Build and execute isolated API consumers for wasm32
         env:
           CARGO_BUILD_JOBS: "1"
-        run: cargo xt ci consumers run --lane wasm --toolchain nightly-2026-06-16
+        run: |
+          # The hosted image supplies a matching Chrome/ChromeDriver pair.
+          export CHROMEDRIVER="${CHROMEWEBDRIVER}/chromedriver"
+          cargo xt ci consumers run --lane wasm --toolchain nightly-2026-06-16
       # The SQLite store reaches wasm through `storages/sqlite-storage/src/pool.rs`,
       # which swaps r2d2 and tokio's blocking pool for a single connection behind a
       # lock. Both of those type-check on wasm and only fail when a thread is actually

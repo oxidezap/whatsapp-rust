@@ -1,0 +1,20 @@
+# This native resolve must stay separate from the browser host's explicit js.
+[package]
+name = "sqlite-interop-consumer"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+
+[workspace]
+resolver = "3"
+
+[features]
+default = []
+bundled = ["rusqlite/bundled"]
+sqlcipher = ["rusqlite/bundled-sqlcipher"]
+
+[dependencies]
+whatsapp-rust = { path = "../..", default-features = false, features = ["sqlite-storage", "tokio-transport", "tokio-runtime", "ureq-client"] }
+rusqlite = "=0.40.2"
+tokio = { version = "1.53.1", features = ["macros", "rt"] }
