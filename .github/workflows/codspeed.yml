@@ -60,7 +60,7 @@ jobs:
       # Simulation omits syscall and scheduling costs. Keep native results
       # separately visible; a shared runner does not establish equivalence.
       - name: Measure native prefetch
-        uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369 # v5.4.2
+        uses: CodSpeedHQ/action@821a40cd6c80e3cfe387caf55668287addd808da # v5.5.0
         with:
           mode: walltime
           runner-version: "5.4.2"
@@ -193,7 +193,7 @@ jobs:
       # this action, and read the PR right after the bump against the new
       # baseline, not the old one. `cycle-estimation: false` reverts it.
       - name: Run the benchmarks
-        uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369 # v5.4.2
+        uses: CodSpeedHQ/action@821a40cd6c80e3cfe387caf55668287addd808da # v5.5.0
         env:
           SHARD_PACKAGES: ${{ matrix.shard.packages }}
         with:
@@ -322,7 +322,7 @@ jobs:
       # workspace default-member, so a bare `cargo codspeed run` discovers no
       # benchmarks for it ("No benchmarks found for the simulation mode").
       - name: Run the benchmarks
-        uses: CodSpeedHQ/action@f842b9a3ffe213dbb81768fd7f7eeb4dfcf1c369 # v5.4.2
+        uses: CodSpeedHQ/action@821a40cd6c80e3cfe387caf55668287addd808da # v5.5.0
         env:
           MOCK_SERVER_URL: "wss://127.0.0.1:8080/ws/chat"
           RUST_LOG: warn
