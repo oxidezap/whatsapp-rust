@@ -433,6 +433,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closed_work_admission_stops_capacity_retries_immediately() {
+        let client = crate::test_utils::create_test_client().await;
+        for close_before in [true, false] {
+            let (lane, rx) = lane(&client.inbound_queues().chat, CHAT_BYTES, 1);
+            if close_before {
+                lane.work.close();
+            } else {
+                lane.try_enqueue(node(0, 0)).unwrap();
+            }
+            let mut retry = Box::pin(lane.enqueue_scoped(
+                node(1, 64 * 1024),
+                client.connection_shutdown_signal(),
+                &*client.runtime,
+            ));
+            if !close_before {
+                assert!(futures::poll!(&mut retry).is_pending());
+                lane.work.close();
+                drop(rx.try_recv().unwrap());
+            }
+            assert!(matches!(
+                futures::poll!(&mut retry),
+                std::task::Poll::Ready(Err(_))
+            ));
+            assert_eq!(lane.work.track_rejections(), usize::from(close_before));
+            assert_eq!(lane.work.pending(), 0);
+            assert_eq!(lane.byte_budget.available(), CHAT_BYTES);
+            assert!(rx.is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn reporting_and_cleanup_do_not_allocate_unused_queue_state() {
         let client = crate::test_utils::create_test_client().await;
         assert!(client.inbound_queues.get().is_none());

@@ -501,11 +501,11 @@ impl ChatLane {
                 Err(async_channel::TrySendError::Full(queued)) => queued,
                 result => return result,
             };
-            if turns == 0 || queued.shutdown.is_fired() {
+            if turns == 0 || queued.shutdown.is_fired() || self.work.is_closed() {
                 return Err(async_channel::TrySendError::Full(queued));
             }
             crate::inbound_queue::yield_for_capacity(runtime).await;
-            if queued.shutdown.is_fired() {
+            if queued.shutdown.is_fired() || self.work.is_closed() {
                 return Err(async_channel::TrySendError::Full(queued));
             }
             turns -= 1;
@@ -539,15 +539,17 @@ impl ChatLane {
         if self.queue_tx.is_full() {
             return Err(async_channel::TrySendError::Full(queued));
         }
+        // Refuse closed admission before compacting/parsing a possibly large
+        // node. A successful guard also covers that work if close races here.
+        let Some(work) = self.work.try_track() else {
+            return Err(async_channel::TrySendError::Full(queued));
+        };
         let Some(retained) = crate::inbound_queue::retain_node(
             &queued.node,
             &self.global_budget,
             &self.byte_budget,
             Arc::clone(&self.enqueue_lock),
         ) else {
-            return Err(async_channel::TrySendError::Full(queued));
-        };
-        let Some(work) = self.work.try_track() else {
             return Err(async_channel::TrySendError::Full(queued));
         };
         let original = queued.node;
