@@ -469,6 +469,20 @@ mod tests {
     fn fallback_from_silent_family(silent: &str, working: &str) {
         use ureq::unversioned::transport::DefaultConnector;
 
+        // Both directions need IPv6 loopback, which can be disabled on Linux.
+        match TcpListener::bind("[::1]:0") {
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
+                ) =>
+            {
+                eprintln!("skipping dual-stack fallback: IPv6 loopback unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("probe IPv6 loopback: {error}"),
+        }
         let (silent, _queued) = silent_listener(silent);
         let working = TcpListener::bind(working).expect("bind working loopback listener");
         let working_addr = working.local_addr().unwrap();
