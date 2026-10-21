@@ -6374,6 +6374,80 @@ mod tests {
         );
     }
 
+    /// Community creation restores omitted parent markers from the requested
+    /// settings without elevating explicit false values, for both reply tags.
+    #[test]
+    fn test_community_create_iq_success_restores_parent_options() {
+        let subject = GroupSubject::new("Community fixture").unwrap();
+        for tag in ["group", "community"] {
+            for closed in [false, true] {
+                for allow in [false, true] {
+                    for general in [false, true] {
+                        let spec = CommunityCreateIq::new(&subject, closed, allow, general);
+                        let iq = NodeBuilder::new("iq")
+                            .children([NodeBuilder::new(tag)
+                                .attr("id", "120363000000000001")
+                                .attr("subject", "Server subject")
+                                .build()])
+                            .build();
+                        let response = spec.parse_response(&iq.as_node_ref()).unwrap();
+                        assert!(response.is_parent_group);
+                        assert!(response.parent_group_jid.is_none());
+                        assert_eq!(response.parent_membership_approval_required, closed);
+                        assert_eq!(response.allow_non_admin_sub_group_creation, allow);
+                        assert_eq!(
+                            response.subject.as_ref().unwrap().as_str(),
+                            "Server subject"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A false request preference never erases affirmative server metadata.
+    #[test]
+    fn test_community_create_iq_success_keeps_server_parent_options() {
+        let subject = GroupSubject::new("Community fixture").unwrap();
+        let spec = CommunityCreateIq::new(&subject, false, false, false);
+        let iq = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("group")
+                .attr("id", "120363000000000001")
+                .children([
+                    NodeBuilder::new("parent")
+                        .attr("default_membership_approval_mode", "request_required")
+                        .build(),
+                    NodeBuilder::new("allow_non_admin_sub_group_creation").build(),
+                ])
+                .build()])
+            .build();
+        let response = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert!(response.is_parent_group);
+        assert!(response.parent_membership_approval_required);
+        assert!(response.allow_non_admin_sub_group_creation);
+    }
+
+    /// Server-supplied subgroup identity prevents the parent fallback overlay.
+    #[test]
+    fn test_community_create_iq_success_keeps_linked_subgroup_identity() {
+        let subject = GroupSubject::new("Community fixture").unwrap();
+        let spec = CommunityCreateIq::new(&subject, true, true, true);
+        let parent = Jid::group("120363000000000001");
+        let iq = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("group")
+                .attr("id", "120363000000000002")
+                .children([NodeBuilder::new("linked_parent")
+                    .attr("jid", &parent)
+                    .build()])
+                .build()])
+            .build();
+        let response = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(response.parent_group_jid, Some(parent));
+        assert!(!response.is_parent_group);
+        assert!(!response.parent_membership_approval_required);
+        assert!(!response.allow_non_admin_sub_group_creation);
+    }
+
     /// `parse_response` should overlay parent settings from the request when
     /// the server omits `<parent>` from a community-create reply (WA Web's
     /// CreateJob never reads parent markers from the response either).
