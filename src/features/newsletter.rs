@@ -3780,8 +3780,6 @@ mod tests {
 
     #[tokio::test]
     async fn send_poll_publishes_plaintext_without_a_secret() {
-        use buffa::Message as _;
-
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
         let jid = newsletter_jid();
         let options = vec!["Yes".to_owned(), "No".to_owned(), "Maybe".to_owned()];
@@ -3814,7 +3812,7 @@ mod tests {
             let NodeContentRef::Bytes(bytes) = plaintext.content.as_ref().unwrap() else {
                 panic!("poll payload must be protobuf bytes");
             };
-            let message = wa::Message::decode_from_slice(bytes.as_ref()).unwrap();
+            let message = waproto::codec::message_decode(bytes.as_ref()).unwrap();
             assert_eq!(message, *result.message);
             assert!(message.message_context_info.is_unset());
             assert!(message.poll_creation_message_v2.is_unset());
