@@ -884,7 +884,7 @@ impl<'a> Newsletter<'a> {
     /// let options = ["Yes".to_owned(), "No".to_owned()];
     /// let sent = client.newsletter().send_poll(channel, "Continue?", &options, 1).await?;
     /// let poll = sent.newsletter_ref()?;
-    /// // Add the server id from Event::ServerAck before voting.
+    /// // Obtain the server id from channel history or a live update before voting.
     /// # let _ = poll;
     /// # Ok(()) }
     /// ```
