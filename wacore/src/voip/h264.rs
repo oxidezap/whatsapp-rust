@@ -8,9 +8,9 @@
 /// Largest RTP payload we emit before fragmenting a NAL into FU-A units.
 ///
 /// WhatsApp's iOS sender fills FU-A payloads up to 960 bytes in a live call. With the 28-byte
-/// video RTP header, the 10-byte SRTP tag and a WARP MI tag of at most 20 bytes, such a packet is
-/// at most 1018 bytes, inside the 1163 bytes an SCTP DATA chunk can carry within the relay
-/// association's 1191-byte MTU, so no fragment is split again below RTP.
+/// video RTP header and a WARP MI tag of at most 20 bytes, such a packet is at most 1008 bytes,
+/// inside the 1163 bytes an SCTP DATA chunk can carry within the relay association's 1191-byte
+/// MTU, so no fragment is split again below RTP.
 pub const H264_SINGLE_NAL_MAX: usize = 960;
 /// Largest FU-A fragment body: `H264_SINGLE_NAL_MAX` minus indicator + FU header.
 const H264_FUA_FRAG_MAX: usize = H264_SINGLE_NAL_MAX - 2;
