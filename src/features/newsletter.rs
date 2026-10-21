@@ -30,6 +30,12 @@ use waproto::whatsapp as wa;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum NewsletterError {
+    /// The poll definition failed validation.
+    #[error("{0}")]
+    Poll(#[from] super::polls::PollError),
+    /// Publishing channel content failed.
+    #[error("{0}")]
+    Send(#[from] crate::SendError),
     /// Invalid or missing target identifiers, rejected before network work.
     #[error("{0}")]
     MessageRef(#[from] crate::MessageRefError),
@@ -862,6 +868,40 @@ impl<'a> Newsletter<'a> {
         let server_id = target.require_server_id()?;
         self.send_reaction_raw(target.chat(), server_id.get(), reaction)
             .await
+    }
+
+    /// Publish a text poll to a channel the account can post to.
+    ///
+    /// Use `selectable_count` 1 for a single answer or 0 for multiple answers.
+    /// The poll must have 2 to 12 distinct options, as with [`crate::Polls::create`].
+    /// Channel polls are plaintext and carry no message secret. Vote with
+    /// [`Self::send_poll_vote`] after obtaining the poll's server id.
+    /// The result identifies the sent stanza; it does not confirm server acceptance.
+    ///
+    /// ```no_run
+    /// # use whatsapp_rust::{Client, Jid, NewsletterError};
+    /// # async fn example(client: &Client, channel: &Jid) -> Result<(), NewsletterError> {
+    /// let options = ["Yes".to_owned(), "No".to_owned()];
+    /// let sent = client.newsletter().send_poll(channel, "Continue?", &options, 1).await?;
+    /// let poll = sent.newsletter_ref()?;
+    /// // Add the server id from Event::ServerAck before voting.
+    /// # let _ = poll;
+    /// # Ok(()) }
+    /// ```
+    pub async fn send_poll(
+        &self,
+        jid: &Jid,
+        name: &str,
+        options: &[String],
+        selectable_count: u32,
+    ) -> Result<crate::SendResult, NewsletterError> {
+        if !jid.is_newsletter() {
+            return Err(NewsletterError::InvalidRequest(
+                "send_poll is only valid for newsletter (channel) JIDs".into(),
+            ));
+        }
+        let message = super::polls::build_newsletter_poll_message(name, options, selectable_count)?;
+        Ok(self.client.send_message(jid, message).await?)
     }
 
     /// Replace a poll selection using only the poll's server content id.
@@ -3735,6 +3775,125 @@ mod tests {
             .await;
         assert!(matches!(repeated, Err(NewsletterError::InvalidRequest(_))));
 
+        assert_eq!(transport.sent_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn send_poll_publishes_plaintext_without_a_secret() {
+        use buffa::Message as _;
+
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let jid = newsletter_jid();
+        let options = vec!["Yes".to_owned(), "No".to_owned(), "Maybe".to_owned()];
+        for (index, count) in [1, 0].into_iter().enumerate() {
+            let result = client
+                .newsletter()
+                .send_poll(&jid, "Question?", &options, count)
+                .await
+                .expect("publish poll");
+            let sent = crate::test_utils::decode_sent_iq(&transport, index).await;
+            let node = sent.get();
+            assert_eq!(node.tag.as_ref(), "message");
+            assert_eq!(node.attrs().jid("to"), jid);
+            assert_eq!(
+                node.attrs().required_string("id").unwrap(),
+                result.message_id.as_str()
+            );
+            assert_eq!(node.attrs().required_string("type").unwrap(), "poll");
+            assert!(node.attrs().optional_u64("server_id").is_none());
+            assert!(node.get_optional_child("enc").is_none());
+            assert!(node.get_optional_child("participants").is_none());
+            let meta = node.get_optional_child("meta").unwrap();
+            assert_eq!(
+                meta.attrs().required_string("polltype").unwrap(),
+                "creation"
+            );
+            assert_eq!(meta.attrs().required_string("contenttype").unwrap(), "text");
+            let plaintext = node.get_optional_child("plaintext").unwrap();
+            assert!(plaintext.attrs().optional_string("mediatype").is_none());
+            let NodeContentRef::Bytes(bytes) = plaintext.content.as_ref().unwrap() else {
+                panic!("poll payload must be protobuf bytes");
+            };
+            let message = wa::Message::decode_from_slice(bytes.as_ref()).unwrap();
+            assert_eq!(message, *result.message);
+            assert!(message.message_context_info.is_unset());
+            assert!(message.poll_creation_message_v2.is_unset());
+            let poll = if count == 1 {
+                assert!(message.poll_creation_message.is_unset());
+                message.poll_creation_message_v3.as_option().unwrap()
+            } else {
+                assert!(message.poll_creation_message_v3.is_unset());
+                message.poll_creation_message.as_option().unwrap()
+            };
+            assert_eq!(poll.name.as_deref(), Some("Question?"));
+            assert_eq!(poll.selectable_options_count, Some(count));
+            assert_eq!(
+                poll.poll_content_type,
+                Some(wa::message::PollContentType::TEXT)
+            );
+            assert!(poll.enc_key.is_none());
+            assert!(poll.context_info.is_unset());
+            assert!(poll.correct_answer.is_unset());
+            assert_eq!(
+                poll.options
+                    .iter()
+                    .map(|o| o.option_name.as_deref().unwrap())
+                    .collect::<Vec<_>>(),
+                ["Yes", "No", "Maybe"]
+            );
+            assert!(poll.options.iter().all(|o| o.option_hash.is_none()));
+        }
+    }
+
+    #[tokio::test]
+    async fn send_poll_rejects_invalid_inputs_before_sending() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let options = vec!["Yes".to_owned(), "No".to_owned()];
+        for target in [
+            "123456789@s.whatsapp.net",
+            "123456@g.us",
+            "123456@broadcast",
+            "status@broadcast",
+        ] {
+            let jid: Jid = target.parse().unwrap();
+            assert!(matches!(
+                client.newsletter().send_poll(&jid, "Q", &options, 1).await,
+                Err(NewsletterError::InvalidRequest(_))
+            ));
+        }
+        let jid = newsletter_jid();
+        for (options, count) in [
+            (vec![], 1),
+            (vec!["A".into(), " ".into()], 1),
+            (vec!["A".into()], 1),
+            ((0..13).map(|i| i.to_string()).collect(), 1),
+            (vec!["A".into(), "A".into()], 1),
+            (options.clone(), 2),
+            (options.clone(), 3),
+        ] {
+            assert!(matches!(
+                client
+                    .newsletter()
+                    .send_poll(&jid, "Q", &options, count)
+                    .await,
+                Err(NewsletterError::Poll(crate::PollError::InvalidPoll(_)))
+            ));
+        }
+        assert!(matches!(
+            client.newsletter().send_poll(&jid, " ", &options, 1).await,
+            Err(NewsletterError::Poll(crate::PollError::InvalidPoll(_)))
+        ));
+        for target in ["123456@newsletter", "123456@broadcast", "status@broadcast"] {
+            let jid: Jid = target.parse().unwrap();
+            assert!(matches!(
+                client.polls().create(&jid, "Q", &options, 1).await,
+                Err(crate::PollError::Send(crate::SendError::InvalidRequest(_)))
+            ));
+            assert!(matches!(
+                client.polls().create_quiz(&jid, "Q", &options, 0).await,
+                Err(crate::PollError::Send(crate::SendError::InvalidRequest(_)))
+            ));
+        }
         assert_eq!(transport.sent_count(), 0);
     }
 }

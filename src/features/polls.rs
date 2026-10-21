@@ -54,6 +54,7 @@ impl<'a> Polls<'a> {
 
     /// Create an E2E poll. Use the returned `poll_ref()` for voting or
     /// `secret()` for explicit crypto/persistence interop.
+    /// For plaintext channel polls, use [`super::Newsletter::send_poll`].
     ///
     /// ```no_run
     /// # use whatsapp_rust::{Client, Jid};
@@ -103,22 +104,7 @@ impl<'a> Polls<'a> {
         selectable_count: u32,
         correct_index: Option<usize>,
     ) -> Result<CreatedPoll, PollError> {
-        let poll_msg = build_poll_creation_message(name, options, selectable_count, correct_index)?;
-
-        // WA Web: v3 for single-select, v1 for multi-select (GeneratePollCreationMessageProto.js:39-41)
-        let mut message = if selectable_count == 1 {
-            {
-                let mut proto = wa::Message::default();
-                proto.poll_creation_message_v3 = buffa::MessageField::some(poll_msg);
-                proto
-            }
-        } else {
-            {
-                let mut proto = wa::Message::default();
-                proto.poll_creation_message = buffa::MessageField::some(poll_msg);
-                proto
-            }
-        };
+        let mut message = build_poll_message(name, options, selectable_count, correct_index)?;
 
         // WA Web generates a 32-byte random secret at poll creation time
         // (SendPollCreationMsgAction.js:158). Voters need this to derive their encryption key.
@@ -478,6 +464,51 @@ impl Client {
     pub fn polls(&self) -> Polls<'_> {
         Polls::new(self)
     }
+}
+
+/// Build the content shared by E2E creation and plaintext channel publication.
+/// The caller owns the transport-specific message secret.
+fn build_poll_message(
+    name: &str,
+    options: &[String],
+    selectable_count: u32,
+    correct_index: Option<usize>,
+) -> Result<wa::Message, PollError> {
+    let poll = build_poll_creation_message(name, options, selectable_count, correct_index)?;
+    Ok(wrap_poll_message(poll))
+}
+
+pub(crate) fn build_newsletter_poll_message(
+    name: &str,
+    options: &[String],
+    selectable_count: u32,
+) -> Result<wa::Message, PollError> {
+    if selectable_count > 1 {
+        return Err(PollError::InvalidPoll(
+            "channel polls require selectable_count 0 (multiple answers) or 1 (single answer)"
+                .into(),
+        ));
+    }
+    if name.trim().is_empty() || options.iter().any(|option| option.trim().is_empty()) {
+        return Err(PollError::InvalidPoll(
+            "channel poll questions and options cannot be blank".into(),
+        ));
+    }
+    // Reuse the E2E builder's definition checks without changing its count contract.
+    let mut poll = build_poll_creation_message(name, options, 1, None)?;
+    poll.selectable_options_count = Some(selectable_count);
+    Ok(wrap_poll_message(poll))
+}
+
+fn wrap_poll_message(poll: wa::message::PollCreationMessage) -> wa::Message {
+    // WA Web uses v3 for single-select text polls and v1 for multi-select.
+    let mut message = wa::Message::default();
+    if poll.selectable_options_count == Some(1) {
+        message.poll_creation_message_v3 = buffa::MessageField::some(poll);
+    } else {
+        message.poll_creation_message = buffa::MessageField::some(poll);
+    }
+    message
 }
 
 /// Validate inputs and build a `PollCreationMessage`. A `Some(correct_index)`

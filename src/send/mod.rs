@@ -1610,7 +1610,23 @@ impl Client {
             let stanza_type = stanza_type_override
                 .map(StanzaType::as_wire)
                 .unwrap_or_else(|| wacore::send::stanza_type_from_message(&message));
-            let (_, meta_node) = infer_stanza_metadata(&message);
+            let (_, mut meta_node) = infer_stanza_metadata(&message);
+            // Newsletter publication adds contenttype to the poll creation meta.
+            // E2E metadata does not carry this newsletter-specific attribute.
+            if let Some(poll) = message
+                .poll_creation_message_v3
+                .as_option()
+                .or_else(|| message.poll_creation_message.as_option())
+                && let Some(meta) = meta_node.as_mut()
+            {
+                let content_type =
+                    if poll.poll_content_type == Some(wa::message::PollContentType::IMAGE) {
+                        "image"
+                    } else {
+                        "text"
+                    };
+                meta.attrs.insert("contenttype", content_type);
+            }
             let mut plaintext_builder = NodeBuilder::new("plaintext");
             if let Some(mt) = wacore::send::media_type_from_message(&message) {
                 plaintext_builder = plaintext_builder.attr("mediatype", mt);
