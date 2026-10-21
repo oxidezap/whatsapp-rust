@@ -112,6 +112,9 @@ fn mark_if_dispatchable<Any>(requested: &AtomicBool, req: &ureq::RequestBuilder<
 }
 
 impl UreqHttpClient {
+    /// Create a client with a 10-second connection establishment budget,
+    /// including proxy negotiation and TLS. Both IP families remain enabled.
+    /// Use [`Self::with_agent`] to supply a different connection policy.
     pub fn new() -> Self {
         Self {
             agent: build_agent(),
@@ -167,7 +170,13 @@ fn build_agent() -> ureq::Agent {
         .input_buffer_size(INPUT_BUFFER_BYTES as usize)
         .output_buffer_size(OUTPUT_BUFFER_BYTES as usize)
         .max_idle_connections(MAX_IDLE_CONNECTIONS as usize)
-        .max_idle_connections_per_host(2);
+        .max_idle_connections_per_host(2)
+        // ureq divides this budget across resolved addresses. Without it, a
+        // silent first address uses the OS connect deadline and can outlive
+        // the SDK's 20s version-fetch timeout before trying the other family.
+        // Leave time for DNS and the response; retain both IP families and
+        // avoid racing blocking workers that cannot be cancelled on drop.
+        .timeout_connect(Some(std::time::Duration::from_secs(10)));
 
     #[cfg(feature = "danger-skip-tls-verify")]
     {
@@ -388,6 +397,170 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn default_connect_budget_preserves_custom_agent_policy() {
+        let client = UreqHttpClient::new();
+        assert_eq!(
+            client.agent.config().timeouts().connect,
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            client.agent.config().ip_family(),
+            ureq::config::IpFamily::Any
+        );
+        // A connect bound must not impose a whole-transfer deadline on media.
+        assert_eq!(client.agent.config().timeouts().global, None);
+
+        let custom = UreqHttpClient::with_agent(
+            ureq::config::Config::builder()
+                .timeout_connect(Some(Duration::from_secs(42)))
+                .build()
+                .into(),
+        );
+        assert_eq!(
+            custom.agent.config().timeouts().connect,
+            Some(Duration::from_secs(42))
+        );
+    }
+
+    // Linux drops SYNs once a listener's accept queue is full. Keep its
+    // established sockets alive without accepting them to create a silent TCP
+    // destination entirely on loopback, with no routing/firewall changes.
+    #[cfg(target_os = "linux")]
+    fn silent_listener(addr: &str) -> (TcpListener, Vec<std::net::TcpStream>) {
+        let listener = TcpListener::bind(addr).expect("bind silent loopback listener");
+        let addr = listener.local_addr().unwrap();
+        let mut queued = Vec::new();
+        for _ in 0..512 {
+            match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(50)) {
+                Ok(stream) => queued.push(stream),
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    return (listener, queued);
+                }
+                Err(e) => panic!("filling accept queue: {e}"),
+            }
+        }
+        panic!("loopback accept queue did not saturate");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Debug)]
+    struct FixedResolver(Vec<std::net::SocketAddr>);
+
+    #[cfg(target_os = "linux")]
+    impl ureq::unversioned::resolver::Resolver for FixedResolver {
+        fn resolve(
+            &self,
+            _: &ureq::http::Uri,
+            _: &ureq::config::Config,
+            _: ureq::unversioned::transport::NextTimeout,
+        ) -> std::result::Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error>
+        {
+            let mut addrs = self.empty();
+            for addr in &self.0 {
+                addrs.push(*addr);
+            }
+            Ok(addrs)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fallback_from_silent_family(silent: &str, working: &str) {
+        use ureq::unversioned::transport::DefaultConnector;
+
+        let (silent, _queued) = silent_listener(silent);
+        let working = TcpListener::bind(working).expect("bind working loopback listener");
+        let working_addr = working.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            working.set_nonblocking(true).unwrap();
+            let deadline = wacore::time::Instant::now() + Duration::from_secs(35);
+            let mut stream = loop {
+                match working.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            wacore::time::Instant::now() < deadline,
+                            "fallback never dialed"
+                        );
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("accept fallback: {e}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        let agent = ureq::Agent::with_parts(
+            build_agent().config().clone(),
+            DefaultConnector::default(),
+            FixedResolver(vec![silent.local_addr().unwrap(), working_addr]),
+        );
+        let start = wacore::time::Instant::now();
+        let result = agent
+            .get("http://fallback.invalid/")
+            .config()
+            .proxy(None)
+            // A watchdog for the old unbounded config. With two addresses,
+            // it spends 20s on the first; the fixed 10s connect budget spends
+            // about 6.7s there, leaving time inside the SDK's outer 20s bound.
+            .timeout_global(Some(Duration::from_secs(30)))
+            .build()
+            .call();
+        let elapsed = start.elapsed();
+        server.join().expect("fallback HTTP server");
+        assert_eq!(result.unwrap().body_mut().read_to_string().unwrap(), "ok");
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "fallback took {elapsed:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn silent_ipv6_reaches_ipv4_within_connect_budget() {
+        fallback_from_silent_family("[::1]:0", "127.0.0.1:0");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn silent_ipv4_reaches_ipv6_within_connect_budget() {
+        fallback_from_silent_family("127.0.0.1:0", "[::1]:0");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn silent_only_address_preserves_typed_connect_timeout() {
+        let (silent, _queued) = silent_listener("127.0.0.1:0");
+        let agent = ureq::Agent::with_parts(
+            build_agent().config().clone(),
+            ureq::unversioned::transport::DefaultConnector::default(),
+            FixedResolver(vec![silent.local_addr().unwrap()]),
+        );
+        let error = agent
+            .get("http://fallback.invalid/")
+            .config()
+            .proxy(None)
+            .timeout_connect(Some(Duration::from_millis(100)))
+            .timeout_global(Some(Duration::from_secs(2)))
+            .build()
+            .call()
+            .expect_err("the only address cannot connect");
+        assert!(matches!(
+            error,
+            ureq::Error::Timeout(ureq::Timeout::Connect)
+        ));
+    }
 
     fn spawn_fixed_size_server(body_size: usize) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
