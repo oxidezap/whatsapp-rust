@@ -3,6 +3,7 @@ pub mod blocklist;
 pub mod bot;
 pub mod business;
 pub mod chatstate;
+mod community_create;
 pub mod contacts;
 pub mod devices;
 pub mod dirty;

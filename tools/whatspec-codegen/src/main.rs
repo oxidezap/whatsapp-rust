@@ -305,6 +305,11 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
             rust: true,
         },
         Artifact {
+            path: "wacore/src/iq/community_create.rs",
+            content: emit::community_create::generate(&ir.text("iq/index.json")?, wa_version)?,
+            rust: true,
+        },
+        Artifact {
             path: "wacore/src/iq/pilots.rs",
             content: emit::iq_pilots::generate(&ir.text("iq/index.json")?, wa_version)?,
             rust: true,

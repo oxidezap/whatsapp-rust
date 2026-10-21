@@ -14,6 +14,13 @@ borrowed inputs so an argument rename requires an adapter update, and map the
 private outcomes. Keep legacy group/community result
 extensions in the handwritten adapter.
 
+Community creation consumes a separate named-subject, parent-only projection of
+the whatspec Create contract. Wire tags, attributes, literals, child ordering
+and presence argument bindings come from the IR. The adapter maps `closed` to
+an optional unit value because upstream `optionalMerge` tests nullability,
+including false as present. Ordinary group creation retains its existing builder.
+Description configuration and public partial-success errors stay in the adapter.
+
 This boundary does not replace the full RPC parser: `IqSpec::parse_response`
 has no actual request ID, and the runtime converts errors before calling it.
 Keep those paths unchanged; never synthesize correlation context from response
