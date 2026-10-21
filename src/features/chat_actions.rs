@@ -337,8 +337,10 @@ pub(crate) fn dispatch_chat_mutation_outcome(
             }
         }
         "lock" => {
+            // WAWebLockChatSync rejects an omitted `locked`; it is not an unlock.
             if let Some(val) = &m.action_value
                 && let Some(act) = val.lock_chat_action.as_option()
+                && act.locked.is_some()
             {
                 event_bus.dispatch(Event::LockChatUpdate(
                     LockChatUpdate::builder()
@@ -1642,6 +1644,31 @@ mod registry_tests {
         }
     }
 
+    #[test]
+    fn a_lock_without_a_locked_value_is_malformed() {
+        for jid in ["12025550111@s.whatsapp.net", "100000012345678@lid"] {
+            for full_sync in [false, true] {
+                let m = Mutation {
+                    index: vec!["lock".into(), jid.into()],
+                    operation: wa::syncd_mutation::SyncdOperation::SET,
+                    action_value: Some({
+                        let mut value = wa::SyncActionValue::default();
+                        value.lock_chat_action = buffa::MessageField::some(
+                            wa::sync_action_value::LockChatAction::default(),
+                        );
+                        value
+                    }),
+                };
+                let (outcome, events) = dispatch_outcome_into_recorder_with(&m, full_sync);
+                assert_eq!(
+                    outcome,
+                    AppStateDispatchOutcome::Malformed("LockChatUpdate")
+                );
+                assert!(events.is_empty());
+            }
+        }
+    }
+
     /// One mutation per kind `dispatch_chat_mutation_outcome` claims, plus a
     /// contact removal, each stamped with `timestamp`.
     fn every_chat_mutation(timestamp: Option<i64>) -> Vec<Mutation> {
@@ -1726,7 +1753,11 @@ mod registry_tests {
             }),
             set(&["lock", CHAT], {
                 let mut proto = wa::SyncActionValue::default();
-                proto.lock_chat_action = buffa::MessageField::some(sav::LockChatAction::default());
+                proto.lock_chat_action = buffa::MessageField::some({
+                    let mut action = sav::LockChatAction::default();
+                    action.locked = Some(true);
+                    action
+                });
                 proto
             }),
             set(&["userStatusMute", CHAT], {
