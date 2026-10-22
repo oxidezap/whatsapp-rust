@@ -3011,7 +3011,7 @@ impl CallEngine {
                 // Our video can go out from here on; the keyframe it starts with is asked for now,
                 // as the one the encoder may have made already was dropped with the stale queue.
                 if self.group.is_none() {
-                    self.announce_video_keyframe();
+                    self.require_video_keyframe();
                 }
                 if self.media.is_some() {
                     self.rtcp_deadline = now + RTCP_MS;
@@ -11310,6 +11310,7 @@ mod tests {
         let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
         eng.start(0, 0);
         let _ = drain(&mut eng);
+        allocate(&mut eng);
         eng.handle_input(1, Input::VideoFrame(&video_au(20_000)));
         let (video, fec) = split(&drain(&mut eng).0);
         assert!(video.len() >= 16, "a keyframe of several groups");
@@ -11816,6 +11817,32 @@ mod tests {
         );
         eng.handle_input(4, Input::VideoFrame(&video_au(3000)));
         assert!(count_transmits(&drain(&mut eng).0) > 0);
+    }
+
+    #[test]
+    fn allocation_rearms_the_keyframe_request_without_prior_video() {
+        let mut cfg = config(true);
+        cfg.enable_video = true;
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        let success = allocate_success(&eng);
+        eng.handle_input(2, Input::RelayPacket(&success));
+        assert_eq!(
+            drain(&mut eng)
+                .0
+                .iter()
+                .filter(|output| matches!(output, Output::Event(CallEvent::VideoKeyframeNeeded)))
+                .count(),
+            1
+        );
+        eng.handle_input(3, Input::RelayPacket(&success));
+        assert!(
+            !drain(&mut eng)
+                .0
+                .iter()
+                .any(|output| matches!(output, Output::Event(CallEvent::VideoKeyframeNeeded)))
+        );
     }
 
     #[test]

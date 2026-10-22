@@ -837,8 +837,7 @@ async fn run_call_with_clock_and_wallclock(
     let mut timed_video_in_open = true;
     let mut video_generation = 0u64;
     let mut video_ctl_open = true;
-    // Set by a `Disable` to drain the video input queue after the select block (it can't be drained
-    // inside, where the arm futures borrow the channel).
+    // Retire input after allocation or Disable, once the select futures release their borrows.
     let mut drain_video_in = false;
 
     // Decouple sending from receive/playout. Outbound packets are queued and the in-flight send is
@@ -1455,7 +1454,11 @@ async fn run_call_with_clock_and_wallclock(
             },
             ev = relay_events.recv().fuse() => match ev {
                 Ok(RelayTransportEvent::PacketReceived(data)) => {
+                    let was_allocated = eng.is_allocated();
                     eng.handle_input(now_ms(), Input::RelayPacket(&data));
+                    if !was_allocated && eng.is_allocated() && !eng.is_group() {
+                        drain_video_in = true;
+                    }
                     let now = now_ms();
                     if let Some(at) = eng.poll_timeout()
                         && at != engine::NEVER
@@ -1548,11 +1551,19 @@ async fn run_call_with_clock_and_wallclock(
             () = &mut pace_timer => {},
         }
 
-        // Post-select: the arm futures (which borrow the channels) have been dropped, so it is now
-        // safe to drain the video input queue requested by a Disable above.
+        // Post-select: the arm futures have released their channel borrows.
         if drain_video_in {
             drain_video_in = false;
-            while channels.video_in.try_recv().is_ok() {}
+            // Drain the backlog before the allocation's keyframe request reaches the producer.
+            // Bound each drain so a concurrent encoder cannot keep this loop busy indefinitely.
+            for _ in 0..channels.video_in.len() {
+                let _ = channels.video_in.try_recv();
+            }
+            if let Some(input) = channels.timed_video_in.as_ref() {
+                for _ in 0..input.len() {
+                    let _ = input.try_recv();
+                }
+            }
         }
     }
 
@@ -3257,8 +3268,7 @@ mod tests {
     // Video through the real drive loop: Enable + orientation via video_ctl (biased ahead of the
     // media arms), mirrored peer video packets via the relay (reassemble to video_out with the
     // orientation stamped), one of our own AUs via video_in (fans out to PT-97 FU-A transmits).
-    // Deterministic: queues drain by bias order on virtual time, which the pacer needs to let the
-    // video out, and the relay closes once a timer fires past the horizon, long after it has.
+    // Poll through allocation with both input queues backlogged, then supply fresh video.
     #[test]
     fn drive_loop_routes_video_both_ways() {
         use crate::voip::rtp::{RTP_PAYLOAD_TYPE_H264, VIDEO_TS_STRIDE_15FPS, parse_rtp_header};
@@ -3267,12 +3277,7 @@ mod tests {
 
         let (relay_tx, relay_rx) = async_channel::unbounded();
         let clock = Arc::new(AtomicU64::new(0));
-        let rt: Arc<dyn Runtime> = Arc::new(ScheduleRuntime {
-            clock: clock.clone(),
-            arms: Arc::new(Mutex::new(Vec::new())),
-            relay_tx: relay_tx.clone(),
-            horizon_ms: 5_000,
-        });
+        let rt: Arc<dyn Runtime> = Arc::new(PendingSleepRuntime);
         let transport = Arc::new(RecordingTransport {
             allocate_answers: Some(relay_tx.clone()),
             ..RecordingTransport::default()
@@ -3346,7 +3351,7 @@ mod tests {
         }
 
         let eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
-        futures::executor::block_on(run_call_with_clock(
+        let drive = run_call_with_clock(
             rt,
             transport.clone() as Arc<dyn RelayTransport>,
             relay_rx,
@@ -3366,7 +3371,30 @@ mod tests {
             },
             eng,
             move || clock.load(Ordering::Relaxed),
-        ));
+        );
+        futures::pin_mut!(drive);
+        assert!(drive.as_mut().now_or_never().is_none());
+        assert!(
+            transport.sent.lock().unwrap().iter().all(|packet| {
+                parse_rtp_header(packet).is_none_or(|h| h.payload_type != RTP_PAYLOAD_TYPE_H264)
+            }),
+            "both pre-allocation input queues must be retired before publishing readiness"
+        );
+
+        vin_tx.try_send(our_au.clone()).unwrap();
+        vin_tx.try_send(our_au.clone()).unwrap();
+        for timestamp in [9000, 18000] {
+            timed_tx
+                .try_send(VideoInput {
+                    data: our_au.clone(),
+                    timestamp,
+                    generation: 7,
+                })
+                .unwrap();
+        }
+        assert!(drive.as_mut().now_or_never().is_none());
+        relay_tx.close();
+        futures::executor::block_on(drive);
 
         // RTP frame metadata takes precedence over the signaling fallback.
         let frames: Vec<VideoFrame> = std::iter::from_fn(|| vout_rx.try_recv().ok()).collect();
@@ -3577,7 +3605,6 @@ mod tests {
         const FRAGMENTS: usize = 32;
         let mut au = vec![0, 0, 0, 1, 0x65];
         au.extend(vec![0x55; 30_000]);
-        video_tx.try_send(au).unwrap();
         let engine = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
         let clock = rt.clock.clone();
         let mut drive = Box::pin(run_call_with_clock(
@@ -3589,6 +3616,8 @@ mod tests {
             move || clock.load(Ordering::Relaxed),
         ));
         let mut context = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(drive.as_mut().poll(&mut context).is_pending());
+        video_tx.try_send(au).unwrap();
         for _ in 0..100 {
             assert!(drive.as_mut().poll(&mut context).is_pending());
             let count = transport
