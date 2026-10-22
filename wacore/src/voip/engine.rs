@@ -2666,6 +2666,20 @@ impl CallEngine {
             .saturating_add(access_units);
     }
 
+    pub(crate) fn reset_video_fec(&mut self) {
+        if let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut()) {
+            video.pipe.reset_send_fec();
+        }
+    }
+
+    pub(crate) fn note_video_fec_sent(&mut self, bytes: usize) {
+        self.media_stats.video_fec_sent = self.media_stats.video_fec_sent.saturating_add(1);
+        self.media_stats.video_fec_bytes_sent = self
+            .media_stats
+            .video_fec_bytes_sent
+            .saturating_add(bytes as u64);
+    }
+
     /// Fold in inbound media the transport dropped before the engine could see it.
     ///
     /// The drop happens one crate out, in the relay read pump, so the engine cannot observe it
@@ -4248,16 +4262,11 @@ impl CallEngine {
             let packet = Bytes::from(packet);
             // A repair packet is never asked for again: the peer NACKs video sequence numbers,
             // and a lost repair packet is only worth what it could have repaired.
-            if packet
-                .get(1)
-                .is_some_and(|b| b & 0x7f == RTP_PAYLOAD_TYPE_VIDEO_FEC)
+            if answers_nacks
+                && !packet
+                    .get(1)
+                    .is_some_and(|b| b & 0x7f == RTP_PAYLOAD_TYPE_VIDEO_FEC)
             {
-                self.media_stats.video_fec_sent = self.media_stats.video_fec_sent.saturating_add(1);
-                self.media_stats.video_fec_bytes_sent = self
-                    .media_stats
-                    .video_fec_bytes_sent
-                    .saturating_add(packet.len() as u64);
-            } else if answers_nacks {
                 v.sent.record(&packet);
             }
             self.outbox.push_back(Output::Transmit(packet));
@@ -11310,6 +11319,7 @@ mod tests {
         let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
         eng.start(0, 0);
         let _ = drain(&mut eng);
+        allocate(&mut eng);
         eng.handle_input(1, Input::VideoFrame(&video_au(20_000)));
         let (video, fec) = split(&drain(&mut eng).0);
         assert!(video.len() >= 16, "a keyframe of several groups");
@@ -11321,12 +11331,12 @@ mod tests {
             assert_eq!(header.sequence_number, index as u16 + 1);
             assert!(header.marker);
         }
-        let stats = eng.media_stats();
-        assert_eq!(stats.video_fec_sent as usize, fec.len());
         assert_eq!(
-            stats.video_fec_bytes_sent,
-            fec.iter().map(|packet| packet.len() as u64).sum::<u64>()
+            eng.media_stats().video_fec_sent,
+            0,
+            "generation is not a transport write"
         );
+        assert_eq!(eng.media_stats().video_fec_bytes_sent, 0);
 
         // The peer reports a tenth of our video lost: FEC doubles.
         let peer_keys = derive_srtcp_keys(&call_key, PEER_LID).unwrap();

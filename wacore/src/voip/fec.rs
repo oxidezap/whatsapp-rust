@@ -366,7 +366,7 @@ pub fn recover_packet(fec_payload: &[u8], received: &[&[u8]]) -> Option<Vec<u8>>
 /// into several groups of about the same size.
 pub(crate) struct VideoFecSender {
     config: VideoFecConfig,
-    lossy: bool,
+    fraction_lost: u8,
     parity: Parity,
     /// The size of each group the current access unit closes, counting packets carried over.
     plan: VecDeque<usize>,
@@ -376,7 +376,7 @@ impl VideoFecSender {
     pub(crate) fn new(config: VideoFecConfig) -> Self {
         Self {
             config,
-            lossy: false,
+            fraction_lost: 0,
             parity: Parity::default(),
             plan: VecDeque::new(),
         }
@@ -389,19 +389,18 @@ impl VideoFecSender {
     pub(crate) fn set_config(&mut self, config: VideoFecConfig) {
         self.config = config;
         if !config.enabled {
-            self.parity.reset();
-            self.plan.clear();
+            self.reset();
         }
     }
 
     /// The fraction (in 256ths) of our video the peer's latest RTCP report says it lost.
     pub(crate) fn observe_loss(&mut self, fraction_lost: u8) {
-        self.lossy = fraction_lost > self.config.loss_threshold;
+        self.fraction_lost = fraction_lost;
     }
 
     /// Video packets per repair packet at the moment.
     pub(crate) fn group_size(&self) -> usize {
-        let wanted = if self.lossy {
+        let wanted = if self.fraction_lost > self.config.loss_threshold {
             self.config.lossy_group
         } else {
             self.config.clean_group
@@ -415,8 +414,12 @@ impl VideoFecSender {
         if !self.config.enabled {
             return;
         }
-        let total = self.parity.count + packets;
         let size = self.group_size();
+        // A new threshold can shrink the target below the carried group.
+        if self.parity.count >= size {
+            self.parity.reset();
+        }
+        let total = self.parity.count + packets;
         if total < size {
             return;
         }
@@ -434,6 +437,11 @@ impl VideoFecSender {
         );
     }
 
+    pub(crate) fn reset(&mut self) {
+        self.parity.reset();
+        self.plan.clear();
+    }
+
     /// Add one plaintext RTP packet of the planned access unit. `Some(repair payload)` when it
     /// closes a group: the repair packet goes on the wire right after it.
     pub(crate) fn push(&mut self, packet: &[u8]) -> Option<Vec<u8>> {
@@ -449,6 +457,10 @@ impl VideoFecSender {
         if !self.parity.add(packet) {
             self.parity.reset();
             self.plan.clear();
+            return None;
+        }
+        if self.plan.is_empty() && self.parity.count >= self.group_size() {
+            self.parity.reset();
             return None;
         }
         if self.plan.front() == Some(&self.parity.count) {
@@ -714,6 +726,42 @@ mod tests {
             vec![9, 8, 8]
         );
         assert!(groups.iter().all(|group| group.len() <= FEC_MAX_GROUP));
+    }
+
+    #[test]
+    fn changing_the_threshold_reclassifies_the_latest_report() {
+        let mut sender = VideoFecSender::new(VideoFecConfig::default());
+        sender.observe_loss(13);
+        assert_eq!(sender.group_size(), 4);
+        sender.set_config(VideoFecConfig {
+            loss_threshold: 20,
+            ..VideoFecConfig::default()
+        });
+        assert_eq!(sender.group_size(), 8);
+        sender.set_config(VideoFecConfig::default());
+        assert_eq!(sender.group_size(), 4);
+    }
+
+    #[test]
+    fn a_smaller_target_retires_a_larger_carried_group() {
+        let mut sender = VideoFecSender::new(VideoFecConfig::default());
+        let (groups, next) = run(&mut sender, &[7], 1);
+        assert!(groups.is_empty());
+        sender.observe_loss(13);
+        let (groups, _) = run(&mut sender, &[4], next);
+        assert_eq!(groups, vec![(next..next + 4).collect::<Vec<_>>()]);
+    }
+
+    #[test]
+    fn a_mid_frame_discontinuity_does_not_poison_the_next_plan() {
+        let mut sender = VideoFecSender::new(VideoFecConfig::default());
+        sender.begin_access_unit(40);
+        for sequence in (1..=40).filter(|sequence| *sequence != 2) {
+            sender.push(&video_packet(sequence, 0, sequence == 40, 100));
+        }
+        let (groups, _) = run(&mut sender, &[8], 41);
+        assert!(!groups.is_empty());
+        assert!(sender.parity.count < sender.group_size());
     }
 
     #[test]

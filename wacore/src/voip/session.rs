@@ -912,6 +912,12 @@ impl VideoPipeline {
         })
     }
 
+    pub(crate) fn reset_send_fec(&mut self) {
+        if let Some(fec) = self.fec.as_mut() {
+            fec.sender.reset();
+        }
+    }
+
     /// Send forward error correction with our video on `ssrc`, configured by `config`. Called
     /// again it changes the configuration only: the stream keeps its SSRC, sequence numbers and
     /// rollover counter, which must never repeat under the same keys.
