@@ -211,10 +211,12 @@ fn discard_queued_fec(queue: &mut VecDeque<SendBatch>, pending: &mut Vec<Bytes>)
         dropped = dropped.saturating_add(u32::from(fec));
         !fec
     };
-    for batch in queue {
+    for batch in queue.iter_mut() {
         batch.packets.retain(&mut retain);
         batch.bytes = batch.packets.iter().map(Bytes::len).sum();
     }
+    // A started batch may contain only its trailing repair.
+    queue.retain(|batch| !batch.packets.is_empty());
     pending.retain(retain);
     dropped
 }
@@ -3578,6 +3580,82 @@ mod tests {
             queue[0].bytes,
             queue[0].packets.iter().map(Bytes::len).sum::<usize>()
         );
+    }
+
+    fn retiring_a_started_fec_tail_keeps_video_moving(overflow: bool) {
+        use crate::voip::rtp::{VideoRtpStream, encode_rtp_header};
+
+        let mut stream = VideoRtpStream::new(0x1122_3344, 4500).unwrap();
+        let first = Bytes::from(encode_rtp_header(
+            &stream.next_video_packet(true, VIDEO_MEDIA_FRAME_INFO_IDR),
+        ));
+        let mut repair = first.to_vec();
+        repair[1] = (repair[1] & 0x80) | RTP_PAYLOAD_TYPE_VIDEO_FEC;
+        let mut queue = VecDeque::new();
+        let mut pending = Vec::new();
+        let mut gate = SendKeyframeGate::default();
+        queue_transmit(&mut queue, &mut pending, &mut gate, first.clone());
+        queue_transmit(&mut queue, &mut pending, &mut gate, Bytes::from(repair));
+        assert_eq!(pop_next_packet(&mut queue, true).unwrap().0, first);
+        assert!(queue[0].started);
+        assert_eq!(queue[0].packets.len(), 1);
+
+        let delta =
+            overflow.then(|| Bytes::from(encode_rtp_header(&stream.next_video_packet(true, 0))));
+        let fresh = Bytes::from(encode_rtp_header(
+            &stream.next_video_packet(true, VIDEO_MEDIA_FRAME_INFO_IDR),
+        ));
+        let mut controls = 0;
+        if let Some(delta) = delta {
+            queue_transmit(&mut queue, &mut pending, &mut gate, delta);
+            queue_transmit(&mut queue, &mut pending, &mut gate, fresh.clone());
+            let mut dropped = 0;
+            controls = SEND_QUEUE_BATCH_CAP - 2;
+            for _ in 0..controls {
+                dropped += enqueue_batch(
+                    &mut queue,
+                    &mut gate,
+                    SendBatch::packet(Bytes::from_static(&[0, 1])),
+                )
+                .video_access_units;
+            }
+            assert_eq!(dropped, 1, "overflow must shed the unstarted delta");
+        } else {
+            assert_eq!(purge_unstarted_video(&mut queue, &mut gate).packets, 0);
+        }
+        assert_eq!(discard_queued_fec(&mut queue, &mut pending), 1);
+        if !overflow {
+            queue_transmit(&mut queue, &mut pending, &mut gate, fresh.clone());
+        }
+        let mut sent_video = Vec::new();
+        let mut sent_controls = 0;
+        while let Some((packet, kind)) = pop_next_packet(&mut queue, true) {
+            if kind == SendBatchKind::Video {
+                sent_video.push(packet);
+            } else {
+                sent_controls += 1;
+            }
+        }
+        assert_eq!(
+            sent_video,
+            vec![fresh],
+            "a retired repair must not block later video"
+        );
+        assert_eq!(sent_controls, controls);
+        assert!(
+            queue.is_empty(),
+            "an empty batch must not keep the pacer armed"
+        );
+    }
+
+    #[test]
+    fn disabling_after_the_last_video_packet_does_not_block_resumed_video() {
+        retiring_a_started_fec_tail_keeps_video_moving(false);
+    }
+
+    #[test]
+    fn overflow_after_the_last_video_packet_does_not_block_the_next_keyframe() {
+        retiring_a_started_fec_tail_keeps_video_moving(true);
     }
 
     #[test]
