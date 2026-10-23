@@ -411,6 +411,8 @@ impl StanzaHandler for CallHandler {
                     #[cfg(feature = "voip-control")]
                     let mut accepting_device_capability = None;
                     #[cfg(feature = "voip-control")]
+                    let mut caller_transport: Option<(Jid, Jid)> = None;
+                    #[cfg(feature = "voip-control")]
                     if matches!(
                         &call.action,
                         CallAction::PreAccept { .. } | CallAction::Accept { .. }
@@ -553,6 +555,10 @@ impl StanzaHandler for CallHandler {
                             {
                                 return true;
                             }
+                            // #1098: answer the callee's `<accept>` with our `<transport>`, as the
+                            // phone does when it is the caller. Sent after the accept's own
+                            // stanzas (rotation, sibling dismiss) below.
+                            caller_transport = Some((sender.clone(), creator.clone()));
                         } else {
                             client
                                 .call_registry()
@@ -618,6 +624,26 @@ impl StanzaHandler for CallHandler {
                     // rejects an outbound call of ours, tell the rest to stop ringing.
                     #[cfg(feature = "voip-control")]
                     dismiss_outgoing_siblings(&client, &call).await;
+                    #[cfg(feature = "voip-control")]
+                    if let Some((to, creator)) = caller_transport.take() {
+                        let transport = wacore::stanza::call::build_transport(
+                            &wacore::stanza::call::TransportParams {
+                                call_id: call.action.call_id(),
+                                to: &to,
+                                call_creator: &creator,
+                                p2p_cand_round: Some("1"),
+                                transport_message_type: Some("1"),
+                                relay_te: None,
+                            },
+                        );
+                        crate::voip::facade::send_caller_call_signal(
+                            &client,
+                            transport,
+                            "transport",
+                            call.action.call_id(),
+                        )
+                        .await;
+                    }
                     // A <terminate> for a call that was still ringing (an incoming offer we never
                     // answered) gets a terminal outcome. We mirror WA Web's
                     // ActionWebHandleIncomingSignalingMessage, which maps it from the `reason`:
@@ -3831,7 +3857,8 @@ mod tests {
             .expect("accepted 1:1 call retains both active device capabilities");
         assert_eq!(fallback.len(), 2);
         assert_eq!(fallback[1].devices[0].jid, fake_caller_lid());
-        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // Only the caller-side <transport> answering the accept (#1098).
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(matches!(
             global_rx.try_recv().as_deref(),
             Ok(Event::IncomingCall(call)) if matches!(call.action, CallAction::Accept { .. })
@@ -5203,9 +5230,10 @@ mod tests {
                 .is_none(),
             "the rung device set must be consumed one-shot"
         );
+        // The sibling's dismiss plus the caller-side <transport> to the answerer (#1098).
         assert_eq!(
             sends.load(std::sync::atomic::Ordering::SeqCst),
-            1,
+            2,
             "the routed answerer must not receive accepted_elsewhere"
         );
     }

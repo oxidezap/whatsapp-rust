@@ -63,6 +63,11 @@ enum AudioEndpoints {
         source: Arc<dyn AudioSource>,
         sink: Arc<dyn AudioSink>,
     },
+    /// PCM I/O on standard Opus instead of MLOW (decoded by the native libopus codec).
+    PcmOpus {
+        source: Arc<dyn AudioSource>,
+        sink: Arc<dyn AudioSink>,
+    },
     Encoded {
         format: AudioFormat,
         source: Arc<dyn EncodedAudioSource>,
@@ -75,6 +80,10 @@ impl AudioEndpoints {
         match self {
             Self::Pcm { .. } => wacore::voip_control::MediaAudioSpec::builder()
                 .format(wacore::voip_control::MediaAudioFormat::MLOW_16KHZ_60MS)
+                .io(wacore::voip_control::MediaAudioIo::Pcm)
+                .build(),
+            Self::PcmOpus { .. } => wacore::voip_control::MediaAudioSpec::builder()
+                .format(wacore::voip_control::MediaAudioFormat::OPUS_16KHZ_60MS)
                 .io(wacore::voip_control::MediaAudioIo::Pcm)
                 .build(),
             Self::Encoded { format, .. } => wacore::voip_control::MediaAudioSpec::builder()
@@ -91,7 +100,7 @@ impl AudioEndpoints {
     /// The neutral opening ports this endpoint pair maps to, moving the trait objects across.
     fn into_ports(self) -> wacore::voip_control::MediaAudioPorts {
         match self {
-            Self::Pcm { source, sink } => {
+            Self::Pcm { source, sink } | Self::PcmOpus { source, sink } => {
                 wacore::voip_control::MediaAudioPorts::Pcm { source, sink }
             }
             Self::Encoded { source, sink, .. } => {
@@ -111,6 +120,23 @@ macro_rules! impl_media_builder_methods {
             K: AudioSink,
         {
             self.audio = Some(AudioEndpoints::Pcm {
+                source: Arc::new(source),
+                sink: Arc::new(sink),
+            });
+            self
+        }
+
+        /// Like [`audio`](Self::audio), but negotiate standard Opus instead of MLOW.
+        ///
+        /// MLOW's decoder drops the peer's 10 ms frames at talkspurt starts, so the first second of
+        /// what the callee says can go missing (#1098). Opus does not, and the native build decodes
+        /// it with libopus.
+        pub fn audio_opus<S, K>(mut self, source: S, sink: K) -> Self
+        where
+            S: AudioSource,
+            K: AudioSink,
+        {
+            self.audio = Some(AudioEndpoints::PcmOpus {
                 source: Arc::new(source),
                 sink: Arc::new(sink),
             });
@@ -2148,7 +2174,14 @@ async fn place_call(
     // The relay arrives in the `<ack type=offer>` reply to the offer's stanza id (live-only, needs a
     // real server). Wait on the ack-waiter with a bounded timeout; attach the engine when the relay
     // lands, else fail the call so a parked wait_ended() resolves.
-    spawn_outgoing_relay_waiter(client, call_id.clone(), generation, ack_guard, ack_rx);
+    spawn_outgoing_relay_waiter(
+        client,
+        call_id.clone(),
+        generation,
+        ack_guard,
+        ack_rx,
+        Some((peer.clone(), call_creator.clone())),
+    );
 
     // No await between transferring ownership and returning the handle: cancellation before this
     // point owns local cleanup, including an offer write whose delivery is ambiguous.
@@ -2196,6 +2229,7 @@ fn spawn_outgoing_relay_waiter(
     generation: u64,
     ack_guard: crate::request::ResponseWaiterGuard,
     ack_rx: futures::channel::oneshot::Receiver<Arc<wacore_binary::OwnedNodeRef>>,
+    caller: Option<(Jid, Jid)>,
 ) {
     // Upgrade the client's self-weak so the task owns an Arc<Client> for the duration of the wait.
     let Some(client) = client.self_weak.get().and_then(|w| w.upgrade()) else {
@@ -2215,9 +2249,24 @@ fn spawn_outgoing_relay_waiter(
                 match wacore::runtime::timeout(&*runtime, OFFER_ACK_RELAY_TIMEOUT, ack_rx).await {
                     // The ack node re-encoded as OwnedNodeRef; find its <relay> child and parse it (same
                     // path the incoming offer uses). handle_ack_response already removed our waiter entry.
-                    Ok(Ok(ack)) => wacore::stanza::call::find_relay(ack.get())
-                        .and_then(wacore::voip_control::relay_parse::parse_relay_data)
-                        .ok_or("the server acked the offer but carried no relay"),
+                    Ok(Ok(ack)) => {
+                        let relay = wacore::stanza::call::find_relay(ack.get())
+                            .and_then(wacore::voip_control::relay_parse::parse_relay_data)
+                            .ok_or("the server acked the offer but carried no relay");
+                        if let (Ok(relay), Some((peer, call_creator))) = (&relay, &caller) {
+                            let devices = offer_ack_devices(ack.get());
+                            send_caller_relay_latency(
+                                &client,
+                                &call_id,
+                                peer,
+                                call_creator,
+                                relay,
+                                &devices,
+                            )
+                            .await;
+                        }
+                        relay
+                    }
                     // Sender dropped (disconnect cleared the waiter map) or the timeout elapsed:
                     // handle_ack_response never ran, so our still-registered waiter entry must be dropped
                     // here or send_keepalive suppresses pings for the life of the connection.
@@ -2249,6 +2298,118 @@ fn spawn_outgoing_relay_waiter(
             }
         }))
         .detach();
+}
+
+/// The callee devices the server lists in its `<ack type=offer>` (`<user><device jid>`).
+fn offer_ack_devices(ack: &wacore_binary::NodeRef<'_>) -> Vec<Jid> {
+    fn walk(node: &wacore_binary::NodeRef<'_>, out: &mut Vec<Jid>) {
+        let Some(children) = node.children() else {
+            return;
+        };
+        for child in children.iter() {
+            match child.tag.as_ref() {
+                // Relay blocks carry keys/tokens and never devices; skip them.
+                "relay" => {}
+                "device" => {
+                    if let Some(jid) = child.attrs().optional_jid("jid")
+                        && !out.contains(&jid)
+                    {
+                        out.push(jid);
+                    }
+                }
+                _ => walk(child, out),
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(ack, &mut out);
+    out
+}
+
+/// How long to watch for the server's ack of a caller-side `<relaylatency>`/`<transport>`.
+/// Diagnostic only: nothing waits on it.
+const CALLER_SIGNAL_ACK_WATCH: Duration = Duration::from_secs(5);
+
+/// Send a caller-side call stanza with a fresh `<call id>` and log whether the server acks it.
+///
+/// #1098: as the caller the library sent neither `<relaylatency>` nor `<transport>`, and the relay
+/// then never routed the callee's RTP to us. Both need an `id` on the `<call>` wrapper, or the
+/// server ignores them (reported on the issue by a second implementation).
+pub(crate) async fn send_caller_call_signal(
+    client: &Arc<Client>,
+    mut node: wacore_binary::Node,
+    what: &'static str,
+    call_id: &str,
+) {
+    let id = client.generate_request_id();
+    node.attrs.insert("id", id.clone());
+    let waiter = client.try_register_ack_waiter(&id);
+    if let Err(e) = client.send_node(node).await {
+        warn!("voip: failed to send caller {what} for {call_id}: {e}");
+        if let Some((_, generation)) = waiter {
+            drop(crate::request::ResponseWaiterGuard::new(
+                client.response_waiters.clone(),
+                id,
+                generation,
+            ));
+        }
+        return;
+    }
+    let Some((rx, generation)) = waiter else {
+        log::info!("voip: sent caller {what} for {call_id}");
+        return;
+    };
+    let guard =
+        crate::request::ResponseWaiterGuard::new(client.response_waiters.clone(), id, generation);
+    let runtime = client.runtime.clone();
+    let call_id = call_id.to_string();
+    runtime
+        .clone()
+        .spawn(Box::pin(async move {
+            let _guard = guard;
+            match wacore::runtime::timeout(&*runtime, CALLER_SIGNAL_ACK_WATCH, rx).await {
+                Ok(Ok(_)) => log::info!("voip: server acked caller {what} for {call_id}"),
+                _ => log::warn!("voip: no server ack for caller {what} for {call_id}"),
+            }
+        }))
+        .detach();
+}
+
+/// #1098: announce, as the caller, the relay we dial, the way the phone does for its own calls.
+async fn send_caller_relay_latency(
+    client: &Arc<Client>,
+    call_id: &str,
+    peer: &Jid,
+    call_creator: &Jid,
+    relay: &RelayData,
+    devices: &[Jid],
+) {
+    let Some(endpoint) = wacore::voip_control::relay_parse::get_media_relay_endpoint(relay) else {
+        return;
+    };
+    let Some(address) = endpoint.ipv4_te2_bytes else {
+        warn!(
+            "voip: caller relaylatency for {call_id} skipped: {} has no te2",
+            endpoint.relay_name
+        );
+        return;
+    };
+    let node =
+        wacore::stanza::call::build_relay_latency(&wacore::stanza::call::RelayLatencyParams {
+            call_id,
+            to: peer,
+            call_creator,
+            latency_ms: endpoint.c2r_rtt_ms.unwrap_or(40),
+            relay_name: &endpoint.relay_name,
+            address_bytes: &address,
+            devices,
+        });
+    log::info!(
+        "voip: caller relaylatency for {call_id}: relay {} to {} device(s)",
+        endpoint.relay_name,
+        devices.len()
+    );
+    send_caller_call_signal(client, node, "relaylatency", call_id).await;
 }
 
 /// Fire-and-forget issuance of our trusted-contact token to the callee after an outgoing offer,
@@ -8553,9 +8714,10 @@ mod tests {
     // listed here (suffixes only, so this list is not its own evidence of a caller) with the reason.
     #[test]
     fn call_stanza_builders_are_wired_to_the_runtime() {
-        // Media-plane keepalives: no public call-control method claims to send them today, and what
-        // the official client emits for them is not established here. See the audit notes.
-        const UNWIRED: &[&str] = &["transport", "relay_latency", "heartbeat"];
+        // Media-plane keepalive: no public call-control method claims to send it today, and what
+        // the official client emits for it is not established here. See the audit notes.
+        // (`transport` and `relay_latency` are sent by the caller since #1098.)
+        const UNWIRED: &[&str] = &["heartbeat"];
         const CALLERS: &[&str] = &[
             "src/voip/facade.rs",
             "src/client/voip.rs",
@@ -11663,6 +11825,7 @@ mod tests {
             0,
             ack_guard,
             ack_rx,
+            None,
         );
 
         // The spawned task drops the now-dangling waiter on the no-ack path.
