@@ -334,6 +334,37 @@ fn self_peer_target(device: &wacore::store::Device) -> Result<Jid, crate::client
     Ok(Jid::pn(pn.user.clone()))
 }
 
+fn history_sync_on_demand_message(
+    chat_jid: &Jid,
+    oldest_msg_id: &str,
+    oldest_msg_from_me: bool,
+    oldest_msg_timestamp_ms: i64,
+    count: i32,
+) -> wa::Message {
+    let pdo_request = {
+        let mut proto = wa::message::PeerDataOperationRequestMessage::default();
+        proto.peer_data_operation_request_type =
+            Some(wa::message::PeerDataOperationRequestType::HISTORY_SYNC_ON_DEMAND);
+        proto.history_sync_on_demand_request = buffa::MessageField::some({
+            let mut proto = wa::message::peer_data_operation_request_message::HistorySyncOnDemandRequest::default();
+            proto.chat_jid = Some(chat_jid.to_string());
+            proto.oldest_msg_id = Some(oldest_msg_id.to_string());
+            proto.oldest_msg_from_me = Some(oldest_msg_from_me);
+            proto.oldest_msg_timestamp_ms = Some(oldest_msg_timestamp_ms);
+            proto.on_demand_msg_count = Some(count);
+            proto
+        });
+        proto
+    };
+    let mut protocol_message = wa::message::ProtocolMessage::default();
+    protocol_message.r#type =
+        Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_MESSAGE);
+    protocol_message.peer_data_operation_request_message = buffa::MessageField::some(pdo_request);
+    let mut message = wa::Message::default();
+    message.protocol_message = buffa::MessageField::some(protocol_message);
+    message
+}
+
 impl Client {
     /// Sends a PDO (Peer Data Operation) request to our own primary phone to get the
     /// decrypted content of a message that we failed to decrypt.
@@ -769,38 +800,43 @@ impl Client {
         oldest_msg_timestamp_ms: i64,
         count: i32,
     ) -> Result<String, anyhow::Error> {
+        let request_id = self.generate_message_id();
+        self.fetch_message_history_with_id(
+            chat_jid,
+            oldest_msg_id,
+            oldest_msg_from_me,
+            oldest_msg_timestamp_ms,
+            count,
+            &request_id,
+        )
+        .await?;
+        Ok(request_id.into_string())
+    }
+
+    /// Request on-demand message history with a caller-supplied session ID.
+    ///
+    /// Generate the ID with [`Client::generate_message_id`] and durably record
+    /// it before awaiting this method when an incoming history notification
+    /// must be correlated even if it arrives before the send completes.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.pdo.fetch_history_with_id", level = "debug", skip_all, fields(chat = %chat_jid.observe(), count), err(Debug)))]
+    pub async fn fetch_message_history_with_id(
+        self: &Arc<Self>,
+        chat_jid: &Jid,
+        oldest_msg_id: &str,
+        oldest_msg_from_me: bool,
+        oldest_msg_timestamp_ms: i64,
+        count: i32,
+        request_id: &crate::MessageId,
+    ) -> Result<(), anyhow::Error> {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let peer_target = self_peer_target(&device_snapshot)?;
-
-        let pdo_request = {
-            let mut proto = wa::message::PeerDataOperationRequestMessage::default();
-            proto.peer_data_operation_request_type =
-                Some(wa::message::PeerDataOperationRequestType::HISTORY_SYNC_ON_DEMAND);
-            proto.history_sync_on_demand_request = buffa::MessageField::some({
-                let mut proto = wa::message::peer_data_operation_request_message::HistorySyncOnDemandRequest::default();
-                proto.chat_jid = Some(chat_jid.to_string());
-                proto.oldest_msg_id = Some(oldest_msg_id.to_string());
-                proto.oldest_msg_from_me = Some(oldest_msg_from_me);
-                proto.oldest_msg_timestamp_ms = Some(oldest_msg_timestamp_ms);
-                proto.on_demand_msg_count = Some(count);
-                proto
-            });
-            proto
-        };
-
-        let protocol_message = {
-            let mut proto_ = wa::message::ProtocolMessage::default();
-            proto_.r#type =
-                Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_MESSAGE);
-            proto_.peer_data_operation_request_message = buffa::MessageField::some(pdo_request);
-            proto_
-        };
-
-        let msg = {
-            let mut proto_ = wa::Message::default();
-            proto_.protocol_message = buffa::MessageField::some(protocol_message);
-            proto_
-        };
+        let msg = history_sync_on_demand_message(
+            chat_jid,
+            oldest_msg_id,
+            oldest_msg_from_me,
+            oldest_msg_timestamp_ms,
+            count,
+        );
 
         info!(
             "Sending PDO history sync on-demand request for chat {} (count={}) to {}",
@@ -811,7 +847,8 @@ impl Client {
 
         self.ensure_e2e_sessions(std::slice::from_ref(&peer_target))
             .await?;
-        self.send_peer_message(peer_target, &msg).await
+        self.send_peer_message_with_id(peer_target, &msg, request_id.as_str())
+            .await
     }
 
     /// Ask the primary device for a collection this side could not validate.
@@ -994,22 +1031,7 @@ impl Client {
         ))
     }
 
-    /// Sends a peer message (message to our own devices).
-    /// This is used for PDO requests and similar device-to-device communication.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.pdo.send_peer_message", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
-    async fn send_peer_message(
-        self: &Arc<Self>,
-        to: Jid,
-        msg: &wa::Message,
-    ) -> Result<String, anyhow::Error> {
-        let msg_id = self.generate_message_id_at(wacore::time::now_secs_u64());
-        self.send_peer_message_with_id(to, msg, &msg_id).await?;
-        Ok(msg_id)
-    }
-
-    /// [`Self::send_peer_message`] for a caller that has to know the id before
-    /// the send, because it records something against it that an answer can
-    /// arrive and look up before this returns.
+    /// Sends a peer message using an ID recorded before the send starts.
     async fn send_peer_message_with_id(
         self: &Arc<Self>,
         to: Jid,
@@ -1905,7 +1927,7 @@ impl Client {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
-    use super::self_peer_target;
+    use super::{history_sync_on_demand_message, self_peer_target, wa};
     use wacore::store::Device;
     use wacore_binary::{Jid, JidExt, Server};
 
@@ -1964,6 +1986,35 @@ mod tests {
             ),
             "must require either PN or LID"
         );
+    }
+
+    #[test]
+    fn history_request_preserves_all_anchor_metadata() {
+        let chat: Jid = "12025550123@s.whatsapp.net".parse().unwrap();
+        let message = history_sync_on_demand_message(&chat, "OLDEST", true, 1_700_000_123, 50);
+        let protocol = message.protocol_message.as_option().unwrap();
+        assert_eq!(
+            protocol.r#type,
+            Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_MESSAGE)
+        );
+        let operation = protocol
+            .peer_data_operation_request_message
+            .as_option()
+            .unwrap();
+        assert_eq!(
+            operation.peer_data_operation_request_type,
+            Some(wa::message::PeerDataOperationRequestType::HISTORY_SYNC_ON_DEMAND)
+        );
+        let request = operation
+            .history_sync_on_demand_request
+            .as_option()
+            .unwrap();
+        let chat_text = chat.to_string();
+        assert_eq!(request.chat_jid.as_deref(), Some(chat_text.as_str()));
+        assert_eq!(request.oldest_msg_id.as_deref(), Some("OLDEST"));
+        assert_eq!(request.oldest_msg_from_me, Some(true));
+        assert_eq!(request.oldest_msg_timestamp_ms, Some(1_700_000_123));
+        assert_eq!(request.on_demand_msg_count, Some(50));
     }
 
     // Reconstruction-path tests share a bare Client wired to mock transport
@@ -2967,6 +3018,56 @@ mod tests {
                 "MANUAL_PDO_SYNTHETIC",
             );
             (client, transport, info)
+        }
+
+        #[tokio::test]
+        async fn supplied_history_session_id_is_the_outgoing_stanza_id() {
+            let (client, transport, _) = manual_retry_client().await;
+            let chat: Jid = "12025550123@s.whatsapp.net".parse().unwrap();
+            let request_id = crate::MessageId::new("HISTORY_SESSION_SUPPLIED").unwrap();
+            assert!(crate::MessageId::new("").is_err());
+
+            client
+                .fetch_message_history_with_id(
+                    &chat,
+                    "OLDEST",
+                    false,
+                    1_700_000_123,
+                    50,
+                    &request_id,
+                )
+                .await
+                .unwrap();
+
+            let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
+            assert_eq!(sent.get().tag.as_ref(), "message");
+            assert_eq!(
+                sent.get().get_attr("id").unwrap().as_str(),
+                request_id.as_str()
+            );
+        }
+
+        #[tokio::test]
+        async fn generated_history_session_ids_remain_unique_and_are_returned() {
+            let (client, transport, _) = manual_retry_client().await;
+            let chat: Jid = "12025550123@s.whatsapp.net".parse().unwrap();
+
+            let first = client
+                .fetch_message_history(&chat, "FIRST", false, 1_700_000_123, 50)
+                .await
+                .unwrap();
+            let second = client
+                .fetch_message_history(&chat, "SECOND", true, 1_700_000_100, 25)
+                .await
+                .unwrap();
+
+            assert!(!first.is_empty());
+            assert!(!second.is_empty());
+            assert_ne!(first, second);
+            for (index, expected) in [(0, first.as_str()), (1, second.as_str())] {
+                let sent = crate::test_utils::decode_sent_iq(&transport, index).await;
+                assert_eq!(sent.get().get_attr("id").unwrap().as_str(), expected);
+            }
         }
 
         fn authenticate_recovery_fixture(client: &Arc<Client>) {
