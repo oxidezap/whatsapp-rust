@@ -389,7 +389,7 @@ fn max_span(depth: usize) -> usize {
 /// Packets are taken in spans of [`Self::span_size`] consecutive packets, dealt round-robin to
 /// [`Self::depth`] groups: packet `k` of a span goes to group `k % depth`, so the members of one
 /// group are `depth` apart and a burst of up to `depth` lost packets takes at most one from each.
-/// The span's repair payloads, one per group, lowest group first, follow its last packet.
+/// The span's repair payloads follow its last packet, starting after that packet's group.
 ///
 /// A span always closes on a packet of the access unit being sent, its last or one partway
 /// through it, and its repair packets go out right behind that packet, so a receiver waiting on a
@@ -564,8 +564,13 @@ impl VideoFecSender {
         }
         if self.plan.front() == Some(&self.span_count) {
             self.plan.pop_front();
+            // Keep a full interleave depth between the last media packet of each group and its
+            // repair, including when the span ends partway through a round.
+            let first = self.span_count % depth;
             self.span_count = 0;
-            return self.groups.iter_mut().filter_map(Parity::take).collect();
+            return (0..depth)
+                .filter_map(|i| self.groups[(first + i) % depth].take())
+                .collect();
         }
         Vec::new()
     }
@@ -1146,7 +1151,7 @@ mod tests {
         let (groups, _) = run(&mut sender, &[25], next);
         assert_eq!(
             groups.iter().map(Vec::len).collect::<Vec<_>>(),
-            vec![5, 4, 4, 4, 4, 4]
+            vec![4, 4, 5, 4, 4, 4]
         );
         assert_eq!(sender.span_count, 0);
     }
@@ -1164,6 +1169,70 @@ mod tests {
                 .map(|group| (next + group..next + 12).step_by(3).collect())
                 .collect::<Vec<Vec<u16>>>()
         );
+    }
+
+    #[test]
+    fn partial_spans_survive_bursts_across_media_and_repairs() {
+        for (depth, group) in (2..=8u8).flat_map(|depth| (2..=8u8).map(move |group| (depth, group)))
+        {
+            let config = VideoFecConfig::builder()
+                .clean_group(group)
+                .clean_interleave(depth)
+                .build();
+            let mut sender = VideoFecSender::new(config);
+            let span = sender.span_size();
+            for count in span..=max_span(usize::from(depth)).min(2 * span - 1) {
+                sender.reset();
+                sender.begin_access_unit(count);
+                let video: Vec<_> = (0..count)
+                    .map(|i| {
+                        video_packet(
+                            65_530u16.wrapping_add(i as u16),
+                            90_000,
+                            i + 1 == count,
+                            30 + i,
+                        )
+                    })
+                    .collect();
+                let mut wire = Vec::new();
+                for packet in &video {
+                    wire.push((false, packet.clone()));
+                    wire.extend(sender.push(packet).into_iter().map(|p| (true, p)));
+                }
+                assert_eq!(wire.len(), count + usize::from(depth));
+                for length in 1..=usize::from(depth) {
+                    for start in 0..=wire.len() - length {
+                        let received: Vec<_> = wire
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| !(start..start + length).contains(i))
+                            .map(|(_, item)| item)
+                            .collect();
+                        for (repair, lost) in &wire[start..start + length] {
+                            if *repair {
+                                continue;
+                            }
+                            let sequence = u16::from_be_bytes([lost[2], lost[3]]);
+                            let repair = received.iter().find(|(repair, payload)| {
+                                *repair && FecHeader::parse(payload).unwrap().0.protected().any(|s| s == sequence)
+                            }).unwrap_or_else(|| panic!("lost repair with media: depth {depth}, count {count}, burst {start}..{}", start + length));
+                            let header = FecHeader::parse(&repair.1).unwrap().0;
+                            let members: Vec<_> = received
+                                .iter()
+                                .filter(|(repair, _)| !repair)
+                                .map(|(_, p)| p.as_slice())
+                                .filter(|p| {
+                                    header
+                                        .protected()
+                                        .any(|s| s == u16::from_be_bytes([p[2], p[3]]))
+                                })
+                                .collect();
+                            assert_eq!(recover_packet(&repair.1, &members).as_ref(), Some(lost));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

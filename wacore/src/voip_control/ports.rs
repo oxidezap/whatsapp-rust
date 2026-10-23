@@ -67,8 +67,10 @@ pub struct TimedVideoFrame {
     pub data: Vec<u8>,
     pub timestamp: u32,
     /// When the picture was captured, on the [`crate::time::Instant`] clock. Optional: with it,
-    /// every packet of the access unit carries the time from capture to its departure in its
-    /// transmission offset extension; without it, the offset stays zero.
+    /// every packet carries the time since capture in its transmission offset extension.
+    /// Without video FEC this is measured at departure. With video FEC it is measured at
+    /// packetization, because repair packets cover the header as built. Without a capture time,
+    /// the offset stays zero.
     pub captured_at: Option<crate::time::Instant>,
 }
 
