@@ -22,6 +22,124 @@ use wacore::types::message::{ChatMessageId, EditAttribute, MessageCategory, Mess
 use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
 
+/// How many unrequested recoveries may wait behind the one being applied.
+const MAX_QUEUED_UNREQUESTED_RECOVERIES: usize = 64;
+
+/// How many wire bytes they may hold between them: one reply of the largest
+/// size the decode accepts.
+const MAX_QUEUED_UNREQUESTED_RECOVERY_BYTES: u64 = wacore::history_sync::MAX_DECOMPRESSED;
+
+/// The collections a recovery from the primary can be for, synced again when
+/// unrequested replies were dropped before anything read which collection
+/// they were for. The block list is never recovered from the primary, and an
+/// unknown name is not a collection.
+const RECOVERABLE_COLLECTIONS: [wacore::appstate::patch_decode::WAPatchName; 4] = [
+    wacore::appstate::patch_decode::WAPatchName::RegularLow,
+    wacore::appstate::patch_decode::WAPatchName::RegularHigh,
+    wacore::appstate::patch_decode::WAPatchName::Regular,
+    wacore::appstate::patch_decode::WAPatchName::CriticalUnblockLow,
+];
+
+/// What a client keeps for snapshot recoveries from the primary, built on the
+/// first recovery reply.
+#[derive(Default)]
+pub(crate) struct SnapshotRecoveryState {
+    /// Serializes the decode and apply of snapshot recoveries.
+    ///
+    /// A reply is applied whether or not this process still remembers the ask
+    /// it answers, and the phone answers late and in bursts -- dozens of
+    /// whole-collection replies within seconds, to asks made over hours. One at
+    /// a time bounds that to one inflated collection in memory, and lets each
+    /// reply after the first find the collection already moved and be
+    /// discarded by the version check rather than racing it. Locked through
+    /// `lock_arc`, so the count of handles is the count of tasks holding or
+    /// waiting for it: one per matched reply, and one drainer for however many
+    /// unrequested replies are queued behind it.
+    pub(crate) lock: Arc<async_lock::Mutex<()>>,
+    /// Unrequested snapshot recoveries waiting, in arrival order, behind the
+    /// one task that applies them.
+    ///
+    /// The lock above bounds the decodes to one, not the copies: a reply's
+    /// payload is copied off the inbound lane before anything waits for the
+    /// lock, so a burst of unrequested replies would each hold a
+    /// collection-sized copy while it waited. A matched reply is bounded by its
+    /// claim -- one per ask -- but nothing bounds replies nobody asked for.
+    ///
+    /// No admitted reply is ever dropped or replaced before it is decoded:
+    /// which collection a reply is for is inside the payload, so any reply
+    /// discarded unread can be the only one for its collection. Every one is
+    /// applied in turn, and the older ones end as stale. What bounds the copies
+    /// is admission instead -- a count, and a byte budget of one reply of the
+    /// largest size the decode accepts, which one reply may always use. A
+    /// reply refused there is dropped before anything reads which collection
+    /// it was for, so a refusal marks the queue, and once it drains every
+    /// collection a recovery can be for is scheduled to sync again (see
+    /// `Client::converge_after_dropped_recovery`): one still stuck fails as
+    /// before and asks the primary again. An admitted reply that fails to
+    /// decode cannot be read either, but gets no such sync: the primary's
+    /// answer to the ask that sync would end in is likely the same unreadable
+    /// reply, so it would only loop. A sync mutex, held only to admit (and
+    /// copy) a reply or take one.
+    pub(crate) unrequested: std::sync::Mutex<UnrequestedRecoveryQueue>,
+}
+
+impl SnapshotRecoveryState {
+    /// How many unrequested replies are queued and the wire bytes they hold,
+    /// for the memory report.
+    pub(crate) fn queued_unrequested(&self) -> (usize, u64) {
+        let queue = self.unrequested.lock().unwrap_or_else(|p| p.into_inner());
+        (queue.queued.len(), queue.queued_bytes)
+    }
+}
+
+impl Client {
+    /// The snapshot recovery state, built on first use.
+    pub(crate) fn snapshot_recovery(&self) -> &SnapshotRecoveryState {
+        self.snapshot_recovery.get_or_init(Box::default)
+    }
+}
+
+/// The unrequested snapshot recoveries waiting behind the one being applied;
+/// why is on `SnapshotRecoveryState::unrequested`.
+#[derive(Default)]
+pub(crate) struct UnrequestedRecoveryQueue {
+    /// Whether a drainer task is applying replies.
+    running: bool,
+    /// The replies that arrived while it was, in arrival order.
+    queued: std::collections::VecDeque<QueuedRecoveryReply>,
+    /// The wire bytes `queued` holds.
+    queued_bytes: u64,
+    /// Whether a reply was refused since the drainer last finished, so the
+    /// collections it may have been for are synced again once it does.
+    overflowed: bool,
+}
+
+/// The unrequested recovery drainer's exit when it dies before its end.
+///
+/// A drainer that ended any other way would leave the queue marked as running
+/// for ever, every later unrequested reply queued behind it for nothing, and
+/// the reply it was applying and the ones behind it lost. Cleared on the
+/// drainer's normal exit; dropped while set, it releases the queue and has the
+/// collections synced again.
+struct UnrequestedDrainer {
+    client: Option<Arc<Client>>,
+}
+
+impl Drop for UnrequestedDrainer {
+    fn drop(&mut self) {
+        if let Some(client) = self.client.take() {
+            client.abandon_unrequested_recoveries();
+        }
+    }
+}
+
+/// A recovery reply copied off the inbound lane, not yet decoded.
+pub(crate) struct QueuedRecoveryReply {
+    payload: Vec<u8>,
+    compressed: bool,
+    request_id: String,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PendingPdoRequest {
     pub(crate) message_info: Arc<MessageInfo>,
@@ -716,10 +834,10 @@ impl Client {
         // is public and takes a name.
         //
         // A name this client has no rules for is refused outright: the reply
-        // side rejects `Unknown` *before* spending the marker, and an
-        // outstanding request only ever expires when the same name is asked for
-        // again -- so one typo would sit in the map for the life of the process,
-        // having been sent to the phone for nothing.
+        // side refuses `Unknown` whatever the phone sends back, so the ask
+        // would have the primary serialize a whole collection for nothing, and
+        // an unanswered marker for it would sit in the map until the same name
+        // was asked for again.
         let patch_name = collection
             .parse::<wacore::appstate::patch_decode::WAPatchName>()
             .unwrap_or(wacore::appstate::patch_decode::WAPatchName::Unknown);
@@ -728,11 +846,11 @@ impl Client {
                 "{collection} is not an app-state collection this client knows"
             ));
         }
-        // And the block list is refused because a caller asking for it would
-        // otherwise mark it pending and send, and the reply passes the
-        // known-collection check and applies. Rebuilding a block list from a
-        // device that may itself be behind is the one collection where being
-        // wrong means talking to somebody who was blocked.
+        // And the block list is refused, here and again where a reply is
+        // applied, since a reply no longer has to match an ask to be applied.
+        // Rebuilding a block list from a device that may itself be behind is
+        // the one collection where being wrong means talking to somebody who
+        // was blocked.
         if patch_name == wacore::appstate::patch_decode::WAPatchName::CriticalBlock {
             return Err(anyhow::anyhow!(
                 "the block list is not recovered from the primary"
@@ -1028,54 +1146,60 @@ impl Client {
             // one's decoder is still working against -- and that task, finding
             // no marker at the end, would drop a usable recovery.
             let proc = self.get_app_state_processor();
-            let Some(name) = proc.claim_recovery_request_by_id(request_id).await else {
-                warn!(
-                    "Ignoring a snapshot recovery with no collection: nothing here is waiting on that ask"
-                );
-                return;
-            };
-            proc.take_recovery_request_by_id(request_id).await;
-            warn!(
-                "Snapshot recovery response for {name} carries no collection; it may be asked for again"
-            );
+            match proc.claim_recovery_reply(request_id).await {
+                wacore::appstate_sync::RecoveryClaim::Claimed(name) => {
+                    proc.take_recovery_request_by_id(request_id).await;
+                    warn!(
+                        "Snapshot recovery response for {name} carries no collection; it may be asked for again"
+                    );
+                }
+                wacore::appstate_sync::RecoveryClaim::AlreadyAnswering(_) => {}
+                wacore::appstate_sync::RecoveryClaim::Unrequested => info!(
+                    "Discarding a snapshot recovery response that carries no collection and answers no ask outstanding here"
+                ),
+            }
             return;
         };
 
-        // Which collection this id was asked about -- claimed, before a byte is
-        // cloned or inflated.
+        // Which collection this id was asked about, if any -- claimed, before a
+        // byte is cloned or inflated.
         //
-        // Correlating here rather than after the decode is the difference
-        // between a map read and up to 64 MiB of inflate plus a record graph
-        // built for a reply that was never eligible to apply. Claiming rather
-        // than reading is what makes one ask cost one decode: a response that
-        // repeats the result, or a second copy arriving before the first is
-        // consumed, would otherwise each spawn a collection-sized job against
-        // the same request.
+        // Claiming rather than reading is what makes one ask cost one decode: a
+        // response that repeats the result, or a second copy arriving before the
+        // first is consumed, would otherwise each spawn a collection-sized job
+        // against the same request.
         //
         // The payload names a collection too, but that is the reply's claim
         // about itself -- and with two recoveries outstanding, a reply carrying
         // A's id and B's name would select B's marker and be checked against its
-        // own name, which always agrees. So the ask decides.
-        let Some((asked, generation)) = self
-            .get_app_state_processor()
-            .claim_recovery_request_with_generation_by_id(request_id)
-            .await
-        else {
-            warn!("Ignoring a snapshot recovery nothing here asked for");
-            return;
+        // own name, which always agrees. So where there is an ask, it decides.
+        //
+        // Where there is none, the reply is still decoded and applied. The
+        // phone answers late and in bursts, to asks made minutes or hours
+        // earlier -- on connections or in processes that are gone, or since
+        // replaced by a newer ask -- and refusing everything this process cannot
+        // match threw away nearly every answer a stuck collection ever got.
+        // What keeps a late answer from rolling a collection back is the
+        // version check at apply, not the bookkeeping here; the decode it costs
+        // is accepted because only the primary reaches this path, and the lock
+        // below makes a burst cost one decode at a time.
+        let proc = self.get_app_state_processor();
+        let asked = match proc.claim_recovery_reply(request_id).await {
+            wacore::appstate_sync::RecoveryClaim::Claimed(name) => Some(name),
+            wacore::appstate_sync::RecoveryClaim::AlreadyAnswering(name) => {
+                info!(
+                    "Ignoring a repeat of the {name} snapshot recovery answering {request_id}: a copy of it is already being handled"
+                );
+                return;
+            }
+            wacore::appstate_sync::RecoveryClaim::Unrequested => {
+                info!(
+                    "Snapshot recovery {request_id} answers no ask outstanding here; applying it as a late or unsolicited recovery from the primary"
+                );
+                None
+            }
         };
-
-        if self
-            .connection_generation
-            .load(std::sync::atomic::Ordering::Acquire)
-            != generation
-        {
-            self.get_app_state_processor()
-                .take_recovery_request_by_id(request_id)
-                .await;
-            debug!("Dropping retired recovery for {asked} before decoding");
-            return;
-        }
+        let about = asked.as_deref().unwrap_or("an unrequested collection");
 
         // The whole continuation is detached, not just the CPU inside it.
         // `receive.rs` awaits this handler inline and inbound processing is
@@ -1110,79 +1234,214 @@ impl Client {
             wacore::history_sync::MAX_DECOMPRESSED
         };
         if blob.len() as u64 > max_wire {
-            self.get_app_state_processor()
-                .take_recovery_request_by_id(request_id)
-                .await;
+            if asked.is_some() {
+                proc.take_recovery_request_by_id(request_id).await;
+            }
             warn!(
-                "Snapshot recovery for {asked} is {} bytes on the wire, over the {max_wire} this path allows; refusing it",
+                "Snapshot recovery for {about} is {} bytes on the wire, over the {max_wire} this path allows; refusing it",
                 blob.len()
             );
             return;
         }
-        let payload = blob.to_vec();
-        let request_id = request_id.to_string();
+        if asked.is_some() {
+            let reply = QueuedRecoveryReply {
+                payload: blob.to_vec(),
+                compressed,
+                request_id: request_id.to_string(),
+            };
+            self.runtime.spawn_detached(Box::pin(async move {
+                client.recover_from_reply(asked, reply).await;
+            }));
+            return;
+        }
 
-        self.runtime.spawn_detached(Box::pin(async move {
-            // Up to 64 MiB of inflate plus a decode wide enough that `waproto`
-            // pins its instantiation: off the runtime's async workers either
-            // way.
-            let decoded = wacore::runtime::blocking(&*client.runtime, move || {
-                decode_snapshot_recovery(&payload, compressed)
-            })
-            .await;
+        // Admitted, and copied, under the queue's lock, so the decision and the
+        // copy it allows cannot be split by the drainer finishing in between.
+        // Nothing else is done under it, and nothing awaits.
+        let wire = blob.len() as u64;
+        let refused = {
+            let mut queue = self
+                .snapshot_recovery()
+                .unrequested
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let reply = || QueuedRecoveryReply {
+                payload: blob.to_vec(),
+                compressed,
+                request_id: request_id.to_string(),
+            };
+            if !queue.running {
+                queue.running = true;
+                let first = reply();
+                drop(queue);
+                // The exit guard exists before the task does, so a task dropped
+                // before its first poll still releases the queue.
+                let drainer = UnrequestedDrainer {
+                    client: Some(Arc::clone(&client)),
+                };
+                self.runtime
+                    .spawn_detached(Box::pin(Self::drain_unrequested_recoveries(drainer, first)));
+                None
+            } else if queue.queued.is_empty()
+                || (queue.queued.len() < MAX_QUEUED_UNREQUESTED_RECOVERIES
+                    && queue.queued_bytes + wire <= MAX_QUEUED_UNREQUESTED_RECOVERY_BYTES)
+            {
+                queue.queued.push_back(reply());
+                queue.queued_bytes += wire;
+                None
+            } else {
+                // Refused without a copy, and so without knowing which
+                // collection it was for -- the name is inside the payload. What
+                // keeps that from losing a collection is `overflowed`: once the
+                // queue drains, every collection a recovery can be for is synced
+                // again, and one still stuck asks the primary again.
+                queue.overflowed = true;
+                Some((queue.queued.len(), queue.queued_bytes))
+            }
+        };
+        if let Some((queued, queued_bytes)) = refused {
+            warn!(
+                "Refusing the unrequested snapshot recovery {request_id} ({wire} bytes): {queued} replies holding {queued_bytes} bytes are already queued; the collections will be synced again once the queue drains"
+            );
+        }
+    }
 
-            let recovery = match decoded {
-                Ok(recovery) => recovery,
-                Err(e) => {
-                    // The request was answered, badly. Its collection name is
-                    // inside the payload that would not read, so the id the
-                    // answer carried is the only way to say which ask this was
-                    // -- and leaving the marker would suppress every retry for
-                    // the rest of the window over a question already answered.
-                    let proc = client.get_app_state_processor();
-                    match proc.take_recovery_request_by_id(&request_id).await {
-                        Some(name) => warn!(
-                            "Snapshot recovery response for {name} {e}; the collection may be asked for again"
-                        ),
-                        None => warn!("Snapshot recovery response {e}"),
+    /// Applies unrequested recoveries one after the other, in arrival order,
+    /// starting with `first` and then taking whatever is queued until nothing
+    /// is.
+    async fn drain_unrequested_recoveries(
+        mut drainer: UnrequestedDrainer,
+        first: QueuedRecoveryReply,
+    ) {
+        let Some(client) = drainer.client.clone() else {
+            return;
+        };
+        let mut next = first;
+        let overflowed = loop {
+            client.recover_from_reply(None, next).await;
+            let taken = {
+                let mut queue = client
+                    .snapshot_recovery()
+                    .unrequested
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                match queue.queued.pop_front() {
+                    Some(reply) => {
+                        queue.queued_bytes -= reply.payload.len() as u64;
+                        Ok(reply)
                     }
-                    return;
+                    // Cleared under the same lock as the empty queue was seen,
+                    // so a reply arriving now either was queued before this
+                    // or starts a drainer of its own after it.
+                    None => {
+                        queue.running = false;
+                        Err(std::mem::take(&mut queue.overflowed))
+                    }
                 }
             };
-
-            let proc = client.get_app_state_processor();
-
-            match recovery.collection_name.as_deref() {
-                Some(named) if named == asked => {}
-                other => {
-                    proc.take_recovery_request_by_id(&request_id).await;
-                    warn!(
-                        "Snapshot recovery answering the ask for {asked} names {}; refusing it",
-                        other.unwrap_or("nothing")
-                    );
-                    return;
-                }
+            match taken {
+                Ok(reply) => next = reply,
+                Err(overflowed) => break overflowed,
             }
+        };
+        drainer.client = None;
+        if overflowed {
+            info!("Unrequested snapshot recoveries were refused while the queue was full");
+            client.converge_after_dropped_recovery(&RECOVERABLE_COLLECTIONS);
+        }
+    }
 
-            // The reservation is a connection's, and a disconnect clears the
-            // registry wholesale -- so a task that started before one and
-            // applied after it would write beside the new connection's own sync
-            // and dispatch events for a session that has since been replaced.
-            if client.connection_generation.load(std::sync::atomic::Ordering::Acquire) != generation
-            {
-                // Spent, like every other ending that is not an apply. The ask
-                // was answered; dropping the answer because the connection went
-                // is this side's decision, and leaving the marker would have the
-                // next connection unable to ask again until the window ran out.
-                proc.take_recovery_request_by_id(&request_id).await;
-                debug!("Dropping the {asked} recovery: the connection it belongs to is gone");
+    /// The drainer's exit when it dies before reaching its end.
+    pub(crate) fn abandon_unrequested_recoveries(self: &Arc<Self>) {
+        let dropped = {
+            let mut queue = self
+                .snapshot_recovery()
+                .unrequested
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            queue.running = false;
+            queue.overflowed = false;
+            queue.queued_bytes = 0;
+            std::mem::take(&mut queue.queued).len()
+        };
+        // Scheduled whether or not anything was still queued: the reply it was
+        // applying is lost with it.
+        if self.is_permanently_stopped() {
+            return;
+        }
+        warn!(
+            "The unrequested snapshot recovery drainer ended early; dropped {dropped} queued replies"
+        );
+        self.converge_after_dropped_recovery(&RECOVERABLE_COLLECTIONS);
+    }
+
+    /// Decodes one reply and applies it, under the recovery lock.
+    ///
+    /// `asked` is the collection the reply's ask was made about, claimed for
+    /// it, or `None` for a reply nothing here is waiting for.
+    async fn recover_from_reply(&self, asked: Option<String>, reply: QueuedRecoveryReply) {
+        let QueuedRecoveryReply {
+            payload,
+            compressed,
+            request_id,
+        } = reply;
+        // Held across the decode and the apply, and taken by every reply,
+        // matched or not. See the field for why.
+        let _one_at_a_time = self.snapshot_recovery().lock.lock_arc().await;
+
+        // Up to 64 MiB of inflate plus a decode wide enough that `waproto`
+        // pins its instantiation: off the runtime's async workers either way.
+        let decoded = wacore::runtime::blocking(&*self.runtime, move || {
+            decode_snapshot_recovery(&payload, compressed)
+        })
+        .await;
+
+        let proc = self.get_app_state_processor();
+        let recovery = match decoded {
+            Ok(recovery) => recovery,
+            Err(e) => {
+                // The request was answered, badly. Its collection name is
+                // inside the payload that would not read, so the id the answer
+                // carried is the only way to say which ask this was -- and
+                // leaving the marker would suppress every retry for the rest of
+                // the window over a question already answered.
+                match &asked {
+                    Some(name) => {
+                        proc.take_recovery_request_by_id(&request_id).await;
+                        warn!(
+                            "Snapshot recovery response for {name} {e}; the collection may be asked for again"
+                        );
+                    }
+                    None => warn!(
+                        "Discarding the unrequested snapshot recovery response {request_id}: {e}"
+                    ),
+                }
                 return;
             }
+        };
 
-            client
-                .apply_recovered_collection(&asked, &request_id, generation, recovery)
-                .await;
-        }));
+        let matched = asked.is_some();
+        let name = match (asked, recovery.collection_name.as_deref()) {
+            (Some(asked), Some(named)) if named == asked => asked,
+            (Some(asked), other) => {
+                proc.take_recovery_request_by_id(&request_id).await;
+                warn!(
+                    "Snapshot recovery answering the ask for {asked} names {}; refusing it",
+                    other.unwrap_or("nothing")
+                );
+                return;
+            }
+            (None, Some(named)) => named.to_string(),
+            (None, None) => {
+                warn!(
+                    "Discarding the unrequested snapshot recovery {request_id}: it names no collection"
+                );
+                return;
+            }
+        };
+
+        self.apply_recovered_collection(&name, matched.then_some(request_id.as_str()), recovery)
+            .await;
     }
 
     async fn handle_placeholder_resend_response(
@@ -2845,34 +3104,557 @@ mod tests {
             );
         }
 
+        type RecoveryResponse = wa::message::peer_data_operation_request_response_message::peer_data_operation_result::SyncDSnapshotFatalRecoveryResponse;
+
+        const RECOVERY_KEY_ID: &[u8] = b"recovery-test-key";
+        const RECOVERY_KEY: [u8; 32] = [7; 32];
+        const OLD_INDEX_MAC: &[u8] = b"index-mac-before-the-recovery";
+
+        async fn seed_regular_low(client: &Arc<Client>, version: u64) {
+            seed_collection(client, "regular_low", version).await;
+        }
+
+        /// `collection` at `version`, with an ltHash, a MAC row and the key
+        /// the replies below are signed with.
+        async fn seed_collection(client: &Arc<Client>, collection: &str, version: u64) {
+            let backend = client.persistence_manager.backend();
+            backend
+                .set_sync_key(
+                    RECOVERY_KEY_ID,
+                    wacore::store::traits::AppStateSyncKey {
+                        key_data: RECOVERY_KEY.to_vec(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            backend
+                .set_version(
+                    collection,
+                    wacore::appstate::hash::HashState {
+                        version,
+                        hash: [0x11; 128],
+                        bootstrapped: true,
+                        mac_mismatch_fatal: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            backend
+                .put_mutation_macs(
+                    collection,
+                    version,
+                    &[wacore::appstate::processor::AppStateMutationMAC {
+                        index_mac: OLD_INDEX_MAC.to_vec(),
+                        value_mac: vec![0x22; 32],
+                    }],
+                )
+                .await
+                .unwrap();
+        }
+
+        fn regular_low_reply(version: u64, chat: &str, mark: u8) -> RecoveryResponse {
+            recovery_reply("regular_low", version, chat, mark)
+        }
+
+        /// The primary's `collection` at `version`: one mute record for `chat`,
+        /// and the ltHash byte and value MAC byte that identify this reply.
+        fn recovery_reply(
+            collection: &str,
+            version: u64,
+            chat: &str,
+            mark: u8,
+        ) -> RecoveryResponse {
+            use buffa::Message as _;
+            let mut record = wa::SyncdPlainTextRecord::default();
+            record.value = buffa::MessageField::some({
+                let mut data = wa::SyncActionData::default();
+                data.index = Some(format!(r#"["mute","{chat}"]"#).into_bytes());
+                data.value = buffa::MessageField::some({
+                    let mut value = wa::SyncActionValue::default();
+                    value.mute_action = buffa::MessageField::some({
+                        let mut mute = wa::sync_action_value::MuteAction::default();
+                        mute.muted = Some(true);
+                        mute
+                    });
+                    value
+                });
+                data
+            });
+            record.key_id = Some(RECOVERY_KEY_ID.to_vec());
+            record.mac = Some(vec![mark; 32]);
+            let mut recovery = wa::SyncdSnapshotRecovery::default();
+            recovery.collection_name = Some(collection.to_string());
+            recovery.version = buffa::MessageField::some({
+                let mut v = wa::SyncdVersion::default();
+                v.version = Some(version);
+                v
+            });
+            recovery.collection_lthash = Some(vec![mark; 128]);
+            recovery.mutation_records = vec![record];
+            let mut response = RecoveryResponse::default();
+            response.collection_snapshot = Some(recovery.encode_to_vec());
+            response.is_compressed = Some(false);
+            response
+        }
+
+        async fn regular_low_state(client: &Arc<Client>) -> wacore::appstate::hash::HashState {
+            collection_state(client, "regular_low").await
+        }
+
+        async fn collection_state(
+            client: &Arc<Client>,
+            collection: &str,
+        ) -> wacore::appstate::hash::HashState {
+            client
+                .persistence_manager
+                .backend()
+                .get_version(collection)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        async fn regular_low_mac(client: &Arc<Client>, index_mac: &[u8]) -> Option<Vec<u8>> {
+            client
+                .persistence_manager
+                .backend()
+                .get_mutation_mac("regular_low", index_mac)
+                .await
+                .unwrap()
+        }
+
+        fn mute_index_mac(chat: &str) -> Vec<u8> {
+            let keys = wacore::appstate::keys::expand_app_state_keys(&RECOVERY_KEY);
+            wacore::appstate::hash::generate_index_mac(
+                format!(r#"["mute","{chat}"]"#).as_bytes(),
+                &keys.index,
+            )
+        }
+
+        /// The request ids of the unrequested replies queued behind the drainer,
+        /// and the wire bytes they hold.
+        fn queued_unrequested_recoveries(client: &Arc<Client>) -> (Vec<String>, u64) {
+            let queue = client.snapshot_recovery().unrequested.lock().unwrap();
+            (
+                queue
+                    .queued
+                    .iter()
+                    .map(|reply| reply.request_id.clone())
+                    .collect(),
+                queue.queued_bytes,
+            )
+        }
+
+        /// Hands each reply to the handler, letting the task it spawns, if
+        /// any, reach the recovery lock before the next one is handed over.
+        async fn hand_over(client: &Arc<Client>, replies: &[(&RecoveryResponse, &str)]) {
+            for (reply, request_id) in replies {
+                client
+                    .handle_syncd_snapshot_recovery_response(reply, request_id)
+                    .await;
+                for _ in 0..64 {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+
+        /// Waits until no recovery task holds or waits for the lock and the
+        /// unrequested drainer has finished.
+        async fn wait_for_recoveries(client: &Arc<Client>) {
+            crate::test_utils::poll_until("every recovery reply to finish", || {
+                Arc::strong_count(&client.snapshot_recovery().lock) == 1
+                    && !client
+                        .snapshot_recovery()
+                        .unrequested
+                        .lock()
+                        .unwrap()
+                        .running
+            })
+            .await;
+        }
+
+        /// Hands every reply to the handler while the recovery lock is held, so
+        /// all of them are in flight together, checks that `tasks` of them
+        /// queued on the lock and which unrequested ones are `queued` behind
+        /// them, in order, and waits for every one to finish.
+        ///
+        /// A task holds a handle to the lock while it waits for it and while it
+        /// runs, so the handle count is the tasks in flight: one per matched
+        /// reply, and one drainer for all the unrequested ones.
+        async fn deliver_together(
+            client: &Arc<Client>,
+            replies: &[(&RecoveryResponse, &str)],
+            tasks: usize,
+            queued: &[&str],
+        ) {
+            let held = client.snapshot_recovery().lock.lock().await;
+            hand_over(client, replies).await;
+            assert_eq!(
+                Arc::strong_count(&client.snapshot_recovery().lock),
+                1 + tasks,
+                "tasks queued on the recovery lock"
+            );
+            assert_eq!(
+                queued_unrequested_recoveries(client).0,
+                queued,
+                "the unrequested replies queued behind them"
+            );
+            drop(held);
+            wait_for_recoveries(client).await;
+        }
+
         #[tokio::test]
-        async fn retired_recovery_reply_is_released_before_decode_is_scheduled() {
+        async fn a_recovery_reply_nothing_asked_for_is_applied_when_it_moves_the_collection() {
             let (client, _, _) = manual_retry_client().await;
+            seed_regular_low(&client, 5).await;
+            let reply = regular_low_reply(8, "1@s.whatsapp.net", 0x5A);
+            deliver_together(&client, &[(&reply, "asked-by-an-earlier-process")], 1, &[]).await;
+
+            let state = regular_low_state(&client).await;
+            assert_eq!(state.version, 8, "the primary's version replaces ours");
+            assert_eq!(state.hash, [0x5A; 128], "and so does its ltHash");
+            assert!(!state.mac_mismatch_fatal);
+            assert_eq!(
+                regular_low_mac(&client, &mute_index_mac("1@s.whatsapp.net")).await,
+                Some(vec![0x5A; 32]),
+                "the record's MAC is stored"
+            );
+            assert_eq!(
+                regular_low_mac(&client, OLD_INDEX_MAC).await,
+                None,
+                "and the MACs of the collection it replaced are gone"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_recovery_reply_to_an_ask_from_an_older_connection_is_applied() {
+            let (client, _, _) = manual_retry_client().await;
+            seed_regular_low(&client, 5).await;
             let proc = client.get_app_state_processor();
             let generation = client
                 .connection_generation
                 .load(std::sync::atomic::Ordering::Acquire);
             assert!(
-                proc.mark_recovery_requested_with_id("regular_low", generation, "retired")
-                    .await
+                proc.mark_recovery_requested_with_id(
+                    "regular_low",
+                    generation,
+                    "asked-before-reconnect"
+                )
+                .await
             );
             client
                 .connection_generation
                 .store(generation + 1, std::sync::atomic::Ordering::Release);
-            let mut response = wa::message::peer_data_operation_request_response_message::peer_data_operation_result::SyncDSnapshotFatalRecoveryResponse::default();
-            response.collection_snapshot = Some(vec![255; 32]);
-            response.is_compressed = Some(true);
-            client
-                .handle_syncd_snapshot_recovery_response(&response, "retired")
-                .await;
+
+            let reply = regular_low_reply(8, "1@s.whatsapp.net", 0x5A);
+            deliver_together(&client, &[(&reply, "asked-before-reconnect")], 1, &[]).await;
+
+            let state = regular_low_state(&client).await;
+            assert_eq!(state.version, 8, "applied under the current connection");
+            assert_eq!(state.hash, [0x5A; 128]);
             assert!(
                 !proc.has_recovery_request("regular_low").await,
-                "retired reply is consumed synchronously, before a decode job can run"
+                "the ask it answered is spent"
             );
             assert!(
-                proc.mark_recovery_requested_with_id("regular_low", generation + 1, "replacement")
+                proc.mark_recovery_requested_with_id("regular_low", generation + 1, "next")
+                    .await,
+                "and does not suppress the next one"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_recovery_reply_behind_the_collection_is_discarded_and_releases_the_ask() {
+            let (client, _, _) = manual_retry_client().await;
+            seed_regular_low(&client, 10).await;
+            let proc = client.get_app_state_processor();
+            let generation = client
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            assert!(
+                proc.mark_recovery_requested_with_id("regular_low", generation, "newest-ask")
                     .await
             );
+
+            let reply = regular_low_reply(10, "1@s.whatsapp.net", 0x5A);
+            deliver_together(&client, &[(&reply, "an-older-ask")], 1, &[]).await;
+
+            let state = regular_low_state(&client).await;
+            assert_eq!(state.version, 10, "the stored version stands");
+            assert_eq!(state.hash, [0x11; 128], "and so does its ltHash");
+            assert_eq!(
+                regular_low_mac(&client, OLD_INDEX_MAC).await,
+                Some(vec![0x22; 32]),
+                "and its MACs"
+            );
+            assert_eq!(
+                regular_low_mac(&client, &mute_index_mac("1@s.whatsapp.net")).await,
+                None
+            );
+            assert!(
+                !proc.has_recovery_request("regular_low").await,
+                "an answer found behind still settles the outstanding ask"
+            );
+        }
+
+        #[tokio::test]
+        async fn recovery_replies_arriving_together_apply_one_after_the_other() {
+            let (client, _, _) = manual_retry_client().await;
+            seed_regular_low(&client, 5).await;
+            let first = regular_low_reply(8, "1@s.whatsapp.net", 0x5A);
+            let second = regular_low_reply(8, "2@s.whatsapp.net", 0x6B);
+            deliver_together(
+                &client,
+                &[(&first, "first"), (&second, "second")],
+                1,
+                &["second"],
+            )
+            .await;
+
+            let state = regular_low_state(&client).await;
+            assert_eq!(state.version, 8);
+            assert_eq!(
+                state.hash, [0x5A; 128],
+                "the first reply's collection stands"
+            );
+            assert_eq!(
+                regular_low_mac(&client, &mute_index_mac("1@s.whatsapp.net")).await,
+                Some(vec![0x5A; 32])
+            );
+            assert_eq!(
+                regular_low_mac(&client, &mute_index_mac("2@s.whatsapp.net")).await,
+                None,
+                "the second, at the same version, was discarded as stale"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_burst_of_unrequested_recoveries_ends_at_the_newest_version() {
+            let (client, _, _) = manual_retry_client().await;
+            seed_regular_low(&client, 5).await;
+            let first = regular_low_reply(8, "1@s.whatsapp.net", 0x5A);
+            let second = regular_low_reply(8, "2@s.whatsapp.net", 0x6B);
+            let newest = regular_low_reply(9, "3@s.whatsapp.net", 0x7C);
+            deliver_together(
+                &client,
+                &[(&first, "first"), (&second, "second"), (&newest, "third")],
+                1,
+                &["second", "third"],
+            )
+            .await;
+
+            let state = regular_low_state(&client).await;
+            assert_eq!(state.version, 9, "every reply is applied in turn");
+            assert_eq!(state.hash, [0x7C; 128]);
+            assert_eq!(
+                regular_low_mac(&client, &mute_index_mac("3@s.whatsapp.net")).await,
+                Some(vec![0x7C; 32])
+            );
+            assert_eq!(queued_unrequested_recoveries(&client), (Vec::new(), 0));
+
+            let later = regular_low_reply(10, "4@s.whatsapp.net", 0x8D);
+            deliver_together(&client, &[(&later, "after-the-burst")], 1, &[]).await;
+            assert_eq!(
+                regular_low_state(&client).await.version,
+                10,
+                "a drained queue starts a drainer for the next reply"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_burst_whose_newest_version_arrives_first_ends_at_it() {
+            let (client, _, _) = manual_retry_client().await;
+            seed_regular_low(&client, 5).await;
+            let newest = regular_low_reply(9, "1@s.whatsapp.net", 0x7C);
+            let older = regular_low_reply(8, "2@s.whatsapp.net", 0x5A);
+            deliver_together(
+                &client,
+                &[(&newest, "first"), (&older, "second")],
+                1,
+                &["second"],
+            )
+            .await;
+
+            let state = regular_low_state(&client).await;
+            assert_eq!(
+                state.version, 9,
+                "the older reply applied after it is discarded as stale"
+            );
+            assert_eq!(state.hash, [0x7C; 128]);
+            assert_eq!(
+                regular_low_mac(&client, &mute_index_mac("2@s.whatsapp.net")).await,
+                None
+            );
+        }
+
+        #[tokio::test]
+        async fn unrequested_recoveries_for_different_collections_are_all_applied() {
+            let (client, _, _) = manual_retry_client().await;
+            seed_regular_low(&client, 5).await;
+            seed_collection(&client, "regular", 1).await;
+            let low = regular_low_reply(8, "1@s.whatsapp.net", 0x5A);
+            let regular = recovery_reply("regular", 3, "2@s.whatsapp.net", 0x6B);
+            let newer_low = regular_low_reply(9, "3@s.whatsapp.net", 0x7C);
+            deliver_together(
+                &client,
+                &[
+                    (&low, "regular-low-v8"),
+                    (&regular, "regular-v3"),
+                    (&newer_low, "regular-low-v9"),
+                ],
+                1,
+                &["regular-v3", "regular-low-v9"],
+            )
+            .await;
+
+            let low_state = regular_low_state(&client).await;
+            assert_eq!(low_state.version, 9);
+            assert_eq!(low_state.hash, [0x7C; 128]);
+            let regular_state = collection_state(&client, "regular").await;
+            assert_eq!(
+                regular_state.version, 3,
+                "a later reply for another collection does not cost this one its recovery"
+            );
+            assert_eq!(regular_state.hash, [0x6B; 128]);
+        }
+
+        /// Whether a sync holds a collection no recovery here touches: the
+        /// reservation `process_app_state_sync_task` keeps while its request is
+        /// out, which the fixture's transport never answers.
+        fn recoverable_collection_reserved(client: &Arc<Client>) -> bool {
+            [
+                wacore::appstate::patch_decode::WAPatchName::RegularHigh,
+                wacore::appstate::patch_decode::WAPatchName::CriticalUnblockLow,
+            ]
+            .into_iter()
+            .any(|name| client.app_state_syncing.is_held(name))
+        }
+
+        /// The convergence sync waits for a usable connection rather than
+        /// giving up without one: nothing is reserved while the fixture is
+        /// unauthenticated, past the scheduler's first backoff, and the sync
+        /// runs once it authenticates.
+        async fn assert_converges_once_connected(client: &Arc<Client>) {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            assert!(
+                !recoverable_collection_reserved(client),
+                "nothing is synced without a connection"
+            );
+            authenticate_recovery_fixture(client);
+            crate::test_utils::poll_until("the recoverable collections to be synced again", || {
+                recoverable_collection_reserved(client)
+            })
+            .await;
+        }
+
+        #[tokio::test]
+        async fn an_unrequested_recovery_past_the_queue_bound_is_refused_before_it_is_copied_and_the_collections_are_synced_again()
+         {
+            let (client, _, _) = manual_retry_client().await;
+            seed_regular_low(&client, 5).await;
+            let running = regular_low_reply(8, "1@s.whatsapp.net", 0x5A);
+            let queued = regular_low_reply(9, "2@s.whatsapp.net", 0x6B);
+            // The largest reply the size check lets through, uncompressed: it
+            // fits the byte budget alone but not beside the one queued above.
+            let mut oversized = RecoveryResponse::default();
+            oversized.collection_snapshot =
+                Some(vec![0; wacore::history_sync::MAX_DECOMPRESSED as usize]);
+            oversized.is_compressed = Some(false);
+
+            let held = client.snapshot_recovery().lock.lock().await;
+            hand_over(
+                &client,
+                &[
+                    (&running, "running"),
+                    (&queued, "queued"),
+                    (&oversized, "refused"),
+                ],
+            )
+            .await;
+            let (ids, bytes) = queued_unrequested_recoveries(&client);
+            assert_eq!(ids, ["queued"], "the refused reply never reached the queue");
+            assert_eq!(
+                bytes,
+                queued.collection_snapshot.as_ref().unwrap().len() as u64,
+                "and holds none of its bytes"
+            );
+            assert!(
+                client
+                    .snapshot_recovery()
+                    .unrequested
+                    .lock()
+                    .unwrap()
+                    .overflowed
+            );
+            assert!(
+                !recoverable_collection_reserved(&client),
+                "nothing is synced while the queue is still draining"
+            );
+
+            drop(held);
+            wait_for_recoveries(&client).await;
+            assert_eq!(regular_low_state(&client).await.version, 9);
+            assert!(
+                !client
+                    .snapshot_recovery()
+                    .unrequested
+                    .lock()
+                    .unwrap()
+                    .overflowed
+            );
+            assert_converges_once_connected(&client).await;
+        }
+
+        #[tokio::test]
+        async fn a_drainer_that_ends_early_releases_the_queue_and_syncs_the_collections_again() {
+            let (client, _, _) = manual_retry_client().await;
+            let reply = |request_id: &str| super::super::QueuedRecoveryReply {
+                payload: vec![1; 16],
+                compressed: false,
+                request_id: request_id.into(),
+            };
+            {
+                let mut queue = client.snapshot_recovery().unrequested.lock().unwrap();
+                queue.running = true;
+                queue.queued.push_back(reply("stranded"));
+                queue.queued_bytes = 16;
+            }
+            // Dropped before its first poll: the earliest a drainer can end.
+            drop(Client::drain_unrequested_recoveries(
+                super::super::UnrequestedDrainer {
+                    client: Some(Arc::clone(&client)),
+                },
+                reply("in-flight"),
+            ));
+            {
+                let queue = client.snapshot_recovery().unrequested.lock().unwrap();
+                assert!(!queue.running, "a later reply starts a drainer of its own");
+                assert!(queue.queued.is_empty());
+                assert_eq!(queue.queued_bytes, 0);
+            }
+            assert_converges_once_connected(&client).await;
+        }
+
+        #[tokio::test]
+        async fn a_repeat_of_a_recovery_reply_being_handled_costs_no_decode() {
+            let (client, _, _) = manual_retry_client().await;
+            seed_regular_low(&client, 5).await;
+            let proc = client.get_app_state_processor();
+            let generation = client
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            assert!(
+                proc.mark_recovery_requested_with_id("regular_low", generation, "asked")
+                    .await
+            );
+
+            let reply = regular_low_reply(8, "1@s.whatsapp.net", 0x5A);
+            deliver_together(&client, &[(&reply, "asked"), (&reply, "asked")], 1, &[]).await;
+
+            assert_eq!(regular_low_state(&client).await.version, 8);
+            assert!(!proc.has_recovery_request("regular_low").await);
         }
 
         #[tokio::test]

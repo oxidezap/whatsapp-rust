@@ -1617,8 +1617,8 @@ mod tests {
         );
     }
 
-    /// The marker keeps the generation it was asked on, so an answer that
-    /// outlives its connection can be refused before changing the collection.
+    /// The marker keeps the generation it was asked on, so a sender from an
+    /// older connection cannot replace the ask a newer one made.
     #[tokio::test]
     async fn a_recovery_request_remembers_the_generation_it_was_asked_on() {
         let backend = Arc::new(MockBackend::default());
@@ -1748,6 +1748,91 @@ mod tests {
             processor.take_recovery_request_by_id("req-1").await,
             Some("regular_low".to_string()),
             "and the claim does not stop the answer from spending its request"
+        );
+    }
+
+    /// A reply nobody here is waiting for is told apart from a copy of one
+    /// already being handled: the first is decoded and applied if it moves the
+    /// collection forward, the second never costs a decode.
+    #[tokio::test]
+    async fn a_recovery_reply_is_claimed_unrequested_or_already_answering() {
+        use wacore::appstate_sync::RecoveryClaim;
+        let processor = AppStateProcessor::new(
+            Arc::new(MockBackend::default()),
+            Arc::new(crate::runtime_impl::TokioRuntime),
+        );
+        assert_eq!(
+            processor.claim_recovery_reply("from-another-process").await,
+            RecoveryClaim::Unrequested
+        );
+        assert!(
+            processor
+                .mark_recovery_requested_with_id("regular_low", 3, "req")
+                .await
+        );
+        assert_eq!(
+            processor.claim_recovery_reply("req").await,
+            RecoveryClaim::Claimed("regular_low".into())
+        );
+        assert_eq!(
+            processor.claim_recovery_reply("req").await,
+            RecoveryClaim::AlreadyAnswering("regular_low".into())
+        );
+        assert_eq!(
+            processor.claim_recovery_reply("from-another-process").await,
+            RecoveryClaim::Unrequested,
+            "a claimed ask is still not one an unrelated id answers"
+        );
+    }
+
+    /// An answer that reached the apply settles the collection's unanswered
+    /// ask whatever id it was made under, but leaves one another reply has
+    /// claimed to that reply.
+    #[tokio::test]
+    async fn ending_a_recovery_answer_releases_only_what_nothing_else_is_answering() {
+        let processor = AppStateProcessor::new(
+            Arc::new(MockBackend::default()),
+            Arc::new(crate::runtime_impl::TokioRuntime),
+        );
+        assert!(
+            processor
+                .mark_recovery_requested_with_id("regular_low", 3, "newest")
+                .await
+        );
+        assert!(
+            processor.end_recovery_answer("regular_low", None).await,
+            "an unrequested reply settles the unanswered ask under another id"
+        );
+        assert!(!processor.has_recovery_request("regular_low").await);
+
+        assert!(
+            processor
+                .mark_recovery_requested_with_id("regular_low", 3, "claimed")
+                .await
+        );
+        assert!(
+            processor
+                .claim_recovery_request_by_id("claimed")
+                .await
+                .is_some()
+        );
+        assert!(
+            !processor
+                .end_recovery_answer("regular_low", Some("other"))
+                .await,
+            "an ask another reply is answering is left to it"
+        );
+        assert!(processor.has_recovery_request("regular_low").await);
+        assert!(
+            processor
+                .end_recovery_answer("regular_low", Some("claimed"))
+                .await,
+            "and that reply ends it itself"
+        );
+        assert!(!processor.has_recovery_request("regular_low").await);
+        assert!(
+            !processor.end_recovery_answer("regular_low", None).await,
+            "nothing left to release"
         );
     }
 

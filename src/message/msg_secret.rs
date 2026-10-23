@@ -864,8 +864,7 @@ impl Client {
             info,
             false,
             None,
-            self.inbound_durability_hook()
-                .is_some()
+            self.inbound_journal_enabled()
                 .then_some((Some(index), plaintext)),
             (
                 Some(raw_pending::DeliveryOrigin {

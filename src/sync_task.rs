@@ -9,6 +9,10 @@ use wacore::messages::DetachedHistorySyncNotification;
 pub(crate) struct HistorySyncActivity {
     state: Mutex<HistorySyncActivityState>,
     idle_notifier: event_listener::Event,
+    /// Shared by the worker and explicit host replay, never reset on reconnect.
+    pub(crate) processing_permits: Arc<async_lock::Semaphore>,
+    /// Replays take this first, leaving global capacity for the sync worker.
+    pub(crate) replay_permits: Arc<async_lock::Semaphore>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -36,6 +40,8 @@ impl HistorySyncActivity {
         Self {
             state: Mutex::new(HistorySyncActivityState::default()),
             idle_notifier: event_listener::Event::new(),
+            processing_permits: Arc::new(async_lock::Semaphore::new(2)),
+            replay_permits: Arc::new(async_lock::Semaphore::new(1)),
         }
     }
 
@@ -48,9 +54,15 @@ impl HistorySyncActivity {
         state.payload_bytes_peak = state.payload_bytes_peak.max(state.payload_bytes);
         drop(state);
         HistorySyncTaskTracker {
-            activity: Arc::clone(self),
-            generation,
-            payload_bytes,
+            inner: Arc::new(HistorySyncTaskTrackerInner {
+                activity: Arc::clone(self),
+                generation,
+                state: Mutex::new(HistorySyncTaskState {
+                    payload_bytes,
+                    durable_key: None,
+                    processing_permits: None,
+                }),
+            }),
         }
     }
 
@@ -109,46 +121,107 @@ impl HistorySyncActivity {
 
 #[doc(hidden)]
 pub struct HistorySyncTaskTracker {
+    // The bounded channel allocates every slot when the Client is built.
+    // Keep recovery state out of those empty slots, without changing the
+    // public MajorSyncTask variant or its tracker field type.
+    inner: Arc<HistorySyncTaskTrackerInner>,
+}
+
+struct HistorySyncTaskTrackerInner {
     activity: Arc<HistorySyncActivity>,
     generation: HistorySyncGeneration,
+    state: Mutex<HistorySyncTaskState>,
+}
+
+struct HistorySyncTaskState {
     payload_bytes: usize,
+    // Recovery context follows this one task through the existing public queue
+    // shape. It must not be keyed globally by the non-unique stanza ID.
+    durable_key: Option<Box<crate::HistorySyncKey>>,
+    // A blocking parser/encoder keeps a lease after its async caller is
+    // cancelled. Keep both limits in one lease so a detached replay cannot
+    // release its replay slot while still occupying global processing capacity.
+    processing_permits: Option<Arc<HistorySyncProcessingPermits>>,
+}
+
+pub(crate) struct HistorySyncProcessingPermits {
+    _processing: async_lock::SemaphoreGuardArc,
+    _replay: Option<async_lock::SemaphoreGuardArc>,
 }
 
 impl HistorySyncTaskTracker {
+    /// Retain this task's activity and capacity until physical CPU work ends.
+    pub(crate) fn blocking_lease(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, HistorySyncTaskState> {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn set_processing_permits(
+        &mut self,
+        processing: async_lock::SemaphoreGuardArc,
+        replay: Option<async_lock::SemaphoreGuardArc>,
+    ) {
+        self.state().processing_permits = Some(Arc::new(HistorySyncProcessingPermits {
+            _processing: processing,
+            _replay: replay,
+        }));
+    }
+
+    pub(crate) fn processing_permits(&self) -> Option<Arc<HistorySyncProcessingPermits>> {
+        self.state().processing_permits.clone()
+    }
+
+    pub(crate) fn clear_processing_permits(&mut self) {
+        self.state().processing_permits = None;
+    }
+
+    pub(crate) fn set_durable_key(&mut self, key: crate::HistorySyncKey) {
+        self.state().durable_key = Some(Box::new(key));
+    }
+
+    pub(crate) fn take_durable_key(&mut self) -> Option<Box<crate::HistorySyncKey>> {
+        self.state().durable_key.take()
+    }
+
     pub(crate) fn set_payload_bytes(&mut self, payload_bytes: usize) {
-        let mut state = self.activity.state_guard();
-        if state.generation != self.generation {
-            self.payload_bytes = payload_bytes;
-            return;
+        let mut task = self.state();
+        let mut state = self.inner.activity.state_guard();
+        if state.generation == self.inner.generation {
+            state.payload_bytes = state
+                .payload_bytes
+                .saturating_sub(task.payload_bytes)
+                .saturating_add(payload_bytes);
+            state.payload_bytes_peak = state.payload_bytes_peak.max(state.payload_bytes);
         }
-        match payload_bytes.cmp(&self.payload_bytes) {
-            std::cmp::Ordering::Greater => {
-                let additional = payload_bytes - self.payload_bytes;
-                state.payload_bytes = state.payload_bytes.saturating_add(additional);
-                state.payload_bytes_peak = state.payload_bytes_peak.max(state.payload_bytes);
-            }
-            std::cmp::Ordering::Less => {
-                let released = self.payload_bytes - payload_bytes;
-                state.payload_bytes = state.payload_bytes.saturating_sub(released);
-            }
-            std::cmp::Ordering::Equal => {}
-        }
-        self.payload_bytes = payload_bytes;
+        task.payload_bytes = payload_bytes;
     }
 }
 
 impl std::fmt::Debug for HistorySyncTaskTracker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HistorySyncTaskTracker")
-            .field("generation", &self.generation)
-            .field("payload_bytes", &self.payload_bytes)
+            .field("generation", &self.inner.generation)
+            .field("payload_bytes", &self.state().payload_bytes)
             .finish_non_exhaustive()
     }
 }
 
-impl Drop for HistorySyncTaskTracker {
+impl Drop for HistorySyncTaskTrackerInner {
     fn drop(&mut self) {
-        self.activity.release(self.generation, self.payload_bytes);
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(state.processing_permits.take());
+        self.activity.release(self.generation, state.payload_bytes);
     }
 }
 

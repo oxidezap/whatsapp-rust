@@ -1877,6 +1877,65 @@ fn parse_participating_response(
     Ok(GroupParticipatingResponse { groups })
 }
 
+/// Community creation without plain-group defaults. The request builder is
+/// generated from whatspec; the existing metadata and IQ error parsers are shared.
+#[derive(Debug, Clone)]
+pub struct CommunityCreateIq<'a> {
+    subject: &'a GroupSubject,
+    closed: bool,
+    allow_non_admin_sub_group_creation: bool,
+    create_general_chat: bool,
+}
+
+impl<'a> CommunityCreateIq<'a> {
+    pub fn new(
+        subject: &'a GroupSubject,
+        closed: bool,
+        allow_non_admin_sub_group_creation: bool,
+        create_general_chat: bool,
+    ) -> Self {
+        Self {
+            subject,
+            closed,
+            allow_non_admin_sub_group_creation,
+            create_general_chat,
+        }
+    }
+}
+
+impl IqSpec for CommunityCreateIq<'_> {
+    type Response = GroupMetadataResponse;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        super::community_create::build_community_create(
+            super::community_create::CommunityCreateRequest {
+                any_subject: self.subject.as_str(),
+                has_parent_group_default_membership_approval_mode: self.closed.then_some(()),
+                has_allow_non_admin_sub_group_creation: self.allow_non_admin_sub_group_creation,
+                has_create_general_chat: self.create_general_chat,
+            },
+        )
+    }
+
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+        let mut info = parse_create_group_response(response)?;
+        if info.parent_group_jid.is_none() {
+            info.is_parent_group = true;
+            info.parent_membership_approval_required |= self.closed;
+            info.allow_non_admin_sub_group_creation |= self.allow_non_admin_sub_group_creation;
+        }
+        Ok(info)
+    }
+}
+
+fn parse_create_group_response(response: &NodeRef<'_>) -> Result<GroupMetadataResponse> {
+    let group_node = response
+        .get_optional_child("group")
+        .or_else(|| response.get_optional_child("community"))
+        .ok_or_else(|| anyhow!("missing group or community create result"))?;
+    GroupMetadataResponse::try_from_node_ref(group_node)
+}
+
 /// IQ specification for creating a new group.
 #[derive(Debug, Clone)]
 pub struct GroupCreateIq {
@@ -1905,11 +1964,7 @@ impl IqSpec for GroupCreateIq {
     }
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
-        let group_node = response
-            .get_optional_child("group")
-            .or_else(|| response.get_optional_child("community"))
-            .ok_or_else(|| anyhow!("missing group or community create result"))?;
-        let mut info = GroupMetadataResponse::try_from_node_ref(group_node)?;
+        let mut info = parse_create_group_response(response)?;
 
         // Server may omit `<parent>` from a community-create reply; overlay
         // request flags so metadata hierarchy classifies without a follow-up query.
@@ -6317,6 +6372,80 @@ mod tests {
                 .as_deref(),
             Some("fixture.description.only")
         );
+    }
+
+    /// Community creation restores omitted parent markers from the requested
+    /// settings without elevating explicit false values, for both reply tags.
+    #[test]
+    fn test_community_create_iq_success_restores_parent_options() {
+        let subject = GroupSubject::new("Community fixture").unwrap();
+        for tag in ["group", "community"] {
+            for closed in [false, true] {
+                for allow in [false, true] {
+                    for general in [false, true] {
+                        let spec = CommunityCreateIq::new(&subject, closed, allow, general);
+                        let iq = NodeBuilder::new("iq")
+                            .children([NodeBuilder::new(tag)
+                                .attr("id", "120363000000000001")
+                                .attr("subject", "Server subject")
+                                .build()])
+                            .build();
+                        let response = spec.parse_response(&iq.as_node_ref()).unwrap();
+                        assert!(response.is_parent_group);
+                        assert!(response.parent_group_jid.is_none());
+                        assert_eq!(response.parent_membership_approval_required, closed);
+                        assert_eq!(response.allow_non_admin_sub_group_creation, allow);
+                        assert_eq!(
+                            response.subject.as_ref().unwrap().as_str(),
+                            "Server subject"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A false request preference never erases affirmative server metadata.
+    #[test]
+    fn test_community_create_iq_success_keeps_server_parent_options() {
+        let subject = GroupSubject::new("Community fixture").unwrap();
+        let spec = CommunityCreateIq::new(&subject, false, false, false);
+        let iq = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("group")
+                .attr("id", "120363000000000001")
+                .children([
+                    NodeBuilder::new("parent")
+                        .attr("default_membership_approval_mode", "request_required")
+                        .build(),
+                    NodeBuilder::new("allow_non_admin_sub_group_creation").build(),
+                ])
+                .build()])
+            .build();
+        let response = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert!(response.is_parent_group);
+        assert!(response.parent_membership_approval_required);
+        assert!(response.allow_non_admin_sub_group_creation);
+    }
+
+    /// Server-supplied subgroup identity prevents the parent fallback overlay.
+    #[test]
+    fn test_community_create_iq_success_keeps_linked_subgroup_identity() {
+        let subject = GroupSubject::new("Community fixture").unwrap();
+        let spec = CommunityCreateIq::new(&subject, true, true, true);
+        let parent = Jid::group("120363000000000001");
+        let iq = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("group")
+                .attr("id", "120363000000000002")
+                .children([NodeBuilder::new("linked_parent")
+                    .attr("jid", &parent)
+                    .build()])
+                .build()])
+            .build();
+        let response = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(response.parent_group_jid, Some(parent));
+        assert!(!response.is_parent_group);
+        assert!(!response.parent_membership_approval_required);
+        assert!(!response.allow_non_admin_sub_group_creation);
     }
 
     /// `parse_response` should overlay parent settings from the request when

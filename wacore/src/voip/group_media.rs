@@ -104,6 +104,7 @@ pub struct ParticipantVideo {
     pub header: RtpHeader,
     pub access_units: Vec<(u32, Vec<u8>)>,
     pub(crate) orientations: Vec<Option<u8>>,
+    pub(crate) payload_len: usize,
 }
 
 struct ParticipantReceiver {
@@ -465,7 +466,11 @@ impl GroupMediaRegistry {
         if !receiver.video_enabled {
             return None;
         }
-        let (header, access_units) = receiver.video.as_mut()?.unprotect_video_packet(packet)?;
+        let (header, access_units, _, payload_len) = receiver
+            .video
+            .as_mut()?
+            .unprotect_video_packet_split(packet)
+            .ok()?;
         let (access_units, orientations) = access_units
             .into_iter()
             .map(|(timestamp, data, orientation)| ((timestamp, data), orientation))
@@ -478,6 +483,7 @@ impl GroupMediaRegistry {
             header,
             access_units,
             orientations,
+            payload_len,
         })
     }
 

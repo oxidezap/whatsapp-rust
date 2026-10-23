@@ -296,6 +296,20 @@ pub mod codec {
         msg.encode_to_vec()
     }
 
+    #[inline(never)]
+    pub fn history_sync_notification_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::message::HistorySyncNotification, buffa::DecodeError> {
+        whatsapp::message::HistorySyncNotification::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
+    pub fn history_sync_notification_to_vec(
+        msg: &whatsapp::message::HistorySyncNotification,
+    ) -> Vec<u8> {
+        msg.encode_to_vec()
+    }
+
     /// Keep the GroupHistory protobuf encoder in this crate so its nested
     /// WebMessageInfo encode tree is not instantiated by each caller.
     #[inline(never)]

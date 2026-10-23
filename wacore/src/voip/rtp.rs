@@ -75,6 +75,40 @@ impl VideoRtpExtension {
     }
 }
 
+/// The RTP timestamp `elapsed_ms` after the instant `timestamp` stands for, on a `clock_rate` Hz
+/// media clock, for a Sender Report that pairs a stream's media clock with the wall clock.
+pub(crate) fn rtp_timestamp_after(timestamp: u32, elapsed_ms: u64, clock_rate: u32) -> u32 {
+    let ticks = u128::from(elapsed_ms) * u128::from(clock_rate) / 1000;
+    timestamp.wrapping_add(ticks as u32)
+}
+
+/// Byte range of the `short_offset` value inside an encoded video header: element id 6 (`0x61`,
+/// two bytes) is the third of [`VideoRtpExtension::encode_into`]'s elements, after the 12-byte
+/// fixed header, the 4-byte extension header, and four bytes of the first two elements.
+const VIDEO_SHORT_OFFSET_RANGE: core::ops::Range<usize> = 22..24;
+
+/// The transmission offset for a packet leaving `elapsed_ms` after its picture was captured.
+///
+/// Extension id 6 is a millisecond offset from the RTP timestamp, the picture's capture, to the
+/// packet's transmission. The Android keyframe and delta packets the tests pin carry 29 and 36; an
+/// iPhone sends 10 to 23 on ordinary frames, equal or one higher from one packet of a
+/// frame to the next, as stamping each packet when it leaves gives. Clamped to the field's
+/// non-negative range, so a frame held for over 32 s saturates.
+pub fn video_short_offset(elapsed_ms: u64) -> i16 {
+    i16::try_from(elapsed_ms).unwrap_or(i16::MAX)
+}
+
+/// Where an encoded video packet's `short_offset` value sits, if the packet has the layout
+/// [`encode_rtp_header_into`] writes for video: no CSRCs, the WhatsApp extension profile three
+/// words long, and element id 6 in its place.
+pub(crate) fn video_short_offset_range(packet: &[u8]) -> Option<core::ops::Range<usize>> {
+    let header = packet.get(..WHATSAPP_VIDEO_RTP_HEADER_SIZE)?;
+    let layout_matches = header[0] & 0x1f == 0x10
+        && header[12..16] == [0xde, 0xbe, 0x00, 0x03]
+        && header[VIDEO_SHORT_OFFSET_RANGE.start - 1] == 0x61;
+    layout_matches.then_some(VIDEO_SHORT_OFFSET_RANGE)
+}
+
 /// Android first priming frame (18 bytes).
 pub const OPUS_PRIMING_FRAME_1: [u8; 18] = [
     0x12, 0x36, 0x26, 0x2b, 0x4a, 0xc8, 0x2b, 0x09, 0xc9, 0x1f, 0x34, 0xc2, 0xd6, 0x7a, 0x01, 0x73,
@@ -267,6 +301,33 @@ pub fn parse_whatsapp_media_frame_info(data: &[u8]) -> Option<u8> {
     info.into_iter().flatten().next()
 }
 
+/// Read the media time offset (one-byte extension element 6, `short_offset` in
+/// [`VideoRtpExtension`]) independently of the other 0xdebe extensions: a signed
+/// millisecond offset from the RTP timestamp. Packets of one picture carry the
+/// same value, or one 1 ms later; see [`super::h264::H264Depacketizer::push_with_time_offset`]
+/// for a picture told apart by it. A truncated element ends the scan.
+pub fn parse_whatsapp_media_time_offset(data: &[u8]) -> Option<i16> {
+    let (Some(WHATSAPP_RTP_EXTENSION_PROFILE), mut extension) =
+        rtp_extension_profile_and_data(data)?
+    else {
+        return None;
+    };
+    while let Some((&header, rest)) = extension.split_first() {
+        extension = rest;
+        let id = header >> 4;
+        if id == 0 {
+            continue;
+        }
+        let len = usize::from(header & 0x0f) + 1;
+        let (value, rest) = extension.split_at_checked(len)?;
+        extension = rest;
+        if id == 6 && len == 2 {
+            return Some(i16::from_be_bytes([value[0], value[1]]));
+        }
+    }
+    None
+}
+
 /// RFC 8285's one-byte header extension profile. WhatsApp's own stack registers its one-byte
 /// element parser under this profile as well as under [`WHATSAPP_RTP_EXTENSION_PROFILE`].
 pub const RFC8285_ONE_BYTE_EXTENSION_PROFILE: u16 = 0xbede;
@@ -335,6 +396,26 @@ pub fn split_whatsapp_audio_piggyback(packet: &[u8], payload: &mut Vec<u8>) -> O
         }
     }
     Some(audio)
+}
+
+/// Authenticated payload bytes, excluding RTP padding. In a WhatsApp carrier the padding
+/// terminates the media part, before the embedded audio RTP packet.
+pub(crate) fn received_payload_len(packet: &[u8], payload: &[u8]) -> usize {
+    let media_end = parse_whatsapp_audio_piggyback_offset(packet)
+        .filter(|&offset| offset > 0 && offset < payload.len())
+        .unwrap_or(payload.len());
+    let padding = if packet.first().is_some_and(|byte| byte & 0x20 != 0) {
+        payload
+            .get(..media_end)
+            .and_then(|media| media.last())
+            .copied()
+            .map(usize::from)
+            .filter(|&padding| padding <= media_end)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    payload.len() - padding
 }
 
 /// The payload of a plain (unprotected) RTP packet: after the fixed header, CSRCs and extension
@@ -500,6 +581,11 @@ impl RtpStream {
         self.last_sent_timestamp.unwrap_or(self.timestamp)
     }
 
+    /// The last emitted timestamp and the one the next packet will carry, once a packet has gone.
+    pub(crate) fn sent_and_next_timestamp(&self) -> Option<(u32, u32)> {
+        self.last_sent_timestamp.map(|sent| (sent, self.timestamp))
+    }
+
     fn resolve_warp_extension(&mut self, dtx: bool) -> Option<u32> {
         if dtx {
             return Some(WHATSAPP_RTP_EXTENSION_DTX_WORD);
@@ -615,7 +701,19 @@ impl VideoRtpStream {
     /// Header for the next packet of the current AU; `last_in_au` sets the
     /// marker and moves the timestamp to the next AU. `media_frame_info` is an
     /// encoded-frame property and must be identical on every fragment of the AU.
+    /// The transmission offset is zero: see [`Self::next_video_packet_with_offset`].
     pub fn next_video_packet(&mut self, last_in_au: bool, media_frame_info: u8) -> RtpHeader {
+        self.next_video_packet_with_offset(last_in_au, media_frame_info, 0)
+    }
+
+    /// [`Self::next_video_packet`] carrying `short_offset`, the milliseconds from the picture's
+    /// capture to the packet's transmission (see [`video_short_offset`]).
+    pub fn next_video_packet_with_offset(
+        &mut self,
+        last_in_au: bool,
+        media_frame_info: u8,
+        short_offset: i16,
+    ) -> RtpHeader {
         let header = RtpHeader {
             marker: last_in_au,
             payload_type: RTP_PAYLOAD_TYPE_H264,
@@ -626,9 +724,7 @@ impl VideoRtpStream {
             video_extension: Some(VideoRtpExtension {
                 media_frame_info,
                 initial_bandwidth: 0,
-                // The real sender reported 29 ticks (~0.3 ms). Zero is the truthful value when
-                // the API has no capture-time origin to subtract from the RTP timestamp.
-                short_offset: 0,
+                short_offset,
                 transport_sequence: self.transport_sequence,
             }),
         };
@@ -947,6 +1043,87 @@ mod tests {
     }
 
     #[test]
+    fn media_time_offset_reads_element_six_alone() {
+        let header = |extension: &[u8]| {
+            let mut packet = vec![
+                0x90,
+                RTP_PAYLOAD_TYPE_H264,
+                0,
+                1,
+                0,
+                0,
+                0x2a,
+                0xf8,
+                0,
+                0,
+                0,
+                1,
+            ];
+            packet.extend_from_slice(&WHATSAPP_RTP_EXTENSION_PROFILE.to_be_bytes());
+            packet.extend_from_slice(&((extension.len() / 4) as u16).to_be_bytes());
+            packet.extend_from_slice(extension);
+            packet
+        };
+        // Only the offset, after padding, negative.
+        assert_eq!(
+            parse_whatsapp_media_time_offset(&header(&[0x00, 0x61, 0xff, 0x9c])),
+            Some(-100)
+        );
+        // Behind the frame info, with none of the other elements.
+        assert_eq!(
+            parse_whatsapp_media_time_offset(&header(&[0x30, 0x08, 0x61, 0x00, 0x4f, 0, 0, 0])),
+            Some(79)
+        );
+        assert_eq!(
+            parse_whatsapp_media_time_offset(&header(&[0x30, 0x08, 0, 0])),
+            None
+        );
+        // Truncated: the value runs past the block.
+        assert_eq!(
+            parse_whatsapp_media_time_offset(&header(&[0x00, 0x00, 0x61, 0x00])),
+            None
+        );
+        let mut plain = header(&[]);
+        plain[0] = 0x80;
+        plain.truncate(RTP_FIXED_HEADER_LEN);
+        assert_eq!(parse_whatsapp_media_time_offset(&plain), None);
+    }
+
+    #[test]
+    fn video_short_offset_is_written_in_place_and_clamped() {
+        assert_eq!(video_short_offset(0), 0);
+        assert_eq!(video_short_offset(23), 23);
+        assert_eq!(video_short_offset(32_767), i16::MAX);
+        assert_eq!(video_short_offset(u64::MAX), i16::MAX);
+
+        let mut stream = VideoRtpStream::new(0x1122_3344, VIDEO_TS_STRIDE_15FPS).unwrap();
+        let header =
+            stream.next_video_packet_with_offset(true, VIDEO_MEDIA_FRAME_INFO_DELTA, 0x0123);
+        let encoded = encode_rtp_header(&header);
+        let range = video_short_offset_range(&encoded).unwrap();
+        assert_eq!(encoded[range], [0x01, 0x23]);
+        assert_eq!(
+            parse_rtp_header(&encoded)
+                .unwrap()
+                .video_extension
+                .unwrap()
+                .short_offset,
+            0x0123
+        );
+
+        let audio = encode_rtp_header(&RtpHeader {
+            marker: false,
+            payload_type: RTP_PAYLOAD_TYPE_WHATSAPP_AUDIO,
+            sequence_number: 2,
+            timestamp: 320,
+            ssrc: 1,
+            extension_word: Some(WHATSAPP_RTP_EXTENSION_DTX_WORD),
+            video_extension: None,
+        });
+        assert_eq!(video_short_offset_range(&audio), None);
+    }
+
+    #[test]
     fn video_header_matches_android_capture() {
         let k = kats();
         let captured = hex::decode(k["rtp"]["androidVideoHeader28"].as_str().unwrap()).unwrap();
@@ -972,6 +1149,7 @@ mod tests {
                 }),
             })
         );
+        assert_eq!(parse_whatsapp_media_time_offset(&captured), Some(29));
     }
 
     #[test]
@@ -1001,6 +1179,7 @@ mod tests {
                 }),
             })
         );
+        assert_eq!(parse_whatsapp_media_time_offset(&captured), Some(36));
         assert_eq!(
             VIDEO_MEDIA_FRAME_INFO_IDR,
             VIDEO_MEDIA_FRAME_INFO_DELTA | 0x08
@@ -1104,6 +1283,21 @@ mod tests {
             assert_eq!(split_whatsapp_audio_piggyback(&header, &mut payload), None);
             assert_eq!(payload.len(), media.len() + audio.len());
         }
+    }
+
+    #[test]
+    fn received_payload_count_excludes_padding_before_embedded_audio() {
+        let header = video_header_with_piggyback(7, true);
+        let mut payload = vec![0x41, 1, 2, 3, 0, 0, 3];
+        let audio = [
+            0x80, 0xfa, 0, 9, 0, 0, 0x21, 0xc0, 0x12, 0x34, 0x56, 0x78, 0x50,
+        ];
+        payload.extend_from_slice(&audio);
+        assert_eq!(received_payload_len(&header, &payload), 4 + audio.len());
+        assert_eq!(received_payload_len(&[0xa0], &[1, 2, 0, 2]), 2);
+        assert_eq!(received_payload_len(&[0x80], &[1, 2, 0, 2]), 4);
+        assert_eq!(received_payload_len(&[0xa0], &[]), 0);
+        assert_eq!(received_payload_len(&[0xa0], &[9]), 1);
     }
 
     #[test]

@@ -31,6 +31,12 @@ use super::{
 pub enum CallEvent {
     /// The relay accepted our allocate (an allocate/binding success arrived); media path is live.
     RelayAllocated,
+    /// A direct call was accepted and its constructed media plane has an allocated relay.
+    /// Outgoing calls require the verified answer's receive keys to be installed first;
+    /// incoming media is opened only after the local acceptance was sent successfully.
+    /// Relay allocation while the peer is still ringing never raises this event.
+    /// This is setup readiness, not proof of RTP reception or audible sound.
+    MediaConnected,
     /// A standard Opus packet carried through MLOW's in-profile escape while PCM/MLOW I/O is
     /// selected. Shells with an Opus decoder can play it; codec selection still follows signaling.
     ForeignAudio(Bytes),
@@ -207,6 +213,7 @@ impl CallEvent {
                 ..
             } => source.heap_bytes() + call_creator.heap_bytes(),
             Self::RelayAllocated
+            | Self::MediaConnected
             | Self::RelayAllocateFailed(_)
             | Self::RelayAllocateTimedOut
             | Self::RelayReconnectTimedOut

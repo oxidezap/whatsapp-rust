@@ -33,6 +33,7 @@ use super::h264::{VideoFrame, au_has_idr, au_is_keyframe};
 use super::media_stats::{AudioHealthAlarm, AudioHealthWatch, CODEC_FLAP_LIMIT, CallMediaStats};
 // Re-exported for the engine's tests and for callers that name the silence reason from this module;
 // the type itself lives in the neutral contract.
+use super::fec::RTP_PAYLOAD_TYPE_VIDEO_FEC;
 pub use super::media_stats::AudioSilenceReason;
 #[cfg(feature = "voip-mlow")]
 use super::mlow;
@@ -49,11 +50,12 @@ use super::rtp::{
 };
 use super::session::{
     CallDirection, MediaPipeline, MediaPipelineParams, SrtpReceiveError, VideoPipeline,
-    VideoPipelineParams,
+    VideoPipelineParams, VideoReassemblyStats,
 };
 use super::sframe::{SframeIn, SframeSession};
 use super::{ssrc, stun};
 use crate::types::group_call::{GroupCallRelay, GroupCallUpdate};
+use crate::voip_control::VideoFecConfig;
 use wacore_binary::Jid;
 use zeroize::Zeroize;
 
@@ -950,6 +952,69 @@ impl VideoPlaneState {
     }
 }
 
+/// Add one packet's reassembly counters to the call's totals. Taken per packet rather than read from
+/// the pipeline at report time because the video plane can be rebuilt mid-call, and its counters
+/// with it.
+fn fold_video_reassembly(stats: &mut CallMediaStats, r: &VideoReassemblyStats) {
+    let d = &r.depacketizer;
+    for (total, delta) in [
+        (
+            &mut stats.video_access_units_completed,
+            d.access_units_completed,
+        ),
+        (
+            &mut stats.video_access_units_without_marker,
+            d.access_units_without_marker,
+        ),
+        (&mut stats.video_access_units_empty, d.access_units_empty),
+        (
+            &mut stats.video_access_units_evicted,
+            d.access_units_evicted,
+        ),
+        (
+            &mut stats.video_rtp_stale_timestamp,
+            d.packets_stale_timestamp,
+        ),
+        (
+            &mut stats.video_rtp_completed_timestamp,
+            d.packets_completed_timestamp,
+        ),
+        (
+            &mut stats.video_access_units_shared_timestamp,
+            d.access_units_shared_timestamp,
+        ),
+        (
+            &mut stats.video_fu_dropped_sequence_gap,
+            d.fu_dropped_sequence_gap,
+        ),
+        (
+            &mut stats.video_fu_dropped_timestamp_boundary,
+            d.fu_dropped_timestamp_boundary,
+        ),
+        (
+            &mut stats.video_fu_dropped_unterminated,
+            d.fu_dropped_unterminated,
+        ),
+        (&mut stats.video_fu_orphan_fragments, d.fu_orphan_fragments),
+        (
+            &mut stats.video_nal_oversize_dropped,
+            d.nal_oversize_dropped,
+        ),
+        (&mut stats.video_payload_unusable, d.payload_unusable),
+        (&mut stats.video_ssrc_switches, r.ssrc_switches),
+        (
+            &mut stats.video_ssrc_switch_partial_dropped,
+            r.ssrc_switch_partial_dropped,
+        ),
+        (
+            &mut stats.video_retired_ssrc_ignored,
+            r.retired_ssrc_ignored,
+        ),
+    ] {
+        *total = total.saturating_add(delta);
+    }
+}
+
 /// Build the video pipeline for `self_lid` sending / `recv_peer_lid` receiving. `None` on a
 /// malformed callKey (a setup invariant the audio plane already validated).
 fn make_video_plane(
@@ -1065,6 +1130,10 @@ pub struct CallEngine {
     /// order they arrive: inbound media cannot flow before the relay answers our allocate, so arming
     /// on the accept alone reports the allocation interval itself as lost reception.
     peer_has_answered: bool,
+    /// An outgoing answer must install receive keys before it can announce readiness.
+    answer_recv_keys_installed: bool,
+    /// One accepted direct-call media-ready notification per engine, even after relay migration.
+    media_connected_notified: bool,
     started: bool,
     /// A terminal relay-allocate failure was surfaced; the engine goes inert (no keepalive, no
     /// timer, no further transmits) so the driver tears the call down instead of keepaliving a
@@ -1083,6 +1152,8 @@ pub struct CallEngine {
     /// Peer device orientation (0..3, ×90°) from the last `<video device_orientation>`; stamped on
     /// every reassembled inbound AU so the sink can rotate.
     peer_video_orientation: u8,
+    /// Forward error correction for our video in a 1:1 call. Group calls send none.
+    video_fec: VideoFecConfig,
     /// Media counters and the audio-health watchdog. On the engine rather than `MediaState` so a
     /// call that never gets a media plane still reports zeroes instead of nothing.
     media_stats: CallMediaStats,
@@ -1241,6 +1312,8 @@ impl CallEngine {
             allocate_pending: false,
             allocated: false,
             peer_has_answered: false,
+            answer_recv_keys_installed: false,
+            media_connected_notified: false,
             started: false,
             terminated: false,
             self_participant_id: ssrc::format_e2e_srtp_participant_id(&config.self_lid),
@@ -1248,6 +1321,7 @@ impl CallEngine {
             group: None,
             media,
             peer_video_orientation: 0,
+            video_fec: VideoFecConfig::default(),
             media_stats: CallMediaStats::default(),
             health: AudioHealthWatch::default(),
             outbox: VecDeque::new(),
@@ -1891,8 +1965,22 @@ impl CallEngine {
                 v.peer_keyframe_pending = None;
                 v.inbound_gap_timestamp = None;
             }
-            return rekeyed;
+            if !rekeyed {
+                return false;
+            }
         }
+        self.answer_recv_keys_installed = true;
+        self.maybe_publish_media_connected();
+        true
+    }
+
+    /// Apply the verified direct answer before committing peer acceptance. A malformed stored
+    /// key must never announce a connected call whose receive path was not installed.
+    pub fn accept_peer_answer(&mut self, now: Millis, answering_peer_lid: &str) -> bool {
+        if !self.rekey_recv(answering_peer_lid) {
+            return false;
+        }
+        self.peer_answered(now);
         true
     }
 
@@ -1947,6 +2035,22 @@ impl CallEngine {
         if self.group.is_none() && self.allocated {
             self.health.media_started(now);
         }
+        self.maybe_publish_media_connected();
+    }
+
+    fn maybe_publish_media_connected(&mut self) {
+        if !self.media_connected_notified
+            && !self.terminated
+            && self.allocated
+            && self.media.is_some()
+            && self.group.is_none()
+            && (self.direction == CallDirection::Incoming
+                || (self.peer_has_answered && self.answer_recv_keys_installed))
+        {
+            self.media_connected_notified = true;
+            self.outbox
+                .push_back(Output::Event(CallEvent::MediaConnected));
+        }
     }
 
     /// Whether the video plane is currently up (sending is possible, inbound PT-97 decodes).
@@ -1977,6 +2081,24 @@ impl CallEngine {
         video.keyframe_announced = true;
         self.outbox
             .push_back(Output::Event(CallEvent::VideoKeyframeNeeded));
+    }
+
+    /// How much forward error correction a 1:1 call sends with its video, from the next access
+    /// unit on. On by default ([`VideoFecConfig::default`]); a group call sends none whatever this
+    /// says. [`CallMediaStats::video_fec_bytes_sent`] counts what it costs.
+    pub fn set_video_fec(&mut self, config: VideoFecConfig) {
+        self.video_fec = config;
+    }
+
+    /// Video packets per FEC packet at the moment, or `None` while no FEC is sent.
+    pub fn video_fec_group_size(&self) -> Option<usize> {
+        if self.group.is_some() {
+            return None;
+        }
+        self.media
+            .as_ref()
+            .and_then(|m| m.video.as_ref())
+            .and_then(|v| v.pipe.fec_group_size())
     }
 
     /// Re-arm outbound H.264 recovery after the application switches camera/screen sources.
@@ -2230,17 +2352,47 @@ impl CallEngine {
         match input {
             Input::Timeout => self.on_timeout(now),
             Input::RelayPacket(pkt) => self.on_packet(now, pkt),
-            Input::MicFrame(pcm) => self.on_mic(pcm),
-            Input::EncodedAudio(payload) => self.on_encoded_audio(payload),
-            Input::VideoFrame(au) => self.on_video(au),
+            Input::MicFrame(pcm) => {
+                self.on_mic(pcm);
+                self.note_audio_handed_over(now);
+            }
+            Input::EncodedAudio(payload) => {
+                self.on_encoded_audio(payload);
+                self.note_audio_handed_over(now);
+            }
+            Input::VideoFrame(au) => self.on_video(au, now, None),
         }
     }
 
     /// Apply a source-timestamped video access unit without changing the legacy `Input` enum.
-    pub fn handle_video_frame_at(&mut self, _now: Millis, au: &[u8], timestamp: u32) {
+    pub fn handle_video_frame_at(&mut self, now: Millis, au: &[u8], timestamp: u32) {
+        self.handle_captured_video_frame_at(now, au, timestamp, None);
+    }
+
+    /// [`Self::handle_video_frame_at`] for a picture captured at `captured`, on the engine's clock:
+    /// its packets carry the time from capture to transmission (see
+    /// [`Self::stamp_video_departure`]).
+    pub fn handle_captured_video_frame_at(
+        &mut self,
+        now: Millis,
+        au: &[u8],
+        timestamp: u32,
+        captured: Option<Millis>,
+    ) {
         if !self.terminated {
-            self.on_video_at(au, timestamp);
+            self.on_video_at(au, timestamp, now, captured);
         }
+    }
+
+    /// A video packet this engine put out is leaving at `now`: hand back the packet to send in
+    /// its place, its transmission offset measured to now, or the packet itself when it carries
+    /// no capture time (see [`VideoPipeline::stamp_departure`]).
+    pub fn stamp_video_departure(&self, now: Millis, packet: Bytes) -> Bytes {
+        self.media
+            .as_ref()
+            .and_then(|media| media.video.as_ref())
+            .and_then(|video| video.pipe.stamp_departure(now, &packet))
+            .map_or(packet, Bytes::from)
     }
 
     /// Drain one intent. Returns `Output::Timeout(deadline)` once the queue is empty; the shell
@@ -2544,6 +2696,20 @@ impl CallEngine {
             .saturating_add(access_units);
     }
 
+    pub(crate) fn reset_video_fec(&mut self) {
+        if let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut()) {
+            video.pipe.reset_send_fec();
+        }
+    }
+
+    pub(crate) fn note_video_fec_sent(&mut self, bytes: usize) {
+        self.media_stats.video_fec_sent = self.media_stats.video_fec_sent.saturating_add(1);
+        self.media_stats.video_fec_bytes_sent = self
+            .media_stats
+            .video_fec_bytes_sent
+            .saturating_add(bytes as u64);
+    }
+
     /// Fold in inbound media the transport dropped before the engine could see it.
     ///
     /// The drop happens one crate out, in the relay read pump, so the engine cannot observe it
@@ -2628,7 +2794,14 @@ impl CallEngine {
         self.outbox.push_back(Output::Transmit(Bytes::from(packet)));
     }
 
-    /// Audio and video share one wall-clock sample for lip sync.
+    fn note_audio_handed_over(&mut self, now: Millis) {
+        if let Some(m) = self.media.as_mut() {
+            m.pipe.note_audio_handed_over(now);
+        }
+    }
+
+    /// Audio and video share one wall-clock sample for lip sync, and each maps it to its own media
+    /// clock at that same instant.
     fn emit_sender_reports(&mut self, monotonic_ms: Millis, wallclock_ms: u64) {
         if !self.group_epoch_ready() {
             return;
@@ -2649,23 +2822,33 @@ impl CallEngine {
         let Some(m) = self.media.as_mut() else {
             return;
         };
+        let audio_clock_rate = m.audio.format.rtp_clock_rate;
         if let Some((audio_reports, video_reports)) = group_reports {
             if audio_reports.is_empty() {
-                let report = m.pipe.audio_sender_report(wallclock_ms, None);
+                let report =
+                    m.pipe
+                        .audio_sender_report(wallclock_ms, monotonic_ms, audio_clock_rate, None);
                 self.outbox.push_back(Output::Transmit(Bytes::from(report)));
             } else {
                 for reception in &audio_reports {
-                    let report = m.pipe.audio_sender_report(wallclock_ms, Some(reception));
+                    let report = m.pipe.audio_sender_report(
+                        wallclock_ms,
+                        monotonic_ms,
+                        audio_clock_rate,
+                        Some(reception),
+                    );
                     self.outbox.push_back(Output::Transmit(Bytes::from(report)));
                 }
             }
             if let Some(v) = m.video.as_mut().filter(|v| v.active && !v.send_gated) {
                 if video_reports.is_empty() {
-                    let report = v.pipe.video_sender_report(wallclock_ms, None);
+                    let report = v.pipe.video_sender_report(wallclock_ms, monotonic_ms, None);
                     self.outbox.push_back(Output::Transmit(Bytes::from(report)));
                 } else {
                     for reception in &video_reports {
-                        let report = v.pipe.video_sender_report(wallclock_ms, Some(reception));
+                        let report =
+                            v.pipe
+                                .video_sender_report(wallclock_ms, monotonic_ms, Some(reception));
                         self.outbox.push_back(Output::Transmit(Bytes::from(report)));
                     }
                 }
@@ -2673,16 +2856,19 @@ impl CallEngine {
             return;
         }
         let audio_report = m.audio_reception.report(monotonic_ms);
-        let audio_sr = m
-            .pipe
-            .audio_sender_report(wallclock_ms, audio_report.as_ref());
+        let audio_sr = m.pipe.audio_sender_report(
+            wallclock_ms,
+            monotonic_ms,
+            audio_clock_rate,
+            audio_report.as_ref(),
+        );
         self.outbox
             .push_back(Output::Transmit(Bytes::from(audio_sr)));
         if let Some(v) = m.video.as_mut().filter(|v| v.active && !v.send_gated) {
             let video_report = v.reception.report(monotonic_ms);
-            let video_sr = v
-                .pipe
-                .video_sender_report(wallclock_ms, video_report.as_ref());
+            let video_sr =
+                v.pipe
+                    .video_sender_report(wallclock_ms, monotonic_ms, video_report.as_ref());
             self.outbox
                 .push_back(Output::Transmit(Bytes::from(video_sr)));
         }
@@ -2797,6 +2983,16 @@ impl CallEngine {
                 newly_needs_keyframe = true;
                 video.keyframe_required = true;
             }
+            // How much of our video the peer reports lost sets how much FEC follows it.
+            if let Some(video_ssrc) = video_ssrc
+                && let Some(video) = m.video.as_mut()
+                && let Some(block) = summary
+                    .report_blocks
+                    .iter()
+                    .rfind(|block| block.ssrc == video_ssrc)
+            {
+                video.pipe.observe_send_loss(block.fraction_lost);
+            }
             // The peer lost some of our video and asks for it again. Answered while video is on
             // the wire; a gated or downgraded plane has nothing it may send.
             if let Some(video_ssrc) = video_ssrc
@@ -2876,6 +3072,11 @@ impl CallEngine {
             if !was_allocated {
                 self.outbox
                     .push_back(Output::Event(CallEvent::RelayAllocated));
+                // Our video can go out from here on; the keyframe it starts with is asked for now,
+                // as the one the encoder may have made already was dropped with the stale queue.
+                if self.group.is_none() {
+                    self.require_video_keyframe();
+                }
                 if self.media.is_some() {
                     self.rtcp_deadline = now + RTCP_MS;
                     // Inbound media only becomes possible here, so this is the earliest instant at
@@ -2902,6 +3103,7 @@ impl CallEngine {
                     }
                     self.announce_audio_rtcp_session();
                 }
+                self.maybe_publish_media_connected();
             }
             return;
         }
@@ -2956,6 +3158,8 @@ impl CallEngine {
             let mut piggybacked = None;
             // Packets of the peer's picture that never arrived, acted on once the media borrow ends.
             let mut video_lost = 0u16;
+            // What reassembly did with the packet, folded in once the media borrow ends.
+            let mut reassembly = None;
             // The clear extension identifies an audio arrival even when its tag fails.
             // Pure video must not keep the audio watchdog alive.
             if audio_carrier {
@@ -2964,14 +3168,18 @@ impl CallEngine {
             }
             let received = match m.video.as_mut() {
                 Some(v) if v.active => match v.pipe.unprotect_video_packet_split(pkt) {
-                    Ok((header, completed, audio)) => {
-                        v.reception.observe(
-                            header.ssrc,
-                            header.sequence_number,
-                            header.timestamp,
-                            now,
-                            VIDEO_CLOCK_RATE,
-                        );
+                    Ok((header, completed, audio, received_payload_len)) => {
+                        reassembly = Some(v.pipe.take_reassembly_stats());
+                        if v.pipe.inbound_ssrc() == Some(header.ssrc) {
+                            v.reception.observe(
+                                header.ssrc,
+                                header.sequence_number,
+                                header.timestamp,
+                                now,
+                                VIDEO_CLOCK_RATE,
+                            );
+                            v.reception.count_payload(header.ssrc, received_payload_len);
+                        }
                         video_lost = v.missing_before(header.ssrc, header.sequence_number);
                         if video_lost > 0 {
                             v.inbound_gap_timestamp = Some(header.timestamp);
@@ -3029,6 +3237,9 @@ impl CallEngine {
                     self.media_stats.srtp_unprotect_failed =
                         self.media_stats.srtp_unprotect_failed.saturating_add(1);
                 }
+            }
+            if let Some(reassembly) = reassembly {
+                fold_video_reassembly(&mut self.media_stats, &reassembly);
             }
             if let Some(audio) = piggybacked {
                 self.on_piggybacked_audio(now, &audio);
@@ -3098,7 +3309,10 @@ impl CallEngine {
             return;
         }
         match m.pipe.unprotect_audio_checked(pkt) {
-            Ok((header, payload)) => self.on_audio_rtp(now, header, payload),
+            Ok((header, payload)) => {
+                let payload_len = super::rtp::received_payload_len(pkt, &payload);
+                self.on_audio_rtp(now, header, payload, payload_len);
+            }
             Err(SrtpReceiveError::AuthenticationFailed) => {
                 self.media_stats.srtp_unprotect_failed =
                     self.media_stats.srtp_unprotect_failed.saturating_add(1);
@@ -3154,12 +3368,18 @@ impl CallEngine {
             .media_stats
             .piggybacked_audio_received
             .saturating_add(1);
-        self.on_audio_rtp(now, header, payload.to_vec());
+        self.on_audio_rtp(now, header, payload.to_vec(), payload.len());
     }
 
     /// The audio receive path from an authenticated, decrypted RTP packet onwards: reception
     /// statistics, SFrame, and the decoder the packet's codec selects.
-    fn on_audio_rtp(&mut self, now: Millis, header: crate::voip::rtp::RtpHeader, payload: Vec<u8>) {
+    fn on_audio_rtp(
+        &mut self,
+        now: Millis,
+        header: crate::voip::rtp::RtpHeader,
+        payload: Vec<u8>,
+        payload_len: usize,
+    ) {
         // Set by the content probe below and applied once the media borrow has ended: the switch
         // needs the whole engine, and holding both borrows would be a borrow-checker fight for no
         // behavioural gain. The encoded path keeps its own, since it returns before the tail. Not
@@ -3183,6 +3403,7 @@ impl CallEngine {
             now,
             m.audio.format.rtp_clock_rate,
         );
+        m.audio_reception.count_payload(header.ssrc, payload_len);
         // Set when the payload reaching the codec is ciphertext whose tag did not authenticate. Such
         // bytes are passed through by contract but they are NOT evidence about anything: they are
         // whatever the wrong key produced, and three of them structurally resembling 60ms Opus would
@@ -3507,17 +3728,18 @@ impl CallEngine {
             let Some(video) = group.registry.unprotect_video(pkt) else {
                 return;
             };
-            group
+            let reception = group
                 .video_reception
                 .entry(video.participant_id.clone())
-                .or_default()
-                .observe(
-                    video.header.ssrc,
-                    video.header.sequence_number,
-                    video.header.timestamp,
-                    now,
-                    VIDEO_CLOCK_RATE,
-                );
+                .or_default();
+            reception.observe(
+                video.header.ssrc,
+                video.header.sequence_number,
+                video.header.timestamp,
+                now,
+                VIDEO_CLOCK_RATE,
+            );
+            reception.count_payload(video.header.ssrc, video.payload_len);
             let orientation = group
                 .video_orientations
                 .get(&video.device_jid)
@@ -3626,17 +3848,21 @@ impl CallEngine {
         {
             probe.stream_restarted();
         }
-        group
+        let reception = group
             .audio_reception
             .entry(participant.participant_id.clone())
-            .or_default()
-            .observe(
-                participant.header.ssrc,
-                participant.header.sequence_number,
-                participant.header.timestamp,
-                now,
-                audio.format.rtp_clock_rate,
-            );
+            .or_default();
+        reception.observe(
+            participant.header.ssrc,
+            participant.header.sequence_number,
+            participant.header.timestamp,
+            now,
+            audio.format.rtp_clock_rate,
+        );
+        reception.count_payload(
+            participant.header.ssrc,
+            super::rtp::received_payload_len(pkt, &participant.payload),
+        );
         // The latched promotion is consulted FIRST, because the escape marker cannot tell the two
         // apart: `is_mlow_embedded_opus` tests the top two bits, and every native Opus CELT config
         // (24..=31) sets them -- a native 60ms CELT packet starts 0xC3. Read marker-first, a
@@ -4003,7 +4229,7 @@ impl CallEngine {
         self.outbox.push_back(Output::Transmit(Bytes::from(packet)));
     }
 
-    fn on_video_at(&mut self, au: &[u8], timestamp: u32) {
+    fn on_video_at(&mut self, au: &[u8], timestamp: u32, now: Millis, captured: Option<Millis>) {
         if let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut())
             && video.active
             && !video.send_gated
@@ -4011,10 +4237,10 @@ impl CallEngine {
         {
             return;
         }
-        self.on_video(au);
+        self.on_video(au, now, captured);
     }
 
-    fn on_video(&mut self, au: &[u8]) {
+    fn on_video(&mut self, au: &[u8], now: Millis, captured: Option<Millis>) {
         if !self.group_epoch_ready() {
             // Everything here is discarded, an IDR included -- so a request the
             // application has already answered has to be made again once the
@@ -4025,6 +4251,20 @@ impl CallEngine {
                 && video.keyframe_required
                 && au_has_idr(au)
             {
+                video.keyframe_announced = false;
+            }
+            return;
+        }
+        if self.group.is_none() && !self.allocated {
+            // Video that reaches us before the relay has allocated was captured before the call's
+            // media could carry it: the application's encoder starts with the call, the drive loop
+            // only once the relay channel is open, and what the encoder made in between waits in
+            // the input queue. Sent now, seconds of stale pictures leave in one burst the moment
+            // media comes up. They are dropped instead, and the picture starts over from a fresh
+            // keyframe, asked for once the relay allocates: whatever comes next refers to a
+            // picture the peer never got.
+            if let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut()) {
+                video.keyframe_required = true;
                 video.keyframe_announced = false;
             }
             return;
@@ -4043,7 +4283,23 @@ impl CallEngine {
         if v.keyframe_required && !au_has_idr(au) {
             return;
         }
-        let packets = v.pipe.protect_video(au);
+        // 1:1 only: a group call's media goes through an SFU, whose own FEC is hop by hop.
+        let fec = if self.group.is_none() {
+            self.video_fec
+        } else {
+            VideoFecConfig::disabled()
+        };
+        if fec.enabled || v.pipe.fec_ssrc().is_some() {
+            let fec_ssrc = v.pipe.fec_ssrc().unwrap_or_else(|| {
+                ssrc::derive_wasm_participant_ssrc(
+                    &self.call_id,
+                    &self.self_participant_id,
+                    ssrc::VIDEO_FEC_SSRC_SLOT_WORD,
+                )
+            });
+            v.pipe.configure_fec(fec_ssrc, fec);
+        }
+        let packets = v.pipe.protect_video_captured(au, now, captured);
         if packets.is_empty() {
             return;
         }
@@ -4054,7 +4310,13 @@ impl CallEngine {
         let answers_nacks = self.group.is_none();
         for packet in packets {
             let packet = Bytes::from(packet);
-            if answers_nacks {
+            // A repair packet is never asked for again: the peer NACKs video sequence numbers,
+            // and a lost repair packet is only worth what it could have repaired.
+            if answers_nacks
+                && !packet
+                    .get(1)
+                    .is_some_and(|b| b & 0x7f == RTP_PAYLOAD_TYPE_VIDEO_FEC)
+            {
                 v.sent.record(&packet);
             }
             self.outbox.push_back(Output::Transmit(packet));
@@ -4411,6 +4673,22 @@ mod encoded_tests {
             })
             .expect("configure group");
         engine
+    }
+
+    #[test]
+    fn group_allocation_never_emits_direct_media_connected() {
+        let mut eng = group_engine();
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        let success = allocation_success(&eng);
+        eng.handle_input(1, Input::RelayPacket(&success));
+        eng.peer_answered(2);
+        assert!(
+            !drain(&mut eng)
+                .iter()
+                .any(|output| matches!(output, Output::Event(CallEvent::MediaConnected)))
+        );
+        assert!(eng.is_allocated());
     }
 
     /// Hands each group participant its own [`DecodeToConstant`].
@@ -4895,6 +5173,32 @@ mod encoded_tests {
             Some(8),
             "the driver must be able to observe and purge on the send-key transition"
         );
+    }
+
+    #[test]
+    fn a_group_call_sends_no_video_fec() {
+        let mut engine = group_engine();
+        assert_eq!(
+            engine.apply_group_raw_epoch(7, &[0x42; 32]).unwrap(),
+            GroupEpochApply::Installed
+        );
+        engine.start(0, 1_700_000_000_000);
+        let _ = drain(&mut engine);
+        let mut idr = vec![0, 0, 0, 1, 0x65];
+        idr.extend(std::iter::repeat_n(0x55, 20_000));
+        engine.handle_input(1, Input::VideoFrame(&idr));
+        let outputs = drain(&mut engine);
+        let payload_types: Vec<u8> = outputs
+            .iter()
+            .filter_map(|output| match output {
+                Output::Transmit(packet) => parse_rtp_header(packet).map(|h| h.payload_type),
+                _ => None,
+            })
+            .collect();
+        assert!(payload_types.contains(&RTP_PAYLOAD_TYPE_H264));
+        assert!(!payload_types.contains(&RTP_PAYLOAD_TYPE_VIDEO_FEC));
+        assert_eq!(engine.video_fec_group_size(), None);
+        assert_eq!(engine.media_stats().video_fec_sent, 0);
     }
 
     #[test]
@@ -7303,6 +7607,114 @@ mod tests {
     }
 
     #[test]
+    fn direct_media_connected_requires_accept_and_allocation_in_either_order() {
+        for accept_first in [false, true] {
+            let mut cfg = config(true);
+            cfg.direction = CallDirection::Outgoing;
+            let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+            eng.start(0, 0);
+            let _ = drain(&mut eng);
+            if accept_first {
+                assert!(eng.accept_peer_answer(1, PEER_LID));
+                assert_eq!(connected_count(&drain(&mut eng).0), 0);
+            }
+            let success = allocate_success(&eng);
+            eng.handle_input(2, Input::RelayPacket(&success));
+            assert_eq!(
+                connected_count(&drain(&mut eng).0),
+                usize::from(accept_first)
+            );
+            if !accept_first {
+                assert!(eng.accept_peer_answer(3, PEER_LID));
+                assert_eq!(connected_count(&drain(&mut eng).0), 1);
+            }
+            assert!(eng.accept_peer_answer(4, PEER_LID));
+            eng.handle_input(4, Input::RelayPacket(&success));
+            assert_eq!(
+                connected_count(&drain(&mut eng).0),
+                0,
+                "connected is one-shot"
+            );
+        }
+    }
+
+    fn connected_count(outputs: &[Output]) -> usize {
+        outputs
+            .iter()
+            .filter(|output| matches!(output, Output::Event(CallEvent::MediaConnected)))
+            .count()
+    }
+
+    #[test]
+    fn separate_answer_and_rekey_require_both_facts_in_either_order() {
+        for answer_first in [false, true] {
+            let mut cfg = config(true);
+            cfg.direction = CallDirection::Outgoing;
+            let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+            eng.start(0, 0);
+            let _ = drain(&mut eng);
+            let success = allocate_success(&eng);
+            eng.handle_input(1, Input::RelayPacket(&success));
+            assert_eq!(connected_count(&drain(&mut eng).0), 0);
+            if answer_first {
+                eng.peer_answered(2);
+            } else {
+                assert!(eng.rekey_recv(PEER_LID));
+            }
+            assert_eq!(connected_count(&drain(&mut eng).0), 0);
+            if answer_first {
+                assert!(eng.rekey_recv(PEER_LID));
+            } else {
+                eng.peer_answered(3);
+            }
+            assert_eq!(connected_count(&drain(&mut eng).0), 1);
+        }
+    }
+
+    #[test]
+    fn answered_without_a_successful_rekey_never_announces_readiness() {
+        let mut cfg = config(true);
+        cfg.direction = CallDirection::Outgoing;
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        eng.peer_answered(1);
+        eng.media.as_mut().unwrap().call_key.clear();
+        assert!(!eng.rekey_recv(PEER_LID));
+        let success = allocate_success(&eng);
+        eng.handle_input(2, Input::RelayPacket(&success));
+        assert_eq!(connected_count(&drain(&mut eng).0), 0);
+    }
+
+    #[test]
+    fn incoming_media_connected_requires_a_constructed_media_plane() {
+        for with_media in [false, true] {
+            let mut eng = engine(with_media);
+            eng.start(0, 0);
+            let _ = drain(&mut eng);
+            let success = allocate_success(&eng);
+            eng.handle_input(1, Input::RelayPacket(&success));
+            assert_eq!(connected_count(&drain(&mut eng).0), usize::from(with_media));
+        }
+    }
+
+    #[test]
+    fn failed_receive_rekey_never_connects_an_outgoing_call() {
+        let mut cfg = config(true);
+        cfg.direction = CallDirection::Outgoing;
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        let success = allocate_success(&eng);
+        eng.handle_input(1, Input::RelayPacket(&success));
+        assert_eq!(connected_count(&drain(&mut eng).0), 0);
+        eng.media.as_mut().unwrap().call_key.clear();
+        assert!(!eng.accept_peer_answer(2, PEER_LID));
+        assert_eq!(connected_count(&drain(&mut eng).0), 0);
+        assert!(!eng.peer_has_answered);
+    }
+
+    #[test]
     fn mic_drops_wrong_length_frames() {
         let mut eng = engine(true);
         eng.start(0, 0);
@@ -7534,6 +7946,13 @@ mod tests {
             warp_mi_tag_len: WARP_MI_TAG_LEN,
         })
         .unwrap()
+    }
+
+    /// Answer the engine's Allocate, as the relay does before any of our video may go out.
+    fn allocate(eng: &mut CallEngine) {
+        let success = allocate_success(eng);
+        eng.handle_input(0, Input::RelayPacket(&success));
+        let _ = drain(eng);
     }
 
     /// Started, allocated, and with the health watchdog armed: the state a live call is in.
@@ -9243,6 +9662,79 @@ mod tests {
     }
 
     #[test]
+    fn group_reception_counts_authenticated_payload_before_video_reassembly() {
+        let (mut eng, epoch) = group_engine(true);
+        let peer_id = ssrc::format_e2e_srtp_participant_id(PEER_LID);
+        let mut audio = group_peer_audio(&epoch);
+        let mut video = group_peer_video(&epoch);
+        let audio_packet = audio.protect_audio(&[0xf8, 0xff, 0xfe]);
+        eng.handle_input(1, Input::RelayPacket(&audio_packet));
+        let packets = video.protect_video(&video_au(4000));
+        assert!(packets.len() > 1);
+        // Only a fragment arrives, so no access unit is available to count.
+        eng.handle_input(2, Input::RelayPacket(&packets[0]));
+        let mut forged = packets[1].clone();
+        *forged.last_mut().unwrap() ^= 1;
+        eng.handle_input(3, Input::RelayPacket(&forged));
+        eng.handle_input(4, Input::RelayPacket(&packets[0]));
+        let group = eng.group.as_mut().unwrap();
+        let audio = group
+            .audio_reception
+            .get_mut(&peer_id)
+            .unwrap()
+            .report(100)
+            .unwrap();
+        let video = group
+            .video_reception
+            .get_mut(&peer_id)
+            .unwrap()
+            .report(100)
+            .unwrap();
+        assert_eq!(audio.bytes_received, 3);
+        let header_len = super::super::rtp::rtp_header_byte_length(&packets[0]).unwrap();
+        assert_eq!(
+            video.bytes_received as usize,
+            packets[0].len() - header_len - WARP_MI_TAG_LEN
+        );
+    }
+
+    #[test]
+    fn retired_video_packets_preserve_active_reception_totals_and_report_time() {
+        let (mut eng, mut departed) = video_engine_with_inbound_stream();
+        let mut live = peer_video_pipe_with_ssrc(departed.send_ssrc() ^ 0x5a5a5a5a);
+        let packet = live.protect_video(&video_au(100)).pop().unwrap();
+        eng.handle_input(200, Input::RelayPacket(&packet));
+        let report = eng
+            .media
+            .as_mut()
+            .unwrap()
+            .video
+            .as_mut()
+            .unwrap()
+            .reception
+            .report(300)
+            .unwrap();
+        assert_eq!(report.bytes_received, 101);
+        let straggler = departed.protect_video(&video_au(100)).pop().unwrap();
+        eng.handle_input(400, Input::RelayPacket(&straggler));
+        let packet = live.protect_video(&video_au(100)).pop().unwrap();
+        eng.handle_input(500, Input::RelayPacket(&packet));
+        let report = eng
+            .media
+            .as_mut()
+            .unwrap()
+            .video
+            .as_mut()
+            .unwrap()
+            .reception
+            .report(1300)
+            .unwrap();
+        assert_eq!(report.ssrc, live.send_ssrc());
+        assert_eq!(report.bytes_received, 202);
+        assert_eq!(report.receive_rate_bps, 808);
+    }
+
+    #[test]
     fn group_sender_reports_update_only_the_matching_reception_stream() {
         let (mut eng, epoch) = group_engine(true);
         let peer_id = ssrc::format_e2e_srtp_participant_id(PEER_LID);
@@ -9256,7 +9748,7 @@ mod tests {
         }
         let _ = drain(&mut eng);
 
-        let audio_sr = audio.audio_sender_report(1_700_000_000_000, None);
+        let audio_sr = audio.audio_sender_report(1_700_000_000_000, 0, 16_000, None);
         eng.handle_input(100, Input::RelayPacket(&audio_sr));
         let _ = drain(&mut eng);
         let audio_lsr = {
@@ -9279,7 +9771,7 @@ mod tests {
             audio_report.last_sender_report
         };
 
-        let video_sr = video.video_sender_report(1_700_000_100_000, None);
+        let video_sr = video.video_sender_report(1_700_000_100_000, 0, None);
         eng.handle_input(200, Input::RelayPacket(&video_sr));
         let _ = drain(&mut eng);
         let group = eng.group.as_mut().expect("group engine");
@@ -9904,14 +10396,80 @@ mod tests {
         let (plain, _) = unprotect_srtcp(&transport, local_video_ssrc, protected).unwrap();
         assert_eq!(&plain[..4], &[0x91, RTCP_PT_SR, 0, 18]);
         assert_eq!(&plain[28..32], &peer_video_ssrc.to_be_bytes());
-        assert_eq!(&plain[52..76], &[0; 24]);
+        assert_eq!(&plain[52..56], &101u32.to_be_bytes());
+        assert_eq!(&plain[56..76], &[0; 20]);
         assert_eq!(&plain[76..80], &[0x91, RTCP_PT_SDES, 0, 7]);
         let summary = summarize_rtcp(&plain).unwrap();
         assert_eq!(summary.packet_types, [RTCP_PT_SR, RTCP_PT_SDES]);
         assert_eq!(summary.referenced_ssrcs, [peer_video_ssrc]);
         assert_eq!(summary.report_blocks.len(), 1);
-        assert_eq!(summary.report_blocks[0].profile_extension, [0; 24]);
+        let mut expected = [0; 24];
+        expected[..4].copy_from_slice(&101u32.to_be_bytes());
+        assert_eq!(summary.report_blocks[0].profile_extension, expected);
         assert!(summary.uses_whatsapp_profile_extension);
+
+        let check_report = |outputs: &[Output], local_ssrc, bytes: u32, rate: u32| {
+            let packet = outputs
+                .iter()
+                .find_map(|output| match output {
+                    Output::Transmit(packet)
+                        if parse_rtcp_sender_ssrc(packet) == Some(local_ssrc) =>
+                    {
+                        Some(packet)
+                    }
+                    _ => None,
+                })
+                .expect("stream Sender Report");
+            let (plain, _) = unprotect_srtcp(&transport, local_ssrc, packet).unwrap();
+            assert_eq!(&plain[52..56], &bytes.to_be_bytes());
+            assert_eq!(&plain[56..72], &[0; 16]);
+            assert_eq!(&plain[72..76], &rate.to_be_bytes());
+        };
+        let local_audio_ssrc = eng.media.as_ref().unwrap().pipe.send_ssrc();
+        check_report(&outs, local_audio_ssrc, 3, 0);
+
+        // Authentication failures and replays must not increase either stream's totals.
+        let mut forged = peer_video.protect_video(&video_au(70)).pop().unwrap();
+        *forged.last_mut().unwrap() ^= 1;
+        eng.handle_input(RTCP_MS + 10, Input::RelayPacket(&forged));
+        eng.handle_input(RTCP_MS + 11, Input::RelayPacket(&video));
+        eng.handle_input(RTCP_MS + 12, Input::RelayPacket(&audio));
+        // The carrier contributes its entire authenticated payload, including embedded RTP.
+        // The audio stream independently counts the embedded codec payload.
+        let carried_audio = plain_peer_audio(
+            parse_rtp_header(&audio).unwrap().payload_type,
+            10,
+            &[0xf8, 0xff, 0xfe],
+        );
+        let carrier = peer_packet_carrying_audio_with_padding(
+            RTP_PAYLOAD_TYPE_H264,
+            peer_video_ssrc,
+            20,
+            &[0x41, 1, 2, 3, 0, 0, 3],
+            &carried_audio,
+            true,
+        );
+        eng.handle_input(RTCP_MS + 20, Input::RelayPacket(&carrier));
+        let padded_audio = peer_packet_carrying_audio_with_padding(
+            parse_rtp_header(&audio).unwrap().payload_type,
+            peer_audio_ssrc,
+            30,
+            &[0xf8, 0xff, 0xfe, 0, 2],
+            &[],
+            true,
+        );
+        eng.handle_input(RTCP_MS + 21, Input::RelayPacket(&padded_audio));
+        let _ = drain(&mut eng);
+        eng.handle_input(1 + 2 * RTCP_MS, Input::Timeout);
+        let (outs, _) = drain(&mut eng);
+        let added_video = 4 + carried_audio.len() as u32;
+        check_report(
+            &outs,
+            local_video_ssrc,
+            101 + added_video,
+            added_video * 8000 / RTCP_MS as u32,
+        );
+        check_report(&outs, local_audio_ssrc, 9, 6 * 8000 / RTCP_MS as u32);
     }
 
     /// Bring a 1:1 engine up to the point where the peer's video stream has
@@ -10209,6 +10767,44 @@ mod tests {
         for packet in peer.protect_video(&video_delta_au(100)) {
             eng.handle_input(now, Input::RelayPacket(&packet));
         }
+    }
+
+    // Reassembly's counters reach the call's stats, so a call whose packets arrived but whose
+    // pictures did not can say where they went.
+    #[test]
+    fn video_reassembly_counters_reach_media_stats() {
+        let (mut eng, mut peer) = video_engine_with_inbound_stream();
+        // The stream is already established, with its first picture through.
+        let before = eng.media_stats();
+        assert_eq!(before.video_access_units_completed, 1);
+        for packet in peer.protect_video(&video_delta_au(100)) {
+            eng.handle_input(200, Input::RelayPacket(&packet));
+        }
+        // A fragmented picture whose second packet is lost: the partial NAL is dropped, its later
+        // fragments are orphans, and the timestamp yields nothing.
+        let mut fragments = peer.protect_video(&video_delta_au(3_000));
+        assert!(fragments.len() > 3);
+        fragments.remove(1);
+        for packet in &fragments {
+            eng.handle_input(300, Input::RelayPacket(packet));
+        }
+        for packet in peer.protect_video(&video_delta_au(100)) {
+            eng.handle_input(400, Input::RelayPacket(&packet));
+        }
+
+        let stats = eng.media_stats();
+        assert_eq!(stats.video_rtp_lost, 1);
+        assert_eq!(stats.video_access_units_completed, 3);
+        assert_eq!(stats.video_fu_dropped_sequence_gap, 1);
+        assert_eq!(
+            stats.video_fu_orphan_fragments,
+            u32::try_from(fragments.len() - 1).unwrap()
+        );
+        assert_eq!(stats.video_access_units_empty, 1);
+        assert_eq!(stats.video_access_units_without_marker, 0);
+        assert_eq!(stats.video_ssrc_switches, 0);
+        let report = format!("{stats:?}");
+        assert!(report.contains("video_fu_dropped_sequence_gap: 1"));
     }
 
     #[test]
@@ -10585,6 +11181,7 @@ mod tests {
         let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
         eng.start(0, 0);
         let _ = drain(&mut eng);
+        allocate(&mut eng);
         eng.handle_input(1, Input::RelayPacket(&protected));
         let (outs, _) = drain(&mut eng);
         assert!(outs.iter().any(|output| matches!(
@@ -10688,6 +11285,7 @@ mod tests {
         let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
         eng.start(0, 0);
         let _ = drain(&mut eng);
+        allocate(&mut eng);
         eng.handle_input(1, Input::VideoFrame(&video_au(4000)));
         let sent = video_packets(&drain(&mut eng).0);
         assert!(sent.len() >= 4, "the keyframe spans several packets");
@@ -10731,6 +11329,119 @@ mod tests {
         assert!(video_packets(&drain(&mut eng).0).is_empty());
         assert_eq!(eng.media_stats().video_nack_requested, 9);
         assert_eq!(eng.media_stats().video_retransmitted, 4);
+    }
+
+    #[test]
+    fn a_one_to_one_call_sends_video_fec_on_its_own_stream_and_adapts_it_to_loss() {
+        use crate::voip::e2e_srtp::{derive_srtcp_keys, protect_srtcp};
+        use crate::voip::fec::RTP_PAYLOAD_TYPE_VIDEO_FEC;
+        use crate::voip::rtcp::RTCP_PT_RR;
+
+        let mut cfg = config(true);
+        cfg.enable_video = true;
+        let call_key = cfg.call_key.clone();
+        let self_id = ssrc::format_e2e_srtp_participant_id(&cfg.self_lid);
+        let video_ssrc = ssrc::derive_video_participant_ssrc(&cfg.call_id, &self_id);
+        let fec_ssrc = ssrc::derive_wasm_participant_ssrc(
+            &cfg.call_id,
+            &self_id,
+            ssrc::VIDEO_FEC_SSRC_SLOT_WORD,
+        );
+        let peer_ssrc = ssrc::derive_wasm_participant_ssrc(
+            &cfg.call_id,
+            &ssrc::format_e2e_srtp_participant_id(&cfg.peer_lid),
+            0,
+        );
+        let split = |outs: &[Output]| -> (Vec<Bytes>, Vec<Bytes>) {
+            outs.iter()
+                .filter_map(|output| match output {
+                    Output::Transmit(packet) => parse_rtp_header(packet)
+                        .filter(|h| {
+                            h.payload_type == RTP_PAYLOAD_TYPE_H264
+                                || h.payload_type == RTP_PAYLOAD_TYPE_VIDEO_FEC
+                        })
+                        .map(|_| packet.clone()),
+                    _ => None,
+                })
+                .partition(|packet| packet[1] & 0x7f == RTP_PAYLOAD_TYPE_H264)
+        };
+
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        allocate(&mut eng);
+        eng.handle_input(1, Input::VideoFrame(&video_au(20_000)));
+        let (video, fec) = split(&drain(&mut eng).0);
+        assert!(video.len() >= 16, "a keyframe of several groups");
+        assert_eq!(fec.len(), video.len() / 8, "one per eight video packets");
+        assert_eq!(eng.video_fec_group_size(), Some(8));
+        for (index, packet) in fec.iter().enumerate() {
+            let header = parse_rtp_header(packet).unwrap();
+            assert_eq!(header.ssrc, fec_ssrc, "slot 3 of our participant id");
+            assert_eq!(header.sequence_number, index as u16 + 1);
+            assert!(header.marker);
+        }
+        assert_eq!(
+            eng.media_stats().video_fec_sent,
+            0,
+            "generation is not a transport write"
+        );
+        assert_eq!(eng.media_stats().video_fec_bytes_sent, 0);
+
+        // The peer reports a tenth of our video lost: FEC doubles.
+        let peer_keys = derive_srtcp_keys(&call_key, PEER_LID).unwrap();
+        let report = |fraction_lost: u8, index: u32| {
+            let mut rr = vec![0x81, RTCP_PT_RR, 0, 7];
+            rr.extend_from_slice(&peer_ssrc.to_be_bytes());
+            rr.extend_from_slice(&video_ssrc.to_be_bytes());
+            rr.extend_from_slice(&[fraction_lost, 0, 0, 3]);
+            rr.extend_from_slice(&[0; 16]);
+            protect_srtcp(&peer_keys, peer_ssrc, index, &rr)
+        };
+        eng.handle_input(2, Input::RelayPacket(&report(26, 1)));
+        let _ = drain(&mut eng);
+        assert_eq!(eng.video_fec_group_size(), Some(4));
+        eng.handle_input(3, Input::VideoFrame(&video_delta_au(20_000)));
+        let (video, fec) = split(&drain(&mut eng).0);
+        // Whole spans of twelve in three groups; the carried rest of the keyframe's span was two
+        // groups deep and is retired.
+        assert_eq!(fec.len(), 3 * (video.len() / 12));
+        eng.handle_input(4, Input::RelayPacket(&report(0, 2)));
+        let _ = drain(&mut eng);
+        assert_eq!(eng.video_fec_group_size(), Some(8));
+
+        // Repair packets are kept out of the retransmission store, which NACKs index by video
+        // sequence number.
+        let held = &eng
+            .media
+            .as_ref()
+            .unwrap()
+            .video
+            .as_ref()
+            .unwrap()
+            .sent
+            .packets;
+        assert!(!held.is_empty());
+        assert!(
+            held.iter()
+                .all(|(_, packet, _)| packet[1] & 0x7f == RTP_PAYLOAD_TYPE_H264)
+        );
+
+        // Turned off, it stops with the next access unit, and the stream does not restart.
+        eng.set_video_fec(VideoFecConfig::disabled());
+        eng.handle_input(5, Input::VideoFrame(&video_delta_au(20_000)));
+        let (video, fec) = split(&drain(&mut eng).0);
+        assert!(!video.is_empty());
+        assert!(fec.is_empty());
+        assert_eq!(eng.video_fec_group_size(), None);
+        eng.set_video_fec(VideoFecConfig::default());
+        eng.handle_input(6, Input::VideoFrame(&video_delta_au(20_000)));
+        let (_, fec) = split(&drain(&mut eng).0);
+        let first = parse_rtp_header(fec.first().unwrap()).unwrap();
+        assert!(
+            first.sequence_number > 1,
+            "sequence numbers continue under the same keys"
+        );
     }
 
     #[test]
@@ -11136,6 +11847,65 @@ mod tests {
         );
     }
 
+    // The application's encoder starts with the call and the drive loop only once the relay
+    // channel is open, so the first video the engine sees was captured before media could carry
+    // it. A real call sent nine such frames in a third of a millisecond, a keyframe among them.
+    #[test]
+    fn video_queued_before_the_relay_allocates_is_dropped_for_a_fresh_keyframe() {
+        let mut cfg = config(true);
+        cfg.enable_video = true;
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        eng.handle_input(1, Input::VideoFrame(&video_au(3000)));
+        eng.handle_input(1, Input::VideoFrame(&video_delta_au(300)));
+        let (outs, _) = drain(&mut eng);
+        assert_eq!(count_transmits(&outs), 0, "nothing before the allocation");
+
+        let success = allocate_success(&eng);
+        eng.handle_input(2, Input::RelayPacket(&success));
+        let (outs, _) = drain(&mut eng);
+        assert!(
+            outs.iter()
+                .any(|output| matches!(output, Output::Event(CallEvent::VideoKeyframeNeeded))),
+            "the dropped keyframe is asked for again"
+        );
+        eng.handle_input(3, Input::VideoFrame(&video_delta_au(300)));
+        assert_eq!(
+            count_transmits(&drain(&mut eng).0),
+            0,
+            "a delta cannot start the picture"
+        );
+        eng.handle_input(4, Input::VideoFrame(&video_au(3000)));
+        assert!(count_transmits(&drain(&mut eng).0) > 0);
+    }
+
+    #[test]
+    fn allocation_rearms_the_keyframe_request_without_prior_video() {
+        let mut cfg = config(true);
+        cfg.enable_video = true;
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        let success = allocate_success(&eng);
+        eng.handle_input(2, Input::RelayPacket(&success));
+        assert_eq!(
+            drain(&mut eng)
+                .0
+                .iter()
+                .filter(|output| matches!(output, Output::Event(CallEvent::VideoKeyframeNeeded)))
+                .count(),
+            1
+        );
+        eng.handle_input(3, Input::RelayPacket(&success));
+        assert!(
+            !drain(&mut eng)
+                .0
+                .iter()
+                .any(|output| matches!(output, Output::Event(CallEvent::VideoKeyframeNeeded)))
+        );
+    }
+
     #[test]
     fn video_from_start_transmits_pt97_packets() {
         let mut cfg = config(true);
@@ -11144,6 +11914,7 @@ mod tests {
         assert!(eng.is_video_enabled());
         eng.start(0, 0);
         let _ = drain(&mut eng);
+        allocate(&mut eng);
         eng.handle_input(1, Input::VideoFrame(&video_delta_au(300)));
         assert_eq!(
             count_transmits(&drain(&mut eng).0),
@@ -11176,6 +11947,7 @@ mod tests {
         let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
         eng.start(0, 0);
         let _ = drain(&mut eng);
+        allocate(&mut eng);
 
         eng.handle_input(1, Input::VideoFrame(&video_au(100)));
         assert_eq!(count_transmits(&drain(&mut eng).0), 1);
@@ -11202,6 +11974,7 @@ mod tests {
         let mut eng = engine(true);
         eng.start(0, 0);
         let _ = drain(&mut eng);
+        allocate(&mut eng);
         let au = video_au(200);
         // Off: dropped.
         eng.handle_input(1, Input::VideoFrame(&au));
@@ -11236,6 +12009,7 @@ mod tests {
         assert!(eng.enable_video());
         eng.start(0, 0);
         let _ = drain(&mut eng);
+        allocate(&mut eng);
 
         let seq_of = |outs: &[Output]| -> Vec<u16> {
             outs.iter()
@@ -11277,6 +12051,7 @@ mod tests {
         assert!(eng.enable_video());
         eng.start(0, 0);
         let _ = drain(&mut eng);
+        allocate(&mut eng);
 
         let oversized = video_au(crate::voip::h264::H264_MAX_AU_BYTES);
         eng.handle_input(1, Input::VideoFrame(&oversized));
@@ -11302,6 +12077,7 @@ mod tests {
         assert!(eng.is_video_enabled(), "a gated plane is still 'enabled'");
         eng.start(0, 0);
         let _ = drain(&mut eng);
+        allocate(&mut eng);
 
         // Gated: local AUs are dropped (no PT-97 on the wire).
         eng.handle_input(1, Input::VideoFrame(&video_au(200)));
@@ -12023,6 +12799,17 @@ mod tests {
         media: &[u8],
         audio: &[u8],
     ) -> Vec<u8> {
+        peer_packet_carrying_audio_with_padding(payload_type, ssrc, seq, media, audio, false)
+    }
+
+    fn peer_packet_carrying_audio_with_padding(
+        payload_type: u8,
+        ssrc: u32,
+        seq: u16,
+        media: &[u8],
+        audio: &[u8],
+        padded: bool,
+    ) -> Vec<u8> {
         use crate::voip::e2e_srtp::{crypt_payload_in_place, derive_e2e_keys};
         use crate::voip::rtp::VIDEO_MEDIA_FRAME_INFO_IDR;
         use crate::voip::warp::append_warp_mi_tag_in_place;
@@ -12032,7 +12819,7 @@ mod tests {
         let [high, low] = u16::try_from(media.len())
             .expect("media fits")
             .to_be_bytes();
-        let mut packet = vec![0x90, 0x80 | payload_type];
+        let mut packet = vec![if padded { 0xb0 } else { 0x90 }, 0x80 | payload_type];
         packet.extend_from_slice(&seq.to_be_bytes());
         packet.extend_from_slice(&(u32::from(seq) * VIDEO_TS_STRIDE_15FPS).to_be_bytes());
         packet.extend_from_slice(&ssrc.to_be_bytes());

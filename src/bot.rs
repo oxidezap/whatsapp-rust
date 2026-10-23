@@ -1,3 +1,4 @@
+use crate::HistorySyncDurabilityHook;
 use crate::cache_config::CacheConfig;
 use crate::client::{Client, ClientBuilder, ClientBuilderError, ClientOptions};
 use crate::features::PresencePolicy;
@@ -1306,6 +1307,27 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         self.client_builder = self
             .client_builder
             .with_group_notification_durability_hook_arc(hook);
+        self
+    }
+
+    /// Retain self-sent history notifications and chunks before ACK/receipt.
+    /// See [`HistorySyncDurabilityHook`] for backend requirements and replay.
+    pub fn with_history_sync_durability_hook<Hd>(mut self, hook: Hd) -> Self
+    where
+        Hd: HistorySyncDurabilityHook + 'static,
+    {
+        self.client_builder = self.client_builder.with_history_sync_durability_hook(hook);
+        self
+    }
+
+    /// Register a shared history recovery hook. The last registration wins.
+    pub fn with_history_sync_durability_hook_arc(
+        mut self,
+        hook: Arc<dyn HistorySyncDurabilityHook>,
+    ) -> Self {
+        self.client_builder = self
+            .client_builder
+            .with_history_sync_durability_hook_arc(hook);
         self
     }
 

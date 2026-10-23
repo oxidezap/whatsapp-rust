@@ -16,6 +16,8 @@ pub fn derive_wasm_participant_ssrc(call_id: &str, lid: &str, slot_word: u32) ->
 
 /// Relay stream slot used to derive the VIDEO SSRC, pinned to the WhatsApp WASM slot grid.
 pub const VIDEO_SSRC_SLOT_WORD: u32 = 2;
+/// Relay stream slot of the video stream's forward error correction (video, sub-type FEC).
+pub const VIDEO_FEC_SSRC_SLOT_WORD: u32 = 3;
 /// RTC app-data stream slot (reactions and other call controls).
 pub const APP_DATA_SSRC_SLOT_WORD: u32 = 6;
 /// Hop-by-hop FEC relay stream slots used once more than one remote PID is subscribed.

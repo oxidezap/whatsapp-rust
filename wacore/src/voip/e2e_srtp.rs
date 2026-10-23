@@ -257,6 +257,17 @@ impl RocTracker {
         self.last_seq = seq;
         self.roc
     }
+
+    /// The ROC a packet already sent with `seq` was protected under. A seq above the last one
+    /// was sent before the latest wrap; valid while fewer than half the sequence space has been
+    /// sent since it.
+    pub fn roc_of(&self, seq: u16) -> u32 {
+        if self.initialized && seq > self.last_seq {
+            self.roc.wrapping_sub(1)
+        } else {
+            self.roc
+        }
+    }
 }
 
 /// Recv-side ROC estimator (RFC 3711 §3.3.1 guess-index). Unlike the monotonic send tracker it
@@ -421,6 +432,20 @@ mod tests {
         let roc = k["inputs"]["roc"].as_u64().unwrap() as u32;
         let iv = build_e2e_rtp_iv(&peer.salt, ssrc, roc, seq);
         assert_eq!(hex::encode(iv), k["e2e_srtp"]["rtpIv"].as_str().unwrap());
+    }
+
+    #[test]
+    fn roc_of_names_the_rollover_a_sent_packet_used() {
+        let mut tx = RocTracker::default();
+        assert_eq!(tx.roc_of(7), 0, "nothing sent yet");
+        assert_eq!(tx.advance(0xFFFE), 0);
+        assert_eq!(tx.advance(0xFFFF), 0);
+        assert_eq!(tx.advance(0x0000), 1);
+        assert_eq!(tx.advance(0x0001), 1);
+        assert_eq!(tx.roc_of(0x0001), 1);
+        assert_eq!(tx.roc_of(0x0000), 1);
+        assert_eq!(tx.roc_of(0xFFFF), 0, "sent before the wrap");
+        assert_eq!(tx.roc_of(0xFFFE), 0);
     }
 
     #[test]

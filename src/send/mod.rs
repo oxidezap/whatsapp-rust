@@ -1610,7 +1610,23 @@ impl Client {
             let stanza_type = stanza_type_override
                 .map(StanzaType::as_wire)
                 .unwrap_or_else(|| wacore::send::stanza_type_from_message(&message));
-            let (_, meta_node) = infer_stanza_metadata(&message);
+            let (_, mut meta_node) = infer_stanza_metadata(&message);
+            // Newsletter publication adds contenttype to the poll creation meta.
+            // E2E metadata does not carry this newsletter-specific attribute.
+            if let Some(poll) = message
+                .poll_creation_message_v3
+                .as_option()
+                .or_else(|| message.poll_creation_message.as_option())
+                && let Some(meta) = meta_node.as_mut()
+            {
+                let content_type =
+                    if poll.poll_content_type == Some(wa::message::PollContentType::IMAGE) {
+                        "image"
+                    } else {
+                        "text"
+                    };
+                meta.attrs.insert("contenttype", content_type);
+            }
             let mut plaintext_builder = NodeBuilder::new("plaintext");
             if let Some(mt) = wacore::send::media_type_from_message(&message) {
                 plaintext_builder = plaintext_builder.attr("mediatype", mt);
@@ -5409,7 +5425,21 @@ mod tests {
         use wacore::store::traits::{DeviceInfo, DeviceListRecord};
         use wacore::types::jid::cmp_for_lock_order;
 
-        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        // Startup can publish persisted mappings after a send and invalidate
+        // its memo. Keep that publication separate from the warm-send checks.
+        let (mut backend, _dropped) = crate::store::release::tests::ProbeBackend::new();
+        backend.backend = crate::test_utils::create_test_backend().await;
+        let (release_startup, parked) = async_channel::bounded(1);
+        let (entered, startup_read) = async_channel::bounded(1);
+        backend.gate_method = "get_all_lid_mappings";
+        backend.gate = Some(parked);
+        backend.entered = Some(entered);
+        let (client, _transport) =
+            crate::test_utils::create_iq_test_client_with_backend(Arc::new(backend)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), startup_read.recv())
+            .await
+            .unwrap()
+            .unwrap();
         let own = Jid::from_str("5511000000001@s.whatsapp.net").unwrap();
         client
             .persistence_manager
@@ -5535,6 +5565,38 @@ mod tests {
                 .all(|address| address.user.as_str() == new_lid),
             "the fresh entry addresses the new LID: {:?}",
             addressing.encryption()
+        );
+
+        // A delayed startup read sees the mappings persisted above. Even when
+        // their values match the cache, publication invalidates this topology.
+        let before_startup = client.device_topology.current();
+        release_startup.send(()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while client.device_topology.current() == before_startup {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("startup publishes its mapping snapshot");
+        let after_startup = resolve().await;
+        assert!(
+            !Arc::ptr_eq(&third, &after_startup),
+            "startup publication must invalidate the previous memo"
+        );
+        assert!(after_startup.signal_addressing().is_none());
+        client
+            .send_message(peer.clone(), wa::Message::text("after startup"))
+            .await
+            .expect("DM after startup publication");
+        let fourth = resolve().await;
+        assert!(Arc::ptr_eq(&after_startup, &fourth));
+        assert!(
+            fourth
+                .signal_addressing()
+                .expect("the next send warms the new entry")
+                .encryption()
+                .iter()
+                .all(|address| address.user.as_str() == new_lid)
         );
     }
 

@@ -39,14 +39,25 @@ pub use super::MediaStats as CallMediaStats;
 /// numbers cross a task boundary. The drive loop republishes whenever a counter moved, which on a
 /// live call is most iterations, since `rtp_received` moves on every authenticated packet. That is
 /// an uncontended lock at roughly the packet rate; measured, it does not appear in a profile.
-#[derive(Debug, Default)]
-pub struct MediaStatsCell(std::sync::Mutex<CallMediaStats>);
+#[derive(Default)]
+pub struct MediaStatsCell {
+    stats: std::sync::Mutex<CallMediaStats>,
+    connected: std::sync::Mutex<Option<super::MediaConnectedHook>>,
+}
+
+impl std::fmt::Debug for MediaStatsCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaStatsCell")
+            .field("stats", &self.snapshot())
+            .finish()
+    }
+}
 
 impl MediaStatsCell {
     /// Overwrite the published snapshot. Called by the drive loop; a poisoned lock is ignored,
     /// since a stale diagnostic must never take a live call down.
     pub fn publish(&self, stats: CallMediaStats) {
-        if let Ok(mut slot) = self.0.lock() {
+        if let Ok(mut slot) = self.stats.lock() {
             *slot = stats;
         }
     }
@@ -54,7 +65,26 @@ impl MediaStatsCell {
     /// The most recent snapshot, or zeroes if the lock was poisoned or nothing has published yet.
     #[must_use]
     pub fn snapshot(&self) -> CallMediaStats {
-        self.0.lock().map(|slot| *slot).unwrap_or_default()
+        self.stats.lock().map(|slot| *slot).unwrap_or_default()
+    }
+
+    /// Install the backend's generation-scoped lifecycle hook before its driver starts.
+    /// The hook is consumed once and must not retain the call registry strongly.
+    pub fn on_media_connected(&self, hook: super::MediaConnectedHook) {
+        *self.connected.lock().unwrap_or_else(|p| p.into_inner()) = Some(hook);
+    }
+
+    /// Commit accepted media readiness before attempting public event delivery. The driver calls
+    /// this once per engine. A false result suppresses the public event for a rejected generation.
+    /// Without a hook a standalone engine may publish normally. The hook runs outside the cell
+    /// lock so registry teardown cannot deadlock.
+    pub fn notify_media_connected(&self) -> bool {
+        let hook = self
+            .connected
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        hook.is_none_or(|hook| hook())
     }
 }
 
@@ -354,6 +384,58 @@ fn window_delta(now: &CallMediaStats, then: &CallMediaStats) -> CallMediaStats {
         video_retransmitted: now
             .video_retransmitted
             .saturating_sub(then.video_retransmitted),
+        video_access_units_completed: now
+            .video_access_units_completed
+            .saturating_sub(then.video_access_units_completed),
+        video_access_units_without_marker: now
+            .video_access_units_without_marker
+            .saturating_sub(then.video_access_units_without_marker),
+        video_access_units_empty: now
+            .video_access_units_empty
+            .saturating_sub(then.video_access_units_empty),
+        video_access_units_evicted: now
+            .video_access_units_evicted
+            .saturating_sub(then.video_access_units_evicted),
+        video_rtp_stale_timestamp: now
+            .video_rtp_stale_timestamp
+            .saturating_sub(then.video_rtp_stale_timestamp),
+        video_rtp_completed_timestamp: now
+            .video_rtp_completed_timestamp
+            .saturating_sub(then.video_rtp_completed_timestamp),
+        video_access_units_shared_timestamp: now
+            .video_access_units_shared_timestamp
+            .saturating_sub(then.video_access_units_shared_timestamp),
+        video_fu_dropped_sequence_gap: now
+            .video_fu_dropped_sequence_gap
+            .saturating_sub(then.video_fu_dropped_sequence_gap),
+        video_fu_dropped_timestamp_boundary: now
+            .video_fu_dropped_timestamp_boundary
+            .saturating_sub(then.video_fu_dropped_timestamp_boundary),
+        video_fu_dropped_unterminated: now
+            .video_fu_dropped_unterminated
+            .saturating_sub(then.video_fu_dropped_unterminated),
+        video_fu_orphan_fragments: now
+            .video_fu_orphan_fragments
+            .saturating_sub(then.video_fu_orphan_fragments),
+        video_nal_oversize_dropped: now
+            .video_nal_oversize_dropped
+            .saturating_sub(then.video_nal_oversize_dropped),
+        video_payload_unusable: now
+            .video_payload_unusable
+            .saturating_sub(then.video_payload_unusable),
+        video_ssrc_switches: now
+            .video_ssrc_switches
+            .saturating_sub(then.video_ssrc_switches),
+        video_ssrc_switch_partial_dropped: now
+            .video_ssrc_switch_partial_dropped
+            .saturating_sub(then.video_ssrc_switch_partial_dropped),
+        video_retired_ssrc_ignored: now
+            .video_retired_ssrc_ignored
+            .saturating_sub(then.video_retired_ssrc_ignored),
+        video_fec_sent: now.video_fec_sent.saturating_sub(then.video_fec_sent),
+        video_fec_bytes_sent: now
+            .video_fec_bytes_sent
+            .saturating_sub(then.video_fec_bytes_sent),
     }
 }
 

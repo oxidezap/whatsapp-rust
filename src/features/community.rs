@@ -15,10 +15,10 @@ use crate::request::IqError;
 use log::warn;
 use thiserror::Error;
 use wacore::iq::groups::{
-    CommunityParticipatingIq, CommunityParticipatingOverviewIq, DeleteCommunityIq,
-    GetLinkedGroupsParticipantsIq, GroupCreateOptions, GroupDescription, GroupSubject,
-    JoinGroupResult, JoinLinkedGroupIq, LinkSubgroup, LinkSubgroupsIq, QueryLinkedGroupIq,
-    UnlinkSubgroupsIq,
+    CommunityCreateIq, CommunityParticipatingIq, CommunityParticipatingOverviewIq,
+    DeleteCommunityIq, GetLinkedGroupsParticipantsIq, GroupCreateOptions, GroupDescription,
+    GroupSubject, JoinGroupResult, JoinLinkedGroupIq, LinkSubgroup, LinkSubgroupsIq,
+    QueryLinkedGroupIq, UnlinkSubgroupsIq,
 };
 use wacore::iq::mex_operations::{fetch_all_subgroups, query_subgroup_participant_count};
 use wacore_binary::Jid;
@@ -73,7 +73,8 @@ pub enum CommunityConfigurationStep {
 pub struct CreateCommunityOptions {
     pub name: GroupSubject,
     pub description: Option<GroupDescription>,
-    /// Whether the community is closed (requires approval to join).
+    /// Whether the community requires approval to join. Defaults to true,
+    /// matching the Web community creation action.
     pub closed: bool,
     /// Allow non-admin members to create subgroups.
     pub allow_non_admin_sub_group_creation: bool,
@@ -89,7 +90,7 @@ impl CreateCommunityOptions {
         Ok(Self {
             name,
             description: None,
-            closed: false,
+            closed: true,
             allow_non_admin_sub_group_creation: false,
             create_general_chat: true,
         })
@@ -258,22 +259,18 @@ impl<'a> Community<'a> {
         options.validate()?;
         let description = options.description;
 
-        // Preserve the existing two-stage community wire flow. Generic group
-        // creation also has an inline description option; adopting it here is
-        // a protocol-sequencing change, not part of this input/error fix.
-        let mut create_options = GroupCreateOptions::new(options.name.into_string());
-        create_options.is_parent = true;
-        create_options.closed = options.closed;
-        create_options.allow_non_admin_sub_group_creation =
-            options.allow_non_admin_sub_group_creation;
-        create_options.create_general_chat = options.create_general_chat;
-
-        let mut metadata = self
+        // Keep description configuration and its recoverable partial-success error.
+        let group = self
             .client
-            .groups()
-            .create_group(create_options)
-            .await?
-            .metadata;
+            .execute(CommunityCreateIq::new(
+                &options.name,
+                options.closed,
+                options.allow_non_admin_sub_group_creation,
+                options.create_general_chat,
+            ))
+            .await
+            .map_err(GroupError::from)?;
+        let mut metadata = GroupMetadata::from(group);
 
         if let Some(description) = description {
             let desc_text = description.as_str().to_owned();
@@ -734,6 +731,80 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn community_create_sends_only_parent_settings() {
+        use wacore_binary::builder::NodeBuilder;
+        for closed in [false, true] {
+            for allow in [false, true] {
+                for general in [false, true] {
+                    let (client, transport) = crate::test_utils::create_iq_test_client().await;
+                    let mut options = CreateCommunityOptions::new("Fictitious community").unwrap();
+                    options.closed = closed;
+                    options.allow_non_admin_sub_group_creation = allow;
+                    options.create_general_chat = general;
+                    let task = {
+                        let client = client.clone();
+                        tokio::spawn(async move { client.community().create(options).await })
+                    };
+                    let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
+                    let sent = sent.get();
+                    assert_eq!(sent.attrs().optional_string("to").as_deref(), Some("g.us"));
+                    assert_eq!(
+                        sent.attrs().optional_string("xmlns").as_deref(),
+                        Some("w:g2")
+                    );
+                    assert_eq!(sent.attrs().optional_string("type").as_deref(), Some("set"));
+                    let create = sent.get_optional_child("create").unwrap();
+                    assert_eq!(
+                        create.attrs().optional_string("subject").as_deref(),
+                        Some("Fictitious community")
+                    );
+                    let mut expected = vec!["parent"];
+                    if allow {
+                        expected.push("allow_non_admin_sub_group_creation");
+                    }
+                    if general {
+                        expected.push("create_general_chat");
+                    }
+                    assert_eq!(
+                        create
+                            .children()
+                            .unwrap()
+                            .iter()
+                            .map(|n| n.tag.as_ref())
+                            .collect::<Vec<_>>(),
+                        expected
+                    );
+                    let parent = create.get_optional_child("parent").unwrap();
+                    assert_eq!(
+                        parent
+                            .attrs()
+                            .optional_string("default_membership_approval_mode")
+                            .as_deref(),
+                        closed.then_some("request_required")
+                    );
+                    let id = sent.attrs().optional_string("id").unwrap().into_owned();
+                    let response = NodeBuilder::new("iq")
+                        .attr("id", &id)
+                        .attr("type", "error")
+                        .attr("from", "g.us")
+                        .children([NodeBuilder::new("error")
+                            .attr("code", "400")
+                            .attr("text", "bad-request")
+                            .build()])
+                        .build();
+                    crate::test_utils::answer_iq(&client, &id, &response).await;
+                    assert!(matches!(
+                        task.await.unwrap(),
+                        Err(CommunityError::Group(GroupError::Iq(
+                            IqError::ServerError { code: 400, .. }
+                        )))
+                    ));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn invalid_description_sends_no_create_iq() {
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
         let mut options = CreateCommunityOptions::new("Fictitious community").unwrap();
@@ -750,7 +821,7 @@ mod tests {
     #[test]
     fn community_options_validate_and_preserve_defaults() {
         let options = CreateCommunityOptions::new("Fictitious community").unwrap();
-        assert!(!options.closed);
+        assert!(options.closed);
         assert!(!options.allow_non_admin_sub_group_creation);
         assert!(options.create_general_chat);
         assert!(options.description.is_none());
@@ -806,7 +877,23 @@ mod tests {
         let sent = crate::test_utils::decode_sent_iq(transport, 0).await;
         let sent = sent.get();
         let create = sent.get_optional_child("create").unwrap();
-        assert!(create.get_optional_child("parent").is_some());
+        let parent = create.get_optional_child("parent").unwrap();
+        assert_eq!(
+            parent
+                .attrs()
+                .optional_string("default_membership_approval_mode")
+                .as_deref(),
+            Some("request_required")
+        );
+        assert_eq!(
+            create
+                .children()
+                .unwrap()
+                .iter()
+                .map(|n| n.tag.as_ref())
+                .collect::<Vec<_>>(),
+            ["parent", "create_general_chat"]
+        );
         assert!(create.get_optional_child("description").is_none());
         let id = sent.attrs().optional_string("id").unwrap().into_owned();
         crate::test_utils::answer_iq(

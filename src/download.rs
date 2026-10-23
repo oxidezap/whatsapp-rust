@@ -1065,14 +1065,24 @@ impl Client {
     /// Only needed when you need the plaintext bytes (processing, transcoding,
     /// re-upload). To forward existing media unchanged, reuse the original
     /// message's CDN fields directly, no round-trip required.
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(name = "wa.media.download", level = "debug", skip_all, err(Debug))
-    )]
     pub async fn download(
         &self,
         downloadable: &dyn Downloadable,
         limits: DownloadLimits,
+    ) -> std::result::Result<Vec<u8>, ClientDownloadError> {
+        self.download_with_runtime(downloadable, limits, &self.runtime)
+            .await
+    }
+
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.media.download", level = "debug", skip_all, err(Debug))
+    )]
+    pub(crate) async fn download_with_runtime(
+        &self,
+        downloadable: &dyn Downloadable,
+        limits: DownloadLimits,
+        runtime: &Arc<dyn Runtime>,
     ) -> std::result::Result<Vec<u8>, ClientDownloadError> {
         if limits.is_bounded() && !self.http_client.supports_streaming() {
             return Err(DownloadPolicyError::StreamingRequired.into());
@@ -1094,7 +1104,7 @@ impl Client {
             |request| async move {
                 execute_request_into_memory(
                     &self.http_client,
-                    &self.runtime,
+                    runtime,
                     &request,
                     ExpectedMediaHashes {
                         budget: budget.clone(),

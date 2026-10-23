@@ -66,6 +66,10 @@ impl FlushScope {
         self.state.fetch_or(CLOSED, Ordering::Relaxed);
     }
 
+    pub(crate) fn is_closed(&self) -> bool {
+        self.state.load(Ordering::Relaxed) & CLOSED != 0
+    }
+
     pub fn reopen(&self) {
         self.state.fetch_and(!CLOSED, Ordering::Relaxed);
     }

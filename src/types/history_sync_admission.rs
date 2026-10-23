@@ -1,6 +1,6 @@
 /// Metadata available to a history-sync admission policy.
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HistorySyncMetadata<'a> {
     /// Protocol history-sync type, using the core's stable numeric representation.
     pub sync_type: Option<i32>,

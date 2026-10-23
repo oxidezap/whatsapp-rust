@@ -768,3 +768,6 @@ fn is_sender_key_distribution_only(msg: &mut wa::Message) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod history_durability_tests;

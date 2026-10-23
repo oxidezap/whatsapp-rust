@@ -172,7 +172,7 @@ impl Client {
         let candidate = decrypted.as_ref().map_or(message, |inner| inner);
         let fingerprint = MessageDispatch::fingerprint(candidate);
         if self.with_message_dispatch(info, false, |claim| {
-            let sibling = self.inbound_durability_hook.get().is_some()
+            let sibling = self.inbound_journal_enabled()
                 && producer.is_some()
                 && claim.payloads.iter().any(|payload| {
                     payload.fingerprint == fingerprint
@@ -182,8 +182,7 @@ impl Client {
                 });
             !sibling
                 && claim.state(&fingerprint).is_some_and(|state| {
-                    state != MessageDispatch::Recovered
-                        || self.inbound_durability_hook.get().is_none()
+                    state != MessageDispatch::Recovered || !self.inbound_journal_enabled()
                 })
         }) {
             ProbeOutcome::Suppress { decrypted }
@@ -424,7 +423,7 @@ impl Client {
     /// receipt for own-account self-fanouts), else a transport ack. status is
     /// acked by the `should_ack` gate, newsletters/empty ids need nothing here.
     pub(crate) fn ack_received_message(self: &Arc<Self>, info: &Arc<MessageInfo>) {
-        if self.inbound_durability_hook.get().is_some()
+        if self.inbound_journal_enabled()
             && self.inbound_commit_batch.live_retention.defer_receipt(info)
         {
             return;

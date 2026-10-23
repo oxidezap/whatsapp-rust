@@ -11,14 +11,21 @@ description = "SQLite storage backend for whatsapp-rust"
 # `libsqlite3-sys` is pulled only to activate its `bundled` feature (compile
 # SQLite in-tree); there is no direct `use`, so static analysers flag it.
 [package.metadata.cargo-machete]
-# Diesel uses sqlite-wasm-rs; the direct edge constrains its WASM host ABI.
+# `js` names sqlite-wasm-rs only to select Diesel's browser host hooks.
 ignored = ["libsqlite3-sys", "sqlite-wasm-rs"]
 
 [features]
 default = ["bundled-sqlite"]
 bundled-sqlite = ["libsqlite3-sys/bundled"]
 test-util = []
-wasm-test = ["wacore/js"]
+# The browser host on wasm32-unknown-unknown: wacore's JS randomness and
+# sqlite-wasm-rs's wasm-bindgen hooks, which the 0.6 ABI Diesel accepts no
+# longer enables by default. Opt-in because Cargo checks sqlite-wasm-rs's
+# `links = "wsqlite3"` across the whole resolve, whatever the target: an
+# unconditional 0.6 edge stops a native application from also depending on a
+# crate that requires 0.5, such as rusqlite 0.40. No effect on other targets.
+js = ["wacore/js", "dep:sqlite-wasm-rs"]
+wasm-test = ["js"]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -53,9 +60,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # target does not provide. This future wraps the platform's real setTimeout.
 gloo-timers = { version = "0.4", features = ["futures"] }
 
-# Diesel 2.3.14 accepts the 0.6 ABI; explicitly select the browser host hooks.
+# Diesel 2.3.14 accepts the 0.6 ABI; `js` selects the browser host hooks.
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
-sqlite-wasm-rs = { version = "0.6.1", default-features = false, features = ["wasm-bindgen"] }
+sqlite-wasm-rs = { version = "0.6.1", default-features = false, features = ["wasm-bindgen"], optional = true }
 
 [[bench]]
 name = "signal_flush"

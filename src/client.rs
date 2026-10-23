@@ -474,8 +474,12 @@ use wacore::runtime::Runtime;
 /// Keyed by `Jid` to avoid per-message `to_string()` allocation.
 #[derive(Clone)]
 pub(crate) struct ChatLane {
+    pub generation: u64,
     pub enqueue_lock: Arc<Mutex<()>>,
     pub queue_tx: async_channel::Sender<QueuedChatMessage>,
+    pub byte_budget: Arc<crate::inbound_queue::ByteBudget>,
+    pub global_budget: Arc<crate::inbound_queue::ByteBudget>,
+    pub work: Arc<crate::flush_scope::FlushScope>,
     /// Held by the lane's worker for as long as it runs; a replacement
     /// worker takes it before its first message. Why it is shared across
     /// lane generations is explained at `create_chat_lane`.
@@ -483,6 +487,33 @@ pub(crate) struct ChatLane {
 }
 
 impl ChatLane {
+    /// A full queue may only mean its ready worker has not had a turn yet.
+    /// Give it bounded turns; never wait for capacity on the IQ-serving reader.
+    pub(crate) async fn enqueue_scoped(
+        &self,
+        mut node: Arc<wacore_binary::OwnedNodeRef>,
+        mut shutdown: wacore::runtime::ShutdownSignal,
+        runtime: &dyn Runtime,
+    ) -> Result<(), async_channel::TrySendError<QueuedChatMessage>> {
+        let mut turns = crate::inbound_queue::SATURATION_RETRY_TURNS;
+        loop {
+            let queued = match self.try_enqueue_scoped(node, shutdown) {
+                Err(async_channel::TrySendError::Full(queued)) => queued,
+                result => return result,
+            };
+            if turns == 0 || queued.shutdown.is_fired() || self.work.is_closed() {
+                return Err(async_channel::TrySendError::Full(queued));
+            }
+            crate::inbound_queue::yield_for_capacity(runtime).await;
+            if queued.shutdown.is_fired() || self.work.is_closed() {
+                return Err(async_channel::TrySendError::Full(queued));
+            }
+            turns -= 1;
+            node = queued.node;
+            shutdown = queued.shutdown;
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn try_enqueue(
         &self,
@@ -496,11 +527,48 @@ impl ChatLane {
         node: Arc<wacore_binary::OwnedNodeRef>,
         shutdown: wacore::runtime::ShutdownSignal,
     ) -> Result<(), async_channel::TrySendError<QueuedChatMessage>> {
-        self.queue_tx.try_send(QueuedChatMessage {
+        let queued = QueuedChatMessage {
             node,
             shutdown,
             lane_liveness: Arc::clone(&self.enqueue_lock),
-        })
+            work: None,
+        };
+        if self.queue_tx.is_closed() {
+            return Err(async_channel::TrySendError::Closed(queued));
+        }
+        if self.queue_tx.is_full() {
+            return Err(async_channel::TrySendError::Full(queued));
+        }
+        // Refuse closed admission before compacting/parsing a possibly large
+        // node. A successful guard also covers that work if close races here.
+        let Some(work) = self.work.try_track() else {
+            return Err(async_channel::TrySendError::Full(queued));
+        };
+        let Some(retained) = crate::inbound_queue::retain_node(
+            &queued.node,
+            &self.global_budget,
+            &self.byte_budget,
+            Arc::clone(&self.enqueue_lock),
+        ) else {
+            return Err(async_channel::TrySendError::Full(queued));
+        };
+        let original = queued.node;
+        self.queue_tx
+            .try_send(QueuedChatMessage {
+                node: Arc::new(retained),
+                work: Some(work),
+                ..queued
+            })
+            .map_err(|error| match error {
+                async_channel::TrySendError::Full(mut queued) => {
+                    queued.node = original;
+                    async_channel::TrySendError::Full(queued)
+                }
+                async_channel::TrySendError::Closed(mut queued) => {
+                    queued.node = original;
+                    async_channel::TrySendError::Closed(queued)
+                }
+            })
     }
 }
 
@@ -508,6 +576,7 @@ pub(crate) struct QueuedChatMessage {
     pub shutdown: wacore::runtime::ShutdownSignal,
     pub node: Arc<wacore_binary::OwnedNodeRef>,
     pub lane_liveness: Arc<Mutex<()>>,
+    pub work: Option<crate::flush_scope::FlushGuard>,
 }
 
 const APP_STATE_RETRY_MAX_ATTEMPTS: u32 = 6;
@@ -625,13 +694,19 @@ pub struct MemoryReport {
     /// Groups with a metadata query in flight; normally zero.
     pub group_metadata_inflight: u64,
     pub chat_lanes: u64,
+    /// Live per-chat budgets, including backing slices surviving lane eviction.
+    /// Bytes include the shared queue controller and budget/registry overhead.
+    pub inbound_chat_budgets: CollectionStats,
+    /// Charged backing storage, including in-flight nodes and escaped slices.
+    /// Conservatively charges at least 1 KiB per owner; excludes decoded trees.
+    pub inbound_chat_charged_bytes: u64,
+    /// Charged compact ACK storage, including in-flight transport ownership.
+    pub inbound_ack_charged_bytes: u64,
     /// Incoming offers still inside the handler, awaiting signaling or identity work.
     pub pending_call_offers: u64,
     /// Inbound messages queued behind their chat's lane worker, summed over
-    /// every lane. The lanes are capacity-bounded; their queues are not, and
-    /// each queued message retains its whole frame, so a worker that is stuck
-    /// (a slow durability hook, a hung decrypt) shows up here as a backlog
-    /// that grows with the chat's inbound rate.
+    /// every lane. Queued messages retain compact byte-budgeted frame copies.
+    /// A stalled worker can fill its lane, but cannot grow it indefinitely.
     pub chat_lane_backlog: u64,
     pub group_distribution_locks: u64,
     /// Cumulative capacity evictions; poll successive reports to derive a rate.
@@ -645,11 +720,10 @@ pub struct MemoryReport {
     /// Groups whose sender-key distribution is memoised as already warm.
     pub skdm_warm_memo: u64,
     // -- Unbounded collections --
-    /// Deferred acks queued for the transport-ack worker. Unbounded, and each
-    /// entry retains the full inbound node plus a flush guard, so a stalled
-    /// transport shows up here as a growing backlog.
+    /// Deferred encoded ACKs, bounded by item count and retained byte budget.
+    /// Full incoming payload nodes are never retained by this queue.
     pub transport_ack_queue: usize,
-    /// Delivery receipts queued for their worker, same shape as above.
+    /// Delivery receipts queued for their worker, bounded by draining/lifecycle.
     pub delivery_receipt_queue: usize,
     pub response_waiters: usize,
     pub node_waiters: usize,
@@ -681,6 +755,19 @@ pub struct MemoryReport {
     /// Bounded by the number of collections in practice, but retained until a
     /// reply consumes the entry, so it is reported rather than assumed small.
     pub app_state_recovery_requests: usize,
+    /// Snapshot recoveries the primary sent unasked, queued behind the one
+    /// being applied.
+    ///
+    /// Bounded at 64 replies, plus the one in flight. Reads 0 until the first
+    /// recovery reply builds the state that holds them.
+    pub app_state_unrequested_recoveries_queued: usize,
+    /// Wire bytes the queued unrequested recoveries hold.
+    ///
+    /// Bounded by `wacore::history_sync::MAX_DECOMPRESSED`, except that one
+    /// reply of up to the slightly larger compressed wire ceiling may always
+    /// wait alone; the reply in flight is not counted. Reads 0 until the first
+    /// recovery reply builds the state that holds them.
+    pub app_state_unrequested_recoveries_queued_bytes: u64,
     pub app_state_syncing: usize,
     /// Synced audience retention. `entries` counts top-level JIDs, custom-list
     /// records, and JIDs inside those lists. `bytes` attributes the shared
@@ -766,7 +853,7 @@ pub struct SubsystemMemory {
 impl MemoryReport {
     /// Common byte-carrying collections used by both totals and `Display`.
     /// Feature-specific collections stay beside their gated report section.
-    fn collections(&self) -> [(&'static str, &CollectionStats); 19] {
+    fn collections(&self) -> [(&'static str, &CollectionStats); 20] {
         [
             ("group_cache:", &self.group_cache),
             ("device_registry_cache:", &self.device_registry_cache),
@@ -787,6 +874,7 @@ impl MemoryReport {
             ("offline_receipts:", &self.offline_receipt_buffer),
             ("core_event_handlers:", &self.core_event_handlers),
             ("status_privacy:", &self.status_privacy),
+            ("inbound_chat_budgets:", &self.inbound_chat_budgets),
         ]
     }
 
@@ -804,6 +892,10 @@ impl MemoryReport {
     /// Sum of every estimated byte figure in the report.
     pub fn total_estimated_bytes(&self) -> u64 {
         let total: u64 = self.collections().iter().map(|(_, c)| c.bytes).sum();
+        let total = total
+            .saturating_add(self.inbound_chat_charged_bytes)
+            .saturating_add(self.inbound_ack_charged_bytes)
+            .saturating_add(self.app_state_unrequested_recoveries_queued_bytes);
         let total = self.subsystems.iter().fold(total, |sum, retained| {
             sum.saturating_add(retained.stats.bytes)
         });
@@ -847,8 +939,6 @@ impl MemoryReport {
             ),
             ("ensure_inflight", self.ensure_inflight),
             ("group_metadata_inflight", self.group_metadata_inflight),
-            ("chat_lane_backlog", self.chat_lane_backlog),
-            ("transport_ack_queue", n(self.transport_ack_queue)),
             ("delivery_receipt_queue", n(self.delivery_receipt_queue)),
             ("response_waiters", n(self.response_waiters)),
             ("node_waiters", n(self.node_waiters)),
@@ -862,6 +952,10 @@ impl MemoryReport {
             (
                 "app_state_recovery_requests",
                 n(self.app_state_recovery_requests),
+            ),
+            (
+                "app_state_unrequested_recoveries_queued",
+                n(self.app_state_unrequested_recoveries_queued),
             ),
             ("app_state_syncing", n(self.app_state_syncing)),
             ("status_privacy", self.status_privacy.entries),
@@ -947,9 +1041,21 @@ impl std::fmt::Display for MemoryReport {
             self.session_recreate_history
         )?;
         writeln!(f, "  skdm_warm_memo:         {}", self.skdm_warm_memo)?;
-        writeln!(f, "--- Unbounded collections ---")?;
+        writeln!(f, "--- Byte-bounded receive queues ---")?;
+        line(f, "inbound_chat_budgets:", &self.inbound_chat_budgets)?;
+        writeln!(
+            f,
+            "  inbound_chat_bytes:     {}",
+            self.inbound_chat_charged_bytes
+        )?;
+        writeln!(
+            f,
+            "  inbound_ack_bytes:      {}",
+            self.inbound_ack_charged_bytes
+        )?;
         writeln!(f, "  chat_lane_backlog:      {}", self.chat_lane_backlog)?;
         writeln!(f, "  transport_ack_queue:    {}", self.transport_ack_queue)?;
+        writeln!(f, "--- Unbounded collections ---")?;
         writeln!(
             f,
             "  delivery_receipt_queue: {}",
@@ -981,6 +1087,12 @@ impl std::fmt::Display for MemoryReport {
             f,
             "  app_state_recovery:     {}",
             self.app_state_recovery_requests
+        )?;
+        writeln!(
+            f,
+            "  app_state_unrequested_recoveries: {} ({} B)",
+            self.app_state_unrequested_recoveries_queued,
+            self.app_state_unrequested_recoveries_queued_bytes
         )?;
         writeln!(f, "  app_state_syncing:      {}", self.app_state_syncing)?;
         line(f, "status_privacy:", &self.status_privacy)?;
@@ -1982,6 +2094,11 @@ pub struct Client {
     /// are user-paced, so there is nothing to gain from finer granularity.
     /// Inline: only ever locked via `&self` on the `Arc`-held `Client`.
     pub(crate) app_state_send_lock: Mutex<()>,
+    /// The state behind snapshot recoveries from the primary, built when the
+    /// first recovery reply arrives. Most clients never receive one, so they
+    /// pay for this cell and nothing else; what it holds, and why, is on
+    /// `crate::pdo::SnapshotRecoveryState`.
+    pub(crate) snapshot_recovery: std::sync::OnceLock<Box<crate::pdo::SnapshotRecoveryState>>,
     pub(crate) initial_keys_synced_notifier: Arc<event_listener::Event>,
     pub(crate) initial_app_state_keys_received: AtomicBool,
 
@@ -2041,16 +2158,11 @@ pub struct Client {
             crate::flush_scope::FlushGuard,
         )>,
     >,
-    /// Feed of the persistent transport-ack worker, mirroring
+    /// Lazy receive-queue controller and persistent transport-ack feed, mirroring
     /// [`Self::delivery_receipt_queue`]. Deferred acks used to be one spawned
     /// task each; the queue also gives them FIFO order, which the spawns did
     /// not guarantee.
-    pub(crate) transport_ack_queue: std::sync::OnceLock<
-        async_channel::Sender<(
-            Arc<wacore_binary::OwnedNodeRef>,
-            crate::flush_scope::FlushGuard,
-        )>,
-    >,
+    pub(crate) inbound_queues: std::sync::OnceLock<Box<crate::inbound_queue::QueueBudgets>>,
     /// Contacts with active presence subscriptions that must be re-subscribed on reconnect.
     pub(crate) presence_subscriptions: Arc<std::sync::Mutex<HashSet<Jid>>>,
     /// Metrics for granular offline sync logging
@@ -2124,6 +2236,10 @@ pub struct Client {
     /// Optional whole-envelope group capture before effects and ACK; fixed at build.
     pub(crate) group_notification_durability_hook:
         std::sync::OnceLock<Arc<dyn crate::GroupNotificationDurabilityHook>>,
+
+    /// Notification recovery shares the inbound journal, independently of capture.
+    pub(crate) history_sync_durability_hook:
+        std::sync::OnceLock<Arc<dyn crate::HistorySyncDurabilityHook>>,
 
     /// History capture is independent of message durability and immutable after build.
     pub(crate) history_sync_capture_hook:

@@ -477,6 +477,7 @@ pub mod types;
 
 pub mod client;
 pub(crate) mod flush_scope;
+mod inbound_queue;
 /// Shared base error for transport/connection concerns; the per-domain error
 /// types embed it.
 pub use client::ClientError;
@@ -509,6 +510,7 @@ pub use types::group_notification_durability::GroupNotificationDurabilityHook;
 pub use types::history_sync_admission::{
     HistorySyncAdmission, HistorySyncDecision, HistorySyncMetadata,
 };
+pub use types::history_sync_durability::{HistorySyncDurabilityHook, HistorySyncKey};
 pub use types::retry_admission::{RetryAdmission, RetryContext, RetryDecision};
 pub mod download;
 pub mod error;

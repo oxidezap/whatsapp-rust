@@ -933,7 +933,7 @@ impl Client {
         let Some(first) = owned.first() else {
             return Ok(None);
         };
-        if self.inbound_durability_hook().is_none() || first.origin.is_none() {
+        if !self.inbound_journal_enabled() || first.origin.is_none() {
             return Ok(None);
         }
         let mut physical = owned
@@ -1051,7 +1051,7 @@ impl Client {
         mut item: PendingDelivery,
         track_commit: bool,
     ) -> InboundCommitState {
-        let durable = self.inbound_durability_hook.get().is_some();
+        let durable = self.inbound_journal_enabled();
         if durable
             && let Err(error) = self
                 .inbound_commit_batch
@@ -1768,7 +1768,7 @@ impl Client {
         let dispatch_gate = self.dispatch_gate_enabled();
         let mut fingerprints =
             smallvec::SmallVec::<[(Option<DispatchFingerprint>, bool); 1]>::new();
-        if let Some(hook) = self.inbound_durability_hook() {
+        if self.inbound_journal_enabled() {
             if dispatch_gate {
                 fingerprints.reserve_exact(items.len());
             }
@@ -1811,7 +1811,27 @@ impl Client {
                 self.inbound_commit_batch.live_retention.stored(&pending);
             }
 
+            // Use every original carrier, before projection deduplication can
+            // collapse distinct history notifications to the same empty message.
+            // The same journal supplies these bytes on redelivery after restart.
+            if self.history_sync_durability_hook.get().is_some() {
+                for delivery in pending.iter() {
+                    let Some((_, carrier)) = &delivery.carrier else {
+                        continue;
+                    };
+                    // Erase the already-boxed future so downstream Send proofs
+                    // do not traverse history capture and its traced receipts
+                    // through the send pipeline's Signal flush path.
+                    let history_commit: wacore::runtime::BoxFuture<'_, _> =
+                        Box::pin(self.commit_history_sync_carrier(&delivery.info, carrier.clone()));
+                    if let Err(error) = history_commit.await {
+                        log::warn!("History sync durability failed; withholding ACK: {error:?}");
+                        return PendingCommitOutcome::BUFFERED;
+                    }
+                }
+            }
             if !items.is_empty()
+                && let Some(hook) = self.inbound_durability_hook()
                 && let Err(e) = hook.on_messages(self.clone(), &items).await
             {
                 log::warn!(
@@ -1820,7 +1840,7 @@ impl Client {
                 );
                 return PendingCommitOutcome::BUFFERED;
             }
-            hook_committed = true;
+            hook_committed = self.inbound_durability_hook.get().is_some();
 
             // A commit covering only a subset cannot delete prior failed
             // occurrences. Redelivery replays the complete retained group.

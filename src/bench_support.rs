@@ -1000,28 +1000,30 @@ impl ReceiveHarness {
     /// chat lanes, driving the lane workers to process them, and flush outbound receipts.
     pub fn enqueue_and_drain(&self, nodes: &[Arc<wacore_binary::OwnedNodeRef>]) {
         self.runtime.block_on(async {
-            let target = self.messages_delivered() + nodes.len() as u64;
-            for node in nodes {
-                let mut cancelled = false;
-                let accepted = crate::handlers::message::MessageHandler::handle_inline(
-                    Arc::clone(&self.client),
-                    Arc::clone(node),
-                    &mut cancelled,
-                )
-                .await;
-                assert!(accepted && !cancelled, "message enqueue failed");
-            }
-            tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                while self.messages_delivered() < target {
-                    tokio::task::yield_now().await;
+            for window in nodes.chunks(crate::inbound_queue::CHAT_QUEUE_ITEMS) {
+                let target = self.messages_delivered() + window.len() as u64;
+                for node in window {
+                    let mut cancelled = false;
+                    let accepted = crate::handlers::message::MessageHandler::handle_inline(
+                        Arc::clone(&self.client),
+                        Arc::clone(node),
+                        &mut cancelled,
+                    )
+                    .await;
+                    assert!(accepted && !cancelled, "message enqueue failed");
                 }
-            })
-            .await
-            .expect("lane delivery timed out: a decrypt, commit, or worker failed");
-            self.client
-                .outbound_flush
-                .flush(&*self.client.runtime, std::time::Duration::from_secs(5))
-                .await;
+                tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                    while self.messages_delivered() < target {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("lane delivery timed out: a decrypt, commit, or worker failed");
+                self.client
+                    .outbound_flush
+                    .flush(&*self.client.runtime, std::time::Duration::from_secs(5))
+                    .await;
+            }
         });
     }
 
@@ -1122,15 +1124,19 @@ impl ReceiveHarness {
     }
 
     /// Run a whole batch of stanzas under one `block_on`, as an offline drain
-    /// does: the read loop hands the queue over without yielding to anything
-    /// else between items, so the per-item cost includes whatever the ack
-    /// worker gets to do in the gaps.
+    /// does, including the reader's runtime-defined cooperative yields so lane
+    /// and ACK workers get the same scheduling opportunities as production.
     pub fn process_burst(&self, nodes: &[Arc<wacore_binary::OwnedNodeRef>]) {
         self.runtime.block_on(async {
-            for node in nodes {
+            for (index, node) in nodes.iter().enumerate() {
                 Arc::clone(&self.client)
                     .process_node(Arc::clone(node))
                     .await;
+                if ((index + 1) as u32).is_multiple_of(self.client.runtime.yield_frequency())
+                    && let Some(turn) = self.client.runtime.yield_now()
+                {
+                    turn.await;
+                }
             }
         });
     }
@@ -1288,8 +1294,12 @@ impl MultiLaneReceiveHarness {
     /// their respective chat lanes, await their processing, and flush outbound receipts.
     pub fn enqueue_and_drain(&self, nodes: &[Arc<wacore_binary::OwnedNodeRef>]) {
         self.runtime.block_on(async {
-            let target = self.enqueue_batch(nodes).await;
-            self.drain_until(target).await;
+            // Throughput inputs must respect the admission window; overload is
+            // measured separately with a deliberately blocked receiver.
+            for window in nodes.chunks(crate::inbound_queue::CHAT_QUEUE_ITEMS) {
+                let target = self.enqueue_batch(window).await;
+                self.drain_until(target).await;
+            }
         });
     }
 
@@ -1807,4 +1817,60 @@ async fn build_scale_fixture(
 
     install_offline_socket(&client).await;
     (client, group_list, own_pn)
+}
+
+/// Deterministic blocked-worker fixture for CodSpeed Memory and Simulation.
+/// Payload construction stays outside the measured admission loop.
+pub struct InboundQueueHarness {
+    nodes: Vec<Arc<wacore_binary::OwnedNodeRef>>,
+}
+impl Default for InboundQueueHarness {
+    fn default() -> Self {
+        use wacore_binary::builder::NodeBuilder;
+        Self {
+            nodes: (0..128)
+                .map(|id| {
+                    decoded(
+                        &NodeBuilder::new("message")
+                            .attr("from", "120363000000042@g.us")
+                            .attr("id", id.to_string())
+                            .bytes(vec![id as u8; 64 * 1024])
+                            .build(),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+impl InboundQueueHarness {
+    /// The receiver deliberately never polls. Admission must finish without it.
+    pub fn saturate(&self) -> usize {
+        let budgets = crate::inbound_queue::QueueBudgets::default();
+        let (queue_tx, rx) = async_channel::bounded(crate::inbound_queue::CHAT_QUEUE_ITEMS);
+        let rx = crate::inbound_queue::DrainingReceiver(rx);
+        let lane = ChatLane {
+            generation: 0,
+            queue_tx,
+            enqueue_lock: Arc::default(),
+            worker_running: Arc::default(),
+            byte_budget: Arc::new(crate::inbound_queue::ByteBudget::new(
+                crate::inbound_queue::CHAT_BYTES,
+            )),
+            global_budget: Arc::clone(&budgets.chat),
+            work: Arc::clone(&budgets.work),
+        };
+        let accepted = self
+            .nodes
+            .iter()
+            .filter(|node| {
+                lane.try_enqueue_scoped(Arc::clone(node), wacore::runtime::ShutdownSignal::never())
+                    .is_ok()
+            })
+            .count();
+        assert_eq!(accepted, crate::inbound_queue::CHAT_QUEUE_ITEMS);
+        assert_eq!(rx.len(), accepted);
+        drop(rx);
+        assert_eq!(budgets.chat.available(), 32 * 1024 * 1024);
+        accepted
+    }
 }

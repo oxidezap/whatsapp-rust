@@ -411,6 +411,11 @@ impl Client {
         let group_distribution_locks = self.group_distribution_locks.capacity_stats().await;
         // One awaited walk: a lane's queue length is a channel counter, so this
         // reads each lane once and allocates nothing.
+        let (inbound_chat_budgets, inbound_chat_charged_bytes, inbound_ack_charged_bytes) = self
+            .inbound_queues
+            .get()
+            .map(|q| q.memory_stats())
+            .unwrap_or_default();
         let (chat_lanes, chat_lane_backlog) = self
             .chat_lanes
             .fold_entries((0u64, 0u64), |(lanes, backlog), _, lane| {
@@ -440,6 +445,15 @@ impl Client {
                 ),
                 None => (0, 0),
             };
+        // `get()` for the same reason: a client that never received a
+        // recovery reply has nothing queued and builds nothing here.
+        let (
+            app_state_unrequested_recoveries_queued,
+            app_state_unrequested_recoveries_queued_bytes,
+        ) = self
+            .snapshot_recovery
+            .get()
+            .map_or((0, 0), |state| state.queued_unrequested());
         let offline_receipt_buffer = {
             let buffer = self
                 .offline_receipt_buffer
@@ -577,6 +591,9 @@ impl Client {
             ensure_inflight: self.ensure_inflight.len() as u64,
             group_metadata_inflight: self.group_metadata_inflight.len() as u64,
             chat_lanes,
+            inbound_chat_budgets,
+            inbound_chat_charged_bytes,
+            inbound_ack_charged_bytes,
             pending_call_offers: self.pending_call_offers.len() as u64,
             chat_lane_backlog,
             group_distribution_locks: group_distribution_locks.entries,
@@ -585,7 +602,11 @@ impl Client {
             resend_rate_limiter_chats: self.resend_rate_limiter.entry_count_async().await,
             session_recreate_history: self.session_recreate_history.entry_count_async().await,
             skdm_warm_memo: self.skdm_warm_memo.entry_count_async().await,
-            transport_ack_queue: self.transport_ack_queue.get().map_or(0, |tx| tx.len()),
+            transport_ack_queue: self
+                .inbound_queues
+                .get()
+                .and_then(|q| q.ack_queue.get())
+                .map_or(0, |tx| tx.len()),
             delivery_receipt_queue: self.delivery_receipt_queue.get().map_or(0, |tx| tx.len()),
             response_waiters,
             node_waiters: self.node_waiter_count.load(Ordering::Relaxed),
@@ -598,6 +619,8 @@ impl Client {
             app_state_key_requests,
             app_state_key_cache,
             app_state_recovery_requests,
+            app_state_unrequested_recoveries_queued,
+            app_state_unrequested_recoveries_queued_bytes,
             app_state_syncing,
             status_privacy,
             signal_sessions,

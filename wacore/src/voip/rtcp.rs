@@ -259,6 +259,11 @@ pub(crate) struct RtcpReceptionReport {
     pub jitter: u32,
     pub last_sender_report: u32,
     pub delay_since_last_sender_report: u32,
+    /// Payload bytes received on the stream so far, modulo 2^32: the first word of the native
+    /// report's extension.
+    pub bytes_received: u32,
+    /// The stream's receive rate since the previous report, in bit/s: the extension's sixth word.
+    pub receive_rate_bps: u32,
 }
 
 #[derive(Debug, Default)]
@@ -283,9 +288,22 @@ pub(crate) struct RtpReceptionStats {
     jitter_q4: u64,
     last_sender_report: u32,
     last_sender_report_at_ms: Option<u64>,
+    /// Payload bytes of the stream counted by [`Self::count_payload`], and as of the last report,
+    /// with when that report was made, for its receive rate.
+    payload_bytes: u64,
+    payload_bytes_prior: u64,
+    reported_at_ms: Option<u64>,
 }
 
 impl RtpReceptionStats {
+    /// Counts the payload of a packet of the current stream, which [`Self::observe`] has just
+    /// seen.
+    pub(crate) fn count_payload(&mut self, ssrc: u32, bytes: usize) {
+        if self.ssrc == Some(ssrc) {
+            self.payload_bytes = self.payload_bytes.saturating_add(bytes as u64);
+        }
+    }
+
     pub(crate) fn observe(
         &mut self,
         ssrc: u32,
@@ -408,6 +426,16 @@ impl RtpReceptionStats {
         };
         self.expected_prior = expected;
         self.received_prior = self.received;
+        let receive_rate_bps = self
+            .reported_at_ms
+            .filter(|&at| now_ms > at)
+            .map(|at| {
+                let bits = self.payload_bytes.saturating_sub(self.payload_bytes_prior) * 8;
+                (u128::from(bits) * 1000 / u128::from(now_ms - at)).min(u128::from(u32::MAX)) as u32
+            })
+            .unwrap_or(0);
+        self.payload_bytes_prior = self.payload_bytes;
+        self.reported_at_ms = Some(now_ms);
 
         let cumulative_lost =
             (expected as i64 - self.received as i64).clamp(-0x80_0000, 0x7f_ffff) as i32;
@@ -427,6 +455,8 @@ impl RtpReceptionStats {
             jitter: (self.jitter_q4 >> 4).min(u32::MAX as u64) as u32,
             last_sender_report: self.last_sender_report,
             delay_since_last_sender_report,
+            bytes_received: self.payload_bytes as u32,
+            receive_rate_bps,
         })
     }
 }
@@ -585,9 +615,17 @@ const WHATSAPP_RECEPTION_REPORT_EXTENSION_LEN: usize = 24;
 
 fn encode_whatsapp_reception_report(report: &RtcpReceptionReport, out: &mut Vec<u8>) {
     encode_reception_report(report, out);
-    // These are optional transport/BWE statistics in the native 1:1 report. Zero is the
-    // native unavailable value; the RFC fields above remain authoritative.
-    out.resize(out.len() + WHATSAPP_RECEPTION_REPORT_EXTENSION_LEN, 0);
+    // Optional transport/BWE statistics in the native 1:1 report; zero is the native unavailable
+    // value, and the RFC fields above remain authoritative. A native client's own reports fill the
+    // first word with the payload bytes it has received on the stream and the sixth with its
+    // receive rate in bit/s (each tracks the sender's own count and rate). Those two are filled
+    // here; the words whose meaning is not known stay zero. Left all zero, a native sender had no
+    // statement of what reached us, and lowered its video to 600 kbit/s a couple of minutes into a
+    // call.
+    let mut extension = [0u8; WHATSAPP_RECEPTION_REPORT_EXTENSION_LEN];
+    extension[0..4].copy_from_slice(&report.bytes_received.to_be_bytes());
+    extension[20..24].copy_from_slice(&report.receive_rate_bps.to_be_bytes());
+    out.extend_from_slice(&extension);
 }
 
 fn build_sender_report_with_reports(
@@ -935,6 +973,8 @@ mod tests {
                 jitter: 123,
                 last_sender_report: 0x3344_5566,
                 delay_since_last_sender_report: 0x7788_99aa,
+                bytes_received: 0,
+                receive_rate_bps: 0,
             },
             RtcpReceptionReport {
                 ssrc: 0x3333_4444,
@@ -944,6 +984,8 @@ mod tests {
                 jitter: 8,
                 last_sender_report: 0,
                 delay_since_last_sender_report: 0,
+                bytes_received: 0,
+                receive_rate_bps: 0,
             },
         ];
         let compound = build_sender_report_with_sdes_and_reports(
@@ -1030,6 +1072,8 @@ mod tests {
             jitter: 7,
             last_sender_report: 8,
             delay_since_last_sender_report: 9,
+            bytes_received: 0x0008_1549,
+            receive_rate_bps: 758_055,
         };
         let compound = build_whatsapp_sender_report_with_sdes(
             0x1111_2222,
@@ -1047,12 +1091,39 @@ mod tests {
         assert_eq!(compound.len(), 108);
         assert_eq!(&compound[..4], &[0x91, RTCP_PT_SR, 0, 18]);
         assert_eq!(&compound[28..32], &report.ssrc.to_be_bytes());
-        assert_eq!(&compound[52..76], &[0; 24]);
+        // The bytes received and the receive rate, where a native client's report carries them;
+        // the rest of the extension zero.
+        let mut extension = [0u8; 24];
+        extension[0..4].copy_from_slice(&0x0008_1549u32.to_be_bytes());
+        extension[20..24].copy_from_slice(&758_055u32.to_be_bytes());
+        assert_eq!(&compound[52..76], &extension);
         assert_eq!(&compound[76..80], &[0x91, RTCP_PT_SDES, 0, 7]);
         let summary = summarize_rtcp(&compound).expect("native video compound");
         assert_eq!(summary.referenced_ssrcs, [report.ssrc]);
-        assert_eq!(summary.report_blocks[0].profile_extension, [0; 24]);
+        assert_eq!(summary.report_blocks[0].profile_extension, extension);
         assert!(summary.uses_whatsapp_profile_extension);
+    }
+
+    #[test]
+    fn reception_stats_report_the_bytes_received_and_the_rate_since_the_last_report() {
+        let mut reception = RtpReceptionStats::default();
+        reception.observe(0x1111, 1, 0, 1_000, 90_000);
+        reception.count_payload(0x1111, 800);
+        let first = reception.report(1_000).expect("a stream");
+        assert_eq!(first.bytes_received, 800);
+        assert_eq!(
+            first.receive_rate_bps, 0,
+            "no interval before the first report"
+        );
+        for sequence in 2..=101u16 {
+            reception.observe(0x1111, sequence, 0, 1_000, 90_000);
+            reception.count_payload(0x1111, 1_000);
+        }
+        // Another stream's packets are not this one's.
+        reception.count_payload(0x2222, 50_000);
+        let second = reception.report(2_000).expect("a stream");
+        assert_eq!(second.bytes_received, 100_800);
+        assert_eq!(second.receive_rate_bps, 800_000, "100 kB in a second");
     }
 
     #[test]

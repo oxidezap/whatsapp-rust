@@ -3804,6 +3804,9 @@ fn client_size_pins_runtime_cache_config_saving() {
     }
     expected += size_of::<AppStateDownloads>();
     expected += size_of::<std::sync::OnceLock<Arc<dyn crate::HistorySyncCaptureHook>>>();
+    // Opt-in history recovery keeps one additional immutable hook cell.
+    // Derive its cost from the representation; do not loosen the fixed base.
+    expected += size_of::<std::sync::OnceLock<Arc<dyn crate::HistorySyncDurabilityHook>>>();
     // Independent group capture adds one immutable hook cell; keep the fixed base.
     expected += size_of::<std::sync::OnceLock<Arc<dyn crate::GroupNotificationDurabilityHook>>>();
     // Immutable retry policies and handler map replace their synchronization cells.
@@ -3814,6 +3817,9 @@ fn client_size_pins_runtime_cache_config_saving() {
 
     expected -= size_of::<std::sync::OnceLock<HashMap<String, Arc<dyn EncHandler>>>>()
         - size_of::<Option<HashMap<String, Arc<dyn EncHandler>>>>();
+    // Snapshot recovery state is built on the first recovery reply, so the
+    // client carries only its cell; count it rather than raising the base.
+    expected += size_of::<std::sync::OnceLock<Box<crate::pdo::SnapshotRecoveryState>>>();
     // The detached storage owner now also owns the reusable arena, replacing
     // its former inline async mutex. Account for the actual attachment rather
     // than raising the fixed Client base; retention includes test-only gates.
@@ -3989,8 +3995,14 @@ async fn active_chat_lane_survives_capacity_pressure() {
         let (queue_tx, queue_rx) = async_channel::unbounded();
         (
             ChatLane {
+                generation: 0,
                 enqueue_lock: Arc::new(Mutex::new(())),
                 queue_tx,
+                byte_budget: Arc::new(crate::inbound_queue::ByteBudget::new(
+                    crate::inbound_queue::CHAT_BYTES,
+                )),
+                global_budget: crate::inbound_queue::QueueBudgets::default().chat,
+                work: Arc::default(),
                 worker_running: Arc::new(Mutex::new(())),
             },
             queue_rx,
@@ -4332,7 +4344,7 @@ async fn every_send_path_is_observed_exactly_as_it_reached_the_wire() {
         .attr("from", "5550000@g.us")
         .build();
     client
-        .send_ack_for(&incoming.as_node_ref())
+        .send_ack_for(&incoming.as_node_ref(), None)
         .await
         .expect("ack must send");
 
@@ -4977,7 +4989,7 @@ async fn test_send_ack_for_returns_error_when_disconnected() {
         .attr("participant", "236395184570386@lid")
         .build();
 
-    let result = client.send_ack_for(&receipt.as_node_ref()).await;
+    let result = client.send_ack_for(&receipt.as_node_ref(), None).await;
     assert!(
         matches!(result, Err(ClientError::NotConnected)),
         "send_ack_for must return Err(NotConnected) when disconnected, got: {result:?}"
@@ -5088,7 +5100,7 @@ async fn test_send_ack_for_returns_ok_on_expected_disconnect() {
         .attr("id", "TEST-RECEIPT-ID")
         .build();
 
-    let result = client.send_ack_for(&receipt.as_node_ref()).await;
+    let result = client.send_ack_for(&receipt.as_node_ref(), None).await;
     assert!(
         result.is_ok(),
         "send_ack_for should return Ok during expected disconnect"
@@ -5414,22 +5426,12 @@ async fn memory_report_display_sections_stay_aligned() {
         );
     }
 
-    // The lanes are capped; their queues are not, so the backlog belongs with
-    // the drain-bounded collections, not beside the lane count.
-    let capacity_start = rendered
-        .find("--- Capacity-only caches ---")
-        .expect("capacity section");
-    let unbounded_start = rendered
-        .find("--- Unbounded collections ---")
-        .expect("unbounded section");
-    assert!(
-        !rendered[capacity_start..unbounded_start].contains("chat_lane_backlog:"),
-        "chat_lane_backlog must not render as capacity-bounded, got:\n{rendered}"
-    );
-    assert!(
-        rendered[unbounded_start..signal_start].contains("chat_lane_backlog:"),
-        "chat_lane_backlog must render under the unbounded heading, got:\n{rendered}"
-    );
+    let bounded_start = rendered
+        .find("--- Byte-bounded receive queues ---")
+        .unwrap();
+    let unbounded_start = rendered.find("--- Unbounded collections ---").unwrap();
+    assert!(rendered[bounded_start..unbounded_start].contains("chat_lane_backlog:"));
+    assert!(!rendered[unbounded_start..signal_start].contains("chat_lane_backlog:"));
 
     // The last two `collections()` entries are transient retention, one section
     // each. Their order is what the two boundary constants encode, so a cache
@@ -5533,9 +5535,7 @@ async fn memory_report_counts_lid_pn_side_maps() {
     assert!(names.contains(&"lid_pn_persisted_entries"));
 }
 
-/// A lane's queue is unbounded and each queued message retains its frame, so
-/// a stuck worker is a backlog the report has to show; the lane count alone
-/// reads the same whether the queues are empty or a million deep.
+/// Backlog remains visible even though admission is now structurally bounded.
 #[tokio::test]
 async fn memory_report_sums_chat_lane_backlog() {
     let client = crate::test_utils::create_test_client_with_name("chat_lane_backlog").await;
@@ -5545,8 +5545,14 @@ async fn memory_report_sums_chat_lane_backlog() {
     let chat: Jid = "120363000000000042@g.us".parse().unwrap();
     let (queue_tx, _queue_rx) = async_channel::unbounded();
     let lane = ChatLane {
+        generation: 0,
         enqueue_lock: Arc::new(Mutex::new(())),
         queue_tx,
+        byte_budget: Arc::new(crate::inbound_queue::ByteBudget::new(
+            crate::inbound_queue::CHAT_BYTES,
+        )),
+        global_budget: Arc::clone(&client.inbound_queues().chat),
+        work: Arc::clone(&client.inbound_queues().work),
         worker_running: Arc::new(Mutex::new(())),
     };
     client.chat_lanes.insert(chat.clone(), lane.clone()).await;
@@ -5556,17 +5562,17 @@ async fn memory_report_sums_chat_lane_backlog() {
             .attr("id", id)
             .build();
         lane.try_enqueue(node_to_owned_ref(node))
-            .expect("an unbounded lane queue accepts every message");
+            .expect("three messages fit the bounded lane");
     }
 
     let report = client.memory_report().await;
     assert_eq!(report.chat_lanes, 1);
     assert_eq!(report.chat_lane_backlog, 3);
     assert!(
-        report
+        !report
             .unbounded_counts()
             .contains(&("chat_lane_backlog", 3)),
-        "the backlog is a drain-bounded collection, so the soak compares it"
+        "a byte-bounded backlog is excluded from unbounded growth checks"
     );
 }
 

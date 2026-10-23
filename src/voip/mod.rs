@@ -68,7 +68,8 @@ pub use wacore::voip_control::{
 // cannot call it without naming the type.
 pub use wacore::voip_control::group::{GroupCallState, GroupStateApply};
 pub use wacore::voip_control::{
-    CallEvent, MediaKeyframeUrgency as KeyframeUrgency, MediaVideoUpgradeToken as VideoUpgradeToken,
+    CallEvent, MediaKeyframeUrgency as KeyframeUrgency,
+    MediaVideoUpgradeToken as VideoUpgradeToken, VideoFecConfig,
 };
 // The platform transport seam, beside the facade that consults it: a consumer installing one
 // through `Client::set_relay_transport_provider` reaches for the whole set below, and having to

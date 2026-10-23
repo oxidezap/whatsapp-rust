@@ -132,8 +132,8 @@ serde-big-array = "0.5"
 serde_json = { version = "1.0", default-features = false }
 sha1 = { version = "0.11.0", default-features = false }
 sha2 = { version = "0.11.0", default-features = false }
-wasm-encoder = "0.261"
-wasmparser = { version = "0.261", default-features = false, features = ["std", "validate", "features"] }
+wasm-encoder = "0.262"
+wasmparser = { version = "0.262", default-features = false, features = ["std", "validate", "features"] }
 wasmtime = { version = "48.0.5", default-features = false, features = [
     "runtime",
     "anyhow",
@@ -169,6 +169,10 @@ zerocopy = { version = "0.8.55", default-features = false, features = ["derive"]
 zlib-rs = { version = "0.6.6", default-features = false, features = ["std", "rust-allocator"] }
 
 [features]
+# Browser randomness and, when selected, SQLite's wasm-bindgen host hooks.
+# Keep this opt-in separate from sqlite-storage: enabling it for native
+# consumers with rusqlite 0.40 would reintroduce the wsqlite3 links conflict.
+js = ["wacore/js", "whatsapp-rust-sqlite-storage?/js"]
 debug-snapshots = ["wacore/debug-snapshots"]
 # Typed interop with the decoded legacy SessionRecord v1 model, for migrating
 # externally produced auth state. Off by default so native clients carry no
@@ -365,6 +369,12 @@ wacore-noise = { path = "./wacore/noise", features = ["test-util"] }
 
 [lints]
 workspace = true
+
+# Explicit host policy; does not change the library's automatic presence default.
+[[example]]
+name = "manual_presence"
+test = true
+required-features = ["sqlite-storage", "tokio-runtime", "tokio-transport", "ureq-client", "signal"]
 
 # The demo client. Needs only the package default features, so a plain
 # `cargo build --example demo` works without `required-features`.

@@ -14,7 +14,7 @@ use portable_atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use zeroize::Zeroize;
 
 use crate::types::group_call::{GROUP_CALL_MAX_PARTICIPANTS, GroupCallUpdate};
-use crate::voip_control::{MediaAudioCodec, MediaKeyframeUrgency};
+use crate::voip_control::{MediaAudioCodec, MediaKeyframeUrgency, VideoFecConfig};
 
 /// Lossless, ordered signaling mutations consumed by the sans-I/O group-media engine.
 pub enum GroupControl {
@@ -163,6 +163,8 @@ pub enum VideoControl {
     RequestPeerKeyframe(MediaKeyframeUrgency),
     /// The peer's device orientation (0..3, ×90°) from a `<video>` stanza.
     SetOrientation(u8),
+    /// How much forward error correction our video carries in a 1:1 call.
+    SetFec(VideoFecConfig),
     /// One routed group participant's device orientation.
     SetParticipantOrientation {
         participant: wacore_binary::Jid,

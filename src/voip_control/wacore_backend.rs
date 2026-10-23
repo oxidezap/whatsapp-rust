@@ -241,6 +241,9 @@ impl VoipMediaBackend for WacoreVoipMediaBackend {
         };
 
         let stats = resident.install_fresh_stats_cell();
+        if let Some(hook) = ctx.on_media_connected.take() {
+            stats.on_media_connected(hook);
+        }
         // The session has owned the public event stream since reservation, and the `CallHandle`
         // already reads it through `subscribe`: signaling events published before media attaches
         // and the drive loop's media events share that one ordered stream with no install here.

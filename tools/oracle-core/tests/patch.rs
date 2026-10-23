@@ -553,6 +553,29 @@ fn a_nominated_sink_that_does_not_exist_is_refused() {
 }
 
 #[test]
+fn a_code_section_extending_past_the_module_is_rejected() {
+    let mut bytes = sample();
+    let section_start = wasmparser::Parser::new(0)
+        .parse_all(&bytes)
+        .find_map(|payload| match payload.expect("valid sample") {
+            wasmparser::Payload::CodeSectionStart {
+                unchecked_range, ..
+            } => Some(usize::try_from(unchecked_range.start).expect("small fixture")),
+            _ => None,
+        })
+        .expect("code section");
+    // The sample's section length fits in one LEB128 byte. Claim an extra
+    // byte without adding it, so the parser exposes an out-of-bounds range.
+    bytes[section_start - 1] += 1;
+    let error = patch::replace(&bytes, &[]).expect_err("truncated code section");
+    assert!(
+        error
+            .to_string()
+            .contains("code section extends past the module")
+    );
+}
+
+#[test]
 fn replacement_must_preserve_a_valid_function_end_and_stack() {
     for (at, count, with) in [(3, 1, vec![Edit::Nop]), (1, 1, vec![Edit::Drop])] {
         assert!(

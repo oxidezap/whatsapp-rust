@@ -309,14 +309,26 @@ impl Client {
     /// The previous notifier's subscribers have already been woken (either
     /// by notify on disconnect, or by falling out of scope).
     pub(crate) fn reset_connection_shutdown(&self) {
-        *self
+        let mut connection = self
             .connection_shutdown
             .lock()
-            .unwrap_or_else(|p| p.into_inner()) = wacore::runtime::ShutdownNotifier::new();
+            .unwrap_or_else(|p| p.into_inner());
+        connection.notify();
+        *connection = wacore::runtime::ShutdownNotifier::new();
+        self.inbound_queues().work.reopen();
+        self.inbound_queues()
+            .draining
+            .store(false, Ordering::Release);
     }
 
     pub(crate) fn is_shutting_down(&self) -> bool {
         self.expected_disconnect.load(Ordering::Relaxed) || !self.is_running.load(Ordering::Relaxed)
+    }
+
+    /// A permanent verdict, independent of whether the host has started a run
+    /// loop or enabled reconnects. Local durable replay also works before run.
+    pub(crate) fn is_permanently_stopped(&self) -> bool {
+        self.shutdown_signal().is_fired() || self.enable_auto_reconnect.is_terminal()
     }
 
     /// Whether the client is finished for good, as opposed to being between
@@ -343,7 +355,7 @@ impl Client {
     /// waiter parked on a connection that is never coming has no other way to
     /// learn that it should stop.
     pub(crate) fn is_terminal(&self) -> bool {
-        if self.shutdown_signal().is_fired() || self.enable_auto_reconnect.is_terminal() {
+        if self.is_permanently_stopped() {
             return true;
         }
         // The reconnect preference alone is not proof: an application may
@@ -522,6 +534,7 @@ impl Client {
             plugin_host,
             inbound_durability_hook,
             history_sync_capture_hook,
+            history_sync_durability_hook,
             group_notification_durability_hook,
             custom_enc_handlers,
             retry_admission,
@@ -701,6 +714,7 @@ impl Client {
             app_state_key_requests: Arc::new(Mutex::new(HashMap::new())),
             app_state_syncing: app_state::SyncInFlight::new(),
             app_state_send_lock: Mutex::new(()),
+            snapshot_recovery: std::sync::OnceLock::new(),
             initial_keys_synced_notifier: Arc::new(event_listener::Event::new()),
             initial_app_state_keys_received: AtomicBool::new(false),
             prekey_upload_lock: Arc::new(Mutex::new(())),
@@ -714,7 +728,7 @@ impl Client {
             history_sync_activity: Arc::new(crate::sync_task::HistorySyncActivity::new()),
             outbound_flush: Arc::new(crate::flush_scope::FlushScope::new()),
             delivery_receipt_queue: std::sync::OnceLock::new(),
-            transport_ack_queue: std::sync::OnceLock::new(),
+            inbound_queues: std::sync::OnceLock::new(),
             presence_subscriptions: Arc::new(std::sync::Mutex::new(HashSet::new())),
             socket_ready_notifier: event_listener::Event::new(),
             is_ready: AtomicBool::new(false),
@@ -743,6 +757,9 @@ impl Client {
             chatstate_events_built: AtomicU32::new(0),
             custom_enc_handlers,
             inbound_durability_hook: inbound_durability_hook
+                .map(std::sync::OnceLock::from)
+                .unwrap_or_default(),
+            history_sync_durability_hook: history_sync_durability_hook
                 .map(std::sync::OnceLock::from)
                 .unwrap_or_default(),
             history_sync_capture_hook: history_sync_capture_hook
@@ -2367,7 +2384,11 @@ impl Client {
             Err(poison) => *poison.into_inner() = None,
         }
         drop(terminal_gate);
-        self.history_sync_activity.reset();
+        // Durable hooks and blocking leases can outlive this socket. Their
+        // trackers must remain in the accounting generation until they drop.
+        if self.history_sync_durability_hook.get().is_none() {
+            self.history_sync_activity.reset();
+        }
         // Drain all pending IQ waiters so they fail fast with InternalChannelClosed
         // instead of hanging until the 75s timeout.
         // Scoped so the sync guard is dropped before the awaits below (a

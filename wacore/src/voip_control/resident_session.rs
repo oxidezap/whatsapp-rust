@@ -77,6 +77,7 @@ pub(crate) fn video_control_to_command(control: VideoControl) -> MediaCommand {
             MediaCommand::SetVideoInputGeneration(generation)
         }
         VideoControl::SetTimestampStride(stride) => MediaCommand::SetVideoTimestampStride(stride),
+        VideoControl::SetFec(config) => MediaCommand::SetVideoFec(config),
         VideoControl::Enable => MediaCommand::EnableVideo {
             awaiting_accept: false,
         },
@@ -451,6 +452,7 @@ impl VoipMediaSession for ResidentMediaSession {
             MediaCommand::SetVideoTimestampStride(stride) => {
                 self.send_video(VideoControl::SetTimestampStride(stride))
             }
+            MediaCommand::SetVideoFec(config) => self.send_video(VideoControl::SetFec(config)),
             MediaCommand::RekeyRecv {
                 answering_lid,
                 audio_codec,
@@ -724,6 +726,15 @@ mod tests {
         session.set_video_sender(tx);
         assert!(session.submit(MediaCommand::RequireVideoKeyframe));
         assert!(matches!(rx.try_recv(), Ok(VideoControl::RequireKeyframe)));
+        let fec = crate::voip_control::VideoFecConfig::builder()
+            .lossy_group(3)
+            .build();
+        assert!(session.submit(MediaCommand::SetVideoFec(fec)));
+        assert_eq!(rx.try_recv(), Ok(VideoControl::SetFec(fec)));
+        assert_eq!(
+            video_control_to_command(VideoControl::SetFec(fec)),
+            MediaCommand::SetVideoFec(fec)
+        );
     }
 
     #[test]

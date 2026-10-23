@@ -70,8 +70,8 @@ pub mod registry;
 pub mod ports;
 pub use ports::{AudioSink, AudioSource, EncodedAudioSink, EncodedAudioSource};
 pub use ports::{
-    MediaAudioPorts, MediaOpenContext, MediaVideoChannels, TimedVideoFrame, VideoFrame, VideoInput,
-    VideoSink, VideoSource, VideoTeardownHook,
+    MediaAudioPorts, MediaConnectedHook, MediaOpenContext, MediaVideoChannels, TimedVideoFrame,
+    VideoFrame, VideoInput, VideoSink, VideoSource, VideoTeardownHook,
 };
 // RTC app-data payload encoding (reactions), pure and engine-free.
 pub mod app_data;
@@ -171,6 +171,62 @@ pub struct MediaAudioSpec {
 pub enum MediaKeyframeUrgency {
     Coalesced,
     Immediate,
+}
+
+/// How much forward error correction a 1:1 call sends with its video.
+///
+/// One FEC packet per group of video packets lets the peer rebuild any one packet of the group it
+/// lost, without asking for a retransmission or a keyframe. WhatsApp's own clients send it, and a
+/// receiver that never NACKs (an iPhone) depends on it: without it, any lost packet freezes the
+/// picture until the next keyframe.
+///
+/// A group is `clean_group` video packets while the peer's RTCP reports at most
+/// `loss_threshold` of our video lost, and `lossy_group` once it reports more. Both are clamped
+/// to 2..=8 packets: at least two, so FEC never exceeds half the video packets, and at most eight.
+///
+/// Groups are interleaved, `clean_interleave` or `lossy_interleave` deep: a span of `depth`
+/// times the group size consecutive packets is dealt round-robin to `depth` groups, so packet `k`
+/// of the span goes to group `k % depth`, and the span's `depth` repair packets follow its last
+/// packet. A burst of up to `depth` consecutive losses then costs each group at most one packet,
+/// which its repair packet rebuilds, where a group of consecutive packets could rebuild only one.
+/// The ratio of repair to video stays one per group size. A depth of 1 is a group of consecutive
+/// packets. Depths are clamped to 1..=8, and a span to what keeps every group's mask two bytes
+/// long (16 packets at depth 2, 15 at depth 3), so a large group at a large depth shrinks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bon::Builder)]
+#[non_exhaustive]
+pub struct VideoFecConfig {
+    /// Whether FEC is sent at all.
+    #[builder(default = true)]
+    pub enabled: bool,
+    /// Video packets per FEC packet on a clean path.
+    #[builder(default = 8)]
+    pub clean_group: u8,
+    /// Video packets per FEC packet while the peer reports loss above `loss_threshold`.
+    #[builder(default = 4)]
+    pub lossy_group: u8,
+    /// The RTCP fraction lost (in 256ths) above which `lossy_group` applies. 5 is about 2%.
+    #[builder(default = 5)]
+    pub loss_threshold: u8,
+    /// Groups interleaved in one span on a clean path. 1 sends groups of consecutive packets.
+    #[builder(default = 2)]
+    pub clean_interleave: u8,
+    /// Groups interleaved in one span while the peer reports loss above `loss_threshold`.
+    #[builder(default = 3)]
+    pub lossy_interleave: u8,
+}
+
+impl Default for VideoFecConfig {
+    fn default() -> Self {
+        Self::builder().build()
+    }
+}
+
+impl VideoFecConfig {
+    /// No FEC.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self::builder().enabled(false).build()
+    }
 }
 
 /// Identity of one peer video-upgrade request. Replaces the engine's `VideoUpgradeToken`, whose
@@ -410,6 +466,8 @@ pub enum MediaCommand {
     SetVideoInputGeneration(u64),
     /// RTP clock increment per access unit.
     SetVideoTimestampStride(u32),
+    /// How much forward error correction our video carries in a 1:1 call.
+    SetVideoFec(VideoFecConfig),
     /// Caller-only: rekey the recv path to the device that answered, and apply the audio codec its
     /// capability selected in the same step. The two travel together because rekeying decides which
     /// keys decrypt the next packet, and the codec decides how it is decoded.
@@ -575,6 +633,75 @@ pub struct MediaStats {
     /// and transport failures can still prevent delivery.
     #[builder(default)]
     pub video_retransmitted: u32,
+    /// Access units the peer's video reassembled into and handed on, before the application's sink.
+    ///
+    /// The baseline every other reassembly counter below is read against: packets that arrived
+    /// whole can still fail to become a picture, and these say which way.
+    #[builder(default)]
+    pub video_access_units_completed: u32,
+    /// Of those, access units closed by the next RTP timestamp because their marker packet never
+    /// came. Handed on, but likely missing their tail.
+    #[builder(default)]
+    pub video_access_units_without_marker: u32,
+    /// RTP timestamps whose packets left no complete NAL when the next timestamp began: pictures
+    /// that produced nothing to hand on.
+    #[builder(default)]
+    pub video_access_units_empty: u32,
+    /// Completed access units dropped because the depacketizer's ready queue was full.
+    #[builder(default)]
+    pub video_access_units_evicted: u32,
+    /// Authenticated video packets discarded for a timestamp older than the access unit being
+    /// assembled, or than the one last completed. Arrived, but too late to join their picture.
+    #[builder(default)]
+    pub video_rtp_stale_timestamp: u32,
+    /// Authenticated video packets discarded because they carry the timestamp of the access unit
+    /// whose marker already completed it.
+    #[builder(default)]
+    pub video_rtp_completed_timestamp: u32,
+    /// Access units that began on the RTP timestamp of the one before them and were told apart by
+    /// the sender's later media time offset: pictures that would otherwise have been discarded as
+    /// late packets of their predecessor.
+    #[builder(default)]
+    pub video_access_units_shared_timestamp: u32,
+    /// Partially reassembled FU-A NALs dropped because a fragment's sequence number skipped.
+    #[builder(default)]
+    pub video_fu_dropped_sequence_gap: u32,
+    /// Partially reassembled FU-A NALs dropped because the next RTP timestamp began before their
+    /// end fragment arrived.
+    #[builder(default)]
+    pub video_fu_dropped_timestamp_boundary: u32,
+    /// Partially reassembled FU-A NALs dropped because another NAL, or their access unit's marker,
+    /// arrived before their end fragment.
+    #[builder(default)]
+    pub video_fu_dropped_unterminated: u32,
+    /// FU-A middle or end fragments ignored because no start fragment was on record.
+    #[builder(default)]
+    pub video_fu_orphan_fragments: u32,
+    /// NALs refused because they would grow a NAL or an access unit past the reassembly limit.
+    #[builder(default)]
+    pub video_nal_oversize_dropped: u32,
+    /// Video payloads with no usable NAL: empty, NAL type 0, a packetization mode the depacketizer
+    /// does not support, or a truncated FU-A or STAP-A.
+    #[builder(default)]
+    pub video_payload_unusable: u32,
+    /// Times reassembly moved from one peer video SSRC to another. The first stream is not one.
+    #[builder(default)]
+    pub video_ssrc_switches: u32,
+    /// Those switches that discarded a partial access unit the previous stream left behind.
+    #[builder(default)]
+    pub video_ssrc_switch_partial_dropped: u32,
+    /// Video packets from an SSRC the peer had switched away from, ignored for their picture
+    /// while the switch settles. Their piggybacked audio is still played.
+    #[builder(default)]
+    pub video_retired_ssrc_ignored: u32,
+    /// Video FEC packets we sent (see [`VideoFecConfig`]). Not kept for retransmission.
+    #[builder(default)]
+    pub video_fec_sent: u32,
+    /// Bytes of those packets as they went to the relay, RTP header and SRTP tag included. Their
+    /// rate is what FEC adds on top of the encoder's video, so an application holding the call to a
+    /// total budget can take it out of the encoder's target.
+    #[builder(default)]
+    pub video_fec_bytes_sent: u64,
 }
 
 impl MediaStats {

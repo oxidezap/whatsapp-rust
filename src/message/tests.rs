@@ -6048,7 +6048,7 @@ async fn explicit_and_automatic_receipt_acks_use_distinct_participant_policies()
         .attr("type", "read")
         .build();
     client
-        .send_ack_for(&automatic.as_node_ref())
+        .send_ack_for(&automatic.as_node_ref(), None)
         .await
         .expect("specialized receipt ack should send");
 

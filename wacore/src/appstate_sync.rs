@@ -322,8 +322,12 @@ struct RecoveryRequest {
     /// that answer is refused before it costs a decode.
     answering: bool,
     /// The caller's monotonic connection generation when the ask was made.
-    /// It distinguishes retired replies and prevents an older sender from
-    /// replacing a newer request, since the marker survives a reconnect.
+    /// It stops an older sender from replacing a newer request, since the
+    /// marker survives a reconnect. It does not decide whether a reply applies:
+    /// the phone answers whenever it answers, often to a connection or a
+    /// process that never made the ask, and the version check in
+    /// [`AppStateProcessor::apply_snapshot_recovery`] is what keeps a late
+    /// answer from rolling a collection back.
     generation: u64,
 }
 
@@ -341,6 +345,24 @@ pub enum RecoveryOutcome {
     /// The caller stopped standing behind the write before it began, so nothing
     /// was touched.
     Retired,
+}
+
+/// Which ask, if any, a recovery reply answers.
+///
+/// Three answers rather than an `Option`, because "nothing asked for this" and
+/// "this is a copy of an answer already being handled" now lead to opposite
+/// ends: the first is decoded and applied if it moves the collection forward,
+/// the second is refused before it costs a decode.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RecoveryClaim {
+    /// The reply answers this outstanding ask, now claimed for it.
+    Claimed(String),
+    /// The ask this id was made under is already being answered by another
+    /// copy of the reply.
+    AlreadyAnswering(String),
+    /// No outstanding ask carries this id: a reply to an ask made by an earlier
+    /// process, to one a newer ask has since replaced, or to none at all.
+    Unrequested,
 }
 
 #[derive(Clone)]
@@ -474,11 +496,12 @@ impl AppStateProcessor {
     /// How long a request that is *being answered* survives instead.
     ///
     /// The window above is sized for a phone that never replied. Once a reply
-    /// has been taken up, replacing the request would strand the handler holding
-    /// it: it takes by id at the end and would find nothing, dropping a decoded
-    /// recovery for a collection that is stuck. An answer can legitimately take
-    /// far longer than the ask's own window -- the key repair and then the
-    /// collection reservation, which waits up to 450 seconds on its own.
+    /// has been taken up, a replacement ask would be sent while its answer is
+    /// already being applied, and a repeat of that answer would no longer be
+    /// recognised as one and would cost a decode of its own. An answer can
+    /// legitimately take far longer than the ask's own window -- waiting its
+    /// turn behind other replies, the key repair, and then the collection
+    /// reservation, which waits up to 450 seconds on its own.
     ///
     /// Measured from the claim, not from the ask: expiry is lazy, so a phone
     /// that answers long after the window closed still claims successfully, and
@@ -588,6 +611,10 @@ impl AppStateProcessor {
     }
 
     /// Claims a reply together with its request generation, before decoding.
+    ///
+    /// The reply path no longer compares the generation (see
+    /// `RecoveryRequest`) and claims through [`Self::claim_recovery_reply`];
+    /// this stays for callers outside this crate.
     pub async fn claim_recovery_request_with_generation_by_id(
         &self,
         request_id: &str,
@@ -605,6 +632,52 @@ impl AppStateProcessor {
         // arrive long after the ask's own window closed.
         request.asked_at = crate::time::Instant::now();
         Some((name.clone(), request.generation))
+    }
+
+    /// [`Self::claim_recovery_request_by_id`], telling a reply nobody here is
+    /// waiting for apart from a copy of an answer already being handled.
+    ///
+    /// The difference matters because an unrequested reply is no longer
+    /// ignored: the primary answers late and in bursts, to asks this process
+    /// may never have made, and any of those answers can be the one that moves
+    /// a stuck collection forward. A repeat of an answer in progress cannot be,
+    /// since the first copy is already on its way to the same version.
+    pub async fn claim_recovery_reply(&self, request_id: &str) -> RecoveryClaim {
+        let mut outstanding = self.recovery_requested.lock().await;
+        let Some((name, request)) = outstanding
+            .iter_mut()
+            .find(|(_, request)| request.request_id.as_deref() == Some(request_id))
+        else {
+            return RecoveryClaim::Unrequested;
+        };
+        if request.answering {
+            return RecoveryClaim::AlreadyAnswering(name.clone());
+        }
+        request.answering = true;
+        // Restarted for the reason given in
+        // `claim_recovery_request_with_generation_by_id`.
+        request.asked_at = crate::time::Instant::now();
+        RecoveryClaim::Claimed(name.clone())
+    }
+
+    /// Ends an answer for `collection`, releasing the ask it settled.
+    ///
+    /// The ask made under `request_id` goes, and so does any other ask for the
+    /// collection that nothing is answering yet: a reply that reached the apply
+    /// has settled the question that ask raised, whether it was applied or
+    /// found behind, and a marker left standing would suppress the next
+    /// escalation for the rest of the window. An ask another reply has already
+    /// claimed is left to that reply, which ends it itself.
+    pub async fn end_recovery_answer(&self, collection: &str, request_id: Option<&str>) -> bool {
+        let mut outstanding = self.recovery_requested.lock().await;
+        let settled = outstanding.get(collection).is_some_and(|request| {
+            !request.answering
+                || request_id.is_some_and(|id| request.request_id.as_deref() == Some(id))
+        });
+        if settled {
+            outstanding.remove(collection);
+        }
+        settled
     }
 
     /// Takes the request an id answers, whatever its payload turned out to be.
@@ -636,8 +709,9 @@ impl AppStateProcessor {
 
     /// Whether a recovery for this collection is outstanding, without taking it.
     ///
-    /// The cheap check a reply is refused by before anything is reserved or
-    /// spawned on its behalf.
+    /// No longer a gate on a reply, since one the primary sends is applied
+    /// whenever it moves the collection forward; kept for callers asking
+    /// whether an escalation would be suppressed.
     pub async fn has_recovery_request(&self, collection: &str) -> bool {
         self.recovery_requested
             .lock()
@@ -732,7 +806,10 @@ impl AppStateProcessor {
         // would undo real state and leave the next patch conflicting with a
         // baseline nobody is at. Checking first also means a stale reply costs
         // one read rather than a key lookup and an HMAC per record, and cannot
-        // be turned into an error by a payload nobody is going to apply.
+        // be turned into an error by a payload nobody is going to apply. It is
+        // also the whole guard against regression: the caller applies a reply
+        // from the primary whether or not anything still remembers asking for
+        // it, so a burst of late answers is settled here, one version at a time.
         let held = self
             .backend
             .get_version(name)
@@ -1527,7 +1604,11 @@ impl AppStateProcessor {
 /// incoming snapshot's; WA Web discards it ("skip applying syncd old version") rather
 /// than rolling the collection backward. The `persisted_version > 0` guard keeps the
 /// benign first-sync path (snapshots are requested only at version 0) unaffected.
-fn snapshot_is_stale(persisted_version: u64, snapshot_version: u64) -> bool {
+///
+/// Public so a caller can turn a stale recovery away before paying for it; the
+/// check inside [`AppStateProcessor::apply_snapshot_recovery`] stays the one
+/// that decides.
+pub fn snapshot_is_stale(persisted_version: u64, snapshot_version: u64) -> bool {
     persisted_version > 0 && snapshot_version <= persisted_version
 }
 

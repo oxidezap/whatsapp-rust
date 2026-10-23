@@ -1177,7 +1177,8 @@ impl Voip<'_> {
         crate::voip::facade::OutgoingCall::new(self.client, peer)
     }
 
-    /// Begin a native group call to two or more selected users.
+    /// Begin a native group call to two or more selected users, or to one when the call is bound
+    /// to a group with [`group`](crate::voip::OutgoingGroupCall::group).
     #[cfg(feature = "voip-control")]
     pub fn group_call<'b>(&'b self, targets: &'b [Jid]) -> crate::voip::OutgoingGroupCall<'b> {
         crate::voip::facade::OutgoingGroupCall::new(self.client, targets)
@@ -1185,6 +1186,7 @@ impl Voip<'_> {
 
     /// Begin a native call bound to an existing group. The current roster is resolved at
     /// [`start`](crate::voip::GroupBoundCall::start), with this account excluded automatically.
+    /// A two-person group rings its one other member, as WhatsApp's own clients call it.
     #[cfg(feature = "voip-control")]
     pub fn group_call_by_id<'b>(&'b self, group_jid: &'b Jid) -> crate::voip::GroupBoundCall<'b> {
         crate::voip::facade::GroupBoundCall::new(self.client, group_jid)

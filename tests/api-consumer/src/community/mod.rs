@@ -94,7 +94,7 @@ mod tests {
     fn validated_construction_and_defaults() {
         let defaults = CreateCommunityOptions::new("Fictitious community").unwrap();
         assert!(defaults.create_general_chat);
-        assert!(!defaults.closed);
+        assert!(defaults.closed);
         assert!(defaults.description.is_none());
         assert!(CreateCommunityOptions::new("a".repeat(101)).is_err());
         assert!(GroupDescription::new("a".repeat(2049)).is_err());

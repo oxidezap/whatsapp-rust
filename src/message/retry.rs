@@ -84,7 +84,7 @@ impl Client {
         enc_type: &'static str,
         reason: EncDecryptFailureReason,
     ) {
-        if self.inbound_durability_hook.get().is_some() {
+        if self.inbound_journal_enabled() {
             self.inbound_commit_batch.live_retention.fail_receipt(info);
         }
         if !self.enc_decrypt_failed_forwarding_enabled() {

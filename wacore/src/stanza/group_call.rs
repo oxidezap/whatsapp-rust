@@ -15,7 +15,7 @@ use crate::types::group_call::{
     CallLink, CallLinkJoin, CallLinkMedia, CallLinkPreview, GROUP_CALL_MAX_PARTICIPANTS,
     GroupCallDevice, GroupCallEncRekey, GroupCallParticipant, GroupCallRelay,
     GroupCallRelayEndpoint, GroupCallUpdate, ScreenShare, ScreenShareState, WaitingRoom,
-    WaitingRoomUser,
+    WaitingRoomUser, group_call_min_remote_participants,
 };
 
 use super::call::{
@@ -115,7 +115,11 @@ pub fn build_active_group_accept(
 #[cold]
 pub fn build_initial_group_offer(params: &InitialGroupOfferParams<'_>) -> Result<Node> {
     validate_call_identity(params.call_id, params.id, params.call_creator)?;
-    if params.participants.len() < 3 {
+    let min_remote = group_call_min_remote_participants(params.group_jid.is_some());
+    if params.participants.len() < 1 + min_remote {
+        if params.group_jid.is_some() {
+            bail!("group-bound offer requires self and at least one remote participant");
+        }
         bail!("group offer requires self and at least two remote participants");
     }
     if params.participants.len() > GROUP_CALL_MAX_PARTICIPANTS {
@@ -1532,6 +1536,57 @@ mod tests {
                 video: false,
             })
             .is_err()
+        );
+    }
+
+    #[test]
+    fn a_group_bound_offer_may_ring_one_other_member() {
+        let creator = jid("100001", 1);
+        let pair = [
+            participant("100001", 1, &CAPABILITY_OFFER),
+            participant("200002", 2, &CAPABILITY_OFFER),
+        ];
+        let group = Jid::new("1234567890-1111111111", Server::Group);
+        let params = |group_jid, participants| InitialGroupOfferParams {
+            call_id: "00aabbccddeeff001122334455667788",
+            id: "REQ-1",
+            call_creator: &creator,
+            group_jid,
+            participants,
+            audio_rate: 16_000,
+            video: false,
+        };
+
+        let node = build_initial_group_offer(&params(Some(&group), &pair))
+            .expect("a two-person group's call is a group offer");
+        let offer = action(&node);
+        assert_eq!(
+            offer
+                .attrs
+                .get("group-jid")
+                .and_then(|value| value.to_jid()),
+            Some(group.clone())
+        );
+        let node_ref = node.as_node_ref();
+        let users = node_ref.children().expect("call action")[0]
+            .get_optional_child("group_info")
+            .expect("group info")
+            .children()
+            .expect("group users")
+            .len();
+        assert_eq!(users, 2, "self and the one other member");
+
+        let err = build_initial_group_offer(&params(None, &pair))
+            .expect_err("an ad-hoc call to one person is a 1:1 call");
+        assert_eq!(
+            err.to_string(),
+            "group offer requires self and at least two remote participants"
+        );
+        let err = build_initial_group_offer(&params(Some(&group), &pair[..1]))
+            .expect_err("a group-bound call still rings someone");
+        assert_eq!(
+            err.to_string(),
+            "group-bound offer requires self and at least one remote participant"
         );
     }
 

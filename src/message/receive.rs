@@ -157,7 +157,7 @@ impl Client {
         slot: (usize, &'static str, u8),
         plaintext: &bytes::Bytes,
     ) {
-        if self.inbound_durability_hook.get().is_some() {
+        if self.inbound_journal_enabled() {
             self.inbound_commit_batch.live_retention.stage_owned(
                 info,
                 producer,
@@ -169,7 +169,7 @@ impl Client {
 
     #[inline(never)]
     pub(super) fn finish_retained_raw(&self, origin: raw_pending::DeliveryOrigin) {
-        if self.inbound_durability_hook.get().is_some() {
+        if self.inbound_journal_enabled() {
             self.inbound_commit_batch.live_retention.finish_raw(origin);
         }
     }
@@ -599,7 +599,7 @@ impl Client {
 
         let stanza_origin = raw_pending::StanzaOrigin::new();
         let mut receipt_producer = None;
-        if self.inbound_durability_hook().is_some()
+        if self.inbound_journal_enabled()
             && self.inbound_commit_batch.is_active()
             && self.inbound_commit_batch.has_entries()
             && self
@@ -611,7 +611,7 @@ impl Client {
             wacore::telemetry::live_admission_refused(LiveAdmissionRefusal::RetainedWrite);
             return;
         }
-        if self.inbound_durability_hook().is_some()
+        if self.inbound_journal_enabled()
             && self
                 .inbound_commit_batch
                 .live_retention
@@ -647,7 +647,7 @@ impl Client {
         }
         // Admission precedes every ratchet mutation. Refusal leaves ciphertext
         // untouched for server redelivery; reset never evicts a retained live row.
-        let _live_admission = if self.inbound_durability_hook().is_some() {
+        let _live_admission = if self.inbound_journal_enabled() {
             if let Err(error) = self.persist_live_retained_before_decrypt(&info).await {
                 wacore::telemetry::live_admission_refused(LiveAdmissionRefusal::RetainedWrite);
                 log::warn!(
@@ -699,7 +699,7 @@ impl Client {
             None
         };
         // Scope only receipts; predecessor hooks continue streaming.
-        if receipt_producer.is_none() && self.inbound_durability_hook().is_some() {
+        if receipt_producer.is_none() && self.inbound_journal_enabled() {
             receipt_producer = match self
                 .inbound_commit_batch
                 .live_retention
@@ -770,7 +770,7 @@ impl Client {
             }
             SessionBatchOutcome::default()
         };
-        if session_outcome.had_failure && self.inbound_durability_hook.get().is_some() {
+        if session_outcome.had_failure && self.inbound_journal_enabled() {
             self.inbound_commit_batch.live_retention.fail_receipt(&info);
         }
         let session_decrypted_successfully = session_outcome.decrypted;
@@ -2211,8 +2211,7 @@ impl Client {
         // Retain the exact unpadded carrier before detached-history decode,
         // DSM unwrapping or consumer projection construction can discard it.
         let carrier = self
-            .inbound_durability_hook()
-            .is_some()
+            .inbound_journal_enabled()
             .then(|| u32::try_from(enc_index).map(|index| (Some(index), source.clone())))
             .transpose()?;
         let (original_msg, history_sync_taken) =
@@ -2390,10 +2389,10 @@ impl Client {
         // history, so honour it only from self. WA Web
         // `WAWebHandleHistorySyncNotification` gates on `isMePrimaryNonLid`.
         if let Some(history_sync) = history_sync_taken {
-            if info.source.is_from_me {
+            if info.source.is_from_me && self.history_sync_durability_hook.get().is_none() {
                 self.handle_history_sync(info.id.to_string(), history_sync)
                     .await;
-            } else {
+            } else if !info.source.is_from_me {
                 warn!(
                     "[msg:{}] Dropping history_sync_notification from non-self sender {}",
                     info.id,
@@ -2440,7 +2439,7 @@ impl Client {
                     // message again: that is the documented at-least-once shape, not a
                     // suppression, so it is not counted as one.
                     let (replayed, commit_state) =
-                        if self.inbound_durability_hook().is_some() && carrier.is_some() {
+                        if self.inbound_journal_enabled() && carrier.is_some() {
                             // A consumer claim does not prove that this raw occurrence
                             // is stored. Commit it directly instead of recursively
                             // replaying the raw entry that is currently being prepared.

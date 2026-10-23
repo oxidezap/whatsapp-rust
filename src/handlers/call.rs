@@ -177,7 +177,7 @@ impl StanzaHandler for CallHandler {
                     // transition later commits. Send it before Signal fanout can block for every
                     // participant, and suppress the router's deferred generic ACK.
                     *cancelled = true;
-                    if let Err(error) = client.send_ack_for(nr).await {
+                    if let Err(error) = client.send_ack_for(nr, None).await {
                         warn!(
                             "call: failed to acknowledge group update before epoch fanout: {error}"
                         );

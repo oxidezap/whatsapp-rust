@@ -1,0 +1,580 @@
+{
+  "stanzas": [
+    {
+      "moduleName": "WASmaxOutGroupsCreateRequest",
+      "namespace": "w:g2",
+      "iqType": "set",
+      "target": "g.us",
+      "parserName": "WASmaxGroupsCreateRPC",
+      "exportedFunction": "makeCreateRequestCreateParticipant",
+      "allExports": [
+        "makeCreateRequestCreateParticipant",
+        "makeCreateRequestCreateDescription",
+        "makeCreateRequestCreateLocked",
+        "makeCreateRequestCreateAnnouncement",
+        "makeCreateRequestCreateParent",
+        "makeCreateRequestCreateNoFrequentlyForwarded",
+        "makeCreateRequestCreateEphemeral",
+        "makeCreateRequestCreateMembershipApprovalMode",
+        "makeCreateRequestCreateBreakout",
+        "makeCreateRequestCreateCreatedAsLid",
+        "makeCreateRequestCreateAddressingModeOverride",
+        "makeCreateRequestCreateLinkedParent",
+        "makeCreateRequestCreateHiddenGroup",
+        "makeCreateRequestCreateAllowNonAdminSubGroupCreation",
+        "makeCreateRequestCreateCreateGeneralChat",
+        "makeCreateRequestCreateCapi",
+        "makeCreateRequest"
+      ],
+      "request": {
+        "namespace": "w:g2",
+        "iqType": "set",
+        "target": "g.us",
+        "children": [
+          {
+            "tag": "create",
+            "attrs": [
+              {
+                "presenceArgPath": [
+                  {
+                    "key": "dedupAttrsMixinArgs"
+                  }
+                ],
+                "name": "key",
+                "kind": "string",
+                "required": false,
+                "argPath": [
+                  {
+                    "key": "dedupAttrsMixinArgs"
+                  },
+                  {
+                    "key": "anyKey"
+                  }
+                ]
+              },
+              {
+                "presenceArgPath": [
+                  {
+                    "key": "dedupAttrsMixinArgs"
+                  }
+                ],
+                "name": "create_ctx",
+                "kind": "optional",
+                "required": false,
+                "argPath": [
+                  {
+                    "key": "dedupAttrsMixinArgs"
+                  },
+                  {
+                    "key": "anyCreateCtx"
+                  }
+                ]
+              }
+            ],
+            "children": [
+              {
+                "tag": "participant",
+                "attrs": [
+                  {
+                    "name": "jid",
+                    "kind": "user_jid",
+                    "required": true,
+                    "argPath": [
+                      {
+                        "key": "participantArgs",
+                        "list": true
+                      },
+                      {
+                        "key": "participantJid"
+                      }
+                    ]
+                  },
+                  {
+                    "name": "phone_number",
+                    "kind": "optional",
+                    "required": false,
+                    "argPath": [
+                      {
+                        "key": "participantArgs",
+                        "list": true
+                      },
+                      {
+                        "key": "participantPhoneNumber"
+                      }
+                    ]
+                  },
+                  {
+                    "name": "username",
+                    "kind": "optional",
+                    "required": false,
+                    "argPath": [
+                      {
+                        "key": "participantArgs",
+                        "list": true
+                      },
+                      {
+                        "key": "participantUsername"
+                      }
+                    ]
+                  }
+                ],
+                "children": [
+                  {
+                    "tag": "privacy",
+                    "attrs": [],
+                    "children": [],
+                    "content": {
+                      "kind": "dynamic",
+                      "argPath": [
+                        {
+                          "key": "participantArgs",
+                          "list": true
+                        },
+                        {
+                          "key": "permissionTokenMixinArgs"
+                        },
+                        {
+                          "key": "anyElementValue"
+                        }
+                      ]
+                    },
+                    "repeats": false,
+                    "presence": "optional",
+                    "argPath": [
+                      {
+                        "key": "participantArgs",
+                        "list": true
+                      },
+                      {
+                        "key": "permissionTokenMixinArgs"
+                      }
+                    ]
+                  }
+                ],
+                "repeats": true,
+                "repeatMin": 0,
+                "repeatMax": 19999,
+                "argPath": [
+                  {
+                    "key": "participantArgs",
+                    "list": true
+                  }
+                ]
+              },
+              {
+                "tag": "description",
+                "attrs": [
+                  {
+                    "name": "id",
+                    "kind": "string",
+                    "required": true,
+                    "argPath": [
+                      {
+                        "key": "descriptionArgs"
+                      },
+                      {
+                        "key": "descriptionId"
+                      }
+                    ]
+                  }
+                ],
+                "children": [
+                  {
+                    "tag": "body",
+                    "attrs": [],
+                    "children": [],
+                    "content": {
+                      "kind": "dynamic",
+                      "argPath": [
+                        {
+                          "key": "descriptionArgs"
+                        },
+                        {
+                          "key": "bodyElementValue"
+                        }
+                      ]
+                    },
+                    "repeats": false
+                  }
+                ],
+                "repeats": false,
+                "presence": "optional",
+                "argPath": [
+                  {
+                    "key": "descriptionArgs"
+                  }
+                ]
+              },
+              {
+                "tag": "locked",
+                "attrs": [],
+                "children": [],
+                "repeats": false,
+                "presence": "presence_flag",
+                "argPath": [
+                  {
+                    "key": "hasLocked"
+                  }
+                ]
+              },
+              {
+                "tag": "announcement",
+                "attrs": [],
+                "children": [],
+                "repeats": false,
+                "presence": "presence_flag",
+                "argPath": [
+                  {
+                    "key": "hasAnnouncement"
+                  }
+                ]
+              },
+              {
+                "tag": "parent",
+                "attrs": [
+                  {
+                    "presenceArgPath": [
+                      {
+                        "key": "parentArgs"
+                      },
+                      {
+                        "key": "hasParentGroupDefaultMembershipApprovalMode"
+                      }
+                    ],
+                    "name": "default_membership_approval_mode",
+                    "kind": "const",
+                    "value": "request_required",
+                    "required": false
+                  }
+                ],
+                "children": [],
+                "repeats": false,
+                "presence": "optional",
+                "argPath": [
+                  {
+                    "key": "parentArgs"
+                  }
+                ]
+              },
+              {
+                "tag": "no_frequently_forwarded",
+                "attrs": [],
+                "children": [],
+                "repeats": false,
+                "presence": "presence_flag",
+                "argPath": [
+                  {
+                    "key": "hasNoFrequentlyForwarded"
+                  }
+                ]
+              },
+              {
+                "tag": "ephemeral",
+                "attrs": [
+                  {
+                    "name": "expiration",
+                    "kind": "integer",
+                    "required": true,
+                    "argPath": [
+                      {
+                        "key": "ephemeralArgs"
+                      },
+                      {
+                        "key": "ephemeralExpiration"
+                      }
+                    ]
+                  },
+                  {
+                    "name": "trigger",
+                    "kind": "optional",
+                    "required": false,
+                    "argPath": [
+                      {
+                        "key": "ephemeralArgs"
+                      },
+                      {
+                        "key": "ephemeralTrigger"
+                      }
+                    ]
+                  }
+                ],
+                "children": [],
+                "repeats": false,
+                "presence": "optional",
+                "argPath": [
+                  {
+                    "key": "ephemeralArgs"
+                  }
+                ]
+              },
+              {
+                "tag": "membership_approval_mode",
+                "attrs": [],
+                "children": [
+                  {
+                    "tag": "group_join",
+                    "attrs": [],
+                    "children": [],
+                    "repeats": false,
+                    "variantGroups": [
+                      {
+                        "variants": [
+                          {
+                            "attrs": [
+                              {
+                                "name": "state",
+                                "kind": "const",
+                                "value": "on",
+                                "required": true
+                              }
+                            ]
+                          },
+                          {
+                            "attrs": [
+                              {
+                                "name": "state",
+                                "kind": "const",
+                                "value": "off",
+                                "required": true
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ],
+                "repeats": false,
+                "presence": "optional",
+                "argPath": [
+                  {
+                    "key": "membershipApprovalModeArgs"
+                  }
+                ]
+              },
+              {
+                "tag": "breakout",
+                "attrs": [],
+                "children": [],
+                "repeats": false,
+                "presence": "presence_flag",
+                "argPath": [
+                  {
+                    "key": "hasBreakout"
+                  }
+                ]
+              },
+              {
+                "tag": "created_as_lid",
+                "attrs": [],
+                "children": [],
+                "repeats": false,
+                "presence": "presence_flag",
+                "argPath": [
+                  {
+                    "key": "hasCreatedAsLid"
+                  }
+                ]
+              },
+              {
+                "tag": "addressing_mode_override",
+                "attrs": [
+                  {
+                    "name": "mode",
+                    "kind": "string",
+                    "required": true,
+                    "argPath": [
+                      {
+                        "key": "addressingModeOverrideArgs"
+                      },
+                      {
+                        "key": "addressingModeOverrideMode"
+                      }
+                    ]
+                  }
+                ],
+                "children": [],
+                "repeats": false,
+                "presence": "optional",
+                "argPath": [
+                  {
+                    "key": "addressingModeOverrideArgs"
+                  }
+                ]
+              },
+              {
+                "tag": "linked_parent",
+                "attrs": [
+                  {
+                    "name": "jid",
+                    "kind": "group_jid",
+                    "required": true,
+                    "argPath": [
+                      {
+                        "key": "linkedParentArgs"
+                      },
+                      {
+                        "key": "linkedParentJid"
+                      }
+                    ]
+                  }
+                ],
+                "children": [],
+                "repeats": false,
+                "presence": "optional",
+                "argPath": [
+                  {
+                    "key": "linkedParentArgs"
+                  }
+                ]
+              },
+              {
+                "tag": "hidden_group",
+                "attrs": [],
+                "children": [],
+                "repeats": false,
+                "presence": "presence_flag",
+                "argPath": [
+                  {
+                    "key": "hasHiddenGroup"
+                  }
+                ]
+              },
+              {
+                "tag": "allow_non_admin_sub_group_creation",
+                "attrs": [],
+                "children": [],
+                "repeats": false,
+                "presence": "presence_flag",
+                "argPath": [
+                  {
+                    "key": "hasAllowNonAdminSubGroupCreation"
+                  }
+                ]
+              },
+              {
+                "tag": "create_general_chat",
+                "attrs": [],
+                "children": [],
+                "repeats": false,
+                "presence": "presence_flag",
+                "argPath": [
+                  {
+                    "key": "hasCreateGeneralChat"
+                  }
+                ]
+              },
+              {
+                "tag": "capi",
+                "attrs": [],
+                "children": [],
+                "repeats": false,
+                "presence": "presence_flag",
+                "argPath": [
+                  {
+                    "key": "hasCapi"
+                  }
+                ]
+              },
+              {
+                "tag": "member_add_mode",
+                "attrs": [],
+                "children": [],
+                "content": {
+                  "kind": "const",
+                  "value": "admin_add"
+                },
+                "repeats": false,
+                "presence": "optional",
+                "argPath": [
+                  {
+                    "key": "groupMemberAddModeMixinArgs"
+                  }
+                ]
+              },
+              {
+                "tag": "member_link_mode",
+                "attrs": [],
+                "children": [],
+                "content": {
+                  "kind": "const",
+                  "value": "admin_link"
+                },
+                "repeats": false,
+                "presence": "optional",
+                "argPath": [
+                  {
+                    "key": "groupMemberLinkModeMixinArgs"
+                  }
+                ]
+              },
+              {
+                "tag": "member_share_group_history_mode",
+                "attrs": [],
+                "children": [],
+                "content": {
+                  "kind": "const",
+                  "value": "admin_share"
+                },
+                "repeats": false,
+                "presence": "optional",
+                "argPath": [
+                  {
+                    "key": "groupMemberShareGroupHistoryModeMixinArgs"
+                  }
+                ]
+              }
+            ],
+            "repeats": false,
+            "variantGroups": [
+              {
+                "variants": [
+                  {
+                    "attrs": [
+                      {
+                        "name": "subject",
+                        "kind": "string",
+                        "required": true,
+                        "argPath": [
+                          {
+                            "key": "namedSubjectOrUnnamedSubjectFallbackMixinGroupArgs"
+                          },
+                          {
+                            "key": "namedSubject"
+                          },
+                          {
+                            "key": "anySubject"
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "attrs": [
+                      {
+                        "name": "subject",
+                        "kind": "optional",
+                        "required": false,
+                        "argPath": [
+                          {
+                            "key": "namedSubjectOrUnnamedSubjectFallbackMixinGroupArgs"
+                          },
+                          {
+                            "key": "unnamedSubjectFallback"
+                          },
+                          {
+                            "key": "anySubject"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

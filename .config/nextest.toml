@@ -62,3 +62,18 @@ final-status-level = "flaky"
 # same numbers something a script can read.
 [profile.e2e.junit]
 path = "junit.xml"
+
+# Captured engines use process-wide clock/filesystem state. One process per
+# scenario prevents a failed or trapped engine from changing later scenarios.
+[profile.oracle]
+fail-fast = false
+retries = 0
+test-threads = 1
+slow-timeout = { period = "60s", terminate-after = 3 }
+failure-output = "immediate-final"
+success-output = "final"
+
+[profile.oracle.junit]
+path = "junit.xml"
+store-success-output = true
+store-failure-output = true

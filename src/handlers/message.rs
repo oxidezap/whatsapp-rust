@@ -49,6 +49,23 @@ impl MessageHandler {
         cancelled: &mut bool,
         scope: Option<NotificationScope<'_>>,
     ) -> bool {
+        let shutdown = scope.map_or_else(
+            || client.connection_shutdown_signal(),
+            NotificationScope::shutdown,
+        );
+        let generation = client
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        if shutdown.is_fired()
+            || scope.is_some_and(|scope| !scope.is_current(&client))
+            || client
+                .inbound_queues()
+                .draining
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            *cancelled = true;
+            return true;
+        }
         let chat_jid = match node.attrs().optional_jid("from") {
             // Normalize AD metadata so the same chat always maps to one lane
             Some(jid) if jid.device > 0 || jid.agent > 0 => jid.to_non_ad(),
@@ -64,10 +81,12 @@ impl MessageHandler {
         let lane = client
             .chat_lanes
             .get_with_by_ref(&chat_jid, async {
+                let budget = client.inbound_queues().chat_budget(&chat_jid);
                 create_chat_lane(
                     &client,
                     Arc::new(async_lock::Mutex::new(())),
                     Arc::new(async_lock::Mutex::new(())),
+                    budget,
                 )
             })
             .await;
@@ -78,18 +97,27 @@ impl MessageHandler {
 
         // A lane lookup or enqueue lock can resume after reconnection. Do not
         // admit an old notification to a worker created by the new connection.
-        if scope.is_some_and(|scope| !scope.is_current(&client)) {
+        if shutdown.is_fired()
+            || client
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                != generation
+            || scope.is_some_and(|scope| !scope.is_current(&client))
+        {
             *cancelled = true;
             return true;
         }
 
-        let node = match lane.try_enqueue_scoped(
-            node,
-            scope.map_or_else(
-                wacore::runtime::ShutdownSignal::never,
-                NotificationScope::shutdown,
-            ),
-        ) {
+        // An initializer can publish after cleanup cleared the cache. Refuse
+        // fresh work on that retired worker and use the ordinary replacement path.
+        if lane.generation != generation {
+            lane.queue_tx.close();
+        }
+
+        let node = match lane
+            .enqueue_scoped(node, shutdown.clone(), &*client.runtime)
+            .await
+        {
             Ok(()) => return true,
             // The worker went idle and closed its queue (see
             // `LANE_IDLE_TIMEOUT`). Replace the lane; the successor worker
@@ -99,6 +127,7 @@ impl MessageHandler {
                 warn!("Failed to enqueue message for processing: {e}");
                 // Cancel ack so server redelivers
                 *cancelled = true;
+                client.drain_overloaded_inbound(&shutdown);
                 return true;
             }
         };
@@ -118,24 +147,29 @@ impl MessageHandler {
                             &client,
                             Arc::clone(&lane.enqueue_lock),
                             Arc::clone(&lane.worker_running),
+                            Arc::clone(&lane.byte_budget),
                         )
                     })
                     .await
             }
         };
-        if scope.is_some_and(|scope| !scope.is_current(&client)) {
+        if shutdown.is_fired()
+            || client
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                != generation
+            || scope.is_some_and(|scope| !scope.is_current(&client))
+        {
             *cancelled = true;
             return true;
         }
-        if let Err(e) = fresh.try_enqueue_scoped(
-            node,
-            scope.map_or_else(
-                wacore::runtime::ShutdownSignal::never,
-                NotificationScope::shutdown,
-            ),
-        ) {
+        if let Err(e) = fresh
+            .enqueue_scoped(node, shutdown.clone(), &*client.runtime)
+            .await
+        {
             warn!("Failed to enqueue message for processing: {e}");
             *cancelled = true;
+            client.drain_overloaded_inbound(&shutdown);
         }
 
         true
@@ -173,8 +207,11 @@ fn create_chat_lane(
     client: &Arc<Client>,
     enqueue_lock: Arc<async_lock::Mutex<()>>,
     worker_running: Arc<async_lock::Mutex<()>>,
+    byte_budget: Arc<crate::inbound_queue::ByteBudget>,
 ) -> ChatLane {
-    let (tx, rx) = async_channel::unbounded::<QueuedChatMessage>();
+    let (tx, rx) =
+        async_channel::bounded::<QueuedChatMessage>(crate::inbound_queue::CHAT_QUEUE_ITEMS);
+    let rx = crate::inbound_queue::DrainingReceiver(rx);
 
     let client_for_worker = client.clone();
     let spawn_generation = client
@@ -231,8 +268,12 @@ fn create_chat_lane(
         .detach();
 
     ChatLane {
+        generation: spawn_generation,
         enqueue_lock,
         queue_tx: tx,
+        byte_budget,
+        global_budget: Arc::clone(&client.inbound_queues().chat),
+        work: Arc::clone(&client.inbound_queues().work),
         worker_running,
     }
 }
@@ -245,6 +286,7 @@ async fn process_queued(
         shutdown,
         node: msg_node,
         lane_liveness, // Prevents capacity eviction until processing finishes.
+        work,
     }: QueuedChatMessage,
     spawn_generation: u64,
 ) -> bool {
@@ -260,6 +302,10 @@ async fn process_queued(
     // backlog would stop reporting the single pathological message
     // this guard exists to catch.
     let start = wacore::time::Instant::now();
+    // Classification can drop the parsed node before its heavy processing
+    // finishes. Keep this admission charged until the whole handler completes;
+    // escaped slices independently retain the same charge for longer.
+    let _backing = msg_node.backing_bytes();
     if msg_node.tag() == StanzaTag::Notification.as_str() {
         client
             .process_queued_group_notification(msg_node, spawn_generation, shutdown)
@@ -282,6 +328,7 @@ async fn process_queued(
         );
     }
     drop(lane_liveness);
+    drop(work);
     true
 }
 
@@ -291,6 +338,84 @@ mod tests {
     use crate::test_utils::node_to_owned_ref;
     use wacore_binary::builder::NodeBuilder;
     use wacore_binary::jid::Jid;
+
+    #[tokio::test]
+    async fn a_late_initializer_cannot_admit_fresh_work_to_a_retired_worker() {
+        let client = crate::test_utils::create_test_client().await;
+        let chat: Jid = "120363000000042@g.us".parse().unwrap();
+        let running = Arc::new(async_lock::Mutex::new(()));
+        let blocked = running.lock().await;
+        let retired = create_chat_lane(
+            &client,
+            Arc::default(),
+            Arc::clone(&running),
+            Arc::new(crate::inbound_queue::ByteBudget::new(
+                crate::inbound_queue::CHAT_BYTES,
+            )),
+        );
+        client.notify_connection_shutdown();
+        client.chat_lanes.clear().await;
+        client
+            .connection_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        client.reset_connection_shutdown();
+        // Finish the old cache initializer after the reconnect's clear.
+        client
+            .chat_lanes
+            .insert(chat.clone(), retired.clone())
+            .await;
+        let mut cancelled = false;
+        MessageHandler::handle_inline(
+            Arc::clone(&client),
+            message_for(&chat, "fresh"),
+            &mut cancelled,
+        )
+        .await;
+        assert!(!cancelled);
+        let fresh = client.chat_lanes.get(&chat).await.unwrap();
+        assert!(!fresh.queue_tx.same_channel(&retired.queue_tx));
+        assert!(retired.queue_tx.is_closed());
+        assert_eq!(retired.queue_tx.len(), 0);
+        assert_eq!(fresh.queue_tx.len(), 1);
+        fresh.queue_tx.close();
+        drop(blocked);
+    }
+
+    #[tokio::test]
+    async fn a_real_chat_lane_bounds_a_burst_behind_a_blocked_worker() {
+        let client = crate::test_utils::create_test_client().await;
+        let running = Arc::new(async_lock::Mutex::new(()));
+        let blocked = running.lock().await;
+        let lane = create_chat_lane(
+            &client,
+            Arc::default(),
+            Arc::clone(&running),
+            Arc::new(crate::inbound_queue::ByteBudget::new(
+                crate::inbound_queue::CHAT_BYTES,
+            )),
+        );
+        let mut accepted = 0;
+        for id in 0..128 {
+            let node = node_to_owned_ref(
+                &NodeBuilder::new("message")
+                    .attr("from", "120363000000042@g.us")
+                    .attr("id", id.to_string())
+                    .bytes(vec![id as u8; 64 * 1024])
+                    .build(),
+            );
+            if lane.try_enqueue(node).is_ok() {
+                accepted += 1;
+            }
+        }
+        assert_eq!(lane.queue_tx.capacity(), Some(64));
+        assert_eq!(accepted, 64);
+        assert_eq!(lane.queue_tx.len(), 64);
+        let retained = 32 * 1024 * 1024 - client.inbound_queues().chat.available();
+        assert!((4 * 1024 * 1024..5 * 1024 * 1024).contains(&retained));
+        eprintln!("production lane: {accepted}/128 accepted, {retained} charged bytes");
+        lane.queue_tx.close();
+        drop(blocked);
+    }
 
     fn message_for(chat: &Jid, id: &str) -> Arc<wacore_binary::OwnedNodeRef> {
         node_to_owned_ref(
@@ -434,11 +559,21 @@ mod tests {
         }
     }
 
-    // Exact and width independent: the entry carries the enqueue-time shutdown handle.
+    // Exact and width independent: node, shutdown, lane liveness and drain guard.
     // Rebaseline per [layout asserts](../../agent_docs/testing.md).
     #[test]
-    fn queued_chat_message_keeps_three_handles() {
-        assert_eq!(size_of::<QueuedChatMessage>(), 3 * size_of::<usize>());
+    fn queued_chat_message_keeps_four_handles() {
+        assert_eq!(size_of::<QueuedChatMessage>(), 4 * size_of::<usize>());
+    }
+
+    #[cfg(feature = "bench-harness")]
+    #[test]
+    fn worker_throughput_fixture_drains_a_large_single_chat_burst_in_windows() {
+        let harness = crate::bench_support::MultiLaneReceiveHarness::new(1);
+        let before = harness.messages_delivered();
+        harness.enqueue_and_drain(&harness.generate_burst(1, 256));
+        assert_eq!(harness.messages_delivered() - before, 256);
+        harness.close_lanes();
     }
 
     #[cfg(feature = "bench-harness")]
@@ -490,6 +625,9 @@ mod tests {
             &client,
             Arc::new(async_lock::Mutex::new(())),
             Arc::new(async_lock::Mutex::new(())),
+            Arc::new(crate::inbound_queue::ByteBudget::new(
+                crate::inbound_queue::CHAT_BYTES,
+            )),
         );
         let task_size = sizes.lock().unwrap().pop().unwrap();
         lane.queue_tx.close();
@@ -522,6 +660,9 @@ mod tests {
             &client,
             Arc::new(async_lock::Mutex::new(())),
             Arc::new(async_lock::Mutex::new(())),
+            Arc::new(crate::inbound_queue::ByteBudget::new(
+                crate::inbound_queue::CHAT_BYTES,
+            )),
         );
         let chat_lane_task_size = sizes.lock().unwrap().pop().unwrap();
 
@@ -530,6 +671,7 @@ mod tests {
             shutdown: wacore::runtime::ShutdownSignal::never(),
             node: Arc::clone(&dummy_node),
             lane_liveness: Arc::new(async_lock::Mutex::new(())),
+            work: None,
         };
         let process_queued_fut = process_queued(&client, queued, 0);
         let process_queued_size = size_of_val(&process_queued_fut);
@@ -795,6 +937,7 @@ mod tests {
                     node,
                     shutdown: client.connection_shutdown_signal(),
                     lane_liveness: Arc::new(async_lock::Mutex::new(())),
+                    work: None,
                 },
                 generation
             )

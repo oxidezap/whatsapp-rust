@@ -14,6 +14,14 @@ pub const GROUP_CALL_MAX_PARTICIPANTS: usize = 32;
 /// The local endpoint consumes one membership slot.
 pub const GROUP_CALL_MAX_REMOTE_PARTICIPANTS: usize = GROUP_CALL_MAX_PARTICIPANTS - 1;
 
+/// Fewest remote users a new group call may ring. An ad-hoc call needs two, because a call to one
+/// person is a 1:1 call. A call bound to a group rings the rest of the group, which in a two-person
+/// group is one member: WhatsApp's own clients place that as a group call, and the server accepts
+/// the offer and rings the other member.
+pub const fn group_call_min_remote_participants(group_bound: bool) -> usize {
+    if group_bound { 1 } else { 2 }
+}
+
 /// Audio/video mode of a reusable call link.
 ///
 /// Hand-written rather than generated. The enum catalog holds exactly one

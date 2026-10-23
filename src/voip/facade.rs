@@ -31,6 +31,7 @@ use wacore::types::call::{CallAction, IncomingCall, VideoState};
 use wacore::types::group_call::{
     CallLinkMedia, GROUP_CALL_MAX_PARTICIPANTS, GROUP_CALL_MAX_REMOTE_PARTICIPANTS,
     GroupCallDevice, GroupCallParticipant, GroupCallUpdate, ScreenShareState,
+    group_call_min_remote_participants,
 };
 #[cfg(all(test, feature = "voip-engine-wacore"))]
 use wacore::voip::transport::RelayTransportFactory;
@@ -44,7 +45,7 @@ use wacore::voip_control::{
     CallDirection, CallEvent, CallPhase, MediaAudioCodec as AudioCodec,
     MediaAudioFormat as AudioFormat, MediaAudioRtpProfile as AudioRtpProfile,
     MediaKeyframeUrgency as KeyframeUrgency, MediaVideoUpgradeToken as VideoUpgradeToken,
-    VideoFrame, VideoInput, VideoTeardownHook, VoipMediaSession,
+    VideoFecConfig, VideoFrame, VideoInput, VideoTeardownHook, VoipMediaSession,
 };
 use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
@@ -794,7 +795,8 @@ impl<'a> OutgoingCall<'a> {
     }
 }
 
-/// Builder for a native ad-hoc or group-bound call with at least two remote users.
+/// Builder for a native ad-hoc call with at least two remote users, or a group-bound call with at
+/// least one.
 pub struct OutgoingGroupCall<'a> {
     client: &'a Client,
     targets: &'a [Jid],
@@ -846,6 +848,17 @@ impl<'a> OutgoingGroupCall<'a> {
                 "video RTP timestamp stride must be non-zero",
             ));
         }
+        let min_remote = group_call_min_remote_participants(self.group_jid.is_some());
+        let roster_error = || {
+            let kind = if self.group_jid.is_some() {
+                "group-bound"
+            } else {
+                "group"
+            };
+            CallError::Setup(format!(
+                "{kind} call requires {min_remote}..={GROUP_CALL_MAX_REMOTE_PARTICIPANTS} remote users"
+            ))
+        };
         let own_lid = self.client.lid().ok_or(CallError::Media("no own LID"))?;
         let own_user = own_lid.to_non_ad();
         let own_pn = self.client.pn().map(|jid| jid.to_non_ad());
@@ -863,9 +876,7 @@ impl<'a> OutgoingGroupCall<'a> {
             candidates.push(target);
         }
         if candidates.len() > GROUP_CALL_MAX_REMOTE_PARTICIPANTS {
-            return Err(CallError::Setup(format!(
-                "group call requires 2..={GROUP_CALL_MAX_REMOTE_PARTICIPANTS} remote users"
-            )));
+            return Err(roster_error());
         }
         let resolved = futures::future::join_all(candidates.into_iter().map(|target| async move {
             match target.server {
@@ -897,15 +908,11 @@ impl<'a> OutgoingGroupCall<'a> {
             }
             targets.push(resolved);
             if targets.len() > GROUP_CALL_MAX_REMOTE_PARTICIPANTS {
-                return Err(CallError::Setup(format!(
-                    "group call requires 2..={GROUP_CALL_MAX_REMOTE_PARTICIPANTS} remote users"
-                )));
+                return Err(roster_error());
             }
         }
-        if !(2..=GROUP_CALL_MAX_REMOTE_PARTICIPANTS).contains(&targets.len()) {
-            return Err(CallError::Setup(format!(
-                "group call requires 2..={GROUP_CALL_MAX_REMOTE_PARTICIPANTS} remote users"
-            )));
+        if !(min_remote..=GROUP_CALL_MAX_REMOTE_PARTICIPANTS).contains(&targets.len()) {
+            return Err(roster_error());
         }
 
         let devices = drop_hosted_devices(
@@ -2562,6 +2569,11 @@ pub(crate) async fn attach_outgoing_relay(
         );
         let ctx = wacore::voip_control::MediaOpenContext::builder()
             .audio(pending.audio.clone().into_ports())
+            .on_media_connected(
+                client
+                    .call_registry()
+                    .direct_media_connected_hook(spec.key.clone()),
+            )
             .video_channels(video_channels)
             .video_teardown(pending.video_teardown)
             // Re-read at open time, not parked at registration: a rotation the peer announced
@@ -3132,6 +3144,7 @@ async fn open_registered_media(
 
     let ctx = wacore::voip_control::MediaOpenContext::builder()
         .audio(audio.into_ports())
+        .on_media_connected(registry.direct_media_connected_hook(spec.key.clone()))
         .video_channels(
             wacore::voip_control::MediaVideoChannels::builder()
                 .control(video_ctl)
@@ -3475,6 +3488,7 @@ impl TimedVideoFeed {
                         .data(frame.data)
                         .timestamp(frame.timestamp)
                         .generation(self.generation)
+                        .maybe_captured_at(frame.captured_at)
                         .build(),
                 )
                 .fuse();
@@ -3760,6 +3774,19 @@ impl CallHandle {
     pub fn phase(&self) -> Option<CallPhase> {
         self.client_registry
             .phase_if_current(&self.call_id, self.generation)
+    }
+
+    /// Whether this direct call has reached accepted media readiness.
+    ///
+    /// Readiness means a constructed media plane and an allocated relay, plus validated acceptance
+    /// and installed receive keys for an outgoing call (or sent acceptance for an incoming call).
+    /// It does not prove that RTP arrived or audio was heard. The snapshot survives event queue
+    /// backpressure and stays true across relay reconnects until this generation ends, is replaced,
+    /// or becomes a group call. An external backend must invoke `MediaOpenContext::on_media_connected`
+    /// to publish readiness. False before readiness and for group calls.
+    pub fn media_connected(&self) -> bool {
+        self.client_registry
+            .media_connected_if_current(&self.call_id, self.generation)
     }
 
     /// Media counters for this call: what arrived, what was discarded, and where.
@@ -4255,6 +4282,19 @@ impl CallHandle {
     pub fn request_peer_keyframe(&self, urgency: KeyframeUrgency) {
         self.video
             .send_control(VideoControl::RequestPeerKeyframe(urgency));
+    }
+
+    /// Set how much forward error correction our video carries, from the next access unit on.
+    ///
+    /// On by default in a 1:1 call, as WhatsApp's own clients send it: a peer that does not ask
+    /// for retransmissions (an iPhone) otherwise freezes on any lost packet until the next
+    /// keyframe. [`CallMediaStats::video_fec_bytes_sent`] counts what it adds on top of the
+    /// encoder's bitrate. **Does nothing in a group call**, which sends no FEC.
+    ///
+    /// [`CallMediaStats::video_fec_bytes_sent`]:
+    ///     wacore::voip_control::media_stats::CallMediaStats::video_fec_bytes_sent
+    pub fn set_video_fec(&self, config: VideoFecConfig) {
+        self.video.send_control(VideoControl::SetFec(config));
     }
 
     /// Send the standalone `<video state=1 dec="H264" device_orientation="0">` used after a
@@ -5307,8 +5347,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn group_call_by_id_uses_cached_roster_and_excludes_every_local_identity() {
+    /// A client whose own PN and LID are set, whose `peers` each have one device on record, and
+    /// whose group cache holds a group of the local user (under both identities) and `peers`.
+    async fn group_call_client(peers: &[&Jid]) -> (Arc<Client>, Jid, Jid) {
         use wacore::client::context::GroupRoutingInfo;
         use wacore::store::traits::{DeviceInfo, DeviceListRecord};
         use wacore::types::message::AddressingMode;
@@ -5322,9 +5363,7 @@ mod tests {
         ] {
             client.persistence_manager().process_command(command).await;
         }
-        let peer_a = Jid::new("222222222222222", Server::Lid);
-        let peer_b = Jid::new("333333333333333", Server::Lid);
-        for peer in [&peer_a, &peer_b] {
+        for peer in peers {
             client
                 .update_device_list(DeviceListRecord {
                     user: peer.user.as_str().into(),
@@ -5337,17 +5376,20 @@ mod tests {
                 .expect("seed device list");
         }
         let group = Jid::new("120363000000000001", Server::Group);
+        let mut members = vec![own_pn, own_lid.to_non_ad()];
+        members.extend(peers.iter().map(|peer| (*peer).clone()));
         client
             .get_group_cache()
             .insert(
                 group.clone(),
-                Arc::new(GroupRoutingInfo::new(
-                    vec![own_pn, own_lid.to_non_ad(), peer_a.clone(), peer_b.clone()],
-                    AddressingMode::Lid,
-                )),
+                Arc::new(GroupRoutingInfo::new(members, AddressingMode::Lid)),
             )
             .await;
+        (client, own_lid, group)
+    }
 
+    /// Start a call to `group`'s roster and return the offer it sends, as the users it rings.
+    async fn group_offer_users(client: &Arc<Client>, group: &Jid) -> Vec<Jid> {
         let sent = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
         let start_client = client.clone();
         let start_group = group.clone();
@@ -5366,7 +5408,7 @@ mod tests {
         let offer = &node_ref.children().expect("call action")[0];
         assert_eq!(
             offer.attrs().optional_jid("group-jid"),
-            Some(group),
+            Some(group.clone()),
             "the roster-derived call must remain bound to its source group"
         );
         let users = offer
@@ -5377,14 +5419,79 @@ mod tests {
             .iter()
             .map(|user| user.attrs().optional_jid("jid").expect("user jid"))
             .collect::<Vec<_>>();
+        start.abort();
+        let _ = start.await;
+        users
+    }
+
+    #[tokio::test]
+    async fn group_call_by_id_uses_cached_roster_and_excludes_every_local_identity() {
+        let peer_a = Jid::new("222222222222222", Server::Lid);
+        let peer_b = Jid::new("333333333333333", Server::Lid);
+        let (client, own_lid, group) = group_call_client(&[&peer_a, &peer_b]).await;
+
         assert_eq!(
-            users,
+            group_offer_users(&client, &group).await,
             [own_lid.to_non_ad(), peer_a, peer_b],
             "the own PN and LID roster entries must collapse into the single local participant"
         );
+    }
 
-        start.abort();
-        let _ = start.await;
+    #[tokio::test]
+    async fn a_two_person_group_call_rings_its_other_member() {
+        let peer = Jid::new("222222222222222", Server::Lid);
+        let (client, own_lid, group) = group_call_client(&[&peer]).await;
+
+        assert_eq!(
+            group_offer_users(&client, &group).await,
+            [own_lid.to_non_ad(), peer],
+            "a group-bound call needs only one other member"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_group_with_no_other_member_cannot_be_called() {
+        let (client, _own_lid, group) = group_call_client(&[]).await;
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (speaker_tx, _speaker_rx) = async_channel::unbounded::<Vec<i16>>();
+
+        let result = client
+            .voip()
+            .group_call_by_id(&group)
+            .audio(mic_rx, speaker_tx)
+            .start()
+            .await;
+        assert!(matches!(
+            result,
+            Err(CallError::Setup(message))
+                if message
+                    == format!(
+                        "group-bound call requires 1..={GROUP_CALL_MAX_REMOTE_PARTICIPANTS} remote users"
+                    )
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_ad_hoc_group_call_still_needs_two_remote_users() {
+        let peer = Jid::new("222222222222222", Server::Lid);
+        let (client, _own_lid, _group) = group_call_client(&[&peer]).await;
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (speaker_tx, _speaker_rx) = async_channel::unbounded::<Vec<i16>>();
+
+        let result = client
+            .voip()
+            .group_call(std::slice::from_ref(&peer))
+            .audio(mic_rx, speaker_tx)
+            .start()
+            .await;
+        assert!(matches!(
+            result,
+            Err(CallError::Setup(message))
+                if message
+                    == format!(
+                        "group call requires 2..={GROUP_CALL_MAX_REMOTE_PARTICIPANTS} remote users"
+                    )
+        ));
     }
 
     #[tokio::test]
@@ -7877,6 +7984,54 @@ mod tests {
             ended: Arc::new(EndedFlag::default()),
             media: None,
         }
+    }
+
+    #[tokio::test]
+    async fn media_readiness_is_retained_without_consuming_events_and_cannot_cross_generations() {
+        let (client, sends) = make_sending_client().await;
+        let registry = client.call_registry();
+        let generation = registry.insert(mk_session());
+        let handle = registry_handle(&client, generation);
+        let cloned = handle.clone();
+        let media = registry
+            .resident_session(handle.call_id(), generation)
+            .unwrap();
+        let sender = media.event_sender();
+        while sender.try_send(CallEvent::RelayAllocated).is_ok() {}
+        let queued = sender.len();
+        let stats = media.install_fresh_stats_cell();
+        stats.on_media_connected(
+            registry.direct_media_connected_hook(
+                wacore::voip_control::MediaSessionKey::builder()
+                    .call_id(handle.call_id().to_owned())
+                    .generation(generation)
+                    .build(),
+            ),
+        );
+        assert!(!handle.media_connected());
+        stats.notify_media_connected();
+        assert!(handle.media_connected());
+        assert!(cloned.media_connected());
+        assert_eq!(handle.phase(), Some(CallPhase::Active));
+        assert_eq!(
+            sender.len(),
+            queued,
+            "lifecycle never consumes the public queue"
+        );
+        assert!(registry.transition_if_current(handle.call_id(), generation, CallPhase::Ended));
+        assert!(
+            !handle.media_connected(),
+            "a terminal generation is no longer ready before removal"
+        );
+        assert!(!registry.direct_media_connected_if_current(handle.call_id(), generation));
+        assert_eq!(handle.phase(), Some(CallPhase::Ended));
+        let replacement_generation = registry.insert(mk_session());
+        let replacement = registry_handle(&client, replacement_generation);
+        stats.notify_media_connected();
+        assert!(!handle.media_connected());
+        assert!(!replacement.media_connected());
+        assert_eq!(replacement.phase(), Some(CallPhase::Ringing));
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -13071,11 +13226,13 @@ mod tests {
             ctl_rx.recv().await.unwrap(),
             VideoControl::SetTimestampStride(6000)
         );
+        let captured_at = wacore::time::Instant::now();
         src_tx
             .send(
                 TimedVideoFrame::builder()
                     .data(vec![1, 2, 3])
                     .timestamp(12_000)
+                    .captured_at(captured_at)
                     .build(),
             )
             .await
@@ -13084,6 +13241,7 @@ mod tests {
         assert_eq!(forwarded.data, vec![1, 2, 3]);
         assert_eq!(forwarded.timestamp, 12_000);
         assert_eq!(forwarded.generation, 1);
+        assert_eq!(forwarded.captured_at, Some(captured_at));
     }
 
     #[tokio::test]

@@ -23,55 +23,92 @@ fn video_offer_matches_the_vendor_engine() -> Result<()> {
     let _serial = common::threaded_guard();
     let bytes = common::capture(CAPTURE)?.with_context(|| format!("missing {CAPTURE}"))?;
     assert_eq!(hex::encode(Sha256::digest(&bytes)), CAPTURE_SHA);
+    eprintln!(
+        "oracle capture={CAPTURE} capture_sha256={CAPTURE_SHA} bytes={}",
+        bytes.len()
+    );
 
-    let mut runtime = None;
-    for _ in 0..6 {
-        let mut candidate = Runtime::instantiate(&bytes)?;
-        candidate.set_thread_policy(ThreadPolicy::Spawn);
-        candidate.set_main_thread_registration(true);
-        candidate.run_ctors()?;
-        candidate.attach_log_ring(4 << 20)?;
-        let init = candidate.call_embind(
-            "initVoipStack",
-            &[
-                Value::Str("15550002222@c.us".into()),
-                Value::Str("15550002222:0@c.us".into()),
-                Value::Str("99887766554433:0@lid".into()),
-            ],
-        );
-        candidate.refuel();
-        if init.as_ref().ok().and_then(|value| value.as_int()) == Some(0) {
-            runtime = Some(candidate);
+    let mut runtime = Runtime::instantiate(&bytes)?;
+    runtime.set_thread_policy(ThreadPolicy::Spawn);
+    runtime.demand_strict_turns();
+    runtime.set_main_thread_registration(true);
+    runtime.run_ctors()?;
+    runtime.attach_log_ring(4 << 20)?;
+    let init = common::evidence::call(
+        &mut runtime,
+        "initVoipStack",
+        &[
+            Value::Str("15550002222@c.us".into()),
+            Value::Str("15550002222:0@c.us".into()),
+            Value::Str("99887766554433:0@lid".into()),
+        ],
+    );
+    runtime.refuel();
+    assert_eq!(
+        init.as_ref().ok().and_then(|value| value.as_int()),
+        Some(0),
+        "oracle infrastructure failure: init={init:?} log={:?}",
+        runtime.engine_log()
+    );
+
+    let outcome = common::evidence::call(
+        &mut runtime,
+        "startVoipCall",
+        &[
+            Value::Str("11223344556677@lid".into()),
+            Value::StringList(vec!["11223344556677:0@lid".into()]),
+            Value::Str("0011223344556677".into()),
+            Value::Bool(true),
+            Value::Str("11223344556677@lid".into()),
+            Value::Bool(false),
+            Value::Bytes(vec![0xa5; 32]),
+        ],
+    );
+    runtime.refuel();
+    assert_eq!(
+        outcome.as_ref().ok().and_then(|value| value.as_int()),
+        Some(0),
+        "startVoipCall: {outcome:?}"
+    );
+    let sent = common::evidence::wait_for_signaling(
+        &mut runtime,
+        std::time::Duration::from_secs(8),
+        "0011223344556677",
+    )?;
+    // The signaling callback precedes delivery of the last call event. Wait
+    // for that event before comparing exact stub counters.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    let call_events = |runtime: &Runtime| {
+        runtime
+            .stubs_called()
+            .iter()
+            .find(|(name, _)| name == "env::on_call_event_js_sync")
+            .map_or(0, |(_, count)| *count)
+    };
+    while call_events(&runtime) < 3 {
+        if let Err(error) = runtime.try_process_queued_calls() {
+            common::evidence::record(&runtime);
+            return Err(error);
+        }
+        if call_events(&runtime) >= 3 {
             break;
         }
-    }
-    let mut runtime = runtime.context("initVoipStack never returned 0")?;
-
-    let mut started = false;
-    for _ in 0..3 {
-        let outcome = runtime.call_embind(
-            "startVoipCall",
-            &[
-                Value::Str("11223344556677@lid".into()),
-                Value::StringList(vec!["11223344556677:0@lid".into()]),
-                Value::Str("0011223344556677".into()),
-                Value::Bool(true),
-                Value::Str("11223344556677@lid".into()),
-                Value::Bool(false),
-                Value::Bytes(vec![0xa5; 32]),
-            ],
-        );
-        runtime.refuel();
-        runtime.settle(std::time::Duration::from_secs(8));
-        runtime.refuel();
-        if outcome.as_ref().ok().and_then(|value| value.as_int()) == Some(0)
-            && !runtime.signaling()?.is_empty()
-        {
-            started = true;
-            break;
+        if std::time::Instant::now() >= deadline {
+            common::evidence::record(&runtime);
+            anyhow::bail!(
+                "oracle Infrastructure: final call event deadline expired after {} call events",
+                call_events(&runtime)
+            );
         }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    assert!(started, "the engine should emit a video offer");
+    common::evidence::record(&runtime);
+    common::evidence::check_log(
+        runtime.engine_log_overflowed()?,
+        runtime.memory_view_is_coherent(),
+        !sent.is_empty(),
+    )
+    .unwrap_or_else(|kind| common::evidence::fail(kind, "video offer evidence"));
 
     let mut stubs = runtime.stubs_called();
     stubs.sort();
@@ -92,7 +129,6 @@ fn video_offer_matches_the_vendor_engine() -> Result<()> {
         ],
         "a changed stub-dependent path must fail here, not bless new geometry"
     );
-    let sent = runtime.signaling()?;
     let node = marshal::unmarshal_ref(&sent[0].stanza[1..])?;
     assert_eq!(node.tag, "offer");
     let children = node.children().context("offer children")?;

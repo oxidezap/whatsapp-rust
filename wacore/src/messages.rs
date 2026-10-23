@@ -776,6 +776,47 @@ struct WireRedaction {
     detached_value: Option<std::ops::Range<usize>>,
 }
 
+/// Original notification fragments, including unknown fields. Concatenating
+/// repeated singular submessages preserves protobuf merge semantics. Slices
+/// share the carrier so even large inline payloads are not copied here.
+pub fn history_sync_notification_wire(source: &bytes::Bytes) -> Result<Vec<bytes::Bytes>> {
+    let path = if contains_nested_message_field(source, DEVICE_SENT_INNER_MESSAGE_PATH)? {
+        DEVICE_SENT_HISTORY_PAYLOAD_PATH
+    } else {
+        DIRECT_HISTORY_PAYLOAD_PATH
+    };
+    let mut fragments = Vec::new();
+    collect_nested_wire(source, &path[..path.len() - 1], &mut fragments)?;
+    Ok(fragments)
+}
+
+fn collect_nested_wire(
+    source: &bytes::Bytes,
+    path: &[u32],
+    fragments: &mut Vec<bytes::Bytes>,
+) -> Result<(), buffa::DecodeError> {
+    let Some((&field, rest)) = path.split_first() else {
+        fragments.push(source.clone());
+        return Ok(());
+    };
+    let mut remaining = source.as_ref();
+    while !remaining.is_empty() {
+        let mut after_tag = remaining;
+        let tag = buffa::encoding::Tag::decode(&mut after_tag)?;
+        if tag.field_number() == field
+            && tag.wire_type() == buffa::encoding::WireType::LengthDelimited
+        {
+            let range = length_delimited_value_range(source.len(), after_tag)?;
+            collect_nested_wire(&source.slice(range.clone()), rest, fragments)?;
+            remaining = &source[range.end..];
+        } else {
+            buffa::encoding::skip_field_depth(tag, &mut after_tag, buffa::RECURSION_LIMIT)?;
+            remaining = after_tag;
+        }
+    }
+    Ok(())
+}
+
 /// Whether a nested message field path is set on the wire.
 ///
 /// This deliberately recognizes only length-delimited fields, the schema wire
@@ -3349,5 +3390,49 @@ mod device_sent_tests {
             decode_padded(&MessageUtils::encode_and_pad(&plain)),
             "encode_and_pad_with_context(None) must equal encode_and_pad"
         );
+    }
+}
+
+#[cfg(test)]
+mod retained_history_wire_tests {
+    use super::*;
+
+    #[test]
+    fn notification_wire_preserves_unknown_fields_and_repeated_message_fragments() {
+        let first = [0xc0, 0x3e, 0x7b];
+        let second = [0xc8, 0x3e, 0x01];
+        let mut protocol = Vec::new();
+        for fragment in [&first, &second] {
+            push_len_delimited(
+                waproto::tags::message::protocol_message::HISTORY_SYNC_NOTIFICATION,
+                fragment,
+                &mut protocol,
+            );
+        }
+        let mut message = Vec::new();
+        push_len_delimited(
+            waproto::tags::message::PROTOCOL_MESSAGE,
+            &protocol,
+            &mut message,
+        );
+        for wrapped in [false, true] {
+            let source = if wrapped {
+                let mut dsm = Vec::new();
+                push_len_delimited(TAG_DSM_MESSAGE, &message, &mut dsm);
+                let mut outer = Vec::new();
+                push_len_delimited(TAG_DEVICE_SENT_MESSAGE, &dsm, &mut outer);
+                bytes::Bytes::from(outer)
+            } else {
+                bytes::Bytes::copy_from_slice(&message)
+            };
+            let fragments = history_sync_notification_wire(&source).unwrap();
+            assert_eq!(
+                fragments,
+                vec![
+                    bytes::Bytes::copy_from_slice(&first),
+                    bytes::Bytes::copy_from_slice(&second)
+                ]
+            );
+        }
     }
 }

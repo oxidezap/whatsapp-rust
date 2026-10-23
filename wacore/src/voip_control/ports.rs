@@ -66,6 +66,10 @@ pub struct VideoFrame {
 pub struct TimedVideoFrame {
     pub data: Vec<u8>,
     pub timestamp: u32,
+    /// When the picture was captured, on the [`crate::time::Instant`] clock. Optional: with it,
+    /// every packet of the access unit carries the time from capture to its departure in its
+    /// transmission offset extension; without it, the offset stays zero.
+    pub captured_at: Option<crate::time::Instant>,
 }
 
 /// A pre-encoded video access unit with an RTP-clock capture timestamp, as the drive loop consumes
@@ -79,6 +83,8 @@ pub struct VideoInput {
     pub timestamp: u32,
     /// Source generation assigned by the caller. Stale generations are discarded at the driver.
     pub generation: u64,
+    /// When the picture was captured; see [`TimedVideoFrame::captured_at`].
+    pub captured_at: Option<crate::time::Instant>,
 }
 
 /// Video RTP timestamp clock (90 kHz).
@@ -162,12 +168,26 @@ pub type VideoTeardownHook = Box<dyn Fn() + Send + Sync>;
 #[cfg(target_arch = "wasm32")]
 pub type VideoTeardownHook = Box<dyn Fn()>;
 
+/// One-shot direct media readiness callback: thread-safe on native, local on wasm32.
+/// Return false when this generation no longer accepts direct readiness; the backend must
+/// then suppress the public MediaConnected event as well as the retained snapshot.
+#[cfg(not(target_arch = "wasm32"))]
+pub type MediaConnectedHook = Box<dyn FnOnce() -> bool + Send + Sync>;
+#[cfg(target_arch = "wasm32")]
+pub type MediaConnectedHook = Box<dyn FnOnce() -> bool>;
+
 /// Sealed like every other seam DTO: `#[non_exhaustive]` plus a builder, so a later field does
 /// not break a backend that builds it.
 #[derive(bon::Builder)]
 #[non_exhaustive]
 pub struct MediaOpenContext {
     pub audio: MediaAudioPorts,
+    /// Commit direct-call readiness independently of public event delivery. Invoke only after
+    /// media is constructed, the relay is allocated and acceptance is confirmed: an outgoing
+    /// answer's receive keys must be installed; incoming acceptance must already be sent.
+    /// This does not prove RTP reception or audible sound. Group calls must not invoke it.
+    /// Optional for external backends; omitting it leaves the readiness snapshot false.
+    pub on_media_connected: Option<MediaConnectedHook>,
     /// The drive-loop video halves, always pre-created by the control plane at registration (so a
     /// dormant handle can attach or detach endpoints before media exists). The backend must use
     /// these rather than create its own, or the sender the handle steers would reach a different

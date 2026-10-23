@@ -6,6 +6,7 @@
 //! | Newsletter/channel messages and PDO recovery | No durable capture gate; event-only paths |
 //! | Group `w:gp2` notifications | [`crate::GroupNotificationDurabilityHook`] |
 //! | Admitted history chunks | [`HistorySyncCaptureHook`], registered separately |
+//! | History notifications with restart recovery | [`crate::HistorySyncDurabilityHook`] |
 //! | Callbacks/event subscriptions | Observers, not durable capture |
 //!
 //! Each hook defines its own idempotence, cancellation and replay limits.
@@ -46,6 +47,7 @@ use waproto::whatsapp as wa;
 ///
 /// History capture is configured independently through [`HistorySyncCaptureHook`].
 /// Registering this hook alone does not change history receipt ordering.
+/// [`crate::HistorySyncDurabilityHook`] additionally retains notifications for replay.
 ///
 /// The hook is awaited inside the receive pipeline, so a slow hook backpressures
 /// inbound processing (the same trade-off as whatsmeow's synchronous ack). Do

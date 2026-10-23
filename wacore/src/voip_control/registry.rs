@@ -138,6 +138,7 @@ impl Drop for EndedNotify {
 
 struct CallEntry {
     session: CallSession,
+    direct_media_connected: bool,
     /// The media plane, behind the neutral seam. It owns the driver command mailboxes (recv-rekey,
     /// video-control, group-control) and the epoch retained before media attaches; the registry
     /// reaches media only through [`VoipMediaSession`]. Present from registration, before the
@@ -1757,6 +1758,7 @@ impl CallRegistry {
         });
         let announced = session.peer_video_orientation.clone();
         let mut entry = CallEntry {
+            direct_media_connected: false,
             // A fresh call starts upright; the app announces a rotation when it
             // has one, and it then outlives every negotiation rebuild.
             self_video_orientation: 0,
@@ -3160,6 +3162,48 @@ impl CallRegistry {
             .get_mut(call_id)
             .filter(|entry| entry.generation == generation)
             .is_some_and(|entry| entry.session.transition_to(next))
+    }
+
+    /// Commit accepted direct media readiness. A stale engine or a call promoted to a group
+    /// cannot activate a replacement or borrow a direct call's readiness.
+    pub fn direct_media_connected_if_current(&self, call_id: &str, generation: u64) -> bool {
+        self.active_calls()
+            .get_mut(call_id)
+            .filter(|entry| {
+                entry.generation == generation && !entry.is_group_call && !entry.is_call_link
+            })
+            .is_some_and(|entry| {
+                if !entry.session.transition_to(CallPhase::Active) {
+                    return false;
+                }
+                entry.direct_media_connected = true;
+                true
+            })
+    }
+
+    /// Whether this current direct generation has reached accepted media readiness.
+    /// This is retained state, independent of delivery into the public event queue.
+    pub fn media_connected_if_current(&self, call_id: &str, generation: u64) -> bool {
+        self.active_calls().get(call_id).is_some_and(|entry| {
+            entry.generation == generation
+                && !entry.is_group_call
+                && !entry.is_call_link
+                && !entry.session.is_ended()
+                && entry.direct_media_connected
+        })
+    }
+
+    /// A weak, generation-scoped callback for the neutral backend's opening context.
+    pub fn direct_media_connected_hook(
+        self: &Arc<Self>,
+        key: MediaSessionKey,
+    ) -> super::MediaConnectedHook {
+        let registry = Arc::downgrade(self);
+        Box::new(move || {
+            registry.upgrade().is_some_and(|registry| {
+                registry.direct_media_connected_if_current(&key.call_id, key.generation)
+            })
+        })
     }
 
     /// Read a clone of a call's session snapshot.
@@ -5614,6 +5658,52 @@ mod tests {
             "a stale generation must not read the replacement's device"
         );
         assert_eq!(reg.answering_device_if_current("CID", g2), None);
+    }
+
+    #[test]
+    fn media_readiness_hook_is_weak_and_generation_scoped() {
+        let registry = Arc::new(CallRegistry::new());
+        let stale = registry.insert(session("READY"));
+        let hook = registry.direct_media_connected_hook(MediaSessionKey {
+            call_id: "READY".into(),
+            generation: stale,
+        });
+        let current = registry.insert(session("READY"));
+        hook();
+        assert!(!registry.media_connected_if_current("READY", current));
+        assert_eq!(Arc::strong_count(&registry), 1);
+        let hook = registry.direct_media_connected_hook(MediaSessionKey {
+            call_id: "READY".into(),
+            generation: current,
+        });
+        registry.remove_if_current("READY", current);
+        hook();
+        assert!(!registry.media_connected_if_current("READY", current));
+    }
+
+    #[test]
+    fn promotion_rejects_a_delayed_direct_readiness_hook() {
+        let registry = Arc::new(CallRegistry::new());
+        let generation = registry.insert(session("PROMOTED"));
+        let hook = registry.direct_media_connected_hook(MediaSessionKey {
+            call_id: "PROMOTED".into(),
+            generation,
+        });
+        registry
+            .active_calls()
+            .get_mut("PROMOTED")
+            .unwrap()
+            .is_group_call = true;
+        assert!(!hook());
+        assert!(!registry.media_connected_if_current("PROMOTED", generation));
+    }
+
+    #[test]
+    fn group_call_cannot_borrow_direct_media_readiness() {
+        let registry = CallRegistry::new();
+        let generation = registry.insert_group(session("READY-GROUP"));
+        assert!(!registry.direct_media_connected_if_current("READY-GROUP", generation));
+        assert!(!registry.media_connected_if_current("READY-GROUP", generation));
     }
 
     #[test]
