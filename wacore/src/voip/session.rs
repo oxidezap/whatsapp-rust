@@ -1174,8 +1174,9 @@ impl VideoPipeline {
 
     /// [`Self::protect_video`] for a picture captured at `captured_ms`, on the same millisecond
     /// clock as `now_ms`. Each packet's transmission offset is the time since capture as of now;
-    /// [`Self::stamp_departure`] moves it on to when the packet actually leaves. Without a capture
-    /// time the offset is zero.
+    /// [`Self::stamp_departure`] moves it on to when the packet actually leaves unless video FEC
+    /// covers its header, in which case it keeps the packetization offset. Without a capture time
+    /// the offset is zero.
     pub fn protect_video_captured(
         &mut self,
         au: &[u8],

@@ -837,6 +837,24 @@ impl SentVideoHistory {
         self.packets.push_back((sequence, packet.clone(), 0));
     }
 
+    fn replace(&mut self, original: &Bytes, stamped: &Bytes) {
+        let Some(first) = self.packets.front().map(|p| p.0) else {
+            return;
+        };
+        let Some(seq) = original.get(2..4) else {
+            return;
+        };
+        let sequence = u16::from_be_bytes([seq[0], seq[1]]);
+        if let Some((held, packet, _)) = self
+            .packets
+            .get_mut(usize::from(sequence.wrapping_sub(first)))
+            && *held == sequence
+            && packet == original
+        {
+            *packet = stamped.clone();
+        }
+    }
+
     /// The packet with `sequence`, if it is still held and has not been sent again too often.
     fn resend(&mut self, sequence: u16) -> Option<Bytes> {
         let first = self.packets.front()?.0;
@@ -2370,8 +2388,8 @@ impl CallEngine {
     }
 
     /// [`Self::handle_video_frame_at`] for a picture captured at `captured`, on the engine's clock:
-    /// its packets carry the time from capture to transmission (see
-    /// [`Self::stamp_video_departure`]).
+    /// its packets carry the time since capture, measured at departure without FEC or at
+    /// packetization with FEC (see [`Self::stamp_video_departure`]).
     pub fn handle_captured_video_frame_at(
         &mut self,
         now: Millis,
@@ -2386,13 +2404,24 @@ impl CallEngine {
 
     /// A video packet this engine put out is leaving at `now`: hand back the packet to send in
     /// its place, its transmission offset measured to now, or the packet itself when it carries
-    /// no capture time (see [`VideoPipeline::stamp_departure`]).
+    /// no capture time or is covered by FEC (see [`VideoPipeline::stamp_departure`]).
     pub fn stamp_video_departure(&self, now: Millis, packet: Bytes) -> Bytes {
         self.media
             .as_ref()
             .and_then(|media| media.video.as_ref())
             .and_then(|video| video.pipe.stamp_departure(now, &packet))
             .map_or(packet, Bytes::from)
+    }
+
+    /// Keep NACK history identical to the bytes handed to the transport after pacing.
+    pub(crate) fn prepare_video_departure(&mut self, now: Millis, packet: Bytes) -> Bytes {
+        let stamped = self.stamp_video_departure(now, packet.clone());
+        if stamped != packet
+            && let Some(video) = self.media.as_mut().and_then(|m| m.video.as_mut())
+        {
+            video.sent.replace(&packet, &stamped);
+        }
+        stamped
     }
 
     /// Drain one intent. Returns `Output::Timeout(deadline)` once the queue is empty; the shell

@@ -1116,7 +1116,7 @@ async fn run_call_with_clock_and_wallclock(
             // A retransmission keeps the offset it was first sent with: it answers for a packet
             // the peer has already timed, and its picture is long past capture.
             let data = if kind == SendBatchKind::Video {
-                eng.stamp_video_departure(now, data)
+                eng.prepare_video_departure(now, data)
             } else {
                 data
             };
@@ -3764,6 +3764,9 @@ mod tests {
             ..RecordingTransport::default()
         });
         let cfg = config();
+        let nack_keys =
+            crate::voip::e2e_srtp::derive_srtcp_keys(&cfg.call_key, &cfg.peer_lid).unwrap();
+
         // Receives what we send: its peer is us.
         let mut receiver = VideoPipeline::new(&VideoPipelineParams {
             call_key: &cfg.call_key,
@@ -3865,6 +3868,69 @@ mod tests {
                 .expect("driver armed a deadline");
             rt.clock.store(at, Ordering::Relaxed);
         }
+        let original = transport
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|packet| {
+                parse_rtp_header(packet)
+                    .is_some_and(|h| h.payload_type == RTP_PAYLOAD_TYPE_H264 && h.timestamp == 9000)
+            })
+            .unwrap()
+            .clone();
+        let header = parse_rtp_header(&original).unwrap();
+        assert!(header.video_extension.unwrap().short_offset >= 300);
+        let peer_ssrc = 0x1234_5678u32;
+        let mut nack = vec![0x91, crate::voip::rtcp::RTCP_PT_RTPFB, 0, 3];
+        nack.extend_from_slice(&peer_ssrc.to_be_bytes());
+        nack.extend_from_slice(&header.ssrc.to_be_bytes());
+        nack.extend_from_slice(&header.sequence_number.to_be_bytes());
+        nack.extend_from_slice(&[0, 0]);
+        relay_tx
+            .try_send(RelayTransportEvent::PacketReceived(Bytes::from(
+                crate::voip::e2e_srtp::protect_srtcp(&nack_keys, peer_ssrc, 1, &nack),
+            )))
+            .unwrap();
+        let copies = || {
+            transport
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| {
+                    parse_rtp_header(p).is_some_and(|h| {
+                        h.ssrc == header.ssrc && h.sequence_number == header.sequence_number
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for _ in 0..100 {
+            assert!(drive.as_mut().poll(&mut context).is_pending());
+            if copies().len() == 2 {
+                break;
+            }
+            let at = *rt
+                .deadlines
+                .lock()
+                .unwrap()
+                .values()
+                .min()
+                .expect("driver armed a deadline");
+            rt.clock.store(at, Ordering::Relaxed);
+        }
+        let retransmissions = copies();
+        assert_eq!(
+            retransmissions.len(),
+            2,
+            "NACK retransmits the paced packet"
+        );
+        assert_eq!(
+            retransmissions[1], original,
+            "retransmission preserves the actual departure bytes"
+        );
         drop(drive);
 
         let sent = transport.sent.lock().unwrap();
@@ -3891,8 +3957,11 @@ mod tests {
         assert!(!uncaptured.is_empty());
         assert!(uncaptured.iter().all(|&offset| offset == 0));
 
+        let mut seen = std::collections::BTreeSet::new();
         for packet in sent.iter().filter(|packet| {
-            parse_rtp_header(packet).is_some_and(|h| h.payload_type == RTP_PAYLOAD_TYPE_H264)
+            parse_rtp_header(packet).is_some_and(|h| {
+                h.payload_type == RTP_PAYLOAD_TYPE_H264 && seen.insert((h.ssrc, h.sequence_number))
+            })
         }) {
             assert!(
                 receiver.unprotect_without_picture(packet).is_ok(),
