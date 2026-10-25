@@ -4,12 +4,15 @@
 
 use super::chat_actions::AppStateError;
 use crate::client::{Client, ClientError};
+use crate::features::mex::{MexError, mex_request};
 use crate::request::IqError;
 use crate::store::commands::DeviceCommand;
 use anyhow::Result;
 use log::debug;
+use std::time::Duration;
 use thiserror::Error;
 use wacore::iq::contacts::SetProfilePictureSpec;
+use wacore::iq::mex_operations::update_text_status;
 use wacore::iq::profile::SetStatusTextSpec;
 use wacore_binary::builder::NodeBuilder;
 
@@ -25,6 +28,9 @@ pub enum ProfileError {
     /// Connection/transport failure sending a stanza (push-name presence).
     #[error("{0}")]
     Client(#[from] ClientError),
+    /// A MEX request failed (text status).
+    #[error("{0}")]
+    Mex(#[from] MexError),
     /// Picture data was empty; use the dedicated removal operation instead.
     #[error("picture data cannot be empty; use remove_profile_picture instead")]
     EmptyPicture,
@@ -53,6 +59,60 @@ pub enum PushNameOutcome {
     },
 }
 
+/// How long a text status stays visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TextStatusExpiry {
+    /// Stays until it is replaced or cleared. WhatsApp Web sends `-1`.
+    Never,
+    /// Disappears after this long. Must be at least one second.
+    After(Duration),
+}
+
+/// Duration WhatsApp Web sends for a text status that never expires.
+const TEXT_STATUS_NEVER: i64 = -1;
+
+/// Build the `input` variable of `WAWebMexUpdateTextStatusJobMutation`.
+///
+/// The server refuses a zero duration together with text or an emoji (`400`),
+/// so an expiring status needs at least one second. Clearing is the one case
+/// that sends zero: a null text and no emoji, exactly as WhatsApp Web does.
+fn text_status_input(
+    text: Option<&str>,
+    emoji: Option<&str>,
+    expiry: TextStatusExpiry,
+) -> Result<serde_json::Value, ProfileError> {
+    let text = text.map(str::trim).filter(|t| !t.is_empty());
+    let emoji = emoji.map(str::trim).filter(|e| !e.is_empty());
+    if text.is_none() && emoji.is_none() {
+        return Err(ProfileError::InvalidArgument(
+            "a text status needs text or an emoji; use clear_text_status to remove it".into(),
+        ));
+    }
+    let seconds = match expiry {
+        TextStatusExpiry::Never => TEXT_STATUS_NEVER,
+        TextStatusExpiry::After(after) => {
+            let seconds = after.as_secs();
+            if seconds == 0 {
+                return Err(ProfileError::InvalidArgument(
+                    "a text status must last at least one second".into(),
+                ));
+            }
+            i64::try_from(seconds).map_err(|_| {
+                ProfileError::InvalidArgument("text status duration is too large".into())
+            })?
+        }
+    };
+    let mut input = serde_json::json!({
+        "text": text,
+        "ephemeral_duration_sec": seconds,
+    });
+    if let Some(emoji) = emoji {
+        input["emoji"] = serde_json::json!({ "content": emoji });
+    }
+    Ok(input)
+}
+
 /// Feature handle for profile operations.
 pub struct Profile<'a> {
     client: &'a Client,
@@ -72,12 +132,69 @@ impl<'a> Profile<'a> {
     /// </iq>
     /// ```
     ///
-    /// Note: This sets the profile "About" text, not ephemeral text status updates.
+    /// The server accepts this and even reads the new text back, but current
+    /// phone apps ignore it, so the About shown on the phone does not change.
+    /// Use [`Self::set_text_status`], which is what WhatsApp Web sends today.
     pub async fn set_status_text(&self, text: &str) -> Result<(), ProfileError> {
         debug!("Setting status text (length={})", text.len());
 
         self.client.execute(SetStatusTextSpec::new(text)).await?;
 
+        Ok(())
+    }
+
+    /// Set the user's About / text status, with an optional emoji.
+    ///
+    /// Sends `WAWebMexUpdateTextStatusJobMutation`, the request WhatsApp Web
+    /// uses, so the phone app shows the change. Pass [`TextStatusExpiry::Never`]
+    /// for a permanent About. Use [`Self::clear_text_status`] to remove it.
+    ///
+    /// The generated variables type for this operation is a plain string, but
+    /// the server expects an object, so the request goes through `raw_request`.
+    pub async fn set_text_status(
+        &self,
+        text: &str,
+        emoji: Option<&str>,
+        expiry: TextStatusExpiry,
+    ) -> Result<(), ProfileError> {
+        let input = text_status_input(Some(text), emoji, expiry)?;
+        debug!("Setting text status (length={})", text.len());
+        self.send_text_status(input).await
+    }
+
+    /// Remove the user's text status.
+    ///
+    /// Sends a null text with a zero duration, as WhatsApp Web does.
+    pub async fn clear_text_status(&self) -> Result<(), ProfileError> {
+        debug!("Clearing text status");
+        self.send_text_status(serde_json::json!({
+            "text": null,
+            "ephemeral_duration_sec": 0,
+        }))
+        .await
+    }
+
+    async fn send_text_status(&self, input: serde_json::Value) -> Result<(), ProfileError> {
+        let response = self
+            .client
+            .mex()
+            .execute(mex_request!(
+                update_text_status,
+                serde_json::json!({ "input": input })
+            ))
+            .await?;
+        let result = response
+            .data
+            .as_ref()
+            .and_then(|data| data.get("xwa2_update_text_status"))
+            .and_then(|status| status.get("result"))
+            .and_then(|result| result.as_str());
+        if result != Some("SUCCESS") {
+            return Err(MexError::PayloadParsing(format!(
+                "text status update failed, result: {result:?}"
+            ))
+            .into());
+        }
         Ok(())
     }
 
@@ -360,5 +477,42 @@ mod tests {
                 .as_deref(),
             Some("Retry Name")
         );
+    }
+
+    #[test]
+    fn text_status_input_matches_what_whatsapp_web_sends() {
+        let input =
+            text_status_input(Some(" Open "), Some("\u{1f680}"), TextStatusExpiry::Never).unwrap();
+        assert_eq!(
+            input,
+            serde_json::json!({
+                "text": "Open",
+                "emoji": { "content": "\u{1f680}" },
+                "ephemeral_duration_sec": -1,
+            })
+        );
+
+        let input = text_status_input(
+            Some("Away"),
+            None,
+            TextStatusExpiry::After(Duration::from_secs(86_400)),
+        )
+        .unwrap();
+        assert_eq!(
+            input,
+            serde_json::json!({ "text": "Away", "ephemeral_duration_sec": 86_400 })
+        );
+    }
+
+    #[test]
+    fn text_status_input_rejects_what_the_server_refuses() {
+        assert!(matches!(
+            text_status_input(Some("  "), None, TextStatusExpiry::Never),
+            Err(ProfileError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            text_status_input(Some("Hi"), None, TextStatusExpiry::After(Duration::ZERO)),
+            Err(ProfileError::InvalidArgument(_))
+        ));
     }
 }
