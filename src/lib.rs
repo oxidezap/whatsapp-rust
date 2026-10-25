@@ -630,9 +630,9 @@ pub use features::{
     SetProfilePictureResponse, Signal, SignalError, SignalSessionInfo, SignalSessionMigration,
     StanzaRejection, StanzaResponseError, Status, StatusPrivacySetting, StatusSendOptions,
     SubgroupFailure, SubgroupKind, SubgroupVisibility, SyncActionMessageRange, TcToken,
-    TcTokenError, USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH, UnlinkSubgroupsResult, UserInfo,
-    UsernameLookup, UsernameLookupError, UsernameLookupUser, UsyncSubprotocolError,
-    VariantProperty, VerifiedName, message_range,
+    TcTokenError, TextStatusExpiry, USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH,
+    UnlinkSubgroupsResult, UserInfo, UsernameLookup, UsernameLookupError, UsernameLookupUser,
+    UsyncSubprotocolError, VariantProperty, VerifiedName, message_range,
 };
 pub use features::{CreatedEvent, CreatedPoll, EventRef, MexDoc, MexOperation, PollRef};
 

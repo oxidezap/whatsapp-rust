@@ -515,4 +515,123 @@ mod tests {
             Err(ProfileError::InvalidArgument(_))
         ));
     }
+
+    fn mex_answer(id: &str, body: &str) -> wacore_binary::Node {
+        use wacore_binary::builder::NodeBuilder;
+        NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("id", id)
+            .children([NodeBuilder::new("result")
+                .bytes(body.as_bytes().to_vec())
+                .build()])
+            .build()
+    }
+
+    /// Run `call` against the test client, answer its single MEX IQ with `body`
+    /// and hand back the variables the request carried and the call's result.
+    async fn text_status_round_trip<F, Fut>(
+        body: &str,
+        call: F,
+    ) -> (serde_json::Value, Result<(), ProfileError>)
+    where
+        F: FnOnce(std::sync::Arc<Client>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<(), ProfileError>> + Send + 'static,
+    {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let request = {
+            let client = client.clone();
+            tokio::spawn(async move { call(client).await })
+        };
+
+        let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let sent = sent.get();
+        let query = sent.get_optional_child("query").expect("mex query node");
+        assert_eq!(
+            query.attrs().optional_string("query_id").as_deref(),
+            Some(update_text_status::DOC_ID)
+        );
+        let payload = match query.content.as_ref() {
+            Some(wacore_binary::NodeContentRef::Bytes(bytes)) => bytes.to_vec(),
+            _ => panic!("mex payload should be bytes"),
+        };
+        let id = sent
+            .attrs()
+            .optional_string("id")
+            .expect("iq id")
+            .into_owned();
+        crate::test_utils::answer_iq(&client, &id, &mex_answer(&id, body)).await;
+
+        let result = request.await.expect("task");
+        let payload: serde_json::Value = serde_json::from_slice(&payload).expect("json payload");
+        (payload, result)
+    }
+
+    const TEXT_STATUS_OK: &str = r#"{"data":{"xwa2_update_text_status":{"result":"SUCCESS"}}}"#;
+
+    #[tokio::test]
+    async fn set_text_status_sends_an_object_input_and_accepts_success() {
+        let (payload, result) = text_status_round_trip(TEXT_STATUS_OK, |client| async move {
+            client
+                .profile()
+                .set_text_status("Open", Some("\u{1f680}"), TextStatusExpiry::Never)
+                .await
+        })
+        .await;
+        result.expect("SUCCESS answer");
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "variables": {
+                    "input": {
+                        "text": "Open",
+                        "emoji": { "content": "\u{1f680}" },
+                        "ephemeral_duration_sec": -1,
+                    }
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_text_status_sends_a_null_text_and_a_zero_duration() {
+        let (payload, result) = text_status_round_trip(TEXT_STATUS_OK, |client| async move {
+            client.profile().clear_text_status().await
+        })
+        .await;
+        result.expect("SUCCESS answer");
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "variables": { "input": { "text": null, "ephemeral_duration_sec": 0 } }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_failed_result_is_an_error() {
+        for body in [
+            r#"{"data":{"xwa2_update_text_status":{}}}"#,
+            r#"{"data":{"xwa2_update_text_status":{"result":"FAILED"}}}"#,
+            r#"{"data":null}"#,
+        ] {
+            let (_, result) = text_status_round_trip(body, |client| async move {
+                client.profile().clear_text_status().await
+            })
+            .await;
+            assert!(
+                matches!(result, Err(ProfileError::Mex(MexError::PayloadParsing(_)))),
+                "{body} should be refused, got {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fatal_mex_error_is_returned() {
+        let (_, result) = text_status_round_trip(
+            r#"{"data":null,"errors":[{"message":"Bad Request","extensions":{"error_code":400}}]}"#,
+            |client| async move { client.profile().clear_text_status().await },
+        )
+        .await;
+        assert!(matches!(result, Err(ProfileError::Mex(_))), "{result:?}");
+    }
 }

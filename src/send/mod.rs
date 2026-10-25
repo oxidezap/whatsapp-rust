@@ -1287,7 +1287,15 @@ fn extract_interactive_message(msg: &wa::Message) -> Option<&wa::message::Intera
     // disappearing-messages chat, viewOnce) must not hide the payload: without
     // the <biz> node the server accepts and acks the message but the phone
     // renders it as plain text with no buttons.
-    msg.get_base_message().interactive_message.as_option()
+    let mut base = msg.get_base_message();
+    loop {
+        let inner = base.get_base_message();
+        if std::ptr::eq(inner, base) {
+            break;
+        }
+        base = inner;
+    }
+    base.interactive_message.as_option()
 }
 
 /// Refuse a caller node that repeats one this send already derives.
@@ -8134,6 +8142,39 @@ mod tests {
             ] {
                 let biz = infer_biz_node(&msg, FIXED_NOW)
                     .unwrap_or_else(|| panic!("{label} wrapper should keep the biz node"));
+                assert_nested_biz(&biz, "mixed", label);
+            }
+        }
+
+        /// `get_base_message` unwraps in one fixed order, so a wrapper nested the
+        /// other way round needs another pass to reach the payload.
+        #[test]
+        fn wrappers_nested_in_either_order_keep_their_biz_node() {
+            fn future_proof(
+                inner: wa::Message,
+            ) -> buffa::MessageField<wa::message::FutureProofMessage> {
+                let mut proto = wa::message::FutureProofMessage::default();
+                proto.message = buffa::MessageField::some(inner);
+                buffa::MessageField::some(proto)
+            }
+
+            let mut ephemeral = wa::Message::default();
+            ephemeral.ephemeral_message = future_proof(msg_with_native_flow_button("quick_reply"));
+            let mut view_once_around_ephemeral = wa::Message::default();
+            view_once_around_ephemeral.view_once_message_v2 = future_proof(ephemeral);
+
+            let mut view_once = wa::Message::default();
+            view_once.view_once_message_v2 =
+                future_proof(msg_with_native_flow_button("quick_reply"));
+            let mut ephemeral_around_view_once = wa::Message::default();
+            ephemeral_around_view_once.ephemeral_message = future_proof(view_once);
+
+            for (label, msg) in [
+                ("view_once_v2 around ephemeral", view_once_around_ephemeral),
+                ("ephemeral around view_once_v2", ephemeral_around_view_once),
+            ] {
+                let biz = infer_biz_node(&msg, FIXED_NOW)
+                    .unwrap_or_else(|| panic!("{label} should keep the biz node"));
                 assert_nested_biz(&biz, "mixed", label);
             }
         }
