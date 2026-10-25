@@ -1282,15 +1282,12 @@ fn build_nested_biz(privacy_mode_ts: &str, flow_name: &str) -> Node {
 }
 
 fn extract_interactive_message(msg: &wa::Message) -> Option<&wa::message::InteractiveMessage> {
-    // Only checks documentWithCaptionMessage wrapper (for media headers) and direct field.
-    // Does not use unwrap_message() since we need the InteractiveMessage specifically.
-    if let Some(doc) = msg.document_with_caption_message.as_option()
-        && let Some(inner) = doc.message.as_option()
-        && let Some(im) = inner.interactive_message.as_option()
-    {
-        return Some(im);
-    }
-    msg.interactive_message.as_option()
+    use wacore::proto_helpers::MessageExt;
+    // A wrapper (documentWithCaption for media headers, ephemeral in a
+    // disappearing-messages chat, viewOnce) must not hide the payload: without
+    // the <biz> node the server accepts and acks the message but the phone
+    // renders it as plain text with no buttons.
+    msg.get_base_message().interactive_message.as_option()
 }
 
 /// Refuse a caller node that repeats one this send already derives.
@@ -8106,6 +8103,39 @@ mod tests {
             let biz = infer_biz_node(&msg, FIXED_NOW)
                 .expect("doc-with-caption wrapper should propagate the inner native_flow");
             assert_nested_biz(&biz, "mixed", "doc-with-caption/quick_reply");
+        }
+
+        /// An interactive message inside a view-once or ephemeral wrapper still
+        /// gets its <biz> node; losing it drops the buttons on the phone while
+        /// the server still acks the send.
+        #[test]
+        fn wrapped_interactive_messages_keep_their_biz_node() {
+            fn future_proof(
+                inner: wa::Message,
+            ) -> buffa::MessageField<wa::message::FutureProofMessage> {
+                let mut proto = wa::message::FutureProofMessage::default();
+                proto.message = buffa::MessageField::some(inner);
+                buffa::MessageField::some(proto)
+            }
+
+            let inner = || msg_with_native_flow_button("quick_reply");
+
+            let mut view_once_v2 = wa::Message::default();
+            view_once_v2.view_once_message_v2 = future_proof(inner());
+            let mut view_once = wa::Message::default();
+            view_once.view_once_message = future_proof(inner());
+            let mut ephemeral = wa::Message::default();
+            ephemeral.ephemeral_message = future_proof(inner());
+
+            for (label, msg) in [
+                ("view_once_message_v2", view_once_v2),
+                ("view_once_message", view_once),
+                ("ephemeral_message", ephemeral),
+            ] {
+                let biz = infer_biz_node(&msg, FIXED_NOW)
+                    .unwrap_or_else(|| panic!("{label} wrapper should keep the biz node"));
+                assert_nested_biz(&biz, "mixed", label);
+            }
         }
 
         // -- build_extra_stanza_nodes assembly tests --
