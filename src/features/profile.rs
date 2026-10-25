@@ -535,15 +535,15 @@ mod tests {
     ) -> (serde_json::Value, Result<(), ProfileError>)
     where
         F: FnOnce(std::sync::Arc<Client>) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = Result<(), ProfileError>> + Send + 'static,
+        Fut: Future<Output = Result<(), ProfileError>> + Send + 'static,
     {
-        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let (client, transport) = create_iq_test_client().await;
         let request = {
             let client = client.clone();
             tokio::spawn(async move { call(client).await })
         };
 
-        let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let sent = decode_sent_iq(&transport, 0).await;
         let sent = sent.get();
         let query = sent.get_optional_child("query").expect("mex query node");
         assert_eq!(
