@@ -1366,15 +1366,11 @@ impl PluginCoreEvents {
 /// # What a claim skips
 ///
 /// Interception runs before the built-in pipeline, so a claimed stanza is one
-/// the client did no work on at all — no decryption, no session mutation, no
-/// prekey consumed. Signal state is untouched rather than half-advanced, which
-/// is what makes claiming safe to reason about; but it also means claiming a
-/// `<message>` bypasses decryption and leaves its delivery receipt to the
-/// claimant. There is no generic message or IQ ACK, and taking a stanza does
-/// not establish the server's redelivery policy. Newsletter/status and other
-/// stanza classes have different response rules; see the per-type matrix in
-/// [`crate::client::interceptor`]. A plugin that claims stanzas carrying Signal
-/// state takes over that responsibility whole. Match narrowly.
+/// the client did no work on at all. Claiming a Signal message transfers
+/// decryption, session state and receipt handling to the plugin. Message/IQ
+/// claims receive no generic ACK; other classes follow the response rules in
+/// [`crate::client::interceptor`]. Claims do not establish server redelivery
+/// policy. Match narrowly.
 #[derive(Clone)]
 pub struct PluginStanzaInterception {
     client: Weak<Client>,

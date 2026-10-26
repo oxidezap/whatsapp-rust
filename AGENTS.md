@@ -62,7 +62,6 @@ Comments carry the *why* of a decision, at the single point where it is made. Re
 - `agent_docs/architecture.md`: layers, protocol types, ownership and durability.
 - `agent_docs/testing.md`: local/CI checks, E2E, layout budgets and captures.
 - `agent_docs/support.md`: target, feature, runtime and storage qualification.
-- `agent_docs/interception_validation.md`: ACK claim-path tests and pinned Web evidence.
 - `agent_docs/codegen.md`: generated files, feature graphs and build policy.
 - `agent_docs/observability.md`: counters, reports, tracing and measurement scope.
 - `agent_docs/wa_web_reference.md`: verify behavior against the pinned source.

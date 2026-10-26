@@ -14,14 +14,6 @@ borrowed inputs so an argument rename requires an adapter update, and map the
 private outcomes. Keep legacy group/community result
 extensions in the handwritten adapter.
 
-The private AcceptGroupAdd conformance fixture consumes a separately reviewed
-bundle oracle in `tools/whatspec-codegen/fixtures`. Generated cases exercise the
-payload parser's absent, unique, duplicate, unknown and binary-content branches.
-The oracle records module hashes and byte spans, and pin/guard/order changes stop
-generation for review. `--verify-iq-bundles <dir>` checks restored source bytes
-without evaluating JavaScript. See the fixtures README for the static evidence
-and its envelope/server limits.
-
 Community creation consumes a separate named-subject, parent-only projection of
 the whatspec Create contract. Wire tags, attributes, literals, child ordering
 and presence argument bindings come from the IR. The adapter maps `closed` to

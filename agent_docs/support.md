@@ -1,11 +1,8 @@
 # Support qualification
 
-Support is qualified per target, feature profile, runtime and storage backend.
-A successful Linux build does not qualify another operating system. A compile
-check does not establish working sockets, browser persistence or authenticated
-WhatsApp behavior. Record the exact commit, toolchain and executed commands in
-release evidence; the table below identifies the maintained gates, not a claim
-that every gate passed on an arbitrary checkout.
+Qualification applies to a specific target, feature profile, runtime and store.
+The table lists maintained gates; candidate results belong in release/PR evidence.
+Compilation does not establish runtime or authenticated WhatsApp compatibility.
 
 | Target/profile | Runtime and storage | Maintained validation | Qualification boundary |
 | --- | --- | --- | --- |
@@ -19,17 +16,12 @@ that every gate passed on an arbitrary checkout.
 | ESP32/embedded | Core with target-specific runtime/storage/transport supplied externally | No maintained target gate for the SDK | Experimental portability intent. Neither a complete SDK build nor resource/network behavior is qualified here. |
 | Other targets, WASI, threaded WASM and arbitrary feature combinations | Host-specific | No implicit qualification | Unqualified until a reproducible consumer and appropriate execution/link gate exist. |
 
-`signal` means OS signal handling; it does not select Signal encryption. TLS,
-codec, SQLite and native relay dependencies belong to the selected profile.
-The sans-I/O VoIP core can compile independently of a native relay provider.
-Do not infer that all codecs or platform adapters are available from the
-`voip-control` profile alone.
+`signal` selects OS signal handling. Codecs, TLS, SQLite and relay providers
+remain profile-specific; `voip-control` alone does not select them all.
 
 ## Reproducing the maintained gates
 
-Use the pinned toolchain in `rust-toolchain.toml` for workspace checks. The
-isolated consumer driver selects each requested toolchain and validates directed
-negative controls as well as positive profiles:
+Run isolated profiles with the pinned toolchain and supported MSRV:
 
 ```console
 cargo xt ci consumers run --lane native --toolchain nightly-2026-06-16
@@ -37,19 +29,7 @@ cargo xt ci consumers run --lane msrv --toolchain 1.94.1
 cargo xt ci consumers run --lane wasm --toolchain nightly-2026-06-16
 ```
 
-The browser lane needs the `wasm32-unknown-unknown` standard library, matching
-`wasm-bindgen` runner, and Chrome/ChromeDriver as configured in `wasm.yml`.
-Its runtime and SQLite tests execute in a browser; the release build steps
-alone only establish linking. See `tests/api-consumer/README.md` and the registry
-for the exact feature combinations rather than expanding them into a separate
-list that can drift. Native SQLite also has independent storage consumer tests.
-
-For a minimal compile/link probe matching the browser SDK claim:
-
-```console
-RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo build -p whatsapp-rust --lib --release --target wasm32-unknown-unknown --no-default-features
-```
-
-Do not label a target qualified from inspecting these commands. Run the relevant
-lane on the candidate and retain its result. A failed advisory or other required
-gate remains a readiness blocker even when platform smoke tests pass.
+The browser lane requires the WASM standard library, matching `wasm-bindgen`
+runner and Chrome/ChromeDriver configured in `wasm.yml`. Browser execution tests
+cover runtime/storage behavior; release builds establish linking only. Exact
+feature combinations live in `tools/xtask/consumers.json`.
