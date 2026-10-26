@@ -131,6 +131,17 @@ pub fn controls(root: &Path, lane: Lane, toolchain: &str) -> Result<()> {
         );
         additive = additive.replace(before, after);
     }
+    let participant_field = "    pub jid: Jid,";
+    let participant_constructor =
+        "                    Some(GroupParticipantInfo {\n                        jid,";
+    ensure!(
+        additive.matches(participant_field).count() == 1
+            && additive.matches(participant_constructor).count() == 2,
+        "participant additive mutation anchors changed"
+    );
+    additive = additive
+        .replace(participant_field, "    pub jid: Jid,\n    pub compatibility_optional: Option<String>,")
+        .replace(participant_constructor, "                    Some(GroupParticipantInfo {\n                        compatibility_optional: None,\n                        jid,");
     let result = with_mutated_source(&path, &original, &additive, check)?;
     ensure!(
         result.status.success(),
