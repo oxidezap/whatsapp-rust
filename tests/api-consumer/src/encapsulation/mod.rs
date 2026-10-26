@@ -101,7 +101,8 @@ impl whatsapp_rust::ClientPlugin for HostPlugin {
         context: whatsapp_rust::PluginContext,
     ) -> whatsapp_rust::PluginFuture<'_, whatsapp_rust::anyhow::Result<Arc<Self::Api>>> {
         Box::pin(async move {
-            let info: &whatsapp_rust::PluginClientInfo = context.client_info().expect("declared client info");
+            let info: &whatsapp_rust::PluginClientInfo =
+                context.client_info().expect("declared client info");
             let (_profile, _version) = info.identity()?;
             Ok(Arc::new(()))
         })
