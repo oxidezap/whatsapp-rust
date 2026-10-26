@@ -1,22 +1,8 @@
-//! A reply grant is minted only by the live inbound dispatcher, never from a
-//! node supplied by a plugin. Its envelope and socket cannot be replaced.
+//! The dispatcher grants one reply tied to the request identity and socket.
 //!
-//! This is an SDK extension contract, not a claim that WhatsApp Web implements
-//! arbitrary extension IQs. In whatspec c581c20a9d0605df49abf297f2e7cfc04ccf1ff7,
-//! WA 2.3000.1047483476, preserved bundle
-//! 09d91fdc4089c50ab1d35dd6c796ee82ef4c3296710316d20383c85738b871b8,
-//! `WAComms` bytes 2269566..2289024, `be` correlates only result/error IQs and
-//! `parseAndHandleStanza` sends returned replies only while socketId is current.
-//! Those two invariants constrain this grant. Payload schemas remain the
-//! extension author's responsibility; server acceptance is not inferred.
-//!
-//! The code/text error envelope without xmlns or the original query is observed
-//! in the same bundle's `WASmaxOutMdSetRegResponseError`, bytes
-//! 1339066..1339701, and `WASmaxOutMdIQErrorNotAuthorizedMixin`, bytes
-//! 1338746..1339064. That pairing flow uses code=401, text=not-authorized.
-//! The 400..599 SDK subset and extension namespace vocabulary are explicit
-//! plugin policy, not inferred universal WhatsApp behavior. This capability
-//! continues to exclude the md pairing namespace.
+//! WAComms fences replies by socket; WASmaxOutMdSetRegResponseError uses a
+//! code/text error without echoing the query. Those constrain this envelope,
+//! while extension payloads and namespace support remain plugin-owned policy.
 
 use std::sync::atomic::AtomicU8;
 
@@ -53,36 +39,6 @@ where
 struct Claim {
     state: AtomicU8,
     decided: Event,
-}
-
-struct ClaimDecision(Arc<Claim>);
-
-impl ClaimDecision {
-    fn finish(&self, interception: Interception) {
-        self.0.state.store(
-            if interception.is_handled() {
-                CLAIMED
-            } else {
-                REJECTED
-            },
-            Ordering::Release,
-        );
-        self.0.decided.notify(usize::MAX);
-    }
-}
-
-impl Drop for ClaimDecision {
-    fn drop(&mut self) {
-        // Also invalidate a grant retained by a callback that unwinds.
-        if self
-            .0
-            .state
-            .compare_exchange(PENDING, REJECTED, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            self.0.decided.notify(usize::MAX);
-        }
-    }
 }
 
 /// One correlated reply to one claimed inbound IQ, on its original connection.
@@ -122,13 +78,9 @@ impl PluginIqReply {
         self.send("result", children).await
     }
 
-    /// Reply with an error code and nonempty protocol text.
-    ///
-    /// The envelope is evidenced in a Web pairing response with 401 and
-    /// `not-authorized`; this capability does not handle pairing itself. The
-    /// 400..599 range is an SDK subset. The plugin must select a code/text pair
-    /// its extension namespace defines; not every pair is accepted everywhere.
-    /// Invalid arguments do not reserve or consume the reply grant.
+    /// Reply with code 400..=599 and nonempty text, using a code/text pair
+    /// defined by the plugin's extension namespace. Invalid arguments leave
+    /// the grant unused. Pairing requests remain owned by the core.
     pub async fn error(&self, code: u16, text: &str) -> Result<(), PluginIqReplyError> {
         if !(400..=599).contains(&code) {
             return Err(PluginIqReplyError::InvalidErrorCode);
@@ -248,7 +200,16 @@ impl StanzaInterceptor for PluginIqInterceptorAdapter {
             state: AtomicU8::new(PENDING),
             decided: Event::new(),
         });
-        let decision = ClaimDecision(Arc::clone(&claim));
+        let decision = scopeguard::guard(Arc::clone(&claim), |claim| {
+            // Reject any grant retained by a callback that unwinds.
+            if claim
+                .state
+                .compare_exchange(PENDING, REJECTED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                claim.decided.notify(usize::MAX);
+            }
+        });
         let reply = PluginIqReply {
             client: self.client.clone(),
             resources: Arc::clone(&self.resources),
@@ -260,7 +221,15 @@ impl StanzaInterceptor for PluginIqInterceptorAdapter {
             to,
         };
         let interception = self.inner.intercept(node, reply);
-        decision.finish(interception);
+        decision.state.store(
+            if interception.is_handled() {
+                CLAIMED
+            } else {
+                REJECTED
+            },
+            Ordering::Release,
+        );
+        decision.decided.notify(usize::MAX);
         interception
     }
 }
@@ -583,9 +552,8 @@ mod tests {
             Err(PluginIqReplyError::InvalidErrorText)
         ));
         assert!(transport.sent().is_empty());
-        // Independent Web evidence fixes this exact error payload. The request
-        // namespace is synthetic: this tests the envelope, not pairing effects
-        // or acceptance of an extension namespace by a server.
+        // The Web pairing builder supplies this envelope. The synthetic
+        // namespace models neither pairing effects nor server acceptance.
         reply.error(401, "not-authorized").await.unwrap();
         let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
         let node = sent.get();
