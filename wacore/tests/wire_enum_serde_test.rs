@@ -602,13 +602,15 @@ fn temp_ban_reason_serializes_as_int_and_roundtrips() {
 #[test]
 fn group_notification_action_serializes_every_field_present() {
     assert_eq!(
-        serde_json::to_value(GroupNotificationAction::Subject {
-            subject: "Team".into(),
-            subject_owner: Some("271060335329480@lid".parse::<Jid>().unwrap()),
-            subject_owner_pn: Some("12025550111@s.whatsapp.net".parse::<Jid>().unwrap()),
-            subject_owner_username: Some("team-admin".into()),
-            subject_time: Some(1_704_067_200),
-        })
+        serde_json::to_value(
+            GroupNotificationAction::subject()
+                .subject("Team".into())
+                .subject_owner("271060335329480@lid".parse::<Jid>().unwrap())
+                .subject_owner_pn("12025550111@s.whatsapp.net".parse::<Jid>().unwrap())
+                .subject_owner_username("team-admin".into())
+                .subject_time(1_704_067_200)
+                .build()
+        )
         .unwrap(),
         json!({
             "type": "subject",
@@ -633,20 +635,24 @@ fn group_notification_action_serializes_every_field_present() {
     );
 
     assert_eq!(
-        serde_json::to_value(GroupNotificationAction::Ephemeral {
-            expiration: 86_400,
-            trigger: Some(2),
-        })
+        serde_json::to_value(
+            GroupNotificationAction::ephemeral()
+                .expiration(86_400)
+                .trigger(2)
+                .build()
+        )
         .unwrap(),
         json!({ "type": "ephemeral", "expiration": 86_400, "trigger": 2 })
     );
 
     assert_eq!(
-        serde_json::to_value(GroupNotificationAction::CreatedMembershipRequests {
-            request_method: MembershipRequestMethod::NonAdminAdd,
-            parent_group_jid: Some("555000222@g.us".parse::<Jid>().unwrap()),
-            requests: vec![],
-        })
+        serde_json::to_value(
+            GroupNotificationAction::created_membership_requests()
+                .request_method(MembershipRequestMethod::NonAdminAdd)
+                .parent_group_jid("555000222@g.us".parse::<Jid>().unwrap())
+                .requests(vec![])
+                .build()
+        )
         .unwrap(),
         json!({
             "type": "created_membership_requests",
@@ -666,36 +672,32 @@ fn group_notification_action_serializes_every_field_present() {
 #[test]
 fn group_notification_action_omits_none_fields() {
     assert_eq!(
-        serde_json::to_value(GroupNotificationAction::Subject {
-            subject: "Team".into(),
-            subject_owner: None,
-            subject_owner_pn: None,
-            subject_owner_username: None,
-            subject_time: None,
-        })
+        serde_json::to_value(
+            GroupNotificationAction::subject()
+                .subject("Team".into())
+                .build()
+        )
         .unwrap(),
         json!({ "type": "subject", "subject": "Team" })
     );
 
     // Every field optional: only the discriminator survives.
     assert_eq!(
-        serde_json::to_value(GroupNotificationAction::Locked { threshold: None }).unwrap(),
+        serde_json::to_value(GroupNotificationAction::locked().build()).unwrap(),
         json!({ "type": "locked" })
     );
     assert_eq!(
-        serde_json::to_value(GroupNotificationAction::Locked {
-            threshold: Some("admin".into()),
-        })
+        serde_json::to_value(
+            GroupNotificationAction::locked()
+                .threshold("admin".into())
+                .build()
+        )
         .unwrap(),
         json!({ "type": "locked", "threshold": "admin" })
     );
 
     assert_eq!(
-        serde_json::to_value(GroupNotificationAction::Ephemeral {
-            expiration: 0,
-            trigger: None,
-        })
-        .unwrap(),
+        serde_json::to_value(GroupNotificationAction::ephemeral().expiration(0).build()).unwrap(),
         json!({ "type": "ephemeral", "expiration": 0 })
     );
 }
@@ -709,28 +711,33 @@ fn group_notification_action_skips_unit_and_skipped_fields() {
 
     let raw = NodeBuilder::new("link").attr("link_type", "sub").build();
     assert_eq!(
-        serde_json::to_value(GroupNotificationAction::Link {
-            link_type: "sub".into(),
-            raw: raw.clone(),
-        })
+        serde_json::to_value(
+            GroupNotificationAction::link()
+                .link_type("sub".into())
+                .raw(raw.clone())
+                .build()
+        )
         .unwrap(),
         json!({ "type": "link", "link_type": "sub" })
     );
     assert_eq!(
-        serde_json::to_value(GroupNotificationAction::Unlink {
-            unlink_type: "sub".into(),
-            unlink_reason: None,
-            raw,
-        })
+        serde_json::to_value(
+            GroupNotificationAction::unlink()
+                .unlink_type("sub".into())
+                .raw(raw)
+                .build()
+        )
         .unwrap(),
         json!({ "type": "unlink", "unlink_type": "sub" })
     );
 
     // Fallback: the captured tag IS the discriminator, never an extra field.
     assert_eq!(
-        serde_json::to_value(GroupNotificationAction::Unknown {
-            tag: "future_tag".into(),
-        })
+        serde_json::to_value(
+            GroupNotificationAction::unknown()
+                .tag("future_tag".into())
+                .build()
+        )
         .unwrap(),
         json!({ "type": "future_tag" })
     );
@@ -743,42 +750,34 @@ fn group_notification_action_declares_exact_field_count() {
     let raw = NodeBuilder::new("link").attr("link_type", "sub").build();
     let samples = vec![
         // Mixed constant + optional, both present and absent.
-        GroupNotificationAction::Subject {
-            subject: "Team".into(),
-            subject_owner: Some("271060335329480@lid".parse::<Jid>().unwrap()),
-            subject_owner_pn: Some("12025550111@s.whatsapp.net".parse::<Jid>().unwrap()),
-            subject_owner_username: Some("team-admin".into()),
-            subject_time: Some(1_704_067_200),
-        },
-        GroupNotificationAction::Subject {
-            subject: "Team".into(),
-            subject_owner: None,
-            subject_owner_pn: None,
-            subject_owner_username: None,
-            subject_time: Some(1_704_067_200),
-        },
-        GroupNotificationAction::Subject {
-            subject: "Team".into(),
-            subject_owner: None,
-            subject_owner_pn: None,
-            subject_owner_username: None,
-            subject_time: None,
-        },
+        GroupNotificationAction::subject()
+            .subject("Team".into())
+            .subject_owner("271060335329480@lid".parse::<Jid>().unwrap())
+            .subject_owner_pn("12025550111@s.whatsapp.net".parse::<Jid>().unwrap())
+            .subject_owner_username("team-admin".into())
+            .subject_time(1_704_067_200)
+            .build(),
+        GroupNotificationAction::subject()
+            .subject("Team".into())
+            .subject_time(1_704_067_200)
+            .build(),
+        GroupNotificationAction::subject()
+            .subject("Team".into())
+            .build(),
         // Only-optional, only-skipped, unit and fallback variants.
-        GroupNotificationAction::Locked {
-            threshold: Some("admin".into()),
-        },
-        GroupNotificationAction::Locked { threshold: None },
-        GroupNotificationAction::Create { raw: raw.clone() },
-        GroupNotificationAction::Unlink {
-            unlink_type: "sub".into(),
-            unlink_reason: None,
-            raw,
-        },
+        GroupNotificationAction::locked()
+            .threshold("admin".into())
+            .build(),
+        GroupNotificationAction::locked().build(),
+        GroupNotificationAction::create().raw(raw.clone()).build(),
+        GroupNotificationAction::unlink()
+            .unlink_type("sub".into())
+            .raw(raw)
+            .build(),
         GroupNotificationAction::Unlocked,
-        GroupNotificationAction::Unknown {
-            tag: "future_tag".into(),
-        },
+        GroupNotificationAction::unknown()
+            .tag("future_tag".into())
+            .build(),
     ];
 
     for action in &samples {

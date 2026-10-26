@@ -4,6 +4,119 @@
     "locked": true,
     "commands": [
       {
+        "lanes": [
+          "native",
+          "msrv"
+        ],
+        "mode": "check",
+        "features": [
+          "group-notification-literal"
+        ],
+        "lib": true,
+        "expect_failure": {
+          "error_code": "E0639",
+          "contains": [
+            "GroupNotification"
+          ],
+          "source": "src/group_notifications.rs"
+        }
+      },
+      {
+        "lanes": [
+          "native",
+          "msrv"
+        ],
+        "mode": "check",
+        "features": [
+          "group-participant-literal"
+        ],
+        "lib": true,
+        "expect_failure": {
+          "error_code": "E0639",
+          "contains": [
+            "GroupParticipantInfo"
+          ],
+          "source": "src/group_notifications.rs"
+        }
+      },
+      {
+        "lanes": [
+          "native",
+          "msrv"
+        ],
+        "mode": "check",
+        "features": [
+          "group-action-literal"
+        ],
+        "lib": true,
+        "expect_failure": {
+          "error_code": "E0639",
+          "contains": [
+            "Add"
+          ],
+          "source": "src/group_notifications.rs"
+        }
+      },
+      {
+        "lanes": [
+          "native",
+          "msrv"
+        ],
+        "mode": "check",
+        "features": [
+          "group-action-exact-pattern"
+        ],
+        "lib": true,
+        "expect_failure": {
+          "error_code": "E0638",
+          "contains": [
+            "Add"
+          ],
+          "source": "src/group_notifications.rs"
+        }
+      },
+      {
+        "lanes": [
+          "native",
+          "msrv"
+        ],
+        "mode": "check",
+        "features": [
+          "group-action-exhaustive"
+        ],
+        "lib": true,
+        "expect_failure": {
+          "error_code": "E0004",
+          "contains": [
+            "GroupNotificationAction"
+          ],
+          "source": "src/group_notifications.rs"
+        }
+      },
+      {
+        "lanes": [
+          "native",
+          "msrv"
+        ],
+        "mode": "test",
+        "features": [
+          "native"
+        ],
+        "test": "host_shutdown_budget"
+      },
+      {
+        "lanes": [
+          "native",
+          "msrv"
+        ],
+        "mode": "test",
+        "features": [
+          "native",
+          "plugins"
+        ],
+        "test": "bounded_plugin_workers"
+      },
+      {
         "lanes": ["wasm"],
         "mode": "test",
         "features": ["runtime-execution"],

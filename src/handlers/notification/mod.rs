@@ -1350,6 +1350,7 @@ mod tests {
             GroupNotificationAction::ChangeNumber {
                 new_owner,
                 sub_group_suggestions,
+                ..
             } => {
                 assert_eq!(
                     new_owner.as_ref().map(|j| j.user.as_str()),

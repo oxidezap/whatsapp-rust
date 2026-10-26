@@ -67,6 +67,12 @@ wrong-stanza-id-domain = ["sdk"]
 
 old-options-literal = ["sdk"]
 
+group-notification-literal = []
+group-participant-literal = []
+group-action-literal = []
+group-action-exact-pattern = []
+group-action-exhaustive = []
+
 [dependencies]
 anyhow = { version = "1", default-features = false, optional = true }
 wacore = { path = "../../wacore", default-features = false }

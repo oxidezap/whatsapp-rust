@@ -42,7 +42,6 @@ pub fn controls(root: &Path, lane: Lane, toolchain: &str) -> Result<()> {
             ])
             .current_dir(stage.path())
             .env_remove("CARGO_ENCODED_RUSTFLAGS")
-            .env("CARGO_TARGET_DIR", stage.path().join("target"))
             .env("CARGO_BUILD_JOBS", "1")
             .env("CARGO_INCREMENTAL", "0")
             .env("CARGO_PROFILE_DEV_DEBUG", "0")
@@ -87,6 +86,59 @@ pub fn controls(root: &Path, lane: Lane, toolchain: &str) -> Result<()> {
         consumers::verify_mutation(&result, code, needle, "src/encapsulation/mod.rs")?;
         println!("{lane:?} control caught {needle} ({code}) in the external host");
     }
+    // Received group models permit additive fields and typed actions without
+    // changing the existing external construction and matching paths.
+    let path = stage.path().join("wacore/src/stanza/groups.rs");
+    let original = std::fs::read_to_string(&path)?;
+    let mut additive = original.clone();
+    for (before, after) in [
+        (
+            "    pub group_jid: Jid,",
+            "    pub group_jid: Jid,\n    pub compatibility_optional: Option<String>,",
+        ),
+        (
+            "        Some(Self {\n            group_jid,",
+            "        Some(Self {\n            compatibility_optional: None,\n            group_jid,",
+        ),
+        (
+            "        subject_time: Option<u64>,\n    },",
+            "        subject_time: Option<u64>,\n        compatibility_optional: Option<String>,\n    },",
+        ),
+        (
+            "        subject_time: Option<u64>,\n    ) -> Self {",
+            "        subject_time: Option<u64>,\n        compatibility_optional: Option<String>,\n    ) -> Self {",
+        ),
+        (
+            "            subject_time,\n        }",
+            "            subject_time,\n            compatibility_optional,\n        }",
+        ),
+        (
+            "            subject_time: node.attrs().optional_u64(\"s_t\"),",
+            "            subject_time: node.attrs().optional_u64(\"s_t\"),\n            compatibility_optional: None,",
+        ),
+        (
+            "    // -- Catch-all --",
+            "    #[wire = \"compatibility_future\"]\n    CompatibilityFuture,\n\n    // -- Catch-all --",
+        ),
+        (
+            "        T::Unknown(_) =>",
+            "        T::CompatibilityFuture => GroupNotificationAction::CompatibilityFuture,\n        T::Unknown(_) =>",
+        ),
+    ] {
+        ensure!(
+            additive.matches(before).count() == 1,
+            "group additive mutation anchor changed: {before}"
+        );
+        additive = additive.replace(before, after);
+    }
+    let result = with_mutated_source(&path, &original, &additive, check)?;
+    ensure!(
+        result.status.success(),
+        "external host rejected additive group evolution: {}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    println!("{lane:?} external host accepts additive group fields and action");
     Ok(())
 }
 

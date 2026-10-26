@@ -74,7 +74,11 @@ pub enum MembershipRequestMethod {
 }
 
 /// Parsed group notification containing one or more actions.
-#[derive(Debug, Clone)]
+///
+/// Construct synthetic notifications with [`Self::builder`]. New optional fields
+/// may be added; external patterns must include `..`.
+#[derive(Debug, Clone, bon::Builder)]
+#[non_exhaustive]
 pub struct GroupNotification {
     /// Group JID (from `from` attribute)
     pub group_jid: Jid,
@@ -118,6 +122,9 @@ pub enum GroupHistorySentState {
 
 /// Participant info extracted from `<participant>` child elements.
 ///
+/// Construct fixtures with [`Self::builder`], supplying `jid` and any optional
+/// metadata. External patterns must include `..` to permit future metadata.
+///
 /// Wire format:
 /// ```xml
 /// <participant jid="..." type="..." lid="..." phone_number="..."
@@ -130,7 +137,8 @@ pub enum GroupHistorySentState {
 /// `username`. WA Web's `WAWebHandleGroupNotification` y() reads all of
 /// these into the participant model so the UI can render notifications
 /// and patch admin caches without resolving the contact locally.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
 pub struct GroupParticipantInfo {
     pub jid: Jid,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -160,7 +168,12 @@ pub struct GroupParticipantInfo {
     pub group_history_sent_state: Option<GroupHistorySentState>,
 }
 
-/// All possible group notification action types.
+/// Group notification actions recognized by this snapshot.
+///
+/// Use the associated factory builders for named-field actions, and match them
+/// with `..`. Match the enum with a fallback arm for future typed actions.
+/// `Unknown` preserves an unrecognized wire tag; it is distinct from a future
+/// Rust variant added to this enum.
 ///
 /// Maps 1:1 to `GROUP_NOTIFICATION_TAG` child element tags from WhatsApp Web.
 ///
@@ -171,32 +184,38 @@ pub struct GroupParticipantInfo {
 /// read from the same table.
 #[derive(Debug, Clone, WireEnum)]
 #[wire(tag = "type")]
+#[non_exhaustive]
 pub enum GroupNotificationAction {
     // -- Participant management --
     /// `<add>` — Members added to group
     #[wire = "add"]
+    #[non_exhaustive]
     Add {
         participants: Vec<GroupParticipantInfo>,
         reason: Option<String>,
     },
     /// `<remove>` — Members removed from group
     #[wire = "remove"]
+    #[non_exhaustive]
     Remove {
         participants: Vec<GroupParticipantInfo>,
         reason: Option<String>,
     },
     /// `<promote>` — Members promoted to admin
     #[wire = "promote"]
+    #[non_exhaustive]
     Promote {
         participants: Vec<GroupParticipantInfo>,
     },
     /// `<demote>` — Members demoted from admin
     #[wire = "demote"]
+    #[non_exhaustive]
     Demote {
         participants: Vec<GroupParticipantInfo>,
     },
     /// `<modify>` — Member changed phone number
     #[wire = "modify"]
+    #[non_exhaustive]
     Modify {
         participants: Vec<GroupParticipantInfo>,
     },
@@ -210,6 +229,7 @@ pub enum GroupNotificationAction {
     /// — the same split the notification's own `participant` / `participant_pn`
     /// pair uses.
     #[wire = "subject"]
+    #[non_exhaustive]
     Subject {
         subject: String,
         subject_owner: Option<Jid>,
@@ -221,6 +241,7 @@ pub enum GroupNotificationAction {
     },
     /// `<description id="..."><body>text</body></description>` or `<description id="..."><delete/></description>`
     #[wire = "description"]
+    #[non_exhaustive]
     Description {
         id: String,
         /// `Some(text)` = added/updated, `None` = deleted
@@ -230,6 +251,7 @@ pub enum GroupNotificationAction {
     // -- Settings --
     /// `<locked threshold="..."/>` — Only admins can edit group info
     #[wire = "locked"]
+    #[non_exhaustive]
     Locked { threshold: Option<String> },
     /// `<unlocked/>` — All members can edit group info
     #[wire = "unlocked"]
@@ -245,16 +267,19 @@ pub enum GroupNotificationAction {
     /// matching WA Web's collapsing of the two tags into one action type.
     #[wire = "ephemeral"]
     #[wire_alias = "not_ephemeral"]
+    #[non_exhaustive]
     Ephemeral {
         expiration: u32,
         trigger: Option<u32>,
     },
     /// `<membership_approval_mode><group_join state="on|off"/></membership_approval_mode>`
     #[wire = "membership_approval_mode"]
+    #[non_exhaustive]
     MembershipApprovalMode { enabled: bool },
     /// `<membership_approval_request request_method="..." parent_group_jid="..."/>`
     /// A user requested to join. Requester is on parent [`GroupNotification::participant`].
     #[wire = "membership_approval_request"]
+    #[non_exhaustive]
     MembershipApprovalRequest {
         request_method: MembershipRequestMethod,
         parent_group_jid: Option<Jid>,
@@ -262,6 +287,7 @@ pub enum GroupNotificationAction {
     /// `<created_membership_requests request_method="..." parent_group_jid="...">` —
     /// admin-side notification: new join requests appeared.
     #[wire = "created_membership_requests"]
+    #[non_exhaustive]
     CreatedMembershipRequests {
         request_method: MembershipRequestMethod,
         parent_group_jid: Option<Jid>,
@@ -270,9 +296,11 @@ pub enum GroupNotificationAction {
     },
     /// `<revoked_membership_requests>` — requests rejected by admin or cancelled by requester.
     #[wire = "revoked_membership_requests"]
+    #[non_exhaustive]
     RevokedMembershipRequests { participants: Vec<Jid> },
     /// `<member_add_mode>admin_add|all_member_add</member_add_mode>`
     #[wire = "member_add_mode"]
+    #[non_exhaustive]
     MemberAddMode { mode: String },
     /// `<no_frequently_forwarded/>` — Forwarding restricted
     #[wire = "no_frequently_forwarded"]
@@ -284,12 +312,14 @@ pub enum GroupNotificationAction {
     // -- Invites --
     /// `<invite code="..."/>` — Joined via invite link
     #[wire = "invite"]
+    #[non_exhaustive]
     Invite { code: String },
     /// `<revoke>` — Invite link revoked
     #[wire = "revoke"]
     RevokeInvite,
     /// `<growth_locked expiration="..." type="..."/>` — Invite links unavailable
     #[wire = "growth_locked"]
+    #[non_exhaustive]
     GrowthLocked { expiration: u32, lock_type: String },
     /// `<growth_unlocked/>` — Invite links available again
     #[wire = "growth_unlocked"]
@@ -298,17 +328,20 @@ pub enum GroupNotificationAction {
     // -- Group lifecycle --
     /// `<create>` — Group created (complex structure, raw node preserved)
     #[wire = "create"]
+    #[non_exhaustive]
     Create {
         #[wire(skip)]
         raw: Node,
     },
     /// `<delete>` — Group deleted
     #[wire = "delete"]
+    #[non_exhaustive]
     Delete { reason: Option<String> },
 
     // -- Community linking --
     /// `<link link_type="...">` — Subgroup linked
     #[wire = "link"]
+    #[non_exhaustive]
     Link {
         link_type: String,
         #[wire(skip)]
@@ -316,6 +349,7 @@ pub enum GroupNotificationAction {
     },
     /// `<unlink unlink_type="..." unlink_reason="...">` — Subgroup unlinked
     #[wire = "unlink"]
+    #[non_exhaustive]
     Unlink {
         unlink_type: String,
         unlink_reason: Option<String>,
@@ -324,11 +358,13 @@ pub enum GroupNotificationAction {
     },
     /// `<linked_group_promote>` — Subgroup admin elevated (community parent).
     #[wire = "linked_group_promote"]
+    #[non_exhaustive]
     LinkedGroupPromote {
         participants: Vec<GroupParticipantInfo>,
     },
     /// `<linked_group_demote>` — Subgroup admin demoted.
     #[wire = "linked_group_demote"]
+    #[non_exhaustive]
     LinkedGroupDemote {
         participants: Vec<GroupParticipantInfo>,
     },
@@ -353,6 +389,7 @@ pub enum GroupNotificationAction {
     /// optional `trigger` attribute (range 0..20 per
     /// `WASmaxInGroupsGroupInfoMixin`) identifies the source of the change.
     #[wire = "limit_sharing_enabled"]
+    #[non_exhaustive]
     LimitSharingEnabled { trigger: Option<u32> },
     /// `<allow_admin_reports/>` — Admins may receive report alerts.
     #[wire = "allow_admin_reports"]
@@ -375,12 +412,14 @@ pub enum GroupNotificationAction {
     // -- Subgroup suggestions (community) --
     /// `<created_sub_group_suggestion>` — Suggested subgroup added.
     #[wire = "created_sub_group_suggestion"]
+    #[non_exhaustive]
     CreatedSubGroupSuggestion {
         #[wire(skip)]
         raw: Node,
     },
     /// `<revoked_sub_group_suggestions>` — Subgroup suggestion revoked.
     #[wire = "revoked_sub_group_suggestions"]
+    #[non_exhaustive]
     RevokedSubGroupSuggestions {
         #[wire(skip)]
         raw: Node,
@@ -391,6 +430,7 @@ pub enum GroupNotificationAction {
     /// attribute; the new owner is in the `jid` attribute on the child.
     /// `sub_group_suggestions` lists the affected subgroup JIDs.
     #[wire = "change_number"]
+    #[non_exhaustive]
     ChangeNumber {
         new_owner: Option<Jid>,
         sub_group_suggestions: Vec<Jid>,
@@ -400,7 +440,218 @@ pub enum GroupNotificationAction {
     /// Unknown child tag — preserved for forward compatibility. The `tag`
     /// field is what `wire_tag()` returns, so roundtrips stay intact.
     #[wire_fallback]
+    #[non_exhaustive]
     Unknown { tag: String },
+}
+
+#[bon::bon]
+impl GroupNotificationAction {
+    /// Construct the `Add` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn add(participants: Vec<GroupParticipantInfo>, reason: Option<String>) -> Self {
+        Self::Add {
+            participants,
+            reason,
+        }
+    }
+
+    /// Construct the `Remove` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn remove(participants: Vec<GroupParticipantInfo>, reason: Option<String>) -> Self {
+        Self::Remove {
+            participants,
+            reason,
+        }
+    }
+
+    /// Construct the `Promote` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn promote(participants: Vec<GroupParticipantInfo>) -> Self {
+        Self::Promote { participants }
+    }
+
+    /// Construct the `Demote` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn demote(participants: Vec<GroupParticipantInfo>) -> Self {
+        Self::Demote { participants }
+    }
+
+    /// Construct the `Modify` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn modify(participants: Vec<GroupParticipantInfo>) -> Self {
+        Self::Modify { participants }
+    }
+
+    /// Construct the `Subject` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn subject(
+        subject: String,
+        subject_owner: Option<Jid>,
+        subject_owner_pn: Option<Jid>,
+        subject_owner_username: Option<String>,
+        subject_time: Option<u64>,
+    ) -> Self {
+        Self::Subject {
+            subject,
+            subject_owner,
+            subject_owner_pn,
+            subject_owner_username,
+            subject_time,
+        }
+    }
+
+    /// Construct the `Description` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn description(id: String, description: Option<String>) -> Self {
+        Self::Description { id, description }
+    }
+
+    /// Construct the `Locked` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn locked(threshold: Option<String>) -> Self {
+        Self::Locked { threshold }
+    }
+
+    /// Construct the `Ephemeral` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn ephemeral(expiration: u32, trigger: Option<u32>) -> Self {
+        Self::Ephemeral {
+            expiration,
+            trigger,
+        }
+    }
+
+    /// Construct the `MembershipApprovalMode` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn membership_approval_mode(enabled: bool) -> Self {
+        Self::MembershipApprovalMode { enabled }
+    }
+
+    /// Construct the `MembershipApprovalRequest` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn membership_approval_request(
+        request_method: MembershipRequestMethod,
+        parent_group_jid: Option<Jid>,
+    ) -> Self {
+        Self::MembershipApprovalRequest {
+            request_method,
+            parent_group_jid,
+        }
+    }
+
+    /// Construct the `CreatedMembershipRequests` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn created_membership_requests(
+        request_method: MembershipRequestMethod,
+        parent_group_jid: Option<Jid>,
+        requests: Vec<GroupParticipantInfo>,
+    ) -> Self {
+        Self::CreatedMembershipRequests {
+            request_method,
+            parent_group_jid,
+            requests,
+        }
+    }
+
+    /// Construct the `RevokedMembershipRequests` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn revoked_membership_requests(participants: Vec<Jid>) -> Self {
+        Self::RevokedMembershipRequests { participants }
+    }
+
+    /// Construct the `MemberAddMode` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn member_add_mode(mode: String) -> Self {
+        Self::MemberAddMode { mode }
+    }
+
+    /// Construct the `Invite` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn invite(code: String) -> Self {
+        Self::Invite { code }
+    }
+
+    /// Construct the `GrowthLocked` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn growth_locked(expiration: u32, lock_type: String) -> Self {
+        Self::GrowthLocked {
+            expiration,
+            lock_type,
+        }
+    }
+
+    /// Construct the `Create` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn create(raw: Node) -> Self {
+        Self::Create { raw }
+    }
+
+    /// Construct the `Delete` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn delete(reason: Option<String>) -> Self {
+        Self::Delete { reason }
+    }
+
+    /// Construct the `Link` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn link(link_type: String, raw: Node) -> Self {
+        Self::Link { link_type, raw }
+    }
+
+    /// Construct the `Unlink` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn unlink(unlink_type: String, unlink_reason: Option<String>, raw: Node) -> Self {
+        Self::Unlink {
+            unlink_type,
+            unlink_reason,
+            raw,
+        }
+    }
+
+    /// Construct the `LinkedGroupPromote` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn linked_group_promote(participants: Vec<GroupParticipantInfo>) -> Self {
+        Self::LinkedGroupPromote { participants }
+    }
+
+    /// Construct the `LinkedGroupDemote` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn linked_group_demote(participants: Vec<GroupParticipantInfo>) -> Self {
+        Self::LinkedGroupDemote { participants }
+    }
+
+    /// Construct the `LimitSharingEnabled` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn limit_sharing_enabled(trigger: Option<u32>) -> Self {
+        Self::LimitSharingEnabled { trigger }
+    }
+
+    /// Construct the `CreatedSubGroupSuggestion` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn created_sub_group_suggestion(raw: Node) -> Self {
+        Self::CreatedSubGroupSuggestion { raw }
+    }
+
+    /// Construct the `RevokedSubGroupSuggestions` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn revoked_sub_group_suggestions(raw: Node) -> Self {
+        Self::RevokedSubGroupSuggestions { raw }
+    }
+
+    /// Construct the `ChangeNumber` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn change_number(new_owner: Option<Jid>, sub_group_suggestions: Vec<Jid>) -> Self {
+        Self::ChangeNumber {
+            new_owner,
+            sub_group_suggestions,
+        }
+    }
+
+    /// Construct the `Unknown` action through its extensible builder.
+    #[builder(finish_fn = build)]
+    pub fn unknown(tag: String) -> Self {
+        Self::Unknown { tag }
+    }
 }
 
 impl GroupNotification {
