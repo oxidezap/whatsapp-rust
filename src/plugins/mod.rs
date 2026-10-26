@@ -3252,13 +3252,14 @@ mod tests {
             .unwrap()
             .into_client();
         assert!(without.plugin::<ClientInfoPlugin>().unwrap().is_none());
-        let client = complete_builder()
+        let (client, sync_tasks) = complete_builder()
             .await
             .with_plugin(ClientInfoPlugin(true))
             .build()
             .await
             .unwrap()
-            .into_client();
+            .into_parts();
+        drop(sync_tasks);
         let api = client.plugin::<ClientInfoPlugin>().unwrap();
         let info = api.as_ref().as_ref().unwrap();
         client
@@ -3287,6 +3288,14 @@ mod tests {
         client.shutdown().await;
         assert_eq!(info.identity().unwrap().1, version);
         drop(client);
+        // Background services release their transient client references on cancellation.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while info.client.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("client-info handle retained the client");
         assert!(matches!(
             info.identity(),
             Err(PluginResourceError::ClientUnavailable)

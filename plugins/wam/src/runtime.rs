@@ -205,8 +205,8 @@ pub struct WamStats {
     pub sampled_out: u64,
     /// Events dropped because the queue was full.
     pub dropped: u64,
-    /// Events lost because no buffer could be started to hold them: the store
-    /// would not issue a sequence number, or a global no longer belongs on the
+    /// Events lost because identity was unavailable, the store would not issue
+    /// a sequence number, or a global no longer belongs on the
     /// channel. Counted apart from [`Self::dropped`] because the two say
     /// different things about a client, and the fix for one is not the fix for
     /// the other.
