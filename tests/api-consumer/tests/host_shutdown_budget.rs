@@ -1,5 +1,4 @@
-//! A host deadline bounds waiting, not durable work. Keep ownership and resume
-//! cleanup after reporting an incomplete attempt. No account or network is used.
+//! Host timeouts keep shutdown pinned while pending saves finish.
 #![cfg(all(feature = "native", not(target_arch = "wasm32")))]
 
 use std::sync::{
@@ -24,6 +23,28 @@ struct PendingBackend {
     commits: Mutex<Vec<String>>,
 }
 
+impl PendingBackend {
+    fn new(
+        parked: bool,
+        capacity: usize,
+    ) -> (
+        Arc<Self>,
+        async_channel::Sender<()>,
+        async_channel::Receiver<()>,
+    ) {
+        let (resume, gate) = async_channel::bounded(capacity);
+        let (entered, began) = async_channel::bounded(capacity);
+        let backend = Arc::new(Self {
+            inner: InMemoryBackend::new(),
+            parked: AtomicBool::new(parked),
+            resume: gate,
+            entered,
+            commits: Mutex::new(Vec::new()),
+        });
+        (backend, resume, began)
+    }
+}
+
 #[async_trait::async_trait]
 impl DeviceStore for PendingBackend {
     async fn save(&self, device: &wacore::store::Device) -> Result<()> {
@@ -46,35 +67,9 @@ impl DeviceStore for PendingBackend {
     }
 }
 
-#[derive(Debug, PartialEq)]
-enum HostObservation {
-    CleanupPending,
-    CleanupCompleted,
-}
-
-/// Stop host producers/callbacks first. Keep the future pinned outside the
-/// timeout so an elapsed budget does not cancel shutdown or its durable writes.
-async fn observe_with_budget<F: std::future::Future>(
-    cleanup: std::pin::Pin<&mut F>,
-    budget: Duration,
-) -> (HostObservation, Option<F::Output>) {
-    match tokio::time::timeout(budget, cleanup).await {
-        Ok(report) => (HostObservation::CleanupCompleted, Some(report)),
-        Err(_) => (HostObservation::CleanupPending, None),
-    }
-}
-
 #[tokio::test]
 async fn host_deadline_keeps_shutdown_owned_until_save_and_release_finish() {
-    let (resume, gate) = async_channel::bounded(1);
-    let (entered, began) = async_channel::bounded(1);
-    let backend = Arc::new(PendingBackend {
-        inner: InMemoryBackend::new(),
-        parked: AtomicBool::new(false),
-        resume: gate,
-        entered,
-        commits: Mutex::new(Vec::new()),
-    });
+    let (backend, resume, began) = PendingBackend::new(false, 1);
     let manager = Arc::new(PersistenceManager::new(backend.clone()).await.unwrap());
     let client = Client::builder()
         .with_persistence_manager(manager.clone())
@@ -94,16 +89,15 @@ async fn host_deadline_keeps_shutdown_owned_until_save_and_release_finish() {
     let release = client.store_release();
     let mut released = Box::pin(release.wait());
     let mut shutdown = Box::pin(client.shutdown());
-    let (observation, report) =
-        observe_with_budget(shutdown.as_mut(), Duration::from_millis(10)).await;
+    // Borrow the pinned future so expiry stops waiting without cancelling cleanup.
+    let observation = tokio::time::timeout(Duration::from_millis(10), shutdown.as_mut()).await;
     tokio::time::timeout(Duration::from_secs(2), began.recv())
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(observation, HostObservation::CleanupPending);
     assert!(
-        report.is_none(),
-        "a timeout provides no ShutdownReport or durability verdict"
+        observation.is_err(),
+        "an elapsed host budget means cleanup pending, with no durability verdict"
     );
     assert!(futures::poll!(released.as_mut()).is_pending());
     assert!(
@@ -143,15 +137,7 @@ async fn host_deadline_keeps_shutdown_owned_until_save_and_release_finish() {
 
 #[tokio::test]
 async fn cancelling_flush_driver_resumes_old_save_before_new_snapshot() {
-    let (resume, gate) = async_channel::bounded(2);
-    let (entered, began) = async_channel::bounded(2);
-    let backend = Arc::new(PendingBackend {
-        inner: InMemoryBackend::new(),
-        parked: AtomicBool::new(true),
-        resume: gate,
-        entered,
-        commits: Mutex::new(Vec::new()),
-    });
+    let (backend, resume, began) = PendingBackend::new(true, 2);
     let manager = Arc::new(PersistenceManager::new(backend.clone()).await.unwrap());
     let release = manager.store_release();
     let mut released = Box::pin(release.wait());
@@ -194,15 +180,7 @@ async fn cancelling_flush_driver_resumes_old_save_before_new_snapshot() {
 
 #[tokio::test]
 async fn store_release_waits_for_saver_worker_after_host_drops_manager() {
-    let (resume, gate) = async_channel::bounded(1);
-    let (entered, began) = async_channel::bounded(1);
-    let backend = Arc::new(PendingBackend {
-        inner: InMemoryBackend::new(),
-        parked: AtomicBool::new(true),
-        resume: gate,
-        entered,
-        commits: Mutex::new(Vec::new()),
-    });
+    let (backend, resume, began) = PendingBackend::new(true, 1);
     let manager = Arc::new(PersistenceManager::new(backend.clone()).await.unwrap());
     manager
         .process_command(DeviceCommand::SetPushName("worker owned".into()))
@@ -210,8 +188,7 @@ async fn store_release_waits_for_saver_worker_after_host_drops_manager() {
     let release = manager.store_release();
     let mut released = Box::pin(release.wait());
     let stop = wacore::runtime::ShutdownNotifier::new();
-    // Retain the abort handle: dropping it would request cancellation, not a
-    // successful flush. An elapsed host budget must not abort this durable work.
+    // Keep the abort handle alive until the durable save finishes.
     let saver = manager.clone().run_background_saver(
         Arc::new(TokioRuntime),
         Duration::from_secs(3600),

@@ -1,5 +1,4 @@
-//! A downstream admission policy and fixed worker pool. Endpoint capacities do
-//! not limit total plugin tasks, bytes or endpoints. This adds no SDK scheduler.
+//! Fixed plugin workers with bounded admission and cooperative draining.
 #![cfg(all(feature = "native", feature = "plugins", not(target_arch = "wasm32")))]
 
 use std::sync::{
@@ -49,9 +48,7 @@ struct Pool {
     events: PluginEvents,
 }
 impl Pool {
-    /// DropNewest admission: reject before readiness, after sealing, or when
-    /// oversized, before copying/retaining input.
-    /// Charge queued AND in-flight jobs. A queued clone would need another lease.
+    /// DropNewest policy. Charge queued and in-flight bytes before copying input.
     fn admit(&self, input: &[u8]) -> bool {
         if input.len() > MAX_PAYLOAD
             || self.queue.is_closed()
@@ -83,9 +80,7 @@ impl Pool {
         }
         true
     }
-    /// A foreign adapter applies its wire ceiling before constructing Bytes.
-    /// Endpoint queues share payload storage; endpoint counts remain a separate
-    /// adapter policy. The worker byte budget does not cover router retention.
+    /// Router retention needs a separate budget from the worker queue.
     fn publish_foreign(&self, input: &[u8]) -> anyhow::Result<()> {
         anyhow::ensure!(input.len() <= MAX_PAYLOAD, "foreign payload exceeds limit");
         let payload = Bytes::copy_from_slice(input);
@@ -97,9 +92,6 @@ impl Pool {
             payload,
         )?;
         Ok(())
-    }
-    fn close_admission(&self) {
-        self.queue.close();
     }
 }
 struct WorkerPlugin;
@@ -139,8 +131,7 @@ impl ClientPlugin for WorkerPlugin {
                             futures::future::Either::Right((Ok(job), _)) => job,
                             futures::future::Either::Right((Err(_), _)) => break,
                         };
-                        // Real work must cooperate with cancellation and have
-                        // its own I/O deadline. Never block an inline callback.
+                        // Real I/O also needs a deadline and cooperative cancellation.
                         tokio::task::yield_now().await;
                         counts.processed.fetch_add(1, Ordering::SeqCst);
                         drop(job);
@@ -195,7 +186,7 @@ async fn burst_admission_drops_excess_and_shutdown_drains_fixed_workers() {
     assert_eq!(accepted, QUEUE);
     assert_eq!(pool.counts.retained.load(Ordering::SeqCst), BYTE_BUDGET);
     assert_eq!(pool.counts.rejected.load(Ordering::SeqCst), 101 - accepted);
-    pool.close_admission();
+    pool.queue.close();
     assert!(!pool.admit(b"late"));
     let report = tokio::time::timeout(Duration::from_secs(2), client.shutdown())
         .await
@@ -225,7 +216,6 @@ async fn foreign_size_gate_precedes_copy_and_endpoints_share_one_payload() {
     let selector = pool.events.selector(&topic);
     let router = client.plugin_event_router().unwrap();
     let config = PluginEventEndpointConfig::new(1, PluginEventOverflow::DropNewest);
-    // A foreign host must also cap the number of endpoints it permits.
     let first = router.subscribe([selector.clone()], config).unwrap();
     let second = router.subscribe([selector], config).unwrap();
     assert!(pool.publish_foreign(&[0; MAX_PAYLOAD + 1]).is_err());
@@ -252,7 +242,7 @@ async fn full_queue_releases_rejected_jobs_byte_reservation() {
     assert!(!pool.admit(b"y"));
     assert_eq!(pool.counts.retained.load(Ordering::SeqCst), QUEUE);
     assert_eq!(pool.counts.rejected.load(Ordering::SeqCst), 1);
-    pool.close_admission();
+    pool.queue.close();
     tokio::time::timeout(Duration::from_secs(2), client.shutdown())
         .await
         .unwrap();
