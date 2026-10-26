@@ -3442,6 +3442,7 @@ mod tests {
             PluginCapability::PluginEvents,
             PluginCapability::StanzaInterception,
             PluginCapability::ClientInfo,
+            PluginCapability::IqReply,
         ];
         let combined = capabilities
             .into_iter()
