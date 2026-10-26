@@ -662,7 +662,12 @@ impl Client {
             self.resolve_node_waiters(&node);
         }
 
+        // WAComms.be correlates result/error only. An inbound get/set may use
+        // the same ID as an outstanding request without being its response.
         if tag == Some(StanzaTag::Iq)
+            && nr
+                .get_attr("type")
+                .is_some_and(|kind| matches!(kind.as_str().as_ref(), "result" | "error"))
             && let Some(id) = nr.get_attr("id").map(|v| v.as_str())
             && let Some(waiter) = self.response_waiters_guard().remove(id.as_ref())
         {
@@ -751,13 +756,13 @@ impl Client {
         // get nacked.
         if self.has_stanza_interceptors()
             && !is_connection_critical(nr)
-            && self.intercept_stanza(&node)
+            && self.intercept_stanza(&node, generation, shutdown)
         {
             // A claim does not change what the server is owed. Where this
             // client would have acked it still acks; where it would have nacked
             // a tag it does not model, the claim turns that into an ack,
-            // because someone did handle it — and answering nothing would leave
-            // the stanza in the offline queue with the stream recycling.
+            // because someone did handle it. This does not establish server
+            // redelivery behavior.
             //
             // A tag the client models but answers some other way gets nothing
             // here: a direct <message> draws a delivery <receipt>, an <iq>
@@ -866,9 +871,22 @@ impl Client {
     /// Returns whether one took it. The first to claim the stanza wins, so an
     /// interceptor registered earlier can shadow a later one — registration
     /// order is the priority order.
-    fn intercept_stanza(self: &Arc<Self>, node: &Arc<wacore_binary::OwnedNodeRef>) -> bool {
+    fn intercept_stanza(
+        self: &Arc<Self>,
+        node: &Arc<wacore_binary::OwnedNodeRef>,
+        generation: u64,
+        shutdown: &wacore::runtime::ShutdownSignal,
+    ) -> bool {
+        let scope = interceptor::InterceptionScope {
+            generation,
+            shutdown: shutdown.clone(),
+        };
         for registration in self.stanza_interceptors().iter() {
-            if registration.interceptor.intercept(node).is_handled() {
+            if registration
+                .interceptor
+                .intercept_scoped(node, &scope)
+                .is_handled()
+            {
                 debug!(
                     target: "Client/Recv",
                     "Stanza <{}> taken by an interceptor",

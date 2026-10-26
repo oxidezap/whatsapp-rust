@@ -1,8 +1,8 @@
 //! Taking over a stanza before the built-in pipeline sees it.
 //!
 //! The client models the stanzas it knows about and nacks the rest, which is
-//! the right default: a `<nack>` tells the server this client cannot act on
-//! something, and silence would leave the stanza in the offline queue forever.
+//! the default for a tag it cannot handle: a `<nack>` reports that limitation.
+//! The local response does not establish the server's redelivery policy.
 //!
 //! But it leaves no room for a consumer that *can* act on it. A stanza this
 //! version does not model gets nacked whether or not the application would have
@@ -55,9 +55,8 @@
 //!
 //! A claim does not change what the server is owed. Where the client would have
 //! acked, it still acks; where it would have nacked a tag it does not model,
-//! the claim turns that into an ack, because someone did handle it — answering
-//! nothing would leave the stanza in the offline queue and keep the stream
-//! recycling. Both need `id` and `from`: without them there is nothing to
+//! the claim turns that into an ack, because someone did handle it.
+//! Both need `id` and `from`: without them there is nothing to
 //! address, and the client would not have answered either.
 //!
 //! A tag the client *does* model but answers some other way is answered by
@@ -113,6 +112,27 @@ use wacore_binary::node::OwnedNodeRef;
 
 use crate::Client;
 
+/// Connection identity passed by the dispatcher to scoped interceptors.
+///
+/// Its fields are private so a caller cannot manufacture an inbound reply grant.
+#[doc(hidden)]
+pub struct InterceptionScope {
+    pub(crate) generation: u64,
+    pub(crate) shutdown: wacore::runtime::ShutdownSignal,
+}
+
+impl InterceptionScope {
+    /// Connection generation captured by the dispatcher.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Whether that connection has requested cancellation.
+    pub fn is_cancelled(&self) -> bool {
+        self.shutdown.is_fired()
+    }
+}
+
 /// What an interceptor decided about a stanza.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Interception {
@@ -156,6 +176,13 @@ impl Interception {
 pub trait StanzaInterceptor: MaybeSendSync + 'static {
     /// Decide what happens to `node`.
     fn intercept(&self, node: &OwnedNodeRef) -> Interception;
+
+    /// Dispatcher hook for connection-bound capabilities. Existing interceptors
+    /// use `intercept`; the default preserves their behavior.
+    #[doc(hidden)]
+    fn intercept_scoped(&self, node: &OwnedNodeRef, _scope: &InterceptionScope) -> Interception {
+        self.intercept(node)
+    }
 }
 
 impl<F> StanzaInterceptor for F
