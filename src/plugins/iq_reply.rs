@@ -429,10 +429,7 @@ mod tests {
     }
 
     fn owned(node: Node) -> Arc<OwnedNodeRef> {
-        Arc::new(
-            OwnedNodeRef::new(wacore_binary::marshal::marshal_exact(&node).unwrap().into())
-                .unwrap(),
-        )
+        crate::test_utils::node_to_owned_ref(&node)
     }
 
     fn grant(client: &Arc<Client>) -> PluginIqReply {
