@@ -3275,13 +3275,13 @@ mod tests {
             .persistence_manager
             .get_device_snapshot()
             .get_client_payload();
-        assert_eq!(profile.os_version, payload.user_agent.os_version);
+        assert_eq!(Some(profile.os_version), payload.user_agent.os_version);
         assert_eq!(
             version,
             (
-                payload.user_agent.app_version.primary(),
-                payload.user_agent.app_version.secondary(),
-                payload.user_agent.app_version.tertiary()
+                payload.user_agent.app_version.primary.unwrap(),
+                payload.user_agent.app_version.secondary.unwrap(),
+                payload.user_agent.app_version.tertiary.unwrap()
             )
         );
         client.shutdown().await;
