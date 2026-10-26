@@ -42,9 +42,7 @@ struct Case {
     expected: String,
 }
 
-/// Verify the exact raw sources used in the review, without evaluating JavaScript.
-/// Spans were selected from complete `__d` definitions with Acorn; their hashes
-/// keep a later restoration from silently using a different module or bundle.
+/// Verify bundle and complete Acorn-extracted module bytes without executing JS.
 pub fn verify_bundles(dir: &Path) -> Result<()> {
     let oracle: Oracle = serde_json::from_str(ORACLE)?;
     for module in oracle.modules {
@@ -88,11 +86,7 @@ pub fn validate_revision(rev: &str) -> Result<()> {
 }
 
 pub fn generate(json: &str, wa_version: &str) -> Result<String> {
-    generate_with_oracle(json, wa_version, ORACLE)
-}
-
-fn generate_with_oracle(json: &str, wa_version: &str, oracle: &str) -> Result<String> {
-    let oracle: Oracle = serde_json::from_str(oracle)?;
+    let oracle: Oracle = serde_json::from_str(ORACLE)?;
     ensure!(
         oracle.schema_version == 1 && oracle.wa_version == wa_version,
         "IQ oracle needs review for this version"
@@ -118,8 +112,7 @@ fn generate_with_oracle(json: &str, wa_version: &str, oracle: &str) -> Result<St
         successes == oracle.success_contracts,
         "AcceptGroupAdd IR differs from the reviewed bundle oracle; review guards, payload and precedence"
     );
-    // Validate delegated errors and request/envelope boundaries as well. This
-    // emitter does not make the payload fixture a full contextual RPC parser.
+    // Retain the pilot's request, envelope and delegated-error guards.
     super::iq_pilots::generate(json, wa_version)?;
     let mut out = header("private IQ bundle conformance cases", wa_version);
     out.push_str(&format!("//! Reviewed whatspec {}.\n//! Bundle set {}.\n//! Archive SHA-256 {}.\n//! Source asset: {}\n//! Correlation/error dispatch are outside this payload-only fixture.\n", oracle.whatspec_rev, oracle.set_hash, oracle.archive_sha256, oracle.asset));
@@ -168,8 +161,7 @@ mod tests {
     use super::*;
 
     fn ir() -> Value {
-        // Reuse the full pinned input's two qualified operations via the compact
-        // fixture the pilot emitter also validates, with real success contracts.
+        // Bind the compact pilot input to the separately reviewed success shapes.
         let oracle: Value = serde_json::from_str(ORACLE).unwrap();
         let mut ir = super::super::iq_pilots::tests::fixture();
         let op = &mut ir["stanzas"][1];
