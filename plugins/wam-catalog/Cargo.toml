@@ -3,6 +3,7 @@ name = "whatsapp-rust-wam-catalog"
 version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
+license.workspace = true
 publish = false
 description = "Generated WhatsApp Metrics (WAM) event catalog and buffer codec"
 

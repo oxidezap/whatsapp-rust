@@ -56,9 +56,8 @@ version = "=0.2.4"
 allow = ["MIT-0"]
 
 [licenses.private]
-# Workspace members marked `publish = false` (e2e-tests, bench-integration,
-# the metrics plugin, voip-cli) carry no license field by design. They are
-# outside the default-members graph today; this keeps them out if that changes.
+# Skip private workspace members in this audit. This does not provide license
+# metadata to downstream consumers that depend on those members.
 ignore = true
 
 [bans]
