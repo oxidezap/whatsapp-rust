@@ -30,8 +30,7 @@ const IQ_TAG: &str = "iq";
 type IqSendFuture<'a> =
     std::pin::Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + 'a>>;
 #[cfg(target_arch = "wasm32")]
-type IqSendFuture<'a> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ClientError>> + 'a>>;
+type IqSendFuture<'a> = std::pin::Pin<Box<dyn Future<Output = Result<(), ClientError>> + 'a>>;
 
 /// Runs once the request is on the wire and before the response is awaited.
 ///

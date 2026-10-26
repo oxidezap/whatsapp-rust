@@ -141,7 +141,7 @@ impl UploadCrypto {
 #[cfg(not(target_arch = "wasm32"))]
 type BoxFut<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[cfg(target_arch = "wasm32")]
-type BoxFut<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>;
+type BoxFut<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + 'a>>;
 
 // Only auto traits can join a `dyn Fn` bound, so the wasm variants must spell
 // out the whole alias instead of borrowing `MaybeSend`.
