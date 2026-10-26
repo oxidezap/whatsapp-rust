@@ -3681,6 +3681,13 @@ mod tests {
     }
 
     async fn client_with_abandoned_dial(factory: Arc<AbandonedDial>) -> Arc<Client> {
+        client_with_mock_dial(factory, handshake::NoiseCertPolicy::Strict).await
+    }
+
+    async fn client_with_mock_dial(
+        factory: Arc<dyn crate::transport::TransportFactory>,
+        cert_policy: handshake::NoiseCertPolicy,
+    ) -> Arc<Client> {
         let persistence = Arc::new(
             PersistenceManager::new(crate::test_utils::create_test_backend().await)
                 .await
@@ -3690,6 +3697,7 @@ mod tests {
             .with_runtime(crate::runtime_impl::TokioRuntime)
             .with_persistence_manager(persistence)
             .with_transport_factory_arc(factory)
+            .with_noise_cert_policy(cert_policy)
             .with_http_client(crate::test_utils::MockHttpClient)
             .with_version_override((2, 3000, 123456789))
             .build()
@@ -3840,6 +3848,201 @@ mod tests {
             "the original malformed handshake error must survive cleanup: {result:?}"
         );
         assert_eq!(closes.load(Ordering::SeqCst), 1);
+        assert_abandoned_attempt_cleared(&client).await;
+    }
+
+    /// Synthetic XX peer using the same transcript and unsigned certificate
+    /// fixture as the handshake integration tests. ClientFinish is decrypted
+    /// before the test barrier, so releasing it completes a real handshake.
+    struct SuccessfulHandshakeTransport {
+        state: std::sync::Mutex<
+            Option<(
+                wacore_noise::NoiseHandshake,
+                wacore::libsignal::protocol::KeyPair,
+            )>,
+        >,
+        events: async_channel::Sender<crate::transport::TransportEvent>,
+        finish_validated: async_channel::Sender<()>,
+        release_finish: async_channel::Receiver<()>,
+        closes: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::transport::Transport for SuccessfulHandshakeTransport {
+        async fn send(&self, data: bytes::Bytes) -> Result<()> {
+            use wacore::libsignal::protocol::KeyPair;
+            use wacore_binary::consts::{NOISE_PATTERN_XX, WA_CONN_HEADER};
+            use waproto::whatsapp as wa;
+
+            let framed = data.strip_prefix(&WA_CONN_HEADER).unwrap_or(&data);
+            assert!(framed.len() >= 3, "one length-prefixed handshake frame");
+            let length = (usize::from(framed[0]) << 16)
+                | (usize::from(framed[1]) << 8)
+                | usize::from(framed[2]);
+            assert_eq!(framed.len(), length + 3, "complete single handshake frame");
+            let message = waproto::codec::handshake_message_decode(&framed[3..])?;
+            let response = {
+                let mut state = self.state.lock().unwrap();
+                if let Some(hello) = message.client_hello.into_option() {
+                    assert!(state.is_none(), "exactly one ClientHello");
+                    let peer: [u8; 32] = hello
+                        .ephemeral
+                        .expect("client ephemeral")
+                        .try_into()
+                        .unwrap();
+                    let identity = KeyPair::generate(&mut rand::rng());
+                    let ephemeral = KeyPair::generate(&mut rand::rng());
+                    let identity_pub: [u8; 32] =
+                        identity.public_key.public_key_bytes().try_into().unwrap();
+                    let mut noise =
+                        wacore_noise::NoiseHandshake::new(NOISE_PATTERN_XX, &WA_CONN_HEADER)?;
+                    noise.authenticate(&peer);
+                    noise.authenticate(ephemeral.public_key.public_key_bytes());
+                    noise.mix_shared_secret(ephemeral.private_key.serialize(), &peer)?;
+                    let encrypted_static = noise.encrypt(&identity_pub)?;
+                    noise.mix_shared_secret(identity.private_key.serialize(), &peer)?;
+                    let payload = noise.encrypt(
+                        &wacore_noise::test_util::build_cert_chain_bytes(&identity_pub),
+                    )?;
+                    let mut response = wa::HandshakeMessage::default();
+                    let mut hello = wa::handshake_message::ServerHello::default();
+                    hello.ephemeral = Some(ephemeral.public_key.public_key_bytes().to_vec());
+                    hello.r#static = Some(encrypted_static);
+                    hello.payload = Some(payload);
+                    response.server_hello = buffa::MessageField::some(hello);
+                    *state = Some((noise, ephemeral));
+                    Some(waproto::codec::handshake_message_to_vec(&response))
+                } else {
+                    let finish = message.client_finish.into_option().expect("ClientFinish");
+                    let (mut noise, ephemeral) = state.take().expect("ServerHello sent");
+                    let peer: [u8; 32] = noise
+                        .decrypt(&finish.r#static.expect("encrypted client static"))?
+                        .try_into()
+                        .unwrap();
+                    noise.mix_shared_secret(ephemeral.private_key.serialize(), &peer)?;
+                    let payload =
+                        noise.decrypt(&finish.payload.expect("encrypted client payload"))?;
+                    #[allow(clippy::disallowed_methods)]
+                    let _payload =
+                        <wa::ClientPayload as buffa::Message>::decode_from_slice(&payload)?;
+                    let _ciphers = noise.finish()?;
+                    None
+                }
+            };
+            if let Some(response) = response {
+                self.events
+                    .send(crate::transport::TransportEvent::DataReceived(
+                        wacore::framing::encode_frame(&response, None)?.into(),
+                    ))
+                    .await?;
+            } else {
+                self.finish_validated.send(()).await?;
+                self.release_finish.recv().await?;
+            }
+            Ok(())
+        }
+
+        async fn disconnect(&self) {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        }
+    }
+
+    struct SuccessfulHandshakeDial {
+        transport: Arc<SuccessfulHandshakeTransport>,
+        events: async_channel::Receiver<crate::transport::TransportEvent>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::transport::TransportFactory for SuccessfulHandshakeDial {
+        async fn create_transport(
+            &self,
+        ) -> Result<(
+            Arc<dyn crate::transport::Transport>,
+            async_channel::Receiver<crate::transport::TransportEvent>,
+        )> {
+            Ok((self.transport.clone(), self.events.clone()))
+        }
+    }
+
+    async fn successful_handshake_client() -> (
+        Arc<Client>,
+        Arc<SuccessfulHandshakeTransport>,
+        async_channel::Receiver<()>,
+        async_channel::Sender<()>,
+    ) {
+        let (events, receiver) = async_channel::bounded(1);
+        let (finish_validated, validated) = async_channel::bounded(1);
+        let (release, release_finish) = async_channel::bounded(1);
+        let transport = Arc::new(SuccessfulHandshakeTransport {
+            state: std::sync::Mutex::new(None),
+            events,
+            finish_validated,
+            release_finish,
+            closes: AtomicUsize::new(0),
+        });
+        let factory = Arc::new(SuccessfulHandshakeDial {
+            transport: transport.clone(),
+            events: receiver,
+        });
+        let client = client_with_mock_dial(
+            factory,
+            handshake::NoiseCertPolicy::DangerSkipCertChainVerify,
+        )
+        .await;
+        (client, transport, validated, release)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abandoned_successful_handshake_stalled_close_preserves_pause() {
+        let (client, transport, validated, release) = successful_handshake_client().await;
+        let attempt = tokio::spawn({
+            let client = client.clone();
+            async move { client.connect().await.map(|_| ()) }
+        });
+        next_connect_attempt(&validated).await;
+        client.pause().await;
+        release.send(()).await.expect("complete ClientFinish send");
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(3), attempt)
+            .await
+            .expect("post-handshake refusal close must respect its deadline")
+            .expect("connect task");
+        assert!(matches!(result, Err(ConnectError::Paused)), "{result:?}");
+        assert_eq!(started.elapsed(), Client::TRANSPORT_CLOSE_TIMEOUT);
+        assert_eq!(transport.closes.load(Ordering::SeqCst), 1);
+        assert_abandoned_attempt_cleared(&client).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abandoned_publication_stalled_close_preserves_shutdown() {
+        let (client, transport, validated, release) = successful_handshake_client().await;
+        let publication = client.connection_publish.lock().await;
+        let attempt = tokio::spawn({
+            let client = client.clone();
+            async move { client.connect().await.map(|_| ()) }
+        });
+        next_connect_attempt(&validated).await;
+        // This sentinel is overwritten only after successful handshake and
+        // the preceding refusal check. Holding publication keeps all slots
+        // unpublished while we observe that exact checkpoint.
+        client.authenticated_generation.store(17, Ordering::SeqCst);
+        release.send(()).await.expect("complete ClientFinish send");
+        crate::test_utils::poll_until("post-handshake refusal check passed", || {
+            client.authenticated_generation.load(Ordering::SeqCst) == NO_AUTHENTICATED_GENERATION
+        })
+        .await;
+        assert!(client.transport.lock().await.is_none());
+        client.signal_shutdown_sync();
+        drop(publication);
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(3), attempt)
+            .await
+            .expect("publication retraction close must respect its deadline")
+            .expect("connect task");
+        assert!(matches!(result, Err(ConnectError::Shutdown)), "{result:?}");
+        assert_eq!(started.elapsed(), Client::TRANSPORT_CLOSE_TIMEOUT);
+        assert_eq!(transport.closes.load(Ordering::SeqCst), 1);
         assert_abandoned_attempt_cleared(&client).await;
     }
 
