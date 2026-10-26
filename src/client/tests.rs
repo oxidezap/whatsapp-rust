@@ -6929,9 +6929,7 @@ async fn claimed_stanza_ack_matrix_preserves_each_response_class() {
         // fixture has none, so configure it through snapshot-safe commands.
         client
             .persistence_manager
-            .process_command(crate::store::commands::DeviceCommand::SetId(Some(
-                Jid::pn_device("15550000001", 3),
-            )))
+            .process_command(DeviceCommand::SetId(Some(Jid::pn_device("15550000001", 3))))
             .await;
         let (interceptor, seen) = recorder(tag);
         let _handle = client.add_stanza_interceptor(interceptor);
