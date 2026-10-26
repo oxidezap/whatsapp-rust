@@ -695,4 +695,38 @@ mod tests {
         ));
         assert_eq!(transport.sends_started(), 1);
     }
+
+    #[tokio::test]
+    async fn retiring_connection_cancels_admitted_send_without_using_replacement() {
+        let client = client_with_plugin(Interception::Handled, false, true).await;
+        let transport = Arc::new(StallingMockTransport::new());
+        connect(&client, transport.clone());
+        client.process_node(owned(request())).await;
+        let reply = grant(&client);
+        let sending = reply.clone();
+        let task = tokio::spawn(async move { sending.result(vec![]).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while transport.sends_started() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        client.notify_connection_shutdown();
+        client.connection_generation.fetch_add(1, Ordering::SeqCst);
+        let replacement = Arc::new(CapturingMockTransport::new());
+        connect(&client, replacement.clone());
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("reply must observe retirement while send is stalled")
+            .unwrap();
+        assert!(matches!(result, Err(PluginIqReplyError::ConnectionRetired)));
+        assert!(matches!(
+            reply.result(vec![]).await,
+            Err(PluginIqReplyError::ConnectionRetired)
+        ));
+        assert_eq!(transport.sends_started(), 1);
+        assert!(replacement.sent().is_empty());
+    }
 }
