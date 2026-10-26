@@ -314,11 +314,11 @@ fn validate_delegated_error(variant: &Value) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use serde_json::json;
 
-    fn fixture() -> Value {
+    pub(crate) fn fixture() -> Value {
         let ops: Vec<_> = PILOTS.iter().map(|pilot| {
             let assertions = json!([
                 {"kind":"tag","name":"iq"},

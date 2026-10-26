@@ -59,6 +59,10 @@ fn every_generated_rust_file_stamps_the_locked_version() {
         "wacore/src/iq/targets.rs",
         "wacore/src/iq/join_shapes.rs",
         "wacore/src/iq/pilots.rs",
+        "wacore/src/iq/pilot_conformance.rs",
+        "wacore/src/iq/community_create.rs",
+        "plugins/wam-catalog/src/generated.rs",
+        "plugins/wam-catalog/src/call_sites.rs",
         "wacore/src/stanza/wire_tags.rs",
     ] {
         let text = read(rel);

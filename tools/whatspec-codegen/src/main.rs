@@ -56,6 +56,7 @@ struct Options {
     git_ref: String,
     /// Skip the `protoc` step, for a machine that has no protoc.
     skip_proto_desc: bool,
+    verify_iq_bundles: Option<PathBuf>,
 }
 
 const USAGE: &str = "\
@@ -66,6 +67,7 @@ Usage: cargo run -p whatspec-codegen -- [options]
   --update-lock          Re-pin the lock to --rev and rewrite it.
   --rev <git-ref>        Ref to pin when updating the lock (default: main).
   --skip-proto-desc      Do not run protoc after writing the .proto.
+  --verify-iq-bundles <dir> Verify restored IQ oracle bundles and module spans.
   -h, --help             This message.
 ";
 
@@ -81,6 +83,10 @@ struct Artifact {
 fn main() -> Result<()> {
     let opts = parse_args(std::env::args().skip(1))?;
     let repo_root = repo_root();
+    if let Some(dir) = &opts.verify_iq_bundles {
+        emit::iq_conformance::verify_bundles(dir)?;
+        println!("reviewed IQ bundle and module hashes match");
+    }
     let lock_path = repo_root.join("tools/whatspec-codegen/whatspec.lock.json");
     let mut lock = Lock::read(&lock_path)?;
 
@@ -109,6 +115,7 @@ fn main() -> Result<()> {
     // Before the lock is touched: the emitters reject a lost proto anchor, an
     // invalid token table and an unrepresentable version, and a lock pinning a
     // build that no committed artifact describes is worse than no new lock.
+    emit::iq_conformance::validate_revision(&lock.rev)?;
     let artifacts = build(&ir, &wa_version)?;
     if opts.check {
         return check(&repo_root, &artifacts);
@@ -145,6 +152,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options> {
         update_lock: false,
         git_ref: "main".to_string(),
         skip_proto_desc: false,
+        verify_iq_bundles: None,
     };
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -152,6 +160,12 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options> {
             "--check" => opts.check = true,
             "--update-lock" => opts.update_lock = true,
             "--skip-proto-desc" => opts.skip_proto_desc = true,
+            "--verify-iq-bundles" => {
+                opts.verify_iq_bundles = Some(PathBuf::from(
+                    args.next()
+                        .context("--verify-iq-bundles needs a directory")?,
+                ))
+            }
             "--from" => {
                 let dir = args.next().context("--from needs a directory")?;
                 opts.origin = Origin::Local(PathBuf::from(dir));
@@ -307,6 +321,11 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
         Artifact {
             path: "wacore/src/iq/community_create.rs",
             content: emit::community_create::generate(&ir.text("iq/index.json")?, wa_version)?,
+            rust: true,
+        },
+        Artifact {
+            path: "wacore/src/iq/pilot_conformance.rs",
+            content: emit::iq_conformance::generate(&ir.text("iq/index.json")?, wa_version)?,
             rust: true,
         },
         Artifact {
@@ -541,6 +560,11 @@ mod tests {
         let o = parse(&["--update-lock", "--rev", "abc"]).expect("flags");
         assert!(o.update_lock);
         assert_eq!(o.git_ref, "abc");
+        let o = parse(&["--verify-iq-bundles", "/tmp/bundles"]).expect("bundle verification");
+        assert_eq!(
+            o.verify_iq_bundles.as_deref(),
+            Some(Path::new("/tmp/bundles"))
+        );
     }
 
     #[test]
@@ -548,6 +572,7 @@ mod tests {
         assert!(parse(&["--wat"]).is_err());
         assert!(parse(&["--from"]).is_err(), "--from needs a value");
         assert!(parse(&["--rev"]).is_err(), "--rev needs a value");
+        assert!(parse(&["--verify-iq-bundles"]).is_err());
         // --check proves the tree matches the lock; --update-lock rewrites the
         // lock to match the tree. Together they prove nothing.
         assert!(parse(&["--check", "--update-lock"]).is_err());

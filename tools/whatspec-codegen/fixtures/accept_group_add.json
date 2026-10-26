@@ -1,0 +1,182 @@
+{
+  "schemaVersion": 1,
+  "whatspecRev": "c581c20a9d0605df49abf297f2e7cfc04ccf1ff7",
+  "waVersion": "2.3000.1047483476",
+  "setHash": "05609307e68b0f6ccfd2a121a573049999e38b752cfe7155ebbe5c661805751b",
+  "archiveSha256": "22243b9c2ff18a66cea8fd66551821fe0f9f09786d107e2be8284637db86c349",
+  "asset": "https://github.com/oxidezap/whatspec/releases/download/bundle-store/bundles-2.3000.1047483476-05609307e68b0f6ccfd2a121a573049999e38b752cfe7155ebbe5c661805751b.tar.xz",
+  "modules": [
+    {
+      "name": "WASmaxParseUtils",
+      "bundleSha256": "09d91fdc4089c50ab1d35dd6c796ee82ef4c3296710316d20383c85738b871b8",
+      "startByte": 2256336,
+      "endByte": 2263058,
+      "moduleSha256": "a2bbd76df3740e48f0f5c979c5ecc94d30217e726c7b42f2b23490161bcc42e6"
+    },
+    {
+      "name": "WASmaxInGroupsAcceptGroupAddResponseGroupJoinRequestSuccess",
+      "bundleSha256": "34859849724a114869fd78e4479a6c412b4ab3ec36c3da2985d8ec4ecb75d5d2",
+      "startByte": 4229,
+      "endByte": 4728,
+      "moduleSha256": "3e137254ccda2e5b4b5d97fd512fe1ff74449cb360886195ecd46e098956718a"
+    },
+    {
+      "name": "WASmaxInGroupsAcceptGroupAddResponseSuccess",
+      "bundleSha256": "34859849724a114869fd78e4479a6c412b4ab3ec36c3da2985d8ec4ecb75d5d2",
+      "startByte": 5098,
+      "endByte": 5459,
+      "moduleSha256": "2881a4c961499317969ca0c9a4ddbbd41cc60f4c0ac6567467e4ffc9cce62354"
+    },
+    {
+      "name": "WASmaxGroupsAcceptGroupAddRPC",
+      "bundleSha256": "34859849724a114869fd78e4479a6c412b4ab3ec36c3da2985d8ec4ecb75d5d2",
+      "startByte": 5922,
+      "endByte": 7533,
+      "moduleSha256": "2167e222e0875e85276bd519e5bd86839ba1e92808af5a1320b424d84ca3d7ae"
+    }
+  ],
+  "successContracts": [
+    {
+      "tag": "AcceptGroupAddResponseGroupJoinRequestSuccess",
+      "moduleName": "WASmaxInGroupsAcceptGroupAddResponseGroupJoinRequestSuccess",
+      "kind": "success",
+      "assertions": [
+        {
+          "kind": "tag",
+          "name": "iq"
+        },
+        {
+          "kind": "reference",
+          "name": "id",
+          "referencePath": [
+            "id"
+          ]
+        },
+        {
+          "kind": "reference",
+          "name": "from",
+          "referencePath": [
+            "to"
+          ]
+        },
+        {
+          "kind": "attr",
+          "name": "type",
+          "value": "result"
+        },
+        {
+          "kind": "child",
+          "name": "membership_approval_request"
+        }
+      ],
+      "fields": [
+        {
+          "method": "attrString",
+          "name": "type",
+          "wireName": "type",
+          "type": "string",
+          "parserRequired": true,
+          "literalValue": "result"
+        }
+      ]
+    },
+    {
+      "tag": "AcceptGroupAddResponseSuccess",
+      "moduleName": "WASmaxInGroupsAcceptGroupAddResponseSuccess",
+      "kind": "success",
+      "assertions": [
+        {
+          "kind": "tag",
+          "name": "iq"
+        },
+        {
+          "kind": "reference",
+          "name": "id",
+          "referencePath": [
+            "id"
+          ]
+        },
+        {
+          "kind": "reference",
+          "name": "from",
+          "referencePath": [
+            "to"
+          ]
+        },
+        {
+          "kind": "attr",
+          "name": "type",
+          "value": "result"
+        }
+      ],
+      "fields": [
+        {
+          "method": "attrString",
+          "name": "type",
+          "wireName": "type",
+          "type": "string",
+          "parserRequired": true,
+          "literalValue": "result"
+        }
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "name": "absent",
+      "children": [],
+      "scalar": false,
+      "expected": "Success"
+    },
+    {
+      "name": "unique",
+      "children": [
+        "membership_approval_request"
+      ],
+      "scalar": false,
+      "expected": "GroupJoinRequestSuccess"
+    },
+    {
+      "name": "duplicate",
+      "children": [
+        "membership_approval_request",
+        "membership_approval_request"
+      ],
+      "scalar": false,
+      "expected": "Success"
+    },
+    {
+      "name": "unknown",
+      "children": [
+        "future"
+      ],
+      "scalar": false,
+      "expected": "Success"
+    },
+    {
+      "name": "unique_with_unknown",
+      "children": [
+        "future",
+        "membership_approval_request"
+      ],
+      "scalar": false,
+      "expected": "GroupJoinRequestSuccess"
+    },
+    {
+      "name": "unknown_between_duplicates",
+      "children": [
+        "membership_approval_request",
+        "future",
+        "membership_approval_request"
+      ],
+      "scalar": false,
+      "expected": "Success"
+    },
+    {
+      "name": "scalar",
+      "children": [],
+      "scalar": true,
+      "expected": "Success"
+    }
+  ]
+}
