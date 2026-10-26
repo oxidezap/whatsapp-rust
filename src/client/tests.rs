@@ -6925,6 +6925,14 @@ async fn claimed_stanza_ack_matrix_preserves_each_response_class() {
         ("vendor:thing", "s.whatsapp.net", true),
     ] {
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        // Message/status ACKs stamp the local device identity. The bare IQ
+        // fixture has none, so configure it through snapshot-safe commands.
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetId(Some(
+                Jid::pn_device("15550000001", 3),
+            )))
+            .await;
         let (interceptor, seen) = recorder(tag);
         let _handle = client.add_stanza_interceptor(interceptor);
         let node = NodeBuilder::new(tag)
@@ -6952,6 +6960,13 @@ async fn claimed_stanza_ack_matrix_preserves_each_response_class() {
                     .is_some_and(|id| id.as_str() == "CLAIM-1")
             );
             assert!(sent.get_attr("error").is_none(), "a claim is not a NACK");
+            if matches!(tag, "message" | "status") {
+                assert_eq!(
+                    sent.attrs().optional_jid("from"),
+                    Some(Jid::pn_device("15550000001", 3)),
+                    "message/status ACKs must stamp the configured local device"
+                );
+            }
         }
     }
 }

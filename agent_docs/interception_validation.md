@@ -14,6 +14,10 @@ Do not infer server delivery, retention or redelivery from a local send.
 | `<receipt>`, `<notification>`, `<call>` | Transport ACK | Own effects; configured group capture must finish successfully first. |
 | Unmodelled tag | Transport ACK | Own the claimed input. Missing addressing identity produces no generic ACK. |
 
+Message/status ACK encoding also requires a configured local device PN to
+stamp `from`. The matrix fixture supplies that identity through `DeviceCommand`;
+an unlinked fixture cannot demonstrate these positive ACK cases.
+
 `success`, `failure`, `stream:error`, `ack`, and server pings never reach an
 interceptor. Request correlation and connection housekeeping precede claims.
 
