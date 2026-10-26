@@ -111,19 +111,23 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    fn server(responses: Vec<String>) -> (String, thread::JoinHandle<()>) {
+    fn server(responses: Vec<String>) -> (String, thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let worker = thread::spawn(move || {
+            let mut requests = Vec::new();
             for response in responses {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
                 let mut request = [0; 4096];
-                assert!(stream.read(&mut request).unwrap() > 0);
+                let length = stream.read(&mut request).unwrap();
+                assert!(length > 0);
+                requests.push(String::from_utf8_lossy(&request[..length]).into_owned());
                 stream.write_all(response.as_bytes()).unwrap();
             }
+            requests
         });
         (url, worker)
     }
@@ -155,6 +159,31 @@ mod tests {
         assert_eq!(probe.location.as_deref(), Some("/final"));
         assert_eq!(client.get(&url, &[], 16).unwrap().body, b"ok");
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn redirects_do_not_forward_authorization_to_another_origin() {
+        let (destination, destination_worker) = server(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".into(),
+        ]);
+        let (source, source_worker) = server(vec![format!(
+            "HTTP/1.1 302 Found\r\nLocation: {destination}/final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )]);
+        UreqClient::new()
+            .get(&source, &[("Authorization", "Bearer fixture")], 16)
+            .unwrap();
+        let original = source_worker.join().unwrap();
+        let redirected = destination_worker.join().unwrap();
+        assert!(
+            original[0]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer fixture")
+        );
+        assert!(
+            !redirected[0]
+                .to_ascii_lowercase()
+                .contains("authorization:")
+        );
     }
 
     #[test]
