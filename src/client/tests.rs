@@ -6909,32 +6909,51 @@ async fn a_claimed_unknown_stanza_is_acked_rather_than_nacked() {
 }
 
 #[tokio::test]
-async fn claiming_a_stanza_the_client_answers_differently_sends_no_generic_ack() {
-    // A direct <message> is answered with a delivery <receipt>, an <iq> with an
-    // <iq type="result">. Neither is an <ack class="…">, so the claimed-stanza
-    // path stays quiet rather than sending the server something it did not ask
-    // for. The interceptor that took the stanza owes the reply.
-    let (client, transport) = crate::test_utils::create_iq_test_client().await;
-    let (interceptor, seen) = recorder("message");
-    let _handle = client.add_stanza_interceptor(interceptor);
-
-    let node = NodeBuilder::new("message")
-        .attr("id", "M-1")
-        .attr("from", "5511999998888@s.whatsapp.net")
-        .build();
-    assert!(
-        !client.should_ack(&node.as_node_ref()),
-        "a direct message is not ack-answered"
-    );
-    client.process_node(node_to_owned_ref(node)).await;
-
-    assert_eq!(seen.lock().expect("lock").len(), 1, "it was claimed");
-    crate::test_utils::wait_for_outbound_tasks(&client).await;
-    assert_eq!(
-        transport.sent_count(),
-        0,
-        "no invented answer for a tag the client models"
-    );
+async fn claimed_stanza_ack_matrix_preserves_each_response_class() {
+    // These cases exercise the claim branch through the encrypted test
+    // transport. They assert SDK output, not server delivery or redelivery.
+    for (tag, from, expected_ack) in [
+        ("message", "100000000001@s.whatsapp.net", false),
+        ("message", "120363000000001@g.us", false),
+        ("iq", "s.whatsapp.net", false),
+        ("message", "120363000000001@newsletter", true),
+        ("message", "status@broadcast", true),
+        ("status", "status@broadcast", true),
+        ("receipt", "100000000001@s.whatsapp.net", true),
+        ("notification", "s.whatsapp.net", true),
+        ("call", "100000000001@s.whatsapp.net", true),
+        ("vendor:thing", "s.whatsapp.net", true),
+    ] {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let (interceptor, seen) = recorder(tag);
+        let _handle = client.add_stanza_interceptor(interceptor);
+        let node = NodeBuilder::new(tag)
+            .attr("id", "CLAIM-1")
+            .attr("from", from)
+            .build();
+        client.process_node(node_to_owned_ref(node)).await;
+        assert_eq!(seen.lock().expect("lock").len(), 1, "{tag} from {from}");
+        crate::test_utils::wait_for_outbound_tasks(&client).await;
+        assert_eq!(
+            transport.sent_count(),
+            usize::from(expected_ack),
+            "{tag} from {from}"
+        );
+        if expected_ack {
+            let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
+            let sent = sent.get();
+            assert_eq!(sent.tag.as_ref(), "ack", "{tag} from {from}");
+            assert!(
+                sent.get_attr("class")
+                    .is_some_and(|class| class.as_str() == tag)
+            );
+            assert!(
+                sent.get_attr("id")
+                    .is_some_and(|id| id.as_str() == "CLAIM-1")
+            );
+            assert!(sent.get_attr("error").is_none(), "a claim is not a NACK");
+        }
+    }
 }
 
 #[tokio::test]
