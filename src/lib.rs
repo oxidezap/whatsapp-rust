@@ -544,9 +544,9 @@ pub use plugins::{
     PluginEventRouterStats, PluginEventSelector, PluginEventSubscribeError,
     PluginEventSubscription, PluginEventTopic, PluginEventTryReceiveError, PluginEvents,
     PluginFuture, PluginHealth, PluginHostConfig, PluginHostStats, PluginInterceptorRegistration,
-    PluginIq, PluginIqError, PluginManifest, PluginMessaging, PluginMessagingError,
-    PluginPlanError, PluginResourceError, PluginStanzaInterception, PluginState, PluginStats,
-    PluginTasks, UntypedClientPlugin,
+    PluginIq, PluginIqError, PluginIqInterceptor, PluginIqReply, PluginIqReplyError,
+    PluginManifest, PluginMessaging, PluginMessagingError, PluginPlanError, PluginResourceError,
+    PluginStanzaInterception, PluginState, PluginStats, PluginTasks, UntypedClientPlugin,
 };
 pub mod request;
 pub(crate) mod signal_flush;
@@ -678,8 +678,8 @@ pub mod prelude {
         PluginCoreEventSubscription, PluginEventEndpointConfig, PluginEventOverflow,
         PluginEventPayloadEncoding, PluginEventRouter, PluginEventSelector,
         PluginEventSubscription, PluginEventTopic, PluginEvents, PluginFuture, PluginHostConfig,
-        PluginInterceptorRegistration, PluginManifest, PluginStanzaInterception,
-        UntypedClientPlugin,
+        PluginInterceptorRegistration, PluginIqInterceptor, PluginIqReply, PluginManifest,
+        PluginStanzaInterception, UntypedClientPlugin,
     };
     pub use crate::request::{IqError, RejectionStanza};
     #[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
