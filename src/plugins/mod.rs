@@ -294,6 +294,12 @@ pub enum PluginPlanError {
         plugin_id: String,
         dependency: String,
     },
+    #[error("plugin `{plugin_id}` capability {capability:?} requires {required:?}")]
+    MissingCapabilityDependency {
+        plugin_id: String,
+        capability: PluginCapability,
+        required: PluginCapability,
+    },
     #[error("plugin dependency cycle involves: {plugins:?}")]
     DependencyCycle { plugins: Vec<String> },
 }
@@ -2263,6 +2269,17 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<(), PluginPlanError> {
             version: manifest.version.clone(),
         });
     }
+    if manifest.capabilities.contains(PluginCapability::IqReply)
+        && !manifest
+            .capabilities
+            .contains(PluginCapability::StanzaInterception)
+    {
+        return Err(PluginPlanError::MissingCapabilityDependency {
+            plugin_id: manifest.id.clone(),
+            capability: PluginCapability::IqReply,
+            required: PluginCapability::StanzaInterception,
+        });
+    }
     Ok(())
 }
 
@@ -4116,6 +4133,36 @@ mod tests {
         ) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
             Box::pin(async { Ok(Arc::new(())) })
         }
+    }
+
+    #[test]
+    fn iq_reply_requires_stanza_interception_at_plan_time() {
+        let manifest = PluginManifest::new("reply-extension", "0.1.0")
+            .with_capability(PluginCapability::IqReply);
+        let invalid = PluginPlan::prepare(vec![PluginRegistration::new(FixedManifestPlugin::<6>(
+            manifest.clone(),
+        ))]);
+        assert!(matches!(
+            invalid,
+            Err(PluginPlanError::MissingCapabilityDependency {
+                ref plugin_id,
+                capability: PluginCapability::IqReply,
+                required: PluginCapability::StanzaInterception,
+            }) if plugin_id == "reply-extension"
+        ));
+
+        let paired = PluginPlan::prepare(vec![PluginRegistration::new(FixedManifestPlugin::<6>(
+            manifest.with_capability(PluginCapability::StanzaInterception),
+        ))])
+        .expect("declared reply requirements")
+        .expect("nonempty plugin plan");
+        assert_eq!(paired.ordered.len(), 1);
+
+        let outbound_only =
+            PluginPlan::prepare(vec![PluginRegistration::new(FixedManifestPlugin::<6>(
+                PluginManifest::new("outbound-only", "0.1.0").with_capability(PluginCapability::Iq),
+            ))]);
+        assert!(matches!(outbound_only, Ok(Some(_))));
     }
 
     struct PanickingManifestPlugin;
