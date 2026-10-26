@@ -4690,7 +4690,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "wa-fetch"
 version = "0.1.0"
-source = "git+https://github.com/oxidezap/whatspec.git?rev=cc148f5ef5c6f151bcb88c987ccb003748ba57e7#cc148f5ef5c6f151bcb88c987ccb003748ba57e7"
+source = "git+https://github.com/oxidezap/whatspec.git?rev=a20b903812df5fbbdf87f3fe3757406e3f2ac685#a20b903812df5fbbdf87f3fe3757406e3f2ac685"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -4700,7 +4700,7 @@ dependencies = [
 [[package]]
 name = "wa-store"
 version = "0.1.0"
-source = "git+https://github.com/oxidezap/whatspec.git?rev=cc148f5ef5c6f151bcb88c987ccb003748ba57e7#cc148f5ef5c6f151bcb88c987ccb003748ba57e7"
+source = "git+https://github.com/oxidezap/whatspec.git?rev=a20b903812df5fbbdf87f3fe3757406e3f2ac685#a20b903812df5fbbdf87f3fe3757406e3f2ac685"
 dependencies = [
  "anyhow",
  "flate2",
@@ -4717,7 +4717,7 @@ dependencies = [
 [[package]]
 name = "wa-text"
 version = "0.1.0"
-source = "git+https://github.com/oxidezap/whatspec.git?rev=cc148f5ef5c6f151bcb88c987ccb003748ba57e7#cc148f5ef5c6f151bcb88c987ccb003748ba57e7"
+source = "git+https://github.com/oxidezap/whatspec.git?rev=a20b903812df5fbbdf87f3fe3757406e3f2ac685#a20b903812df5fbbdf87f3fe3757406e3f2ac685"
 dependencies = [
  "sha2 0.10.9",
 ]
