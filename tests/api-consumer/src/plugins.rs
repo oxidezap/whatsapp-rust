@@ -28,7 +28,7 @@ pub async fn result(reply: PluginIqReply) -> Result<(), PluginIqReplyError> {
 }
 
 pub async fn error(reply: PluginIqReply) -> Result<(), PluginIqReplyError> {
-    reply.error(501).await
+    reply.error(401, "not-authorized").await
 }
 
 pub fn prelude_grant(reply: whatsapp_rust::prelude::PluginIqReply) -> PluginIqReply {

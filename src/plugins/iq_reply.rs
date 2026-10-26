@@ -9,6 +9,14 @@
 //! `parseAndHandleStanza` sends returned replies only while socketId is current.
 //! Those two invariants constrain this grant. Payload schemas remain the
 //! extension author's responsibility; server acceptance is not inferred.
+//!
+//! The code/text error envelope without xmlns or the original query is observed
+//! in the same bundle's `WASmaxOutMdSetRegResponseError`, bytes
+//! 1339066..1339701, and `WASmaxOutMdIQErrorNotAuthorizedMixin`, bytes
+//! 1338746..1339064. That pairing flow uses code=401, text=not-authorized.
+//! The 400..599 SDK subset and extension namespace vocabulary are explicit
+//! plugin policy, not inferred universal WhatsApp behavior. This capability
+//! continues to exclude the md pairing namespace.
 
 use std::sync::atomic::AtomicU8;
 
@@ -114,18 +122,26 @@ impl PluginIqReply {
         self.send("result", children).await
     }
 
-    /// Reply with a protocol error code. This bounded numeric envelope does not
-    /// imply that every namespace accepts every code in the range. The plugin
-    /// must select a code its extension contract defines.
-    pub async fn error(&self, code: u16) -> Result<(), PluginIqReplyError> {
+    /// Reply with an error code and nonempty protocol text.
+    ///
+    /// The envelope is evidenced in a Web pairing response with 401 and
+    /// `not-authorized`; this capability does not handle pairing itself. The
+    /// 400..599 range is an SDK subset. The plugin must select a code/text pair
+    /// its extension namespace defines; not every pair is accepted everywhere.
+    /// Invalid arguments do not reserve or consume the reply grant.
+    pub async fn error(&self, code: u16, text: &str) -> Result<(), PluginIqReplyError> {
         if !(400..=599).contains(&code) {
             return Err(PluginIqReplyError::InvalidErrorCode);
+        }
+        if text.is_empty() {
+            return Err(PluginIqReplyError::InvalidErrorText);
         }
         self.send(
             "error",
             vec![
                 NodeBuilder::new("error")
                     .attr("code", code.to_string())
+                    .attr("text", text.to_owned())
                     .build(),
             ],
         )
@@ -547,36 +563,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_error_reply_preserves_envelope_and_invalid_code_does_not_consume() {
+    async fn set_error_reply_validates_code_and_text_without_consuming_grant() {
         let client = client_with_plugin(Interception::Handled, false, true).await;
         let transport = Arc::new(CapturingMockTransport::new());
         connect(&client, transport.clone());
         let mut node = request();
         node.attrs.insert("type", "set");
         node.attrs.insert("id", "PLUGIN-SET-ERROR");
-        node.attrs.insert("from", "555000123@s.whatsapp.net");
         client.process_node(owned(node)).await;
         let reply = grant(&client);
+        for code in [200, 399, 600] {
+            assert!(matches!(
+                reply.error(code, "not-authorized").await,
+                Err(PluginIqReplyError::InvalidErrorCode)
+            ));
+        }
         assert!(matches!(
-            reply.error(200).await,
-            Err(PluginIqReplyError::InvalidErrorCode)
+            reply.error(401, "").await,
+            Err(PluginIqReplyError::InvalidErrorText)
         ));
         assert!(transport.sent().is_empty());
-        reply.error(501).await.unwrap();
+        // Independent Web evidence fixes this exact error payload. The request
+        // namespace is synthetic: this tests the envelope, not pairing effects
+        // or acceptance of an extension namespace by a server.
+        reply.error(401, "not-authorized").await.unwrap();
         let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
         let node = sent.get();
         assert_eq!(node.get_attr("type").unwrap().as_str(), "error");
         assert_eq!(node.get_attr("id").unwrap().as_str(), "PLUGIN-SET-ERROR");
-        assert_eq!(
-            node.get_attr("to").unwrap().as_str(),
-            "555000123@s.whatsapp.net"
-        );
+        assert_eq!(node.get_attr("to").unwrap().as_str(), "s.whatsapp.net");
         let children = node.children().unwrap();
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].tag.as_ref(), "error");
-        assert_eq!(children[0].get_attr("code").unwrap().as_str(), "501");
+        assert_eq!(children[0].get_attr("code").unwrap().as_str(), "401");
+        assert_eq!(
+            children[0].get_attr("text").unwrap().as_str(),
+            "not-authorized"
+        );
+        assert!(node.get_attr("xmlns").is_none());
         assert!(matches!(
-            reply.error(503).await,
+            reply.error(401, "not-authorized").await,
             Err(PluginIqReplyError::AlreadyUsed)
         ));
         assert_eq!(transport.sent().len(), 1);

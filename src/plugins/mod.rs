@@ -346,6 +346,8 @@ pub enum PluginIqReplyError {
     ConnectionRetired,
     #[error("IQ error codes must be between 400 and 599")]
     InvalidErrorCode,
+    #[error("IQ error text must not be empty")]
+    InvalidErrorText,
     #[error("{0}")]
     Send(#[from] crate::client::ClientError),
 }
@@ -1393,7 +1395,7 @@ impl PluginStanzaInterception {
     /// return promptly. Move the grant into a bounded worker for async work.
     ///
     /// A grant fixes the destination, ID and connection. It can send one result
-    /// with extension-defined children, or an error with a numeric code. It
+    /// with extension-defined children, or an error with a code/text pair. It
     /// cannot initiate IQs, alter the envelope, access storage or send receipts.
     /// `xmlns` must be present and the request must contain exactly one child;
     /// pairing namespace `md` and ping payloads are excluded.
