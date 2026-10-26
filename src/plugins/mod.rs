@@ -47,6 +47,7 @@ const CAP_MESSAGING: u64 = 1 << 2;
 const CAP_IQ: u64 = 1 << 3;
 const CAP_PLUGIN_EVENTS: u64 = 1 << 4;
 const CAP_STANZA_INTERCEPTION: u64 = 1 << 5;
+const CAP_CLIENT_INFO: u64 = 1 << 6;
 const DEFAULT_PLUGIN_INSTALL_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_PLUGIN_CALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PLUGIN_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -61,6 +62,7 @@ pub enum PluginCapability {
     Iq,
     PluginEvents,
     StanzaInterception,
+    ClientInfo,
 }
 
 impl PluginCapability {
@@ -72,6 +74,7 @@ impl PluginCapability {
             Self::Iq => "iq.execute",
             Self::PluginEvents => "events.plugin.publish",
             Self::StanzaInterception => "stanza.intercept",
+            Self::ClientInfo => "client.info.read",
         }
     }
 
@@ -83,6 +86,7 @@ impl PluginCapability {
             Self::Iq => CAP_IQ,
             Self::PluginEvents => CAP_PLUGIN_EVENTS,
             Self::StanzaInterception => CAP_STANZA_INTERCEPTION,
+            Self::ClientInfo => CAP_CLIENT_INFO,
         }
     }
 }
@@ -1523,8 +1527,40 @@ impl PluginIq {
     }
 }
 
+/// Read-only access to the profile and app version used to build `ClientPayload`.
+/// Reads the existing device snapshot; no plugin-specific cache is maintained.
+#[derive(Clone)]
+pub struct PluginClientInfo {
+    client: Weak<Client>,
+}
+
+impl PluginClientInfo {
+    /// Return both values from one coherent device snapshot.
+    /// Remains readable during shutdown so tasks can finish buffered work.
+    /// Profile changes apply to the next handshake. This is configuration,
+    /// not proof that a server has accepted a connection with these values.
+    pub fn identity(
+        &self,
+    ) -> Result<(wacore::client_profile::ClientProfile, (u32, u32, u32)), PluginResourceError> {
+        let client = self
+            .client
+            .upgrade()
+            .ok_or(PluginResourceError::ClientUnavailable)?;
+        let device = client.persistence_manager.get_device_snapshot();
+        Ok((
+            device.client_profile.clone(),
+            (
+                device.app_version_primary,
+                device.app_version_secondary,
+                device.app_version_tertiary,
+            ),
+        ))
+    }
+}
+
 /// Capabilities and already-installed dependencies visible during installation.
 pub struct PluginContext {
+    client_info: Option<PluginClientInfo>,
     plugin_id: String,
     dependencies: HashMap<TypeId, WeakErasedApi>,
     core_events: Option<PluginCoreEvents>,
@@ -1536,6 +1572,10 @@ pub struct PluginContext {
 }
 
 impl PluginContext {
+    pub fn client_info(&self) -> Option<&PluginClientInfo> {
+        self.client_info.as_ref()
+    }
+
     pub fn plugin_id(&self) -> &str {
         &self.plugin_id
     }
@@ -2433,6 +2473,11 @@ impl PluginHost {
         let capabilities = manifest.capabilities;
         let plugin_id: Arc<str> = Arc::from(manifest.id.as_str());
         PluginContext {
+            client_info: capabilities
+                .contains(PluginCapability::ClientInfo)
+                .then(|| PluginClientInfo {
+                    client: client.clone(),
+                }),
             plugin_id: manifest.id.clone(),
             dependencies: apis.dependency_view(&planned.dependency_markers),
             core_events: capabilities
@@ -3178,6 +3223,77 @@ mod tests {
             .with_http_client(MockHttpClient)
     }
 
+    struct ClientInfoPlugin(bool);
+
+    impl ClientPlugin for ClientInfoPlugin {
+        type Api = Option<PluginClientInfo>;
+
+        fn manifest(&self) -> PluginManifest {
+            let manifest = PluginManifest::new("test.client-info", "0.1.0");
+            if self.0 {
+                manifest.with_capability(PluginCapability::ClientInfo)
+            } else {
+                manifest
+            }
+        }
+
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+            Box::pin(async move { Ok(Arc::new(context.client_info().cloned())) })
+        }
+    }
+
+    #[tokio::test]
+    async fn client_info_is_opt_in_coherent_and_does_not_own_the_client() {
+        let without = complete_builder()
+            .await
+            .with_plugin(ClientInfoPlugin(false))
+            .build()
+            .await
+            .unwrap()
+            .into_client();
+        assert!(without.plugin::<ClientInfoPlugin>().unwrap().is_none());
+        let client = complete_builder()
+            .await
+            .with_plugin(ClientInfoPlugin(true))
+            .build()
+            .await
+            .unwrap()
+            .into_client();
+        let api = client.plugin::<ClientInfoPlugin>().unwrap();
+        let info = api.as_ref().as_ref().unwrap();
+        client
+            .set_client_profile(wacore::client_profile::ClientProfile::android("13"))
+            .await;
+        client
+            .persistence_manager
+            .process_command(wacore::store::commands::DeviceCommand::SetAppVersion((
+                2, 3000, 123,
+            )))
+            .await;
+        let (profile, version) = info.identity().unwrap();
+        let payload = client
+            .persistence_manager
+            .get_device_snapshot()
+            .get_client_payload();
+        assert_eq!(profile.os_version, payload.user_agent.os_version);
+        assert_eq!(
+            version,
+            (
+                payload.user_agent.app_version.primary(),
+                payload.user_agent.app_version.secondary(),
+                payload.user_agent.app_version.tertiary()
+            )
+        );
+        client.shutdown().await;
+        assert_eq!(info.identity().unwrap().1, version);
+        drop(client);
+        assert!(matches!(
+            info.identity(),
+            Err(PluginResourceError::ClientUnavailable)
+        ));
+        without.shutdown().await;
+    }
+
     #[test]
     fn capability_bits_are_distinct_and_composable() {
         let capabilities = [
@@ -3187,6 +3303,7 @@ mod tests {
             PluginCapability::Iq,
             PluginCapability::PluginEvents,
             PluginCapability::StanzaInterception,
+            PluginCapability::ClientInfo,
         ];
         let combined = capabilities
             .into_iter()

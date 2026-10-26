@@ -93,7 +93,8 @@ pub const WAM_PLUGIN_ID: &str = "wa.wam";
 /// How this plugin is configured.
 #[derive(Clone)]
 pub struct WamConfig {
-    /// What this client says about itself in a buffer's globals.
+    /// Additional globals for this client. The installed plugin reads app version,
+    /// platform and OS version from the client when starting each buffer.
     pub identity: WamIdentity,
     /// Where sequence numbers and undelivered buffers live.
     pub store: Arc<dyn WamStore>,
@@ -250,6 +251,7 @@ impl ClientPlugin for WamPlugin {
             .with_capability(PluginCapability::CoreEvents)
             .with_capability(PluginCapability::Tasks)
             .with_capability(PluginCapability::Iq)
+            .with_capability(PluginCapability::ClientInfo)
     }
 
     fn install(&self, context: PluginContext) -> PluginFuture<'_, Result<Arc<Self::Api>>> {
@@ -264,11 +266,18 @@ impl ClientPlugin for WamPlugin {
                 .context("tasks capability is missing")?;
             let iq = context.iq().cloned().context("iq capability is missing")?;
 
-            let runtime = Arc::new(WamRuntime::new(
-                self.config.identity.clone(),
-                self.config.store.clone(),
-                self.config.max_queued_events,
-            ));
+            let client_info = context
+                .client_info()
+                .cloned()
+                .context("client-info capability is missing")?;
+            let runtime = Arc::new(
+                WamRuntime::new(
+                    self.config.identity.clone(),
+                    self.config.store.clone(),
+                    self.config.max_queued_events,
+                )
+                .with_client_info(client_info),
+            );
             self.runtime
                 .set(runtime.clone())
                 .map_err(|_| anyhow::anyhow!("the wam plugin was installed more than once"))?;
