@@ -17,9 +17,9 @@ mod mex_operations_unlisted;
 pub mod newsletter;
 pub mod node;
 pub mod passive;
-mod pilots;
 #[cfg(test)]
 mod pilot_conformance;
+mod pilots;
 pub mod prekeys;
 pub mod privacy;
 pub mod profile;
