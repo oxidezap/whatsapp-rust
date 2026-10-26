@@ -1,5 +1,6 @@
 //! Capture-backed repository tasks, launched by `cargo xt` in release mode.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
+mod capture_http;
 mod conformance;
 mod derive_mlow;
 mod media;

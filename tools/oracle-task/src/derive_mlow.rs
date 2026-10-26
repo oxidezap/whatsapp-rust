@@ -199,7 +199,12 @@ pub(crate) fn fetch(root: &Path, captures: Option<&[&str]>) -> Result<()> {
     let wanted: Vec<wa_store::capture::WasmCapture> = serde_json::from_value(Value::Array(wanted))?;
     let sources: Vec<wa_store::capture::ReleaseSource> =
         serde_json::from_value(lock["sources"].clone())?;
-    wa_store::capture::restore_captures(&wanted, &sources, &root.join(".cache/wa-wasm"))
+    wa_store::capture::restore_captures_with(
+        &crate::capture_http::UreqClient::new(),
+        &wanted,
+        &sources,
+        &root.join(".cache/wa-wasm"),
+    )
 }
 
 pub(crate) fn verify(root: &Path, out: &Path, capture: &str, mode: VerifyMode) -> Result<()> {

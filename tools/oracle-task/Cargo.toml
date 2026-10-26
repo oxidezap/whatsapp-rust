@@ -7,6 +7,7 @@ publish = false
 license = "MIT"
 
 [dependencies]
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 anyhow = { workspace = true, features = ["std"] }
 clap = { version = "4", features = ["derive"] }
 serde = { workspace = true, features = ["derive"] }
@@ -21,3 +22,7 @@ hex.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
