@@ -1561,7 +1561,7 @@ impl Client {
         // Re-read before each remaining step, and hand back the socket opened
         // for a client that is no longer there.
         if let Some(refusal) = self.connect_refusal(attempt_pause_generation) {
-            transport.disconnect().await;
+            self.close_transport_bounded(&transport).await;
             return Err(refusal);
         }
 
@@ -1579,13 +1579,13 @@ impl Client {
         {
             Ok(socket) => socket,
             Err(e) => {
-                transport.disconnect().await;
+                self.close_transport_bounded(&transport).await;
                 return Err(e.into());
             }
         };
 
         if let Some(refusal) = self.connect_refusal(attempt_pause_generation) {
-            transport.disconnect().await;
+            self.close_transport_bounded(&transport).await;
             return Err(refusal);
         }
 
@@ -1636,7 +1636,7 @@ impl Client {
         // Closed outside the section: this one does write to the network.
         if let Some((orphan, refusal)) = orphan {
             if let Some(orphan) = orphan {
-                orphan.disconnect().await;
+                self.close_transport_bounded(&orphan).await;
             }
             return Err(refusal);
         }
@@ -3622,6 +3622,225 @@ mod tests {
             }))
             .await;
         (client, entered_rx, release_tx)
+    }
+
+    /// A successful dial held behind a barrier, with a close that never
+    /// acknowledges cancellation. No connection is opened outside the mock.
+    struct AbandonedDial {
+        entered: async_channel::Sender<()>,
+        release: async_channel::Receiver<()>,
+        transport: Arc<dyn crate::transport::Transport>,
+        invalid_handshake: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::transport::TransportFactory for AbandonedDial {
+        async fn create_transport(
+            &self,
+        ) -> Result<(
+            Arc<dyn crate::transport::Transport>,
+            async_channel::Receiver<crate::transport::TransportEvent>,
+        )> {
+            self.entered.send(()).await.expect("observe dial");
+            self.release.recv().await.expect("release dial");
+            let (events, receiver) = async_channel::bounded(1);
+            if self.invalid_handshake {
+                // Empty protobuf ServerHello is invalid, independently of
+                // certificates, identities and the generated ephemeral key.
+                events
+                    .send(crate::transport::TransportEvent::DataReceived(
+                        bytes::Bytes::from_static(&[0, 0, 0]),
+                    ))
+                    .await
+                    .expect("enqueue malformed handshake");
+            }
+            Ok((self.transport.clone(), receiver))
+        }
+    }
+
+    fn abandoned_dial(
+        transport: Arc<dyn crate::transport::Transport>,
+        invalid_handshake: bool,
+    ) -> (
+        Arc<AbandonedDial>,
+        async_channel::Receiver<()>,
+        async_channel::Sender<()>,
+    ) {
+        let (entered, observer) = async_channel::bounded(4);
+        let (release, barrier) = async_channel::bounded(4);
+        (
+            Arc::new(AbandonedDial {
+                entered,
+                release: barrier,
+                transport,
+                invalid_handshake,
+            }),
+            observer,
+            release,
+        )
+    }
+
+    async fn client_with_abandoned_dial(factory: Arc<AbandonedDial>) -> Arc<Client> {
+        let persistence = Arc::new(
+            PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                .await
+                .expect("test persistence"),
+        );
+        let (client, _) = Client::builder()
+            .with_runtime(crate::runtime_impl::TokioRuntime)
+            .with_persistence_manager(persistence)
+            .with_transport_factory_arc(factory)
+            .with_http_client(crate::test_utils::MockHttpClient)
+            .with_version_override((2, 3000, 123456789))
+            .build()
+            .await
+            .expect("test client")
+            .into_parts();
+        client.enter_live_mode_for_tests();
+        client
+    }
+
+    async fn assert_abandoned_attempt_cleared(client: &Client) {
+        assert!(!client.is_connecting.load(Ordering::SeqCst));
+        assert!(!client.is_socket_connected());
+        assert!(client.transport.lock().await.is_none());
+        assert!(client.transport_events.lock().await.is_none());
+        assert!(
+            client
+                .noise_socket
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_none()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abandoned_dial_stalled_close_preserves_pause_and_resume_generation() {
+        for resume_before_dial_returns in [false, true] {
+            let transport = Arc::new(crate::transport::mock::StallingMockTransport::new());
+            let (factory, entered, release) = abandoned_dial(transport.clone(), false);
+            let client = client_with_abandoned_dial(factory).await;
+            let attempt = tokio::spawn({
+                let client = client.clone();
+                async move { client.connect().await.map(|_| ()) }
+            });
+            next_connect_attempt(&entered).await;
+            client.pause().await;
+            if resume_before_dial_returns {
+                client.resume();
+            }
+            release.send(()).await.expect("release dial");
+            let started = tokio::time::Instant::now();
+            let result = tokio::time::timeout(Duration::from_secs(3), attempt)
+                .await
+                .expect("stalled close must respect the two-second deadline")
+                .expect("connect task");
+            assert!(matches!(result, Err(ConnectError::Paused)));
+            assert_eq!(started.elapsed(), Client::TRANSPORT_CLOSE_TIMEOUT);
+            assert_eq!(transport.disconnects_started(), 1);
+            assert_abandoned_attempt_cleared(&client).await;
+
+            // The RAII connecting guard must admit the next generation after
+            // resume. Shut it down while dial is parked to avoid a handshake.
+            client.resume();
+            let next = tokio::spawn({
+                let client = client.clone();
+                async move { client.connect().await.map(|_| ()) }
+            });
+            next_connect_attempt(&entered).await;
+            client.shutdown().await;
+            release.send(()).await.expect("release next dial");
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(3), next)
+                    .await
+                    .expect("next generation bounded close")
+                    .expect("next connect task"),
+                Err(ConnectError::Shutdown)
+            ));
+            assert_abandoned_attempt_cleared(&client).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abandoned_dial_stalled_close_preserves_shutdown() {
+        let transport = Arc::new(crate::transport::mock::StallingMockTransport::new());
+        let (factory, entered, release) = abandoned_dial(transport.clone(), false);
+        let client = client_with_abandoned_dial(factory).await;
+        let attempt = tokio::spawn({
+            let client = client.clone();
+            async move { client.connect().await.map(|_| ()) }
+        });
+        next_connect_attempt(&entered).await;
+        client.shutdown().await;
+        release.send(()).await.expect("release dial");
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(3), attempt)
+                .await
+                .expect("shutdown refusal must outlive only the close budget")
+                .expect("connect task"),
+            Err(ConnectError::Shutdown)
+        ));
+        assert_eq!(transport.disconnects_started(), 1);
+        assert_abandoned_attempt_cleared(&client).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abandoned_dial_stalled_close_allows_bot_shutdown_to_join_owner() {
+        let transport = Arc::new(crate::transport::mock::StallingMockTransport::new());
+        let (factory, entered, release) = abandoned_dial(transport.clone(), false);
+        let bot = crate::bot::Bot::builder()
+            .with_backend_arc(crate::test_utils::create_test_backend().await)
+            .with_transport_factory_arc(factory)
+            .with_http_client(crate::test_utils::MockHttpClient)
+            .with_runtime(crate::runtime_impl::TokioRuntime)
+            .with_version((2, 3000, 123456789))
+            .build()
+            .await
+            .expect("test bot");
+        let client = bot.client();
+        let handle = bot.spawn();
+        next_connect_attempt(&entered).await;
+        let shutdown = tokio::spawn(handle.shutdown());
+        crate::test_utils::poll_until("terminal shutdown requested", || client.is_terminal()).await;
+        release.send(()).await.expect("release dial");
+        let report = tokio::time::timeout(Duration::from_secs(3), shutdown)
+            .await
+            .expect("BotHandle must join the abandoned attempt after bounded close")
+            .expect("shutdown task");
+        assert!(matches!(
+            report.run,
+            crate::bot::BotRunOutcome::Completed(RunCompletionReason::ShutdownRequested)
+        ));
+        assert_eq!(transport.disconnects_started(), 1);
+        assert_abandoned_attempt_cleared(&client).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abandoned_dial_stalled_close_preserves_invalid_handshake_error() {
+        let (transport, _close_entered, _close_release, closes) = parked_transport();
+        let (factory, entered, release) = abandoned_dial(transport, true);
+        let client = client_with_abandoned_dial(factory).await;
+        let attempt = tokio::spawn({
+            let client = client.clone();
+            async move { client.connect().await.map(|_| ()) }
+        });
+        next_connect_attempt(&entered).await;
+        release.send(()).await.expect("release dial");
+        let result = tokio::time::timeout(Duration::from_secs(3), attempt)
+            .await
+            .expect("handshake failure cleanup must respect the close deadline")
+            .expect("connect task");
+        assert!(
+            matches!(
+                &result,
+                Err(ConnectError::Handshake(handshake::HandshakeError::Core(
+                    handshake::CoreHandshakeError::CertVerification(message)
+                ))) if message == "Error parsing server hello: Handshake response is missing required parts"
+            ),
+            "the original malformed handshake error must survive cleanup: {result:?}"
+        );
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        assert_abandoned_attempt_cleared(&client).await;
     }
 
     /// Blocks until the run loop has reached its next connect attempt.
