@@ -205,8 +205,8 @@ pub struct WamStats {
     pub sampled_out: u64,
     /// Events dropped because the queue was full.
     pub dropped: u64,
-    /// Events lost because no buffer could be started to hold them: the store
-    /// would not issue a sequence number, or a global no longer belongs on the
+    /// Events lost because identity was unavailable, the store would not issue
+    /// a sequence number, or a global no longer belongs on the
     /// channel. Counted apart from [`Self::dropped`] because the two say
     /// different things about a client, and the fix for one is not the fix for
     /// the other.
@@ -233,6 +233,7 @@ struct Shared {
 /// The plugin's telemetry runtime.
 pub struct WamRuntime {
     identity: WamIdentity,
+    client_info: Option<whatsapp_rust::PluginClientInfo>,
     store: Arc<dyn WamStore>,
     max_queued_events: usize,
     shared: Mutex<Shared>,
@@ -265,11 +266,10 @@ pub enum TickKind {
 
 /// Why no buffer could be started.
 ///
-/// The two are different faults with different owners: a store that will not
-/// issue a sequence number, and a catalog whose global no longer belongs on the
-/// channel this buffer is for.
+/// Identity access, sequence allocation and catalog validation fail independently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NoBuffer {
+    Identity,
     Store,
     Catalog,
 }
@@ -313,6 +313,7 @@ impl WamRuntime {
         let durable = store.is_durable();
         Self {
             identity,
+            client_info: None,
             store,
             max_queued_events: max_queued_events.max(1),
             shared: Mutex::new(Shared {
@@ -324,6 +325,11 @@ impl WamRuntime {
                 store_losses: 0,
             }),
         }
+    }
+
+    pub(crate) fn with_client_info(mut self, client_info: whatsapp_rust::PluginClientInfo) -> Self {
+        self.client_info = Some(client_info);
+        self
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Shared> {
@@ -562,7 +568,19 @@ impl WamRuntime {
             }
         };
         let mut buffer = WamBuffer::new(Channel::Regular, STREAM_ID, sequence);
-        for global in self.identity.resolved_for(Channel::Regular) {
+        let mut identity = self.identity.clone();
+        if let Some(info) = &self.client_info {
+            let (profile, (primary, secondary, tertiary)) = info.identity().map_err(|err| {
+                warn!("wam: cannot read client identity: {err}");
+                NoBuffer::Identity
+            })?;
+            let current =
+                WamIdentity::from_profile(&profile, format!("{primary}.{secondary}.{tertiary}"));
+            identity.app_version = current.app_version;
+            identity.platform = current.platform;
+            identity.os_version = current.os_version;
+        }
+        for global in identity.resolved_for(Channel::Regular) {
             if let Err(err) = buffer.set_global(global.def, global.value.as_ref()) {
                 // The identity already filters by channel, so the only way here
                 // is a catalog change that moved a global off the regular
@@ -888,6 +906,128 @@ mod tests {
     use super::*;
     use crate::store::{InMemoryWamStore, WamStoreError};
     use std::sync::Mutex as StdMutex;
+
+    struct VersionHttp(std::sync::atomic::AtomicU32);
+
+    #[async_trait]
+    impl whatsapp_rust::http::HttpClient for VersionHttp {
+        async fn execute(
+            &self,
+            _: whatsapp_rust::http::HttpRequest,
+        ) -> anyhow::Result<whatsapp_rust::http::HttpResponse> {
+            let revision = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(whatsapp_rust::http::HttpResponse::new(
+                200,
+                format!("client_revision:{revision};").into_bytes(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn installed_identity_follows_resolution_and_keeps_finished_buffers() {
+        use crate::{WamConfig, WamPlugin};
+        use whatsapp_rust::store::persistence_manager::PersistenceManager;
+        use whatsapp_rust::version::resolve_and_update_version;
+        use whatsapp_rust::wacore::{client_profile::ClientProfile, store::InMemoryBackend};
+        use whatsapp_rust::{Client, TokioRuntime};
+
+        let persistence = Arc::new(
+            PersistenceManager::new(Arc::new(InMemoryBackend::new()))
+                .await
+                .unwrap(),
+        );
+        let http: Arc<dyn whatsapp_rust::http::HttpClient> =
+            Arc::new(VersionHttp(std::sync::atomic::AtomicU32::new(111)));
+        let client = Client::builder()
+            .with_runtime(TokioRuntime)
+            .with_transport_factory(whatsapp_rust::transport::TokioWebSocketTransportFactory::new())
+            .with_http_client_arc(http.clone())
+            .with_persistence_manager(persistence.clone())
+            .with_plugin(WamPlugin::new(WamConfig {
+                identity: WamIdentity {
+                    device_name: Some("synthetic desktop".into()),
+                    service_improvement_opt_out: Some(false),
+                    ..WamIdentity::web()
+                },
+                ..WamConfig::default()
+            }))
+            .build()
+            .await
+            .unwrap()
+            .into_client();
+        let runtime = &client.plugin::<WamPlugin>().unwrap().runtime;
+        resolve_and_update_version(&persistence, &http, None)
+            .await
+            .unwrap();
+        let old = encoded_identity(runtime.start_buffer().await.unwrap());
+        assert!(old.windows(b"2.3000.111".len()).any(|s| s == b"2.3000.111"));
+        // A reconnect inside the cache window does not fetch another revision.
+        resolve_and_update_version(&persistence, &http, None)
+            .await
+            .unwrap();
+        assert_eq!(http_version(&persistence), 111);
+        // Expire the existing cache through the supported snapshot publication path.
+        persistence
+            .modify_device_async(|device| {
+                Box::pin(async move { device.app_version_last_fetched_ms = 1 })
+            })
+            .await;
+        resolve_and_update_version(&persistence, &http, None)
+            .await
+            .unwrap();
+        assert_eq!(http_version(&persistence), 112);
+        client
+            .set_client_profile(ClientProfile::android("13"))
+            .await;
+        let new = encoded_identity(runtime.start_buffer().await.unwrap());
+        let mut expected = WamIdentity::from_profile(&ClientProfile::android("13"), "2.3000.112");
+        expected.device_name = Some("synthetic desktop".into());
+        expected.service_improvement_opt_out = Some(false);
+        let mut buffer = WamBuffer::new(Channel::Regular, STREAM_ID, 2);
+        for global in expected.resolved_for(Channel::Regular) {
+            buffer
+                .set_global(global.def, global.value.as_ref())
+                .unwrap();
+        }
+        assert_eq!(new, encoded_identity(buffer));
+        resolve_and_update_version(&persistence, &http, Some((2, 3000, 333)))
+            .await
+            .unwrap();
+        let overridden = encoded_identity(runtime.start_buffer().await.unwrap());
+        assert!(
+            overridden
+                .windows(b"2.3000.333".len())
+                .any(|s| s == b"2.3000.333")
+        );
+        // Retained bytes still carry the identity under which they were created.
+        runtime.retain(old.clone()).await;
+        let uploader = ScriptedUploader::default();
+        runtime
+            .drain_pending(
+                &mut WamWriter::default(),
+                &uploader,
+                1000,
+                TickKind::Scheduled,
+            )
+            .await;
+        assert_eq!(uploader.seen(), vec![old]);
+        assert!(runtime.store.pending().await.unwrap().is_empty());
+        client.shutdown().await;
+        assert!(runtime.start_buffer().await.is_ok());
+    }
+
+    fn encoded_identity(mut buffer: WamBuffer) -> Vec<u8> {
+        buffer
+            .write_event(&events::WebcSocketConnect::default(), 123, 1)
+            .unwrap();
+        buffer.into_bytes()
+    }
+
+    fn http_version(
+        persistence: &whatsapp_rust::store::persistence_manager::PersistenceManager,
+    ) -> u32 {
+        persistence.get_device_snapshot().app_version_tertiary
+    }
 
     /// An uploader whose answers a test scripts, recording what it was given.
     #[derive(Default)]

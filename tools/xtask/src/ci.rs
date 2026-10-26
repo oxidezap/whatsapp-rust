@@ -325,6 +325,28 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
 mod tests {
     use super::*;
     #[test]
+    fn plugins_declare_the_workspace_license_for_downstream_audits() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let meta = metadata(&root).unwrap();
+        let packages = meta["packages"].as_array().unwrap();
+        let sdk = packages
+            .iter()
+            .find(|p| p["name"] == "whatsapp-rust")
+            .unwrap();
+        let license = sdk["license"].as_str().unwrap();
+        let plugins_dir = Path::new(meta["workspace_root"].as_str().unwrap()).join("plugins");
+        let plugins: Vec<_> = packages
+            .iter()
+            .filter(|p| Path::new(p["manifest_path"].as_str().unwrap()).starts_with(&plugins_dir))
+            .collect();
+        assert!(!plugins.is_empty());
+        for plugin in plugins {
+            // publish = false does not exempt a dependency from downstream license audits.
+            assert_eq!(plugin["license"], license, "{}", plugin["name"]);
+        }
+    }
+
+    #[test]
     fn security_and_backend_features_cannot_join_the_native_suite() {
         let meta = json!({"packages":[{"name":"sample","features":{"default":[],"danger-skip-cert":[],"tracing":[],"tracing-pii":[],"js":[],"alpha":[]}}]});
         assert_eq!(feature_names(&meta, "sample").unwrap(), "alpha,tracing");

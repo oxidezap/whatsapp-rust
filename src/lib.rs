@@ -536,7 +536,7 @@ pub mod plugins;
 #[cfg(feature = "plugins")]
 #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
 pub use plugins::{
-    ClientPlugin, PluginCapabilities, PluginCapability, PluginConnectionScope,
+    ClientPlugin, PluginCapabilities, PluginCapability, PluginClientInfo, PluginConnectionScope,
     PluginConnectionTasks, PluginContext, PluginCoreEventSubscription, PluginCoreEvents,
     PluginEventEndpointConfig, PluginEventEndpointStats, PluginEventEnvelope, PluginEventOverflow,
     PluginEventPayloadEncoding, PluginEventPublishError, PluginEventPublishReport,

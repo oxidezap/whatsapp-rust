@@ -48,13 +48,9 @@ impl GlobalValueOwned {
 
 /// What this client says about itself in a WAM buffer.
 ///
-/// # What it does not guarantee
-///
-/// That the values match what the server was told at pairing. They do when the
-/// identity is built with [`from_profile`](Self::from_profile) from the same
-/// [`ClientProfile`] the client was built with, and nothing checks it when it is
-/// not: the plugin cannot read the client's configuration through any
-/// capability it holds.
+/// The installed plugin refreshes app version, platform and OS version from
+/// the client's device snapshot when starting a buffer. Additional globals
+/// remain caller-supplied. A standalone runtime uses this identity as given.
 #[derive(Debug, Clone)]
 pub struct WamIdentity {
     /// `appVersion`: the WhatsApp build this client announces.
