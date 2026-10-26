@@ -111,6 +111,7 @@ impl ProtocolStore for PendingBackend {
         fn delete_pending_inbound<'s, 'a, 'b, 'c>(this: &'s Self, chat: &'a str, sender: &'b str, id: &'c str) -> Result<()>;
         fn delete_expired_pending_inbound<'s>(this: &'s Self, cutoff_timestamp: i64) -> Result<u32>;
         fn read_pending_inbound_bounded<'s, 'a>(this: &'s Self, key: PendingInboundKey<'a>, max_bytes: usize, lease: PendingInboundLease) -> Result<Option<PendingInboundRecord>>;
+        fn read_pending_inbound_group_bounded<'s, 'a>(this: &'s Self, key: PendingInboundKey<'a>, max_bytes: usize, lease: PendingInboundLease) -> Result<Option<(String, PendingInboundRecord)>>;
         fn replace_pending_inbound_if<'s, 'a>(this: &'s Self, key: PendingInboundKey<'a>, expected: PendingInboundRevision, replacement: PendingInboundPayload, max_bytes: usize) -> Result<PendingInboundMutation>;
         fn delete_pending_inbound_if<'s, 'a>(this: &'s Self, key: PendingInboundKey<'a>, expected: PendingInboundRevision, max_bytes: usize, lease: PendingInboundLease) -> Result<PendingInboundMutation>;
         fn store_pending_inbound_batch<'s, 'a, 'b>(this: &'s Self, rows: &'a [PendingInboundRow<'b>]) -> Result<()>;

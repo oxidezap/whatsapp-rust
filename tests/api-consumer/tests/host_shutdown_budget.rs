@@ -89,12 +89,13 @@ async fn host_deadline_keeps_shutdown_owned_until_save_and_release_finish() {
     let release = client.store_release();
     let mut released = Box::pin(release.wait());
     let mut shutdown = Box::pin(client.shutdown());
+    tokio::select! {
+        started = began.recv() => started.unwrap(),
+        _ = shutdown.as_mut() => panic!("shutdown completed before the save parked"),
+        _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("shutdown did not reach the save"),
+    }
     // Borrow the pinned future so expiry stops waiting without cancelling cleanup.
     let observation = tokio::time::timeout(Duration::from_millis(10), shutdown.as_mut()).await;
-    tokio::time::timeout(Duration::from_secs(2), began.recv())
-        .await
-        .unwrap()
-        .unwrap();
     assert!(
         observation.is_err(),
         "an elapsed host budget means cleanup pending, with no durability verdict"
@@ -208,4 +209,31 @@ async fn store_release_waits_for_saver_worker_after_host_drops_manager() {
         .unwrap();
     assert_eq!(*backend.commits.lock().unwrap(), ["worker owned"]);
     drop(saver);
+}
+
+#[tokio::test]
+async fn backend_decorator_preserves_bounded_group_reads() {
+    use wacore::store::traits::{PendingInboundKey, PendingInboundLease, ProtocolStore};
+
+    let (backend, _, _) = PendingBackend::new(false, 1);
+    let chat = "120363000000000001@g.us";
+    backend
+        .store_pending_inbound(chat, "200:75@lid", "fixture", b"pending")
+        .await
+        .unwrap();
+    let (sender, record) = backend
+        .read_pending_inbound_group_bounded(
+            PendingInboundKey {
+                chat,
+                sender: "200@lid",
+                id: "fixture",
+            },
+            16,
+            PendingInboundLease::new(Arc::new(())),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sender, "200:75@lid");
+    assert_eq!(record.bytes(), b"pending");
 }
