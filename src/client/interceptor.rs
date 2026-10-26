@@ -53,22 +53,18 @@
 //!
 //! # Acknowledgement
 //!
-//! A claim does not change what the server is owed. Where the client would have
-//! acked, it still acks; where it would have nacked a tag it does not model,
-//! the claim turns that into an ack, because someone did handle it.
-//! Both need `id` and `from`: without them there is nothing to
-//! address, and the client would not have answered either.
+//! Claims preserve the response class:
 //!
-//! A tag the client *does* model but answers some other way is answered by
-//! nobody once claimed. A direct `<message>` draws a delivery `<receipt>` and
-//! an `<iq>` draws an `<iq type="result">`; a generic `<ack>` is neither, so
-//! the client does not send one. Claiming those means owing the reply.
+//! - Direct/group messages and IQ requests receive no generic ACK. The claimant
+//!   owns decryption/session state and the appropriate receipt or IQ response.
+//! - Newsletter/status messages, receipts, notifications, calls and unknown tags
+//!   receive a transport ACK when `id` and `from` are present. Message/status ACKs
+//!   also require the local device PN. This SDK fallback is not a Web-equivalence
+//!   or server redelivery guarantee.
 //!
-//! `<receipt>`, `<notification>` and `<call>` are not in that group: the client
-//! answers those with a transport `<ack>` already, so a claim leaves the ack
-//! exactly where it was. When a group notification durability hook is configured,
-//! its commit gate runs first: a failed or stale capture reaches neither
-//! interceptors nor the ACK path.
+//! A configured group notification capture must commit before interception and
+//! ACK. Failed or retired captures reach neither path. An ACK does not establish
+//! application persistence.
 //!
 //! # Cost
 //!
