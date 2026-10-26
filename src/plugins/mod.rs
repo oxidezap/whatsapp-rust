@@ -1367,8 +1367,8 @@ impl PluginCoreEvents {
 ///
 /// Interception runs before the built-in pipeline, so a claimed stanza is one
 /// the client did no work on at all. Claiming a Signal message transfers
-/// decryption, session state and receipt handling to the plugin. Message/IQ
-/// claims receive no generic ACK; other classes follow the response rules in
+/// decryption, session state and receipt handling to the plugin. Direct/group
+/// messages and IQ claims receive no generic ACK; other classes follow the rules in
 /// [`crate::client::interceptor`]. Claims do not establish server redelivery
 /// policy. Match narrowly.
 #[derive(Clone)]
