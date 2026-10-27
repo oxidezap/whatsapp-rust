@@ -5,8 +5,9 @@ use anyhow::{Result, ensure};
 use bytes::Bytes;
 use std::sync::Arc;
 use std::sync::{Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use wacore::appstate::patch_decode::{PatchList, WAPatchName};
+use wacore::time::Instant;
 use waproto::whatsapp as wa;
 
 /// Four retained, authenticated blobs using the production app-state prefetch.
@@ -50,7 +51,7 @@ impl PrefetchHarness {
             hosts: vec![crate::mediaconn::MediaConnHost::new(
                 "synthetic.invalid".into(),
             )],
-            fetched_at: wacore::time::Instant::now(),
+            fetched_at: Instant::now(),
         });
         let lists = (0..4)
             .map(|index| {
