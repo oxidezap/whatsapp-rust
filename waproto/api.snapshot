@@ -20182,6 +20182,7 @@ const tags::session_structure::SENDER_CHAIN u32 = 6
 const tags::session_structure::SESSION_VERSION u32 = 1
 const tags::session_structure::chain::CHAIN_KEY u32 = 3
 const tags::session_structure::chain::MESSAGE_KEYS u32 = 4
+const tags::session_structure::chain::MESSAGE_KEY_LIMIT u32 = 100
 const tags::session_structure::chain::SENDER_RATCHET_KEY u32 = 1
 const tags::session_structure::chain::SENDER_RATCHET_KEY_PRIVATE u32 = 2
 const tags::session_structure::chain::chain_key::INDEX u32 = 1
@@ -29898,10 +29899,12 @@ field whatsapp::sender_key_state_structure::SenderSigningKey::public :: core :: 
 field whatsapp::sender_key_state_structure::SenderSigningKeyView::private :: core :: option :: Option < & 'a [u8] >
 field whatsapp::sender_key_state_structure::SenderSigningKeyView::public :: core :: option :: Option < & 'a [u8] >
 field whatsapp::session_structure::Chain::chain_key :: buffa :: MessageField < whatsapp::session_structure::chain::ChainKey >
+field whatsapp::session_structure::Chain::message_key_limit :: core :: option :: Option < u32 >
 field whatsapp::session_structure::Chain::message_keys :: buffa :: alloc :: vec :: Vec < whatsapp::session_structure::chain::MessageKey , >
 field whatsapp::session_structure::Chain::sender_ratchet_key :: core :: option :: Option < :: buffa :: alloc :: vec :: Vec < u8 > >
 field whatsapp::session_structure::Chain::sender_ratchet_key_private :: core :: option :: Option < :: buffa :: alloc :: vec :: Vec < u8 > , >
 field whatsapp::session_structure::ChainView::chain_key :: buffa :: MessageFieldView < whatsapp::session_structure::chain::ChainKeyView < 'a , > , >
+field whatsapp::session_structure::ChainView::message_key_limit :: core :: option :: Option < u32 >
 field whatsapp::session_structure::ChainView::message_keys :: buffa :: RepeatedView < 'a , whatsapp::session_structure::chain::MessageKeyView < 'a , > , >
 field whatsapp::session_structure::ChainView::sender_ratchet_key :: core :: option :: Option < & 'a [u8] >
 field whatsapp::session_structure::ChainView::sender_ratchet_key_private :: core :: option :: Option < & 'a [u8] >
@@ -33249,6 +33252,7 @@ field-presence .whatsapp.SessionStructure.Chain.MessageKey.iv=Explicit
 field-presence .whatsapp.SessionStructure.Chain.MessageKey.macKey=Explicit
 field-presence .whatsapp.SessionStructure.Chain.MessageKey.seed=Explicit
 field-presence .whatsapp.SessionStructure.Chain.chainKey=Explicit
+field-presence .whatsapp.SessionStructure.Chain.messageKeyLimit=Explicit
 field-presence .whatsapp.SessionStructure.Chain.senderRatchetKey=Explicit
 field-presence .whatsapp.SessionStructure.Chain.senderRatchetKeyPrivate=Explicit
 field-presence .whatsapp.SessionStructure.PendingKeyExchange.localBaseKey=Explicit
@@ -54461,6 +54465,7 @@ inherent-method-bound whatsapp::sender_key_state_structure::SenderSigningKeyOwne
 inherent-method-bound whatsapp::sender_key_state_structure::SenderSigningKeyOwnedView::public  
 inherent-method-bound whatsapp::sender_key_state_structure::SenderSigningKeyOwnedView::to_owned_message  
 inherent-method-bound whatsapp::sender_key_state_structure::SenderSigningKeyOwnedView::view  
+inherent-method-bound whatsapp::session_structure::Chain::with_message_key_limit  
 inherent-method-bound whatsapp::session_structure::Chain::with_sender_ratchet_key  
 inherent-method-bound whatsapp::session_structure::Chain::with_sender_ratchet_key_private  
 inherent-method-bound whatsapp::session_structure::ChainOwnedView::bytes  
@@ -54469,6 +54474,7 @@ inherent-method-bound whatsapp::session_structure::ChainOwnedView::decode
 inherent-method-bound whatsapp::session_structure::ChainOwnedView::decode_with_options  
 inherent-method-bound whatsapp::session_structure::ChainOwnedView::from_owned  
 inherent-method-bound whatsapp::session_structure::ChainOwnedView::into_bytes  
+inherent-method-bound whatsapp::session_structure::ChainOwnedView::message_key_limit  
 inherent-method-bound whatsapp::session_structure::ChainOwnedView::message_keys  
 inherent-method-bound whatsapp::session_structure::ChainOwnedView::sender_ratchet_key  
 inherent-method-bound whatsapp::session_structure::ChainOwnedView::sender_ratchet_key_private  
@@ -66709,6 +66715,7 @@ method whatsapp::sender_key_state_structure::SenderSigningKeyOwnedView fn privat
 method whatsapp::sender_key_state_structure::SenderSigningKeyOwnedView fn public (& self) -> :: core :: option :: Option < & '_ [u8] >
 method whatsapp::sender_key_state_structure::SenderSigningKeyOwnedView fn to_owned_message (& self ,) -> whatsapp::sender_key_state_structure::SenderSigningKey
 method whatsapp::sender_key_state_structure::SenderSigningKeyOwnedView fn view (& self) -> & SenderSigningKeyView < '_ >
+method whatsapp::session_structure::Chain fn with_message_key_limit (mut self , value : u32) -> Self
 method whatsapp::session_structure::Chain fn with_sender_ratchet_key (mut self , value : impl Into < :: buffa :: alloc :: vec :: Vec < u8 > > ,) -> Self
 method whatsapp::session_structure::Chain fn with_sender_ratchet_key_private (mut self , value : impl Into < :: buffa :: alloc :: vec :: Vec < u8 > > ,) -> Self
 method whatsapp::session_structure::ChainOwnedView fn bytes (& self) -> & :: buffa :: bytes :: Bytes
@@ -66717,6 +66724,7 @@ method whatsapp::session_structure::ChainOwnedView fn decode (bytes : :: buffa :
 method whatsapp::session_structure::ChainOwnedView fn decode_with_options (bytes : :: buffa :: bytes :: Bytes , opts : & :: buffa :: DecodeOptions ,) -> :: core :: result :: Result < Self , :: buffa :: DecodeError >
 method whatsapp::session_structure::ChainOwnedView fn from_owned (msg : & whatsapp::session_structure::Chain ,) -> :: core :: result :: Result < Self , :: buffa :: DecodeError >
 method whatsapp::session_structure::ChainOwnedView fn into_bytes (self) -> :: buffa :: bytes :: Bytes
+method whatsapp::session_structure::ChainOwnedView fn message_key_limit (& self) -> :: core :: option :: Option < u32 >
 method whatsapp::session_structure::ChainOwnedView fn message_keys (& self ,) -> & :: buffa :: RepeatedView < '_ , whatsapp::session_structure::chain::MessageKeyView < '_ , > , >
 method whatsapp::session_structure::ChainOwnedView fn sender_ratchet_key (& self) -> :: core :: option :: Option < & '_ [u8] >
 method whatsapp::session_structure::ChainOwnedView fn sender_ratchet_key_private (& self) -> :: core :: option :: Option < & '_ [u8] >
@@ -77960,6 +77968,7 @@ wire .whatsapp.SessionStructure.Chain.MessageKey.iv number=Some(4) type=Some(TYP
 wire .whatsapp.SessionStructure.Chain.MessageKey.macKey number=Some(3) type=Some(TYPE_BYTES) label=Some(LABEL_OPTIONAL) target=None default=None oneof=None
 wire .whatsapp.SessionStructure.Chain.MessageKey.seed number=Some(100) type=Some(TYPE_BYTES) label=Some(LABEL_OPTIONAL) target=None default=None oneof=None
 wire .whatsapp.SessionStructure.Chain.chainKey number=Some(3) type=Some(TYPE_MESSAGE) label=Some(LABEL_OPTIONAL) target=Some(".whatsapp.SessionStructure.Chain.ChainKey") default=None oneof=None
+wire .whatsapp.SessionStructure.Chain.messageKeyLimit number=Some(100) type=Some(TYPE_UINT32) label=Some(LABEL_OPTIONAL) target=None default=None oneof=None
 wire .whatsapp.SessionStructure.Chain.messageKeys number=Some(4) type=Some(TYPE_MESSAGE) label=Some(LABEL_REPEATED) target=Some(".whatsapp.SessionStructure.Chain.MessageKey") default=None oneof=None
 wire .whatsapp.SessionStructure.Chain.senderRatchetKey number=Some(1) type=Some(TYPE_BYTES) label=Some(LABEL_OPTIONAL) target=None default=None oneof=None
 wire .whatsapp.SessionStructure.Chain.senderRatchetKeyPrivate number=Some(2) type=Some(TYPE_BYTES) label=Some(LABEL_OPTIONAL) target=None default=None oneof=None

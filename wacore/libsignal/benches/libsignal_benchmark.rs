@@ -22,10 +22,6 @@ fn bench_rng() -> rand::rngs::StdRng {
 use async_trait::async_trait;
 use divan::black_box;
 
-#[cfg(feature = "legacy-session-interop")]
-#[global_allocator]
-static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
-
 fn main() {
     divan::main();
 }

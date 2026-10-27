@@ -95,6 +95,8 @@ jobs:
             features: --features voip-mlow,bench-internals
           - name: proto-signal
             packages: -p wacore-binary -p wacore-libsignal -p wacore-appstate -p whatsapp-rust-sqlite-storage
+            # Persisted-state import benchmarks are feature-gated.
+            features: --features wacore-libsignal/legacy-session-interop
           # The client crate's own benchmarks. Its fixture needs crate-private
           # internals a bench target cannot otherwise reach, so it builds with
           # the non-default `bench-harness` feature. Its own shard rather than a
