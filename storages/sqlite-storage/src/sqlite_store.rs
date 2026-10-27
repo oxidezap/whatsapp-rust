@@ -2968,20 +2968,13 @@ impl SignalStore for SqliteStore {
             Box::new(move |conn: &mut SqliteConnection| {
                 conn.transaction(|conn| {
                     for (id, record) in batch.iter() {
-                        diesel::insert_into(prekeys::table)
-                            .values((
-                                prekeys::id.eq(*id as i32),
-                                prekeys::key.eq(record.as_ref()),
-                                prekeys::uploaded.eq(uploaded),
-                                prekeys::device_id.eq(device_id),
-                            ))
-                            .on_conflict((prekeys::id, prekeys::device_id))
-                            .do_update()
-                            .set((
-                                prekeys::key.eq(record.as_ref()),
-                                prekeys::uploaded.eq(uploaded),
-                            ))
-                            .execute(conn)?;
+                        crate::upsert_queries::UpsertPrekey {
+                            id: *id as i32,
+                            key: record.as_ref(),
+                            uploaded,
+                            device_id,
+                        }
+                        .execute(conn)?;
                     }
                     Ok(())
                 })
@@ -4053,6 +4046,7 @@ impl ProtocolStore for SqliteStore {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
+            // The full primary key bounds this lookup without Diesel's bound LIMIT.
             let row: Option<(Vec<u8>, i64, Option<i64>)> = tc_tokens::table
                 .select((
                     tc_tokens::token,
@@ -4061,7 +4055,7 @@ impl ProtocolStore for SqliteStore {
                 ))
                 .filter(tc_tokens::jid.eq(&jid))
                 .filter(tc_tokens::device_id.eq(device_id))
-                .first(&mut *conn)
+                .get_result(&mut *conn)
                 .optional()
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(
@@ -4716,6 +4710,10 @@ impl MsgSecretStore for SqliteStore {
             let entries = Arc::clone(&entries);
             Box::new(move |conn: &mut SqliteConnection| {
                 conn.immediate_transaction(|conn| {
+                    if let [entry] = entries.as_slice() {
+                        return crate::upsert_queries::UpsertMsgSecret { entry, device_id }
+                            .execute(conn);
+                    }
                     let mut stored = 0usize;
                     for chunk in entries.chunks(MSG_SECRET_INSERT_CHUNK_SIZE) {
                         // Materialize only the expressions used by this SQL

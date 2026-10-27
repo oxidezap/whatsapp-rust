@@ -282,6 +282,64 @@ async fn failed_secret_and_prekey_writes_roll_back_without_partial_changes() {
 }
 
 #[tokio::test]
+async fn commit_constraint_failure_rolls_back_hot_writes_and_connection_recovers() {
+    let fixture = Fixture::new();
+    let db = fixture.open().await;
+    let store = db.store(1);
+    db.shared().run(|conn| {
+        conn.batch_execute(
+            "CREATE TABLE commit_parent (id INTEGER PRIMARY KEY); \
+             CREATE TABLE commit_child (parent_id INTEGER REFERENCES commit_parent(id) DEFERRABLE INITIALLY DEFERRED); \
+             CREATE TRIGGER defer_secret AFTER INSERT ON msg_secrets BEGIN INSERT INTO commit_child VALUES (1); END; \
+             CREATE TRIGGER defer_prekey AFTER INSERT ON prekeys BEGIN INSERT INTO commit_child VALUES (1); END;",
+        ).map_err(|e| StoreError::Database(Box::new(e)))
+    }).await.unwrap();
+    assert!(
+        store
+            .put_msg_secrets(vec![secret("one", 100, 100, 1)])
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .store_prekeys_batch(
+                &[
+                    (1, Bytes::from_static(b"one")),
+                    (2, Bytes::from_static(b"two")),
+                ],
+                true
+            )
+            .await
+            .is_err()
+    );
+    assert!(rows(&db, 1).await.is_empty());
+    assert!(store.load_prekey(1).await.unwrap().is_none());
+    assert!(store.load_prekey(2).await.unwrap().is_none());
+    db.shared()
+        .run(|conn| {
+            diesel::sql_query("INSERT INTO commit_parent VALUES (1)")
+                .execute(conn)
+                .map(|_| ())
+                .map_err(|e| StoreError::Database(Box::new(e)))
+        })
+        .await
+        .unwrap();
+    store
+        .put_msg_secrets(vec![secret("one", 100, 100, 1)])
+        .await
+        .unwrap();
+    store
+        .store_prekeys_batch(&[(1, Bytes::from_static(b"one"))], true)
+        .await
+        .unwrap();
+    assert_eq!(rows(&db, 1).await.len(), 1);
+    assert_eq!(
+        store.load_prekey(1).await.unwrap(),
+        Some(Bytes::from_static(b"one"))
+    );
+}
+
+#[tokio::test]
 async fn optimized_writes_report_post_commit_barrier_failures() {
     let fixture = Fixture::new();
     let fail = Arc::new(AtomicBool::new(false));
@@ -439,5 +497,53 @@ async fn writes_wait_for_durability_and_cancelled_queued_operations_do_not_run()
                     .is_none()
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn repeated_hot_writes_cache_one_statement_per_shape() {
+    use diesel::connection::InstrumentationEvent;
+    let fixture = Fixture::new();
+    let active = Arc::new(AtomicBool::new(false));
+    let cached = Arc::new(AtomicUsize::new(0));
+    let config = SqliteDatabaseConfig::default().with_connection_init({
+        let active = active.clone();
+        let cached = cached.clone();
+        move |conn| {
+            let active = active.clone();
+            let cached = cached.clone();
+            conn.set_instrumentation(move |event: InstrumentationEvent<'_>| {
+                if active.load(Ordering::SeqCst)
+                    && matches!(event, InstrumentationEvent::CacheQuery { .. })
+                {
+                    cached.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            Ok(())
+        }
+    });
+    let db = SqliteDatabase::open(fixture.url(), config).await.unwrap();
+    let store = db.store(1);
+    active.store(true, Ordering::SeqCst);
+    for iteration in 0..3 {
+        store
+            .store_prekeys_batch(
+                &[
+                    (1, Bytes::from(vec![iteration; 64])),
+                    (2, Bytes::from_static(b"second")),
+                ],
+                iteration != 0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            cached.load(Ordering::SeqCst),
+            if iteration == 0 { 1 } else { 2 }
+        );
+        store
+            .put_msg_secrets(vec![secret("cached", 100, 100, iteration)])
+            .await
+            .unwrap();
+        assert_eq!(cached.load(Ordering::SeqCst), 2);
     }
 }

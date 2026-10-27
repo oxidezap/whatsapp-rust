@@ -1,7 +1,7 @@
 use diesel::query_builder::{AstPass, QueryFragment, QueryId};
 use diesel::query_dsl::RunQueryDsl;
 use diesel::result::QueryResult;
-use diesel::sql_types::{Binary, Integer, Nullable, Text};
+use diesel::sql_types::{BigInt, Binary, Bool, Integer, Nullable, Text};
 use diesel::sqlite::Sqlite;
 
 /// Static query identifier for `UpsertSession`.
@@ -190,6 +190,96 @@ impl<'a> QueryFragment<Sqlite> for UpsertDeviceRegistry<'a> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct UpsertPrekeyQuery;
+
+impl QueryId for UpsertPrekeyQuery {
+    type QueryId = Self;
+    const HAS_STATIC_QUERY_ID: bool = true;
+}
+
+#[derive(Debug)]
+pub struct UpsertPrekey<'a> {
+    pub id: i32,
+    pub key: &'a [u8],
+    pub uploaded: bool,
+    pub device_id: i32,
+}
+
+impl QueryId for UpsertPrekey<'_> {
+    type QueryId = UpsertPrekeyQuery;
+    const HAS_STATIC_QUERY_ID: bool = true;
+}
+
+impl<Conn> RunQueryDsl<Conn> for UpsertPrekey<'_> {}
+
+impl QueryFragment<Sqlite> for UpsertPrekey<'_> {
+    fn walk_ast<'b>(&'b self, mut out: AstPass<'_, 'b, Sqlite>) -> QueryResult<()> {
+        out.push_sql("INSERT INTO prekeys (id, key, uploaded, device_id) VALUES (");
+        out.push_bind_param::<Integer, _>(&self.id)?;
+        out.push_sql(", ");
+        out.push_bind_param::<Binary, _>(&self.key)?;
+        out.push_sql(", ");
+        out.push_bind_param::<Bool, _>(&self.uploaded)?;
+        out.push_sql(", ");
+        out.push_bind_param::<Integer, _>(&self.device_id)?;
+        out.push_sql(
+            ") ON CONFLICT (id, device_id) DO UPDATE SET \
+             key = excluded.key, uploaded = excluded.uploaded",
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct UpsertMsgSecretQuery;
+
+impl QueryId for UpsertMsgSecretQuery {
+    type QueryId = Self;
+    const HAS_STATIC_QUERY_ID: bool = true;
+}
+
+#[derive(Debug)]
+pub struct UpsertMsgSecret<'a> {
+    pub entry: &'a wacore::store::traits::MsgSecretEntry,
+    pub device_id: i32,
+}
+
+impl QueryId for UpsertMsgSecret<'_> {
+    type QueryId = UpsertMsgSecretQuery;
+    const HAS_STATIC_QUERY_ID: bool = true;
+}
+
+impl<Conn> RunQueryDsl<Conn> for UpsertMsgSecret<'_> {}
+
+impl QueryFragment<Sqlite> for UpsertMsgSecret<'_> {
+    fn walk_ast<'b>(&'b self, mut out: AstPass<'_, 'b, Sqlite>) -> QueryResult<()> {
+        out.push_sql("INSERT INTO msg_secrets (chat, sender, msg_id, secret, device_id, expires_at, message_ts) VALUES (");
+        out.push_bind_param::<Text, _>(self.entry.chat.as_ref())?;
+        out.push_sql(", ");
+        out.push_bind_param::<Text, _>(self.entry.sender.as_ref())?;
+        out.push_sql(", ");
+        out.push_bind_param::<Text, _>(self.entry.msg_id.as_ref())?;
+        out.push_sql(", ");
+        out.push_bind_param::<Binary, _>(self.entry.secret.as_slice())?;
+        out.push_sql(", ");
+        out.push_bind_param::<Integer, _>(&self.device_id)?;
+        out.push_sql(", ");
+        out.push_bind_param::<BigInt, _>(&self.entry.expires_at)?;
+        out.push_sql(", ");
+        out.push_bind_param::<BigInt, _>(&self.entry.message_ts)?;
+        // Match the bulk UPSERT's monotonic retention and parent-time merge.
+        out.push_sql(
+            ") ON CONFLICT (chat, sender, msg_id, device_id) DO UPDATE SET \
+             secret = excluded.secret, \
+             expires_at = CASE WHEN msg_secrets.expires_at = 0 OR excluded.expires_at = 0 THEN 0 \
+             ELSE MAX(msg_secrets.expires_at, excluded.expires_at) END, \
+             message_ts = MAX(msg_secrets.message_ts, excluded.message_ts)",
+        );
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,22 +402,26 @@ mod tests {
     #[test]
     fn test_static_query_ids_unique() {
         use std::any::TypeId;
-        let id_session = TypeId::of::<<UpsertSession as QueryId>::QueryId>();
-        let id_identity = TypeId::of::<<UpsertIdentity as QueryId>::QueryId>();
-        let id_sender_key = TypeId::of::<<UpsertSenderKey as QueryId>::QueryId>();
-        let id_registry = TypeId::of::<<UpsertDeviceRegistry as QueryId>::QueryId>();
-
-        assert_ne!(id_session, id_identity);
-        assert_ne!(id_session, id_sender_key);
-        assert_ne!(id_session, id_registry);
-        assert_ne!(id_identity, id_sender_key);
-        assert_ne!(id_identity, id_registry);
-        assert_ne!(id_sender_key, id_registry);
+        let ids = [
+            TypeId::of::<<UpsertSession as QueryId>::QueryId>(),
+            TypeId::of::<<UpsertIdentity as QueryId>::QueryId>(),
+            TypeId::of::<<UpsertSenderKey as QueryId>::QueryId>(),
+            TypeId::of::<<UpsertDeviceRegistry as QueryId>::QueryId>(),
+            TypeId::of::<<UpsertPrekey as QueryId>::QueryId>(),
+            TypeId::of::<<UpsertMsgSecret as QueryId>::QueryId>(),
+        ];
+        for (i, id) in ids.iter().enumerate() {
+            for other in &ids[i + 1..] {
+                assert_ne!(id, other);
+            }
+        }
 
         const { assert!(<UpsertSession as QueryId>::HAS_STATIC_QUERY_ID) };
         const { assert!(<UpsertIdentity as QueryId>::HAS_STATIC_QUERY_ID) };
         const { assert!(<UpsertSenderKey as QueryId>::HAS_STATIC_QUERY_ID) };
         const { assert!(<UpsertDeviceRegistry as QueryId>::HAS_STATIC_QUERY_ID) };
+        const { assert!(<UpsertPrekey as QueryId>::HAS_STATIC_QUERY_ID) };
+        const { assert!(<UpsertMsgSecret as QueryId>::HAS_STATIC_QUERY_ID) };
     }
 
     #[test]
@@ -375,7 +469,7 @@ mod tests {
 
         // Verify data
         use diesel::dsl::sql;
-        let count: i64 = diesel::select(sql::<diesel::sql_types::BigInt>("count(*) FROM sessions"))
+        let count: i64 = diesel::select(sql::<BigInt>("count(*) FROM sessions"))
             .get_result(&mut conn)
             .expect("count");
         assert_eq!(count, 2);
@@ -510,11 +604,9 @@ mod tests {
         assert!(result.is_err());
 
         // Verify user2 was NOT committed
-        let count: i64 = diesel::select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
-            "count(*) FROM sessions",
-        ))
-        .get_result(&mut conn)
-        .expect("count");
+        let count: i64 = diesel::select(diesel::dsl::sql::<BigInt>("count(*) FROM sessions"))
+            .get_result(&mut conn)
+            .expect("count");
         assert_eq!(count, 1);
 
         // Connection statement cache is still healthy and prepared statement can be reused immediately

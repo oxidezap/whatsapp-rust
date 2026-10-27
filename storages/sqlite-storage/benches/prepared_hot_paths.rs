@@ -1,7 +1,11 @@
+//! Public store calls, including queueing and commits, with default SQLite settings.
+//! Run with `cargo bench -p whatsapp-rust-sqlite-storage --bench prepared_hot_paths`.
+//! Each case owns a fresh database in project-local disk scratch space.
+
 use bytes::Bytes;
 use divan::black_box;
+use portable_atomic::{AtomicU32, AtomicU64, Ordering};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use wacore::store::traits::{
     MsgSecretEntry, MsgSecretStore, ProtocolStore, SignalStore, TcTokenEntry,
@@ -20,6 +24,8 @@ struct Fixture {
 
 impl Fixture {
     fn new(storage: &str) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .max_blocking_threads(1)
             .thread_keep_alive(Duration::from_secs(3600))
@@ -29,10 +35,10 @@ impl Fixture {
         let dir =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.cache/sqlite-prepared-bench");
         std::fs::create_dir_all(&dir).expect("scratch directory");
-        let path = dir.join(format!("{}.db", std::process::id()));
+        let path = dir.join(format!("{}-{id}.db", std::process::id()));
         let url = match storage {
             "memory" => format!(
-                "file:prepared_{}?mode=memory&cache=shared",
+                "file:prepared_{}_{id}?mode=memory&cache=shared",
                 std::process::id()
             ),
             "file" => path.to_str().expect("database path").to_owned(),
