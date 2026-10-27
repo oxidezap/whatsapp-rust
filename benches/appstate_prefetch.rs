@@ -1,7 +1,7 @@
 //! Retained app-state blobs through production admission, streaming and verification.
 
 use std::sync::Arc;
-use whatsapp_rust::bench_support::PrefetchHarness;
+use whatsapp_rust::bench_support::{PrefetchCompletionGate, PrefetchHarness};
 
 #[global_allocator]
 static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
@@ -41,10 +41,16 @@ fn eight_clients(bencher: divan::Bencher, bytes: usize) {
         .counter(divan::counter::BytesCount::new((bytes * 32) as u64))
         .with_inputs(|| {
             runtime.block_on(async {
+                // Each of eight clients admits four streaming downloads. Gate
+                // EOF, before verification, so the peak represents all 32 live
+                // production writers instead of accidental client overlap.
+                let gate = Arc::new(PrefetchCompletionGate::new(32));
                 let mut fixtures = Vec::with_capacity(8);
                 for _ in 0..8 {
                     fixtures.push(Arc::new(
-                        PrefetchHarness::new(bytes).await.expect("fixture"),
+                        PrefetchHarness::phase_aligned(bytes, Arc::clone(&gate))
+                            .await
+                            .expect("fixture"),
                     ));
                 }
                 fixtures
