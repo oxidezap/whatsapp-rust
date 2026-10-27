@@ -454,6 +454,17 @@ fn accumulated_backlog(archived: bool) {
             receive(&mut alice, &bob.address, ct).is_err(),
             "replay rejected"
         );
+        if slot == 3 {
+            // A real DH ratchet adds another receiver chain. The older imported
+            // chain must retain its policy and delayed messages across it.
+            let reply = send(&mut alice, &bob.address, b"rotate");
+            receive(&mut bob, &alice.address, &reply).expect("ratchet reply");
+            let rotated = send(&mut bob, &alice.address, b"new chain");
+            assert_eq!(
+                receive(&mut alice, &bob.address, &rotated).expect("new chain"),
+                b"new chain"
+            );
+        }
         let stored = alice.session_store.0[&bob.address]
             .serialize()
             .expect("synthetic session fixture");
