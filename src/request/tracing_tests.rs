@@ -194,7 +194,8 @@ async fn lifecycle_events_follow_each_clients_current_identity() {
             tokio::task::yield_now().await;
             a.shutdown().await
         };
-        futures::join!(run, stop);
+        let (_, shutdown) = futures::join!(run, stop);
+        assert!(shutdown.device.is_ok(), "{shutdown:?}");
         let _ = b.shutdown().await;
         futures::join!(a.run(), b.run());
         let _ = b.logout().await;
