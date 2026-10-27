@@ -203,9 +203,36 @@ mod tests {
         assert_eq!(body.read(&mut bytes).unwrap(), 7);
         assert_eq!(*gate.arrived.lock().unwrap(), 0);
         std::thread::scope(|scope| {
-            let peer = scope.spawn(|| gate.wait(Duration::from_secs(5)).unwrap());
-            assert_eq!(body.read(&mut bytes).unwrap(), 0);
-            peer.join().unwrap();
+            let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+            let reader_body = &mut body;
+            let reader = scope.spawn(move || {
+                finished_tx.send(reader_body.read(&mut [0; 16])).unwrap();
+            });
+            let (arrived, _) = gate
+                .ready
+                .wait_timeout_while(
+                    gate.arrived.lock().unwrap(),
+                    Duration::from_secs(5),
+                    |arrived| *arrived == 0,
+                )
+                .unwrap();
+            assert_eq!(*arrived, 1, "EOF reader never reached the gate");
+            drop(arrived);
+            // Keep the second stream absent until the EOF reader has arrived.
+            // Merely counting both arrivals would also pass a nonblocking gate.
+            assert!(matches!(
+                finished_rx.recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            gate.wait(Duration::from_secs(5)).unwrap();
+            assert_eq!(
+                finished_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+            reader.join().unwrap();
         });
         assert_eq!(*gate.arrived.lock().unwrap(), 2);
         assert_eq!(body.read(&mut bytes).unwrap(), 0);

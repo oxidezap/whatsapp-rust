@@ -32,7 +32,7 @@ env:
 
 jobs:
   prefetch-walltime:
-    name: Prefetch native walltime
+    name: Prefetch walltime (shared-host diagnostic)
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
