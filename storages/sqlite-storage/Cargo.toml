@@ -80,5 +80,9 @@ harness = false
 name = "signal_cache_contention"
 harness = false
 
+[[bench]]
+name = "prepared_hot_paths"
+harness = false
+
 [lints]
 workspace = true
