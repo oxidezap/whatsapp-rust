@@ -53,10 +53,11 @@ pub use identity_key::{IdentityKey, IdentityKeyPair};
 pub use legacy_session::{
     LegacyIndexedSessionV1, LegacySessionBaseKeyRoleV1, LegacySessionChainCounterV1,
     LegacySessionChainKeyV1, LegacySessionChainRoleV1, LegacySessionChainV1,
-    LegacySessionDispositionV1, LegacySessionFieldV1, LegacySessionIndexV1,
-    LegacySessionInteropError, LegacySessionKeyPairV1, LegacySessionLocalContext,
-    LegacySessionMessageKeyV1, LegacySessionPendingPreKeyV1, LegacySessionRatchetV1,
-    LegacySessionRecordV1, LegacySessionUnrepresentableFieldV1, LegacySessionV1,
+    LegacySessionDispositionV1, LegacySessionFieldV1, LegacySessionImportLimits,
+    LegacySessionIndexV1, LegacySessionInteropError, LegacySessionKeyPairV1,
+    LegacySessionLocalContext, LegacySessionMessageKeyV1, LegacySessionPendingPreKeyV1,
+    LegacySessionRatchetV1, LegacySessionRecordV1, LegacySessionUnrepresentableFieldV1,
+    LegacySessionV1,
 };
 pub use protocol::{
     CiphertextMessage, CiphertextMessageType, DecryptionErrorMessage, PlaintextContent,

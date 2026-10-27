@@ -22,6 +22,10 @@ fn bench_rng() -> rand::rngs::StdRng {
 use async_trait::async_trait;
 use divan::black_box;
 
+#[cfg(feature = "legacy-session-interop")]
+#[global_allocator]
+static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
+
 fn main() {
     divan::main();
 }
@@ -1878,4 +1882,124 @@ fn bench_process_sender_key_distribution_message(bencher: divan::Bencher) {
             black_box(&*receiver_store);
         },
     );
+}
+
+#[cfg(feature = "legacy-session-interop")]
+mod legacy_import {
+    use super::*;
+    use wacore_libsignal::protocol::*;
+
+    fn public(seed: u8) -> Bytes {
+        let mut bytes = vec![seed; 33];
+        bytes[0] = 5;
+        bytes.into()
+    }
+
+    fn input(count: u32) -> (LegacySessionRecordV1, LegacySessionLocalContext) {
+        let chain = |seed, role, count| LegacySessionChainV1 {
+            ratchet_key: public(seed),
+            role,
+            chain_key: LegacySessionChainKeyV1 {
+                counter: LegacySessionChainCounterV1::from_native_index(count),
+                key: Some(Bytes::from_static(&[7; 32])),
+            },
+            message_keys: (0..count)
+                .map(|index| LegacySessionMessageKeyV1 {
+                    index,
+                    seed: Bytes::from_static(&[9; 32]),
+                })
+                .collect(),
+        };
+        let session = LegacySessionV1 {
+            registration_id: 42,
+            ratchet: LegacySessionRatchetV1 {
+                key_pair: LegacySessionKeyPairV1 {
+                    public: public(2),
+                    private: Bytes::from_static(&[3; 32]),
+                },
+                last_remote_ephemeral_key: public(4),
+                previous_counter: 0,
+                root_key: Bytes::from_static(&[5; 32]),
+            },
+            index: LegacySessionIndexV1 {
+                base_key: public(1),
+                base_key_role: LegacySessionBaseKeyRoleV1::Remote,
+                disposition: LegacySessionDispositionV1::Current,
+                used_at_ms: 1,
+                created_at_ms: 0,
+                remote_identity_key: public(6),
+            },
+            chains: vec![
+                chain(2, LegacySessionChainRoleV1::Sending, 0),
+                chain(4, LegacySessionChainRoleV1::Receiving, count),
+            ],
+            pending_pre_key: None,
+        };
+        (
+            LegacySessionRecordV1::from_indexed_sessions(vec![LegacyIndexedSessionV1 {
+                index_key: public(1),
+                session,
+            }])
+            .expect("synthetic record"),
+            LegacySessionLocalContext {
+                identity_key: IdentityKey::decode(&public(8)).expect("synthetic identity"),
+                registration_id: 7,
+            },
+        )
+    }
+
+    #[divan::bench(args = [0, 2000])]
+    fn default_import(bencher: divan::Bencher, count: u32) {
+        bencher
+            .with_inputs(|| input(count))
+            .bench_values(|(record, context)| {
+                black_box(record.into_session_record(context).expect("import"))
+            });
+    }
+
+    #[divan::bench(args = [2000, 4000, 8000])]
+    fn budgeted_import(bencher: divan::Bencher, count: u32) {
+        bencher
+            .with_inputs(|| input(count))
+            .bench_values(|(record, context)| {
+                black_box(
+                    record
+                        .into_session_record_with_limits(
+                            context,
+                            LegacySessionImportLimits {
+                                max_message_keys_per_chain: count,
+                                max_message_keys_per_record: count,
+                            },
+                        )
+                        .expect("import"),
+                )
+            });
+    }
+
+    #[divan::bench(args = [2000, 4000, 8000])]
+    fn cold_lookup(bencher: divan::Bencher, count: u32) {
+        let (record, context) = input(count);
+        let record = record
+            .into_session_record_with_limits(
+                context,
+                LegacySessionImportLimits {
+                    max_message_keys_per_chain: count,
+                    max_message_keys_per_record: count,
+                },
+            )
+            .expect("import");
+        let bytes = record.serialize().expect("serialize");
+        let remote = PublicKey::deserialize(&public(4)).expect("remote");
+        bencher
+            .with_inputs(|| SessionRecord::deserialize(&bytes).expect("reload"))
+            .bench_values(|mut record| {
+                black_box(
+                    record
+                        .session_state_mut()
+                        .expect("current")
+                        .get_message_keys(&remote, count - 1)
+                        .expect("lookup"),
+                )
+            });
+    }
 }

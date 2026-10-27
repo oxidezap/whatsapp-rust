@@ -510,6 +510,8 @@ impl SessionChainComponents {
     }
 
     fn from_receiver_structure(mut value: session_structure::Chain) -> Result<Self> {
+        // Local message_key_limit is retention policy, not a protocol component.
+        // Record serialization preserves it; rebuilding components uses defaults.
         // The official reader ignores this field for receiver chains, including
         // historical non-canonical values.
         value.sender_ratchet_key_private = None;

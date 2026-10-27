@@ -804,8 +804,14 @@ impl SessionState {
         // The lookup in get_message_keys() does a linear search by counter value, so order
         // doesn't matter for correctness.
         let len = keys.len();
-        if len > consts::MAX_MESSAGE_KEYS + consts::MESSAGE_KEY_PRUNE_THRESHOLD {
-            let excess = len - consts::MAX_MESSAGE_KEYS;
+        let limit = self.session.receiver_chains[chain_idx]
+            .message_key_limit
+            .unwrap_or(consts::MAX_MESSAGE_KEYS as u32)
+            .max(consts::MAX_MESSAGE_KEYS as u32) as usize;
+        // Compare the excess instead of adding the threshold to a caller's
+        // u32 budget, which could overflow usize on WASM32.
+        if len.saturating_sub(limit) > consts::MESSAGE_KEY_PRUNE_THRESHOLD {
+            let excess = len - limit;
             // Evict the oldest keys by counter value, not slot position:
             // swap_remove (here and in get_message_keys) scrambles slot
             // order, so the front is not the oldest after the first prune.
@@ -1185,22 +1191,35 @@ impl SessionRecord {
 
     /// Builds a record from validated protocol components.
     ///
-    /// Components do not carry process-local durability metadata. The imported
-    /// chain therefore starts a fresh reservation lifecycle, while archived
+    /// Components carry protocol state, not local retention policy or
+    /// process-local durability metadata. Rebuilding uses normal retention.
+    /// The imported chain therefore starts a fresh reservation lifecycle, while archived
     /// sessions are bounded to the same limit used by record deserialization.
     pub fn from_components(value: SessionRecordComponents) -> Result<Self, SignalProtocolError> {
+        Self::from_components_with_message_key_limit(value, None)
+    }
+
+    pub(crate) fn from_components_with_message_key_limit(
+        value: SessionRecordComponents,
+        limit: Option<u32>,
+    ) -> Result<Self, SignalProtocolError> {
+        let convert = |components| {
+            let mut state = session_structure_from_components(components)?;
+            for chain in &mut state.receiver_chains {
+                chain.message_key_limit = limit;
+            }
+            Ok::<_, SignalProtocolError>(state)
+        };
         let current_session = value
             .current_session
-            .map(session_structure_from_components)
+            .map(convert)
             .transpose()?
             .map(SessionState::from_session_structure);
         let previous_sessions = value
             .previous_sessions
             .into_iter()
             .take(consts::ARCHIVED_STATES_MAX_LENGTH)
-            .map(|components| {
-                session_structure_from_components(components).map(|s| ArchivedSession::encode(&s))
-            })
+            .map(|components| convert(components).map(|s| ArchivedSession::encode(&s)))
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
@@ -2634,6 +2653,52 @@ mod tests {
         for counter in evicted_count as u32..total_keys as u32 {
             let key = state.get_message_keys(&sender_key, counter).unwrap();
             assert!(key.is_some(), "Key {} should exist", counter);
+        }
+    }
+
+    #[test]
+    fn imported_retention_limit_survives_reload_and_still_evicts_oldest() {
+        let base_key = KeyPair::generate(&mut rng()).public_key;
+        let mut state = create_test_session_state(3, &base_key);
+        let sender = KeyPair::generate(&mut rng()).public_key;
+        state.add_receiver_chain(&sender, &ChainKey::new([2; 32], 0));
+        state.session.receiver_chains[0].message_key_limit = Some(4000);
+        for counter in 0..4000 {
+            state
+                .set_message_keys(&sender, create_test_message_key_generator(counter))
+                .expect("store seed");
+        }
+        let bytes = SessionRecord::new(state).serialize().expect("serialize");
+        let mut loaded = SessionRecord::deserialize(&bytes).expect("reload");
+        let state = loaded.session_state_mut().expect("current");
+        // Scramble slot order through consumption before crossing the persisted
+        // budget, so eviction must compare counters instead of vector positions.
+        state
+            .get_message_keys(&sender, 1000)
+            .expect("consume")
+            .expect("present");
+        for counter in 4000..4100 {
+            state
+                .set_message_keys(&sender, create_test_message_key_generator(counter))
+                .expect("store seed");
+        }
+        assert_eq!(state.skipped[0].as_ref().expect("backlog").len(), 4048);
+        for counter in 0..51 {
+            assert!(
+                state
+                    .get_message_keys(&sender, counter)
+                    .expect("lookup")
+                    .is_none()
+            );
+        }
+        for counter in 51..4100 {
+            assert_eq!(
+                state
+                    .get_message_keys(&sender, counter)
+                    .expect("lookup")
+                    .is_some(),
+                counter != 1000
+            );
         }
     }
 

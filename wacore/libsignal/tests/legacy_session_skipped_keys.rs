@@ -138,10 +138,14 @@ struct Peer {
 
 impl Peer {
     fn new(name: &str, device_id: u32) -> Self {
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        use rand::SeedableRng;
+        let seed = name.bytes().fold(u64::from(device_id), |acc, b| {
+            acc.wrapping_mul(31).wrapping_add(u64::from(b))
+        });
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
 
         let identity_key_pair = IdentityKeyPair::generate(&mut rng);
-        let registration_id = rand::random::<u32>() & 0x3FFF;
+        let registration_id = 1000 + device_id;
 
         let prekey_id: PreKeyId = 1u32.into();
         let prekey_pair = KeyPair::generate(&mut rng);
@@ -323,5 +327,156 @@ fn a_skipped_key_survives_a_full_v1_projection_cycle() {
     assert_eq!(
         receive(&mut alice, &bob.address, &skipped).expect("skipped message decrypts"),
         b"m0"
+    );
+}
+
+/// Synthetic equivalent of two individually valid 2,000-step fills by a
+/// producer whose accumulated backlog is larger than its per-jump bound.
+#[test]
+fn accumulated_backlog_survives_import_reload_and_forward_step() {
+    accumulated_backlog(false);
+}
+
+#[test]
+fn archived_accumulated_backlog_survives_import_and_promotion() {
+    accumulated_backlog(true);
+}
+
+fn accumulated_backlog(archived: bool) {
+    use wacore_libsignal::protocol::{
+        ChainKey, LegacySessionChainCounterV1, LegacySessionChainRoleV1, LegacySessionMessageKeyV1,
+        MessageKeyGenerator,
+    };
+    let mut alice = Peer::new("alice", 1);
+    let mut bob = Peer::new("bob", 1);
+    establish(&mut alice, &mut bob);
+    let opener = send(&mut bob, &alice.address, b"opener");
+    receive(&mut alice, &bob.address, &opener).expect("synthetic session fixture");
+    let original = alice.session_store.0[&bob.address].clone();
+    let mut legacy = original
+        .into_legacy_session_v1_operational()
+        .expect("synthetic session fixture")
+        .into_indexed_sessions();
+    let remote_key = legacy[0].session.ratchet.last_remote_ephemeral_key.clone();
+    let chain = legacy[0]
+        .session
+        .chains
+        .iter_mut()
+        .find(|c| c.role == LegacySessionChainRoleV1::Receiving && c.ratchet_key == remote_key)
+        .expect("synthetic session fixture");
+    let mut key = ChainKey::new(
+        chain
+            .chain_key
+            .key
+            .as_ref()
+            .expect("synthetic session fixture")
+            .as_ref()
+            .try_into()
+            .expect("synthetic session fixture"),
+        1,
+    );
+    for _ in 0..2 {
+        for _ in 0..2000 {
+            let (MessageKeyGenerator::Seed((seed, index)), next) = key
+                .step_with_message_keys()
+                .expect("synthetic session fixture")
+            else {
+                panic!("fresh chain yields seeds")
+            };
+            chain.message_keys.push(LegacySessionMessageKeyV1 {
+                index,
+                seed: seed.to_vec().into(),
+            });
+            key = next;
+        }
+    }
+    chain.chain_key.counter = LegacySessionChainCounterV1::from_native_index(key.index());
+    chain.chain_key.key = Some(key.key().to_vec().into());
+    let mut legacy =
+        wacore_libsignal::protocol::LegacySessionRecordV1::from_indexed_sessions(legacy)
+            .expect("synthetic session fixture");
+    if archived {
+        let mut entries = legacy.into_indexed_sessions();
+        entries[0].session.index.disposition =
+            wacore_libsignal::protocol::LegacySessionDispositionV1::Archived { closed_at_ms: 1 };
+        legacy = wacore_libsignal::protocol::LegacySessionRecordV1::from_indexed_sessions(entries)
+            .expect("synthetic session fixture");
+    }
+    let imported = legacy
+        .into_session_record_with_limits(
+            alice.legacy_context(),
+            wacore_libsignal::protocol::LegacySessionImportLimits {
+                max_message_keys_per_chain: 4000,
+                max_message_keys_per_record: 4000,
+            },
+        )
+        .expect("accumulated backlog import");
+    alice.session_store.0.insert(
+        bob.address.clone(),
+        SessionRecord::deserialize(&imported.serialize().expect("synthetic session fixture"))
+            .expect("synthetic session fixture"),
+    );
+    let mut pending = Vec::new();
+    for i in 1u32..=4002 {
+        let ct = send(&mut bob, &alice.address, &i.to_be_bytes());
+        if [1, 2000, 4000, 4002].contains(&i) {
+            pending.push((i, ct));
+        }
+    }
+    // Failed authentication must neither consume a skipped key nor publish
+    // the speculative forward step, including after a cold reload.
+    for slot in [0, 3] {
+        let before = alice.session_store.0[&bob.address]
+            .serialize()
+            .expect("synthetic session fixture");
+        let mut wire = pending[slot].1.serialize().to_vec();
+        *wire.last_mut().expect("synthetic session fixture") ^= 1;
+        let corrupt = CiphertextMessage::SignalMessage(
+            wacore_libsignal::protocol::SignalMessage::try_from(wire.as_slice())
+                .expect("synthetic session fixture"),
+        );
+        assert!(receive(&mut alice, &bob.address, &corrupt).is_err());
+        assert_eq!(
+            alice.session_store.0[&bob.address]
+                .serialize()
+                .expect("synthetic session fixture"),
+            before
+        );
+    }
+    // A new skipped key must not immediately erase the accepted backlog.
+    for slot in [3, 1, 0, 2] {
+        let (i, ct) = &pending[slot];
+        assert_eq!(
+            receive(&mut alice, &bob.address, ct).unwrap_or_else(|e| panic!("counter {i}: {e}")),
+            i.to_be_bytes()
+        );
+        assert!(
+            receive(&mut alice, &bob.address, ct).is_err(),
+            "replay rejected"
+        );
+        let stored = alice.session_store.0[&bob.address]
+            .serialize()
+            .expect("synthetic session fixture");
+        alice.session_store.0.insert(
+            bob.address.clone(),
+            SessionRecord::deserialize(&stored).expect("synthetic session fixture"),
+        );
+    }
+    let before = alice.session_store.0[&bob.address]
+        .serialize()
+        .expect("serialize");
+    let mut far_ahead = send(&mut bob, &alice.address, b"gap");
+    for _ in 0..2001 {
+        far_ahead = send(&mut bob, &alice.address, b"gap");
+    }
+    assert!(
+        receive(&mut alice, &bob.address, &far_ahead).is_err(),
+        "import budget must not increase the network jump bound"
+    );
+    assert_eq!(
+        alice.session_store.0[&bob.address]
+            .serialize()
+            .expect("serialize"),
+        before
     );
 }

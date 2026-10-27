@@ -124,6 +124,42 @@ pub struct LegacySessionLocalContext {
     pub registration_id: u32,
 }
 
+/// Finite budgets for decoded persisted state, independent of the network
+/// forward-jump limit. Counts include every input chain and session, even
+/// entries later removed by the existing chain/history retention rules.
+///
+/// The per-chain budget also becomes that imported receiver chain's persisted
+/// retention limit. Normal oldest-counter eviction resumes above that limit
+/// plus the usual amortization threshold. New ratchet chains keep the normal
+/// limit. Re-exporting to v1 requires passing the budget again on reimport,
+/// because v1 has no field for this local retention policy. Canonical protocol
+/// components likewise omit local retention policy; use record serialization
+/// to preserve it. The record budget bounds admission, not ongoing traffic:
+/// each retained receiver chain can subsequently hold its per-chain budget
+/// or the normal 2,000-key limit, whichever is larger,
+/// plus at most `MESSAGE_KEY_PRUNE_THRESHOLD + 1` amortization slots. There are
+/// at most five receiver chains per state and 41 states in a record. Budgets
+/// are explicit u32 counts so callers choose finite storage/lookup costs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegacySessionImportLimits {
+    pub max_message_keys_per_chain: u32,
+    pub max_message_keys_per_record: u32,
+}
+
+impl Default for LegacySessionImportLimits {
+    fn default() -> Self {
+        Self {
+            max_message_keys_per_chain: consts::MAX_MESSAGE_KEYS as u32,
+            // One current state plus the retained archive, each with a sender
+            // and MAX_RECEIVER_CHAINS receivers. Seed storage is 32 bytes per
+            // key plus counters/containers, not eagerly expanded cipher keys.
+            max_message_keys_per_record: ((1 + consts::ARCHIVED_STATES_MAX_LENGTH)
+                * (1 + consts::MAX_RECEIVER_CHAINS)
+                * consts::MAX_MESSAGE_KEYS) as u32,
+        }
+    }
+}
+
 /// One indexed entry decoded from the outer v1 session map.
 pub struct LegacyIndexedSessionV1 {
     pub index_key: Bytes,
@@ -418,6 +454,8 @@ pub enum LegacySessionInteropError {
     MissingSignedPreKeyId { session: usize },
     #[error("legacy session {session} chain {chain} has too many skipped message keys")]
     TooManyMessageKeys { session: usize, chain: usize },
+    #[error("legacy record exceeds its skipped-message-key budget")]
+    TooManyMessageKeysInRecord,
     #[error("canonical session {session} exceeds the receiver-chain limit")]
     InvalidCanonicalReceiverChainCount { session: usize },
     #[error("legacy session {session} chain {chain} has duplicate skipped-message index {index}")]
@@ -513,9 +551,35 @@ impl LegacySessionRecordV1 {
     /// are retained by close time, then ordered by last use to match the v1
     /// decrypt search. Both sorts are in-place and allocation-free.
     pub fn into_session_record(
-        mut self,
+        self,
         context: LegacySessionLocalContext,
     ) -> Result<SessionRecord, LegacySessionInteropError> {
+        self.into_session_record_with_limits(context, LegacySessionImportLimits::default())
+    }
+
+    /// Imports all accepted keys under explicit finite state budgets. A larger
+    /// budget does not change the maximum derivation gap for received messages.
+    /// Count validation precedes sorting, key validation and crypto conversion.
+    pub fn into_session_record_with_limits(
+        mut self,
+        context: LegacySessionLocalContext,
+        limits: LegacySessionImportLimits,
+    ) -> Result<SessionRecord, LegacySessionInteropError> {
+        let mut total = 0u32;
+        for (session, indexed) in self.sessions.iter().enumerate() {
+            for (chain, value) in indexed.session.chains.iter().enumerate() {
+                let count = u32::try_from(value.message_keys.len()).map_err(|_| {
+                    LegacySessionInteropError::TooManyMessageKeys { session, chain }
+                })?;
+                if count > limits.max_message_keys_per_chain {
+                    return Err(LegacySessionInteropError::TooManyMessageKeys { session, chain });
+                }
+                total = total
+                    .checked_add(count)
+                    .filter(|total| *total <= limits.max_message_keys_per_record)
+                    .ok_or(LegacySessionInteropError::TooManyMessageKeysInRecord)?;
+            }
+        }
         for (session_index, indexed) in self.sessions.iter_mut().enumerate() {
             validate_session(&mut indexed.session, session_index)?;
         }
@@ -549,10 +613,14 @@ impl LegacySessionRecordV1 {
             .map(|(index, session)| import_indexed_session(session, context, current_count + index))
             .collect::<Result<Vec<_>, _>>()?;
 
-        SessionRecord::from_components(SessionRecordComponents {
-            current_session,
-            previous_sessions,
-        })
+        SessionRecord::from_components_with_message_key_limit(
+            SessionRecordComponents {
+                current_session,
+                previous_sessions,
+            },
+            (limits.max_message_keys_per_chain > consts::MAX_MESSAGE_KEYS as u32)
+                .then_some(limits.max_message_keys_per_chain),
+        )
         .map_err(LegacySessionInteropError::InvalidCanonicalRecord)
     }
 }
@@ -871,13 +939,6 @@ fn validate_session(
                 field: LegacySessionFieldV1::ChainKey,
             });
         }
-        if chain.message_keys.len() > consts::MAX_MESSAGE_KEYS {
-            return Err(LegacySessionInteropError::TooManyMessageKeys {
-                session: session_index,
-                chain: chain_index,
-            });
-        }
-
         chain.message_keys.sort_unstable_by_key(|key| key.index);
         for pair in chain.message_keys.windows(2) {
             if pair[0].index == pair[1].index {
@@ -1800,7 +1861,16 @@ mod tests {
                 seed: Bytes::from_static(&[0x55; LEGACY_KEY_MATERIAL_LEN]),
             })
             .collect();
-        validate_session(&mut session, 0).expect("canonical limit is accepted");
+        let accepted = record(vec![session])
+            .into_session_record(local_context())
+            .expect("canonical limit is accepted");
+        let mut session = accepted
+            .into_legacy_session_v1_operational()
+            .expect("synthetic session fixture")
+            .into_indexed_sessions()
+            .pop()
+            .expect("synthetic session fixture")
+            .session;
 
         session.chains[1]
             .message_keys
@@ -1809,7 +1879,99 @@ mod tests {
                 seed: Bytes::from_static(&[0x56; LEGACY_KEY_MATERIAL_LEN]),
             });
         assert!(matches!(
-            validate_session(&mut session, 0),
+            record(vec![session]).into_session_record(local_context()),
+            Err(LegacySessionInteropError::TooManyMessageKeys { .. })
+        ));
+    }
+
+    fn backlog_session(
+        seed: u8,
+        disposition: LegacySessionDispositionV1,
+        count: u32,
+    ) -> LegacySessionV1 {
+        let mut session = reference_session(seed, disposition);
+        session.chains[1].chain_key.counter = LegacySessionChainCounterV1::from_native_index(count);
+        session.chains[1].message_keys = (0..count)
+            .map(|index| LegacySessionMessageKeyV1 {
+                index,
+                seed: Bytes::from_static(&[0x55; 32]),
+            })
+            .collect();
+        session
+    }
+
+    #[test]
+    fn explicit_import_budgets_cover_all_chains_and_archived_sessions() {
+        let limits = LegacySessionImportLimits {
+            max_message_keys_per_chain: 4000,
+            max_message_keys_per_record: 8000,
+        };
+        let sessions = || {
+            let mut current = backlog_session(55, LegacySessionDispositionV1::Current, 4000);
+            let extra = backlog_session(56, LegacySessionDispositionV1::Current, 2000)
+                .chains
+                .remove(1);
+            current.chains.push(extra);
+            vec![
+                current,
+                backlog_session(
+                    57,
+                    LegacySessionDispositionV1::Archived { closed_at_ms: 1 },
+                    2000,
+                ),
+            ]
+        };
+        let imported = record(sessions())
+            .into_session_record_with_limits(local_context(), limits)
+            .expect("synthetic session fixture");
+        let loaded =
+            SessionRecord::deserialize(&imported.serialize().expect("synthetic session fixture"))
+                .expect("synthetic session fixture");
+        let components = loaded.into_components().expect("synthetic session fixture");
+        assert_eq!(
+            components
+                .current_session
+                .as_ref()
+                .expect("synthetic session fixture")
+                .receiver_chains
+                .iter()
+                .map(|c| c.message_keys.len())
+                .sum::<usize>(),
+            6000
+        );
+        assert_eq!(
+            components.previous_sessions[0].receiver_chains[0]
+                .message_keys
+                .len(),
+            2000
+        );
+        assert!(matches!(
+            record(sessions()).into_session_record_with_limits(
+                local_context(),
+                LegacySessionImportLimits {
+                    max_message_keys_per_record: 7999,
+                    ..limits
+                }
+            ),
+            Err(LegacySessionInteropError::TooManyMessageKeysInRecord)
+        ));
+        assert!(matches!(
+            record(sessions()).into_session_record_with_limits(
+                local_context(),
+                LegacySessionImportLimits {
+                    max_message_keys_per_chain: 3999,
+                    ..limits
+                }
+            ),
+            Err(LegacySessionInteropError::TooManyMessageKeys { .. })
+        ));
+        assert!(matches!(
+            record(vec![backlog_session(
+                58,
+                LegacySessionDispositionV1::Current,
+                4001
+            )])
+            .into_session_record_with_limits(local_context(), limits),
             Err(LegacySessionInteropError::TooManyMessageKeys { .. })
         ));
     }

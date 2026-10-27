@@ -22,6 +22,7 @@ wire .whatsapp.SessionStructure.Chain.MessageKey.iv number=Some(4) type=Some(TYP
 wire .whatsapp.SessionStructure.Chain.MessageKey.macKey number=Some(3) type=Some(TYPE_BYTES) label=Some(LABEL_OPTIONAL) target=None default=None oneof=None
 wire .whatsapp.SessionStructure.Chain.MessageKey.seed number=Some(100) type=Some(TYPE_BYTES) label=Some(LABEL_OPTIONAL) target=None default=None oneof=None
 wire .whatsapp.SessionStructure.Chain.chainKey number=Some(3) type=Some(TYPE_MESSAGE) label=Some(LABEL_OPTIONAL) target=Some(".whatsapp.SessionStructure.Chain.ChainKey") default=None oneof=None
+wire .whatsapp.SessionStructure.Chain.messageKeyLimit number=Some(100) type=Some(TYPE_UINT32) label=Some(LABEL_OPTIONAL) target=None default=None oneof=None
 wire .whatsapp.SessionStructure.Chain.messageKeys number=Some(4) type=Some(TYPE_MESSAGE) label=Some(LABEL_REPEATED) target=Some(".whatsapp.SessionStructure.Chain.MessageKey") default=None oneof=None
 wire .whatsapp.SessionStructure.Chain.senderRatchetKey number=Some(1) type=Some(TYPE_BYTES) label=Some(LABEL_OPTIONAL) target=None default=None oneof=None
 wire .whatsapp.SessionStructure.Chain.senderRatchetKeyPrivate number=Some(2) type=Some(TYPE_BYTES) label=Some(LABEL_OPTIONAL) target=None default=None oneof=None
