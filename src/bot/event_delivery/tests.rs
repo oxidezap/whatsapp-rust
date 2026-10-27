@@ -125,7 +125,7 @@ async fn shutdown_cancels_running_and_pending_without_retaining_client() {
         let queued = event("pending");
         let weak_event = Arc::downgrade(&queued);
         adapter.handle_event(queued);
-        client.shutdown().await;
+        let _ = client.shutdown().await;
         poll_until("terminal callback release", || {
             adapter.stats().callbacks_active == 0 && weak_event.upgrade().is_none()
         })
@@ -220,7 +220,7 @@ async fn reentrant_shutdown_does_not_join_its_callback() {
         EventInterest::ALL,
         EventDelivery::Ordered { capacity: 1 },
         |_, client| async move {
-            client.shutdown().await;
+            let _ = client.shutdown().await;
         },
     );
     let _subscription = client.subscribe_handler(adapter.clone());

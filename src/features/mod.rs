@@ -55,7 +55,10 @@ pub use business::{
     ProductVideo, SalePrice, VariantProperty,
 };
 
-pub use chat_actions::{AppStateError, ChatActions, SyncActionMessageRange, message_range};
+pub use chat_actions::{
+    AppStateError, ChatActions, ClearChatOptions, MediaDeletion, StarredMessages,
+    SyncActionMessageRange, message_range,
+};
 
 pub use community::{
     Community, CommunityConfigurationStep, CommunityError, CommunitySubgroup,

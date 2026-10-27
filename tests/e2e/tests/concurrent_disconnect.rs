@@ -34,7 +34,7 @@ async fn concurrent_disconnect_two_clients_multithread() -> anyhow::Result<()> {
     let b = Arc::clone(&bob.client);
 
     let start = Instant::now();
-    tokio::join!(a.shutdown(), b.shutdown());
+    let _ = tokio::join!(a.shutdown(), b.shutdown());
     let elapsed = start.elapsed();
 
     drop(alice.run_handle);
@@ -59,7 +59,7 @@ async fn concurrent_disconnect_two_clients_single_thread() -> anyhow::Result<()>
     let b = Arc::clone(&bob.client);
 
     let start = Instant::now();
-    tokio::join!(a.shutdown(), b.shutdown());
+    let _ = tokio::join!(a.shutdown(), b.shutdown());
     let elapsed = start.elapsed();
 
     drop(alice.run_handle);
@@ -87,7 +87,7 @@ async fn concurrent_disconnect_three_clients() -> anyhow::Result<()> {
     let c = Arc::clone(&charlie.client);
 
     let start = Instant::now();
-    tokio::join!(a.shutdown(), b.shutdown(), c.shutdown());
+    let _ = tokio::join!(a.shutdown(), b.shutdown(), c.shutdown());
     let elapsed = start.elapsed();
 
     drop(alice.run_handle);
@@ -134,7 +134,7 @@ async fn concurrent_disconnect_with_pending_receipts() -> anyhow::Result<()> {
     let a = Arc::clone(&alice.client);
     let b = Arc::clone(&bob.client);
     let start = Instant::now();
-    tokio::join!(a.shutdown(), b.shutdown());
+    let _ = tokio::join!(a.shutdown(), b.shutdown());
     let elapsed = start.elapsed();
 
     drop(alice.run_handle);

@@ -241,7 +241,7 @@ impl TestClient {
             .await
         {
             let diagnostics = connect_diagnostics(&client, &backend).await;
-            client.shutdown().await;
+            let _ = client.shutdown().await;
             drop(run_handle);
             return Err(anyhow::anyhow!(
                 "{prefix}: client never became ready after pairing ({diagnostics}): {e}"
@@ -258,7 +258,7 @@ impl TestClient {
             .await
         {
             let diagnostics = connect_diagnostics(&client, &backend).await;
-            client.shutdown().await;
+            let _ = client.shutdown().await;
             drop(run_handle);
             return Err(anyhow::anyhow!(
                 "{prefix}: startup sync did not settle ({diagnostics}): {e}"
@@ -590,7 +590,7 @@ impl TestClient {
 
     /// Disconnect and wait for the run task to complete cleanly.
     pub async fn disconnect(self) {
-        self.client.shutdown().await;
+        let _ = self.client.shutdown().await;
         let run_handle = self.run_handle;
 
         match tokio::time::timeout(tokio::time::Duration::from_secs(5), run_handle).await {

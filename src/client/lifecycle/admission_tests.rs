@@ -75,7 +75,7 @@ async fn admission_extension_retains_timer_on_unrelated_wakes_and_cancels_on_sto
     assert!(matches!(run.await.unwrap(), RunCompletionReason::Stopped));
     assert_eq!(client.stats().reconnects, 0);
     assert_eq!(client.stats().reconnect_errors, 5);
-    client.shutdown().await;
+    let _ = client.shutdown().await;
 }
 
 #[tokio::test]
@@ -94,7 +94,7 @@ async fn admission_stop_preserves_stopped_reason() {
     ));
     assert_eq!(client.stats().reconnects, 0);
     assert_eq!(client.stats().reconnect_errors, 0);
-    client.shutdown().await;
+    let _ = client.shutdown().await;
 }
 
 #[tokio::test]

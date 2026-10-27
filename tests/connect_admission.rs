@@ -248,7 +248,7 @@ async fn connect_admission_zero_reservation_rechecks_and_keeps_full_transport_bu
     );
     assert_eq!(policy.reservations.load(Ordering::SeqCst), 1);
     assert_eq!(policy.rechecks.load(Ordering::SeqCst), 2);
-    f.client.shutdown().await;
+    let _ = f.client.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -433,7 +433,7 @@ async fn connect_admission_wait_is_outside_transport_timeout() {
         other => panic!("admission must not become a timeout: {other:?}"),
     }
     assert_eq!(f.decisions.load(Ordering::SeqCst), 1);
-    f.client.shutdown().await;
+    let _ = f.client.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -450,7 +450,7 @@ async fn connect_admission_does_not_extend_the_factory_timeout() {
         connect_error: Some(ConnectError::Timeout { stage: whatsapp_rust::ConnectStage::Transport, timeout }), ..
     } if timeout == Duration::from_secs(20))
     );
-    f.client.shutdown().await;
+    let _ = f.client.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -597,7 +597,7 @@ async fn connect_admission_manual_connect_is_not_consulted() {
         Err(ConnectError::Transport(_))
     ));
     assert_eq!(f.decisions.load(Ordering::SeqCst), 0);
-    f.client.shutdown().await;
+    let _ = f.client.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]

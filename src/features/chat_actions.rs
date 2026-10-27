@@ -46,6 +46,52 @@ const MUTE_INDEFINITE: i64 = -1;
 
 pub type SyncActionMessageRange = wa::sync_action_value::SyncActionMessageRange;
 
+/// Whether clearing messages also removes downloaded media.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MediaDeletion {
+    #[default]
+    Keep,
+    Delete,
+}
+
+/// Whether clearing a chat includes starred messages.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StarredMessages {
+    #[default]
+    Keep,
+    Delete,
+}
+
+/// A clear keeps starred messages and downloaded media unless requested otherwise.
+/// The message range remains a separate conflict-resolution argument.
+///
+/// ```
+/// use whatsapp_rust::{ClearChatOptions, MediaDeletion, StarredMessages};
+/// let options = ClearChatOptions::default()
+///     .with_starred_messages(StarredMessages::Delete)
+///     .with_media(MediaDeletion::Delete);
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ClearChatOptions {
+    pub starred_messages: StarredMessages,
+    pub media: MediaDeletion,
+}
+
+impl ClearChatOptions {
+    #[must_use]
+    pub fn with_starred_messages(mut self, starred_messages: StarredMessages) -> Self {
+        self.starred_messages = starred_messages;
+        self
+    }
+
+    #[must_use]
+    pub fn with_media(mut self, media: MediaDeletion) -> Self {
+        self.media = media;
+        self
+    }
+}
+
 /// Enables multi-device conflict resolution. `None` is safe for clients without
 /// a complete message database; callers with one can populate the range.
 ///
@@ -644,10 +690,8 @@ impl<'a> ChatActions<'a> {
             .await
     }
 
-    /// Clears a chat's messages while keeping the chat (WA Web's clearChat).
-    ///
-    /// `delete_starred` also removes starred messages; `delete_media` also removes
-    /// downloaded media. Both flags live only in the mutation index, not the proto.
+    /// Clears messages using the legacy positional flags.
+    #[deprecated(note = "use clear_chat_with_options with ClearChatOptions")]
     pub async fn clear_chat(
         &self,
         jid: &Jid,
@@ -655,10 +699,46 @@ impl<'a> ChatActions<'a> {
         delete_media: bool,
         message_range: Option<SyncActionMessageRange>,
     ) -> Result<(), AppStateError> {
+        let options = ClearChatOptions {
+            starred_messages: if delete_starred {
+                StarredMessages::Delete
+            } else {
+                StarredMessages::Keep
+            },
+            media: if delete_media {
+                MediaDeletion::Delete
+            } else {
+                MediaDeletion::Keep
+            },
+        };
+        self.clear_chat_with_options(jid, options, message_range)
+            .await
+    }
+
+    /// Clears messages while keeping the chat in the list.
+    /// Starred-message and media policies live only in the mutation index.
+    ///
+    /// ```no_run
+    /// # async fn clear(client: &whatsapp_rust::Client, jid: &whatsapp_rust::Jid)
+    /// # -> Result<(), whatsapp_rust::AppStateError> {
+    /// use whatsapp_rust::{ClearChatOptions, MediaDeletion, StarredMessages};
+    /// let options = ClearChatOptions::default()
+    ///     .with_starred_messages(StarredMessages::Delete)
+    ///     .with_media(MediaDeletion::Keep);
+    /// client.chat_actions().clear_chat_with_options(jid, options, None).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn clear_chat_with_options(
+        &self,
+        jid: &Jid,
+        options: ClearChatOptions,
+        message_range: Option<SyncActionMessageRange>,
+    ) -> Result<(), AppStateError> {
         debug!("Clearing chat {}", redact_jid(jid));
         // WA Web's $ClearChatSync$p_3 encodes both flags as "1"/"0".
-        let delete_starred_str = if delete_starred { "1" } else { "0" };
-        let delete_media_str = if delete_media { "1" } else { "0" };
+        let delete_starred_str = bool_str(options.starred_messages == StarredMessages::Delete);
+        let delete_media_str = bool_str(options.media == MediaDeletion::Delete);
         let value = {
             let mut proto = wa::SyncActionValue::default();
             proto.clear_chat_action = buffa::MessageField::some({
@@ -1135,6 +1215,86 @@ where
 #[cfg(test)]
 mod registry_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn clear_chat_options_preserve_wire_flags_and_ranges() {
+        assert_eq!(
+            ClearChatOptions::default().starred_messages,
+            StarredMessages::Keep
+        );
+        assert_eq!(ClearChatOptions::default().media, MediaDeletion::Keep);
+        for starred in [StarredMessages::Keep, StarredMessages::Delete] {
+            for media in [MediaDeletion::Keep, MediaDeletion::Delete] {
+                for with_range in [false, true] {
+                    let options = ClearChatOptions::default()
+                        .with_starred_messages(starred)
+                        .with_media(media);
+                    let range = with_range.then(|| message_range(1234, Some(1200), []));
+                    let expected_range = range.clone();
+                    let mutation =
+                        capture_app_state_mutation("regular_high", move |client| async move {
+                            client
+                                .chat_actions()
+                                .clear_chat_with_options(&Jid::pn("12025550111"), options, range)
+                                .await
+                        })
+                        .await;
+                    assert_eq!(
+                        mutation.index,
+                        [
+                            "clearChat",
+                            "12025550111@s.whatsapp.net",
+                            if starred == StarredMessages::Delete {
+                                "1"
+                            } else {
+                                "0"
+                            },
+                            if media == MediaDeletion::Delete {
+                                "1"
+                            } else {
+                                "0"
+                            },
+                        ]
+                    );
+                    assert_eq!(mutation.operation, wa::syncd_mutation::SyncdOperation::SET);
+                    assert_eq!(
+                        mutation
+                            .action_value
+                            .as_ref()
+                            .unwrap()
+                            .clear_chat_action
+                            .as_option()
+                            .unwrap()
+                            .message_range
+                            .as_option(),
+                        expected_range.as_ref(),
+                    );
+
+                    // Keep this control until the positional API is removed.
+                    #[allow(deprecated)]
+                    let legacy =
+                        capture_app_state_mutation("regular_high", move |client| async move {
+                            client
+                                .chat_actions()
+                                .clear_chat(
+                                    &Jid::pn("12025550111"),
+                                    starred == StarredMessages::Delete,
+                                    media == MediaDeletion::Delete,
+                                    expected_range,
+                                )
+                                .await
+                        })
+                        .await;
+                    assert_eq!(legacy.index, mutation.index);
+                    assert_eq!(legacy.operation, mutation.operation);
+                    assert_eq!(
+                        legacy.action_value.as_ref().unwrap().clear_chat_action,
+                        mutation.action_value.as_ref().unwrap().clear_chat_action,
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn message_range_preserves_referential_keys_and_iteration_order() {

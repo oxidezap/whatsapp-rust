@@ -322,6 +322,7 @@ pub enum BotRunOutcome {
 /// Graceful client cleanup and the separately observed background run outcome.
 #[derive(Debug)]
 #[non_exhaustive]
+#[must_use = "inspect client persistence failures and the background run outcome"]
 pub struct BotShutdownReport {
     pub shutdown: crate::ShutdownReport,
     pub run: BotRunOutcome,
@@ -1792,7 +1793,7 @@ mod tests {
             bot.client().plugin::<BotBuilderPlugin>().as_deref(),
             Some(&"installed")
         );
-        bot.client().shutdown().await;
+        let _ = bot.client().shutdown().await;
     }
 
     #[tokio::test]
@@ -1811,7 +1812,7 @@ mod tests {
             default_bot.client().noise_cert_policy,
             NoiseCertPolicy::default()
         );
-        default_bot.client().shutdown().await;
+        let _ = default_bot.client().shutdown().await;
 
         let bypass_bot = Bot::builder()
             .with_backend_arc(create_test_sqlite_backend().await)
@@ -1826,7 +1827,7 @@ mod tests {
             bypass_bot.client().noise_cert_policy,
             NoiseCertPolicy::DangerSkipCertChainVerify
         );
-        bypass_bot.client().shutdown().await;
+        let _ = bypass_bot.client().shutdown().await;
 
         // Explicit Strict is distinct from the default only when the
         // default changes: the setter, not a build flag, decides.
@@ -1843,7 +1844,7 @@ mod tests {
             strict_bot.client().noise_cert_policy,
             NoiseCertPolicy::Strict
         );
-        strict_bot.client().shutdown().await;
+        let _ = strict_bot.client().shutdown().await;
     }
 
     fn pairing_code_event(code: &str) -> Arc<Event> {
@@ -2479,7 +2480,7 @@ mod tests {
             bot.client().decrypt_failure_admission.as_ref().unwrap(),
             &decrypt
         ));
-        bot.client().shutdown().await;
+        let _ = bot.client().shutdown().await;
     }
 
     #[tokio::test]
@@ -2881,7 +2882,7 @@ mod tests {
             handle.await,
             BotRunOutcome::Completed(crate::RunCompletionReason::Stopped)
         ));
-        client.shutdown().await;
+        let _ = client.shutdown().await;
     }
 
     #[tokio::test]
@@ -2913,7 +2914,7 @@ mod tests {
                 other => panic!("lost typed protocol cause: {other:?}"),
             }
         }
-        client.shutdown().await;
+        let _ = client.shutdown().await;
     }
 
     #[tokio::test]
@@ -2970,7 +2971,7 @@ mod tests {
         );
         drop(handle);
         assert_eq!(aborted.load(Ordering::Relaxed), 1);
-        client.shutdown().await;
+        let _ = client.shutdown().await;
     }
 
     #[tokio::test]

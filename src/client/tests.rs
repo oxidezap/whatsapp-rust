@@ -4234,7 +4234,7 @@ async fn assert_teardown_flush_order(reconnect_immediately: Option<bool>) {
     let disconnect_task = tokio::spawn(async move {
         match reconnect_immediately {
             None => {
-                disconnect_client.shutdown().await;
+                let _ = disconnect_client.shutdown().await;
             }
             Some(false) => disconnect_client.reconnect().await,
             Some(true) => disconnect_client.reconnect_immediately().await,
@@ -5175,7 +5175,7 @@ async fn terminal_disconnect_propagates_to_per_connection_signal() {
     let client = crate::test_utils::create_test_client().await;
     let conn_signal = client.connection_shutdown_signal();
 
-    client.shutdown().await;
+    let _ = client.shutdown().await;
 
     assert!(
         conn_signal.is_fired(),
@@ -6546,7 +6546,7 @@ async fn slow_callback_does_not_hold_chatstate_protocol_dispatch() {
     assert_eq!(events.len(), 4);
     assert_eq!(callback.stats().dropped_full, 2);
     assert_eq!(callback.stats().callbacks_active, 1);
-    client.shutdown().await;
+    let _ = client.shutdown().await;
     crate::test_utils::poll_until("slow callback cancelled", || {
         callback.stats().callbacks_active == 0
     })
@@ -6649,7 +6649,7 @@ async fn central_reader_resolves_iq_while_event_callback_is_pending() {
         .await
         .unwrap()
         .unwrap();
-    client.shutdown().await;
+    let _ = client.shutdown().await;
     crate::test_utils::poll_until("observer released after reader exit", || {
         callback.stats().callbacks_active == 0
     })

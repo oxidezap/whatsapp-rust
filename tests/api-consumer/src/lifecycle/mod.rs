@@ -3,6 +3,7 @@ pub mod admission;
 #[cfg(all(test, feature = "native", not(target_arch = "wasm32")))]
 #[path = "../../../lifecycle_outcomes.rs"]
 mod contract;
+pub mod reports;
 
 /// The owned waiter is nameable downstream and can move independently of Client.
 pub fn incoming_waiter(

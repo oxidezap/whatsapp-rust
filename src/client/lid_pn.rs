@@ -3374,7 +3374,7 @@ mod tests {
             .unwrap()
             .insert(key.clone());
 
-        client.shutdown().await;
+        let _ = client.shutdown().await;
 
         assert!(
             client.pending_lid_refreshes.lock().unwrap().contains(&key),

@@ -279,7 +279,7 @@ impl CallFixture {
 
     /// End the actual client connection and all registered calls.
     pub async fn shutdown(&self) -> Result<()> {
-        self.client.shutdown().await;
+        let _ = self.client.shutdown().await;
         let reader = self.reader.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(reader) = reader {
             let mut reader = scopeguard::guard(reader, |reader| reader.abort());

@@ -1021,7 +1021,7 @@ mod tests {
                     .as_ref()
                     .and_then(Weak::upgrade)
                     .expect("installed client");
-                client.shutdown().await;
+                let _ = client.shutdown().await;
                 self.events
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1517,7 +1517,7 @@ mod tests {
 
         let disconnect_client = Arc::clone(&client);
         let disconnect = tokio::spawn(async move {
-            disconnect_client.shutdown().await;
+            let _ = disconnect_client.shutdown().await;
         });
         tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
             .await
@@ -1742,7 +1742,7 @@ mod tests {
             assert!(!client.is_ready.load(Ordering::Relaxed));
 
             registration.close_scope(GENERATION);
-            registration.shutdown().await;
+            let _ = registration.shutdown().await;
             assert_eq!(
                 *lifecycle
                     .events
@@ -2123,7 +2123,7 @@ mod tests {
         .expect("detached cleanup closed the scope");
         assert!(registration.scope_for(GENERATION).is_none());
 
-        registration.shutdown().await;
+        let _ = registration.shutdown().await;
         assert_eq!(
             lifecycle.events(),
             vec!["install", "ready:37", "closed:37", "shutdown"]
@@ -2249,7 +2249,7 @@ mod tests {
 
         registration.cancel_scope(CURRENT_GENERATION);
         registration.close_scope(CURRENT_GENERATION);
-        registration.shutdown().await;
+        let _ = registration.shutdown().await;
         client.signal_shutdown_sync();
     }
 
@@ -2307,7 +2307,7 @@ mod tests {
         assert!(registration.scope_for(32).is_some());
 
         registration.close_scope(32);
-        registration.shutdown().await;
+        let _ = registration.shutdown().await;
         assert_eq!(
             lifecycle.events(),
             vec!["ready:31", "ready:32", "closed:31", "closed:32", "shutdown",]
@@ -2329,7 +2329,7 @@ mod tests {
 
         let shutdown_registration = Arc::clone(&registration);
         let shutdown = tokio::spawn(async move {
-            shutdown_registration.shutdown().await;
+            let _ = shutdown_registration.shutdown().await;
         });
         tokio::time::timeout(Duration::from_secs(2), async {
             while !scope.is_cancelled() {
@@ -2350,7 +2350,7 @@ mod tests {
         assert!(!registration.begin_scope_if_current(GENERATION + 1, || true));
         assert!(registration.scope_for(GENERATION + 1).is_none());
         assert!(!registration.ready(GENERATION + 1).await);
-        registration.shutdown().await;
+        let _ = registration.shutdown().await;
         assert_eq!(lifecycle.shutdowns.load(Ordering::SeqCst), 1);
     }
 
@@ -2378,7 +2378,7 @@ mod tests {
             }))
             .detach();
 
-        client.logout().await;
+        let _ = client.logout().await;
 
         assert_eq!(
             lifecycle.events(),

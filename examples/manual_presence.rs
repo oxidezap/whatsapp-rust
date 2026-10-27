@@ -292,7 +292,8 @@ async fn run_companion() -> Result<()> {
         let _ =
             tokio::time::timeout(Duration::from_secs(3), client.presence().set_unavailable()).await;
     }
-    client.shutdown().await;
+    let report = client.shutdown().await;
+    log::info!("Shutdown outcome: {report:?}");
     if !bot_finished {
         handle.await;
     }

@@ -650,7 +650,7 @@ mod tests {
             client.process_node(owned(request())).await;
             let reply = grant(&client);
             if shutdown {
-                client.shutdown().await;
+                let _ = client.shutdown().await;
             } else {
                 client.connection_generation.fetch_add(1, Ordering::SeqCst);
             }

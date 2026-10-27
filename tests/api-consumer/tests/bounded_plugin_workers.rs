@@ -230,7 +230,7 @@ async fn foreign_size_gate_precedes_copy_and_endpoints_share_one_payload() {
     assert!(Arc::ptr_eq(&a, &b));
     assert_eq!(a.payload.as_ptr(), b.payload.as_ptr());
     assert_eq!(pool.counts.copied.load(Ordering::SeqCst), 1);
-    client.shutdown().await;
+    let _ = client.shutdown().await;
 }
 
 #[tokio::test]

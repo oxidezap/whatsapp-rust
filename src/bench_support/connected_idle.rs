@@ -572,7 +572,7 @@ impl Session {
 
     pub async fn shutdown(mut self) -> Result<()> {
         let client = Arc::downgrade(&self.client);
-        self.client.shutdown().await;
+        let _ = self.client.shutdown().await;
         let reader_result: Result<()> = match self.reader.take() {
             Some(mut reader) => match tokio::time::timeout(DEADLINE, &mut reader).await {
                 Ok(joined) => joined

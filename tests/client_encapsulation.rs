@@ -80,7 +80,7 @@ async fn runtime_disable_interrupts_backoff_without_another_attempt() {
     } if error.to_string().contains("offline encapsulation transport"))
     );
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
-    client.shutdown().await;
+    let _ = client.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -94,7 +94,7 @@ async fn reenable_does_not_shorten_backoff_or_resurrect_shutdown() {
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
     client.set_auto_reconnect(true);
     assert!(whatsapp_rust::futures::poll!(run.as_mut()).is_pending());
-    client.shutdown().await;
+    let _ = client.shutdown().await;
     assert!(matches!(run.await, RunCompletionReason::ShutdownRequested));
     client.set_auto_reconnect(true);
     assert!(matches!(
@@ -113,7 +113,7 @@ async fn injected_http_identity_and_builder_registry_remain_available() {
     assert_eq!(client.memory_report().await.custom_enc_handlers, 1);
     let retained_http = client.http_client().clone();
     let weak = Arc::downgrade(&client);
-    client.shutdown().await;
+    let _ = client.shutdown().await;
     drop(client);
     // Startup maintenance is owned separately; wait for it without changing
     // lifecycle deadlines or making the HTTP handle own the Client.

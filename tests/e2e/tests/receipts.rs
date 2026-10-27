@@ -452,7 +452,7 @@ async fn test_disconnect_is_fast_with_no_pending_receipts() -> anyhow::Result<()
     let client = TestClient::connect("e2e_rcpt_cold_disconnect").await?;
 
     let start = wacore::time::Instant::now();
-    client.client.shutdown().await;
+    let _ = client.client.shutdown().await;
     let elapsed = start.elapsed();
 
     info!("cold disconnect took {elapsed:?}");
@@ -491,7 +491,7 @@ async fn test_disconnect_is_fast_with_pending_receipts() -> anyhow::Result<()> {
         .await?;
 
     let start = wacore::time::Instant::now();
-    client_b.client.shutdown().await;
+    let _ = client_b.client.shutdown().await;
     let elapsed = start.elapsed();
 
     info!("hot disconnect with {N} pending receipts took {elapsed:?}");

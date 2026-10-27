@@ -706,7 +706,7 @@ async fn loopback_tcp_ignored_iq_survives_until_timeout_when_noise_ping_is_answe
         unrelated.await.unwrap().is_ok(),
         "the controlled peer answers the unrelated IQ"
     );
-    client.shutdown().await;
+    let _ = client.shutdown().await;
     assert!(reader.await.unwrap().is_none());
     peer.await.unwrap().unwrap();
 }
@@ -830,7 +830,7 @@ async fn loopback_tcp_keepalive_pings_after_login() {
         "a logged-in idle connection must be pinged; keepalive logs: {:?}",
         logs.records_for("Client/Keepalive")
     );
-    client.shutdown().await;
+    let _ = client.shutdown().await;
     assert!(reader.await.unwrap().is_none());
     peer.await.unwrap().unwrap();
 }

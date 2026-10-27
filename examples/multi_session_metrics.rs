@@ -110,8 +110,10 @@ fn main() {
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("Shutting down both sessions...");
-                    client_a.shutdown().await;
-                    client_b.shutdown().await;
+                    let report = client_a.shutdown().await;
+                    log::info!("Shutdown outcome: {report:?}");
+                    let report = client_b.shutdown().await;
+                    log::info!("Shutdown outcome: {report:?}");
                     break;
                 }
             }

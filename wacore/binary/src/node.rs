@@ -402,7 +402,7 @@ impl FromIterator<(Cow<'static, str>, NodeValue)> for Attrs {
 /// entirely. The boxed slice is allocated once with exact size from the decoder.
 ///
 /// Covariant in `'a` (both Box and slices are covariant), compatible with yoke::Yokeable.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, yoke::Yokeable)]
 pub enum AttrsRef<'a> {
     Empty,
     Slice(Box<[(NodeStr<'a>, ValueRef<'a>)]>),
@@ -455,40 +455,6 @@ impl<'a> AttrsRef<'a> {
 impl<'a> FromIterator<(NodeStr<'a>, ValueRef<'a>)> for AttrsRef<'a> {
     fn from_iter<I: IntoIterator<Item = (NodeStr<'a>, ValueRef<'a>)>>(iter: I) -> Self {
         Self::from_vec(iter.into_iter().collect())
-    }
-}
-
-// Compile-time covariance check: if AttrsRef ever becomes invariant
-// (e.g. by adding a Cell or &mut), this function will fail to compile.
-fn _assert_attrs_ref_covariant<'short, 'long: 'short>(x: AttrsRef<'long>) -> AttrsRef<'short> {
-    x
-}
-
-// Safety: AttrsRef<'a> is covariant in 'a because:
-// - Empty carries no lifetime
-// - Slice(Box<[(NodeStr<'a>, ValueRef<'a>)]>): Box<[T]> is covariant in T,
-//   and (NodeStr<'a>, ValueRef<'a>) is covariant in 'a
-// The _assert_attrs_ref_covariant function above enforces this at compile time.
-unsafe impl<'a> yoke::Yokeable<'a> for AttrsRef<'static> {
-    type Output = AttrsRef<'a>;
-
-    fn transform(&'a self) -> &'a Self::Output {
-        self
-    }
-
-    fn transform_owned(self) -> Self::Output {
-        self
-    }
-
-    unsafe fn make(from: Self::Output) -> Self {
-        unsafe { std::mem::transmute(from) }
-    }
-
-    fn transform_mut<F>(&'a mut self, f: F)
-    where
-        F: 'static + for<'b> FnOnce(&'b mut Self::Output),
-    {
-        unsafe { f(std::mem::transmute::<&mut Self, &mut Self::Output>(self)) }
     }
 }
 
@@ -898,8 +864,9 @@ impl std::ops::Deref for BytesCart {
     }
 }
 
-// Safety: `Bytes` points to immutable backing storage whose deref target
+// SAFETY: `Bytes` points to immutable backing storage whose deref target
 // remains stable for the lifetime of the value, even when the wrapper moves.
+// Yoke requires this guarantee to retain decoded borrows while the cart moves.
 unsafe impl StableDeref for BytesCart {}
 
 /// A decoded node that owns its decompressed buffer. The inner `NodeRef`
@@ -1191,13 +1158,9 @@ mod owned_node_ref_tests {
 
     #[test]
     fn yoked_attrs_ref_survives_make_transform_and_mutation() {
-        // `NodeRef`'s derived `Yokeable` transmutes the whole struct in one go,
-        // so yoking a node never calls `AttrsRef`'s hand-written impl — that one
-        // is there to satisfy the derive's bound on the field. Reaching its
-        // three methods takes a yoke of `AttrsRef` itself, and it is the only
-        // way to put our own transmutes, rather than yoke's generated ones, in
-        // front of the interpreter.
-        let cart = BytesCart(Bytes::from_static(b"idabc"));
+        // A heap-backed cart makes Miri observe the allocation's lifetime;
+        // static bytes would hide a dangling borrow after premature cart release.
+        let cart = BytesCart(Bytes::copy_from_slice(b"idabc"));
         let mut yoke: Yoke<AttrsRef<'static>, BytesCart> = Yoke::attach_to_cart(cart, |buf| {
             // Borrowed from the cart, which is what makes the transmutes load-bearing.
             let (key, value) = buf.split_at(2);
@@ -1209,12 +1172,19 @@ mod owned_node_ref_tests {
             )])
         });
 
-        // `make` ran on attach; `transform` runs here.
         let (key, value) = &yoke.get().as_slice()[0];
         assert!(*key == "id");
         assert!(*value == "abc");
 
-        // `transform_mut`, which nothing in the workspace calls.
+        yoke.with_mut(|attrs| {
+            if let AttrsRef::Slice(values) = attrs {
+                values[0].0 = NodeStr::Owned("k".into());
+            }
+        });
+        assert!(yoke.get().as_slice()[0].0 == "k");
+        assert!(yoke.get().as_slice()[0].1 == "abc");
+
+        // Replacement also exercises dropping borrowed attributes before the cart.
         yoke.with_mut(|attrs| {
             *attrs = AttrsRef::from_vec(vec![(
                 NodeStr::Owned("k".into()),

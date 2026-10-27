@@ -1324,7 +1324,7 @@ mod tests {
             client.decrypt_failure_admission.as_ref().unwrap(),
             &decrypt
         ));
-        client.shutdown().await;
+        let _ = client.shutdown().await;
     }
 
     #[tokio::test]

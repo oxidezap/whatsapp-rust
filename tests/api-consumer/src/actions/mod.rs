@@ -1,13 +1,29 @@
 //! Independent consumer: no transport, session, or runtime is constructed.
+//! Clearing policies cannot be interchanged.
+//!
+//! ```compile_fail,E0308
+//! use whatsapp_rust::{ClearChatOptions, StarredMessages};
+//! let _ = ClearChatOptions::default().with_media(StarredMessages::Delete);
+//! ```
+//!
+//! ```compile_fail,E0308
+//! use whatsapp_rust::{ClearChatOptions, MediaDeletion};
+//! let _ = ClearChatOptions::default().with_starred_messages(MediaDeletion::Delete);
+//! ```
+//!
+//! ```compile_fail,E0639
+//! use whatsapp_rust::ClearChatOptions;
+//! let _ = ClearChatOptions { ..Default::default() };
+//! ```
 use std::{future::Future, pin::Pin, sync::Arc};
 use whatsapp_rust::bot::MessageContext;
 use whatsapp_rust::prelude::MessageBuilderExt;
 use whatsapp_rust::wacore::types::message::{MessageInfo, MessageSource};
 use whatsapp_rust::{
-    Client, EventCreationParams, MessageRef, NewsletterMessage, NewsletterMessageRef,
-    NewsletterMessageType, NewsletterMetadata, NewsletterPollVote, NewsletterReactionCount,
-    NewsletterState, NewsletterVerification, PinDuration, RevokeType, StanzaId, anyhow,
-    async_trait, waproto::whatsapp as proto,
+    ClearChatOptions, Client, EventCreationParams, MediaDeletion, MessageRef, NewsletterMessage,
+    NewsletterMessageRef, NewsletterMessageType, NewsletterMetadata, NewsletterPollVote,
+    NewsletterReactionCount, NewsletterState, NewsletterVerification, PinDuration, RevokeType,
+    StanzaId, StarredMessages, anyhow, async_trait, waproto::whatsapp as proto,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -42,6 +58,15 @@ impl Host for Client {
     ) -> anyhow::Result<()> {
         self.chat_actions().star_message(target).await?;
         self.chat_actions().unstar_message(target).await?;
+        self.chat_actions()
+            .clear_chat_with_options(
+                target.chat(),
+                ClearChatOptions::default()
+                    .with_starred_messages(StarredMessages::Delete)
+                    .with_media(MediaDeletion::Keep),
+                None,
+            )
+            .await?;
         self.chat_actions()
             .delete_message_for_me(target, false, None)
             .await?;

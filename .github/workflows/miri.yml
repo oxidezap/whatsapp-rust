@@ -41,8 +41,8 @@ jobs:
       matrix:
         include:
           # wacore-binary owns the workspace's only load-bearing `unsafe`: the
-          # `Yokeable`/`StableDeref` impls behind `OwnedNodeRef` (two lifetime
-          # transmutes over borrowed decode output) and the `set_len` over
+          # `Yokeable` derive and `StableDeref` impl behind `OwnedNodeRef`
+          # (lifetime erasure over borrowed decode output) and the `set_len` over
           # inflate's uninitialized spare capacity in `zlib_pool`. Both are
           # invisible to clippy and to native tests — nothing observes the
           # aliasing violation or the uninit read until it miscompiles.

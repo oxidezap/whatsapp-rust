@@ -14,6 +14,7 @@ use wacore::net::DisconnectReason;
 /// A host timeout does not confirm cleanup or backend I/O has stopped.
 #[derive(Debug)]
 #[non_exhaustive]
+#[must_use = "inspect shutdown drains and persistence failures before releasing the store"]
 pub struct ShutdownReport {
     /// Pre-close inbound rows/Signal durability decision. Hook failure can
     /// still mean Completed: durable replay rows remain, not successful callbacks.
@@ -32,6 +33,7 @@ pub struct ShutdownReport {
 /// a join of the run loop, callbacks or backend owners.
 #[derive(Debug)]
 #[non_exhaustive]
+#[must_use = "inspect deregistration and local shutdown outcomes"]
 pub struct LogoutReport {
     /// The best-effort deregistration request's actual outcome.
     pub deregistration: DeregistrationOutcome,
@@ -507,7 +509,7 @@ impl Client {
     #[cfg(feature = "client-lifecycle")]
     pub(super) async fn shutdown_lifecycle(&self) {
         if let Some(lifecycle) = &self.lifecycle {
-            lifecycle.shutdown().await;
+            let _ = lifecycle.shutdown().await;
         }
     }
 
@@ -2940,7 +2942,7 @@ mod tests {
         .await;
 
         let started = tokio::time::Instant::now();
-        tokio::time::timeout(Duration::from_secs(600), client.shutdown())
+        let _ = tokio::time::timeout(Duration::from_secs(600), client.shutdown())
             .await
             .expect("shutdown() must not wait on a socket that never closes");
         assert!(
@@ -3295,7 +3297,7 @@ mod tests {
     #[tokio::test]
     async fn connecting_is_refused_after_the_client_is_shut_down() {
         let client = crate::test_utils::create_test_client().await;
-        client.shutdown().await;
+        let _ = client.shutdown().await;
 
         let error = tokio::time::timeout(Duration::from_millis(500), client.connect())
             .await
@@ -3809,7 +3811,7 @@ mod tests {
                 async move { client.connect().await.map(|_| ()) }
             });
             next_connect_attempt(&entered).await;
-            client.shutdown().await;
+            let _ = client.shutdown().await;
             release.send(()).await.expect("release next dial");
             assert!(matches!(
                 tokio::time::timeout(Duration::from_secs(3), next)
@@ -3832,7 +3834,7 @@ mod tests {
             async move { client.connect().await.map(|_| ()) }
         });
         next_connect_attempt(&entered).await;
-        client.shutdown().await;
+        let _ = client.shutdown().await;
         release.send(()).await.expect("release dial");
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(3), attempt)
@@ -4178,7 +4180,7 @@ mod tests {
         let fresh =
             crate::test_utils::create_test_client_with_backend(Arc::new(database.store(1))).await;
         assert!(!fresh.shutdown_signal().is_fired());
-        fresh.shutdown().await;
+        let _ = fresh.shutdown().await;
     }
 
     #[tokio::test]
@@ -4224,7 +4226,7 @@ mod tests {
         assert!(client.is_session_ready());
         client.wait_for_socket_ready(Duration::ZERO).await.unwrap();
         client.wait_for_session_ready(Duration::ZERO).await.unwrap();
-        client.shutdown().await;
+        let _ = client.shutdown().await;
     }
 
     #[tokio::test]
@@ -4246,7 +4248,7 @@ mod tests {
         client.resume();
         assert!(!client.is_paused());
         assert!(!client.shutdown_signal().is_fired());
-        client.shutdown().await;
+        let _ = client.shutdown().await;
     }
 
     #[tokio::test]
@@ -4262,7 +4264,7 @@ mod tests {
         ));
         assert!(!first.is_finished());
 
-        client.shutdown().await;
+        let _ = client.shutdown().await;
         drop(release);
         assert!(matches!(
             first.await.unwrap(),
@@ -4432,7 +4434,7 @@ mod tests {
 
         // Parked, so this is guaranteed to land before the loop reaches the
         // branch that reports what happens next.
-        client.shutdown().await;
+        let _ = client.shutdown().await;
         drop(release);
 
         let reason = tokio::time::timeout(Duration::from_secs(10), run)
@@ -4490,7 +4492,7 @@ mod tests {
             "an expected disconnect that leaves the loop running still reconnects: {said:?}",
         );
 
-        client.shutdown().await;
+        let _ = client.shutdown().await;
         drop(release);
         tokio::time::timeout(Duration::from_secs(10), run)
             .await
@@ -4521,7 +4523,7 @@ mod tests {
         let run = tokio::spawn(async move { runner.run().await });
         next_connect_attempt(&entered).await;
 
-        client.shutdown().await;
+        let _ = client.shutdown().await;
         client.expected_disconnect.store(false, Ordering::Relaxed);
         drop(release);
 
@@ -4560,7 +4562,7 @@ mod tests {
         let run = tokio::spawn(async move { runner.run().await });
         next_connect_attempt(&entered).await;
 
-        client.shutdown().await;
+        let _ = client.shutdown().await;
         drop(release);
         tokio::time::timeout(Duration::from_secs(10), run)
             .await
@@ -4617,7 +4619,7 @@ mod tests {
         assert!(!client.is_paused());
         next_connect_attempt(&entered).await;
 
-        client.shutdown().await;
+        let _ = client.shutdown().await;
         drop(release);
         tokio::time::timeout(Duration::from_secs(10), run)
             .await
@@ -4667,7 +4669,7 @@ mod tests {
         );
 
         client.resume();
-        client.shutdown().await;
+        let _ = client.shutdown().await;
         drop(release);
         tokio::time::timeout(Duration::from_secs(10), run)
             .await
@@ -4691,7 +4693,7 @@ mod tests {
         drop(release);
         crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
 
-        client.shutdown().await;
+        let _ = client.shutdown().await;
         let reason = tokio::time::timeout(Duration::from_secs(10), run)
             .await
             .expect("a paused run loop must still return when the client is disconnected")
@@ -5011,7 +5013,7 @@ mod tests {
         let client = crate::test_utils::create_test_client().await;
 
         client.pause().await;
-        client.shutdown().await;
+        let _ = client.shutdown().await;
         client.resume();
 
         assert!(!client.is_paused(), "the pause itself is cleared");
@@ -5033,7 +5035,7 @@ mod tests {
     #[tokio::test]
     async fn a_disconnected_client_cannot_be_run_again() {
         let client = crate::test_utils::create_test_client().await;
-        client.shutdown().await;
+        let _ = client.shutdown().await;
 
         assert!(
             client.is_terminal(),
@@ -5087,7 +5089,7 @@ mod tests {
         let client = crate::test_utils::create_test_client().await;
         let run = run_until_parked_in_backoff(&client).await;
 
-        client.shutdown().await;
+        let _ = client.shutdown().await;
 
         tokio::time::timeout(Duration::from_secs(10), run)
             .await
@@ -5244,7 +5246,7 @@ mod tests {
             "a per-connection shutdown must not release the reconnect backoff"
         );
 
-        client.shutdown().await;
+        let _ = client.shutdown().await;
         tokio::time::timeout(Duration::from_secs(10), run)
             .await
             .expect("run() must still return on a terminal shutdown")
@@ -5393,7 +5395,7 @@ mod tests {
         drop(release_tx);
         *client.transport.lock().await = Some(transport);
 
-        tokio::time::timeout(Duration::from_secs(10), client.shutdown())
+        let _ = tokio::time::timeout(Duration::from_secs(10), client.shutdown())
             .await
             .expect("disconnect must not block");
 

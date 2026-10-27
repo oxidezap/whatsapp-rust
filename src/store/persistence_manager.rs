@@ -77,11 +77,18 @@ impl Drop for DeviceMutation<'_> {
         // Dirty before rebuilding, under the device write guard: a racing flush
         // waits for publication before consuming the dirty flag.
         self.manager.dirty.store(true, Ordering::Relaxed);
-        *self
-            .manager
-            .device_snapshot
-            .write()
-            .unwrap_or_else(|p| p.into_inner()) = Arc::new(self.device.clone());
+        let snapshot = Arc::new(self.device.clone());
+        // Allocation and destruction stay outside this lock. Its only mutation
+        // swaps prepared Arcs, so a modifier panic cannot poison publication.
+        let previous = {
+            let mut published = self
+                .manager
+                .device_snapshot
+                .write()
+                .expect("snapshot publication only swaps prepared Arcs");
+            std::mem::replace(&mut *published, snapshot)
+        };
+        drop(previous);
         self.manager.save_notify.notify(1);
     }
 }
@@ -149,7 +156,7 @@ impl PersistenceManager {
     pub fn get_device_snapshot(&self) -> Arc<Device> {
         self.device_snapshot
             .read()
-            .unwrap_or_else(|p| p.into_inner())
+            .expect("snapshot publication only swaps prepared Arcs")
             .clone()
     }
 
@@ -469,6 +476,90 @@ mod tests {
     use crate::runtime_impl::TokioRuntime;
     use wacore::store::traits::DeviceStore;
     use wacore::time::Instant;
+
+    #[tokio::test]
+    async fn panicking_modifiers_publish_and_persist_partial_changes() {
+        for asynchronous in [false, true] {
+            let backend = Arc::new(wacore::store::in_memory::InMemoryBackend::new());
+            let pm = Arc::new(PersistenceManager::new(backend.clone()).await.unwrap());
+            let before = pm.get_device_snapshot();
+            let mut notified = Box::pin(pm.save_notify.listen());
+            assert!(futures::poll!(notified.as_mut()).is_pending());
+            let modifying = pm.clone();
+            let task = tokio::spawn(async move {
+                if asynchronous {
+                    modifying
+                        .modify_device_async(|device| {
+                            Box::pin(async move {
+                                device.push_name = "partial".into();
+                                tokio::task::yield_now().await;
+                                panic!("injected async modifier panic");
+                            })
+                        })
+                        .await;
+                } else {
+                    modifying
+                        .modify_device(|device| {
+                            device.push_name = "partial".into();
+                            panic!("injected sync modifier panic");
+                        })
+                        .await;
+                }
+            });
+            assert!(task.await.unwrap_err().is_panic());
+            assert!(futures::poll!(notified.as_mut()).is_ready());
+            assert!(!pm.device_snapshot.is_poisoned());
+            assert_eq!(before.push_name, "");
+            assert_eq!(pm.get_device_snapshot().push_name, "partial");
+            assert!(pm.dirty.load(Ordering::Acquire));
+            pm.flush().await.unwrap();
+            assert_eq!(backend.load().await.unwrap().unwrap().push_name, "partial");
+            pm.process_command(DeviceCommand::SetPushName("recovered".into()))
+                .await;
+            pm.flush().await.unwrap();
+            assert_eq!(pm.get_device_snapshot().push_name, "recovered");
+            assert_eq!(
+                backend.load().await.unwrap().unwrap().push_name,
+                "recovered"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn flush_waits_for_cancelled_modifier_publication() {
+        let backend = Arc::new(wacore::store::in_memory::InMemoryBackend::new());
+        let pm = PersistenceManager::new(backend.clone()).await.unwrap();
+        pm.process_command(DeviceCommand::SetPushName("before".into()))
+            .await;
+        pm.flush().await.unwrap();
+        let before = pm.get_device_snapshot();
+        let mut notified = Box::pin(pm.save_notify.listen());
+        assert!(futures::poll!(notified.as_mut()).is_pending());
+
+        let mut mutation = Box::pin(pm.modify_device_async(|device| {
+            Box::pin(async move {
+                device.push_name = "cancelled".into();
+                std::future::pending::<()>().await;
+            })
+        }));
+        assert!(futures::poll!(mutation.as_mut()).is_pending());
+        let mut flush = Box::pin(pm.flush());
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        assert_eq!(pm.get_device_snapshot().push_name, "before");
+        assert_eq!(backend.load().await.unwrap().unwrap().push_name, "before");
+        drop(mutation);
+
+        assert!(futures::poll!(notified.as_mut()).is_ready());
+        assert!(!pm.device_snapshot.is_poisoned());
+        assert_eq!(before.push_name, "before");
+        assert_eq!(pm.get_device_snapshot().push_name, "cancelled");
+        flush.await.unwrap();
+        assert_eq!(
+            backend.load().await.unwrap().unwrap().push_name,
+            "cancelled"
+        );
+        assert!(!pm.dirty.load(Ordering::Acquire));
+    }
 
     #[tokio::test]
     async fn scoped_mutations_notify_saving_even_when_cancelled() {

@@ -163,7 +163,8 @@ fn main() {
                 // container, skipping the graceful flush below.
                 _ = shutdown_signal() => {
                     info!("Received shutdown signal, shutting down...");
-                    handle.shutdown().await;
+                    let report = handle.shutdown().await;
+                    log::info!("Shutdown outcome: {report:?}");
                 }
             }
             stop_mem_logger();

@@ -195,9 +195,9 @@ async fn lifecycle_events_follow_each_clients_current_identity() {
             a.shutdown().await
         };
         futures::join!(run, stop);
-        b.shutdown().await;
+        let _ = b.shutdown().await;
         futures::join!(a.run(), b.run());
-        b.logout().await;
+        let _ = b.logout().await;
         let records = capture.records();
         let stopped = records
             .iter()
@@ -328,8 +328,8 @@ async fn review_filtered_operations_do_not_replace_host_identity() {
         async {
             a.reconnect().await;
             b.reconnect_immediately().await;
-            a.shutdown().await;
-            b.logout().await;
+            let _ = a.shutdown().await;
+            let _ = b.logout().await;
             let _ = a.send_iq_node(NodeBuilder::new("iq").build(), None).await;
             tracing::info!(target: "host", "host event after client operations");
         }.instrument(host).await;

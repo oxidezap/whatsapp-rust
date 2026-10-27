@@ -76,7 +76,7 @@ async fn foreground_and_background_preserve_shutdown_reason() {
     ));
 
     let background = bot().await;
-    background.client().shutdown().await;
+    let _ = background.client().shutdown().await;
     assert!(matches!(
         background.spawn().await,
         BotRunOutcome::Completed(RunCompletionReason::ShutdownRequested)
@@ -140,7 +140,7 @@ async fn already_running_pause_and_sticky_shutdown_are_public() {
         client.run().await,
         RunCompletionReason::AlreadyRunning
     ));
-    client.shutdown().await;
+    let _ = client.shutdown().await;
     assert!(matches!(
         running.await.unwrap(),
         RunCompletionReason::ShutdownRequested
@@ -159,7 +159,7 @@ async fn already_running_pause_and_sticky_shutdown_are_public() {
     fresh.pause().await;
     fresh.resume();
     assert!(!fresh.is_paused());
-    fresh.shutdown().await;
+    let _ = fresh.shutdown().await;
 }
 
 #[tokio::test]
@@ -182,7 +182,7 @@ async fn background_already_running_is_observable() {
         bot.spawn().await,
         BotRunOutcome::Completed(RunCompletionReason::AlreadyRunning)
     ));
-    client.shutdown().await;
+    let _ = client.shutdown().await;
     assert!(matches!(
         first.await.unwrap(),
         RunCompletionReason::ShutdownRequested

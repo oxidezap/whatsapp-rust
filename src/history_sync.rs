@@ -2289,7 +2289,7 @@ mod tests {
             history_receipts(&transport, "HIST_ENTERED_SHUTDOWN").await,
             0
         );
-        tokio::time::timeout(std::time::Duration::from_secs(2), client.shutdown())
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), client.shutdown())
             .await
             .expect("shutdown does not join an entered history callback");
         assert!(

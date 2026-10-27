@@ -1012,7 +1012,7 @@ mod tests {
             .await;
         assert_eq!(uploader.seen(), vec![old]);
         assert!(runtime.store.pending().await.unwrap().is_empty());
-        client.shutdown().await;
+        let _ = client.shutdown().await;
         assert!(runtime.start_buffer().await.is_ok());
     }
 

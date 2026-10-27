@@ -111,7 +111,7 @@ async fn async_observer_is_filtered_and_subscription_is_raii() {
     assert_eq!(handler.stats().accepted, 1);
     assert!(rx.try_recv().is_err());
     handler.cancel();
-    client.shutdown().await;
+    let _ = client.shutdown().await;
 }
 
 #[tokio::test]
@@ -156,7 +156,7 @@ async fn chatstate_compatibility_view_uses_the_same_bus_fact() {
     drop(bus_subscription);
     dispatch(&client, "paused", None).await;
     assert_eq!(bus.stats().enqueued, 4);
-    client.shutdown().await;
+    let _ = client.shutdown().await;
 }
 
 #[tokio::test]
@@ -190,7 +190,7 @@ async fn bounded_pool_drops_newest_without_stalling_protocol_handler() {
     assert_eq!(handler.stats().callbacks_active, 2);
     assert_eq!(handler.stats().dropped_full, 10);
     assert_eq!(client.stats().events_dropped, 10);
-    client.shutdown().await;
+    let _ = client.shutdown().await;
     eventually(|| handler.stats().callbacks_active == 0 && handler.stats().discarded == 2).await;
     assert_eq!(handler.stats().callbacks_cancelled, 2);
 }
@@ -242,7 +242,7 @@ async fn ordered_delivery_preserves_accepted_order_and_drops_newest() {
     dispatch(&client, "paused", None).await;
     assert_eq!(handler.stats().accepted, 3);
     handler.cancel();
-    client.shutdown().await;
+    let _ = client.shutdown().await;
 }
 
 #[tokio::test]
@@ -267,7 +267,7 @@ async fn defaults_zero_and_reentrant_terminal_cancellation_are_public() {
         EventInterest::ALL,
         EventDelivery::Ordered { capacity: 0 },
         |_, client| async move {
-            client.shutdown().await;
+            let _ = client.shutdown().await;
         },
     );
     let subscription = client.subscribe_handler(handler.clone());
@@ -411,7 +411,7 @@ async fn observe_driver_cancellation(client: &Arc<Client>, probe: &CallbackProbe
         );
         // Preserve the unmasked observation, then use the separately proven
         // terminal path only to clean up a failing regression's pending work.
-        client.shutdown().await;
+        let _ = client.shutdown().await;
         receive(&probe.released).await;
     }
     released

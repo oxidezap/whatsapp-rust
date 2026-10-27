@@ -262,7 +262,8 @@ pub(crate) async fn handle_iq_scoped(
                                         .build(),
                                 ));
                             if !pair_code_outstanding {
-                                client_clone.shutdown().await;
+                                let report = client_clone.shutdown().await;
+                                log::debug!("QR expiry shutdown outcome: {report:?}");
                             }
                         }))
                         .detach();
@@ -852,8 +853,8 @@ mod tests {
         poll_until("first QR", || qr_codes_seen(&collector) == 1).await;
         let weak = Arc::downgrade(&client);
         let released = client.store_release();
-        client.shutdown().await;
-        client.shutdown().await;
+        let _ = client.shutdown().await;
+        let _ = client.shutdown().await;
         let seen = collector.events().len();
         drop(client);
         drop(transport);
