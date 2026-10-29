@@ -77,3 +77,7 @@ validation across the key wait without repeating snapshot scans. Runtime CDN
 prefetch also checks metadata before admitting jobs or reserving download budget.
 Missing snapshot MAC/key guards retain `SnapshotMACMissing` as recovery context
 while preserving the generated validation error for downcasting.
+
+The borrowed `missing_key_ids_after_inline` compatibility probe validates original
+metadata before inlining, so conflicting sources cannot disappear. It retains
+synchronous validation/decoding; owned runtime callers use the prepared API above.

@@ -72,7 +72,9 @@ impl<'a> Value<'a> {
                 Ok(Self::Number(text.encode_utf16().count() as f64))
             }
             Self::Array(items) if key == "length" => Ok(Self::Number(items.len() as f64)),
-            Self::Bytes(bytes) if key == "length" => Ok(Self::Number(bytes.len() as f64)),
+            Self::Bytes(bytes) if matches!(key, "length" | "byteLength") => {
+                Ok(Self::Number(bytes.len() as f64))
+            }
             Self::Undefined | Self::Null => Err(ValidationError::dependency(
                 "TypeError",
                 "field access on nullish value",

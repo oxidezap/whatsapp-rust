@@ -1760,14 +1760,18 @@ impl AppStateProcessor {
     /// its external blob, so [`get_missing_key_ids`](Self::get_missing_key_ids) alone (called before download)
     /// can't see it and would miss the snapshot's key — letting processing later abort
     /// with `KeyNotFound`. Used by the sync paths to request missing keys up front.
-    /// Compatibility key probe: this decodes references without establishing a
-    /// validated processing phase. Runtime sync paths use [`Self::prepare_patch_list`]
+    /// Compatibility key probe: metadata validation and decoding are synchronous.
+    /// This does not establish a validated processing phase.
+    /// Runtime sync paths use [`Self::prepare_patch_list`]
     /// and query its borrowed list, retaining ownership across blocking work.
     pub async fn missing_key_ids_after_inline(
         &self,
         pl: &mut PatchList,
         download: &BlobDownloadFn<'_>,
     ) -> Result<Vec<Vec<u8>>> {
+        // Check the original metadata before inlining can erase conflicting
+        // inline mutations. Owned runtime callers use blocking preparation.
+        validate_patch_list_metadata(pl)?;
         decode_external_blobs(pl, download, false)?;
         self.get_missing_key_ids(pl).await
     }
@@ -2220,6 +2224,54 @@ mod prepared_validation_tests {
                 owner: std::thread::current().id(),
             }),
         )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn compatibility_probe_rejects_conflicting_sources_without_mutating_or_downloading() {
+        let processor = processor(Arc::new(AtomicUsize::new(0)));
+        let mut patch = wa::SyncdPatch::default();
+        let mut version = wa::SyncdVersion::default();
+        version.version = Some(1);
+        patch.version = version.into();
+        patch.mutations.push(wa::SyncdMutation::default());
+        patch.external_mutations = wa::ExternalBlobReference::default().into();
+        let mut pl = PatchList {
+            name: WAPatchName::Regular,
+            has_more_patches: false,
+            patches: vec![patch],
+            snapshot: None,
+            snapshot_ref: None,
+            error: None,
+        };
+        let before = pl.patches[0].clone();
+        let error = processor
+            .missing_key_ids_after_inline(&mut pl, &|_| panic!("must reject before download"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::appstate::validation::ValidationError>()
+                .unwrap()
+                .metric
+                .as_deref(),
+            Some("PATCH_WITH_BOTH_INLINE_AND_EXTERNAL_MUTATIONS")
+        );
+        assert_eq!(pl.patches[0], before);
+        pl.patches[0].version = Default::default();
+        let error = processor
+            .missing_key_ids_after_inline(&mut pl, &|_| panic!("must reject before download"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::appstate::validation::ValidationError>()
+                .unwrap()
+                .metric
+                .as_deref(),
+            Some("MISSING_PATCH_VERSION")
+        );
+        assert_eq!(pl.patches[0].mutations.len(), 1);
+        assert!(pl.patches[0].external_mutations.as_option().is_some());
     }
     #[tokio::test(flavor = "current_thread")]
     async fn preparation_uses_blocking_workers_and_retains_snapshot_ownership() {
