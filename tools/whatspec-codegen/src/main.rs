@@ -294,6 +294,11 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
 
     Ok(vec![
         Artifact {
+            path: "wacore/src/stanza/groups/unlink_generated.rs",
+            content: emit::group_normalization::generate(wa_version)?,
+            rust: true,
+        },
+        Artifact {
             path: "wacore/src/version/generated.rs",
             content: emit::version::generate(wa_version)?,
             rust: true,

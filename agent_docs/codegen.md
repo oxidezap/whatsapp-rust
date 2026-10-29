@@ -50,3 +50,11 @@ fallbacks. A deployment-specific `target-feature` recommendation belongs in the
 consumer docs and requires a declared hardware floor. Changing profile overrides
 must retain optimization on per-message crypto/protocol code and pass the linked
 size gate. See `Cargo.toml` and `.github/workflows/binary-size.yml`.
+
+The experimental group unlink table consumes a separate immutable whatspec
+contract fixture through `emit::group_normalization`, with a checked digest.
+The normal all-domain generator includes it without changing the main IR pin.
+Its official JS oracle cases are emitted as Rust tests. Update the fixture,
+digest, revision and oracle together after reviewing the upstream PR. This
+projection qualifies only unlink action selection; it does not qualify raw
+create/link payloads or enable the opt-in contextual adapter in the runtime.

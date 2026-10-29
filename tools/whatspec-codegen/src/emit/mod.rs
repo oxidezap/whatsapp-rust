@@ -7,6 +7,7 @@ pub mod abprops;
 pub mod appstate;
 pub mod community_create;
 pub mod enums;
+pub mod group_normalization;
 pub mod iq_conformance;
 pub mod iq_pilots;
 pub mod iq_targets;

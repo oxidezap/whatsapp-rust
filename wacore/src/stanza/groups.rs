@@ -10,6 +10,8 @@
 //! - Root `participant` attribute identifies the admin/author who triggered the change
 //! - Participant lists are nested `<participant jid="..." />` children
 
+pub mod normalized;
+
 use crate::WireEnum;
 use serde::Serialize;
 use wacore_binary::Jid;
