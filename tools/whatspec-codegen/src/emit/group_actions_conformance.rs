@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 const ORACLE: &str = include_str!("../../fixtures/group_actions_oracle.json");
-const REV: &str = "ae4ea6e30816f307319522d4bac8fc448185f485";
+const REV: &str = "de8b8fce30e17fefd31861975e3e94806ab4285a";
 const ORACLE_SHA: &str = "1e132eaa76698909e07ae33e90e624400b55cc6c6f061940b6553d394095031a";
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

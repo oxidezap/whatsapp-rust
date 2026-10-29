@@ -90,10 +90,14 @@ fn optional_bool(value: &Value) -> Result<String> {
     ))
 }
 fn compare(out: &mut String, actual: &str, expected: &str, label: &str) {
-    out.push_str(&format!(
-        "assert_eq!({actual},{expected},{});\n",
-        rust_str(label)
-    ));
+    match expected {
+        "true" => out.push_str(&format!("assert!({actual},{});\n", rust_str(label))),
+        "false" => out.push_str(&format!("assert!(!({actual}),{});\n", rust_str(label))),
+        _ => out.push_str(&format!(
+            "assert_eq!({actual},{expected},{});\n",
+            rust_str(label)
+        )),
+    }
 }
 fn opt_text(out: &mut String, actual: &str, value: &Value, label: &str) -> Result<()> {
     compare(out, actual, &optional_string(value)?, label);

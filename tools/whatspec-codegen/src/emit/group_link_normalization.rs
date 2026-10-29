@@ -9,7 +9,7 @@ const CONTRACT: &str = include_str!("../../fixtures/group_link.json");
 const ORACLE: &str = include_str!("../../fixtures/group_link_oracle.json");
 const EVIDENCE: &str = include_str!("../../fixtures/group_link_evidence.json");
 // Root fills these together with the immutable upstream publication.
-const REV: &str = "ae4ea6e30816f307319522d4bac8fc448185f485";
+const REV: &str = "de8b8fce30e17fefd31861975e3e94806ab4285a";
 const CONTRACT_SHA256: &str = "0947df9df11850633040d9f55e73599f5695a6af56e48b1bd9bfa62f0bee0901";
 
 #[derive(Deserialize)]

@@ -86,12 +86,12 @@ fn original_group_envelope_callback_matches_rust_projection() {
             None,
             "absent-to-does-not-require-local-lid.offline"
         );
-        assert_eq!(
-            parsed.is_lid_addressing_mode, false,
+        assert!(
+            !(parsed.is_lid_addressing_mode),
             "absent-to-does-not-require-local-lid.isLidAddressingMode"
         );
-        assert_eq!(
-            parsed.has_incomplete_participant_information, false,
+        assert!(
+            !(parsed.has_incomplete_participant_information),
             "absent-to-does-not-require-local-lid.hasIncompleteParticipantInformation"
         );
         assert_eq!(
@@ -186,12 +186,12 @@ fn original_group_envelope_callback_matches_rust_projection() {
             None,
             "exact-local-lid-device.offline"
         );
-        assert_eq!(
-            parsed.is_lid_addressing_mode, false,
+        assert!(
+            !(parsed.is_lid_addressing_mode),
             "exact-local-lid-device.isLidAddressingMode"
         );
-        assert_eq!(
-            parsed.has_incomplete_participant_information, false,
+        assert!(
+            !(parsed.has_incomplete_participant_information),
             "exact-local-lid-device.hasIncompleteParticipantInformation"
         );
         assert_eq!(parsed.timestamp, 123_i64, "exact-local-lid-device");
@@ -279,12 +279,12 @@ fn original_group_envelope_callback_matches_rust_projection() {
             None,
             "exact-local-pn-device.offline"
         );
-        assert_eq!(
-            parsed.is_lid_addressing_mode, false,
+        assert!(
+            !(parsed.is_lid_addressing_mode),
             "exact-local-pn-device.isLidAddressingMode"
         );
-        assert_eq!(
-            parsed.has_incomplete_participant_information, false,
+        assert!(
+            !(parsed.has_incomplete_participant_information),
             "exact-local-pn-device.hasIncompleteParticipantInformation"
         );
         assert_eq!(parsed.timestamp, 123_i64, "exact-local-pn-device");
@@ -481,12 +481,12 @@ fn original_group_envelope_callback_matches_rust_projection() {
             None,
             "participant-is-optional.offline"
         );
-        assert_eq!(
-            parsed.is_lid_addressing_mode, false,
+        assert!(
+            !(parsed.is_lid_addressing_mode),
             "participant-is-optional.isLidAddressingMode"
         );
-        assert_eq!(
-            parsed.has_incomplete_participant_information, false,
+        assert!(
+            !(parsed.has_incomplete_participant_information),
             "participant-is-optional.hasIncompleteParticipantInformation"
         );
         assert_eq!(parsed.timestamp, 123_i64, "participant-is-optional");
@@ -687,12 +687,12 @@ fn original_group_envelope_callback_matches_rust_projection() {
             None,
             "invalid-participant-pn-lid-is-caught-locally.offline"
         );
-        assert_eq!(
-            parsed.is_lid_addressing_mode, false,
+        assert!(
+            !(parsed.is_lid_addressing_mode),
             "invalid-participant-pn-lid-is-caught-locally.isLidAddressingMode"
         );
-        assert_eq!(
-            parsed.has_incomplete_participant_information, false,
+        assert!(
+            !(parsed.has_incomplete_participant_information),
             "invalid-participant-pn-lid-is-caught-locally.hasIncompleteParticipantInformation"
         );
         assert_eq!(
@@ -787,12 +787,12 @@ fn original_group_envelope_callback_matches_rust_projection() {
             None,
             "invalid-participant-pn-device-is-caught-locally.offline"
         );
-        assert_eq!(
-            parsed.is_lid_addressing_mode, false,
+        assert!(
+            !(parsed.is_lid_addressing_mode),
             "invalid-participant-pn-device-is-caught-locally.isLidAddressingMode"
         );
-        assert_eq!(
-            parsed.has_incomplete_participant_information, false,
+        assert!(
+            !(parsed.has_incomplete_participant_information),
             "invalid-participant-pn-device-is-caught-locally.hasIncompleteParticipantInformation"
         );
         assert_eq!(
@@ -887,12 +887,12 @@ fn original_group_envelope_callback_matches_rust_projection() {
             None,
             "valid-participant-pn-is-retained.offline"
         );
-        assert_eq!(
-            parsed.is_lid_addressing_mode, false,
+        assert!(
+            !(parsed.is_lid_addressing_mode),
             "valid-participant-pn-is-retained.isLidAddressingMode"
         );
-        assert_eq!(
-            parsed.has_incomplete_participant_information, false,
+        assert!(
+            !(parsed.has_incomplete_participant_information),
             "valid-participant-pn-is-retained.hasIncompleteParticipantInformation"
         );
         assert_eq!(
@@ -991,12 +991,12 @@ fn original_group_envelope_callback_matches_rust_projection() {
             None,
             "disabled-username-gate-drops-marker-action-only.offline"
         );
-        assert_eq!(
-            parsed.is_lid_addressing_mode, true,
+        assert!(
+            parsed.is_lid_addressing_mode,
             "disabled-username-gate-drops-marker-action-only.isLidAddressingMode"
         );
-        assert_eq!(
-            parsed.has_incomplete_participant_information, false,
+        assert!(
+            !(parsed.has_incomplete_participant_information),
             "disabled-username-gate-drops-marker-action-only.hasIncompleteParticipantInformation"
         );
         assert_eq!(
@@ -1095,12 +1095,12 @@ fn original_group_envelope_callback_matches_rust_projection() {
             None,
             "enabled-username-gate-stamps-incomplete-marker.offline"
         );
-        assert_eq!(
-            parsed.is_lid_addressing_mode, true,
+        assert!(
+            parsed.is_lid_addressing_mode,
             "enabled-username-gate-stamps-incomplete-marker.isLidAddressingMode"
         );
-        assert_eq!(
-            parsed.has_incomplete_participant_information, true,
+        assert!(
+            parsed.has_incomplete_participant_information,
             "enabled-username-gate-stamps-incomplete-marker.hasIncompleteParticipantInformation"
         );
         assert_eq!(
@@ -1267,12 +1267,12 @@ fn original_group_envelope_callback_matches_rust_projection() {
             None,
             "timestamp-wraps-to-signed32.offline"
         );
-        assert_eq!(
-            parsed.is_lid_addressing_mode, false,
+        assert!(
+            !(parsed.is_lid_addressing_mode),
             "timestamp-wraps-to-signed32.isLidAddressingMode"
         );
-        assert_eq!(
-            parsed.has_incomplete_participant_information, false,
+        assert!(
+            !(parsed.has_incomplete_participant_information),
             "timestamp-wraps-to-signed32.hasIncompleteParticipantInformation"
         );
         assert_eq!(parsed.timestamp, 1_i64, "timestamp-wraps-to-signed32");
@@ -1363,12 +1363,12 @@ fn original_group_envelope_callback_matches_rust_projection() {
             None,
             "timestamp-reserved-minimum-is-clamped.offline"
         );
-        assert_eq!(
-            parsed.is_lid_addressing_mode, false,
+        assert!(
+            !(parsed.is_lid_addressing_mode),
             "timestamp-reserved-minimum-is-clamped.isLidAddressingMode"
         );
-        assert_eq!(
-            parsed.has_incomplete_participant_information, false,
+        assert!(
+            !(parsed.has_incomplete_participant_information),
             "timestamp-reserved-minimum-is-clamped.hasIncompleteParticipantInformation"
         );
         assert_eq!(
@@ -1462,12 +1462,12 @@ fn original_group_envelope_callback_matches_rust_projection() {
             None,
             "simple-unit-action-is-normalized.offline"
         );
-        assert_eq!(
-            parsed.is_lid_addressing_mode, false,
+        assert!(
+            !(parsed.is_lid_addressing_mode),
             "simple-unit-action-is-normalized.isLidAddressingMode"
         );
-        assert_eq!(
-            parsed.has_incomplete_participant_information, false,
+        assert!(
+            !(parsed.has_incomplete_participant_information),
             "simple-unit-action-is-normalized.hasIncompleteParticipantInformation"
         );
         assert_eq!(
@@ -1602,12 +1602,12 @@ fn original_group_envelope_callback_matches_rust_projection() {
             None,
             "absent-children-content-is-empty-actions.offline"
         );
-        assert_eq!(
-            parsed.is_lid_addressing_mode, false,
+        assert!(
+            !(parsed.is_lid_addressing_mode),
             "absent-children-content-is-empty-actions.isLidAddressingMode"
         );
-        assert_eq!(
-            parsed.has_incomplete_participant_information, false,
+        assert!(
+            !(parsed.has_incomplete_participant_information),
             "absent-children-content-is-empty-actions.hasIncompleteParticipantInformation"
         );
         assert_eq!(
@@ -1850,12 +1850,12 @@ fn original_group_envelope_callback_matches_rust_projection() {
             None,
             "bot-participant-is-a-supported-user-class.offline"
         );
-        assert_eq!(
-            parsed.is_lid_addressing_mode, false,
+        assert!(
+            !(parsed.is_lid_addressing_mode),
             "bot-participant-is-a-supported-user-class.isLidAddressingMode"
         );
-        assert_eq!(
-            parsed.has_incomplete_participant_information, false,
+        assert!(
+            !(parsed.has_incomplete_participant_information),
             "bot-participant-is-a-supported-user-class.hasIncompleteParticipantInformation"
         );
         assert_eq!(
@@ -1950,12 +1950,12 @@ fn original_group_envelope_callback_matches_rust_projection() {
             None,
             "pn-prefix-outside-official-user-class-is-caught.offline"
         );
-        assert_eq!(
-            parsed.is_lid_addressing_mode, false,
+        assert!(
+            !(parsed.is_lid_addressing_mode),
             "pn-prefix-outside-official-user-class-is-caught.isLidAddressingMode"
         );
-        assert_eq!(
-            parsed.has_incomplete_participant_information, false,
+        assert!(
+            !(parsed.has_incomplete_participant_information),
             "pn-prefix-outside-official-user-class-is-caught.hasIncompleteParticipantInformation"
         );
         assert_eq!(
@@ -2050,12 +2050,12 @@ fn original_group_envelope_callback_matches_rust_projection() {
             None,
             "unknown-country-is-undefined-with-username-gate-enabled.offline"
         );
-        assert_eq!(
-            parsed.is_lid_addressing_mode, false,
+        assert!(
+            !(parsed.is_lid_addressing_mode),
             "unknown-country-is-undefined-with-username-gate-enabled.isLidAddressingMode"
         );
-        assert_eq!(
-            parsed.has_incomplete_participant_information, false,
+        assert!(
+            !(parsed.has_incomplete_participant_information),
             "unknown-country-is-undefined-with-username-gate-enabled.hasIncompleteParticipantInformation"
         );
         assert_eq!(

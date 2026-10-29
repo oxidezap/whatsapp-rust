@@ -75,64 +75,64 @@ fn isolated_official_create_helpers_match_rust_projection() {
             group.creation, 123_i64,
             "default-and-unconditional-participant-username"
         );
-        assert_eq!(
-            group.restrict, false,
+        assert!(
+            !(group.restrict),
             "default-and-unconditional-participant-username.restrict"
         );
-        assert_eq!(
-            group.announce, false,
+        assert!(
+            !(group.announce),
             "default-and-unconditional-participant-username.announce"
         );
-        assert_eq!(
-            group.no_frequently_forwarded, false,
+        assert!(
+            !(group.no_frequently_forwarded),
             "default-and-unconditional-participant-username.noFrequentlyForwarded"
         );
-        assert_eq!(
-            group.support, false,
+        assert!(
+            !(group.support),
             "default-and-unconditional-participant-username.support"
         );
-        assert_eq!(
-            group.is_parent_group, false,
+        assert!(
+            !(group.is_parent_group),
             "default-and-unconditional-participant-username.isParentGroup"
         );
-        assert_eq!(
-            group.is_parent_group_closed, false,
+        assert!(
+            !(group.is_parent_group_closed),
             "default-and-unconditional-participant-username.isParentGroupClosed"
         );
-        assert_eq!(
-            group.default_subgroup, false,
+        assert!(
+            !(group.default_subgroup),
             "default-and-unconditional-participant-username.defaultSubgroup"
         );
-        assert_eq!(
-            group.general_subgroup, false,
+        assert!(
+            !(group.general_subgroup),
             "default-and-unconditional-participant-username.generalSubgroup"
         );
-        assert_eq!(
-            group.membership_approval_mode, false,
+        assert!(
+            !(group.membership_approval_mode),
             "default-and-unconditional-participant-username.membershipApprovalMode"
         );
-        assert_eq!(
-            group.allow_non_admin_subgroup_creation, false,
+        assert!(
+            !(group.allow_non_admin_subgroup_creation),
             "default-and-unconditional-participant-username.allowNonAdminSubGroupCreation"
         );
-        assert_eq!(
-            group.general_chat_auto_add_disabled, false,
+        assert!(
+            !(group.general_chat_auto_add_disabled),
             "default-and-unconditional-participant-username.generalChatAutoAddDisabled"
         );
-        assert_eq!(
-            group.hidden_subgroup, false,
+        assert!(
+            !(group.hidden_subgroup),
             "default-and-unconditional-participant-username.hiddenSubgroup"
         );
-        assert_eq!(
-            group.group_safety_check, false,
+        assert!(
+            !(group.group_safety_check),
             "default-and-unconditional-participant-username.groupSafetyCheck"
         );
-        assert_eq!(
-            group.has_capi, false,
+        assert!(
+            !(group.has_capi),
             "default-and-unconditional-participant-username.hasCapi"
         );
-        assert_eq!(
-            group.limit_sharing_enabled, false,
+        assert!(
+            !(group.limit_sharing_enabled),
             "default-and-unconditional-participant-username.limitSharingEnabled"
         );
         assert_eq!(
@@ -218,9 +218,8 @@ fn isolated_official_create_helpers_match_rust_projection() {
             None,
             "default-and-unconditional-participant-username.memberAddMode"
         );
-        assert_eq!(
-            group.ephemerality.is_some(),
-            false,
+        assert!(
+            !(group.ephemerality.is_some()),
             "default-and-unconditional-participant-username"
         );
         assert_eq!(
@@ -288,12 +287,12 @@ fn isolated_official_create_helpers_match_rust_projection() {
             None,
             "default-and-unconditional-participant-username"
         );
-        assert_eq!(
-            participant.is_admin, false,
+        assert!(
+            !(participant.is_admin),
             "default-and-unconditional-participant-username"
         );
-        assert_eq!(
-            participant.is_super_admin, false,
+        assert!(
+            !(participant.is_super_admin),
             "default-and-unconditional-participant-username"
         );
         assert_eq!(
@@ -344,12 +343,12 @@ fn isolated_official_create_helpers_match_rust_projection() {
             None,
             "default-and-unconditional-participant-username"
         );
-        assert_eq!(
-            participant.is_admin, true,
+        assert!(
+            participant.is_admin,
             "default-and-unconditional-participant-username"
         );
-        assert_eq!(
-            participant.is_super_admin, true,
+        assert!(
+            participant.is_super_admin,
             "default-and-unconditional-participant-username"
         );
         assert_eq!(
@@ -475,64 +474,64 @@ fn isolated_official_create_helpers_match_rust_projection() {
             group.creation, 123_i64,
             "disabled-country-and-history-gates"
         );
-        assert_eq!(
-            group.restrict, false,
+        assert!(
+            !(group.restrict),
             "disabled-country-and-history-gates.restrict"
         );
-        assert_eq!(
-            group.announce, false,
+        assert!(
+            !(group.announce),
             "disabled-country-and-history-gates.announce"
         );
-        assert_eq!(
-            group.no_frequently_forwarded, false,
+        assert!(
+            !(group.no_frequently_forwarded),
             "disabled-country-and-history-gates.noFrequentlyForwarded"
         );
-        assert_eq!(
-            group.support, false,
+        assert!(
+            !(group.support),
             "disabled-country-and-history-gates.support"
         );
-        assert_eq!(
-            group.is_parent_group, false,
+        assert!(
+            !(group.is_parent_group),
             "disabled-country-and-history-gates.isParentGroup"
         );
-        assert_eq!(
-            group.is_parent_group_closed, false,
+        assert!(
+            !(group.is_parent_group_closed),
             "disabled-country-and-history-gates.isParentGroupClosed"
         );
-        assert_eq!(
-            group.default_subgroup, false,
+        assert!(
+            !(group.default_subgroup),
             "disabled-country-and-history-gates.defaultSubgroup"
         );
-        assert_eq!(
-            group.general_subgroup, false,
+        assert!(
+            !(group.general_subgroup),
             "disabled-country-and-history-gates.generalSubgroup"
         );
-        assert_eq!(
-            group.membership_approval_mode, false,
+        assert!(
+            !(group.membership_approval_mode),
             "disabled-country-and-history-gates.membershipApprovalMode"
         );
-        assert_eq!(
-            group.allow_non_admin_subgroup_creation, false,
+        assert!(
+            !(group.allow_non_admin_subgroup_creation),
             "disabled-country-and-history-gates.allowNonAdminSubGroupCreation"
         );
-        assert_eq!(
-            group.general_chat_auto_add_disabled, false,
+        assert!(
+            !(group.general_chat_auto_add_disabled),
             "disabled-country-and-history-gates.generalChatAutoAddDisabled"
         );
-        assert_eq!(
-            group.hidden_subgroup, false,
+        assert!(
+            !(group.hidden_subgroup),
             "disabled-country-and-history-gates.hiddenSubgroup"
         );
-        assert_eq!(
-            group.group_safety_check, false,
+        assert!(
+            !(group.group_safety_check),
             "disabled-country-and-history-gates.groupSafetyCheck"
         );
-        assert_eq!(
-            group.has_capi, false,
+        assert!(
+            !(group.has_capi),
             "disabled-country-and-history-gates.hasCapi"
         );
-        assert_eq!(
-            group.limit_sharing_enabled, false,
+        assert!(
+            !(group.limit_sharing_enabled),
             "disabled-country-and-history-gates.limitSharingEnabled"
         );
         assert_eq!(
@@ -615,9 +614,8 @@ fn isolated_official_create_helpers_match_rust_projection() {
             None,
             "disabled-country-and-history-gates.memberAddMode"
         );
-        assert_eq!(
-            group.ephemerality.is_some(),
-            false,
+        assert!(
+            !(group.ephemerality.is_some()),
             "disabled-country-and-history-gates"
         );
         assert_eq!(
@@ -685,12 +683,12 @@ fn isolated_official_create_helpers_match_rust_projection() {
             None,
             "disabled-country-and-history-gates"
         );
-        assert_eq!(
-            participant.is_admin, false,
+        assert!(
+            !(participant.is_admin),
             "disabled-country-and-history-gates"
         );
-        assert_eq!(
-            participant.is_super_admin, false,
+        assert!(
+            !(participant.is_super_admin),
             "disabled-country-and-history-gates"
         );
         assert_eq!(
@@ -770,52 +768,52 @@ fn isolated_official_create_helpers_match_rust_projection() {
             "new-group-unknown-trigger"
         );
         assert_eq!(group.creation, 123_i64, "new-group-unknown-trigger");
-        assert_eq!(group.restrict, false, "new-group-unknown-trigger.restrict");
-        assert_eq!(group.announce, false, "new-group-unknown-trigger.announce");
-        assert_eq!(
-            group.no_frequently_forwarded, false,
+        assert!(!(group.restrict), "new-group-unknown-trigger.restrict");
+        assert!(!(group.announce), "new-group-unknown-trigger.announce");
+        assert!(
+            !(group.no_frequently_forwarded),
             "new-group-unknown-trigger.noFrequentlyForwarded"
         );
-        assert_eq!(group.support, false, "new-group-unknown-trigger.support");
-        assert_eq!(
-            group.is_parent_group, false,
+        assert!(!(group.support), "new-group-unknown-trigger.support");
+        assert!(
+            !(group.is_parent_group),
             "new-group-unknown-trigger.isParentGroup"
         );
-        assert_eq!(
-            group.is_parent_group_closed, false,
+        assert!(
+            !(group.is_parent_group_closed),
             "new-group-unknown-trigger.isParentGroupClosed"
         );
-        assert_eq!(
-            group.default_subgroup, false,
+        assert!(
+            !(group.default_subgroup),
             "new-group-unknown-trigger.defaultSubgroup"
         );
-        assert_eq!(
-            group.general_subgroup, false,
+        assert!(
+            !(group.general_subgroup),
             "new-group-unknown-trigger.generalSubgroup"
         );
-        assert_eq!(
-            group.membership_approval_mode, false,
+        assert!(
+            !(group.membership_approval_mode),
             "new-group-unknown-trigger.membershipApprovalMode"
         );
-        assert_eq!(
-            group.allow_non_admin_subgroup_creation, false,
+        assert!(
+            !(group.allow_non_admin_subgroup_creation),
             "new-group-unknown-trigger.allowNonAdminSubGroupCreation"
         );
-        assert_eq!(
-            group.general_chat_auto_add_disabled, false,
+        assert!(
+            !(group.general_chat_auto_add_disabled),
             "new-group-unknown-trigger.generalChatAutoAddDisabled"
         );
-        assert_eq!(
-            group.hidden_subgroup, false,
+        assert!(
+            !(group.hidden_subgroup),
             "new-group-unknown-trigger.hiddenSubgroup"
         );
-        assert_eq!(
-            group.group_safety_check, false,
+        assert!(
+            !(group.group_safety_check),
             "new-group-unknown-trigger.groupSafetyCheck"
         );
-        assert_eq!(group.has_capi, false, "new-group-unknown-trigger.hasCapi");
-        assert_eq!(
-            group.limit_sharing_enabled, false,
+        assert!(!(group.has_capi), "new-group-unknown-trigger.hasCapi");
+        assert!(
+            !(group.limit_sharing_enabled),
             "new-group-unknown-trigger.limitSharingEnabled"
         );
         assert_eq!(
@@ -898,11 +896,7 @@ fn isolated_official_create_helpers_match_rust_projection() {
             None,
             "new-group-unknown-trigger.memberAddMode"
         );
-        assert_eq!(
-            group.ephemerality.is_some(),
-            true,
-            "new-group-unknown-trigger"
-        );
+        assert!(group.ephemerality.is_some(), "new-group-unknown-trigger");
         assert_eq!(
             group.ephemerality.as_ref().map(|v| v.duration),
             Some(12_i64),
@@ -993,64 +987,52 @@ fn isolated_official_create_helpers_match_rust_projection() {
             "existing-group-unknown-trigger"
         );
         assert_eq!(group.creation, 123_i64, "existing-group-unknown-trigger");
-        assert_eq!(
-            group.restrict, false,
-            "existing-group-unknown-trigger.restrict"
-        );
-        assert_eq!(
-            group.announce, false,
-            "existing-group-unknown-trigger.announce"
-        );
-        assert_eq!(
-            group.no_frequently_forwarded, false,
+        assert!(!(group.restrict), "existing-group-unknown-trigger.restrict");
+        assert!(!(group.announce), "existing-group-unknown-trigger.announce");
+        assert!(
+            !(group.no_frequently_forwarded),
             "existing-group-unknown-trigger.noFrequentlyForwarded"
         );
-        assert_eq!(
-            group.support, false,
-            "existing-group-unknown-trigger.support"
-        );
-        assert_eq!(
-            group.is_parent_group, false,
+        assert!(!(group.support), "existing-group-unknown-trigger.support");
+        assert!(
+            !(group.is_parent_group),
             "existing-group-unknown-trigger.isParentGroup"
         );
-        assert_eq!(
-            group.is_parent_group_closed, false,
+        assert!(
+            !(group.is_parent_group_closed),
             "existing-group-unknown-trigger.isParentGroupClosed"
         );
-        assert_eq!(
-            group.default_subgroup, false,
+        assert!(
+            !(group.default_subgroup),
             "existing-group-unknown-trigger.defaultSubgroup"
         );
-        assert_eq!(
-            group.general_subgroup, false,
+        assert!(
+            !(group.general_subgroup),
             "existing-group-unknown-trigger.generalSubgroup"
         );
-        assert_eq!(
-            group.membership_approval_mode, false,
+        assert!(
+            !(group.membership_approval_mode),
             "existing-group-unknown-trigger.membershipApprovalMode"
         );
-        assert_eq!(
-            group.allow_non_admin_subgroup_creation, false,
+        assert!(
+            !(group.allow_non_admin_subgroup_creation),
             "existing-group-unknown-trigger.allowNonAdminSubGroupCreation"
         );
-        assert_eq!(
-            group.general_chat_auto_add_disabled, false,
+        assert!(
+            !(group.general_chat_auto_add_disabled),
             "existing-group-unknown-trigger.generalChatAutoAddDisabled"
         );
-        assert_eq!(
-            group.hidden_subgroup, false,
+        assert!(
+            !(group.hidden_subgroup),
             "existing-group-unknown-trigger.hiddenSubgroup"
         );
-        assert_eq!(
-            group.group_safety_check, false,
+        assert!(
+            !(group.group_safety_check),
             "existing-group-unknown-trigger.groupSafetyCheck"
         );
-        assert_eq!(
-            group.has_capi, false,
-            "existing-group-unknown-trigger.hasCapi"
-        );
-        assert_eq!(
-            group.limit_sharing_enabled, false,
+        assert!(!(group.has_capi), "existing-group-unknown-trigger.hasCapi");
+        assert!(
+            !(group.limit_sharing_enabled),
             "existing-group-unknown-trigger.limitSharingEnabled"
         );
         assert_eq!(
@@ -1133,9 +1115,8 @@ fn isolated_official_create_helpers_match_rust_projection() {
             None,
             "existing-group-unknown-trigger.memberAddMode"
         );
-        assert_eq!(
+        assert!(
             group.ephemerality.is_some(),
-            true,
             "existing-group-unknown-trigger"
         );
         assert_eq!(
@@ -1244,61 +1225,52 @@ fn isolated_official_create_helpers_match_rust_projection() {
             "parent-mode-flags-and-reason"
         );
         assert_eq!(group.creation, 123_i64, "parent-mode-flags-and-reason");
-        assert_eq!(
-            group.restrict, false,
-            "parent-mode-flags-and-reason.restrict"
-        );
-        assert_eq!(
-            group.announce, false,
-            "parent-mode-flags-and-reason.announce"
-        );
-        assert_eq!(
-            group.no_frequently_forwarded, false,
+        assert!(!(group.restrict), "parent-mode-flags-and-reason.restrict");
+        assert!(!(group.announce), "parent-mode-flags-and-reason.announce");
+        assert!(
+            !(group.no_frequently_forwarded),
             "parent-mode-flags-and-reason.noFrequentlyForwarded"
         );
-        assert_eq!(group.support, false, "parent-mode-flags-and-reason.support");
-        assert_eq!(
-            group.is_parent_group, true,
+        assert!(!(group.support), "parent-mode-flags-and-reason.support");
+        assert!(
+            group.is_parent_group,
             "parent-mode-flags-and-reason.isParentGroup"
         );
-        assert_eq!(
-            group.is_parent_group_closed, true,
+        assert!(
+            group.is_parent_group_closed,
             "parent-mode-flags-and-reason.isParentGroupClosed"
         );
-        assert_eq!(
-            group.default_subgroup, false,
+        assert!(
+            !(group.default_subgroup),
             "parent-mode-flags-and-reason.defaultSubgroup"
         );
-        assert_eq!(
-            group.general_subgroup, false,
+        assert!(
+            !(group.general_subgroup),
             "parent-mode-flags-and-reason.generalSubgroup"
         );
-        assert_eq!(
-            group.membership_approval_mode, false,
+        assert!(
+            !(group.membership_approval_mode),
             "parent-mode-flags-and-reason.membershipApprovalMode"
         );
-        assert_eq!(
-            group.allow_non_admin_subgroup_creation, false,
+        assert!(
+            !(group.allow_non_admin_subgroup_creation),
             "parent-mode-flags-and-reason.allowNonAdminSubGroupCreation"
         );
-        assert_eq!(
-            group.general_chat_auto_add_disabled, true,
+        assert!(
+            group.general_chat_auto_add_disabled,
             "parent-mode-flags-and-reason.generalChatAutoAddDisabled"
         );
-        assert_eq!(
-            group.hidden_subgroup, false,
+        assert!(
+            !(group.hidden_subgroup),
             "parent-mode-flags-and-reason.hiddenSubgroup"
         );
-        assert_eq!(
-            group.group_safety_check, false,
+        assert!(
+            !(group.group_safety_check),
             "parent-mode-flags-and-reason.groupSafetyCheck"
         );
-        assert_eq!(
-            group.has_capi, false,
-            "parent-mode-flags-and-reason.hasCapi"
-        );
-        assert_eq!(
-            group.limit_sharing_enabled, false,
+        assert!(!(group.has_capi), "parent-mode-flags-and-reason.hasCapi");
+        assert!(
+            !(group.limit_sharing_enabled),
             "parent-mode-flags-and-reason.limitSharingEnabled"
         );
         assert_eq!(
@@ -1381,9 +1353,8 @@ fn isolated_official_create_helpers_match_rust_projection() {
             Some("all_member_add"),
             "parent-mode-flags-and-reason.memberAddMode"
         );
-        assert_eq!(
-            group.ephemerality.is_some(),
-            false,
+        assert!(
+            !(group.ephemerality.is_some()),
             "parent-mode-flags-and-reason"
         );
         assert_eq!(
@@ -1478,64 +1449,64 @@ fn isolated_official_create_helpers_match_rust_projection() {
             group.creation, 1_i64,
             "time-cast-wraps-before-normalization"
         );
-        assert_eq!(
-            group.restrict, false,
+        assert!(
+            !(group.restrict),
             "time-cast-wraps-before-normalization.restrict"
         );
-        assert_eq!(
-            group.announce, false,
+        assert!(
+            !(group.announce),
             "time-cast-wraps-before-normalization.announce"
         );
-        assert_eq!(
-            group.no_frequently_forwarded, false,
+        assert!(
+            !(group.no_frequently_forwarded),
             "time-cast-wraps-before-normalization.noFrequentlyForwarded"
         );
-        assert_eq!(
-            group.support, false,
+        assert!(
+            !(group.support),
             "time-cast-wraps-before-normalization.support"
         );
-        assert_eq!(
-            group.is_parent_group, false,
+        assert!(
+            !(group.is_parent_group),
             "time-cast-wraps-before-normalization.isParentGroup"
         );
-        assert_eq!(
-            group.is_parent_group_closed, false,
+        assert!(
+            !(group.is_parent_group_closed),
             "time-cast-wraps-before-normalization.isParentGroupClosed"
         );
-        assert_eq!(
-            group.default_subgroup, false,
+        assert!(
+            !(group.default_subgroup),
             "time-cast-wraps-before-normalization.defaultSubgroup"
         );
-        assert_eq!(
-            group.general_subgroup, false,
+        assert!(
+            !(group.general_subgroup),
             "time-cast-wraps-before-normalization.generalSubgroup"
         );
-        assert_eq!(
-            group.membership_approval_mode, false,
+        assert!(
+            !(group.membership_approval_mode),
             "time-cast-wraps-before-normalization.membershipApprovalMode"
         );
-        assert_eq!(
-            group.allow_non_admin_subgroup_creation, false,
+        assert!(
+            !(group.allow_non_admin_subgroup_creation),
             "time-cast-wraps-before-normalization.allowNonAdminSubGroupCreation"
         );
-        assert_eq!(
-            group.general_chat_auto_add_disabled, false,
+        assert!(
+            !(group.general_chat_auto_add_disabled),
             "time-cast-wraps-before-normalization.generalChatAutoAddDisabled"
         );
-        assert_eq!(
-            group.hidden_subgroup, false,
+        assert!(
+            !(group.hidden_subgroup),
             "time-cast-wraps-before-normalization.hiddenSubgroup"
         );
-        assert_eq!(
-            group.group_safety_check, false,
+        assert!(
+            !(group.group_safety_check),
             "time-cast-wraps-before-normalization.groupSafetyCheck"
         );
-        assert_eq!(
-            group.has_capi, false,
+        assert!(
+            !(group.has_capi),
             "time-cast-wraps-before-normalization.hasCapi"
         );
-        assert_eq!(
-            group.limit_sharing_enabled, false,
+        assert!(
+            !(group.limit_sharing_enabled),
             "time-cast-wraps-before-normalization.limitSharingEnabled"
         );
         assert_eq!(
@@ -1621,9 +1592,8 @@ fn isolated_official_create_helpers_match_rust_projection() {
             None,
             "time-cast-wraps-before-normalization.memberAddMode"
         );
-        assert_eq!(
-            group.ephemerality.is_some(),
-            false,
+        assert!(
+            !(group.ephemerality.is_some()),
             "time-cast-wraps-before-normalization"
         );
         assert_eq!(
@@ -1691,12 +1661,12 @@ fn isolated_official_create_helpers_match_rust_projection() {
             None,
             "time-cast-wraps-before-normalization"
         );
-        assert_eq!(
-            participant.is_admin, false,
+        assert!(
+            !(participant.is_admin),
             "time-cast-wraps-before-normalization"
         );
-        assert_eq!(
-            participant.is_super_admin, false,
+        assert!(
+            !(participant.is_super_admin),
             "time-cast-wraps-before-normalization"
         );
         assert_eq!(
