@@ -7,7 +7,7 @@ async fn captured_web_session_scenarios_match_core_repair_outcomes() {
     let bytes = include_bytes!("../tests/fixtures/retry-conformance/session-cases.json");
     assert_eq!(
         hex::encode(sha2::Sha256::digest(bytes)),
-        "aadc079a167af576f3ee7649d86cd91e4ac83e6029951c5f23ca5ab54205c9b9",
+        "dc9412eef9d9241262395948b80745c320922ce6b98a61405748dc4db0a6c0b6",
         "pinned retry oracle fixture drift"
     );
     let fixture: serde_json::Value = serde_json::from_slice(bytes).unwrap();
@@ -132,4 +132,134 @@ async fn captured_retry_repair_cancelled_while_waiting_for_lock_has_no_effects()
             .await
             .unwrap()
     );
+}
+
+/// The official session generator awaits deleteRemoteSession before continuing.
+/// Core adds a persistence boundary: cancellation after the backend committed
+/// must retain the cache tombstone until a later flush acknowledges it.
+#[tokio::test]
+async fn captured_retry_cancel_after_durable_delete_keeps_tombstone_recoverable() {
+    use crate::store::release::tests::ProbeBackend;
+    let (mut probe, _) = ProbeBackend::new();
+    let raw = probe.backend.clone();
+    let (entered_tx, entered_rx) = async_channel::bounded(1);
+    let (_release_tx, release_rx) = async_channel::bounded(1);
+    probe.gate_method = "after:delete_sessions_batch";
+    probe.entered = Some(entered_tx);
+    probe.gate = Some(release_rx);
+    let client = crate::test_utils::create_test_client_with_backend(Arc::new(probe)).await;
+    let requester = Jid::lid_device("100000000000903".to_string(), 7);
+    let address = requester.to_protocol_address();
+    raw.put_session(
+        address.as_str(),
+        &valid_serialized_session(8, vec![0x44; 32]),
+    )
+    .await
+    .unwrap();
+    let task = {
+        let client = Arc::clone(&client);
+        let requester = requester.clone();
+        tokio::spawn(async move {
+            let receipt = build_retry_receipt_with_registration(7);
+            client
+                .reconcile_retry_session(&requester, "AFTER-DELETE", 2, &receipt.as_node_ref())
+                .await;
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx.recv())
+        .await
+        .expect("repair must reach post-delete boundary")
+        .unwrap();
+    assert!(
+        raw.get_session(address.as_str()).await.unwrap().is_none(),
+        "backend deletion committed before cancellation"
+    );
+    assert!(
+        !client
+            .signal_cache
+            .has_session(&address, raw.as_ref())
+            .await
+            .unwrap(),
+        "cache must not resurrect the deleted session"
+    );
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    // The cancelled future did not acknowledge the tombstone. Replaying the
+    // idempotent flush against the same healthy backend must settle it.
+    client.signal_cache.flush(raw.as_ref()).await.unwrap();
+    assert!(
+        !client
+            .signal_cache
+            .has_session(&address, raw.as_ref())
+            .await
+            .unwrap()
+    );
+    let mut settled = Box::pin(client.flush_signal_cache());
+    let result =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(Future::poll(settled.as_mut(), cx))).await;
+    assert!(
+        matches!(result, std::task::Poll::Ready(Ok(()))),
+        "acknowledged tombstone must not repeat gated delete I/O"
+    );
+}
+
+#[tokio::test]
+async fn captured_retry_failed_delete_flush_remains_recoverable_before_and_after_commit() {
+    use crate::store::release::tests::ProbeBackend;
+    for after_commit in [false, true] {
+        let (mut probe, _) = ProbeBackend::new();
+        let raw = probe.backend.clone();
+        if after_commit {
+            probe.fail_after_method = Some("delete_sessions_batch");
+        } else {
+            probe.fail_before_method = Some((
+                "delete_sessions_batch",
+                Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            ));
+        }
+        let client = crate::test_utils::create_test_client_with_backend(Arc::new(probe)).await;
+        let requester = Jid::lid_device("100000000000904".to_string(), 7);
+        let address = requester.to_protocol_address();
+        raw.put_session(
+            address.as_str(),
+            &valid_serialized_session(8, vec![0x45; 32]),
+        )
+        .await
+        .unwrap();
+        let receipt = build_retry_receipt_with_registration(7);
+        // This handwritten wrapper logs persistence failure. Its cache view
+        // must remain deleted even when durable deletion did not commit.
+        client
+            .reconcile_retry_session(&requester, "DELETE-FAILURE", 2, &receipt.as_node_ref())
+            .await;
+        assert_eq!(
+            raw.get_session(address.as_str()).await.unwrap().is_none(),
+            after_commit
+        );
+        assert!(
+            !client
+                .signal_cache
+                .has_session(&address, raw.as_ref())
+                .await
+                .unwrap()
+        );
+        let error = client
+            .flush_signal_cache()
+            .await
+            .expect_err("pending tombstone must retry failed deletion");
+        assert!(format!("{error:#}").contains(if after_commit {
+            "synthetic failure after commit"
+        } else {
+            "synthetic failure before commit"
+        }));
+        client.signal_cache.flush(raw.as_ref()).await.unwrap();
+        assert!(raw.get_session(address.as_str()).await.unwrap().is_none());
+        assert!(
+            !client
+                .signal_cache
+                .has_session(&address, raw.as_ref())
+                .await
+                .unwrap()
+        );
+    }
 }

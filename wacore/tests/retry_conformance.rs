@@ -7,7 +7,7 @@ fn captured_web_key_inclusion_gate_matches_manual_core_helper() {
     let bytes = include_bytes!("fixtures/retry-conformance/session-cases.json");
     assert_eq!(
         hex::encode(sha2::Sha256::digest(bytes)),
-        "aadc079a167af576f3ee7649d86cd91e4ac83e6029951c5f23ca5ab54205c9b9",
+        "dc9412eef9d9241262395948b80745c320922ce6b98a61405748dc4db0a6c0b6",
         "pinned retry oracle fixture drift"
     );
     let fixture: serde_json::Value = serde_json::from_slice(bytes).unwrap();
