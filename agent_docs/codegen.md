@@ -51,10 +51,20 @@ consumer docs and requires a declared hardware floor. Changing profile overrides
 must retain optimization on per-message crypto/protocol code and pass the linked
 size gate. See `Cargo.toml` and `.github/workflows/binary-size.yml`.
 
-The experimental group unlink table consumes a separate immutable whatspec
-contract fixture through `emit::group_normalization`, with a checked digest.
-The normal all-domain generator includes it without changing the main IR pin.
-Its official JS oracle cases are emitted as Rust tests. Update the fixture,
-digest, revision and oracle together after reviewing the upstream PR. This
-projection qualifies only unlink action selection; it does not qualify raw
-create/link payloads or enable the opt-in contextual adapter in the runtime.
+Group normalization consumes separately pinned whatspec envelope, LINK and UNLINK
+contracts, with checked digests. The normal generator emits static Rust guards,
+ordered projections and decision tables without changing the main IR pin.
+Independent original-JS oracle fixtures qualify the handwritten owned CREATE and
+other action parsers as well. Update fixtures, digests, revisions and oracles
+together; regenerate and run the group conformance tests.
+
+Runtime adoption requires the nondefault `generated-group-notifications` feature
+and a `GroupNotificationFactsProvider` installed on the client. The provider
+supplies effective flags and country lookup; device identities come from the
+cached device snapshot. Without a provider the existing adapter remains active.
+Normalized parsers own typed data; the compatibility adapter preserves the public
+event API. Cache, rotation, ACK and storage effects remain in their existing
+handlers. The tests use explicit account/Wid/telemetry mocks, with no authenticated
+session. Numeric values outside the supported safe-integer or legacy field range
+are rejected explicitly. See the pinned whatspec conformance evidence for the
+exact preserved bundle snapshot and source spans.

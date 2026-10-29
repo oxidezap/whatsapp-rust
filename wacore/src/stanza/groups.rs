@@ -10,6 +10,8 @@
 //! - Root `participant` attribute identifies the admin/author who triggered the change
 //! - Participant lists are nested `<participant jid="..." />` children
 
+pub mod create_normalized;
+mod identity;
 pub mod normalized;
 
 use crate::WireEnum;
@@ -657,7 +659,9 @@ impl GroupNotificationAction {
 }
 
 impl GroupNotification {
-    /// Parse from a `NodeRef`. Most fields are zero-copy; `Create`, `Link`,
+    /// Compatibility parser with permissive defaults and raw payload variants.
+    /// The contextual parser supplies source-qualified guards and owned actions.
+    /// Most fields are zero-copy; `Create`, `Link`,
     /// `Unlink`, `CreatedSubGroupSuggestion` and `RevokedSubGroupSuggestions`
     /// call `.to_owned()` to store their child as `raw: Node`.
     pub fn try_from_node_ref(node: &NodeRef<'_>) -> Option<Self> {
@@ -965,9 +969,9 @@ fn parse_participants(node: &NodeRef<'_>) -> Vec<GroupParticipantInfo> {
                     let display_name = attrs
                         .optional_string("display_name")
                         .map(|s| s.into_owned());
-                    // WA Web y(): `maybeAttrEnum("type", GROUP_PARTICIPANT_TYPES)
-                    // != null ? _ : "participant"`. Missing and unknown both
-                    // collapse to `Participant`, so the field is always Some.
+                    // Preserve the legacy API's unknown-role fallback. The
+                    // source-qualified contextual parser rejects an unknown
+                    // present role; upstream maybeAttrEnum defaults only absence.
                     let r#type = Some(
                         attrs
                             .optional_string("type")
@@ -2125,3 +2129,11 @@ mod tests {
         }
     }
 }
+
+pub mod actions_normalized;
+pub(super) mod envelope_runtime;
+pub mod link_normalized;
+pub mod suggestions_normalized;
+
+mod legacy_adapter;
+pub mod normalized_notification;

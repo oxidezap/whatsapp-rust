@@ -5,7 +5,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 use wacore::appstate::patch_decode::WAPatchName;
 use wacore::runtime::BoxFuture;
-use wacore::stanza::groups::{GroupNotification, GroupNotificationAction};
+use wacore::stanza::groups::GroupNotificationAction;
 use wacore::types::events::{
     GroupUpdate, MexNotification, ReachoutTimelock, ReachoutTimelockUpdate,
 };
@@ -162,10 +162,20 @@ pub(crate) async fn handle_group_notification(
         return true;
     }
 
-    let mut notification = match GroupNotification::try_from_node_ref(node.get()) {
-        Some(n) => n,
-        None => {
+    #[cfg(feature = "generated-group-notifications")]
+    let parsed_notification = client.parse_group_notification(node.get());
+    #[cfg(not(feature = "generated-group-notifications"))]
+    let parsed_notification = Ok::<_, &'static str>(
+        wacore::stanza::groups::GroupNotification::try_from_node_ref(node.get()),
+    );
+    let mut notification = match parsed_notification {
+        Ok(Some(n)) => n,
+        Ok(None) => {
             warn!(target: "Client/Group", "w:gp2 notification missing 'from' attribute");
+            return true;
+        }
+        Err(error) => {
+            warn!(target:"Client/Group","w:gp2 notification rejected: {error}");
             return true;
         }
     };

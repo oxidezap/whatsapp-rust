@@ -1,0 +1,534 @@
+[
+  {
+    "kind": "parent_group",
+    "hidden": false,
+    "result": {
+      "actionType": "parent_group_link",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123
+        }
+      ]
+    }
+  },
+  {
+    "kind": "parent_group",
+    "hidden": true,
+    "result": {
+      "actionType": "parent_group_link",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123
+        }
+      ]
+    }
+  },
+  {
+    "kind": "sibling_group",
+    "hidden": false,
+    "result": {
+      "actionType": "sibling_group_link",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": false
+        }
+      ]
+    }
+  },
+  {
+    "kind": "sibling_group",
+    "hidden": true,
+    "result": {
+      "actionType": "sibling_group_link",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": true
+        }
+      ]
+    }
+  },
+  {
+    "kind": "sub_group",
+    "hidden": false,
+    "result": {
+      "actionType": "sub_group_link",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": false
+        }
+      ]
+    }
+  },
+  {
+    "kind": "sub_group",
+    "hidden": true,
+    "result": {
+      "actionType": "sub_group_link",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": true
+        }
+      ]
+    }
+  },
+  {
+    "kind": "",
+    "hidden": false,
+    "result": {
+      "actionType": null,
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": false
+        }
+      ]
+    }
+  },
+  {
+    "kind": "",
+    "hidden": true,
+    "result": {
+      "actionType": null,
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": true
+        }
+      ]
+    }
+  },
+  {
+    "kind": "future_kind",
+    "hidden": false,
+    "result": {
+      "actionType": null,
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": false
+        }
+      ]
+    }
+  },
+  {
+    "kind": "future_kind",
+    "hidden": true,
+    "result": {
+      "actionType": null,
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": true
+        }
+      ]
+    }
+  },
+  {
+    "kind": "__defineGetter__",
+    "hidden": false,
+    "unsupportedAction": true,
+    "result": {
+      "actionValueType": "function",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": false
+        }
+      ]
+    }
+  },
+  {
+    "kind": "__defineGetter__",
+    "hidden": true,
+    "unsupportedAction": true,
+    "result": {
+      "actionValueType": "function",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": true
+        }
+      ]
+    }
+  },
+  {
+    "kind": "__defineSetter__",
+    "hidden": false,
+    "unsupportedAction": true,
+    "result": {
+      "actionValueType": "function",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": false
+        }
+      ]
+    }
+  },
+  {
+    "kind": "__defineSetter__",
+    "hidden": true,
+    "unsupportedAction": true,
+    "result": {
+      "actionValueType": "function",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": true
+        }
+      ]
+    }
+  },
+  {
+    "kind": "__lookupGetter__",
+    "hidden": false,
+    "unsupportedAction": true,
+    "result": {
+      "actionValueType": "function",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": false
+        }
+      ]
+    }
+  },
+  {
+    "kind": "__lookupGetter__",
+    "hidden": true,
+    "unsupportedAction": true,
+    "result": {
+      "actionValueType": "function",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": true
+        }
+      ]
+    }
+  },
+  {
+    "kind": "__lookupSetter__",
+    "hidden": false,
+    "unsupportedAction": true,
+    "result": {
+      "actionValueType": "function",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": false
+        }
+      ]
+    }
+  },
+  {
+    "kind": "__lookupSetter__",
+    "hidden": true,
+    "unsupportedAction": true,
+    "result": {
+      "actionValueType": "function",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": true
+        }
+      ]
+    }
+  },
+  {
+    "kind": "__proto__",
+    "hidden": false,
+    "unsupportedAction": true,
+    "result": {
+      "actionValueType": "object",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": false
+        }
+      ]
+    }
+  },
+  {
+    "kind": "__proto__",
+    "hidden": true,
+    "unsupportedAction": true,
+    "result": {
+      "actionValueType": "object",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": true
+        }
+      ]
+    }
+  },
+  {
+    "kind": "constructor",
+    "hidden": false,
+    "unsupportedAction": true,
+    "result": {
+      "actionValueType": "function",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": false
+        }
+      ]
+    }
+  },
+  {
+    "kind": "constructor",
+    "hidden": true,
+    "unsupportedAction": true,
+    "result": {
+      "actionValueType": "function",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": true
+        }
+      ]
+    }
+  },
+  {
+    "kind": "hasOwnProperty",
+    "hidden": false,
+    "unsupportedAction": true,
+    "result": {
+      "actionValueType": "function",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": false
+        }
+      ]
+    }
+  },
+  {
+    "kind": "hasOwnProperty",
+    "hidden": true,
+    "unsupportedAction": true,
+    "result": {
+      "actionValueType": "function",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": true
+        }
+      ]
+    }
+  },
+  {
+    "kind": "isPrototypeOf",
+    "hidden": false,
+    "unsupportedAction": true,
+    "result": {
+      "actionValueType": "function",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": false
+        }
+      ]
+    }
+  },
+  {
+    "kind": "isPrototypeOf",
+    "hidden": true,
+    "unsupportedAction": true,
+    "result": {
+      "actionValueType": "function",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": true
+        }
+      ]
+    }
+  },
+  {
+    "kind": "propertyIsEnumerable",
+    "hidden": false,
+    "unsupportedAction": true,
+    "result": {
+      "actionValueType": "function",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": false
+        }
+      ]
+    }
+  },
+  {
+    "kind": "propertyIsEnumerable",
+    "hidden": true,
+    "unsupportedAction": true,
+    "result": {
+      "actionValueType": "function",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": true
+        }
+      ]
+    }
+  },
+  {
+    "kind": "toLocaleString",
+    "hidden": false,
+    "unsupportedAction": true,
+    "result": {
+      "actionValueType": "function",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": false
+        }
+      ]
+    }
+  },
+  {
+    "kind": "toLocaleString",
+    "hidden": true,
+    "unsupportedAction": true,
+    "result": {
+      "actionValueType": "function",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": true
+        }
+      ]
+    }
+  },
+  {
+    "kind": "toString",
+    "hidden": false,
+    "unsupportedAction": true,
+    "result": {
+      "actionValueType": "function",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": false
+        }
+      ]
+    }
+  },
+  {
+    "kind": "toString",
+    "hidden": true,
+    "unsupportedAction": true,
+    "result": {
+      "actionValueType": "function",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": true
+        }
+      ]
+    }
+  },
+  {
+    "kind": "valueOf",
+    "hidden": false,
+    "unsupportedAction": true,
+    "result": {
+      "actionValueType": "function",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": false
+        }
+      ]
+    }
+  },
+  {
+    "kind": "valueOf",
+    "hidden": true,
+    "unsupportedAction": true,
+    "result": {
+      "actionValueType": "function",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic group",
+          "subjectTime": 123,
+          "hiddenSubgroup": true
+        }
+      ]
+    }
+  }
+]

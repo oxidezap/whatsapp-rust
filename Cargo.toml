@@ -169,6 +169,9 @@ zerocopy = { version = "0.8.55", default-features = false, features = ["derive"]
 zlib-rs = { version = "0.6.6", default-features = false, features = ["std", "rust-allocator"] }
 
 [features]
+# Source-qualified group parsing requires explicit effective account facts.
+# Kept opt-in to preserve the default runtime footprint.
+generated-group-notifications = []
 # Browser randomness and, when selected, SQLite's wasm-bindgen host hooks.
 # Keep this opt-in separate from sqlite-storage: enabling it for native
 # consumers with rusqlite 0.40 would reintroduce the wsqlite3 links conflict.

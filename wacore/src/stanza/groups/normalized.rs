@@ -1,7 +1,10 @@
 //! Contextual validation and a qualified unlink projection. This is deliberately
 //! opt-in until create/link and effective account gates are qualified. Existing
 //! public events and the legacy raw-node adapter keep their shape.
-use super::{GroupNotification, GroupNotificationAction, GroupParticipantInfo};
+pub use super::normalized_notification::{
+    GroupNotificationDiagnostic, NormalizedGroupNotification, parse_normalized_group_notification,
+};
+use super::{GroupNotification, GroupParticipantInfo};
 use crate::WireEnum;
 use wacore_binary::{Jid, NodeRef};
 #[path = "unlink_generated.rs"]
@@ -9,10 +12,13 @@ mod generated;
 
 /// Facts supplied by the caller from the same account/device snapshot.
 pub struct GroupParseContext<'a> {
-    pub me_device_lid: &'a Jid,
+    pub me_device_lid: Option<&'a Jid>,
     pub me_device_pn: Option<&'a Jid>,
     pub username_displayed: bool,
     pub history_after_join: bool,
+    pub opus_enabled: bool,
+    pub is_me_account: &'a dyn Fn(&Jid) -> bool,
+    pub normalize_country_code: &'a dyn Fn(&str) -> Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -23,8 +29,18 @@ pub enum GroupParseError {
     Destination,
     #[error("missing or invalid {0}")]
     Field(&'static str),
-    #[error("unrecognized group action {0}")]
+    #[error("{prefix}{0}", prefix=super::envelope_runtime::UNKNOWN_ACTION_ERROR_PREFIX)]
     UnknownAction(String),
+    #[error("integer outside the qualified API range for {0}")]
+    NumericRange(&'static str),
+    #[error("non-string action value for {0}")]
+    UnsupportedActionType(&'static str),
+    #[error("missing context fact {0}")]
+    MissingContext(&'static str),
+    #[error("envelope rejected: {0}")]
+    Rejected(String),
+    #[error(transparent)]
+    Action(Box<super::actions_normalized::GroupActionParseError>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
@@ -62,24 +78,24 @@ pub fn parse_unlink(node: &NodeRef<'_>) -> Result<NormalizedUnlink, GroupParseEr
         .ok_or(GroupParseError::Field("unlink_type"))?;
     let reason = node.get_attr("unlink_reason");
     let mut groups = vec![];
+    if node.content.is_some() && node.children().is_none() {
+        return Err(GroupParseError::Field("children"));
+    }
     for child in node.get_children_by_tag("group") {
         let jid = required_jid(child, "jid", JidKind::Group)?;
         let subject = child
             .get_attr("subject")
             .ok_or(GroupParseError::Field("subject"))?
             .to_string();
-        let subject_time = child
-            .get_attr("s_t")
-            .and_then(|v| v.as_str().parse::<i64>().ok())
-            .ok_or(GroupParseError::Field("s_t"))?;
+        let subject_time = read_integer(child, "s_t")?;
         groups.push(UnlinkedGroup {
             jid,
             subject,
             subject_time,
         });
     }
-    let action = generated::normalize_unlink(&kind.as_str(), reason.map(|v| v.as_str()).as_deref())
-        .map_err(|()| GroupParseError::Field("unsupported unlink action"))?;
+    let action =
+        generated::normalize_unlink(&kind.as_str(), reason.map(|v| v.as_str()).as_deref())?;
     let kind = action
         .map(|a| {
             GroupUnlinkKind::try_from(a)
@@ -91,37 +107,32 @@ pub fn parse_unlink(node: &NodeRef<'_>) -> Result<NormalizedUnlink, GroupParseEr
 
 enum JidKind {
     Group,
-    User,
-    Phone,
-    Lid,
 }
 fn required_jid(
     node: &NodeRef<'_>,
     field: &'static str,
     kind: JidKind,
 ) -> Result<Jid, GroupParseError> {
-    let jid = node
-        .attrs()
-        .optional_jid(field)
-        .ok_or(GroupParseError::Field(field))?;
-    let valid = !jid.user.is_empty()
-        && match kind {
-            JidKind::Group => jid.server == wacore_binary::jid::Server::Group,
-            JidKind::User => jid.is_pn() || jid.is_lid(),
-            JidKind::Phone => jid.is_pn(),
-            JidKind::Lid => jid.is_lid(),
-        };
-    valid.then_some(jid).ok_or(GroupParseError::Field(field))
+    let raw = node
+        .get_attr(field)
+        .ok_or(GroupParseError::Field(field))?
+        .as_str();
+    let jid = match kind {
+        JidKind::Group => super::identity::parse_group(&raw),
+    };
+    jid.ok_or(GroupParseError::Field(field))
 }
-fn optional_jid(
-    node: &NodeRef<'_>,
-    field: &'static str,
-    kind: JidKind,
-) -> Result<(), GroupParseError> {
-    if node.get_attr(field).is_some() {
-        required_jid(node, field, kind)?;
-    }
-    Ok(())
+fn read_integer(node: &NodeRef<'_>, field: &'static str) -> Result<i64, GroupParseError> {
+    let raw = node
+        .get_attr(field)
+        .ok_or(GroupParseError::Field(field))?
+        .as_str();
+    super::identity::parse_js_integer(&raw).map_err(|error| match error {
+        super::identity::IntegerReadError::NotInteger => GroupParseError::Field(field),
+        super::identity::IntegerReadError::OutsideExactRange => {
+            GroupParseError::NumericRange(field)
+        }
+    })
 }
 
 impl GroupNotification {
@@ -132,103 +143,32 @@ impl GroupNotification {
         node: &NodeRef<'_>,
         context: &GroupParseContext<'_>,
     ) -> Result<Self, GroupParseError> {
-        if node.tag.as_ref() != "notification" {
-            return Err(GroupParseError::Tag);
+        let parsed = parse_normalized_group_notification(node, context)?;
+        let wire_actions = node.children().into_iter().flatten().filter(|child| {
+            child.tag.as_ref() != super::envelope_runtime::MISSING_IDENTIFICATION_TAG
+        });
+        let mut actions = vec![];
+        for (action, wire) in parsed.actions.iter().zip(wire_actions) {
+            actions.push(super::legacy_adapter::action_to_legacy(action, wire)?);
         }
-        if let Some(to) = node.get_attr("to") {
-            let lid = context.me_device_lid.to_string();
-            let pn = context.me_device_pn.map(ToString::to_string);
-            if to.as_str() != lid && pn.as_deref() != Some(to.as_str().as_ref()) {
-                return Err(GroupParseError::Destination);
-            }
+        if actions.len() != parsed.actions.len() {
+            return Err(GroupParseError::Field("actions"));
         }
-        required_jid(node, "from", JidKind::Group)?;
-        optional_jid(node, "participant", JidKind::User)?;
-        // The official parser catches just this PN accessor's failure.
-        let participant_pn = required_jid(node, "participant_pn", JidKind::Phone).ok();
-        if node
-            .get_attr("t")
-            .and_then(|v| v.as_str().parse::<u64>().ok())
-            .is_none()
-        {
-            return Err(GroupParseError::Field("t"));
-        }
-        // Action and participant validation precedes the final id accessor.
-        if let Some(children) = node.children() {
-            for child in children {
-                if child.tag.as_ref() == "missing_participant_identification" {
-                    continue;
-                }
-                if matches!(
-                    super::parse_action(child),
-                    Some(GroupNotificationAction::Unknown { .. })
-                ) {
-                    return Err(GroupParseError::UnknownAction(child.tag.to_string()));
-                }
-                if matches!(
-                    super::GroupNotificationActionTag::from(child.tag.as_ref()),
-                    super::GroupNotificationActionTag::Add
-                        | super::GroupNotificationActionTag::Remove
-                        | super::GroupNotificationActionTag::Promote
-                        | super::GroupNotificationActionTag::Demote
-                        | super::GroupNotificationActionTag::Modify
-                        | super::GroupNotificationActionTag::LinkedGroupPromote
-                        | super::GroupNotificationActionTag::LinkedGroupDemote
-                ) {
-                    for p in child.get_children_by_tag("participant") {
-                        if let Some(role) = p.attrs().optional_string("type")
-                            && super::GroupParticipantType::try_from(role.as_ref()).is_err()
-                        {
-                            return Err(GroupParseError::Field("type"));
-                        }
-                        optional_jid(p, "lid", JidKind::Lid)?;
-                        optional_jid(p, "phone_number", JidKind::Phone)?;
-                        required_jid(p, "jid", JidKind::User)?;
-                    }
-                }
-            }
-        }
-        if node.get_attr("id").is_none() {
-            return Err(GroupParseError::Field("id"));
-        }
-        let mut parsed = Self::try_from_node_ref(node).ok_or(GroupParseError::Field("from"))?;
-        parsed.participant_pn = participant_pn;
-        parsed.has_incomplete_participant_information &= context.username_displayed;
-        if !context.username_displayed {
-            parsed.participant_username = None;
-            parsed.participant_country_code = None;
-        }
-        for action in &mut parsed.actions {
-            let participants = match action {
-                GroupNotificationAction::Add { participants, .. }
-                | GroupNotificationAction::Remove { participants, .. }
-                | GroupNotificationAction::Promote { participants }
-                | GroupNotificationAction::Demote { participants }
-                | GroupNotificationAction::Modify { participants }
-                | GroupNotificationAction::LinkedGroupPromote { participants }
-                | GroupNotificationAction::LinkedGroupDemote { participants } => Some(participants),
-                // The original helper gates requested_user usernames only.
-                // Participant and subject usernames are read unconditionally.
-                GroupNotificationAction::CreatedMembershipRequests { requests, .. } => {
-                    if !context.username_displayed {
-                        for request in requests {
-                            request.username = None;
-                        }
-                    }
-                    None
-                }
-                _ => None,
-            };
-            if let Some(participants) = participants
-                && !context.history_after_join
-            {
-                for p in participants {
-                    p.join_time = None;
-                    p.group_history_sent_state = None;
-                }
-            }
-        }
-        Ok(parsed)
+        Ok(Self {
+            group_jid: parsed.chat_id,
+            notification_id: Some(parsed.external_id),
+            notify: parsed.pushname,
+            offline: parsed.offline,
+            participant: parsed.author,
+            participant_pn: parsed.author_phone_number,
+            participant_username: parsed.author_username,
+            participant_country_code: parsed.author_username_country_code,
+            timestamp: u64::try_from(parsed.timestamp)
+                .map_err(|_| GroupParseError::NumericRange("t"))?,
+            is_lid_addressing_mode: parsed.is_lid_addressing_mode,
+            has_incomplete_participant_information: parsed.has_incomplete_participant_information,
+            actions,
+        })
     }
 }
 impl GroupParticipantInfo {
@@ -242,6 +182,7 @@ impl GroupParticipantInfo {
 
 #[cfg(test)]
 mod tests {
+    use super::super::GroupNotificationAction;
     use super::*;
     use wacore_binary::builder::NodeBuilder;
     fn base() -> NodeBuilder {
@@ -251,118 +192,17 @@ mod tests {
             .attr("t", "123")
     }
     #[test]
-    fn username_gates_are_field_specific_and_independent_of_history() {
-        let lid = Jid::lid_device("100001", 2);
-        for username_displayed in [false, true] {
-            for history_after_join in [false, true] {
-                let context = GroupParseContext {
-                    me_device_lid: &lid,
-                    me_device_pn: None,
-                    username_displayed,
-                    history_after_join,
-                };
-                let node = base()
-                    .attr("participant_username", "root_name")
-                    .children([
-                        NodeBuilder::new("add")
-                            .children([NodeBuilder::new("participant")
-                                .attr("jid", "200002@s.whatsapp.net")
-                                .attr("username", "member_name")
-                                .build()])
-                            .build(),
-                        NodeBuilder::new("subject")
-                            .attr("subject", "synthetic")
-                            .attr("s_o_username", "subject_name")
-                            .build(),
-                        NodeBuilder::new("created_membership_requests")
-                            .attr("request_method", "invite_link")
-                            .children([NodeBuilder::new("requested_user")
-                                .attr("jid", "200003@s.whatsapp.net")
-                                .attr("username", "request_name")
-                                .build()])
-                            .build(),
-                    ])
-                    .build();
-                let parsed = GroupNotification::try_from_node_ref_with_context(
-                    &node.as_node_ref(),
-                    &context,
-                )
-                .unwrap();
-                assert_eq!(parsed.participant_username.is_some(), username_displayed);
-                let GroupNotificationAction::Add { participants, .. } = &parsed.actions[0] else {
-                    panic!("add")
-                };
-                assert_eq!(participants[0].username.as_deref(), Some("member_name"));
-                let GroupNotificationAction::Subject {
-                    subject_owner_username,
-                    ..
-                } = &parsed.actions[1]
-                else {
-                    panic!("subject")
-                };
-                assert_eq!(subject_owner_username.as_deref(), Some("subject_name"));
-                let GroupNotificationAction::CreatedMembershipRequests { requests, .. } =
-                    &parsed.actions[2]
-                else {
-                    panic!("requests")
-                };
-                assert_eq!(requests[0].username.is_some(), username_displayed);
-            }
-        }
-    }
-    #[test]
-    fn present_unknown_role_rejects_before_missing_jid_but_absence_defaults() {
-        let lid = Jid::lid_device("100001", 2);
-        let context = GroupParseContext {
-            me_device_lid: &lid,
-            me_device_pn: None,
-            username_displayed: false,
-            history_after_join: false,
-        };
-        let node = base()
-            .children([NodeBuilder::new("add")
-                .children([NodeBuilder::new("participant")
-                    .attr("type", "future_role")
-                    .build()])
-                .build()])
-            .build();
-        assert_eq!(
-            GroupNotification::try_from_node_ref_with_context(&node.as_node_ref(), &context)
-                .unwrap_err(),
-            GroupParseError::Field("type")
-        );
-    }
-    #[test]
-    fn inherited_unlink_actions_reject_while_unknown_strings_remain_undefined() {
-        for kind in ["constructor", "toString", "__proto__", "valueOf"] {
-            let node = NodeBuilder::new("unlink").attr("unlink_type", kind).build();
-            assert_eq!(
-                parse_unlink(&node.as_node_ref()).unwrap_err(),
-                GroupParseError::Field("unsupported unlink action")
-            );
-            let invalid_payload = NodeBuilder::new("unlink")
-                .attr("unlink_type", kind)
-                .children([NodeBuilder::new("group").attr("jid", "100001@lid").build()])
-                .build();
-            assert_eq!(
-                parse_unlink(&invalid_payload.as_node_ref()).unwrap_err(),
-                GroupParseError::Field("jid")
-            );
-        }
-        let node = NodeBuilder::new("unlink")
-            .attr("unlink_type", "future_kind")
-            .build();
-        assert_eq!(parse_unlink(&node.as_node_ref()).unwrap().kind, None);
-    }
-    #[test]
     fn identities_and_first_failure_use_real_context() {
         let lid = Jid::lid_device("100001", 2);
-        let pn = Jid::pn_device("100002", 2);
+        let pn = Jid::pn_device("200002", 2);
         let context = GroupParseContext {
-            me_device_lid: &lid,
+            me_device_lid: Some(&lid),
             me_device_pn: Some(&pn),
             username_displayed: false,
             history_after_join: false,
+            opus_enabled: false,
+            is_me_account: &|_| false,
+            normalize_country_code: &|_| None,
         };
         for to in [lid.to_string(), pn.to_string()] {
             let node = base().attr("to", to).build();
@@ -391,15 +231,20 @@ mod tests {
         let lid = Jid::lid_device("100001", 2);
         for enabled in [false, true] {
             let context = GroupParseContext {
-                me_device_lid: &lid,
+                me_device_lid: Some(&lid),
                 me_device_pn: None,
                 username_displayed: enabled,
                 history_after_join: false,
+                opus_enabled: false,
+                is_me_account: &|_| false,
+                normalize_country_code: &|_| None,
             };
             let node = base()
                 .attr("participant_pn", "100004@lid")
                 .attr("participant_username", "synthetic")
-                .children([NodeBuilder::new("missing_participant_identification").build()])
+                .children([
+                    NodeBuilder::new(super::super::MISSING_PARTICIPANT_IDENTIFICATION_TAG).build(),
+                ])
                 .build();
             let parsed =
                 GroupNotification::try_from_node_ref_with_context(&node.as_node_ref(), &context)
@@ -414,10 +259,13 @@ mod tests {
     fn unknown_action_precedes_missing_final_id() {
         let lid = Jid::lid_device("100001", 2);
         let context = GroupParseContext {
-            me_device_lid: &lid,
+            me_device_lid: Some(&lid),
             me_device_pn: None,
             username_displayed: false,
             history_after_join: false,
+            opus_enabled: false,
+            is_me_account: &|_| false,
+            normalize_country_code: &|_| None,
         };
         let node = NodeBuilder::new("notification")
             .attr("from", "123456@g.us")
@@ -435,16 +283,19 @@ mod tests {
         let lid = Jid::lid_device("100001", 2);
         for enabled in [false, true] {
             let context = GroupParseContext {
-                me_device_lid: &lid,
+                me_device_lid: Some(&lid),
                 me_device_pn: None,
                 username_displayed: false,
                 history_after_join: enabled,
+                opus_enabled: false,
+                is_me_account: &|_| false,
+                normalize_country_code: &|_| None,
             };
             let node = base()
                 .children([NodeBuilder::new("add")
                     .children([
                         NodeBuilder::new("participant")
-                            .attr("jid", "100002@s.whatsapp.net")
+                            .attr("jid", "200002@s.whatsapp.net")
                             .attr("join_time", "123")
                             .build(),
                         NodeBuilder::new("participant")
@@ -511,4 +362,165 @@ mod tests {
             GroupParseError::Field("jid")
         );
     }
+    #[test]
+    fn username_gates_follow_the_specific_action() {
+        let lid = Jid::lid_device("100001", 2);
+        let context = GroupParseContext {
+            me_device_lid: Some(&lid),
+            me_device_pn: None,
+            username_displayed: false,
+            history_after_join: false,
+            opus_enabled: false,
+            is_me_account: &|_| false,
+            normalize_country_code: &|_| None,
+        };
+        let node = base()
+            .children([
+                NodeBuilder::new("subject")
+                    .attr("subject", "synthetic subject")
+                    .attr("s_o_username", "owner_username")
+                    .build(),
+                NodeBuilder::new("created_membership_requests")
+                    .attr("request_method", "invite_link")
+                    .children([NodeBuilder::new("requested_user")
+                        .attr("jid", "100002@lid")
+                        .attr("username", "request_username")
+                        .build()])
+                    .build(),
+                NodeBuilder::new("add")
+                    .children([NodeBuilder::new("participant")
+                        .attr("jid", "100003@lid")
+                        .attr("participant_username", "unsupported_alias")
+                        .build()])
+                    .build(),
+            ])
+            .build();
+        let parsed =
+            GroupNotification::try_from_node_ref_with_context(&node.as_node_ref(), &context)
+                .unwrap();
+        let GroupNotificationAction::Subject {
+            subject_owner_username,
+            ..
+        } = &parsed.actions[0]
+        else {
+            panic!("subject")
+        };
+        assert_eq!(subject_owner_username.as_deref(), Some("owner_username"));
+        let GroupNotificationAction::CreatedMembershipRequests { requests, .. } =
+            &parsed.actions[1]
+        else {
+            panic!("requests")
+        };
+        assert!(requests[0].username.is_none());
+        let GroupNotificationAction::Add { participants, .. } = &parsed.actions[2] else {
+            panic!("add")
+        };
+        assert!(participants[0].username.is_none());
+    }
+    #[test]
+    fn participant_username_is_not_gated_by_the_display_preference() {
+        let lid = Jid::lid_device("100001", 2);
+        let context = GroupParseContext {
+            me_device_lid: Some(&lid),
+            me_device_pn: None,
+            username_displayed: false,
+            history_after_join: false,
+            opus_enabled: false,
+            is_me_account: &|_| false,
+            normalize_country_code: &|_| None,
+        };
+        let node = base()
+            .children([NodeBuilder::new("add")
+                .children([NodeBuilder::new("participant")
+                    .attr("jid", "100002@lid")
+                    .attr("username", "participant_username")
+                    .build()])
+                .build()])
+            .build();
+        let parsed =
+            GroupNotification::try_from_node_ref_with_context(&node.as_node_ref(), &context)
+                .unwrap();
+        let GroupNotificationAction::Add { participants, .. } = &parsed.actions[0] else {
+            panic!("add")
+        };
+        assert_eq!(
+            participants[0].username.as_deref(),
+            Some("participant_username")
+        );
+    }
+    #[test]
+    fn present_unknown_role_rejects_before_missing_participant_jid() {
+        let lid = Jid::lid_device("100001", 2);
+        let context = GroupParseContext {
+            me_device_lid: Some(&lid),
+            me_device_pn: None,
+            username_displayed: false,
+            history_after_join: false,
+            opus_enabled: false,
+            is_me_account: &|_| false,
+            normalize_country_code: &|_| None,
+        };
+        let node = base()
+            .children([NodeBuilder::new("add")
+                .children([NodeBuilder::new("participant")
+                    .attr("type", "future_role")
+                    .build()])
+                .build()])
+            .build();
+        assert_eq!(
+            GroupNotification::try_from_node_ref_with_context(&node.as_node_ref(), &context)
+                .unwrap_err(),
+            GroupParseError::Field("type")
+        );
+    }
+    #[test]
+    fn official_integer_prefix_and_identity_classes_are_preserved() {
+        let lid = Jid::lid_device("100001", 2);
+        let context = GroupParseContext {
+            me_device_lid: Some(&lid),
+            me_device_pn: None,
+            username_displayed: false,
+            history_after_join: false,
+            opus_enabled: false,
+            is_me_account: &|_| false,
+            normalize_country_code: &|_| None,
+        };
+        for author in [
+            "200002@bot",
+            "200002@msgr",
+            "1-200002@interop",
+            "200002@s.whatsapp.net",
+        ] {
+            let node = base()
+                .attr("participant", author)
+                .attr("t", " +123seconds")
+                .build();
+            assert_eq!(
+                GroupNotification::try_from_node_ref_with_context(&node.as_node_ref(), &context)
+                    .unwrap()
+                    .timestamp,
+                123
+            );
+        }
+        for author in [
+            "200002:2@s.whatsapp.net",
+            "100002@s.whatsapp.net",
+            "100001:2@lid",
+        ] {
+            let node = base().attr("participant", author).build();
+            assert_eq!(
+                GroupNotification::try_from_node_ref_with_context(&node.as_node_ref(), &context)
+                    .unwrap_err(),
+                GroupParseError::Field("participant")
+            );
+        }
+    }
 }
+
+#[cfg(test)]
+#[path = "envelope_conformance.rs"]
+mod conformance;
+
+#[cfg(test)]
+#[path = "actions_conformance.rs"]
+mod actions_conformance;

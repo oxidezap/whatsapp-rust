@@ -770,6 +770,8 @@ impl Client {
             group_notification_durability_hook: group_notification_durability_hook
                 .map(std::sync::OnceLock::from)
                 .unwrap_or_default(),
+            #[cfg(feature = "generated-group-notifications")]
+            group_notification_facts_provider: std::sync::OnceLock::new(),
             retry_admission,
             decrypt_failure_admission,
             history_sync_admission,

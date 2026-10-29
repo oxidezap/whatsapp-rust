@@ -43,3 +43,11 @@ mod tests {
         );
     }
 }
+
+pub mod group_create_conformance;
+pub mod group_envelope_normalization;
+pub mod group_link_normalization;
+
+pub mod group_envelope_conformance;
+
+pub mod group_actions_conformance;

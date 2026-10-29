@@ -58,12 +58,24 @@ pub fn generate(wa_version: &str) -> Result<String> {
     let mut keys = BTreeSet::new();
     for row in &contract.rows {
         ensure!(
-            keys.insert((&row.unlink_type, &row.reason)),
-            "duplicate matrix row"
+            !row.unsupported_action || row.action_type.is_none(),
+            "non-string unlink value also names an action"
         );
         ensure!(
-            !row.unsupported_action || row.action_type.is_none(),
-            "unsupported action has a string identity"
+            row.action_type.as_deref().is_none_or(|v| [
+                "parent_group_unlink",
+                "sub_group_unlink",
+                "sibling_group_unlink",
+                "delete_parent_group_unlink",
+                "integrity_parent_group_unlink",
+                "integrity_sub_group_unlink"
+            ]
+            .contains(&v)),
+            "unqualified unlink action"
+        );
+        ensure!(
+            keys.insert((&row.unlink_type, &row.reason)),
+            "duplicate matrix row"
         );
     }
     let evidence: serde_json::Value =
@@ -87,7 +99,7 @@ pub fn generate(wa_version: &str) -> Result<String> {
             module["endByte"]
         ));
     }
-    out.push_str("pub(super) fn normalize_unlink(kind: &str, reason: Option<&str>) -> Result<Option<&'static str>, ()> {\n");
+    out.push_str("use super::GroupParseError;\npub(super) fn normalize_unlink(kind: &str, reason: Option<&str>) -> Result<Option<&'static str>,GroupParseError> {\n");
     out.push_str(&format!(
         "let kind = match kind {{ {} => Some(kind), _ => None }};\n",
         kinds
@@ -104,17 +116,17 @@ pub fn generate(wa_version: &str) -> Result<String> {
             .collect::<Vec<_>>()
             .join(" | ")
     ));
-    for row in contract.rows {
+    for row in &contract.rows {
         let opt =
             |s: Option<String>| s.map_or("None".into(), |s| format!("Some({})", rust_str(&s)));
         out.push_str(&format!(
             "({}, {}) => {},\n",
-            opt(row.unlink_type),
-            opt(row.reason),
+            opt(row.unlink_type.clone()),
+            opt(row.reason.clone()),
             if row.unsupported_action {
-                "Err(())".into()
+                "Err(GroupParseError::UnsupportedActionType(\"unlink_type\"))".to_owned()
             } else {
-                format!("Ok({})", opt(row.action_type))
+                format!("Ok({})", opt(row.action_type.clone()))
             }
         ));
     }
@@ -130,6 +142,24 @@ pub fn generate(wa_version: &str) -> Result<String> {
     }
     let cases: Vec<OracleCase> =
         serde_json::from_str(include_str!("../../fixtures/group_unlink_oracle.json"))?;
+    for case in &cases {
+        let kind = if kinds.contains(case.kind.as_str()) {
+            Some(case.kind.as_str())
+        } else {
+            None
+        };
+        let reason = case.reason.as_deref().filter(|v| reasons.contains(*v));
+        let row = contract
+            .rows
+            .iter()
+            .find(|r| r.unlink_type.as_deref() == kind && r.reason.as_deref() == reason)
+            .ok_or_else(|| anyhow::anyhow!("missing oracle matrix row"))?;
+        ensure!(
+            row.action_type == case.action_type
+                && row.unsupported_action == case.unsupported_action,
+            "unlink IR differs from independent official oracle"
+        );
+    }
     out.push_str("\n#[cfg(test)]\nmod tests {\nuse super::normalize_unlink;\n#[test]\nfn isolated_official_js_cases() {\n");
     for case in cases {
         let opt =
@@ -139,7 +169,8 @@ pub fn generate(wa_version: &str) -> Result<String> {
             rust_str(&case.kind),
             opt(case.reason),
             if case.unsupported_action {
-                "Err(())".into()
+                "Err(super::super::GroupParseError::UnsupportedActionType(\"unlink_type\"))"
+                    .to_owned()
             } else {
                 format!("Ok({})", opt(case.action_type))
             }
