@@ -135,3 +135,39 @@ fn v4_approval_precedes_compatibility_metadata_but_bare_success_keeps_it() {
         }
     }
 }
+
+#[test]
+fn both_mode_contracts_validate_sent_context_and_unique_mode_child() {
+    for (spec, tag, other) in [
+        (PassiveModeSpec::active(), "active", "passive"),
+        (PassiveModeSpec::passive(), "passive", "active"),
+    ] {
+        let request =
+            RequestUtils::new(String::new()).build_iq_node(spec.build_iq(), Some("sent-id".into()));
+        for (id, from, children, valid) in [
+            ("sent-id", "s.whatsapp.net", vec![tag], true),
+            ("wrong-id", "s.whatsapp.net", vec![tag], false),
+            ("sent-id", "g.us", vec![tag], false),
+            ("sent-id", "s.whatsapp.net", vec![], false),
+            ("sent-id", "s.whatsapp.net", vec![other], false),
+            ("sent-id", "s.whatsapp.net", vec![tag, tag], false),
+        ] {
+            let response = NodeBuilder::new("iq")
+                .attr("id", id)
+                .attr("from", from)
+                .attr("type", "result")
+                .children(
+                    children
+                        .into_iter()
+                        .map(|tag| NodeBuilder::new(tag).build()),
+                )
+                .build();
+            assert_eq!(
+                spec.parse_response_with_context(&response.as_node_ref(), &request.as_node_ref())
+                    .is_ok(),
+                valid,
+                "{tag} {id} {from}"
+            );
+        }
+    }
+}
