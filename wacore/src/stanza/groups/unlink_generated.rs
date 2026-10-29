@@ -5,6 +5,7 @@
 
 //! "WAWebHandleGroupNotification": bundle "09d91fdc4089c50ab1d35dd6c796ee82ef4c3296710316d20383c85738b871b8", module "a65d861ba0dacdcec52d2df48712a80677ecf10021d7df63c84183f195db13a1", bundle bytes 1693402..1716842.
 //! "WAWebGroupType": bundle "082e0ef2faaa6247e6e17a225bb1685b7e583e946f7b0dc17ee58c431c1a07a8", module "d63035154901e9677bc08acd8ab3994845087875ca5ce84636ec765b72553519", bundle bytes 959207..963377.
+//! "WAWebHandleGroupNotificationConst": bundle "09d91fdc4089c50ab1d35dd6c796ee82ef4c3296710316d20383c85738b871b8", module "176daa1a4d66aee3b907bc26ba2e40da1fde706e142f44bf1bdb8cfb9fd3581e", bundle bytes 268451..276687.
 use super::GroupParseError;
 pub(super) fn normalize_unlink(
     kind: &str,
