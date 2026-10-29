@@ -1,6 +1,6 @@
 //! Auto-generated qualified group LINK normalization (WhatsApp 2.3000.1047483476). DO NOT EDIT.
 //!
-//! Source contract: https://github.com/oxidezap/whatspec/blob/3d4737934a55239928b3265523448aef2978a82b/generated/notif/group-link.json
+//! Source contract: https://github.com/oxidezap/whatspec/blob/ed8da49c24a0e943854e1c7077c60129e169aeb4/generated/notif/group-link.json
 //! Module-relative LINK case bytes 17137..17639.
 //! Plain Object.prototype results remain explicitly unsupported.
 //! "WAWebHandleGroupNotification": bundle "09d91fdc4089c50ab1d35dd6c796ee82ef4c3296710316d20383c85738b871b8", module "a65d861ba0dacdcec52d2df48712a80677ecf10021d7df63c84183f195db13a1", bytes 1693402..1716842.
