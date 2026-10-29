@@ -105,3 +105,33 @@ fn country_code_requires_payload_and_exact_paired_error_alternative() {
         );
     }
 }
+
+#[test]
+fn v4_approval_precedes_compatibility_metadata_but_bare_success_keeps_it() {
+    let group = Jid::group("123");
+    let spec = AcceptGroupInviteV4Iq::new(&group, "synthetic", 12345, &Jid::pn("15550000001"));
+    let request =
+        RequestUtils::new(String::new()).build_iq_node(spec.build_iq(), Some("sent-id".into()));
+    for tag in ["group", "community"] {
+        for approval in [false, true] {
+            let mut children = vec![NodeBuilder::new(tag).attr("jid", Jid::group("456")).build()];
+            if approval {
+                children.push(NodeBuilder::new("membership_approval_request").build());
+            }
+            let response = NodeBuilder::new("iq")
+                .attr("id", "sent-id")
+                .attr("from", &group)
+                .attr("type", "result")
+                .children(children)
+                .build();
+            let result = spec
+                .parse_response_with_context(&response.as_node_ref(), &request.as_node_ref())
+                .unwrap();
+            if approval {
+                assert!(matches!(result, JoinGroupResult::PendingApproval(jid) if jid == group));
+            } else {
+                assert!(matches!(result, JoinGroupResult::Joined(jid) if jid == Jid::group("456")));
+            }
+        }
+    }
+}

@@ -21,11 +21,34 @@ fn source_lock() -> Result<SourceLock> {
             == lock.projection_sha256,
         "contextual IQ projection digest mismatch"
     );
-    ensure!(
-        include_str!("../../Cargo.toml").contains(&format!("rev = {:?}", lock.rev)),
-        "IQ generator dependency must match the contextual source revision"
-    );
+    validate_dependency_pins(include_str!("../../Cargo.toml"), &lock.rev)?;
     Ok(lock)
+}
+
+fn validate_dependency_pins(manifest: &str, revision: &str) -> Result<()> {
+    let manifest: toml::Value = toml::from_str(manifest)?;
+    let dependencies = manifest
+        .get("dependencies")
+        .context("missing tooling dependencies")?;
+    for (alias, package) in [("wa-codegen-iq", "wa-codegen"), ("wa-ir-iq", "wa-ir")] {
+        let dependency = dependencies
+            .get(alias)
+            .with_context(|| format!("missing {alias}"))?;
+        ensure!(
+            dependency.get("rev").and_then(toml::Value::as_str) == Some(revision),
+            "{alias} must match the contextual source revision"
+        );
+        ensure!(
+            dependency.get("git").and_then(toml::Value::as_str)
+                == Some("https://github.com/oxidezap/whatspec.git"),
+            "{alias} must use the locked source repository"
+        );
+        ensure!(
+            dependency.get("package").and_then(toml::Value::as_str) == Some(package),
+            "{alias} must use package {package}"
+        );
+    }
+    Ok(())
 }
 
 pub fn revision() -> Result<String> {
@@ -102,6 +125,18 @@ pub fn verify_projection(full: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn either_dependency_drifting_is_rejected_even_when_the_other_stays_pinned() {
+        let lock = source_lock().unwrap();
+        for alias in ["wa-codegen-iq", "wa-ir-iq"] {
+            let mut manifest: toml::Value =
+                toml::from_str(include_str!("../../Cargo.toml")).unwrap();
+            manifest["dependencies"][alias]["rev"] = toml::Value::String("0".repeat(40));
+            let changed = toml::to_string(&manifest).unwrap();
+            assert!(validate_dependency_pins(&changed, &lock.rev).is_err());
+        }
+    }
 
     #[test]
     fn pinned_projection_emits_and_wrong_source_or_version_fails() {

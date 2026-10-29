@@ -3472,8 +3472,12 @@ impl IqSpec for AcceptGroupInviteV4Iq {
             MakeAcceptGroupAddRequestResponse, MakeAcceptGroupAddRequestSpec,
         };
         match MakeAcceptGroupAddRequestSpec::parse_sent_response(response, request)? {
-            MakeAcceptGroupAddRequestResponse::GroupJoinRequestSuccess(_)
-            | MakeAcceptGroupAddRequestResponse::Success(_) => self.parse_response(response),
+            // An approval outcome already won the official ordered cascade;
+            // compatibility metadata cannot turn it into a joined result.
+            MakeAcceptGroupAddRequestResponse::GroupJoinRequestSuccess(_) => {
+                Ok(JoinGroupResult::PendingApproval(self.group_jid.clone()))
+            }
+            MakeAcceptGroupAddRequestResponse::Success(_) => self.parse_response(response),
             _ => Err(super::spec::contextual_rejection(response)),
         }
     }
