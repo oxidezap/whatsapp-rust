@@ -1,0 +1,19 @@
+{
+  "crate": "wasmtime-internal-cache",
+  "version": "48.0.7",
+  "archiveSha256": "b11ca8945aa341f944558622db59845dffa1435971f318d5fce2f2d9765a69b0",
+  "upstreamRevision": "c6846e13f64b07b7912d372db141397058b55f99",
+  "dependencyBackport": "04f0fcf70248909cc0b6a3ec1d406c7e2d543637",
+  "files": {
+    "LICENSE": "268872b9816f90fd8e85db5a28d33f8150ebb8dd016653fb39ef1f94f2686bc5",
+    "build.rs": "562d7f7a9de09870e065818847ca1dce0582bcc4d204276cc67f971cd9e63099",
+    "src/config.rs": "d77c176f7b19d9908b9a0dd0f4391a8299ef5092a8477ab8693f35506bb89352",
+    "src/lib.rs": "bbae5c0dff3392f1442b3c92ebdb87903b0fc28fe39f69962cde039c22bfcc47",
+    "src/tests.rs": "77ed12aa325a29ce61c6636cec21ed6451ffed15c007a8a4d90cad32c6276139",
+    "src/worker.rs": "531eac51254c195f153098aa9f822c15d02ed2d44553176edf416b8b313da540",
+    "tests/cache_write_default_config.rs": "bdd4758c9dd7f300a7726b04fda7989a295695fe4c5168faeb16ea2ebc1bde3b",
+    "src/config/tests.rs": "ec1bc1a07c425aa8a23c4c1fbc284cb545e10b67c143bdbcd02e4826f8d67809",
+    "src/worker/tests/system_time_stub.rs": "17c1651e1a1dbb3cad353449ebe8e64f509a7b21ecea37b7284bb29f9a4284e9",
+    "src/worker/tests.rs": "e7d96e3c75cecb49327aa1759eaed0572b2ad18e28c78155393220ef1f066122"
+  }
+}
