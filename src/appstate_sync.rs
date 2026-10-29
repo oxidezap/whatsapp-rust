@@ -2634,6 +2634,9 @@ mod tests {
             snapshot_ref: Some({
                 let mut proto = wa::ExternalBlobReference::default();
                 proto.direct_path = Some(direct_path);
+                proto.media_key = Some(vec![0; 32]);
+                proto.file_sha256 = Some(vec![0; 32]);
+                proto.file_enc_sha256 = Some(vec![0; 32]);
                 proto
             }),
             error: None,
