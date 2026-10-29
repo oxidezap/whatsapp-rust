@@ -1,7 +1,7 @@
 # Wasmtime cache dependency backport
 
 This is the published `wasmtime-internal-cache` 48.0.7 crate, with its Rust source,
-build script, tests and license copied unchanged from the verified registry archive.
+tests and license copied unchanged from the verified registry archive.
 `UPSTREAM.json` records the archive digest, original revision and file digests.
 
 The manifest raises only the zstd dependency floor from 0.13.0 to 0.14.3, following
@@ -15,4 +15,9 @@ existing Wasmtime API/MSRV while removing the versions affected by
 No advisory is ignored. The published SDK does not depend on Wasmtime.
 
 Remove this patch when the selected Wasmtime release includes the dependency update.
-Keep source changes out of this copy; re-import an audited upstream crate if needed.
+The build script preserves registry behavior explicitly: compiler identity is the crate
+version and executable mtime is excluded. Otherwise its enclosing Git checkout would
+partition the shared cache by commit and executable. `UPSTREAM.json` retains the
+original build-script digest and records this local exception separately.
+
+Keep library source changes out of this copy; re-import an audited upstream crate if needed.

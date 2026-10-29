@@ -15,5 +15,11 @@
     "src/config/tests.rs": "ec1bc1a07c425aa8a23c4c1fbc284cb545e10b67c143bdbcd02e4826f8d67809",
     "src/worker/tests/system_time_stub.rs": "17c1651e1a1dbb3cad353449ebe8e64f509a7b21ecea37b7284bb29f9a4284e9",
     "src/worker/tests.rs": "e7d96e3c75cecb49327aa1759eaed0572b2ad18e28c78155393220ef1f066122"
+  },
+  "localChanges": {
+    "build.rs": {
+      "reason": "Preserve registry cache identity when vendored inside another Git repository; disable executable mtime partitioning.",
+      "sha256": "537ef221d3d70e0fdbac3ff631a4cf3e072eb2e5afef9d1f41cf6fb5be68bda1"
+    }
   }
 }
