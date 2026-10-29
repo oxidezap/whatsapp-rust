@@ -114,9 +114,12 @@ const OPUS_FRAME_SAMPS_60MS: usize = 960;
 /// packet loss at all. A trim is audible as a chop; the extra ceiling only costs latency during the
 /// burst that would have been trimmed.
 const PLAYOUT_CAP: usize = 6400;
-/// Room above the prime target before a burst is trimmed (200ms), for packets larger than 60ms,
-/// whose target already exceeds what [`PLAYOUT_CAP`] alone would leave room for.
-const PLAYOUT_HEADROOM: usize = 3200;
+/// Room above the prime target before a burst is trimmed (280ms). Sized so a 60ms peer lands
+/// exactly on [`PLAYOUT_CAP`] (1920 + 4480 = 6400) and the ceiling still scales with the packet,
+/// so the 120ms and 60ms ceilings stay a full packet apart: [`effective_playout_cap`] gives the
+/// difference back one packet at a time, and with less than that between them the first step
+/// would land on the smaller ceiling and trim a backlog that was legal under the larger one.
+const PLAYOUT_HEADROOM: usize = 4480;
 /// Prebuffer target: prime playout until the jitter buffer holds two 60ms peer frames, so the
 /// steady-state buffer never drains below one frame (a 60ms cushion that absorbs the relay's
 /// inter-arrival jitter). Priming to a single frame is a zero cushion: that one frame drains away
