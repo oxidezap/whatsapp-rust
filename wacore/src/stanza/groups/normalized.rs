@@ -166,14 +166,14 @@ impl GroupNotification {
                     return Err(GroupParseError::UnknownAction(child.tag.to_string()));
                 }
                 if matches!(
-                    super::GroupNotificationActionTag::try_from(child.tag.as_ref()),
-                    Ok(super::GroupNotificationActionTag::Add
+                    super::GroupNotificationActionTag::from(child.tag.as_ref()),
+                    super::GroupNotificationActionTag::Add
                         | super::GroupNotificationActionTag::Remove
                         | super::GroupNotificationActionTag::Promote
                         | super::GroupNotificationActionTag::Demote
                         | super::GroupNotificationActionTag::Modify
                         | super::GroupNotificationActionTag::LinkedGroupPromote
-                        | super::GroupNotificationActionTag::LinkedGroupDemote)
+                        | super::GroupNotificationActionTag::LinkedGroupDemote
                 ) {
                     for p in child.get_children_by_tag("participant") {
                         if let Some(role) = p.attrs().optional_string("type")
