@@ -1,0 +1,266 @@
+{
+  "formatVersion": 1,
+  "sourceSha256": "d68c5f1c5a7556dadd9d107734a1bc2fc992b392151eb5b51e3e33d5045f417e",
+  "receiptSourceSha256": "39a97ce6c6cfddc3d3f3ed61136dd2cebc30a6b9f55d0f8646eb5edb6f7c2a63",
+  "keyCases": [
+    {
+      "retryCount": 0,
+      "isStateless": false,
+      "includeKeys": false
+    },
+    {
+      "retryCount": 0,
+      "isStateless": true,
+      "includeKeys": true
+    },
+    {
+      "retryCount": 1,
+      "isStateless": false,
+      "includeKeys": false
+    },
+    {
+      "retryCount": 1,
+      "isStateless": true,
+      "includeKeys": true
+    },
+    {
+      "retryCount": 2,
+      "isStateless": false,
+      "includeKeys": true
+    },
+    {
+      "retryCount": 2,
+      "isStateless": true,
+      "includeKeys": true
+    },
+    {
+      "retryCount": 3,
+      "isStateless": false,
+      "includeKeys": true
+    },
+    {
+      "retryCount": 3,
+      "isStateless": true,
+      "includeKeys": true
+    },
+    {
+      "retryCount": 4,
+      "isStateless": false,
+      "includeKeys": true
+    },
+    {
+      "retryCount": 4,
+      "isStateless": true,
+      "includeKeys": true
+    },
+    {
+      "retryCount": 5,
+      "isStateless": false,
+      "includeKeys": true
+    },
+    {
+      "retryCount": 5,
+      "isStateless": true,
+      "includeKeys": true
+    },
+    {
+      "retryCount": 6,
+      "isStateless": false,
+      "includeKeys": true
+    },
+    {
+      "retryCount": 6,
+      "isStateless": true,
+      "includeKeys": true
+    }
+  ],
+  "cases": [
+    {
+      "name": "first",
+      "retryCount": 1,
+      "savedRegId": 7,
+      "receivedRegId": 7,
+      "bundleHandled": false,
+      "sameBaseKey": false,
+      "peer": false,
+      "chatKind": "user",
+      "sessionScope": "default",
+      "effects": [
+        "remoteRegId",
+        "processBundle"
+      ],
+      "terminal": "return"
+    },
+    {
+      "name": "save-at-two",
+      "retryCount": 2,
+      "savedRegId": 7,
+      "receivedRegId": 7,
+      "bundleHandled": false,
+      "sameBaseKey": false,
+      "peer": false,
+      "chatKind": "user",
+      "sessionScope": "default",
+      "effects": [
+        "remoteRegId",
+        "processBundle",
+        "saveBaseKey"
+      ],
+      "terminal": "return"
+    },
+    {
+      "name": "different-base",
+      "retryCount": 3,
+      "savedRegId": 7,
+      "receivedRegId": 7,
+      "bundleHandled": false,
+      "sameBaseKey": false,
+      "peer": false,
+      "chatKind": "user",
+      "sessionScope": "default",
+      "effects": [
+        "remoteRegId",
+        "processBundle",
+        "sameBaseKey"
+      ],
+      "terminal": "return"
+    },
+    {
+      "name": "same-base",
+      "retryCount": 3,
+      "savedRegId": 7,
+      "receivedRegId": 7,
+      "bundleHandled": false,
+      "sameBaseKey": true,
+      "peer": false,
+      "chatKind": "user",
+      "sessionScope": "default",
+      "effects": [
+        "remoteRegId",
+        "processBundle",
+        "sameBaseKey",
+        "deleteSession"
+      ],
+      "terminal": "return"
+    },
+    {
+      "name": "mismatch-continues-at-two",
+      "retryCount": 2,
+      "savedRegId": 8,
+      "receivedRegId": 7,
+      "bundleHandled": false,
+      "sameBaseKey": false,
+      "peer": false,
+      "chatKind": "user",
+      "sessionScope": "default",
+      "effects": [
+        "remoteRegId",
+        "processBundle",
+        "deleteSession",
+        "saveBaseKey"
+      ],
+      "terminal": "return"
+    },
+    {
+      "name": "bundle-handled-mismatch",
+      "retryCount": 1,
+      "savedRegId": 8,
+      "receivedRegId": 7,
+      "bundleHandled": true,
+      "sameBaseKey": false,
+      "peer": false,
+      "chatKind": "user",
+      "sessionScope": "default",
+      "effects": [
+        "remoteRegId",
+        "processBundle"
+      ],
+      "terminal": "return"
+    },
+    {
+      "name": "missing-registration",
+      "retryCount": 1,
+      "savedRegId": null,
+      "receivedRegId": 7,
+      "bundleHandled": false,
+      "sameBaseKey": false,
+      "peer": false,
+      "chatKind": "user",
+      "sessionScope": "default",
+      "effects": [
+        "remoteRegId",
+        "processBundle"
+      ],
+      "terminal": "return"
+    },
+    {
+      "name": "peer-mismatch",
+      "retryCount": 2,
+      "savedRegId": 8,
+      "receivedRegId": 7,
+      "bundleHandled": false,
+      "sameBaseKey": false,
+      "peer": true,
+      "chatKind": "user",
+      "sessionScope": "default",
+      "effects": [
+        "remoteRegId"
+      ],
+      "terminal": "throw"
+    },
+    {
+      "name": "group",
+      "retryCount": 2,
+      "savedRegId": 7,
+      "receivedRegId": 7,
+      "bundleHandled": false,
+      "sameBaseKey": false,
+      "peer": false,
+      "chatKind": "group",
+      "sessionScope": "default",
+      "effects": [
+        "forgetGroup",
+        "remoteRegId",
+        "processBundle",
+        "saveBaseKey"
+      ],
+      "terminal": "return"
+    },
+    {
+      "name": "status-same-base",
+      "retryCount": 3,
+      "savedRegId": 7,
+      "receivedRegId": 7,
+      "bundleHandled": false,
+      "sameBaseKey": true,
+      "peer": false,
+      "chatKind": "status",
+      "sessionScope": "status",
+      "effects": [
+        "forgetStatus",
+        "remoteRegId",
+        "processBundle",
+        "sameBaseKey",
+        "deleteSession"
+      ],
+      "terminal": "return"
+    },
+    {
+      "name": "broadcast",
+      "retryCount": 1,
+      "savedRegId": 7,
+      "receivedRegId": 7,
+      "bundleHandled": false,
+      "sameBaseKey": false,
+      "peer": false,
+      "chatKind": "broadcast",
+      "sessionScope": "default",
+      "effects": [
+        "forgetBroadcast",
+        "remoteRegId",
+        "processBundle"
+      ],
+      "terminal": "return"
+    }
+  ]
+}
