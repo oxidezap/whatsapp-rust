@@ -2340,8 +2340,7 @@ impl Client {
             let proc = self.get_app_state_processor();
             // Pre-download all external blobs for all collections in the response,
             // concurrently (independent CDN GETs, keyed by directPath).
-            let (patch_lists, pre_downloaded) =
-                Box::pin(self.pre_download_external_blobs(patch_lists)).await;
+            let (patch_lists, pre_downloaded) = self.pre_download_external_blobs(patch_lists).await;
 
             let download = external_blob_resolver(&pre_downloaded);
 
@@ -2353,15 +2352,24 @@ impl Client {
             // arrives (process_patch_lists is all-or-nothing on a missing key anyway).
             let mut missing_all: Vec<Vec<u8>> = Vec::new();
             let mut prepared_lists = Vec::with_capacity(patch_lists.len());
-            for pl in patch_lists {
-                let prepared = Box::pin(proc.prepare_patch_list(pl, &download)).await;
-                if prepared.is_ready()
+            // End owning-list temporaries before suspending on boxed operations.
+            let mut patch_lists = patch_lists.into_iter();
+            loop {
+                let preparing = {
+                    let Some(pl) = patch_lists.next() else {
+                        break;
+                    };
+                    Box::pin(proc.prepare_patch_list(pl, &download))
+                };
+                prepared_lists.push(preparing.await);
+                if let Some(prepared) = prepared_lists.last()
+                    && prepared.is_ready()
                     && let Ok(m) = proc.get_missing_key_ids(prepared.list()).await
                 {
                     missing_all.extend(m);
                 }
-                prepared_lists.push(prepared);
             }
+            drop(patch_lists);
             let patch_lists = prepared_lists;
             // Bound the key wait by the critical-sync deadline when one was given
             // (initial bootstrap), so a late/never-auto-shared key still recovers via
@@ -2416,16 +2424,26 @@ impl Client {
             // used to reach the log as the same sentence.
             let responded: HashSet<WAPatchName> =
                 patch_lists.iter().map(|pl| pl.list().name).collect();
-            for pl in patch_lists {
-                if let Err(lost) = self.admits(scope) {
-                    warn!(
-                        target: "Client/AppState",
-                        "Batched sync: stopping before {:?} ({lost:?})", pl.list().name
-                    );
-                    break;
-                }
-                let name = pl.list().name;
-                match Box::pin(proc.process_one_prepared_patch_list(pl, true)).await {
+            let mut patch_lists = patch_lists.into_iter();
+            loop {
+                let (name, processing) = {
+                    let Some(pl) = patch_lists.next() else {
+                        break;
+                    };
+                    if let Err(lost) = self.admits(scope) {
+                        warn!(
+                            target: "Client/AppState",
+                            "Batched sync: stopping before {:?} ({lost:?})", pl.list().name
+                        );
+                        break;
+                    }
+                    let name = pl.list().name;
+                    (
+                        name,
+                        Box::pin(proc.process_one_prepared_patch_list(pl, true)),
+                    )
+                };
+                match processing.await {
                     Ok(applied) => results.push(applied),
                     Err(e) => {
                         // Named here or nowhere: the loop stops on the first
@@ -2442,6 +2460,7 @@ impl Client {
                     }
                 }
             }
+            drop(patch_lists);
 
             let mut needs_refetch = Vec::new();
             // A `<sync>` that simply omits a requested `<collection>` parses
@@ -2732,7 +2751,7 @@ impl Client {
 
             // Pre-download all external blobs (snapshot and patch mutations),
             // concurrently, keyed by directPath.
-            let ([pl], pre_downloaded) = Box::pin(self.pre_download_external_blobs([pl])).await;
+            let ([pl], pre_downloaded) = self.pre_download_external_blobs([pl]).await;
 
             let download = external_blob_resolver(&pre_downloaded);
 
@@ -2763,7 +2782,7 @@ impl Client {
             }
 
             let (mutations, new_state, list) =
-                match Box::pin(proc.process_prepared_patch_list(prepared, true)).await {
+                match proc.process_prepared_patch_list(prepared, true).await {
                     Ok(applied) => applied,
                     Err(error) => {
                         // The single-collection path fails the same way the batched
@@ -3380,7 +3399,7 @@ impl Client {
         let applied = if list.patches.is_empty() && list.snapshot_ref.is_none() {
             false
         } else {
-            let ([list], pre_downloaded) = Box::pin(self.pre_download_external_blobs([list])).await;
+            let ([list], pre_downloaded) = self.pre_download_external_blobs([list]).await;
             let download = external_blob_resolver(&pre_downloaded);
             let replaying_snapshot = list.snapshot.is_some() || list.snapshot_ref.is_some();
             let proc = self.get_app_state_processor();
