@@ -1876,6 +1876,32 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn insert_fast_attempts_cannot_bypass_a_writer_waiting_for_readers() {
+        for capacity in [u64::MAX, 2] {
+            let cache = PortableCache::builder().max_capacity(capacity).build();
+            cache.insert(1, 0).await;
+            let reader = cache.inner.read().await;
+            let mut first = std::pin::pin!(cache.insert(1, 10));
+            assert!(futures::poll!(&mut first).is_pending());
+            drop(reader);
+
+            // The earlier writer owns the writer mutex while waiting for the
+            // reader to leave. Fresh fast attempts must not steal that grant,
+            // even after the reader has left and before the waiter is polled.
+            for _ in 0..64 {
+                let mut barger = std::pin::pin!(cache.insert(1, 99));
+                assert!(futures::poll!(&mut barger).is_pending());
+            }
+            let mut successor = std::pin::pin!(cache.insert(1, 20));
+            assert!(futures::poll!(&mut successor).is_pending());
+            first.await;
+            assert_eq!(cache.get(&1).await, Some(10));
+            successor.await;
+            assert_eq!(cache.get(&1).await, Some(20));
+        }
+    }
+
     #[test]
     fn sync_ttl_admission_is_atomic_and_bounded() {
         let cache = Arc::new(SyncTtlCache::new(2, None));
