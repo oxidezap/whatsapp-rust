@@ -6,7 +6,7 @@ use serde::Deserialize;
 use std::collections::BTreeSet;
 
 const CONTRACT: &str = include_str!("../../fixtures/group_unlink.json");
-const REV: &str = "29fad5a7abfb5dc224c1eb535d21478f50574229";
+const REV: &str = "3d4737934a55239928b3265523448aef2978a82b";
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Contract {

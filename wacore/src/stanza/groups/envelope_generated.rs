@@ -1,6 +1,6 @@
 //! Auto-generated ordered group envelope guards (WhatsApp 2.3000.1047483476). DO NOT EDIT.
 //!
-//! Source contract https://github.com/oxidezap/whatspec/blob/29fad5a7abfb5dc224c1eb535d21478f50574229/generated/notif/group-envelope.json
+//! Source contract https://github.com/oxidezap/whatspec/blob/3d4737934a55239928b3265523448aef2978a82b/generated/notif/group-envelope.json
 //! WAWebHandleGroupNotification callback bytes 10592..22915; child action boundary 11866..22623.
 //! Actions are supplied by the normalized action parser between prefix and projection.
 use super::{
