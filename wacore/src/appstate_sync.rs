@@ -252,6 +252,7 @@ struct PatchListProgress {
 
 /// Validate collection metadata before admitting external downloads.
 /// Large lists belong on a blocking worker, as in [`AppStateProcessor::prepare_patch_list`].
+#[inline(never)]
 pub fn validate_patch_list_metadata(pl: &PatchList) -> Result<()> {
     let name = pl.name;
     // Validate the untrusted protobuf boundary before handing references to a
@@ -269,6 +270,7 @@ pub fn validate_patch_list_metadata(pl: &PatchList) -> Result<()> {
     Ok(())
 }
 
+#[inline(never)]
 fn validate_snapshot_for_processing(collection: &str, snapshot: &wa::SyncdSnapshot) -> Result<()> {
     crate::appstate::validation::validate_snapshot(collection, snapshot).map_err(|error| {
         if matches!(
@@ -288,6 +290,7 @@ fn download_external_blobs(pl: &mut PatchList, download: &BlobDownloadFn<'_>) ->
     decode_external_blobs(pl, download, true)
 }
 
+#[inline(never)]
 fn decode_external_blobs(
     pl: &mut PatchList,
     download: &BlobDownloadFn<'_>,

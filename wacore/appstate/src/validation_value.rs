@@ -1,6 +1,6 @@
 // Native data view for generated validation control flow. Byte payloads borrow
 // protobuf storage; constructing/returning a view never copies encrypted blobs.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub(super) enum Value<'a> {
     Undefined,
     Null,
@@ -11,6 +11,24 @@ pub(super) enum Value<'a> {
     Bytes(&'a [u8]),
     Array(std::sync::Arc<[Self]>),
     Object(std::sync::Arc<[(&'static str, Self)]>),
+}
+impl Clone for Value<'_> {
+    // Generated expressions clone their inputs often. Keep the enum dispatch in
+    // one function instead of copying Cow/Arc branches into every expression.
+    #[inline(never)]
+    fn clone(&self) -> Self {
+        match self {
+            Self::Undefined => Self::Undefined,
+            Self::Null => Self::Null,
+            Self::Bool(value) => Self::Bool(*value),
+            Self::Number(value) => Self::Number(*value),
+            Self::Long(value) => Self::Long(*value),
+            Self::Text(value) => Self::Text(value.clone()),
+            Self::Bytes(value) => Self::Bytes(value),
+            Self::Array(value) => Self::Array(value.clone()),
+            Self::Object(value) => Self::Object(value.clone()),
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidationError {
@@ -25,6 +43,8 @@ impl std::fmt::Display for ValidationError {
 }
 impl std::error::Error for ValidationError {}
 impl ValidationError {
+    #[cold]
+    #[inline(never)]
     pub(super) fn fatal(metric: Value<'_>, message: &str) -> Self {
         Self {
             class: "SyncdFatalError",
@@ -35,6 +55,8 @@ impl ValidationError {
             message: message.into(),
         }
     }
+    #[cold]
+    #[inline(never)]
     pub(super) fn dependency(class: &'static str, message: &str) -> Self {
         Self {
             class,
@@ -44,9 +66,11 @@ impl ValidationError {
     }
 }
 impl<'a> Value<'a> {
+    #[inline(never)]
     pub(super) fn object(fields: Vec<(&'static str, Self)>) -> Self {
         Self::Object(fields.into())
     }
+    #[inline(never)]
     pub(super) fn list(items: Vec<Self>) -> Self {
         Self::Array(items.into())
     }
@@ -62,6 +86,7 @@ impl<'a> Value<'a> {
     pub(super) fn nullish(&self) -> bool {
         matches!(self, Self::Undefined | Self::Null)
     }
+    #[inline(never)]
     pub(super) fn field(&self, key: &str) -> Result<Self, ValidationError> {
         match self {
             Self::Object(fields) => Ok(fields
@@ -95,9 +120,16 @@ impl<'a> Value<'a> {
         }
     }
 }
-/// Dependency calls stay outside the generated program. Implementations must
-/// qualify their decoded LongInt representation and protobuf error contract.
+/// Host calls stay outside the generated program. Implementations must qualify
+/// decoded LongInt/protobuf contracts and any specialized numeric comparator.
 pub(super) trait Transforms<'a> {
+    fn relational_greater(
+        &mut self,
+        left: Value<'a>,
+        right: Value<'a>,
+    ) -> Result<bool, ValidationError> {
+        Ok(left.greater_than(&right))
+    }
     fn number_or_throw_if_too_large(
         &mut self,
         value: Value<'a>,

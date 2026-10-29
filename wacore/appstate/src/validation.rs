@@ -44,6 +44,9 @@ impl<'a> ValidatedPatch<'a> {
         self.patch
     }
 }
+// Keep protobuf projection at one call boundary instead of duplicating its
+// allocation and cleanup paths at every runtime ingestion site under LTO.
+#[inline(never)]
 pub fn validate_patch<'a>(
     collection: &str,
     patch: &'a wa::SyncdPatch,
@@ -59,6 +62,7 @@ pub fn validate_patch<'a>(
         debug_data: transforms.debug_data,
     })
 }
+#[inline(never)]
 pub fn validate_snapshot(
     collection: &str,
     snapshot: &wa::SyncdSnapshot,
@@ -90,6 +94,7 @@ pub fn validate_snapshot(
     )?;
     Ok(())
 }
+#[inline(never)]
 pub fn validate_external_reference(
     collection: &str,
     reference: &wa::ExternalBlobReference,
@@ -101,6 +106,7 @@ pub fn validate_external_reference(
     )?;
     Ok(())
 }
+#[inline(never)]
 pub fn validate_mutation(
     collection: &str,
     mutation: &wa::SyncdMutation,
@@ -129,6 +135,7 @@ pub struct ValidatedSetMutation<'a> {
     pub input: &'a SetMutationInput<'a>,
     pub timestamp: i64,
 }
+#[inline(never)]
 pub fn validate_set_mutations<'a>(
     collection: &str,
     inputs: &'a [SetMutationInput<'a>],
@@ -178,15 +185,18 @@ fn long(value: u64) -> Value<'static> {
         Value::Long(value)
     }
 }
+#[inline(never)]
 fn key_view(key: &wa::KeyId) -> Value<'_> {
     object(vec![("id", bytes(key.id.as_deref()))])
 }
+#[inline(never)]
 fn version_view(version: &wa::SyncdVersion) -> Value<'_> {
     object(vec![(
         "version",
         version.version.map_or(Value::Undefined, long),
     )])
 }
+#[inline(never)]
 fn record_view(record: &wa::SyncdRecord) -> Value<'_> {
     object(vec![
         (
@@ -207,6 +217,7 @@ fn record_view(record: &wa::SyncdRecord) -> Value<'_> {
         ),
     ])
 }
+#[inline(never)]
 fn mutation_view(mutation: &wa::SyncdMutation) -> Value<'_> {
     object(vec![
         (
@@ -224,6 +235,7 @@ fn mutation_view(mutation: &wa::SyncdMutation) -> Value<'_> {
         ),
     ])
 }
+#[inline(never)]
 fn external_view(reference: &wa::ExternalBlobReference) -> Value<'_> {
     object(vec![
         ("mediaKey", bytes(reference.media_key.as_deref())),
@@ -249,6 +261,7 @@ fn external_view(reference: &wa::ExternalBlobReference) -> Value<'_> {
         ),
     ])
 }
+#[inline(never)]
 fn patch_view(patch: &wa::SyncdPatch) -> Value<'_> {
     object(vec![
         (
@@ -296,6 +309,15 @@ struct NativeTransforms {
     debug_data: Option<wa::PatchDebugData>,
 }
 impl<'a> Transforms<'a> for NativeTransforms {
+    fn relational_greater(
+        &mut self,
+        left: Value<'a>,
+        right: Value<'a>,
+    ) -> Result<bool, ValidationError> {
+        // The emitter proves these operands are integer literals or lengths
+        // of ordinary arrays supplied by this typed protobuf adapter.
+        Ok(left.number()? > right.number()?)
+    }
     fn number_or_throw_if_too_large(
         &mut self,
         value: Value<'a>,

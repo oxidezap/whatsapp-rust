@@ -2340,7 +2340,8 @@ impl Client {
             let proc = self.get_app_state_processor();
             // Pre-download all external blobs for all collections in the response,
             // concurrently (independent CDN GETs, keyed by directPath).
-            let (patch_lists, pre_downloaded) = self.pre_download_external_blobs(patch_lists).await;
+            let (patch_lists, pre_downloaded) =
+                Box::pin(self.pre_download_external_blobs(patch_lists)).await;
 
             let download = external_blob_resolver(&pre_downloaded);
 
@@ -2731,7 +2732,7 @@ impl Client {
 
             // Pre-download all external blobs (snapshot and patch mutations),
             // concurrently, keyed by directPath.
-            let ([pl], pre_downloaded) = self.pre_download_external_blobs([pl]).await;
+            let ([pl], pre_downloaded) = Box::pin(self.pre_download_external_blobs([pl])).await;
 
             let download = external_blob_resolver(&pre_downloaded);
 
@@ -2762,7 +2763,7 @@ impl Client {
             }
 
             let (mutations, new_state, list) =
-                match proc.process_prepared_patch_list(prepared, true).await {
+                match Box::pin(proc.process_prepared_patch_list(prepared, true)).await {
                     Ok(applied) => applied,
                     Err(error) => {
                         // The single-collection path fails the same way the batched
@@ -3379,7 +3380,7 @@ impl Client {
         let applied = if list.patches.is_empty() && list.snapshot_ref.is_none() {
             false
         } else {
-            let ([list], pre_downloaded) = self.pre_download_external_blobs([list]).await;
+            let ([list], pre_downloaded) = Box::pin(self.pre_download_external_blobs([list])).await;
             let download = external_blob_resolver(&pre_downloaded);
             let replaying_snapshot = list.snapshot.is_some() || list.snapshot_ref.is_some();
             let proc = self.get_app_state_processor();

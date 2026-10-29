@@ -16,7 +16,8 @@ pub fn generate_appstate_validation(ir: &AppstateValidationIr) -> Result<String,
         if f.parameters > 3 {
             return Err("validator arity".into());
         }
-        out.push_str(&format!("#[allow(unused_variables)]\npub(super) fn {}<'a>(transforms: &mut impl Transforms<'a>, {})->Result<Value<'a>,ValidationError>{{\n",snake_case(name),(0..f.parameters).map(|i|format!("a{i}:Value<'a>")).collect::<Vec<_>>().join(",")));
+        qualify_native_comparisons(name, &f.body)?;
+        out.push_str(&format!("#[allow(unused_variables)]\n#[inline(never)]\npub(super) fn {}<'a>(transforms: &mut impl Transforms<'a>, {})->Result<Value<'a>,ValidationError>{{\n",snake_case(name),(0..f.parameters).map(|i|format!("a{i}:Value<'a>")).collect::<Vec<_>>().join(",")));
         for i in owned_slots(&f.body) {
             out.push_str(&format!(
                 "#[allow(unused_assignments,unused_mut)] let mut s{i}=Value::Undefined;\n"
@@ -49,7 +50,7 @@ fn statements(body: &[S], out: &mut String) -> Result<(), String> {
             S::Bind { slot, value } => out.push_str(&format!("s{slot}={};\n", expr(value)?)),
             S::Evaluate { value } => out.push_str(&format!("let _={};\n", expr(value)?)),
             S::If { condition, yes, no } => {
-                out.push_str(&format!("if ({}).truthy() {{\n", expr(condition)?));
+                out.push_str(&format!("if ({}).truthy() {{\n", receiver(condition)?));
                 statements(yes, out)?;
                 out.push_str("} else {\n");
                 statements(no, out)?;
@@ -77,19 +78,14 @@ fn expr(e: &E) -> Result<String, String> {
             format!("Value::Text({}.into())", rust_lit(value))
         }
         E::Field { object, field } => {
-            let receiver = match object.as_ref() {
-                E::Argument { index: 3 } => "item".to_owned(),
-                E::Argument { index } => format!("a{index}"),
-                E::Slot { index } => format!("s{index}"),
-                _ => expr(object)?,
-            };
+            let receiver = receiver(object)?;
             format!("({receiver}).field({})?", rust_lit(field))
         }
-        E::Not { value } => format!("Value::Bool(!({}).truthy())", expr(value)?),
+        E::Not { value } => format!("Value::Bool(!({}).truthy())", receiver(value)?),
         E::Nullish { value, negate } => format!(
             "Value::Bool({}({}).nullish())",
             if *negate { "!" } else { "" },
-            expr(value)?
+            receiver(value)?
         ),
         E::And { left, right } => format!(
             "{{let left={};if left.truthy(){{{}}}else{{left}}}}",
@@ -102,13 +98,13 @@ fn expr(e: &E) -> Result<String, String> {
             expr(right)?
         ),
         E::Greater { left, right } => format!(
-            "{{let left={};let right={};Value::Bool(left.greater_than(&right))}}",
+            "{{let left={};let right={};Value::Bool(transforms.relational_greater(left,right)?)}}",
             expr(left)?,
             expr(right)?
         ),
         E::Choose { condition, yes, no } => format!(
             "if ({}).truthy() {{{}}} else {{{}}}",
-            expr(condition)?,
+            receiver(condition)?,
             expr(yes)?,
             expr(no)?
         ),
@@ -179,6 +175,163 @@ fn expr(e: &E) -> Result<String, String> {
     })
 }
 
+// Tests and field reads only borrow a slot/argument. Other expressions still
+// evaluate to owned values, preserving their assignments and dependency calls.
+fn receiver(e: &E) -> Result<String, String> {
+    match e {
+        E::Argument { index: 3 } => Ok("item".into()),
+        E::Argument { index } => Ok(format!("a{index}")),
+        E::Slot { index } => Ok(format!("s{index}")),
+        _ => expr(e),
+    }
+}
+
+// The native host accepts buffa protobufs, whose repeated fields are ordinary
+// arrays. Qualify every comparator before letting that host omit JavaScript
+// coercion. The reference host keeps the complete comparator for arbitrary
+// differential inputs. These are adapter input types, not validation rules.
+fn qualify_native_comparisons(name: &str, body: &[S]) -> Result<(), String> {
+    let mut bindings = std::collections::BTreeMap::<usize, Vec<&E>>::new();
+    let mut expressions = Vec::new();
+    collect_comparison_inputs(body, &mut bindings, &mut expressions);
+    // These argument types come from the native entry adapters. A generated
+    // call could supply a different Value, so it needs a separate proof.
+    if expressions.iter().any(|expression| matches!(expression,
+        E::Validate { validator, .. }
+            if matches!(validator.as_str(), "validatePatchProtobuf" | "validateSnapshotProtobuf")
+    )) {
+        return Err(format!("native typed-array entry called internally in {name}"));
+    }
+    let mut arrays = std::collections::BTreeSet::new();
+    for statement in body {
+        let mut local_expressions = Vec::new();
+        collect_comparison_inputs(
+            std::slice::from_ref(statement),
+            &mut std::collections::BTreeMap::new(),
+            &mut local_expressions,
+        );
+        for expression in local_expressions {
+            if let E::Greater { left, right } = expression
+                && (!numeric_operand(name, left, &arrays) || !numeric_operand(name, right, &arrays))
+            {
+                return Err(format!("unqualified native numeric comparison in {name}"));
+            }
+        }
+        // Only preceding, unconditional and uniquely assigned bindings prove
+        // an alias. Branch/callback-local bindings cannot establish dominance.
+        if let S::Bind { slot, value } = statement
+            && bindings.get(slot).is_some_and(|values| values.len() == 1)
+            && ordinary_array(name, value, &arrays)
+        {
+            arrays.insert(*slot);
+        }
+    }
+    Ok(())
+}
+
+fn numeric_operand(name: &str, value: &E, arrays: &std::collections::BTreeSet<usize>) -> bool {
+    match value {
+        E::Integer { .. } => true,
+        E::Field { object, field } if field == "length" => ordinary_array(name, object, arrays),
+        _ => false,
+    }
+}
+
+fn ordinary_array(name: &str, value: &E, arrays: &std::collections::BTreeSet<usize>) -> bool {
+    match value {
+        E::Field { object, field } if matches!(object.as_ref(), E::Argument { index: 1 }) => {
+            matches!(
+                (name, field.as_str()),
+                ("validatePatchProtobuf", "mutations") | ("validateSnapshotProtobuf", "records")
+            )
+        }
+        E::Map { .. } => true,
+        E::Slot { index } => arrays.contains(index),
+        _ => false,
+    }
+}
+
+fn collect_comparison_inputs<'a>(
+    body: &'a [S],
+    bindings: &mut std::collections::BTreeMap<usize, Vec<&'a E>>,
+    expressions: &mut Vec<&'a E>,
+) {
+    for statement in body {
+        match statement {
+            S::Bind { slot, value } => {
+                bindings.entry(*slot).or_default().push(value);
+                collect_comparison_expression(value, bindings, expressions);
+            }
+            S::If { condition, yes, no } => {
+                collect_comparison_expression(condition, bindings, expressions);
+                collect_comparison_inputs(yes, bindings, expressions);
+                collect_comparison_inputs(no, bindings, expressions);
+            }
+            S::Evaluate { value } | S::Return { value } => {
+                collect_comparison_expression(value, bindings, expressions);
+            }
+            S::Fatal { metric, .. } => {
+                collect_comparison_expression(metric, bindings, expressions);
+            }
+        }
+    }
+}
+
+fn collect_comparison_expression<'a>(
+    value: &'a E,
+    bindings: &mut std::collections::BTreeMap<usize, Vec<&'a E>>,
+    expressions: &mut Vec<&'a E>,
+) {
+    expressions.push(value);
+    match value {
+        E::Field { object: value, .. } | E::Not { value } | E::Nullish { value, .. } => {
+            collect_comparison_expression(value, bindings, expressions);
+        }
+        E::Assign { slot, value } => {
+            bindings.entry(*slot).or_default().push(value);
+            collect_comparison_expression(value, bindings, expressions);
+        }
+        E::And { left, right } | E::Or { left, right } | E::Greater { left, right } => {
+            collect_comparison_expression(left, bindings, expressions);
+            collect_comparison_expression(right, bindings, expressions);
+        }
+        E::Choose { condition, yes, no } => {
+            for value in [condition, yes, no] {
+                collect_comparison_expression(value, bindings, expressions);
+            }
+        }
+        E::Sequence { values }
+        | E::Validate {
+            arguments: values, ..
+        }
+        | E::Transform {
+            arguments: values, ..
+        } => {
+            for value in values {
+                collect_comparison_expression(value, bindings, expressions);
+            }
+        }
+        E::Object { fields } => {
+            for (_, value) in fields {
+                collect_comparison_expression(value, bindings, expressions);
+            }
+        }
+        E::Map { input, body } => {
+            collect_comparison_expression(input, bindings, expressions);
+            // Counting callback-local writes conservatively rejects ambiguous
+            // slot aliases rather than accidentally proving a shadowed slot.
+            collect_comparison_inputs(body, bindings, expressions);
+        }
+        E::Argument { .. }
+        | E::Slot { .. }
+        | E::Undefined
+        | E::Null
+        | E::Integer { .. }
+        | E::String { .. }
+        | E::Metric { .. } => {}
+    }
+}
+
 pub fn generate_appstate_batch_validation(
     ir: &wa_ir::AppstateBatchValidationIr,
 ) -> Result<String, String> {
@@ -202,4 +355,186 @@ pub fn generate_appstate_batch_validation(
         "use super::validation_value::Transforms;",
     ));
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn array() -> E {
+        E::Field {
+            object: Box::new(E::Argument { index: 1 }),
+            field: "mutations".into(),
+        }
+    }
+    fn binding(slot: usize, value: E) -> S {
+        S::Bind { slot, value }
+    }
+    fn comparison(slot: usize) -> S {
+        S::Evaluate {
+            value: E::Greater {
+                left: Box::new(E::Field {
+                    object: Box::new(E::Slot { index: slot }),
+                    field: "length".into(),
+                }),
+                right: Box::new(E::Integer { value: 0 }),
+            },
+        }
+    }
+    fn generate(body: Vec<S>) -> Result<String, String> {
+        let ir = AppstateValidationIr {
+            format_version: 1,
+            wa_version: "synthetic".into(),
+            module_sha256: "synthetic".into(),
+            functions: std::collections::BTreeMap::from([(
+                "validatePatchProtobuf".into(),
+                wa_ir::ValidationFunction {
+                    module: "synthetic".into(),
+                    start_byte: 0,
+                    end_byte: 1,
+                    parameters: 2,
+                    body,
+                },
+            )]),
+        };
+        generate_appstate_validation(&ir)
+    }
+
+    #[test]
+    fn generation_rejects_string_and_bytes_lengths_and_callback_rebinding() {
+        for value in [
+            E::String {
+                value: "synthetic".into(),
+            },
+            E::Field {
+                object: Box::new(E::Argument { index: 1 }),
+                field: "patchMac".into(),
+            },
+        ] {
+            assert!(generate(vec![binding(0, value), comparison(0)]).is_err());
+        }
+        assert!(
+            generate(vec![
+                binding(0, array()),
+                S::Evaluate {
+                    value: E::Map {
+                        input: Box::new(array()),
+                        body: vec![
+                            binding(0, E::Null),
+                            comparison(0),
+                            S::Return { value: E::Null }
+                        ],
+                    }
+                },
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn generation_requires_dominance_for_comparisons_inside_branches() {
+        let branch = |body| S::If {
+            condition: E::Integer { value: 1 },
+            yes: body,
+            no: vec![],
+        };
+        assert!(
+            generate(vec![
+                binding(0, array()),
+                branch(vec![comparison(0)]),
+                S::Return { value: E::Null },
+            ])
+            .is_ok()
+        );
+        assert!(generate(vec![branch(vec![binding(0, array()), comparison(0)])]).is_err());
+        assert!(
+            generate(vec![
+                binding(0, array()),
+                branch(vec![binding(0, E::Null), comparison(0)]),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn native_comparison_proof_requires_typed_array_and_dominating_unique_aliases() {
+        let qualify = |body: &[S]| qualify_native_comparisons("validatePatchProtobuf", body);
+        assert!(qualify(&[binding(0, array()), comparison(0)]).is_ok());
+        assert!(
+            qualify(&[
+                binding(0, array()),
+                binding(1, E::Slot { index: 0 }),
+                comparison(1),
+            ])
+            .is_ok()
+        );
+        assert!(qualify(&[comparison(0), binding(0, array())]).is_err());
+        assert!(
+            qualify(&[
+                binding(0, E::Slot { index: 1 }),
+                binding(1, array()),
+                comparison(0),
+            ])
+            .is_err()
+        );
+        assert!(qualify(&[binding(0, array()), comparison(0), binding(0, E::Null),]).is_err());
+        assert!(
+            qualify(&[
+                S::If {
+                    condition: E::Integer { value: 1 },
+                    yes: vec![binding(0, array())],
+                    no: vec![],
+                },
+                comparison(0),
+            ])
+            .is_err()
+        );
+        assert!(
+            qualify(&[
+                binding(0, array()),
+                S::Evaluate {
+                    value: E::Assign {
+                        slot: 0,
+                        value: Box::new(E::Null)
+                    }
+                },
+                comparison(0),
+            ])
+            .is_err()
+        );
+        assert!(
+            qualify(&[
+                binding(
+                    0,
+                    E::Field {
+                        object: Box::new(E::Argument { index: 1 }),
+                        field: "unknown".into(),
+                    }
+                ),
+                comparison(0),
+            ])
+            .is_err()
+        );
+        assert!(
+            qualify_native_comparisons("unknown", &[binding(0, array()), comparison(0)]).is_err()
+        );
+        assert!(
+            qualify(&[S::Evaluate {
+                value: E::Validate {
+                    validator: "validatePatchProtobuf".into(),
+                    arguments: vec![E::Null, E::Null],
+                }
+            }])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn locked_program_qualifies() {
+        let ir: AppstateValidationIr = serde_json::from_str(include_str!(
+            "../../fixtures/appstate-validation/validation.json"
+        ))
+        .unwrap();
+        generate_appstate_validation(&ir).unwrap();
+    }
 }

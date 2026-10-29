@@ -1,6 +1,7 @@
 // Generated app-state protobuf validators. DO NOT EDIT.
 use super::validation_value::{Transforms, ValidationError, Value};
 #[allow(unused_variables)]
+#[inline(never)]
 pub(super) fn validate_external_blob_reference<'a>(
     transforms: &mut impl Transforms<'a>,
     a0: Value<'a>,
@@ -24,28 +25,28 @@ pub(super) fn validate_external_blob_reference<'a>(
     s3 = (a1).field("fileSizeBytes")?;
     s4 = (a1).field("handle")?;
     s5 = (a1).field("mediaKey")?;
-    if (Value::Bool(!(s5.clone()).truthy())).truthy() {
+    if (Value::Bool(!(s5).truthy())).truthy() {
         return Err(ValidationError::fatal(
             Value::Text("MISSING_EXTERNAL_BLOB_REFERENCE_MEDIA_KEY".into()),
             "missing external blob reference media key",
         ));
     } else {
     }
-    if (Value::Bool((s0.clone()).nullish())).truthy() {
+    if (Value::Bool((s0).nullish())).truthy() {
         return Err(ValidationError::fatal(
             Value::Text("MISSING_EXTERNAL_BLOB_REFERENCE_DIRECT_PATH".into()),
             "missing external blob reference direct path",
         ));
     } else {
     }
-    if (Value::Bool(!(s2.clone()).truthy())).truthy() {
+    if (Value::Bool(!(s2).truthy())).truthy() {
         return Err(ValidationError::fatal(
             Value::Text("MISSING_EXTERNAL_BLOB_REFERENCE_FILE_SHA256".into()),
             "missing external blob reference file SHA256",
         ));
     } else {
     }
-    if (Value::Bool(!(s1.clone()).truthy())).truthy() {
+    if (Value::Bool(!(s1).truthy())).truthy() {
         return Err(ValidationError::fatal(
             Value::Text("MISSING_EXTERNAL_BLOB_REFERENCE_FILE_ENC_SHA256".into()),
             "missing external blob reference file enc SHA256",
@@ -62,6 +63,7 @@ pub(super) fn validate_external_blob_reference<'a>(
     ]));
 }
 #[allow(unused_variables)]
+#[inline(never)]
 pub(super) fn validate_key_id_protobuf<'a>(
     transforms: &mut impl Transforms<'a>,
     a0: Value<'a>,
@@ -70,17 +72,17 @@ pub(super) fn validate_key_id_protobuf<'a>(
 ) -> Result<Value<'a>, ValidationError> {
     #[allow(unused_assignments, unused_mut)]
     let mut s0 = Value::Undefined;
-    s0 = if (Value::Bool((a1.clone()).nullish())).truthy() {
+    s0 = if (Value::Bool((a1).nullish())).truthy() {
         Value::Undefined
     } else {
         (a1).field("id")?
     };
     if ({
-        let left = Value::Bool(!(a1.clone()).truthy());
+        let left = Value::Bool(!(a1).truthy());
         if left.truthy() {
             left
         } else {
-            Value::Bool(!(s0.clone()).truthy())
+            Value::Bool(!(s0).truthy())
         }
     })
     .truthy()
@@ -97,6 +99,7 @@ pub(super) fn validate_key_id_protobuf<'a>(
     )]));
 }
 #[allow(unused_variables)]
+#[inline(never)]
 pub(super) fn validate_mutation_protobuf<'a>(
     transforms: &mut impl Transforms<'a>,
     a0: Value<'a>,
@@ -110,14 +113,14 @@ pub(super) fn validate_mutation_protobuf<'a>(
     let mut s2 = Value::Undefined;
     s0 = (a1).field("operation")?;
     s1 = (a1).field("record")?;
-    if (Value::Bool((s0.clone()).nullish())).truthy() {
+    if (Value::Bool((s0).nullish())).truthy() {
         return Err(ValidationError::fatal(
             Value::Text("MISSING_MUTATION_OPERATION".into()),
             "missing mutation operation",
         ));
     } else {
     }
-    if (Value::Bool(!(s1.clone()).truthy())).truthy() {
+    if (Value::Bool(!(s1).truthy())).truthy() {
         return Err(ValidationError::fatal(
             Value::Text("MISSING_MUTATION_RECORD".into()),
             "missing mutation record",
@@ -131,6 +134,7 @@ pub(super) fn validate_mutation_protobuf<'a>(
     ]));
 }
 #[allow(unused_variables)]
+#[inline(never)]
 pub(super) fn validate_patch_protobuf<'a>(
     transforms: &mut impl Transforms<'a>,
     a0: Value<'a>,
@@ -173,17 +177,17 @@ pub(super) fn validate_patch_protobuf<'a>(
     s6 = (a1).field("patchMac")?;
     s7 = (a1).field("snapshotMac")?;
     s8 = (a1).field("version")?;
-    s9 = if (Value::Bool((s8.clone()).nullish())).truthy() {
+    s9 = if (Value::Bool((s8).nullish())).truthy() {
         Value::Undefined
     } else {
         (s8).field("version")?
     };
     if ({
-        let left = Value::Bool(!(s8.clone()).truthy());
+        let left = Value::Bool(!(s8).truthy());
         if left.truthy() {
             left
         } else {
-            Value::Bool((s9.clone()).nullish())
+            Value::Bool((s9).nullish())
         }
     })
     .truthy()
@@ -201,7 +205,7 @@ pub(super) fn validate_patch_protobuf<'a>(
                 {
                     let left = (s5).field("length")?;
                     let right = Value::Number(0_f64);
-                    Value::Bool(left.greater_than(&right))
+                    Value::Bool(transforms.relational_greater(left, right)?)
                 }
             } else {
                 left
@@ -217,14 +221,14 @@ pub(super) fn validate_patch_protobuf<'a>(
         ));
     } else {
     }
-    if (Value::Bool(!(s7.clone()).truthy())).truthy() {
+    if (Value::Bool(!(s7).truthy())).truthy() {
         return Err(ValidationError::fatal(
             Value::Text("MISSING_PATCH_SNAPSHOT_MAC".into()),
             "missing patch snapshot mac",
         ));
     } else {
     }
-    if (Value::Bool(!(s6.clone()).truthy())).truthy() {
+    if (Value::Bool(!(s6).truthy())).truthy() {
         return Err(ValidationError::fatal(
             Value::Text("MISSING_PATCH_MAC".into()),
             "missing patch mac",
@@ -240,7 +244,7 @@ pub(super) fn validate_patch_protobuf<'a>(
     s11 = Value::Undefined;
     if ({
         let _ = {
-            let left = Value::Bool(!(s0.clone()).nullish());
+            let left = Value::Bool(!(s0).nullish());
             if left.truthy() {
                 {
                     s11 = transforms.decode_patch_debug_data(s0.clone())?;
@@ -306,6 +310,7 @@ pub(super) fn validate_patch_protobuf<'a>(
     ]));
 }
 #[allow(unused_variables)]
+#[inline(never)]
 pub(super) fn validate_record_protobuf<'a>(
     transforms: &mut impl Transforms<'a>,
     a0: Value<'a>,
@@ -326,22 +331,22 @@ pub(super) fn validate_record_protobuf<'a>(
     s0 = (a1).field("index")?;
     s1 = (a1).field("keyId")?;
     s2 = (a1).field("value")?;
-    s3 = if (Value::Bool((s0.clone()).nullish())).truthy() {
+    s3 = if (Value::Bool((s0).nullish())).truthy() {
         Value::Undefined
     } else {
         (s0).field("blob")?
     };
-    s4 = if (Value::Bool((s2.clone()).nullish())).truthy() {
+    s4 = if (Value::Bool((s2).nullish())).truthy() {
         Value::Undefined
     } else {
         (s2).field("blob")?
     };
     if ({
-        let left = Value::Bool(!(s0.clone()).truthy());
+        let left = Value::Bool(!(s0).truthy());
         if left.truthy() {
             left
         } else {
-            Value::Bool(!(s3.clone()).truthy())
+            Value::Bool(!(s3).truthy())
         }
     })
     .truthy()
@@ -353,11 +358,11 @@ pub(super) fn validate_record_protobuf<'a>(
     } else {
     }
     if ({
-        let left = Value::Bool(!(s2.clone()).truthy());
+        let left = Value::Bool(!(s2).truthy());
         if left.truthy() {
             left
         } else {
-            Value::Bool(!(s4.clone()).truthy())
+            Value::Bool(!(s4).truthy())
         }
     })
     .truthy()
@@ -381,6 +386,7 @@ pub(super) fn validate_record_protobuf<'a>(
     ]));
 }
 #[allow(unused_variables)]
+#[inline(never)]
 pub(super) fn validate_snapshot_protobuf<'a>(
     transforms: &mut impl Transforms<'a>,
     a0: Value<'a>,
@@ -404,17 +410,17 @@ pub(super) fn validate_snapshot_protobuf<'a>(
     s1 = (a1).field("mac")?;
     s2 = (a1).field("records")?;
     s3 = (a1).field("version")?;
-    s4 = if (Value::Bool((s3.clone()).nullish())).truthy() {
+    s4 = if (Value::Bool((s3).nullish())).truthy() {
         Value::Undefined
     } else {
         (s3).field("version")?
     };
     if ({
-        let left = Value::Bool(!(s3.clone()).truthy());
+        let left = Value::Bool(!(s3).truthy());
         if left.truthy() {
             left
         } else {
-            Value::Bool((s4.clone()).nullish())
+            Value::Bool((s4).nullish())
         }
     })
     .truthy()
@@ -439,7 +445,7 @@ pub(super) fn validate_snapshot_protobuf<'a>(
         }
         Value::list(mapped)
     };
-    if (Value::Bool(!(s1.clone()).truthy())).truthy() {
+    if (Value::Bool(!(s1).truthy())).truthy() {
         return Err(ValidationError::fatal(
             Value::Text("MISSING_SNAPSHOT_MAC".into()),
             "missing snapshot mac",

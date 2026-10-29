@@ -83,6 +83,7 @@ pub fn validate_no_same_index(
 // Generated app-state protobuf validators. DO NOT EDIT.
 use super::validation_value::Transforms;
 #[allow(unused_variables)]
+#[inline(never)]
 pub(super) fn validate_and_type_set_mutations<'a>(
     transforms: &mut impl Transforms<'a>,
     a0: Value<'a>,
@@ -101,7 +102,7 @@ pub(super) fn validate_and_type_set_mutations<'a>(
                 let mut s2 = Value::Undefined;
                 s0 = transforms.decode_sync_action_data((item).field("binarySyncData")?)?;
                 s1 = (s0).field("value")?;
-                if (Value::Bool(!(s1.clone()).truthy())).truthy() {
+                if (Value::Bool(!(s1).truthy())).truthy() {
                     return Err(ValidationError::fatal(
                         Value::Text("MISSING_ACTION_VALUE".into()),
                         "missing action value",
@@ -109,7 +110,7 @@ pub(super) fn validate_and_type_set_mutations<'a>(
                 } else {
                 }
                 s2 = transforms.maybe_number_or_throw_if_too_large((s1).field("timestamp")?)?;
-                if (Value::Bool((s2.clone()).nullish())).truthy() {
+                if (Value::Bool((s2).nullish())).truthy() {
                     return Err(ValidationError::fatal(
                         Value::Text("MISSING_ACTION_TIMESTAMP".into()),
                         "missing action timestamp",

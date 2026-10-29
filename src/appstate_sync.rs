@@ -954,7 +954,13 @@ mod tests {
     async fn multi_collection_error_preserves_prior_results() {
         let (backend, processor, mut list) = committed_before_status_privacy_scenario(false).await;
         let mut status_patch = list.patches.pop().expect("status patch");
-        let nct_patch = list.patches.pop().expect("nct patch");
+        let mut nct_patch = list.patches.pop().expect("nct patch");
+        // These collections pass through wire validation. Presence is required
+        // even while cryptographic MAC checking is disabled for this scenario.
+        for patch in [&mut nct_patch, &mut status_patch] {
+            patch.snapshot_mac = Some(Vec::new());
+            patch.patch_mac = Some(Vec::new());
+        }
         status_patch.version = buffa::MessageField::some({
             let mut proto = wa::SyncdVersion::default();
             proto.version = Some(1);
