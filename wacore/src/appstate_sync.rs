@@ -254,6 +254,8 @@ struct PatchListProgress {
 /// Large lists belong on a blocking worker, as in [`AppStateProcessor::prepare_patch_list`].
 #[inline(never)]
 pub fn validate_patch_list_metadata(pl: &PatchList) -> Result<()> {
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    prepared_validation_tests::METADATA_VALIDATION_CALLS.with(|calls| calls.set(calls.get() + 1));
     let name = pl.name;
     // Validate the untrusted protobuf boundary before handing references to a
     // downloader or advancing any collection state.
@@ -343,6 +345,42 @@ fn decode_external_blobs(
         )?;
     }
     Ok(())
+}
+
+/// An owned collection whose wire metadata has been checked before downloads.
+///
+/// The private fields prevent replacing or mutating the checked protobufs before
+/// preparation. Metadata failures travel with their original collection so batch
+/// processing can retain its existing per-collection error policy.
+///
+/// ```compile_fail
+/// use wacore::appstate::patch_decode::PatchList;
+/// use wacore::appstate_sync::MetadataValidatedPatchList;
+/// fn forge(list: PatchList) -> MetadataValidatedPatchList {
+///     MetadataValidatedPatchList { list, error: None }
+/// }
+/// ```
+#[derive(Debug)]
+pub struct MetadataValidatedPatchList {
+    list: PatchList,
+    error: Option<anyhow::Error>,
+}
+impl MetadataValidatedPatchList {
+    /// Validate an owned list. Large collections belong on a blocking worker.
+    pub fn validate(list: PatchList) -> Self {
+        let error = if list.error.is_none() {
+            validate_patch_list_metadata(&list).err()
+        } else {
+            None
+        };
+        Self { list, error }
+    }
+    pub fn list(&self) -> &PatchList {
+        &self.list
+    }
+    pub fn can_download(&self) -> bool {
+        self.error.is_none() && self.list.error.is_none()
+    }
 }
 
 /// A collection whose wire metadata and downloaded content have been checked.
@@ -1174,14 +1212,32 @@ impl AppStateProcessor {
                 error: None,
             };
         }
-        let (pl, error) = crate::runtime::blocking(&*self.runtime, move || {
-            let error = validate_patch_list_metadata(&pl).err();
-            (pl, error)
-        })
-        .await;
-        if error.is_some() {
-            return PreparedPatchList { list: pl, error };
+        // Keep the compatibility wrapper's validation and decoding frames apart.
+        // Runtime callers already own a metadata token and call the next phase directly.
+        let preparing = {
+            let validated = crate::runtime::blocking(&*self.runtime, move || {
+                MetadataValidatedPatchList::validate(pl)
+            })
+            .await;
+            Box::pin(self.prepare_metadata_validated_patch_list(validated, download))
+        };
+        preparing.await
+    }
+
+    /// Inline downloaded content without revalidating the immutable wire metadata.
+    /// Decoded snapshots/mutations and batch rules are still checked on the worker.
+    pub async fn prepare_metadata_validated_patch_list(
+        &self,
+        validated: MetadataValidatedPatchList,
+        download: &BlobDownloadFn<'_>,
+    ) -> PreparedPatchList {
+        if !validated.can_download() {
+            return PreparedPatchList {
+                list: validated.list,
+                error: validated.error,
+            };
         }
+        let MetadataValidatedPatchList { list: pl, .. } = validated;
         let mut blobs = Vec::new();
         for reference in pl
             .snapshot_ref
@@ -2163,8 +2219,12 @@ mod prepared_validation_tests {
         sync::atomic::{AtomicUsize, Ordering},
         time::Duration,
     };
+    std::thread_local! {
+        pub(super) static METADATA_VALIDATION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
     struct TestRuntime {
         calls: Arc<AtomicUsize>,
+        metadata_calls: Arc<AtomicUsize>,
         owner: std::thread::ThreadId,
     }
     #[async_trait]
@@ -2181,12 +2241,17 @@ mod prepared_validation_tests {
             f: Box<dyn FnOnce() + Send>,
         ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
             let calls = self.calls.clone();
+            let metadata_calls = self.metadata_calls.clone();
             let owner = self.owner;
             Box::pin(async move {
                 tokio::task::spawn_blocking(move || {
                     assert_ne!(std::thread::current().id(), owner);
                     calls.fetch_add(1, Ordering::SeqCst);
+                    METADATA_VALIDATION_CALLS.with(|calls| calls.set(0));
                     f();
+                    METADATA_VALIDATION_CALLS.with(|calls| {
+                        metadata_calls.fetch_add(calls.get(), Ordering::SeqCst);
+                    });
                 })
                 .await
                 .expect("blocking validation worker");
@@ -2220,13 +2285,29 @@ mod prepared_validation_tests {
         }
     }
     fn processor(calls: Arc<AtomicUsize>) -> AppStateProcessor {
+        processor_with_metadata_calls(calls, Arc::new(AtomicUsize::new(0)))
+    }
+    fn processor_with_metadata_calls(
+        calls: Arc<AtomicUsize>,
+        metadata_calls: Arc<AtomicUsize>,
+    ) -> AppStateProcessor {
         AppStateProcessor::new(
             Arc::new(crate::store::InMemoryBackend::new()),
             Arc::new(TestRuntime {
                 calls,
+                metadata_calls,
                 owner: std::thread::current().id(),
             }),
         )
+    }
+    async fn metadata_token(
+        processor: &AppStateProcessor,
+        list: PatchList,
+    ) -> MetadataValidatedPatchList {
+        crate::runtime::blocking(&*processor.runtime, move || {
+            MetadataValidatedPatchList::validate(list)
+        })
+        .await
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2279,7 +2360,9 @@ mod prepared_validation_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn preparation_uses_blocking_workers_and_retains_snapshot_ownership() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let processor = processor(calls.clone());
+        let metadata_calls = Arc::new(AtomicUsize::new(0));
+        let processor = processor_with_metadata_calls(calls.clone(), metadata_calls.clone());
+        METADATA_VALIDATION_CALLS.with(|calls| calls.set(0));
         let mut snapshot = snapshot(false);
         let mut record = wa::SyncdRecord::default();
         let mut index = wa::SyncdIndex::default();
@@ -2293,13 +2376,18 @@ mod prepared_validation_tests {
         record.key_id = key.into();
         snapshot.records.push(record);
         let ptr = snapshot.records[0].value.blob.as_ref().unwrap().as_ptr() as usize;
+        let validated = metadata_token(&processor, list(snapshot)).await;
+        assert!(validated.can_download());
+        assert_eq!(metadata_calls.load(Ordering::SeqCst), 1);
         let prepared = processor
-            .prepare_patch_list(list(snapshot), &|_| {
+            .prepare_metadata_validated_patch_list(validated, &|_| {
                 panic!("inline snapshot must not download")
             })
             .await;
         assert!(prepared.is_ready());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(metadata_calls.load(Ordering::SeqCst), 1);
+        METADATA_VALIDATION_CALLS.with(|calls| assert_eq!(calls.get(), 0));
         assert_eq!(
             prepared.list().snapshot.as_ref().unwrap().records[0]
                 .value
@@ -2363,6 +2451,140 @@ mod prepared_validation_tests {
             );
         }
     }
+    #[tokio::test(flavor = "current_thread")]
+    async fn metadata_failure_is_retained_before_any_download_or_second_validation() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let metadata_calls = Arc::new(AtomicUsize::new(0));
+        let processor = processor_with_metadata_calls(calls.clone(), metadata_calls.clone());
+        let mut snapshot = snapshot(true);
+        snapshot.key_id = Default::default();
+        let validated = metadata_token(&processor, list(snapshot)).await;
+        assert!(!validated.can_download());
+        let prepared = processor
+            .prepare_metadata_validated_patch_list(validated, &|_| panic!("invalid metadata"))
+            .await;
+        let error = processor
+            .process_prepared_patch_list(prepared, true)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::appstate::validation::ValidationError>()
+                .unwrap()
+                .metric
+                .as_deref(),
+            Some("MISSING_SNAPSHOT_MAC")
+        );
+        assert!(matches!(
+            error.downcast_ref::<crate::appstate::AppStateError>(),
+            Some(crate::appstate::AppStateError::SnapshotMACMissing)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(metadata_calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn external_reference() -> wa::ExternalBlobReference {
+        let mut reference = wa::ExternalBlobReference::default();
+        reference.direct_path = Some("/synthetic-appstate".into());
+        reference.media_key = Some(vec![1; 32]);
+        reference.file_sha256 = Some(vec![2; 32]);
+        reference.file_enc_sha256 = Some(vec![3; 32]);
+        reference
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::disallowed_methods)]
+    async fn checked_metadata_still_validates_decoded_content_and_then_batch_versions() {
+        use buffa::Message;
+        let processor = processor(Arc::new(AtomicUsize::new(0)));
+        let mut external_snapshot = list(snapshot(false));
+        external_snapshot.snapshot = None;
+        external_snapshot.snapshot_ref = Some(external_reference());
+        let validated = metadata_token(&processor, external_snapshot).await;
+        assert!(validated.can_download());
+        let downloads = AtomicUsize::new(0);
+        let invalid_snapshot = bytes::Bytes::from(snapshot(true).encode_to_vec());
+        let prepared = processor
+            .prepare_metadata_validated_patch_list(validated, &|_| {
+                downloads.fetch_add(1, Ordering::SeqCst);
+                Ok(invalid_snapshot.clone())
+            })
+            .await;
+        assert_eq!(downloads.load(Ordering::SeqCst), 1);
+        let error = processor
+            .process_prepared_patch_list(prepared, true)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::appstate::validation::ValidationError>()
+                .unwrap()
+                .metric
+                .as_deref(),
+            Some("MISSING_SNAPSHOT_MAC")
+        );
+
+        let mut patch = wa::SyncdPatch::default();
+        let mut version = wa::SyncdVersion::default();
+        version.version = Some(1);
+        patch.version = version.into();
+        patch.snapshot_mac = Some(vec![]);
+        patch.patch_mac = Some(vec![]);
+        let mut key = wa::KeyId::default();
+        key.id = Some(vec![]);
+        patch.key_id = key.into();
+        patch.external_mutations = external_reference().into();
+        let mut duplicate_versions = list(snapshot(false));
+        duplicate_versions.snapshot = None;
+        duplicate_versions.patches = vec![patch.clone(), patch];
+        let validated = metadata_token(&processor, duplicate_versions).await;
+        assert!(
+            validated.can_download(),
+            "batch errors belong after inlining"
+        );
+        downloads.store(0, Ordering::SeqCst);
+        let prepared = processor
+            .prepare_metadata_validated_patch_list(validated, &|_| {
+                downloads.fetch_add(1, Ordering::SeqCst);
+                Ok(bytes::Bytes::new())
+            })
+            .await;
+        assert_eq!(downloads.load(Ordering::SeqCst), 2);
+        let error = processor
+            .process_prepared_patch_list(prepared, true)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::appstate::validation::ValidationError>()
+                .unwrap()
+                .metric
+                .as_deref(),
+            Some("DUPLICATE_PATCH_VERSION_IN_COLLECTION")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_collection_errors_skip_metadata_and_downloads() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let metadata_calls = Arc::new(AtomicUsize::new(0));
+        let processor = processor_with_metadata_calls(calls.clone(), metadata_calls.clone());
+        let mut list = list(snapshot(true));
+        list.error = Some(CollectionSyncError::Retry {
+            code: 503,
+            text: "synthetic retry".into(),
+        });
+        let validated = metadata_token(&processor, list).await;
+        assert!(!validated.can_download());
+        let prepared = processor
+            .prepare_metadata_validated_patch_list(validated, &|_| panic!("collection error"))
+            .await;
+        assert!(prepared.list().error.is_some());
+        assert!(!prepared.is_ready());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(metadata_calls.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     #[allow(clippy::disallowed_methods)]
     async fn preparation_keeps_distinct_references_with_the_same_path_separate() {
