@@ -86,8 +86,8 @@ use super::validation_value::Transforms;
 #[inline(never)]
 pub(super) fn validate_and_type_set_mutations<'a>(
     transforms: &mut impl Transforms<'a>,
-    a0: Value<'a>,
-    a1: Value<'a>,
+    a0: &Value<'a>,
+    a1: &Value<'a>,
 ) -> Result<Value<'a>, ValidationError> {
     return Ok({
         let input = a1.clone();

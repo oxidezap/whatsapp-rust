@@ -17,7 +17,7 @@ pub fn generate_appstate_validation(ir: &AppstateValidationIr) -> Result<String,
             return Err("validator arity".into());
         }
         qualify_native_comparisons(name, &f.body)?;
-        out.push_str(&format!("#[allow(unused_variables)]\n#[inline(never)]\npub(super) fn {}<'a>(transforms: &mut impl Transforms<'a>, {})->Result<Value<'a>,ValidationError>{{\n",snake_case(name),(0..f.parameters).map(|i|format!("a{i}:Value<'a>")).collect::<Vec<_>>().join(",")));
+        out.push_str(&format!("#[allow(unused_variables)]\n#[inline(never)]\npub(super) fn {}<'a>(transforms: &mut impl Transforms<'a>, {})->Result<Value<'a>,ValidationError>{{\n",snake_case(name),(0..f.parameters).map(|i|format!("a{i}:&Value<'a>")).collect::<Vec<_>>().join(",")));
         for i in owned_slots(&f.body) {
             out.push_str(&format!(
                 "#[allow(unused_assignments,unused_mut)] let mut s{i}=Value::Undefined;\n"
@@ -132,15 +132,7 @@ fn expr(e: &E) -> Result<String, String> {
         E::Validate {
             validator,
             arguments,
-        } => format!(
-            "{}(transforms,{})?",
-            snake_case(validator),
-            arguments
-                .iter()
-                .map(expr)
-                .collect::<Result<Vec<_>, _>>()?
-                .join(",")
-        ),
+        } => validation_call(validator, arguments)?,
         E::Map { input, body } => {
             let mut rendered = String::new();
             for i in owned_slots(body) {
@@ -173,6 +165,45 @@ fn expr(e: &E) -> Result<String, String> {
             }
         }
     })
+}
+
+fn validation_call(validator: &str, arguments: &[E]) -> Result<String, String> {
+    let mut rendered = String::from("{");
+    let mut passed = Vec::new();
+    for (index, argument) in arguments.iter().enumerate() {
+        let local = format!("call_arg_{index}");
+        if let Some(borrowed) = borrowed_call_argument(argument, &arguments[index + 1..]) {
+            rendered.push_str(&format!("let {local}={borrowed};"));
+            passed.push(local);
+        } else {
+            rendered.push_str(&format!("let {local}={};", expr(argument)?));
+            passed.push(format!("&{local}"));
+        }
+    }
+    rendered.push_str(&format!(
+        "{}(transforms,{})?}}",
+        snake_case(validator),
+        passed.join(",")
+    ));
+    Ok(rendered)
+}
+
+// Arguments are immutable, while slots can be reassigned by subsequent argument
+// evaluation. Snapshot those slots before later effects, as JavaScript does.
+fn borrowed_call_argument(argument: &E, later: &[E]) -> Option<String> {
+    match argument {
+        E::Argument { index: 3 } => Some("item".into()),
+        E::Argument { index } => Some(format!("a{index}")),
+        E::Slot { index } => {
+            let mut writes = std::collections::BTreeMap::new();
+            let mut expressions = Vec::new();
+            for argument in later {
+                collect_comparison_expression(argument, &mut writes, &mut expressions);
+            }
+            (!writes.contains_key(index)).then(|| format!("&s{index}"))
+        }
+        _ => None,
+    }
 }
 
 // Tests and field reads only borrow a slot/argument. Other expressions still
@@ -360,6 +391,175 @@ pub fn generate_appstate_batch_validation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_calls_preserve_argument_snapshots_and_effect_order() {
+        let function = |parameters, body| wa_ir::ValidationFunction {
+            module: "synthetic argument semantics".into(),
+            start_byte: 0,
+            end_byte: 1,
+            parameters,
+            body,
+        };
+        let invoke = |arguments| E::Validate {
+            validator: "echoArguments".into(),
+            arguments,
+        };
+        let program = AppstateValidationIr {
+            format_version: 1,
+            wa_version: "synthetic".into(),
+            module_sha256: "0".repeat(64),
+            functions: std::collections::BTreeMap::from([
+                (
+                    "echoArguments".into(),
+                    function(
+                        2,
+                        vec![S::Return {
+                            value: E::Object {
+                                fields: vec![
+                                    ("first".into(), E::Argument { index: 0 }),
+                                    ("second".into(), E::Argument { index: 1 }),
+                                ],
+                            },
+                        }],
+                    ),
+                ),
+                (
+                    "captureProbe".into(),
+                    function(
+                        0,
+                        vec![
+                            S::Bind {
+                                slot: 0,
+                                value: E::Integer { value: 1 },
+                            },
+                            S::Return {
+                                value: invoke(vec![
+                                    E::Slot { index: 0 },
+                                    E::Assign {
+                                        slot: 0,
+                                        value: Box::new(E::Integer { value: 2 }),
+                                    },
+                                ]),
+                            },
+                        ],
+                    ),
+                ),
+                (
+                    "effectProbe".into(),
+                    function(
+                        0,
+                        vec![S::Return {
+                            value: invoke(
+                                [1, 2]
+                                    .into_iter()
+                                    .map(|value| E::Transform {
+                                        transform: T::SafeInteger,
+                                        arguments: vec![E::Integer { value }],
+                                    })
+                                    .collect(),
+                            ),
+                        }],
+                    ),
+                ),
+            ]),
+        };
+        let generated = generate_appstate_validation(&program).unwrap();
+        let source = format!(
+            "#![allow(dead_code,unused_variables,unused_assignments,unused_mut,unused_parens)]\nmod validation_value {{\n{}\n}}\nmod generated {{\n{generated}\n}}\n{}",
+            include_str!("appstate_validation_value.rs.txt"),
+            r#"
+use validation_value::{Transforms, ValidationError, Value};
+#[derive(Default)]
+struct Host { trace: Vec<f64> }
+impl<'a> Transforms<'a> for Host {
+    fn number_or_throw_if_too_large(&mut self, value: Value<'a>) -> Result<Value<'a>, ValidationError> {
+        self.trace.push(value.number()?);
+        Ok(value)
+    }
+    fn to_sync_key_id(&mut self, value: Value<'a>) -> Result<Value<'a>, ValidationError> { Ok(value) }
+    fn decode_sync_action_data(&mut self, value: Value<'a>) -> Result<Value<'a>, ValidationError> { Ok(value) }
+    fn decode_patch_debug_data(&mut self, value: Value<'a>) -> Result<Value<'a>, ValidationError> { Ok(value) }
+}
+fn assert_fields(result: Value<'_>) {
+    assert_eq!(result.field("first").expect("first field").number().expect("first number"), 1.0);
+    assert_eq!(result.field("second").expect("second field").number().expect("second number"), 2.0);
+}
+fn main() {
+    let mut host = Host::default();
+    assert_fields(generated::capture_probe(&mut host).expect("argument snapshot"));
+    assert!(host.trace.is_empty());
+    assert_fields(generated::effect_probe(&mut host).expect("ordered transform arguments"));
+    assert_eq!(host.trace, vec![1.0, 2.0]);
+}
+"#
+        );
+        run_generated_program(&source);
+    }
+
+    fn run_generated_program(source: &str) {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        struct RemoveOnDrop(std::path::PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "appstate-generated-semantics-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let cleanup = RemoveOnDrop(directory);
+        let input = cleanup.0.join("probe.rs");
+        let executable = cleanup
+            .0
+            .join(format!("probe{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&input, source).unwrap();
+        let compiler = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let compiled = std::process::Command::new(compiler)
+            .arg("--edition=2024")
+            .arg("--crate-name=appstate_generated_semantics")
+            .arg(&input)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "generated program did not compile:\n{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let executed = std::process::Command::new(&executable).output().unwrap();
+        assert!(
+            executed.status.success(),
+            "generated argument semantics failed:\n{}",
+            String::from_utf8_lossy(&executed.stderr)
+        );
+    }
+
+    #[test]
+    fn borrowed_arguments_detect_nested_callback_writes() {
+        let later = E::Map {
+            input: Box::new(E::Argument { index: 1 }),
+            body: vec![S::Return {
+                value: E::Assign {
+                    slot: 2,
+                    value: Box::new(E::Null),
+                },
+            }],
+        };
+        assert!(borrowed_call_argument(&E::Slot { index: 2 }, &[later]).is_none());
+        assert_eq!(
+            borrowed_call_argument(&E::Slot { index: 2 }, &[]),
+            Some("&s2".into())
+        );
+        assert_eq!(
+            borrowed_call_argument(&E::Argument { index: 3 }, &[]),
+            Some("item".into())
+        );
+    }
 
     fn array() -> E {
         E::Field {

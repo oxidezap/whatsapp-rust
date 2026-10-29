@@ -4,8 +4,8 @@ use super::validation_value::{Transforms, ValidationError, Value};
 #[inline(never)]
 pub(super) fn validate_external_blob_reference<'a>(
     transforms: &mut impl Transforms<'a>,
-    a0: Value<'a>,
-    a1: Value<'a>,
+    a0: &Value<'a>,
+    a1: &Value<'a>,
 ) -> Result<Value<'a>, ValidationError> {
     #[allow(unused_assignments, unused_mut)]
     let mut s0 = Value::Undefined;
@@ -66,9 +66,9 @@ pub(super) fn validate_external_blob_reference<'a>(
 #[inline(never)]
 pub(super) fn validate_key_id_protobuf<'a>(
     transforms: &mut impl Transforms<'a>,
-    a0: Value<'a>,
-    a1: Value<'a>,
-    a2: Value<'a>,
+    a0: &Value<'a>,
+    a1: &Value<'a>,
+    a2: &Value<'a>,
 ) -> Result<Value<'a>, ValidationError> {
     #[allow(unused_assignments, unused_mut)]
     let mut s0 = Value::Undefined;
@@ -102,8 +102,8 @@ pub(super) fn validate_key_id_protobuf<'a>(
 #[inline(never)]
 pub(super) fn validate_mutation_protobuf<'a>(
     transforms: &mut impl Transforms<'a>,
-    a0: Value<'a>,
-    a1: Value<'a>,
+    a0: &Value<'a>,
+    a1: &Value<'a>,
 ) -> Result<Value<'a>, ValidationError> {
     #[allow(unused_assignments, unused_mut)]
     let mut s0 = Value::Undefined;
@@ -127,7 +127,11 @@ pub(super) fn validate_mutation_protobuf<'a>(
         ));
     } else {
     }
-    s2 = validate_record_protobuf(transforms, a0.clone(), s1.clone())?;
+    s2 = {
+        let call_arg_0 = a0;
+        let call_arg_1 = &s1;
+        validate_record_protobuf(transforms, call_arg_0, call_arg_1)?
+    };
     return Ok(Value::object(vec![
         ("operation", s0.clone()),
         ("record", s2.clone()),
@@ -137,8 +141,8 @@ pub(super) fn validate_mutation_protobuf<'a>(
 #[inline(never)]
 pub(super) fn validate_patch_protobuf<'a>(
     transforms: &mut impl Transforms<'a>,
-    a0: Value<'a>,
-    a1: Value<'a>,
+    a0: &Value<'a>,
+    a1: &Value<'a>,
 ) -> Result<Value<'a>, ValidationError> {
     #[allow(unused_assignments, unused_mut)]
     let mut s0 = Value::Undefined;
@@ -235,12 +239,12 @@ pub(super) fn validate_patch_protobuf<'a>(
         ));
     } else {
     }
-    s10 = validate_key_id_protobuf(
-        transforms,
-        a0.clone(),
-        s4.clone(),
-        Value::Text("MISSING_PATCH_KEY_ID".into()),
-    )?;
+    s10 = {
+        let call_arg_0 = a0;
+        let call_arg_1 = &s4;
+        let call_arg_2 = Value::Text("MISSING_PATCH_KEY_ID".into());
+        validate_key_id_protobuf(transforms, call_arg_0, call_arg_1, &call_arg_2)?
+    };
     s11 = Value::Undefined;
     if ({
         let _ = {
@@ -258,7 +262,11 @@ pub(super) fn validate_patch_protobuf<'a>(
     })
     .truthy()
     {
-        s12 = validate_external_blob_reference(transforms, a0.clone(), s3.clone())?;
+        s12 = {
+            let call_arg_0 = a0;
+            let call_arg_1 = &s3;
+            validate_external_blob_reference(transforms, call_arg_0, call_arg_1)?
+        };
         return Ok(Value::object(vec![
             (
                 "version",
@@ -282,11 +290,11 @@ pub(super) fn validate_patch_protobuf<'a>(
         let mut mapped = Vec::new();
         for item in input.array()? {
             mapped.push((|| -> Result<Value, ValidationError> {
-                return Ok(validate_mutation_protobuf(
-                    transforms,
-                    a0.clone(),
-                    item.clone(),
-                )?);
+                return Ok({
+                    let call_arg_0 = a0;
+                    let call_arg_1 = item;
+                    validate_mutation_protobuf(transforms, call_arg_0, call_arg_1)?
+                });
             })()?);
         }
         Value::list(mapped)
@@ -313,8 +321,8 @@ pub(super) fn validate_patch_protobuf<'a>(
 #[inline(never)]
 pub(super) fn validate_record_protobuf<'a>(
     transforms: &mut impl Transforms<'a>,
-    a0: Value<'a>,
-    a1: Value<'a>,
+    a0: &Value<'a>,
+    a1: &Value<'a>,
 ) -> Result<Value<'a>, ValidationError> {
     #[allow(unused_assignments, unused_mut)]
     let mut s0 = Value::Undefined;
@@ -373,12 +381,12 @@ pub(super) fn validate_record_protobuf<'a>(
         ));
     } else {
     }
-    s5 = validate_key_id_protobuf(
-        transforms,
-        a0.clone(),
-        s1.clone(),
-        Value::Text("MISSING_MUTATION_KEY_ID".into()),
-    )?;
+    s5 = {
+        let call_arg_0 = a0;
+        let call_arg_1 = &s1;
+        let call_arg_2 = Value::Text("MISSING_MUTATION_KEY_ID".into());
+        validate_key_id_protobuf(transforms, call_arg_0, call_arg_1, &call_arg_2)?
+    };
     return Ok(Value::object(vec![
         ("index", Value::object(vec![("blob", s3.clone())])),
         ("value", Value::object(vec![("blob", s4.clone())])),
@@ -389,8 +397,8 @@ pub(super) fn validate_record_protobuf<'a>(
 #[inline(never)]
 pub(super) fn validate_snapshot_protobuf<'a>(
     transforms: &mut impl Transforms<'a>,
-    a0: Value<'a>,
-    a1: Value<'a>,
+    a0: &Value<'a>,
+    a1: &Value<'a>,
 ) -> Result<Value<'a>, ValidationError> {
     #[allow(unused_assignments, unused_mut)]
     let mut s0 = Value::Undefined;
@@ -436,11 +444,11 @@ pub(super) fn validate_snapshot_protobuf<'a>(
         let mut mapped = Vec::new();
         for item in input.array()? {
             mapped.push((|| -> Result<Value, ValidationError> {
-                return Ok(validate_record_protobuf(
-                    transforms,
-                    a0.clone(),
-                    item.clone(),
-                )?);
+                return Ok({
+                    let call_arg_0 = a0;
+                    let call_arg_1 = item;
+                    validate_record_protobuf(transforms, call_arg_0, call_arg_1)?
+                });
             })()?);
         }
         Value::list(mapped)
@@ -452,12 +460,12 @@ pub(super) fn validate_snapshot_protobuf<'a>(
         ));
     } else {
     }
-    s6 = validate_key_id_protobuf(
-        transforms,
-        a0.clone(),
-        s0.clone(),
-        Value::Text("MISSING_SNAPSHOT_KEY_ID".into()),
-    )?;
+    s6 = {
+        let call_arg_0 = a0;
+        let call_arg_1 = &s0;
+        let call_arg_2 = Value::Text("MISSING_SNAPSHOT_KEY_ID".into());
+        validate_key_id_protobuf(transforms, call_arg_0, call_arg_1, &call_arg_2)?
+    };
     return Ok(Value::object(vec![
         (
             "version",

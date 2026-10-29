@@ -54,8 +54,8 @@ pub fn validate_patch<'a>(
     let mut transforms = NativeTransforms::default();
     generated::validate_patch_protobuf(
         &mut transforms,
-        Value::Text(collection.into()),
-        patch_view(patch),
+        &Value::Text(collection.into()),
+        &patch_view(patch),
     )?;
     Ok(ValidatedPatch {
         patch,
@@ -69,8 +69,8 @@ pub fn validate_snapshot(
 ) -> Result<(), ValidationError> {
     generated::validate_snapshot_protobuf(
         &mut NativeTransforms::default(),
-        Value::Text(collection.into()),
-        object(vec![
+        &Value::Text(collection.into()),
+        &object(vec![
             (
                 "version",
                 snapshot
@@ -101,8 +101,8 @@ pub fn validate_external_reference(
 ) -> Result<(), ValidationError> {
     generated::validate_external_blob_reference(
         &mut NativeTransforms::default(),
-        Value::Text(collection.into()),
-        external_view(reference),
+        &Value::Text(collection.into()),
+        &external_view(reference),
     )?;
     Ok(())
 }
@@ -113,8 +113,8 @@ pub fn validate_mutation(
 ) -> Result<(), ValidationError> {
     generated::validate_mutation_protobuf(
         &mut NativeTransforms::default(),
-        Value::Text(collection.into()),
-        mutation_view(mutation),
+        &Value::Text(collection.into()),
+        &mutation_view(mutation),
     )?;
     Ok(())
 }
@@ -158,9 +158,10 @@ pub fn validate_set_mutations<'a>(
     );
     let result = super::validation_batch_generated::validate_and_type_set_mutations(
         &mut NativeTransforms::default(),
-        Value::Text(collection.into()),
-        view,
+        &Value::Text(collection.into()),
+        &view,
     )?;
+    drop(view);
     inputs
         .iter()
         .zip(result.array()?)

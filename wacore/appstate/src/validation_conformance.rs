@@ -114,25 +114,25 @@ fn official_isolated_methods_match_generated_rust() {
         let mut transforms = OracleTransforms;
         let result = match c["method"].as_str().unwrap() {
             "validateSnapshotProtobuf" => {
-                generated::validate_snapshot_protobuf(&mut transforms, collection, input)
+                generated::validate_snapshot_protobuf(&mut transforms, &collection, &input)
             }
             "validatePatchProtobuf" => {
-                generated::validate_patch_protobuf(&mut transforms, collection, input)
+                generated::validate_patch_protobuf(&mut transforms, &collection, &input)
             }
             "validateRecordProtobuf" => {
-                generated::validate_record_protobuf(&mut transforms, collection, input)
+                generated::validate_record_protobuf(&mut transforms, &collection, &input)
             }
             "validateMutationProtobuf" => {
-                generated::validate_mutation_protobuf(&mut transforms, collection, input)
+                generated::validate_mutation_protobuf(&mut transforms, &collection, &input)
             }
             "validateExternalBlobReference" => {
-                generated::validate_external_blob_reference(&mut transforms, collection, input)
+                generated::validate_external_blob_reference(&mut transforms, &collection, &input)
             }
             "validateKeyIdProtobuf" => generated::validate_key_id_protobuf(
                 &mut transforms,
-                collection,
-                input,
-                read(&c["metric"]),
+                &collection,
+                &input,
+                &read(&c["metric"]),
             ),
             other => panic!("unknown method {other}"),
         };
@@ -199,8 +199,8 @@ fn official_batch_algorithms_match_generated_rust() {
         let result = match c["method"].as_str().unwrap() {
             "validateAndTypeSetMutations" => batch::validate_and_type_set_mutations(
                 &mut OracleTransforms,
-                Value::Text("test".into()),
-                read(&c["input"]),
+                &Value::Text("test".into()),
+                &read(&c["input"]),
             ),
             "validateNoDuplicatePatchVersionInCollection" => {
                 let result = batch::validate_no_duplicate_patch_version(
