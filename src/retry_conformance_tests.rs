@@ -6,7 +6,7 @@ async fn captured_web_session_scenarios_match_core_repair_outcomes() {
     use sha2::Digest;
     let bytes = include_bytes!("../tests/fixtures/retry-conformance/session-cases.json");
     assert_eq!(
-        format!("{:x}", sha2::Sha256::digest(bytes)),
+        hex::encode(sha2::Sha256::digest(bytes)),
         "aadc079a167af576f3ee7649d86cd91e4ac83e6029951c5f23ca5ab54205c9b9",
         "pinned retry oracle fixture drift"
     );
@@ -115,19 +115,16 @@ async fn captured_retry_repair_cancelled_while_waiting_for_lock_has_no_effects()
         Box::pin(client.reconcile_retry_session(&requester, "CANCELLED-RETRY", 2, &node_ref));
     // Poll deterministically into the held mutex, without relying on scheduling.
     assert!(
-        std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
-            repair.as_mut(),
-            cx
-        )))
-        .await
-        .is_pending()
+        std::future::poll_fn(|cx| std::task::Poll::Ready(Future::poll(repair.as_mut(), cx)))
+            .await
+            .is_pending()
     );
     drop(repair);
     drop(guard);
     client.flush_signal_cache().await.unwrap();
     assert_eq!(
         backend.get_session(address.as_str()).await.unwrap(),
-        Some(original)
+        Some(original.into())
     );
     assert!(
         !backend

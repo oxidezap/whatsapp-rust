@@ -6,7 +6,7 @@ fn captured_web_key_inclusion_gate_matches_manual_core_helper() {
     use sha2::Digest;
     let bytes = include_bytes!("fixtures/retry-conformance/session-cases.json");
     assert_eq!(
-        format!("{:x}", sha2::Sha256::digest(bytes)),
+        hex::encode(sha2::Sha256::digest(bytes)),
         "aadc079a167af576f3ee7649d86cd91e4ac83e6029951c5f23ca5ab54205c9b9",
         "pinned retry oracle fixture drift"
     );
