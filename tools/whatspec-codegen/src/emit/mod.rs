@@ -8,6 +8,7 @@ pub mod appstate;
 pub mod community_create;
 pub mod enums;
 pub mod iq_conformance;
+pub mod iq_contextual;
 pub mod iq_pilots;
 pub mod iq_targets;
 pub mod join_shapes;

@@ -33,6 +33,30 @@ pub trait IqSpec {
         &self,
         response: &wacore_binary::NodeRef<'_>,
     ) -> Result<Self::Response, anyhow::Error>;
+
+    /// Opt into the full response contract, including error stanzas and the
+    /// immutable request after its final ID was assigned. Legacy specs keep
+    /// the existing transport error conversion and direct encoding path.
+    fn uses_contextual_response(&self) -> bool {
+        false
+    }
+
+    /// Admit protocol error stanzas to this parser instead of converting them
+    /// through the legacy generic envelope parser first.
+    fn handles_iq_errors(&self) -> bool {
+        false
+    }
+
+    /// Parse against the stanza actually sent, never a context reconstructed
+    /// from response attributes. Runtime timeout and cancellation stay outside
+    /// this protocol contract.
+    fn parse_response_with_context(
+        &self,
+        response: &wacore_binary::NodeRef<'_>,
+        _request: &wacore_binary::NodeRef<'_>,
+    ) -> Result<Self::Response, anyhow::Error> {
+        self.parse_response(response)
+    }
 }
 
 /// An [`IqSpec`] whose response can be consumed as it is decoded, without ever
@@ -62,4 +86,15 @@ pub trait IqStreamSpec: IqSpec {
         &self,
         stream: &mut wacore_binary::NodeStream<'_>,
     ) -> Result<Self::Response, anyhow::Error>;
+}
+
+/// Preserve the existing public IQ error classification after the generated
+/// contract admitted its particular code/text pair and payload.
+pub(super) fn contextual_rejection(response: &wacore_binary::NodeRef<'_>) -> anyhow::Error {
+    match crate::request::RequestUtils::new(String::new()).parse_iq_response(response) {
+        Err(error) => error.into(),
+        Ok(()) => {
+            anyhow::anyhow!("contextual contract returned a rejection outside an error stanza")
+        }
+    }
 }

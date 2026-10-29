@@ -2136,6 +2136,26 @@ impl IqSpec for SetGroupSubjectIq {
             super::pilots::SetSubjectSuccess::Success => Ok(()),
         }
     }
+
+    fn uses_contextual_response(&self) -> bool {
+        true
+    }
+
+    fn handles_iq_errors(&self) -> bool {
+        true
+    }
+
+    fn parse_response_with_context(
+        &self,
+        response: &NodeRef<'_>,
+        request: &NodeRef<'_>,
+    ) -> Result<Self::Response> {
+        use super::contextual::w_g2::{MakeSetSubjectRequestResponse, MakeSetSubjectRequestSpec};
+        match MakeSetSubjectRequestSpec::parse_sent_response(response, request)? {
+            MakeSetSubjectRequestResponse::Success(_) => Ok(()),
+            _ => Err(super::spec::contextual_rejection(response)),
+        }
+    }
 }
 
 /// IQ specification for setting a group's description.
@@ -3205,6 +3225,31 @@ impl IqSpec for JoinLinkedGroupIq {
         }
         parse_join_group_response(response)
     }
+
+    fn uses_contextual_response(&self) -> bool {
+        true
+    }
+
+    fn handles_iq_errors(&self) -> bool {
+        true
+    }
+
+    fn parse_response_with_context(
+        &self,
+        response: &NodeRef<'_>,
+        request: &NodeRef<'_>,
+    ) -> Result<Self::Response> {
+        use super::contextual::w_g2::{
+            MakeJoinLinkedGroupRequestResponse, MakeJoinLinkedGroupRequestSpec,
+        };
+        match MakeJoinLinkedGroupRequestSpec::parse_sent_response(response, request)? {
+            MakeJoinLinkedGroupRequestResponse::GroupJoinRequestSuccess(_) => {
+                Ok(JoinGroupResult::PendingApproval(self.subgroup_jid.clone()))
+            }
+            MakeJoinLinkedGroupRequestResponse::Success(_) => self.parse_response(response),
+            _ => Err(super::spec::contextual_rejection(response)),
+        }
+    }
 }
 
 /// IQ specification for getting all participants across linked groups.
@@ -3407,6 +3452,29 @@ impl IqSpec for AcceptGroupInviteV4Iq {
             super::pilots::AcceptGroupAddSuccess::Success => {
                 Ok(JoinGroupResult::Joined(self.group_jid.clone()))
             }
+        }
+    }
+
+    fn uses_contextual_response(&self) -> bool {
+        true
+    }
+
+    fn handles_iq_errors(&self) -> bool {
+        true
+    }
+
+    fn parse_response_with_context(
+        &self,
+        response: &NodeRef<'_>,
+        request: &NodeRef<'_>,
+    ) -> Result<Self::Response> {
+        use super::contextual::w_g2::{
+            MakeAcceptGroupAddRequestResponse, MakeAcceptGroupAddRequestSpec,
+        };
+        match MakeAcceptGroupAddRequestSpec::parse_sent_response(response, request)? {
+            MakeAcceptGroupAddRequestResponse::GroupJoinRequestSuccess(_)
+            | MakeAcceptGroupAddRequestResponse::Success(_) => self.parse_response(response),
+            _ => Err(super::spec::contextual_rejection(response)),
         }
     }
 }

@@ -57,6 +57,7 @@ struct Options {
     /// Skip the `protoc` step, for a machine that has no protoc.
     skip_proto_desc: bool,
     verify_iq_bundles: Option<PathBuf>,
+    verify_iq_contextual: Option<PathBuf>,
 }
 
 const USAGE: &str = "\
@@ -68,6 +69,7 @@ Usage: cargo run -p whatspec-codegen -- [options]
   --rev <git-ref>        Ref to pin when updating the lock (default: main).
   --skip-proto-desc      Do not run protoc after writing the .proto.
   --verify-iq-bundles <dir> Verify restored IQ oracle bundles and module spans.
+  --verify-iq-contextual <dir> Verify the dedicated contextual IQ source projection.
   -h, --help             This message.
 ";
 
@@ -87,8 +89,22 @@ fn main() -> Result<()> {
         emit::iq_conformance::verify_bundles(dir)?;
         println!("reviewed IQ bundle and module hashes match");
     }
+    if let Some(dir) = &opts.verify_iq_contextual {
+        emit::iq_contextual::verify_projection(&std::fs::read_to_string(
+            dir.join("iq/index.json"),
+        )?)?;
+    }
     let lock_path = repo_root.join("tools/whatspec-codegen/whatspec.lock.json");
     let mut lock = Lock::read(&lock_path)?;
+    if opts.verify_iq_contextual.is_none() {
+        let revision = emit::iq_contextual::revision()?;
+        let contextual_ir = source::fetch_pinned(
+            &lock.repo,
+            &revision,
+            &repo_root.join("target/whatspec-iq-ir"),
+        )?;
+        emit::iq_contextual::verify_projection(&contextual_ir.text("iq/index.json")?)?;
+    }
 
     if opts.update_lock {
         lock.rev = source::resolve_rev(&lock.repo, &opts.git_ref)?;
@@ -153,6 +169,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options> {
         git_ref: "main".to_string(),
         skip_proto_desc: false,
         verify_iq_bundles: None,
+        verify_iq_contextual: None,
     };
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -164,6 +181,12 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options> {
                 opts.verify_iq_bundles = Some(PathBuf::from(
                     args.next()
                         .context("--verify-iq-bundles needs a directory")?,
+                ))
+            }
+            "--verify-iq-contextual" => {
+                opts.verify_iq_contextual = Some(PathBuf::from(
+                    args.next()
+                        .context("--verify-iq-contextual needs a directory")?,
                 ))
             }
             "--from" => {
@@ -331,6 +354,11 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
         Artifact {
             path: "wacore/src/iq/pilots.rs",
             content: emit::iq_pilots::generate(&ir.text("iq/index.json")?, wa_version)?,
+            rust: true,
+        },
+        Artifact {
+            path: "wacore/src/iq/contextual.rs",
+            content: emit::iq_contextual::generate(wa_version)?,
             rust: true,
         },
         Artifact {
