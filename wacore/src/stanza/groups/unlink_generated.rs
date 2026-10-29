@@ -1,6 +1,6 @@
 //! Auto-generated experimental group unlink normalization (WhatsApp 2.3000.1047483476). DO NOT EDIT.
 //!
-//! Independent contract pin: https://github.com/oxidezap/whatspec/blob/d4e16ba99dd398cfe89e68328d7176640e8ec179/generated/notif/group-unlink.json
+//! Independent contract pin: https://github.com/oxidezap/whatspec/blob/ae4ea6e30816f307319522d4bac8fc448185f485/generated/notif/group-unlink.json
 //! Module-relative helper bytes 6032..7222. Payload parsing remains handwritten.
 
 //! "WAWebHandleGroupNotification": bundle "09d91fdc4089c50ab1d35dd6c796ee82ef4c3296710316d20383c85738b871b8", module "a65d861ba0dacdcec52d2df48712a80677ecf10021d7df63c84183f195db13a1", bundle bytes 1693402..1716842.
