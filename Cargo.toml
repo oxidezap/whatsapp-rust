@@ -44,6 +44,7 @@ members = [
     "wacore/noise",
     "waproto",
 ]
+exclude = ["vendor/wasmtime-internal-cache"]
 default-members = [
     ".",
     "http_clients/ureq-client",
@@ -565,3 +566,8 @@ strip = false
 inherits = "release"
 debug = 1
 strip = false
+
+# Backport Wasmtime's zstd security update without dropping the oracle's cache.
+# Source and the dependency-only delta are recorded beside this host-only crate.
+[patch.crates-io]
+wasmtime-internal-cache = { path = "vendor/wasmtime-internal-cache" }
