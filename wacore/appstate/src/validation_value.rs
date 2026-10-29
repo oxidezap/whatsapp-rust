@@ -7,10 +7,10 @@ pub(super) enum Value<'a> {
     Bool(bool),
     Number(f64),
     Long(u64),
-    Text(String),
+    Text(std::borrow::Cow<'a, str>),
     Bytes(&'a [u8]),
-    Array(Vec<Self>),
-    Object(Vec<(&'static str, Self)>),
+    Array(std::sync::Arc<[Self]>),
+    Object(std::sync::Arc<[(&'static str, Self)]>),
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidationError {
@@ -29,7 +29,7 @@ impl ValidationError {
         Self {
             class: "SyncdFatalError",
             metric: match metric {
-                Value::Text(s) => Some(s),
+                Value::Text(s) => Some(s.into_owned()),
                 _ => None,
             },
             message: message.into(),
@@ -44,6 +44,12 @@ impl ValidationError {
     }
 }
 impl<'a> Value<'a> {
+    pub(super) fn object(fields: Vec<(&'static str, Self)>) -> Self {
+        Self::Object(fields.into())
+    }
+    pub(super) fn list(items: Vec<Self>) -> Self {
+        Self::Array(items.into())
+    }
     pub(super) fn truthy(&self) -> bool {
         match self {
             Self::Undefined | Self::Null => false,
@@ -62,6 +68,9 @@ impl<'a> Value<'a> {
                 .iter()
                 .find(|(k, _)| *k == key)
                 .map_or(Self::Undefined, |(_, v)| v.clone())),
+            Self::Text(text) if key == "length" => {
+                Ok(Self::Number(text.encode_utf16().count() as f64))
+            }
             Self::Array(items) if key == "length" => Ok(Self::Number(items.len() as f64)),
             Self::Bytes(bytes) if key == "length" => Ok(Self::Number(bytes.len() as f64)),
             Self::Undefined | Self::Null => Err(ValidationError::dependency(
@@ -104,4 +113,116 @@ pub(super) trait Transforms<'a> {
     }
     fn decode_sync_action_data(&mut self, value: Value<'a>) -> Result<Value<'a>, ValidationError>;
     fn decode_patch_debug_data(&mut self, value: Value<'a>) -> Result<Value<'a>, ValidationError>;
+}
+
+impl Value<'_> {
+    pub(super) fn greater_than(&self, other: &Self) -> bool {
+        let left = self.primitive();
+        let right = other.primitive();
+        match (&left, &right) {
+            (Self::Text(a), Self::Text(b)) => a.encode_utf16().cmp(b.encode_utf16()).is_gt(),
+            _ => left.to_number() > right.to_number(),
+        }
+    }
+    fn primitive(&self) -> Self {
+        match self {
+            Self::Array(items) => Self::Text(
+                items
+                    .iter()
+                    .map(|item| {
+                        if item.nullish() {
+                            String::new()
+                        } else {
+                            item.js_string()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+                    .into(),
+            ),
+            Self::Bytes(bytes) => Self::Text(
+                bytes
+                    .iter()
+                    .map(u8::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+                    .into(),
+            ),
+            Self::Object(_) | Self::Long(_) => Self::Text("[object Object]".into()),
+            _ => self.clone(),
+        }
+    }
+    fn js_string(&self) -> String {
+        match self.primitive() {
+            Self::Undefined => "undefined".into(),
+            Self::Null => "null".into(),
+            Self::Bool(b) => b.to_string(),
+            Self::Text(s) => s.into_owned(),
+            Self::Number(n) if n.is_nan() => "NaN".into(),
+            Self::Number(n) if n == f64::INFINITY => "Infinity".into(),
+            Self::Number(n) if n == f64::NEG_INFINITY => "-Infinity".into(),
+            Self::Number(0.0) => "0".into(),
+            Self::Number(n) if n.abs() >= 1e21 || n.abs() < 1e-6 => {
+                let text = format!("{n:e}");
+                if let Some((mantissa, exponent)) = text.split_once('e')
+                    && !exponent.starts_with('-')
+                {
+                    return format!("{mantissa}e+{exponent}");
+                }
+                text
+            }
+            Self::Number(n) => n.to_string(),
+            _ => "[object Object]".into(),
+        }
+    }
+    fn to_number(&self) -> f64 {
+        match self {
+            Self::Number(n) => *n,
+            Self::Null => 0.0,
+            Self::Bool(b) => u8::from(*b) as f64,
+            Self::Text(text) => string_number(text),
+            _ => f64::NAN,
+        }
+    }
+}
+fn string_number(text: &str) -> f64 {
+    let text=text.trim_matches(|c|matches!(c,'\u{9}'..='\u{d}'|' '|'\u{a0}'|'\u{1680}'|'\u{2000}'..='\u{200a}'|'\u{2028}'|'\u{2029}'|'\u{202f}'|'\u{205f}'|'\u{3000}'|'\u{feff}'));
+    if text.is_empty() {
+        return 0.0;
+    }
+    if matches!(text, "Infinity" | "+Infinity") {
+        return f64::INFINITY;
+    }
+    if text == "-Infinity" {
+        return f64::NEG_INFINITY;
+    }
+    for (prefix, radix) in [
+        ("0x", 16),
+        ("0X", 16),
+        ("0b", 2),
+        ("0B", 2),
+        ("0o", 8),
+        ("0O", 8),
+    ] {
+        if let Some(digits) = text.strip_prefix(prefix) {
+            if digits.is_empty() {
+                return f64::NAN;
+            }
+            let mut value = 0.0;
+            for c in digits.chars() {
+                let Some(digit) = c.to_digit(radix) else {
+                    return f64::NAN;
+                };
+                value = value * radix as f64 + digit as f64;
+            }
+            return value;
+        }
+    }
+    if text
+        .bytes()
+        .any(|c| !matches!(c, b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-'))
+    {
+        return f64::NAN;
+    }
+    text.parse().unwrap_or(f64::NAN)
 }

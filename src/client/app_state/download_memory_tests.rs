@@ -6,6 +6,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use wacore::appstate::patch_decode::PatchList;
 use wacore::net::StreamingHttpResponse;
 
+// These tests isolate resource admission and retention after metadata preflight.
+// End-to-end rejection before admission is covered by validation_prefetch_tests.
+impl Client {
+    async fn prefetch_validated_for_test(&self, lists: &[PatchList]) -> PrefetchedBlobs {
+        let eligible = vec![true; lists.len()];
+        self.pre_download_validated_metadata(lists, &eligible).await
+    }
+}
+
 struct BlobHttp {
     body: Vec<u8>,
     calls: AtomicUsize,
@@ -117,7 +126,7 @@ async fn prefetch_admits_only_configured_jobs_and_refills_after_completion() {
             })
             .collect();
         let route_gate = client.media_conn.write().await;
-        let mut prefetch = Box::pin(client.pre_download_external_blobs(&lists));
+        let mut prefetch = Box::pin(client.prefetch_validated_for_test(&lists));
         let mut context = Context::from_waker(futures::task::noop_waker_ref());
         assert!(matches!(
             prefetch.as_mut().poll(&mut context),
@@ -130,7 +139,7 @@ async fn prefetch_admits_only_configured_jobs_and_refills_after_completion() {
         assert_eq!(budget.used(), 0);
         drop(route_gate);
 
-        let blobs = client.pre_download_external_blobs(&lists).await;
+        let blobs = client.prefetch_validated_for_test(&lists).await;
         assert_eq!(blobs.len(), lists.len());
         for blob in blobs.values() {
             assert_eq!(blob.as_ref().unwrap().as_ref(), &[7; 32]);
@@ -156,7 +165,7 @@ async fn batch_sum_is_bounded_without_waiting_for_its_own_results() {
             .collect();
         let blobs = tokio::time::timeout(
             Duration::from_secs(5),
-            client.pre_download_external_blobs(&lists),
+            client.prefetch_validated_for_test(&lists),
         )
         .await
         .unwrap();
@@ -174,7 +183,7 @@ async fn batch_sum_is_bounded_without_waiting_for_its_own_results() {
         assert_eq!(successes, 2);
         drop(resolve);
         drop(blobs);
-        let retry = client.pre_download_external_blobs(&lists[..1]).await;
+        let retry = client.prefetch_validated_for_test(&lists[..1]).await;
         assert!(external_blob_resolver(&retry)(lists[0].snapshot_ref.as_ref().unwrap()).is_ok());
     }
 }
@@ -184,14 +193,14 @@ async fn completed_blobs_remain_charged_across_prefetch_batches() {
     let (reference, body) = fixture(32);
     let (client, _) = client(32, 4, body, true).await;
     let lists = [list(reference.clone())];
-    let first = client.pre_download_external_blobs(&lists).await;
+    let first = client.prefetch_validated_for_test(&lists).await;
     assert!(external_blob_resolver(&first)(&reference).is_ok());
-    let second = client.pre_download_external_blobs(&lists).await;
+    let second = client.prefetch_validated_for_test(&lists).await;
     assert!(is_memory_error(
         &external_blob_resolver(&second)(&reference).unwrap_err()
     ));
     drop(first);
-    let third = client.pre_download_external_blobs(&lists).await;
+    let third = client.prefetch_validated_for_test(&lists).await;
     assert!(external_blob_resolver(&third)(&reference).is_ok());
 }
 
@@ -206,7 +215,7 @@ async fn snapshot_and_mutation_prefetch_support_buffered_and_streaming_http() {
         patch.external_mutations = Some(mutation.clone()).into();
         patch_list.patches.push(patch);
         let (client, http) = client(64, 2, body, streaming).await;
-        let blobs = client.pre_download_external_blobs(&[patch_list]).await;
+        let blobs = client.prefetch_validated_for_test(&[patch_list]).await;
         assert_eq!(blobs.len(), 2);
         {
             let resolve = external_blob_resolver(&blobs);
@@ -226,7 +235,7 @@ async fn oversized_declared_blob_fails_before_http_with_either_adapter() {
         let (reference, body) = fixture(32);
         let (client, http) = client(31, 1, body, streaming).await;
         let blobs = client
-            .pre_download_external_blobs(&[list(reference.clone())])
+            .prefetch_validated_for_test(&[list(reference.clone())])
             .await;
         let error = external_blob_resolver(&blobs)(&reference).unwrap_err();
         assert!(error.chain().any(|cause| matches!(
@@ -263,7 +272,7 @@ async fn unknown_and_underreported_lengths_cannot_bypass_memory_budget() {
         reference.file_size_bytes = declared;
         let (client, _) = client(16, 1, body, true).await;
         let blobs = client
-            .pre_download_external_blobs(&[list(reference.clone())])
+            .prefetch_validated_for_test(&[list(reference.clone())])
             .await;
         assert!(is_memory_error(
             &external_blob_resolver(&blobs)(&reference).unwrap_err()
@@ -278,7 +287,7 @@ async fn cryptographic_failure_is_preserved_and_releases_capacity() {
     let valid = reference.clone();
     reference.file_sha256 = Some(vec![0; 32]);
     let blobs = client
-        .pre_download_external_blobs(&[list(reference.clone())])
+        .prefetch_validated_for_test(&[list(reference.clone())])
         .await;
     let error = external_blob_resolver(&blobs)(&reference).unwrap_err();
     assert!(
@@ -288,7 +297,7 @@ async fn cryptographic_failure_is_preserved_and_releases_capacity() {
         "{error:?}"
     );
     let retry = client
-        .pre_download_external_blobs(&[list(valid.clone())])
+        .prefetch_validated_for_test(&[list(valid.clone())])
         .await;
     assert!(external_blob_resolver(&retry)(&valid).is_ok());
 }
@@ -309,7 +318,7 @@ async fn failover_reuses_capacity_without_spending_a_second_body_budget() {
             "fallback.example.com".into(),
         ));
     let blobs = client
-        .pre_download_external_blobs(&[list(reference.clone())])
+        .prefetch_validated_for_test(&[list(reference.clone())])
         .await;
     assert_eq!(
         external_blob_resolver(&blobs)(&reference).unwrap().as_ref(),
@@ -323,7 +332,7 @@ async fn zero_budget_allows_empty_verified_blob_and_deduplicates_paths() {
     let (reference, body) = fixture(0);
     let (client, http) = client(0, 4, body, true).await;
     let blobs = client
-        .pre_download_external_blobs(&[list(reference.clone()), list(reference.clone())])
+        .prefetch_validated_for_test(&[list(reference.clone()), list(reference.clone())])
         .await;
     assert!(
         external_blob_resolver(&blobs)(&reference)
@@ -436,7 +445,7 @@ async fn cancelling_active_prefetch_stops_io_and_releases_its_reservation() {
     let task_client = client.clone();
     let task = tokio::spawn(async move {
         task_client
-            .pre_download_external_blobs(&[list(reference)])
+            .prefetch_validated_for_test(&[list(reference)])
             .await
     });
     tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(5)).unwrap())

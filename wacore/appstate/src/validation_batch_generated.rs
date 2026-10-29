@@ -99,8 +99,8 @@ pub(super) fn validate_and_type_set_mutations<'a>(
                 let mut s1 = Value::Undefined;
                 #[allow(unused_assignments, unused_mut)]
                 let mut s2 = Value::Undefined;
-                s0 = transforms.decode_sync_action_data((item.clone()).field("binarySyncData")?)?;
-                s1 = (s0.clone()).field("value")?;
+                s0 = transforms.decode_sync_action_data((item).field("binarySyncData")?)?;
+                s1 = (s0).field("value")?;
                 if (Value::Bool(!(s1.clone()).truthy())).truthy() {
                     return Err(ValidationError::fatal(
                         Value::Text("MISSING_ACTION_VALUE".into()),
@@ -108,8 +108,7 @@ pub(super) fn validate_and_type_set_mutations<'a>(
                     ));
                 } else {
                 }
-                s2 = transforms
-                    .maybe_number_or_throw_if_too_large((s1.clone()).field("timestamp")?)?;
+                s2 = transforms.maybe_number_or_throw_if_too_large((s1).field("timestamp")?)?;
                 if (Value::Bool((s2.clone()).nullish())).truthy() {
                     return Err(ValidationError::fatal(
                         Value::Text("MISSING_ACTION_TIMESTAMP".into()),
@@ -117,18 +116,18 @@ pub(super) fn validate_and_type_set_mutations<'a>(
                     ));
                 } else {
                 }
-                return Ok(Value::Object(vec![
-                    ("index", (item.clone()).field("index")?),
-                    ("version", (item.clone()).field("version")?),
-                    ("keyId", (item.clone()).field("keyId")?),
-                    ("indexMac", (item.clone()).field("indexMac")?),
-                    ("valueMac", (item.clone()).field("valueMac")?),
-                    ("collection", (item.clone()).field("collection")?),
-                    ("binarySyncData", (item.clone()).field("binarySyncData")?),
+                return Ok(Value::object(vec![
+                    ("index", (item).field("index")?),
+                    ("version", (item).field("version")?),
+                    ("keyId", (item).field("keyId")?),
+                    ("indexMac", (item).field("indexMac")?),
+                    ("valueMac", (item).field("valueMac")?),
+                    ("collection", (item).field("collection")?),
+                    ("binarySyncData", (item).field("binarySyncData")?),
                     ("timestamp", s2.clone()),
                 ]));
             })()?);
         }
-        Value::Array(mapped)
+        Value::list(mapped)
     });
 }

@@ -69,3 +69,11 @@ collection state. Crypto, persistence, recovery, and the existing processor's
 post-decryption batch integration remain handwritten. The public batch/SET APIs
 consume the original decrypted index string and binary payload; the existing
 `Mutation` API does not retain those inputs and is preserved.
+
+Runtime collection ingestion moves owned inputs through `prepare_patch_list` on
+blocking workers. Query keys through the prepared list, then pass that token to
+`process_prepared_patch_list` or `process_one_prepared_patch_list`; this preserves
+validation across the key wait without repeating snapshot scans. Runtime CDN
+prefetch also checks metadata before admitting jobs or reserving download budget.
+Missing snapshot MAC/key guards retain `SnapshotMACMissing` as recovery context
+while preserving the generated validation error for downcasting.

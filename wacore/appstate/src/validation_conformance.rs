@@ -24,21 +24,21 @@ impl<'a> Transforms<'a> for OracleTransforms {
             _ => 255,
         };
         let value = match code {
-            0 => return Ok(Value::Object(vec![])),
+            0 => return Ok(Value::object(vec![])),
             1 => Value::Null,
-            2 => Value::Object(vec![]),
-            3 => Value::Object(vec![("timestamp", Value::Null)]),
-            4 => Value::Object(vec![("timestamp", Value::Number(0.0))]),
-            5 => Value::Object(vec![("timestamp", Value::Number(1.0))]),
+            2 => Value::object(vec![]),
+            3 => Value::object(vec![("timestamp", Value::Null)]),
+            4 => Value::object(vec![("timestamp", Value::Number(0.0))]),
+            5 => Value::object(vec![("timestamp", Value::Number(1.0))]),
             255 => {
                 return Err(ValidationError::dependency(
                     "Error",
                     "test decoder rejected",
                 ));
             }
-            _ => Value::Object(vec![("timestamp", Value::Long(9007199254740992))]),
+            _ => Value::object(vec![("timestamp", Value::Long(9007199254740992))]),
         };
-        Ok(Value::Object(vec![("value", value)]))
+        Ok(Value::object(vec![("value", value)]))
     }
     fn decode_patch_debug_data(&mut self, v: Value<'a>) -> Result<Value<'a>, ValidationError> {
         match v {
@@ -46,7 +46,7 @@ impl<'a> Transforms<'a> for OracleTransforms {
                 "Error",
                 "test decoder rejected",
             )),
-            _ => Ok(Value::Object(vec![("decoded", Value::Bool(true))])),
+            _ => Ok(Value::object(vec![("decoded", Value::Bool(true))])),
         }
     }
 }
@@ -72,9 +72,9 @@ fn read(v: &Json) -> Value<'static> {
         Json::Null => Value::Null,
         Json::Bool(b) => Value::Bool(*b),
         Json::Number(n) => Value::Number(n.as_f64().unwrap()),
-        Json::String(s) => Value::Text(s.clone()),
-        Json::Array(a) => Value::Array(a.iter().map(read).collect()),
-        Json::Object(o) => Value::Object(
+        Json::String(s) => Value::Text(s.clone().into()),
+        Json::Array(a) => Value::list(a.iter().map(read).collect()),
+        Json::Object(o) => Value::object(
             o.iter()
                 .map(|(k, v)| (&*Box::leak(k.clone().into_boxed_str()), read(v)))
                 .collect(),
@@ -96,10 +96,12 @@ fn write(v: Value<'_>) -> Json {
         Value::Long(n) => json!({"$long":n.to_string()}),
         Value::Text(s) => json!(s),
         Value::Bytes(b) => json!({"$bytes":b}),
-        Value::Array(a) => Json::Array(a.into_iter().map(write).collect()),
-        Value::Object(o) => {
-            Json::Object(o.into_iter().map(|(k, v)| (k.into(), write(v))).collect())
-        }
+        Value::Array(a) => Json::Array(a.iter().cloned().map(write).collect()),
+        Value::Object(o) => Json::Object(
+            o.iter()
+                .map(|(k, v)| ((*k).into(), write(v.clone())))
+                .collect(),
+        ),
     }
 }
 #[test]

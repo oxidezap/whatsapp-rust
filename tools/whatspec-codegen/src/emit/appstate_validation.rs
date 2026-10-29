@@ -76,7 +76,15 @@ fn expr(e: &E) -> Result<String, String> {
         E::String { value } | E::Metric { name: value } => {
             format!("Value::Text({}.into())", rust_lit(value))
         }
-        E::Field { object, field } => format!("({}).field({})?", expr(object)?, rust_lit(field)),
+        E::Field { object, field } => {
+            let receiver = match object.as_ref() {
+                E::Argument { index: 3 } => "item".to_owned(),
+                E::Argument { index } => format!("a{index}"),
+                E::Slot { index } => format!("s{index}"),
+                _ => expr(object)?,
+            };
+            format!("({receiver}).field({})?", rust_lit(field))
+        }
         E::Not { value } => format!("Value::Bool(!({}).truthy())", expr(value)?),
         E::Nullish { value, negate } => format!(
             "Value::Bool({}({}).nullish())",
@@ -94,7 +102,7 @@ fn expr(e: &E) -> Result<String, String> {
             expr(right)?
         ),
         E::Greater { left, right } => format!(
-            "Value::Bool(({}).number()? > ({}).number()?)",
+            "{{let left={};let right={};Value::Bool(left.greater_than(&right))}}",
             expr(left)?,
             expr(right)?
         ),
@@ -118,7 +126,7 @@ fn expr(e: &E) -> Result<String, String> {
             v
         }
         E::Object { fields } => format!(
-            "Value::Object(vec![{}])",
+            "Value::object(vec![{}])",
             fields
                 .iter()
                 .map(|(k, v)| Ok(format!("({}, {})", rust_lit(k), expr(v)?)))
@@ -146,7 +154,7 @@ fn expr(e: &E) -> Result<String, String> {
             }
             statements(body, &mut rendered)?;
             format!(
-                "{{let input={};let mut mapped=Vec::new();for item in input.array()?{{mapped.push((||->Result<Value,ValidationError>{{{rendered}}})()?);}}Value::Array(mapped)}}",
+                "{{let input={};let mut mapped=Vec::new();for item in input.array()?{{mapped.push((||->Result<Value,ValidationError>{{{rendered}}})()?);}}Value::list(mapped)}}",
                 expr(input)?
             )
         }

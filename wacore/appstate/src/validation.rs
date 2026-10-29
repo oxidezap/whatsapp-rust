@@ -76,7 +76,7 @@ pub fn validate_snapshot(
             ),
             (
                 "records",
-                Value::Array(snapshot.records.iter().map(record_view).collect()),
+                Value::list(snapshot.records.iter().map(record_view).collect()),
             ),
             ("mac", bytes(snapshot.mac.as_deref())),
             (
@@ -133,7 +133,7 @@ pub fn validate_set_mutations<'a>(
     collection: &str,
     inputs: &'a [SetMutationInput<'a>],
 ) -> Result<Vec<ValidatedSetMutation<'a>>, ValidationError> {
-    let view = Value::Array(
+    let view = Value::list(
         inputs
             .iter()
             .map(|m| {
@@ -166,7 +166,7 @@ pub fn validate_set_mutations<'a>(
         .collect()
 }
 fn object<'a>(fields: Vec<(&'static str, Value<'a>)>) -> Value<'a> {
-    Value::Object(fields)
+    Value::object(fields)
 }
 fn bytes(value: Option<&[u8]>) -> Value<'_> {
     value.map_or(Value::Undefined, Value::Bytes)
@@ -232,7 +232,7 @@ fn external_view(reference: &wa::ExternalBlobReference) -> Value<'_> {
             reference
                 .direct_path
                 .as_ref()
-                .map_or(Value::Undefined, |s| Value::Text(s.clone())),
+                .map_or(Value::Undefined, |s| Value::Text(s.as_str().into())),
         ),
         ("fileSha256", bytes(reference.file_sha256.as_deref())),
         ("fileEncSha256", bytes(reference.file_enc_sha256.as_deref())),
@@ -241,7 +241,7 @@ fn external_view(reference: &wa::ExternalBlobReference) -> Value<'_> {
             reference
                 .handle
                 .as_ref()
-                .map_or(Value::Undefined, |s| Value::Text(s.clone())),
+                .map_or(Value::Undefined, |s| Value::Text(s.as_str().into())),
         ),
         (
             "fileSizeBytes",
@@ -260,7 +260,7 @@ fn patch_view(patch: &wa::SyncdPatch) -> Value<'_> {
         ),
         (
             "mutations",
-            Value::Array(patch.mutations.iter().map(mutation_view).collect()),
+            Value::list(patch.mutations.iter().map(mutation_view).collect()),
         ),
         (
             "externalMutations",

@@ -18,12 +18,12 @@ pub(super) fn validate_external_blob_reference<'a>(
     let mut s4 = Value::Undefined;
     #[allow(unused_assignments, unused_mut)]
     let mut s5 = Value::Undefined;
-    s0 = (a1.clone()).field("directPath")?;
-    s1 = (a1.clone()).field("fileEncSha256")?;
-    s2 = (a1.clone()).field("fileSha256")?;
-    s3 = (a1.clone()).field("fileSizeBytes")?;
-    s4 = (a1.clone()).field("handle")?;
-    s5 = (a1.clone()).field("mediaKey")?;
+    s0 = (a1).field("directPath")?;
+    s1 = (a1).field("fileEncSha256")?;
+    s2 = (a1).field("fileSha256")?;
+    s3 = (a1).field("fileSizeBytes")?;
+    s4 = (a1).field("handle")?;
+    s5 = (a1).field("mediaKey")?;
     if (Value::Bool(!(s5.clone()).truthy())).truthy() {
         return Err(ValidationError::fatal(
             Value::Text("MISSING_EXTERNAL_BLOB_REFERENCE_MEDIA_KEY".into()),
@@ -52,7 +52,7 @@ pub(super) fn validate_external_blob_reference<'a>(
         ));
     } else {
     }
-    return Ok(Value::Object(vec![
+    return Ok(Value::object(vec![
         ("mediaKey", s5.clone()),
         ("directPath", s0.clone()),
         ("handle", s4.clone()),
@@ -73,7 +73,7 @@ pub(super) fn validate_key_id_protobuf<'a>(
     s0 = if (Value::Bool((a1.clone()).nullish())).truthy() {
         Value::Undefined
     } else {
-        (a1.clone()).field("id")?
+        (a1).field("id")?
     };
     if ({
         let left = Value::Bool(!(a1.clone()).truthy());
@@ -91,7 +91,7 @@ pub(super) fn validate_key_id_protobuf<'a>(
         ));
     } else {
     }
-    return Ok(Value::Object(vec![(
+    return Ok(Value::object(vec![(
         "id",
         transforms.to_sync_key_id(s0.clone())?,
     )]));
@@ -108,8 +108,8 @@ pub(super) fn validate_mutation_protobuf<'a>(
     let mut s1 = Value::Undefined;
     #[allow(unused_assignments, unused_mut)]
     let mut s2 = Value::Undefined;
-    s0 = (a1.clone()).field("operation")?;
-    s1 = (a1.clone()).field("record")?;
+    s0 = (a1).field("operation")?;
+    s1 = (a1).field("record")?;
     if (Value::Bool((s0.clone()).nullish())).truthy() {
         return Err(ValidationError::fatal(
             Value::Text("MISSING_MUTATION_OPERATION".into()),
@@ -125,7 +125,7 @@ pub(super) fn validate_mutation_protobuf<'a>(
     } else {
     }
     s2 = validate_record_protobuf(transforms, a0.clone(), s1.clone())?;
-    return Ok(Value::Object(vec![
+    return Ok(Value::object(vec![
         ("operation", s0.clone()),
         ("record", s2.clone()),
     ]));
@@ -164,19 +164,19 @@ pub(super) fn validate_patch_protobuf<'a>(
     let mut s12 = Value::Undefined;
     #[allow(unused_assignments, unused_mut)]
     let mut s13 = Value::Undefined;
-    s0 = (a1.clone()).field("clientDebugData")?;
-    s1 = (a1.clone()).field("deviceIndex")?;
-    s2 = (a1.clone()).field("exitCode")?;
-    s3 = (a1.clone()).field("externalMutations")?;
-    s4 = (a1.clone()).field("keyId")?;
-    s5 = (a1.clone()).field("mutations")?;
-    s6 = (a1.clone()).field("patchMac")?;
-    s7 = (a1.clone()).field("snapshotMac")?;
-    s8 = (a1.clone()).field("version")?;
+    s0 = (a1).field("clientDebugData")?;
+    s1 = (a1).field("deviceIndex")?;
+    s2 = (a1).field("exitCode")?;
+    s3 = (a1).field("externalMutations")?;
+    s4 = (a1).field("keyId")?;
+    s5 = (a1).field("mutations")?;
+    s6 = (a1).field("patchMac")?;
+    s7 = (a1).field("snapshotMac")?;
+    s8 = (a1).field("version")?;
     s9 = if (Value::Bool((s8.clone()).nullish())).truthy() {
         Value::Undefined
     } else {
-        (s8.clone()).field("version")?
+        (s8).field("version")?
     };
     if ({
         let left = Value::Bool(!(s8.clone()).truthy());
@@ -198,9 +198,11 @@ pub(super) fn validate_patch_protobuf<'a>(
         let left = {
             let left = s5.clone();
             if left.truthy() {
-                Value::Bool(
-                    ((s5.clone()).field("length")?).number()? > (Value::Number(0_f64)).number()?,
-                )
+                {
+                    let left = (s5).field("length")?;
+                    let right = Value::Number(0_f64);
+                    Value::Bool(left.greater_than(&right))
+                }
             } else {
                 left
             }
@@ -253,10 +255,10 @@ pub(super) fn validate_patch_protobuf<'a>(
     .truthy()
     {
         s12 = validate_external_blob_reference(transforms, a0.clone(), s3.clone())?;
-        return Ok(Value::Object(vec![
+        return Ok(Value::object(vec![
             (
                 "version",
-                Value::Object(vec![(
+                Value::object(vec![(
                     "version",
                     transforms.number_or_throw_if_too_large(s9.clone())?,
                 )]),
@@ -283,12 +285,12 @@ pub(super) fn validate_patch_protobuf<'a>(
                 )?);
             })()?);
         }
-        Value::Array(mapped)
+        Value::list(mapped)
     };
-    return Ok(Value::Object(vec![
+    return Ok(Value::object(vec![
         (
             "version",
-            Value::Object(vec![(
+            Value::object(vec![(
                 "version",
                 transforms.number_or_throw_if_too_large(s9.clone())?,
             )]),
@@ -321,18 +323,18 @@ pub(super) fn validate_record_protobuf<'a>(
     let mut s4 = Value::Undefined;
     #[allow(unused_assignments, unused_mut)]
     let mut s5 = Value::Undefined;
-    s0 = (a1.clone()).field("index")?;
-    s1 = (a1.clone()).field("keyId")?;
-    s2 = (a1.clone()).field("value")?;
+    s0 = (a1).field("index")?;
+    s1 = (a1).field("keyId")?;
+    s2 = (a1).field("value")?;
     s3 = if (Value::Bool((s0.clone()).nullish())).truthy() {
         Value::Undefined
     } else {
-        (s0.clone()).field("blob")?
+        (s0).field("blob")?
     };
     s4 = if (Value::Bool((s2.clone()).nullish())).truthy() {
         Value::Undefined
     } else {
-        (s2.clone()).field("blob")?
+        (s2).field("blob")?
     };
     if ({
         let left = Value::Bool(!(s0.clone()).truthy());
@@ -372,9 +374,9 @@ pub(super) fn validate_record_protobuf<'a>(
         s1.clone(),
         Value::Text("MISSING_MUTATION_KEY_ID".into()),
     )?;
-    return Ok(Value::Object(vec![
-        ("index", Value::Object(vec![("blob", s3.clone())])),
-        ("value", Value::Object(vec![("blob", s4.clone())])),
+    return Ok(Value::object(vec![
+        ("index", Value::object(vec![("blob", s3.clone())])),
+        ("value", Value::object(vec![("blob", s4.clone())])),
         ("keyId", s5.clone()),
     ]));
 }
@@ -398,14 +400,14 @@ pub(super) fn validate_snapshot_protobuf<'a>(
     let mut s5 = Value::Undefined;
     #[allow(unused_assignments, unused_mut)]
     let mut s6 = Value::Undefined;
-    s0 = (a1.clone()).field("keyId")?;
-    s1 = (a1.clone()).field("mac")?;
-    s2 = (a1.clone()).field("records")?;
-    s3 = (a1.clone()).field("version")?;
+    s0 = (a1).field("keyId")?;
+    s1 = (a1).field("mac")?;
+    s2 = (a1).field("records")?;
+    s3 = (a1).field("version")?;
     s4 = if (Value::Bool((s3.clone()).nullish())).truthy() {
         Value::Undefined
     } else {
-        (s3.clone()).field("version")?
+        (s3).field("version")?
     };
     if ({
         let left = Value::Bool(!(s3.clone()).truthy());
@@ -435,7 +437,7 @@ pub(super) fn validate_snapshot_protobuf<'a>(
                 )?);
             })()?);
         }
-        Value::Array(mapped)
+        Value::list(mapped)
     };
     if (Value::Bool(!(s1.clone()).truthy())).truthy() {
         return Err(ValidationError::fatal(
@@ -450,10 +452,10 @@ pub(super) fn validate_snapshot_protobuf<'a>(
         s0.clone(),
         Value::Text("MISSING_SNAPSHOT_KEY_ID".into()),
     )?;
-    return Ok(Value::Object(vec![
+    return Ok(Value::object(vec![
         (
             "version",
-            Value::Object(vec![(
+            Value::object(vec![(
                 "version",
                 transforms.number_or_throw_if_too_large(s4.clone())?,
             )]),

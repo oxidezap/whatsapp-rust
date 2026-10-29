@@ -5,6 +5,7 @@ on:
       - 'tools/whatspec-codegen/**'
       - 'wacore/appstate/**'
       - 'wacore/src/appstate_sync.rs'
+      - 'src/client/app_state.rs'
       - 'waproto/src/lib.rs'
       - '.github/workflows/appstate-validation.yml'
   push:
@@ -13,6 +14,7 @@ on:
       - 'tools/whatspec-codegen/**'
       - 'wacore/appstate/**'
       - 'wacore/src/appstate_sync.rs'
+      - 'src/client/app_state.rs'
       - 'waproto/src/lib.rs'
       - '.github/workflows/appstate-validation.yml'
 permissions:
