@@ -184,8 +184,21 @@ async fn captured_retry_cancel_after_durable_delete_keeps_tombstone_recoverable(
     );
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
-    // The cancelled future did not acknowledge the tombstone. Replaying the
-    // idempotent flush against the same healthy backend must settle it.
+    // Prove retention by replaying through the gated decorator again. Merely
+    // observing an absent durable row would also pass if cancellation wrongly
+    // discarded the pending tombstone after the first delete committed.
+    let replay = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.flush_signal_cache().await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx.recv())
+        .await
+        .expect("cancelled deletion must be replayed before acknowledgement")
+        .unwrap();
+    assert!(raw.get_session(address.as_str()).await.unwrap().is_none());
+    replay.abort();
+    assert!(replay.await.unwrap_err().is_cancelled());
+    // Settle the retained tombstone against the same healthy backend.
     client.signal_cache.flush(raw.as_ref()).await.unwrap();
     assert!(
         !client
