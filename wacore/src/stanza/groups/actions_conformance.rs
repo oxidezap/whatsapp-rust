@@ -1,6 +1,6 @@
 //! Auto-generated complete official nonraw group action conformance (WhatsApp 2.3000.1047483476). DO NOT EDIT.
 //!
-//! Original callback source: https://github.com/oxidezap/whatspec/blob/57494ccd865fa6471743264fea036f00d26d89cb/tests/conformance/groups/actions.cjs
+//! Original callback source: https://github.com/oxidezap/whatspec/blob/adbe317bf0320bb0cb83824722f6eb60c2ac69da/tests/conformance/groups/actions.cjs
 //! Module SHA-256 a65d861ba0dacdcec52d2df48712a80677ecf10021d7df63c84183f195db13a1.
 //! Account facts/Wid conversion/logging are explicit test mocks; runtime handlers are not run.
 
