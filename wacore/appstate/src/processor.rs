@@ -149,8 +149,8 @@ fn mutation_summary(mutations: &[Mutation]) -> String {
     // hundreds/thousands of mutations and this whole pass exists only
     // for observability, so the aggregation must not dominate the
     // decode it describes. The value is `(count, first_position)`: the
-    // sort below orders most frequent first with first appearance as
-    // the deterministic tiebreak (the old stable-sort order).
+    // selection below orders most frequent first with first appearance as
+    // the deterministic tiebreak.
     let mut counts: HashMap<MutationSummary<'_>, (usize, usize)> =
         HashMap::with_capacity(mutations.len().min(64));
     for (position, m) in mutations.iter().enumerate() {
@@ -158,15 +158,34 @@ fn mutation_summary(mutations: &[Mutation]) -> String {
         let entry = counts.entry(summary).or_insert((0, position));
         entry.0 += 1;
     }
-    // Most frequent first: the dominant command of a snapshot reads before
-    // the tail, and the cap below drops the least interesting entries.
-    // `k log k` over distinct commands only, not over mutations.
-    let mut counts: Vec<_> = counts.into_iter().collect();
-    counts.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.1.1.cmp(&b.1.1)));
+    // Only the best twelve entries are rendered. Keep that bounded prefix
+    // ordered instead of sorting every distinct command. First positions are
+    // unique, so the ordering stays independent of HashMap iteration order.
+    let mut selected: Vec<(MutationSummary<'_>, (usize, usize))> =
+        Vec::with_capacity(counts.len().min(MUTATION_SUMMARY_ENTRY_CAP));
+    let mut hidden = 0;
+    for (summary, (count, first)) in counts {
+        let position = selected
+            .iter()
+            .position(|(_, (other_count, other_first))| {
+                count > *other_count || (count == *other_count && first < *other_first)
+            })
+            .unwrap_or(selected.len());
+        if position < MUTATION_SUMMARY_ENTRY_CAP {
+            // Pop before inserting so a full prefix never grows its allocation.
+            if selected.len() == MUTATION_SUMMARY_ENTRY_CAP
+                && let Some((_, (evicted_count, _))) = selected.pop()
+            {
+                hidden += evicted_count;
+            }
+            selected.insert(position, (summary, (count, first)));
+        } else {
+            hidden += count;
+        }
+    }
 
     let mut out = String::new();
-    let shown = counts.len().min(MUTATION_SUMMARY_ENTRY_CAP);
-    for (i, (summary, (count, _))) in counts[..shown].iter().enumerate() {
+    for (i, (summary, (count, _))) in selected.iter().enumerate() {
         if i > 0 {
             out.push_str(", ");
         }
@@ -175,7 +194,6 @@ fn mutation_summary(mutations: &[Mutation]) -> String {
             let _ = write!(out, "×{count}");
         }
     }
-    let hidden: usize = counts[shown..].iter().map(|(_, (c, _))| c).sum();
     if hidden > 0 {
         if !out.is_empty() {
             out.push_str(", ");
@@ -2635,6 +2653,96 @@ mod tests {
             mutation_summary(&mutations),
             "SET contact×2, SET archive×2, SET pin"
         );
+    }
+
+    #[test]
+    fn bounded_mutation_summary_matches_full_sort() {
+        use std::fmt::Write;
+        use wa::syncd_mutation::SyncdOperation::{REMOVE, SET};
+
+        // Keep the former complete-sort algorithm as an independent ordering
+        // oracle, including the sum of every count beyond the visible prefix.
+        fn full_sort(mutations: &[Mutation]) -> String {
+            let mut counts: HashMap<MutationSummary<'_>, (usize, usize)> = HashMap::new();
+            for (position, mutation) in mutations.iter().enumerate() {
+                let entry = counts
+                    .entry(MutationSummary::of(mutation))
+                    .or_insert((0, position));
+                entry.0 += 1;
+            }
+            let mut counts: Vec<_> = counts.into_iter().collect();
+            counts.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.1.1.cmp(&b.1.1)));
+            let shown = counts.len().min(MUTATION_SUMMARY_ENTRY_CAP);
+            let mut out = String::new();
+            for (i, (summary, (count, _))) in counts[..shown].iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                let _ = write!(out, "{summary}");
+                if *count > 1 {
+                    let _ = write!(out, "×{count}");
+                }
+            }
+            let hidden: usize = counts[shown..].iter().map(|(_, (count, _))| count).sum();
+            if hidden > 0 {
+                if !out.is_empty() {
+                    out.push_str(", ");
+                }
+                let _ = write!(out, "… +{hidden} more");
+            }
+            out
+        }
+
+        let commands = [
+            Some("archive"),
+            Some("pin_v1"),
+            Some("mute"),
+            Some("contact"),
+            Some("star"),
+            Some("call_log"),
+            Some("label_edit"),
+            Some("quick_reply"),
+            Some("clearChat"),
+            Some("deleteChat"),
+            Some("lock"),
+            Some("markChatAsRead"),
+            Some("deleteMessageForMe"),
+            Some("nct_salt_sync"),
+            Some("userStatusMute"),
+            Some("synthetic_unknown\ncommand"),
+            Some(""),
+            None,
+        ];
+        let keys: Vec<_> = commands
+            .iter()
+            .flat_map(|command| [(*command, SET), (*command, REMOVE)])
+            .collect();
+        assert_eq!(mutation_summary(&[]), full_sort(&[]));
+        for profile in 0..3 {
+            for rotation in 0..8 {
+                let mut mutations = Vec::new();
+                // Interleave commands so first appearance and frequency rank
+                // disagree, including ties on both sides of the twelfth item.
+                for round in 0..7 {
+                    for offset in 0..keys.len() {
+                        let index = (offset + rotation) % keys.len();
+                        let repeats = match profile {
+                            0 => 1,
+                            1 => index % 7 + 1,
+                            _ => 7 - index % 7,
+                        };
+                        if round < repeats {
+                            let (command, operation) = keys[index];
+                            mutations.push(summary_mutation(command, operation));
+                        }
+                    }
+                }
+                for _ in 0..2 {
+                    assert_eq!(mutation_summary(&mutations), full_sort(&mutations));
+                    mutations.reverse();
+                }
+            }
+        }
     }
 
     /// Past the entry cap the tail folds into `… +N more`.

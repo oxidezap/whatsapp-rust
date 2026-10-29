@@ -1031,33 +1031,36 @@ impl Client {
 
         // Patch lists outlive all jobs, so metadata need not be cloned before
         // admission. Shared paths still produce a single retained allocation.
-        let mut jobs = Vec::new();
-        let mut seen_paths: HashSet<&str> = HashSet::new();
-        for metadata in patch_lists {
-            let Some(pl) = metadata.list() else {
-                continue;
-            };
-            if pl.snapshot.is_none()
-                && let Some(ext) = &pl.snapshot_ref
-                && let Some(path) = ext.direct_path.as_deref()
-                && seen_paths.insert(path)
-            {
-                jobs.push((ext, BlobKind::Snapshot(pl.name)));
-            }
-            for patch in &pl.patches {
-                if let Some(ext) = patch.external_mutations.as_option()
+        let jobs = {
+            let mut jobs = Vec::new();
+            let mut seen_paths: HashSet<&str> = HashSet::new();
+            for metadata in patch_lists {
+                let Some(pl) = metadata.list() else {
+                    continue;
+                };
+                if pl.snapshot.is_none()
+                    && let Some(ext) = &pl.snapshot_ref
                     && let Some(path) = ext.direct_path.as_deref()
                     && seen_paths.insert(path)
                 {
-                    let v = patch
-                        .version
-                        .as_option()
-                        .and_then(|v| v.version)
-                        .unwrap_or(0);
-                    jobs.push((ext, BlobKind::Mutation(v)));
+                    jobs.push((ext, BlobKind::Snapshot(pl.name)));
+                }
+                for patch in &pl.patches {
+                    if let Some(ext) = patch.external_mutations.as_option()
+                        && let Some(path) = ext.direct_path.as_deref()
+                        && seen_paths.insert(path)
+                    {
+                        let v = patch
+                            .version
+                            .as_option()
+                            .and_then(|v| v.version)
+                            .unwrap_or(0);
+                        jobs.push((ext, BlobKind::Mutation(v)));
+                    }
                 }
             }
-        }
+            jobs
+        };
 
         if jobs.is_empty() {
             return HashMap::new();
