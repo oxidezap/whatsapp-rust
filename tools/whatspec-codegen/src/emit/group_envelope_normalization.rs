@@ -6,7 +6,7 @@ mod ir;
 use super::{header, rust_str};
 use ir::*;
 
-const REV: &str = "de8b8fce30e17fefd31861975e3e94806ab4285a";
+const REV: &str = "29fad5a7abfb5dc224c1eb535d21478f50574229";
 const CONTRACT_SHA: &str = "657e610570e886784cdda871495912926ff2f8caf8369c7c8c086aa0c38aae99";
 const CONTRACT: &str = include_str!("../../fixtures/group_envelope.json");
 struct Compiler {
