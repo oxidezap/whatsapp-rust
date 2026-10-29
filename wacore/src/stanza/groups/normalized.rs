@@ -78,7 +78,8 @@ pub fn parse_unlink(node: &NodeRef<'_>) -> Result<NormalizedUnlink, GroupParseEr
             subject_time,
         });
     }
-    let action = generated::normalize_unlink(&kind.as_str(), reason.map(|v| v.as_str()).as_deref());
+    let action = generated::normalize_unlink(&kind.as_str(), reason.map(|v| v.as_str()).as_deref())
+        .map_err(|()| GroupParseError::Field("unsupported unlink action"))?;
     let kind = action
         .map(|a| {
             GroupUnlinkKind::try_from(a)
@@ -165,14 +166,14 @@ impl GroupNotification {
                     return Err(GroupParseError::UnknownAction(child.tag.to_string()));
                 }
                 if matches!(
-                    child.tag.as_ref(),
-                    "add"
-                        | "remove"
-                        | "promote"
-                        | "demote"
-                        | "modify"
-                        | "linked_group_promote"
-                        | "linked_group_demote"
+                    super::GroupNotificationActionTag::try_from(child.tag.as_ref()),
+                    Ok(super::GroupNotificationActionTag::Add
+                        | super::GroupNotificationActionTag::Remove
+                        | super::GroupNotificationActionTag::Promote
+                        | super::GroupNotificationActionTag::Demote
+                        | super::GroupNotificationActionTag::Modify
+                        | super::GroupNotificationActionTag::LinkedGroupPromote
+                        | super::GroupNotificationActionTag::LinkedGroupDemote)
                 ) {
                     for p in child.get_children_by_tag("participant") {
                         if let Some(role) = p.attrs().optional_string("type")
@@ -206,12 +207,13 @@ impl GroupNotification {
                 | GroupNotificationAction::Modify { participants }
                 | GroupNotificationAction::LinkedGroupPromote { participants }
                 | GroupNotificationAction::LinkedGroupDemote { participants } => Some(participants),
-                GroupNotificationAction::Subject {
-                    subject_owner_username,
-                    ..
-                } => {
+                // The original helper gates requested_user usernames only.
+                // Participant and subject usernames are read unconditionally.
+                GroupNotificationAction::CreatedMembershipRequests { requests, .. } => {
                     if !context.username_displayed {
-                        *subject_owner_username = None;
+                        for request in requests {
+                            request.username = None;
+                        }
                     }
                     None
                 }
@@ -247,6 +249,110 @@ mod tests {
             .attr("from", "123456@g.us")
             .attr("id", "synthetic")
             .attr("t", "123")
+    }
+    #[test]
+    fn username_gates_are_field_specific_and_independent_of_history() {
+        let lid = Jid::lid_device("100001", 2);
+        for username_displayed in [false, true] {
+            for history_after_join in [false, true] {
+                let context = GroupParseContext {
+                    me_device_lid: &lid,
+                    me_device_pn: None,
+                    username_displayed,
+                    history_after_join,
+                };
+                let node = base()
+                    .attr("participant_username", "root_name")
+                    .children([
+                        NodeBuilder::new("add")
+                            .children([NodeBuilder::new("participant")
+                                .attr("jid", "200002@s.whatsapp.net")
+                                .attr("username", "member_name")
+                                .build()])
+                            .build(),
+                        NodeBuilder::new("subject")
+                            .attr("subject", "synthetic")
+                            .attr("s_o_username", "subject_name")
+                            .build(),
+                        NodeBuilder::new("created_membership_requests")
+                            .attr("request_method", "invite_link")
+                            .children([NodeBuilder::new("requested_user")
+                                .attr("jid", "200003@s.whatsapp.net")
+                                .attr("username", "request_name")
+                                .build()])
+                            .build(),
+                    ])
+                    .build();
+                let parsed = GroupNotification::try_from_node_ref_with_context(
+                    &node.as_node_ref(),
+                    &context,
+                )
+                .unwrap();
+                assert_eq!(parsed.participant_username.is_some(), username_displayed);
+                let GroupNotificationAction::Add { participants, .. } = &parsed.actions[0] else {
+                    panic!("add")
+                };
+                assert_eq!(participants[0].username.as_deref(), Some("member_name"));
+                let GroupNotificationAction::Subject {
+                    subject_owner_username,
+                    ..
+                } = &parsed.actions[1]
+                else {
+                    panic!("subject")
+                };
+                assert_eq!(subject_owner_username.as_deref(), Some("subject_name"));
+                let GroupNotificationAction::CreatedMembershipRequests { requests, .. } =
+                    &parsed.actions[2]
+                else {
+                    panic!("requests")
+                };
+                assert_eq!(requests[0].username.is_some(), username_displayed);
+            }
+        }
+    }
+    #[test]
+    fn present_unknown_role_rejects_before_missing_jid_but_absence_defaults() {
+        let lid = Jid::lid_device("100001", 2);
+        let context = GroupParseContext {
+            me_device_lid: &lid,
+            me_device_pn: None,
+            username_displayed: false,
+            history_after_join: false,
+        };
+        let node = base()
+            .children([NodeBuilder::new("add")
+                .children([NodeBuilder::new("participant")
+                    .attr("type", "future_role")
+                    .build()])
+                .build()])
+            .build();
+        assert_eq!(
+            GroupNotification::try_from_node_ref_with_context(&node.as_node_ref(), &context)
+                .unwrap_err(),
+            GroupParseError::Field("type")
+        );
+    }
+    #[test]
+    fn inherited_unlink_actions_reject_while_unknown_strings_remain_undefined() {
+        for kind in ["constructor", "toString", "__proto__", "valueOf"] {
+            let node = NodeBuilder::new("unlink").attr("unlink_type", kind).build();
+            assert_eq!(
+                parse_unlink(&node.as_node_ref()).unwrap_err(),
+                GroupParseError::Field("unsupported unlink action")
+            );
+            let invalid_payload = NodeBuilder::new("unlink")
+                .attr("unlink_type", kind)
+                .children([NodeBuilder::new("group").attr("jid", "100001@lid").build()])
+                .build();
+            assert_eq!(
+                parse_unlink(&invalid_payload.as_node_ref()).unwrap_err(),
+                GroupParseError::Field("jid")
+            );
+        }
+        let node = NodeBuilder::new("unlink")
+            .attr("unlink_type", "future_kind")
+            .build();
+        assert_eq!(parse_unlink(&node.as_node_ref()).unwrap().kind, None);
     }
     #[test]
     fn identities_and_first_failure_use_real_context() {

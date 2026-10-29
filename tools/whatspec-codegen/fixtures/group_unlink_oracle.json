@@ -123,5 +123,77 @@
     "kind": "future_kind",
     "reason": "future_reason",
     "actionType": null
+  },
+  {
+    "kind": "constructor",
+    "reason": null,
+    "actionType": null,
+    "unsupportedAction": true
+  },
+  {
+    "kind": "__defineGetter__",
+    "reason": null,
+    "actionType": null,
+    "unsupportedAction": true
+  },
+  {
+    "kind": "__defineSetter__",
+    "reason": null,
+    "actionType": null,
+    "unsupportedAction": true
+  },
+  {
+    "kind": "hasOwnProperty",
+    "reason": null,
+    "actionType": null,
+    "unsupportedAction": true
+  },
+  {
+    "kind": "__lookupGetter__",
+    "reason": null,
+    "actionType": null,
+    "unsupportedAction": true
+  },
+  {
+    "kind": "__lookupSetter__",
+    "reason": null,
+    "actionType": null,
+    "unsupportedAction": true
+  },
+  {
+    "kind": "isPrototypeOf",
+    "reason": null,
+    "actionType": null,
+    "unsupportedAction": true
+  },
+  {
+    "kind": "propertyIsEnumerable",
+    "reason": null,
+    "actionType": null,
+    "unsupportedAction": true
+  },
+  {
+    "kind": "toString",
+    "reason": null,
+    "actionType": null,
+    "unsupportedAction": true
+  },
+  {
+    "kind": "valueOf",
+    "reason": null,
+    "actionType": null,
+    "unsupportedAction": true
+  },
+  {
+    "kind": "__proto__",
+    "reason": null,
+    "actionType": null,
+    "unsupportedAction": true
+  },
+  {
+    "kind": "toLocaleString",
+    "reason": null,
+    "actionType": null,
+    "unsupportedAction": true
   }
 ]

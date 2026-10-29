@@ -16,6 +16,14 @@
       "startByte": 959207,
       "endByte": 963377,
       "moduleSha256": "d63035154901e9677bc08acd8ab3994845087875ca5ce84636ec765b72553519"
+    },
+    {
+      "name": "WAWebHandleGroupNotificationConst",
+      "bundleSha256": "09d91fdc4089c50ab1d35dd6c796ee82ef4c3296710316d20383c85738b871b8",
+      "startByte": 268451,
+      "endByte": 276687,
+      "moduleSha256": "176daa1a4d66aee3b907bc26ba2e40da1fde706e142f44bf1bdb8cfb9fd3581e"
     }
-  ]
+  ],
+  "archiveSha256": "22243b9c2ff18a66cea8fd66551821fe0f9f09786d107e2be8284637db86c349"
 }

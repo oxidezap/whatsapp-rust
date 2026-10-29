@@ -6,7 +6,7 @@ use serde::Deserialize;
 use std::collections::BTreeSet;
 
 const CONTRACT: &str = include_str!("../../fixtures/group_unlink.json");
-const REV: &str = "2292a11135c5ce0bacf55e06ee9471a6b3f7f219";
+const REV: &str = "1736df6b5b2ab05786ae2b601f5ced0ad99bdf5a";
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Contract {
@@ -21,6 +21,8 @@ struct Row {
     unlink_type: Option<String>,
     reason: Option<String>,
     action_type: Option<String>,
+    #[serde(default)]
+    unsupported_action: bool,
 }
 
 pub fn generate(wa_version: &str) -> Result<String> {
@@ -30,7 +32,7 @@ pub fn generate(wa_version: &str) -> Result<String> {
     );
     ensure!(
         crate::source::digest(CONTRACT.as_bytes())
-            == "sha256:420b8ffd4adb49a7c7e6a5c4b13e7efd3491ef8dcf0f6e016b7d039f3b1735a6",
+            == "sha256:c7f306f66616f284f48a27d2612d201139de727042927d3a3f851e73acacae7f",
         "group unlink contract differs from the independent pinned revision"
     );
     let contract: Contract = serde_json::from_str(CONTRACT)?;
@@ -59,6 +61,10 @@ pub fn generate(wa_version: &str) -> Result<String> {
             keys.insert((&row.unlink_type, &row.reason)),
             "duplicate matrix row"
         );
+        ensure!(
+            !row.unsupported_action || row.action_type.is_none(),
+            "unsupported action has a string identity"
+        );
     }
     let evidence: serde_json::Value =
         serde_json::from_str(include_str!("../../fixtures/group_unlink_evidence.json"))?;
@@ -81,7 +87,7 @@ pub fn generate(wa_version: &str) -> Result<String> {
             module["endByte"]
         ));
     }
-    out.push_str("pub(super) fn normalize_unlink(kind: &str, reason: Option<&str>) -> Option<&'static str> {\n");
+    out.push_str("pub(super) fn normalize_unlink(kind: &str, reason: Option<&str>) -> Result<Option<&'static str>, ()> {\n");
     out.push_str(&format!(
         "let kind = match kind {{ {} => Some(kind), _ => None }};\n",
         kinds
@@ -105,16 +111,22 @@ pub fn generate(wa_version: &str) -> Result<String> {
             "({}, {}) => {},\n",
             opt(row.unlink_type),
             opt(row.reason),
-            opt(row.action_type)
+            if row.unsupported_action {
+                "Err(())".into()
+            } else {
+                format!("Ok({})", opt(row.action_type))
+            }
         ));
     }
-    out.push_str("_ => None,\n}\n}\n");
+    out.push_str("_ => Ok(None),\n}\n}\n");
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
     struct OracleCase {
         kind: String,
         reason: Option<String>,
         action_type: Option<String>,
+        #[serde(default)]
+        unsupported_action: bool,
     }
     let cases: Vec<OracleCase> =
         serde_json::from_str(include_str!("../../fixtures/group_unlink_oracle.json"))?;
@@ -126,7 +138,11 @@ pub fn generate(wa_version: &str) -> Result<String> {
             "assert_eq!(normalize_unlink({},{}),{});\n",
             rust_str(&case.kind),
             opt(case.reason),
-            opt(case.action_type)
+            if case.unsupported_action {
+                "Err(())".into()
+            } else {
+                format!("Ok({})", opt(case.action_type))
+            }
         ));
     }
     out.push_str("}\n}\n");
