@@ -8428,12 +8428,12 @@ mod tests {
             }
         }
         // The number is the assertion because the loss is a prefix of the buffer, not a failure:
-        // purging unconditionally gives 1920 here, keeping what decoded gives 2400. Two 60ms packets
-        // of real speech in this fixture -- less than an unconditional purge costs a call whose
-        // buffer is fuller, and enough to fail if the condition is dropped.
+        // keeping what decoded gives all six 60ms packets (6 x 960 = 5760), which fit under the
+        // playout ceiling, and an unconditional purge loses the corroboration window from that
+        // count. Enough to fail if the condition is dropped.
         let decoded = heard.iter().filter(|s| **s == 1234).count();
         assert_eq!(
-            decoded, 2400,
+            decoded, 5760,
             "the packets decoded before the verdict have to survive it"
         );
     }
