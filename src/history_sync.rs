@@ -205,7 +205,7 @@ impl HistorySecretSeedCollector {
                 && let Ok(chat) = record.chat_id.parse::<Jid>()
             {
                 self.last_chat_is_bot = Some(chat.is_bot());
-                self.last_chat_non_ad_id = Some(Arc::from(chat.to_non_ad_string()));
+                self.last_chat_non_ad_id = Some(chat.to_non_ad_arc_str());
                 self.last_chat = Some(chat);
             }
         }
@@ -236,7 +236,7 @@ impl HistorySecretSeedCollector {
                 return;
             };
             self.last_chat_is_bot = Some(chat.is_bot());
-            self.last_chat_non_ad_id = Some(Arc::from(chat.to_non_ad_string()));
+            self.last_chat_non_ad_id = Some(chat.to_non_ad_arc_str());
             self.last_chat = Some(chat);
         }
         let (Some(chat), Some(chat_non_ad_id)) =
@@ -1987,6 +1987,98 @@ mod tests {
         assert_eq!(entries[0].sender, entries[0].chat);
         assert_eq!(entries[1].chat.as_ref(), SECOND_CHAT);
         assert_eq!(entries[1].sender, entries[1].chat);
+    }
+
+    #[test]
+    fn collector_keeps_canonical_chat_keys_and_reuses_them_within_bursts() {
+        let long_user = "9".repeat(80);
+        let cases = [
+            (
+                "15550000001:33@s.whatsapp.net".to_owned(),
+                "15550000001@s.whatsapp.net".to_owned(),
+            ),
+            (
+                "100000012345678:25@lid".to_owned(),
+                "100000012345678@lid".to_owned(),
+            ),
+            (
+                "867051314767696.5:10@bot".to_owned(),
+                "867051314767696@bot".to_owned(),
+            ),
+            (
+                format!("{long_user}:12@s.whatsapp.net"),
+                format!("{long_user}@s.whatsapp.net"),
+            ),
+        ];
+        let config = HistorySecretSeedConfig {
+            enabled: true,
+            policy: MsgSecretPolicy::Full,
+            retention: MsgSecretRetention::default(),
+            now: 0,
+        };
+        let mut collector = HistorySecretSeedCollector::new(config, None, None);
+        let secret = [0x5a; HISTORY_MSG_SECRET_SIZE];
+        for (index, (chat_id, _)) in cases.iter().enumerate() {
+            for msg_id in ["FIRST", "SECOND"] {
+                collector.collect(HistoryMsgSecretRecordRef {
+                    conversation_index: index,
+                    chat_id,
+                    from_me: false,
+                    key_participant: None,
+                    web_msg_participant: None,
+                    msg_id,
+                    secret: &secret,
+                    timestamp: None,
+                    is_poll_or_event: false,
+                    is_bot_invocation: false,
+                });
+            }
+        }
+        let entries = collector.into_entries();
+        assert_eq!(entries.len(), cases.len() * 2);
+        for (burst, (_, expected)) in entries.chunks_exact(2).zip(&cases) {
+            for entry in burst {
+                assert_eq!(entry.chat.as_ref(), expected);
+                assert_eq!(entry.sender.as_ref(), expected);
+            }
+            assert!(Arc::ptr_eq(&burst[0].chat, &burst[1].chat));
+        }
+    }
+
+    #[test]
+    fn collector_allocates_one_shared_chat_key_per_chat_burst() {
+        let chats: Vec<_> = (0..500)
+            .map(|index| format!("1555000{index:06}:33@s.whatsapp.net"))
+            .collect();
+        let secret = [0x5a; HISTORY_MSG_SECRET_SIZE];
+        for burst in [1, 40] {
+            let config = HistorySecretSeedConfig {
+                enabled: true,
+                policy: MsgSecretPolicy::Full,
+                retention: MsgSecretRetention::default(),
+                now: 0,
+            };
+            let mut collector = HistorySecretSeedCollector::new(config, None, None);
+            collector.entries.reserve(chats.len() * burst);
+            let (sample, collector) = crate::test_alloc::heap_sample(|| {
+                for (index, chat_id) in chats.iter().enumerate() {
+                    for _ in 0..burst {
+                        collector.collect(HistoryMsgSecretRecordRef {
+                            conversation_index: index,
+                            chat_id,
+                            msg_id: "MSGID00000000ABCDEF",
+                            secret: &secret,
+                            ..sender_record(false)
+                        });
+                    }
+                }
+                collector
+            });
+            assert_eq!(collector.entries.len(), chats.len() * burst);
+            // One reusable raw-chat String, one shared canonical key per chat,
+            // and one message-id Arc per row. Preallocated rows are excluded.
+            assert_eq!(sample.allocations as usize, 1 + chats.len() * (burst + 1));
+        }
     }
 
     /// Captures every history-sync chunk the hook is handed, and how many
