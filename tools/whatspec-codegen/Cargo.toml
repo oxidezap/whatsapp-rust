@@ -1,5 +1,6 @@
 [package]
 name = "whatspec-codegen"
+default-run = "whatspec-codegen"
 # 0.0.0 like the other non-published members: nothing links this, so it has no
 # version to keep in lockstep with the released crates.
 version = "0.0.0"

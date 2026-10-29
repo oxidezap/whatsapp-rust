@@ -260,6 +260,18 @@ struct PatchListProgress {
 /// blob's mutations and still persist the new version, losing that data permanently.
 fn download_external_blobs(pl: &mut PatchList, download: &BlobDownloadFn<'_>) -> Result<()> {
     let name = pl.name;
+    // Validate the untrusted protobuf boundary before handing references to a
+    // downloader or advancing any collection state.
+    let collection = name.as_str();
+    if let Some(reference) = &pl.snapshot_ref {
+        crate::appstate::validation::validate_external_reference(collection, reference)?;
+    }
+    if let Some(snapshot) = &pl.snapshot {
+        crate::appstate::validation::validate_snapshot(collection, snapshot)?;
+    }
+    for patch in &pl.patches {
+        crate::appstate::validation::validate_patch(collection, patch)?;
+    }
     if pl.snapshot.is_none()
         && let Some(ext) = &pl.snapshot_ref
     {
@@ -267,6 +279,7 @@ fn download_external_blobs(pl: &mut PatchList, download: &BlobDownloadFn<'_>) ->
             download(ext).with_context(|| format!("download external snapshot for {name:?}"))?;
         let snapshot = waproto::codec::syncd_snapshot_decode(&data)
             .with_context(|| format!("decode external snapshot for {name:?}"))?;
+        crate::appstate::validation::validate_snapshot(collection, &snapshot)?;
         pl.snapshot = Some(snapshot);
     }
 
@@ -281,7 +294,12 @@ fn download_external_blobs(pl: &mut PatchList, download: &BlobDownloadFn<'_>) ->
                 .with_context(|| format!("download external mutations for {name:?} v{v}"))?;
             let ext_mutations = waproto::codec::syncd_mutations_decode(&data)
                 .with_context(|| format!("decode external mutations for {name:?} v{v}"))?;
+            for mutation in &ext_mutations.mutations {
+                crate::appstate::validation::validate_mutation(collection, mutation)?;
+            }
             patch.mutations = ext_mutations.mutations;
+            // The validated external arm omits exitCode.
+            patch.exit_code = buffa::MessageField::none();
             // Consumed: the reference is what marks a patch as still external,
             // so leaving it would make the next pass (`missing_key_ids_after_inline`
             // runs before `process_one_patch_list`) download and decode the
@@ -289,6 +307,9 @@ fn download_external_blobs(pl: &mut PatchList, download: &BlobDownloadFn<'_>) ->
             patch.external_mutations = buffa::MessageField::none();
         }
     }
+    crate::appstate::validation::validate_no_duplicate_patch_version(
+        pl.patches.iter().filter_map(|patch| patch.version.version),
+    )?;
     Ok(())
 }
 
@@ -1642,6 +1663,28 @@ mod external_blob_tests {
     use super::*;
     use crate::appstate::patch_decode::WAPatchName;
 
+    fn valid_reference(path: &str) -> wa::ExternalBlobReference {
+        let mut reference = wa::ExternalBlobReference::default();
+        reference.direct_path = Some(path.into());
+        reference.media_key = Some(vec![]);
+        reference.file_sha256 = Some(vec![]);
+        reference.file_enc_sha256 = Some(vec![]);
+        reference
+    }
+    fn valid_external_patch() -> wa::SyncdPatch {
+        let mut patch = wa::SyncdPatch::default();
+        let mut version = wa::SyncdVersion::default();
+        version.version = Some(1);
+        patch.version = version.into();
+        patch.snapshot_mac = Some(vec![]);
+        patch.patch_mac = Some(vec![]);
+        let mut key = wa::KeyId::default();
+        key.id = Some(vec![]);
+        patch.key_id = key.into();
+        patch.external_mutations = valid_reference("/mutations").into();
+        patch
+    }
+
     fn pl_with_snapshot_ref(snapshot_ref: Option<wa::ExternalBlobReference>) -> PatchList {
         PatchList {
             name: WAPatchName::Regular,
@@ -1657,30 +1700,24 @@ mod external_blob_tests {
     fn external_snapshot_download_failure_propagates() {
         // A referenced blob that fails to download must error, not be swallowed
         // (which would apply an empty patch and advance the version).
-        let mut pl = pl_with_snapshot_ref(Some({
-            let mut proto = wa::ExternalBlobReference::default();
-            proto.direct_path = Some("/blob".into());
-            proto
-        }));
+        let mut pl = pl_with_snapshot_ref(Some(valid_reference("/blob")));
         let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
             Err(anyhow!("simulated failure"))
         };
-        assert!(download_external_blobs(&mut pl, &download).is_err());
+        let error = download_external_blobs(&mut pl, &download).unwrap_err();
+        assert!(format!("{error:#}").contains("simulated failure"));
     }
 
     #[test]
     fn external_snapshot_decode_failure_propagates() {
         // Download succeeds but the bytes aren't a valid SyncdSnapshot: the decode
         // error must propagate too, not just download errors.
-        let mut pl = pl_with_snapshot_ref(Some({
-            let mut proto = wa::ExternalBlobReference::default();
-            proto.direct_path = Some("/blob".into());
-            proto
-        }));
+        let mut pl = pl_with_snapshot_ref(Some(valid_reference("/blob")));
         let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
             Ok(bytes::Bytes::from_static(&[0xFF, 0xFF, 0xFF]))
         };
-        assert!(download_external_blobs(&mut pl, &download).is_err());
+        let error = download_external_blobs(&mut pl, &download).unwrap_err();
+        assert!(format!("{error:#}").contains("decode external snapshot"));
     }
 
     #[test]
@@ -1689,15 +1726,7 @@ mod external_blob_tests {
         let mut pl = PatchList {
             name: WAPatchName::Regular,
             has_more_patches: false,
-            patches: vec![{
-                let mut proto = wa::SyncdPatch::default();
-                proto.external_mutations = buffa::MessageField::some({
-                    let mut proto = wa::ExternalBlobReference::default();
-                    proto.direct_path = Some("/mutations".into());
-                    proto
-                });
-                proto
-            }],
+            patches: vec![valid_external_patch()],
             snapshot: None,
             snapshot_ref: None,
             error: None,
@@ -1705,7 +1734,8 @@ mod external_blob_tests {
         let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
             Err(anyhow!("simulated failure"))
         };
-        assert!(download_external_blobs(&mut pl, &download).is_err());
+        let error = download_external_blobs(&mut pl, &download).unwrap_err();
+        assert!(format!("{error:#}").contains("simulated failure"));
     }
 
     /// The missing-key probe inlines before `process_one_patch_list` inlines
@@ -1715,15 +1745,7 @@ mod external_blob_tests {
         let mut pl = PatchList {
             name: WAPatchName::Regular,
             has_more_patches: false,
-            patches: vec![{
-                let mut proto = wa::SyncdPatch::default();
-                proto.external_mutations = buffa::MessageField::some({
-                    let mut proto = wa::ExternalBlobReference::default();
-                    proto.direct_path = Some("/mutations".into());
-                    proto
-                });
-                proto
-            }],
+            patches: vec![valid_external_patch()],
             snapshot: None,
             snapshot_ref: None,
             error: None,
@@ -1746,6 +1768,27 @@ mod external_blob_tests {
         let download =
             |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> { Ok(bytes::Bytes::new()) };
         assert!(download_external_blobs(&mut pl, &download).is_ok());
+    }
+
+    #[test]
+    fn conflicting_mutation_sources_are_rejected_before_downloading() {
+        let mut pl = pl_with_snapshot_ref(None);
+        let mut patch = valid_external_patch();
+        patch.mutations.push(wa::SyncdMutation::default());
+        pl.patches.push(patch);
+        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
+            panic!("invalid patch reached downloader")
+        };
+        let error = download_external_blobs(&mut pl, &download).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::appstate::validation::ValidationError>()
+                .unwrap()
+                .metric
+                .as_deref(),
+            Some("PATCH_WITH_BOTH_INLINE_AND_EXTERNAL_MUTATIONS")
+        );
+        assert!(pl.patches[0].external_mutations.is_set());
     }
 }
 

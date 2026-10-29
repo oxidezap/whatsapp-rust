@@ -20,3 +20,14 @@ pub use processor::{
     PatchMacVerdict, PatchProcessingResult, ProcessedSnapshot, process_patch, process_snapshot,
     validate_patch_macs, validate_snapshot_mac,
 };
+
+pub mod validation;
+#[allow(clippy::all)]
+mod validation_batch_generated;
+#[allow(clippy::all)]
+mod validation_generated;
+#[allow(dead_code)]
+mod validation_value;
+
+#[cfg(test)]
+mod validation_conformance;

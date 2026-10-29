@@ -1,0 +1,107 @@
+// Native data view for generated validation control flow. Byte payloads borrow
+// protobuf storage; constructing/returning a view never copies encrypted blobs.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum Value<'a> {
+    Undefined,
+    Null,
+    Bool(bool),
+    Number(f64),
+    Long(u64),
+    Text(String),
+    Bytes(&'a [u8]),
+    Array(Vec<Self>),
+    Object(Vec<(&'static str, Self)>),
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidationError {
+    pub class: &'static str,
+    pub metric: Option<String>,
+    pub message: String,
+}
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.class, self.message)
+    }
+}
+impl std::error::Error for ValidationError {}
+impl ValidationError {
+    pub(super) fn fatal(metric: Value<'_>, message: &str) -> Self {
+        Self {
+            class: "SyncdFatalError",
+            metric: match metric {
+                Value::Text(s) => Some(s),
+                _ => None,
+            },
+            message: message.into(),
+        }
+    }
+    pub(super) fn dependency(class: &'static str, message: &str) -> Self {
+        Self {
+            class,
+            metric: None,
+            message: message.into(),
+        }
+    }
+}
+impl<'a> Value<'a> {
+    pub(super) fn truthy(&self) -> bool {
+        match self {
+            Self::Undefined | Self::Null => false,
+            Self::Bool(b) => *b,
+            Self::Number(n) => *n != 0.0 && !n.is_nan(),
+            Self::Text(s) => !s.is_empty(),
+            _ => true,
+        }
+    }
+    pub(super) fn nullish(&self) -> bool {
+        matches!(self, Self::Undefined | Self::Null)
+    }
+    pub(super) fn field(&self, key: &str) -> Result<Self, ValidationError> {
+        match self {
+            Self::Object(fields) => Ok(fields
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map_or(Self::Undefined, |(_, v)| v.clone())),
+            Self::Array(items) if key == "length" => Ok(Self::Number(items.len() as f64)),
+            Self::Bytes(bytes) if key == "length" => Ok(Self::Number(bytes.len() as f64)),
+            Self::Undefined | Self::Null => Err(ValidationError::dependency(
+                "TypeError",
+                "field access on nullish value",
+            )),
+            _ => Ok(Self::Undefined),
+        }
+    }
+    pub(super) fn number(&self) -> Result<f64, ValidationError> {
+        match self {
+            Self::Number(n) => Ok(*n),
+            _ => Err(ValidationError::dependency("TypeError", "expected number")),
+        }
+    }
+    pub(super) fn array(&self) -> Result<&[Self], ValidationError> {
+        match self {
+            Self::Array(a) => Ok(a),
+            _ => Err(ValidationError::dependency("TypeError", "expected array")),
+        }
+    }
+}
+/// Dependency calls stay outside the generated program. Implementations must
+/// qualify their decoded LongInt representation and protobuf error contract.
+pub(super) trait Transforms<'a> {
+    fn number_or_throw_if_too_large(
+        &mut self,
+        value: Value<'a>,
+    ) -> Result<Value<'a>, ValidationError>;
+    fn to_sync_key_id(&mut self, value: Value<'a>) -> Result<Value<'a>, ValidationError>;
+    fn maybe_number_or_throw_if_too_large(
+        &mut self,
+        value: Value<'a>,
+    ) -> Result<Value<'a>, ValidationError> {
+        if value.nullish() {
+            Ok(value)
+        } else {
+            self.number_or_throw_if_too_large(value)
+        }
+    }
+    fn decode_sync_action_data(&mut self, value: Value<'a>) -> Result<Value<'a>, ValidationError>;
+    fn decode_patch_debug_data(&mut self, value: Value<'a>) -> Result<Value<'a>, ValidationError>;
+}

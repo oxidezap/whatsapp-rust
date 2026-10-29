@@ -1,0 +1,36 @@
+name: App-state validation generation
+on:
+  pull_request:
+    paths:
+      - 'tools/whatspec-codegen/**'
+      - 'wacore/appstate/**'
+      - 'wacore/src/appstate_sync.rs'
+      - 'waproto/src/lib.rs'
+      - '.github/workflows/appstate-validation.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'tools/whatspec-codegen/**'
+      - 'wacore/appstate/**'
+      - 'wacore/src/appstate_sync.rs'
+      - 'waproto/src/lib.rs'
+      - '.github/workflows/appstate-validation.yml'
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify pinned app-state programs and native output
+        env:
+          RUSTFLAGS: ''
+        run: cargo +stable run -p whatspec-codegen --bin appstate-validation -- --check
+      - name: Compare generated validators with the official isolated-method fixtures
+        env:
+          RUSTFLAGS: ''
+        run: cargo +stable test -p wacore-appstate --lib validation

@@ -50,3 +50,22 @@ fallbacks. A deployment-specific `target-feature` recommendation belongs in the
 consumer docs and requires a declared hardware floor. Changing profile overrides
 must retain optimization on per-message crypto/protocol code and pass the linked
 size gate. See `Cargo.toml` and `.github/workflows/binary-size.yml`.
+
+App-state protobuf validation uses a separate reviewed pin in
+`tools/whatspec-codegen/fixtures/appstate-validation/lock.json`. This keeps the
+other domains on their existing commit while the new upstream format is reviewed.
+Regenerate with `cargo run -p whatspec-codegen --bin appstate-validation`; add
+`--check` to verify the vendored IR hashes and all three generated Rust files.
+Update this pin and its immutable JSON inputs together, after the upstream PR.
+The normal all-domain generator continues to own the existing action registry.
+
+The generated boundary covers six protobuf methods and the decoded SET method.
+The batch recipe preserves separate SET/REMOVE identities and exposes diagnostic
+hooks for Patch/Snapshot/Local. Its conformance fixtures qualify the ordered
+methods against the official Web snapshot; protobuf decoding is stubbed in that
+oracle and native adapter tests exercise the real buffa decoder separately.
+`wacore::appstate_sync` validates wire protobufs before downloading or mutating
+collection state. Crypto, persistence, recovery, and the existing processor's
+post-decryption batch integration remain handwritten. The public batch/SET APIs
+consume the original decrypted index string and binary payload; the existing
+`Mutation` API does not retain those inputs and is preserved.

@@ -1,0 +1,212 @@
+{
+  "formatVersion": 1,
+  "waVersion": "2.3000.1047483476",
+  "moduleSha256": "05d3e49937060682ad61453ee04e820ca7b02dc8f4a44356bc86de08397892e4",
+  "recipe": "separateSetRemoveV1",
+  "setOperation": 0,
+  "removeOperation": 1,
+  "operationEnumSha256": "32855a0c4d17f23b0d70a2f687d347d3dccaf2b07c751821d5c89ff797920e21",
+  "typeSet": {
+    "module": "WAWebSyncdValidateMutations",
+    "startByte": 4154,
+    "endByte": 4997,
+    "parameters": 2,
+    "body": [
+      {
+        "op": "return",
+        "value": {
+          "op": "map",
+          "input": {
+            "op": "argument",
+            "index": 1
+          },
+          "body": [
+            {
+              "op": "bind",
+              "slot": 0,
+              "value": {
+                "op": "transform",
+                "transform": "decodeSyncActionData",
+                "arguments": [
+                  {
+                    "op": "field",
+                    "object": {
+                      "op": "argument",
+                      "index": 3
+                    },
+                    "field": "binarySyncData"
+                  }
+                ]
+              }
+            },
+            {
+              "op": "bind",
+              "slot": 1,
+              "value": {
+                "op": "field",
+                "object": {
+                  "op": "slot",
+                  "index": 0
+                },
+                "field": "value"
+              }
+            },
+            {
+              "op": "if",
+              "condition": {
+                "op": "not",
+                "value": {
+                  "op": "slot",
+                  "index": 1
+                }
+              },
+              "yes": [
+                {
+                  "op": "fatal",
+                  "metric": {
+                    "op": "metric",
+                    "name": "MISSING_ACTION_VALUE"
+                  },
+                  "message": "missing action value"
+                }
+              ],
+              "no": []
+            },
+            {
+              "op": "bind",
+              "slot": 2,
+              "value": {
+                "op": "transform",
+                "transform": "maybeNumber",
+                "arguments": [
+                  {
+                    "op": "field",
+                    "object": {
+                      "op": "slot",
+                      "index": 1
+                    },
+                    "field": "timestamp"
+                  }
+                ]
+              }
+            },
+            {
+              "op": "if",
+              "condition": {
+                "op": "nullish",
+                "value": {
+                  "op": "slot",
+                  "index": 2
+                },
+                "negate": false
+              },
+              "yes": [
+                {
+                  "op": "fatal",
+                  "metric": {
+                    "op": "metric",
+                    "name": "MISSING_ACTION_TIMESTAMP"
+                  },
+                  "message": "missing action timestamp"
+                }
+              ],
+              "no": []
+            },
+            {
+              "op": "return",
+              "value": {
+                "op": "object",
+                "fields": [
+                  [
+                    "index",
+                    {
+                      "op": "field",
+                      "object": {
+                        "op": "argument",
+                        "index": 3
+                      },
+                      "field": "index"
+                    }
+                  ],
+                  [
+                    "version",
+                    {
+                      "op": "field",
+                      "object": {
+                        "op": "argument",
+                        "index": 3
+                      },
+                      "field": "version"
+                    }
+                  ],
+                  [
+                    "keyId",
+                    {
+                      "op": "field",
+                      "object": {
+                        "op": "argument",
+                        "index": 3
+                      },
+                      "field": "keyId"
+                    }
+                  ],
+                  [
+                    "indexMac",
+                    {
+                      "op": "field",
+                      "object": {
+                        "op": "argument",
+                        "index": 3
+                      },
+                      "field": "indexMac"
+                    }
+                  ],
+                  [
+                    "valueMac",
+                    {
+                      "op": "field",
+                      "object": {
+                        "op": "argument",
+                        "index": 3
+                      },
+                      "field": "valueMac"
+                    }
+                  ],
+                  [
+                    "collection",
+                    {
+                      "op": "field",
+                      "object": {
+                        "op": "argument",
+                        "index": 3
+                      },
+                      "field": "collection"
+                    }
+                  ],
+                  [
+                    "binarySyncData",
+                    {
+                      "op": "field",
+                      "object": {
+                        "op": "argument",
+                        "index": 3
+                      },
+                      "field": "binarySyncData"
+                    }
+                  ],
+                  [
+                    "timestamp",
+                    {
+                      "op": "slot",
+                      "index": 2
+                    }
+                  ]
+                ]
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
