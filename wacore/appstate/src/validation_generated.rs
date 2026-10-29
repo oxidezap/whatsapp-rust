@@ -6,7 +6,7 @@ pub(super) fn validate_external_blob_reference<'a>(
     transforms: &mut impl Transforms<'a>,
     a0: &Value<'a>,
     a1: &Value<'a>,
-) -> Result<Value<'a>, ValidationError> {
+) -> Result<Value<'a>, Box<ValidationError>> {
     #[allow(unused_assignments, unused_mut)]
     let mut s0 = Value::Undefined;
     #[allow(unused_assignments, unused_mut)]
@@ -26,28 +26,28 @@ pub(super) fn validate_external_blob_reference<'a>(
     s4 = (a1).field("handle")?;
     s5 = (a1).field("mediaKey")?;
     if (Value::Bool(!(s5).truthy())).truthy() {
-        return Err(ValidationError::fatal(
+        return Err(ValidationError::fatal_boxed(
             Value::Text("MISSING_EXTERNAL_BLOB_REFERENCE_MEDIA_KEY".into()),
             "missing external blob reference media key",
         ));
     } else {
     }
     if (Value::Bool((s0).nullish())).truthy() {
-        return Err(ValidationError::fatal(
+        return Err(ValidationError::fatal_boxed(
             Value::Text("MISSING_EXTERNAL_BLOB_REFERENCE_DIRECT_PATH".into()),
             "missing external blob reference direct path",
         ));
     } else {
     }
     if (Value::Bool(!(s2).truthy())).truthy() {
-        return Err(ValidationError::fatal(
+        return Err(ValidationError::fatal_boxed(
             Value::Text("MISSING_EXTERNAL_BLOB_REFERENCE_FILE_SHA256".into()),
             "missing external blob reference file SHA256",
         ));
     } else {
     }
     if (Value::Bool(!(s1).truthy())).truthy() {
-        return Err(ValidationError::fatal(
+        return Err(ValidationError::fatal_boxed(
             Value::Text("MISSING_EXTERNAL_BLOB_REFERENCE_FILE_ENC_SHA256".into()),
             "missing external blob reference file enc SHA256",
         ));
@@ -69,7 +69,7 @@ pub(super) fn validate_key_id_protobuf<'a>(
     a0: &Value<'a>,
     a1: &Value<'a>,
     a2: &Value<'a>,
-) -> Result<Value<'a>, ValidationError> {
+) -> Result<Value<'a>, Box<ValidationError>> {
     #[allow(unused_assignments, unused_mut)]
     let mut s0 = Value::Undefined;
     s0 = if (Value::Bool((a1).nullish())).truthy() {
@@ -87,7 +87,7 @@ pub(super) fn validate_key_id_protobuf<'a>(
     })
     .truthy()
     {
-        return Err(ValidationError::fatal(
+        return Err(ValidationError::fatal_boxed(
             a2.clone(),
             "missing mutation key id",
         ));
@@ -104,7 +104,7 @@ pub(super) fn validate_mutation_protobuf<'a>(
     transforms: &mut impl Transforms<'a>,
     a0: &Value<'a>,
     a1: &Value<'a>,
-) -> Result<Value<'a>, ValidationError> {
+) -> Result<Value<'a>, Box<ValidationError>> {
     #[allow(unused_assignments, unused_mut)]
     let mut s0 = Value::Undefined;
     #[allow(unused_assignments, unused_mut)]
@@ -114,14 +114,14 @@ pub(super) fn validate_mutation_protobuf<'a>(
     s0 = (a1).field("operation")?;
     s1 = (a1).field("record")?;
     if (Value::Bool((s0).nullish())).truthy() {
-        return Err(ValidationError::fatal(
+        return Err(ValidationError::fatal_boxed(
             Value::Text("MISSING_MUTATION_OPERATION".into()),
             "missing mutation operation",
         ));
     } else {
     }
     if (Value::Bool(!(s1).truthy())).truthy() {
-        return Err(ValidationError::fatal(
+        return Err(ValidationError::fatal_boxed(
             Value::Text("MISSING_MUTATION_RECORD".into()),
             "missing mutation record",
         ));
@@ -143,7 +143,7 @@ pub(super) fn validate_patch_protobuf<'a>(
     transforms: &mut impl Transforms<'a>,
     a0: &Value<'a>,
     a1: &Value<'a>,
-) -> Result<Value<'a>, ValidationError> {
+) -> Result<Value<'a>, Box<ValidationError>> {
     #[allow(unused_assignments, unused_mut)]
     let mut s0 = Value::Undefined;
     #[allow(unused_assignments, unused_mut)]
@@ -196,7 +196,7 @@ pub(super) fn validate_patch_protobuf<'a>(
     })
     .truthy()
     {
-        return Err(ValidationError::fatal(
+        return Err(ValidationError::fatal_boxed(
             Value::Text("MISSING_PATCH_VERSION".into()),
             "missing patch version",
         ));
@@ -219,21 +219,21 @@ pub(super) fn validate_patch_protobuf<'a>(
     })
     .truthy()
     {
-        return Err(ValidationError::fatal(
+        return Err(ValidationError::fatal_boxed(
             Value::Text("PATCH_WITH_BOTH_INLINE_AND_EXTERNAL_MUTATIONS".into()),
             "patch with both inline and external mutations",
         ));
     } else {
     }
     if (Value::Bool(!(s7).truthy())).truthy() {
-        return Err(ValidationError::fatal(
+        return Err(ValidationError::fatal_boxed(
             Value::Text("MISSING_PATCH_SNAPSHOT_MAC".into()),
             "missing patch snapshot mac",
         ));
     } else {
     }
     if (Value::Bool(!(s6).truthy())).truthy() {
-        return Err(ValidationError::fatal(
+        return Err(ValidationError::fatal_boxed(
             Value::Text("MISSING_PATCH_MAC".into()),
             "missing patch mac",
         ));
@@ -289,7 +289,7 @@ pub(super) fn validate_patch_protobuf<'a>(
         let input = s5.clone();
         let mut mapped = Vec::new();
         for item in input.array()? {
-            mapped.push((|| -> Result<Value, ValidationError> {
+            mapped.push((|| -> Result<Value, Box<ValidationError>> {
                 return Ok({
                     let call_arg_0 = a0;
                     let call_arg_1 = item;
@@ -323,7 +323,7 @@ pub(super) fn validate_record_protobuf<'a>(
     transforms: &mut impl Transforms<'a>,
     a0: &Value<'a>,
     a1: &Value<'a>,
-) -> Result<Value<'a>, ValidationError> {
+) -> Result<Value<'a>, Box<ValidationError>> {
     #[allow(unused_assignments, unused_mut)]
     let mut s0 = Value::Undefined;
     #[allow(unused_assignments, unused_mut)]
@@ -359,7 +359,7 @@ pub(super) fn validate_record_protobuf<'a>(
     })
     .truthy()
     {
-        return Err(ValidationError::fatal(
+        return Err(ValidationError::fatal_boxed(
             Value::Text("MISSING_MUTATION_INDEX".into()),
             "missing mutation index",
         ));
@@ -375,7 +375,7 @@ pub(super) fn validate_record_protobuf<'a>(
     })
     .truthy()
     {
-        return Err(ValidationError::fatal(
+        return Err(ValidationError::fatal_boxed(
             Value::Text("MISSING_MUTATION_VALUE".into()),
             "missing mutation value",
         ));
@@ -399,7 +399,7 @@ pub(super) fn validate_snapshot_protobuf<'a>(
     transforms: &mut impl Transforms<'a>,
     a0: &Value<'a>,
     a1: &Value<'a>,
-) -> Result<Value<'a>, ValidationError> {
+) -> Result<Value<'a>, Box<ValidationError>> {
     #[allow(unused_assignments, unused_mut)]
     let mut s0 = Value::Undefined;
     #[allow(unused_assignments, unused_mut)]
@@ -433,7 +433,7 @@ pub(super) fn validate_snapshot_protobuf<'a>(
     })
     .truthy()
     {
-        return Err(ValidationError::fatal(
+        return Err(ValidationError::fatal_boxed(
             Value::Text("MISSING_SNAPSHOT_VERSION".into()),
             "missing snapshot version",
         ));
@@ -443,7 +443,7 @@ pub(super) fn validate_snapshot_protobuf<'a>(
         let input = s2.clone();
         let mut mapped = Vec::new();
         for item in input.array()? {
-            mapped.push((|| -> Result<Value, ValidationError> {
+            mapped.push((|| -> Result<Value, Box<ValidationError>> {
                 return Ok({
                     let call_arg_0 = a0;
                     let call_arg_1 = item;
@@ -454,7 +454,7 @@ pub(super) fn validate_snapshot_protobuf<'a>(
         Value::list(mapped)
     };
     if (Value::Bool(!(s1).truthy())).truthy() {
-        return Err(ValidationError::fatal(
+        return Err(ValidationError::fatal_boxed(
             Value::Text("MISSING_SNAPSHOT_MAC".into()),
             "missing snapshot mac",
         ));

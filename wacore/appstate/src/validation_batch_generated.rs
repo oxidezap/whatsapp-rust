@@ -88,12 +88,12 @@ pub(super) fn validate_and_type_set_mutations<'a>(
     transforms: &mut impl Transforms<'a>,
     a0: &Value<'a>,
     a1: &Value<'a>,
-) -> Result<Value<'a>, ValidationError> {
+) -> Result<Value<'a>, Box<ValidationError>> {
     return Ok({
         let input = a1.clone();
         let mut mapped = Vec::new();
         for item in input.array()? {
-            mapped.push((|| -> Result<Value, ValidationError> {
+            mapped.push((|| -> Result<Value, Box<ValidationError>> {
                 #[allow(unused_assignments, unused_mut)]
                 let mut s0 = Value::Undefined;
                 #[allow(unused_assignments, unused_mut)]
@@ -103,7 +103,7 @@ pub(super) fn validate_and_type_set_mutations<'a>(
                 s0 = transforms.decode_sync_action_data((item).field("binarySyncData")?)?;
                 s1 = (s0).field("value")?;
                 if (Value::Bool(!(s1).truthy())).truthy() {
-                    return Err(ValidationError::fatal(
+                    return Err(ValidationError::fatal_boxed(
                         Value::Text("MISSING_ACTION_VALUE".into()),
                         "missing action value",
                     ));
@@ -111,7 +111,7 @@ pub(super) fn validate_and_type_set_mutations<'a>(
                 }
                 s2 = transforms.maybe_number_or_throw_if_too_large((s1).field("timestamp")?)?;
                 if (Value::Bool((s2).nullish())).truthy() {
-                    return Err(ValidationError::fatal(
+                    return Err(ValidationError::fatal_boxed(
                         Value::Text("MISSING_ACTION_TIMESTAMP".into()),
                         "missing action timestamp",
                     ));

@@ -42,6 +42,12 @@ impl std::fmt::Display for ValidationError {
     }
 }
 impl std::error::Error for ValidationError {}
+// Generated helpers carry only a pointer on failure; unbox at the public API.
+impl From<Box<ValidationError>> for ValidationError {
+    fn from(error: Box<ValidationError>) -> Self {
+        *error
+    }
+}
 impl ValidationError {
     #[cold]
     #[inline(never)]
@@ -63,6 +69,16 @@ impl ValidationError {
             metric: None,
             message: message.into(),
         }
+    }
+    #[cold]
+    #[inline(never)]
+    pub(super) fn fatal_boxed(metric: Value<'_>, message: &str) -> Box<Self> {
+        Box::new(Self::fatal(metric, message))
+    }
+    #[cold]
+    #[inline(never)]
+    pub(super) fn dependency_boxed(class: &'static str, message: &str) -> Box<Self> {
+        Box::new(Self::dependency(class, message))
     }
 }
 impl<'a> Value<'a> {
@@ -87,7 +103,7 @@ impl<'a> Value<'a> {
         matches!(self, Self::Undefined | Self::Null)
     }
     #[inline(never)]
-    pub(super) fn field(&self, key: &str) -> Result<Self, ValidationError> {
+    pub(super) fn field(&self, key: &str) -> Result<Self, Box<ValidationError>> {
         match self {
             Self::Object(fields) => Ok(fields
                 .iter()
@@ -100,23 +116,29 @@ impl<'a> Value<'a> {
             Self::Bytes(bytes) if matches!(key, "length" | "byteLength") => {
                 Ok(Self::Number(bytes.len() as f64))
             }
-            Self::Undefined | Self::Null => Err(ValidationError::dependency(
+            Self::Undefined | Self::Null => Err(ValidationError::dependency_boxed(
                 "TypeError",
                 "field access on nullish value",
             )),
             _ => Ok(Self::Undefined),
         }
     }
-    pub(super) fn number(&self) -> Result<f64, ValidationError> {
+    pub(super) fn number(&self) -> Result<f64, Box<ValidationError>> {
         match self {
             Self::Number(n) => Ok(*n),
-            _ => Err(ValidationError::dependency("TypeError", "expected number")),
+            _ => Err(ValidationError::dependency_boxed(
+                "TypeError",
+                "expected number",
+            )),
         }
     }
-    pub(super) fn array(&self) -> Result<&[Self], ValidationError> {
+    pub(super) fn array(&self) -> Result<&[Self], Box<ValidationError>> {
         match self {
             Self::Array(a) => Ok(a),
-            _ => Err(ValidationError::dependency("TypeError", "expected array")),
+            _ => Err(ValidationError::dependency_boxed(
+                "TypeError",
+                "expected array",
+            )),
         }
     }
 }
@@ -127,26 +149,32 @@ pub(super) trait Transforms<'a> {
         &mut self,
         left: Value<'a>,
         right: Value<'a>,
-    ) -> Result<bool, ValidationError> {
+    ) -> Result<bool, Box<ValidationError>> {
         Ok(left.greater_than(&right))
     }
     fn number_or_throw_if_too_large(
         &mut self,
         value: Value<'a>,
-    ) -> Result<Value<'a>, ValidationError>;
-    fn to_sync_key_id(&mut self, value: Value<'a>) -> Result<Value<'a>, ValidationError>;
+    ) -> Result<Value<'a>, Box<ValidationError>>;
+    fn to_sync_key_id(&mut self, value: Value<'a>) -> Result<Value<'a>, Box<ValidationError>>;
     fn maybe_number_or_throw_if_too_large(
         &mut self,
         value: Value<'a>,
-    ) -> Result<Value<'a>, ValidationError> {
+    ) -> Result<Value<'a>, Box<ValidationError>> {
         if value.nullish() {
             Ok(value)
         } else {
             self.number_or_throw_if_too_large(value)
         }
     }
-    fn decode_sync_action_data(&mut self, value: Value<'a>) -> Result<Value<'a>, ValidationError>;
-    fn decode_patch_debug_data(&mut self, value: Value<'a>) -> Result<Value<'a>, ValidationError>;
+    fn decode_sync_action_data(
+        &mut self,
+        value: Value<'a>,
+    ) -> Result<Value<'a>, Box<ValidationError>>;
+    fn decode_patch_debug_data(
+        &mut self,
+        value: Value<'a>,
+    ) -> Result<Value<'a>, Box<ValidationError>>;
 }
 
 impl Value<'_> {

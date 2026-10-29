@@ -5,19 +5,22 @@ use serde_json::{Value as Json, json};
 use validation_value::{Transforms, ValidationError, Value};
 struct OracleTransforms;
 impl<'a> Transforms<'a> for OracleTransforms {
-    fn number_or_throw_if_too_large(&mut self, v: Value<'a>) -> Result<Value<'a>, ValidationError> {
+    fn number_or_throw_if_too_large(
+        &mut self,
+        v: Value<'a>,
+    ) -> Result<Value<'a>, Box<ValidationError>> {
         match v {
             Value::Number(_) => Ok(v),
-            _ => Err(ValidationError::dependency(
+            _ => Err(ValidationError::dependency_boxed(
                 "Error",
                 "numberOrThrowIfTooLarge is given a non-safe integer",
             )),
         }
     }
-    fn to_sync_key_id(&mut self, v: Value<'a>) -> Result<Value<'a>, ValidationError> {
+    fn to_sync_key_id(&mut self, v: Value<'a>) -> Result<Value<'a>, Box<ValidationError>> {
         Ok(v)
     }
-    fn decode_sync_action_data(&mut self, v: Value<'a>) -> Result<Value<'a>, ValidationError> {
+    fn decode_sync_action_data(&mut self, v: Value<'a>) -> Result<Value<'a>, Box<ValidationError>> {
         let code = match v {
             Value::Array(a) => a[0].number()? as u8,
             Value::Bytes(b) => b[0],
@@ -31,7 +34,7 @@ impl<'a> Transforms<'a> for OracleTransforms {
             4 => Value::object(vec![("timestamp", Value::Number(0.0))]),
             5 => Value::object(vec![("timestamp", Value::Number(1.0))]),
             255 => {
-                return Err(ValidationError::dependency(
+                return Err(ValidationError::dependency_boxed(
                     "Error",
                     "test decoder rejected",
                 ));
@@ -40,9 +43,9 @@ impl<'a> Transforms<'a> for OracleTransforms {
         };
         Ok(Value::object(vec![("value", value)]))
     }
-    fn decode_patch_debug_data(&mut self, v: Value<'a>) -> Result<Value<'a>, ValidationError> {
+    fn decode_patch_debug_data(&mut self, v: Value<'a>) -> Result<Value<'a>, Box<ValidationError>> {
         match v {
-            Value::Bytes([255, ..]) => Err(ValidationError::dependency(
+            Value::Bytes([255, ..]) => Err(ValidationError::dependency_boxed(
                 "Error",
                 "test decoder rejected",
             )),
@@ -213,7 +216,7 @@ fn official_batch_algorithms_match_generated_rust() {
                 if let Err(e) = &result {
                     effects.events.push(json!(["report", e.metric, true]));
                 }
-                result.map(|_| Value::Undefined)
+                result.map(|_| Value::Undefined).map_err(Box::new)
             }
             "validateNoSameIndexForMultipleMutations" => {
                 let storage: Vec<Vec<u8>> = c["input"]
@@ -242,6 +245,7 @@ fn official_batch_algorithms_match_generated_rust() {
                 };
                 batch::validate_no_same_index(&mutations, kind, &mut effects)
                     .map(|_| Value::Undefined)
+                    .map_err(Box::new)
             }
             _ => unreachable!(),
         };

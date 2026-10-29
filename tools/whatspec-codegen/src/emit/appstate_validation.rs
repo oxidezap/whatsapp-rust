@@ -17,7 +17,7 @@ pub fn generate_appstate_validation(ir: &AppstateValidationIr) -> Result<String,
             return Err("validator arity".into());
         }
         qualify_native_comparisons(name, &f.body)?;
-        out.push_str(&format!("#[allow(unused_variables)]\n#[inline(never)]\npub(super) fn {}<'a>(transforms: &mut impl Transforms<'a>, {})->Result<Value<'a>,ValidationError>{{\n",snake_case(name),(0..f.parameters).map(|i|format!("a{i}:&Value<'a>")).collect::<Vec<_>>().join(",")));
+        out.push_str(&format!("#[allow(unused_variables)]\n#[inline(never)]\npub(super) fn {}<'a>(transforms: &mut impl Transforms<'a>, {})->Result<Value<'a>,Box<ValidationError>>{{\n",snake_case(name),(0..f.parameters).map(|i|format!("a{i}:&Value<'a>")).collect::<Vec<_>>().join(",")));
         for i in owned_slots(&f.body) {
             out.push_str(&format!(
                 "#[allow(unused_assignments,unused_mut)] let mut s{i}=Value::Undefined;\n"
@@ -57,7 +57,7 @@ fn statements(body: &[S], out: &mut String) -> Result<(), String> {
                 out.push_str("}\n");
             }
             S::Fatal { metric, message } => out.push_str(&format!(
-                "return Err(ValidationError::fatal({},{}));\n",
+                "return Err(ValidationError::fatal_boxed({},{}));\n",
                 expr(metric)?,
                 rust_lit(message)
             )),
@@ -142,7 +142,7 @@ fn expr(e: &E) -> Result<String, String> {
             }
             statements(body, &mut rendered)?;
             format!(
-                "{{let input={};let mut mapped=Vec::new();for item in input.array()?{{mapped.push((||->Result<Value,ValidationError>{{{rendered}}})()?);}}Value::list(mapped)}}",
+                "{{let input={};let mut mapped=Vec::new();for item in input.array()?{{mapped.push((||->Result<Value,Box<ValidationError>>{{{rendered}}})()?);}}Value::list(mapped)}}",
                 expr(input)?
             )
         }
@@ -473,19 +473,30 @@ use validation_value::{Transforms, ValidationError, Value};
 #[derive(Default)]
 struct Host { trace: Vec<f64> }
 impl<'a> Transforms<'a> for Host {
-    fn number_or_throw_if_too_large(&mut self, value: Value<'a>) -> Result<Value<'a>, ValidationError> {
+    fn number_or_throw_if_too_large(&mut self, value: Value<'a>) -> Result<Value<'a>, Box<ValidationError>> {
         self.trace.push(value.number()?);
         Ok(value)
     }
-    fn to_sync_key_id(&mut self, value: Value<'a>) -> Result<Value<'a>, ValidationError> { Ok(value) }
-    fn decode_sync_action_data(&mut self, value: Value<'a>) -> Result<Value<'a>, ValidationError> { Ok(value) }
-    fn decode_patch_debug_data(&mut self, value: Value<'a>) -> Result<Value<'a>, ValidationError> { Ok(value) }
+    fn to_sync_key_id(&mut self, value: Value<'a>) -> Result<Value<'a>, Box<ValidationError>> { Ok(value) }
+    fn decode_sync_action_data(&mut self, value: Value<'a>) -> Result<Value<'a>, Box<ValidationError>> { Ok(value) }
+    fn decode_patch_debug_data(&mut self, value: Value<'a>) -> Result<Value<'a>, Box<ValidationError>> { Ok(value) }
 }
 fn assert_fields(result: Value<'_>) {
     assert_eq!(result.field("first").expect("first field").number().expect("first number"), 1.0);
     assert_eq!(result.field("second").expect("second field").number().expect("second number"), 2.0);
 }
 fn main() {
+    assert!(std::mem::size_of::<Result<Value<'_>, Box<ValidationError>>>()
+        < std::mem::size_of::<Result<Value<'_>, ValidationError>>());
+    let boxed = ValidationError::fatal_boxed(Value::Text("metric".into()), "failure");
+    let metric_address = boxed.metric.as_ref().expect("metric").as_ptr();
+    let message_address = boxed.message.as_ptr();
+    let error = ValidationError::from(boxed);
+    assert_eq!(error.class, "SyncdFatalError");
+    assert_eq!(error.metric.as_deref(), Some("metric"));
+    assert_eq!(error.message, "failure");
+    assert_eq!(error.metric.as_ref().expect("metric").as_ptr(), metric_address);
+    assert_eq!(error.message.as_ptr(), message_address);
     let mut host = Host::default();
     assert_fields(generated::capture_probe(&mut host).expect("argument snapshot"));
     assert!(host.trace.is_empty());

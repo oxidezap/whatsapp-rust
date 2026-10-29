@@ -314,7 +314,7 @@ impl<'a> Transforms<'a> for NativeTransforms {
         &mut self,
         left: Value<'a>,
         right: Value<'a>,
-    ) -> Result<bool, ValidationError> {
+    ) -> Result<bool, Box<ValidationError>> {
         // The emitter proves these operands are integer literals or lengths
         // of ordinary arrays supplied by this typed protobuf adapter.
         Ok(left.number()? > right.number()?)
@@ -322,40 +322,46 @@ impl<'a> Transforms<'a> for NativeTransforms {
     fn number_or_throw_if_too_large(
         &mut self,
         value: Value<'a>,
-    ) -> Result<Value<'a>, ValidationError> {
+    ) -> Result<Value<'a>, Box<ValidationError>> {
         match value {
             Value::Number(_) => Ok(value),
-            _ => Err(ValidationError::dependency(
+            _ => Err(ValidationError::dependency_boxed(
                 "Error",
                 "numberOrThrowIfTooLarge is given a non-safe integer",
             )),
         }
     }
-    fn to_sync_key_id(&mut self, value: Value<'a>) -> Result<Value<'a>, ValidationError> {
+    fn to_sync_key_id(&mut self, value: Value<'a>) -> Result<Value<'a>, Box<ValidationError>> {
         Ok(value)
     }
-    fn decode_patch_debug_data(&mut self, value: Value<'a>) -> Result<Value<'a>, ValidationError> {
+    fn decode_patch_debug_data(
+        &mut self,
+        value: Value<'a>,
+    ) -> Result<Value<'a>, Box<ValidationError>> {
         let Value::Bytes(bytes) = value else {
-            return Err(ValidationError::dependency(
+            return Err(ValidationError::dependency_boxed(
                 "TypeError",
                 "expected debug bytes",
             ));
         };
         self.debug_data = Some(
             waproto::codec::patch_debug_data_decode(bytes)
-                .map_err(|e| ValidationError::dependency("DecodeError", &e.to_string()))?,
+                .map_err(|e| ValidationError::dependency_boxed("DecodeError", &e.to_string()))?,
         );
         Ok(object(vec![]))
     }
-    fn decode_sync_action_data(&mut self, value: Value<'a>) -> Result<Value<'a>, ValidationError> {
+    fn decode_sync_action_data(
+        &mut self,
+        value: Value<'a>,
+    ) -> Result<Value<'a>, Box<ValidationError>> {
         let Value::Bytes(bytes) = value else {
-            return Err(ValidationError::dependency(
+            return Err(ValidationError::dependency_boxed(
                 "TypeError",
                 "expected action bytes",
             ));
         };
         let action = waproto::codec::sync_action_data_decode(bytes)
-            .map_err(|e| ValidationError::dependency("DecodeError", &e.to_string()))?;
+            .map_err(|e| ValidationError::dependency_boxed("DecodeError", &e.to_string()))?;
         let value = action.value.as_option().map_or(Value::Undefined, |value| {
             object(vec![(
                 "timestamp",
