@@ -107,9 +107,21 @@ const PLAYOUT_DRAIN: usize = 320;
 /// 60ms @ 16kHz: the peer packet size the playout constants were written for, and the assumption
 /// used until the first decode reports what the peer actually sends.
 const OPUS_FRAME_SAMPS_60MS: usize = 960;
-/// ~150ms latency ceiling for a 60ms peer frame; a burst past this resyncs (drops oldest) instead
+/// ~400ms latency ceiling for a 60ms peer frame; a burst past this resyncs (drops oldest) instead
 /// of lagging. The floor for [`playout_bounds`], which scales it to the peer's packet.
-const PLAYOUT_CAP: usize = 2400;
+///
+/// It was ~150ms, 30ms above [`PLAYOUT_TARGET`]: a packet arriving 30ms early was enough to trim
+/// queued speech, and ordinary relay jitter does that many times a minute. One 88s call to a linked
+/// device trimmed 76,640 samples (4.8s of the caller's speech, `playout_trimmed_samples`) with no
+/// packet loss at all. A trim is audible as a chop; the extra ceiling only costs latency during the
+/// burst that would have been trimmed.
+const PLAYOUT_CAP: usize = 6400;
+/// Room above the prime target before a burst is trimmed (280ms). Sized so a 60ms peer lands
+/// exactly on [`PLAYOUT_CAP`] (1920 + 4480 = 6400) and the ceiling still scales with the packet,
+/// so the 120ms and 60ms ceilings stay a full packet apart: [`effective_playout_cap`] gives the
+/// difference back one packet at a time, and with less than that between them the first step
+/// would land on the smaller ceiling and trim a backlog that was legal under the larger one.
+const PLAYOUT_HEADROOM: usize = 4480;
 /// Prebuffer target: prime playout until the jitter buffer holds two 60ms peer frames, so the
 /// steady-state buffer never drains below one frame (a 60ms cushion that absorbs the relay's
 /// inter-arrival jitter). Priming to a single frame is a zero cushion: that one frame drains away
@@ -123,10 +135,10 @@ const PLAYOUT_TARGET: usize = 1920;
 /// A 120ms packet is a full [`PLAYOUT_TARGET`] on its own, so priming would end on the first one
 /// with no cushion at all, and two in flight would exceed [`PLAYOUT_CAP`] and be trimmed on arrival.
 /// Keep the same shape instead: prime to two packets so the steady-state buffer never drains below
-/// one, and let the ceiling hold that cushion plus a drain slice.
+/// one, and let the ceiling hold that cushion plus [`PLAYOUT_HEADROOM`] of jitter.
 fn playout_bounds(packet_samps: usize) -> (usize, usize) {
     let target = PLAYOUT_TARGET.max(packet_samps.saturating_mul(2));
-    (target, PLAYOUT_CAP.max(target + PLAYOUT_DRAIN))
+    (target, PLAYOUT_CAP.max(target + PLAYOUT_HEADROOM))
 }
 
 /// The ceiling to enforce now, given the one in force, the peer's current packet and what is queued.
@@ -8261,23 +8273,25 @@ mod tests {
 
         let mut peer_tx = peer_pipeline();
         let body: Vec<u8> = core::iter::once(0x58u8).chain(0..80u8).collect();
-        for n in 0..10u64 {
+        let ceiling = playout_bounds(2 * SAMPLES as usize).1;
+        let rescued_packets = u32::try_from(ceiling / SAMPLES as usize + 1).unwrap();
+        let packets = 4 + rescued_packets;
+        for n in 0..u64::from(packets) {
             let packet = peer_tx.protect_audio(&body);
             eng.handle_input(1 + n * 60, Input::RelayPacket(&packet));
             let _ = drain(&mut eng);
         }
         assert_eq!(eng.active_audio_codec(), Some(AudioCodec::Opus));
         let stats = eng.media_stats();
-        // Exact, not "greater than zero": a rescue that recovered one packet in ten would satisfy a
-        // loose assertion and sound exactly as broken as no rescue at all.
+        // A rescue that recovers only one packet would satisfy a loose assertion
+        // but still sound broken. Count every packet after the switch.
         //
         // Four packets are spent before the switch -- one to give the timestamps a difference to
-        // measure, then three agreeing ones -- and every packet after it decodes. Ten in, four
-        // concealed, six rescued, and the two numbers have to add up to the packets received.
-        assert_eq!(stats.rtp_received, 10);
+        // measure, then three agreeing ones -- and every packet after it decodes.
+        assert_eq!(stats.rtp_received, packets);
         assert_eq!(
             (stats.audio_frames_concealed, stats.foreign_frames_decoded),
-            (4, 6),
+            (4, rescued_packets),
             "every packet after the switch must decode, got {stats:?}"
         );
         assert_eq!(stats.codec_switches, 1);
@@ -8285,26 +8299,14 @@ mod tests {
             stats.audio_frames_without_decoder, 0,
             "a rescued call never reports a missing decoder"
         );
-        // The first ten packets fit the larger jitter ceiling. Keep feeding rescued audio without
-        // a playout tick so this fixture still exercises the feed-side bound and trim accounting.
-        for n in 10..20u64 {
-            let packet = peer_tx.protect_audio(&body);
-            eng.handle_input(1 + n * 60, Input::RelayPacket(&packet));
-            let _ = drain(&mut eng);
-        }
-        let stats = eng.media_stats();
-        assert_eq!(stats.rtp_received, 20);
-        assert_eq!(
-            (stats.audio_frames_concealed, stats.foreign_frames_decoded),
-            (4, 16),
-        );
-        // The rescued samples go into the same buffer the MLOW path feeds, under the same ceiling.
+        // The rescued samples go into the SAME buffer the MLOW path feeds, under the same ceiling:
+        // enqueue more decoded samples than the larger ceiling with no playout
+        // tick in between, so the feed-side bound must trim and count the excess.
         assert!(eng.jitter_len() > 0, "decoded samples reach playout");
         // The ceiling in force is the one the MLOW reading left behind: those first four packets
         // declared 120 ms (TOC 0x58 under that grammar), so the cushion grew to fit them, and it
         // only comes back down once the backlog fits underneath -- otherwise dropping to a shorter
         // packet would trim audio that was legally queued under the previous bound.
-        let ceiling = playout_bounds(2 * SAMPLES as usize).1;
         assert!(
             eng.jitter_len() <= ceiling,
             "the rescued path is bounded by the ceiling in force ({ceiling}), got {}",
@@ -8885,12 +8887,12 @@ mod tests {
             }
         }
         // The number is the assertion because the loss is a prefix of the buffer, not a failure:
-        // purging unconditionally gives 1920 here, keeping what decoded gives 2400. Two 60ms packets
-        // of real speech in this fixture -- less than an unconditional purge costs a call whose
-        // buffer is fuller, and enough to fail if the condition is dropped.
+        // keeping what decoded gives all six 60ms packets (6 x 960 = 5760), which fit under the
+        // playout ceiling, and an unconditional purge loses the corroboration window from that
+        // count. Enough to fail if the condition is dropped.
         let decoded = heard.iter().filter(|s| **s == 1234).count();
         assert_eq!(
-            decoded, 2400,
+            decoded, 5760,
             "the packets decoded before the verdict have to survive it"
         );
     }

@@ -9033,3 +9033,660 @@ async fn wait_for_startup_sync_succeeds_when_history_tasks_finish() {
         .await
         .expect("an idle activity tracker is a completed startup sync");
 }
+
+/// A chat lane whose receiver the test owns: it decides when — or whether —
+/// the queued messages are processed, which is the only way to hold a resume's
+/// gate closed on purpose.
+fn detached_chat_lane(
+    client: &Arc<Client>,
+    items: usize,
+) -> (ChatLane, async_channel::Receiver<QueuedChatMessage>) {
+    let (queue_tx, queue_rx) = async_channel::bounded(items);
+    (
+        ChatLane {
+            generation: client.connection_generation.load(Ordering::Acquire),
+            queue_tx,
+            enqueue_lock: Arc::default(),
+            worker_running: Arc::default(),
+            byte_budget: Arc::new(crate::inbound_queue::ByteBudget::new(
+                crate::inbound_queue::CHAT_BYTES,
+            )),
+            global_budget: Arc::clone(&client.inbound_queues().chat),
+            work: Arc::default(),
+        },
+        queue_rx,
+    )
+}
+
+/// The `<ib><offline_batch count>` requests the client actually wrote, read
+/// back from the frames the noise sender published: what the server saw, not
+/// what the coordinator believes it asked for.
+fn offline_batch_requests(recorder: &crate::test_utils::SentFrameRecorder) -> Vec<u32> {
+    recorder
+        .frames()
+        .iter()
+        .filter_map(|frame| {
+            let node = wacore_binary::marshal::unmarshal_packed_ref(&frame[..]).ok()?;
+            if node.tag.as_ref() != "ib" {
+                return None;
+            }
+            let batch = node.get_optional_child("offline_batch")?;
+            batch
+                .attrs()
+                .optional_u64("count")
+                .map(|count| count as u32)
+        })
+        .collect()
+}
+
+fn offline_preview(total: usize) -> Node {
+    NodeBuilder::new("ib")
+        .children([NodeBuilder::new("offline_preview")
+            .attr("count", total.to_string())
+            .build()])
+        .build()
+}
+
+/// One offline-delivered message. A kilobyte of payload keeps the chat byte
+/// budget far from its limit, so the item limit is what a lane runs into.
+fn offline_message(chat: &Jid, id: usize) -> Arc<OwnedNodeRef> {
+    node_to_owned_ref(
+        NodeBuilder::new("message")
+            .attr("from", chat.clone())
+            .attr("id", format!("OFFLINE-{id}"))
+            .attr("offline", "1")
+            .attr("type", "text")
+            .bytes(vec![id as u8; 1024])
+            .build(),
+    )
+}
+
+/// The review case of whatsapp-rust#1814: a 1,000-item backlog pulled in
+/// batches of 200 towards one chat whose worker never runs.
+///
+/// Two batches fit a lane (`2 * BATCH_SIZE <= CHAT_QUEUE_ITEMS`); the third
+/// request may only leave once the lane is done with what it already holds, so
+/// the overload the review reproduced with three captured requests is
+/// unreachable.
+#[tokio::test]
+async fn a_blocked_lane_is_never_handed_more_than_two_pulled_batches() {
+    let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+    // A resume runs in drain mode; the fixture's default is the steady state.
+    client.enter_drain_mode_for_tests();
+    let recorder = Arc::new(crate::test_utils::SentFrameRecorder::default());
+    let _subscription = client.subscribe_handler(recorder.clone());
+    let _lease = client.acquire_sent_frame_forwarding();
+
+    let chat: Jid = "120363000000000042@g.us".parse().unwrap();
+    // Nothing polls this lane, so nothing handed to it can finish.
+    let (lane, queued) = detached_chat_lane(&client, crate::inbound_queue::CHAT_QUEUE_ITEMS);
+    client.chat_lanes.insert(chat.clone(), lane.clone()).await;
+
+    client
+        .process_node(node_to_owned_ref(offline_preview(1_000)))
+        .await;
+    crate::test_utils::poll_until("the resume's first batch request", || {
+        offline_batch_requests(&recorder).len() == 1
+    })
+    .await;
+
+    let mut deepest = 0;
+    for id in 0..200 {
+        client.process_node(offline_message(&chat, id)).await;
+        deepest = deepest.max(lane.queue_tx.len());
+    }
+    crate::test_utils::poll_until("the first batch's continuation", || {
+        offline_batch_requests(&recorder).len() == 2
+    })
+    .await;
+
+    for id in 200..400 {
+        client.process_node(offline_message(&chat, id)).await;
+        deepest = deepest.max(lane.queue_tx.len());
+    }
+    // Longer than the continuation's 100 ms debounce: this batch's request may
+    // only be deferred, never sent on top of two unprocessed ones.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        offline_batch_requests(&recorder),
+        vec![200, 200],
+        "the first request and exactly one continuation; a third would land on a lane \
+         that has processed neither batch"
+    );
+    assert_eq!(
+        lane.queue_tx.len(),
+        400,
+        "both pulled batches are queued and neither is processed"
+    );
+    assert!(
+        deepest <= 400,
+        "a lane peaked at {deepest} items, past the two batches it is sized for"
+    );
+    assert!(
+        !client.inbound_queues().draining.load(Ordering::Acquire),
+        "no message was refused, so the overload drain must never start"
+    );
+
+    // The lane finishes with both batches: the request the debounce had to
+    // defer leaves on the state that opens the gate, not on another stanza
+    // arriving. Nothing else was asked for, so it stays at three.
+    while let Ok(message) = queued.try_recv() {
+        drop(message);
+    }
+    crate::test_utils::poll_until("the deferred third batch request", || {
+        offline_batch_requests(&recorder).len() == 3
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        offline_batch_requests(&recorder).len(),
+        3,
+        "exactly one deferred request, released once"
+    );
+}
+
+/// The other direction, and the behaviour that must not change: a lane that
+/// keeps up still gets its continuation after the debounce.
+#[tokio::test]
+async fn a_lane_that_keeps_up_still_gets_its_continuation() {
+    let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+    // A resume runs in drain mode; the fixture's default is the steady state.
+    client.enter_drain_mode_for_tests();
+    let recorder = Arc::new(crate::test_utils::SentFrameRecorder::default());
+    let _subscription = client.subscribe_handler(recorder.clone());
+    let _lease = client.acquire_sent_frame_forwarding();
+
+    let chat: Jid = "120363000000000043@g.us".parse().unwrap();
+    let (lane, queued) = detached_chat_lane(&client, crate::inbound_queue::CHAT_QUEUE_ITEMS);
+    client.chat_lanes.insert(chat.clone(), lane).await;
+    // A worker that keeps up: everything it is handed is finished at once.
+    let worker = tokio::spawn(async move {
+        while let Ok(message) = queued.recv().await {
+            drop(message);
+        }
+    });
+
+    client
+        .process_node(node_to_owned_ref(offline_preview(1_000)))
+        .await;
+    crate::test_utils::poll_until("the resume's first batch request", || {
+        offline_batch_requests(&recorder).len() == 1
+    })
+    .await;
+
+    for id in 0..200 {
+        client.process_node(offline_message(&chat, id)).await;
+    }
+
+    crate::test_utils::poll_until("the continuation batch", || {
+        offline_batch_requests(&recorder).len() == 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        offline_batch_requests(&recorder).len(),
+        2,
+        "one continuation for one batch, and no more once nothing else arrives"
+    );
+    worker.abort();
+}
+
+/// S3/S6(b): the pacing follows each queued message, so no path that ends one
+/// — processed, cancelled, refused, or dropped with its queue — can leave the
+/// resume waiting on a message its lane already let go.
+#[tokio::test]
+async fn offline_admissions_are_settled_by_every_way_a_queued_message_ends() {
+    let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+    client.enter_drain_mode_for_tests();
+    let chat: Jid = "120363000000000044@g.us".parse().unwrap();
+    // Two slots, so the third message is refused at admission.
+    let (lane, queued) = detached_chat_lane(&client, 2);
+    client.chat_lanes.insert(chat.clone(), lane.clone()).await;
+
+    client
+        .process_node(node_to_owned_ref(offline_preview(10)))
+        .await;
+    crate::test_utils::poll_until("the resume to arm", || client.offline_batch.is_armed()).await;
+    assert_eq!(
+        client.offline_batch.outstanding(),
+        10,
+        "the first request booked the ten stanzas the preview announced"
+    );
+
+    // 1-2. Admitted: two messages own two of those stanzas until their lane is
+    // done with them.
+    for id in 0..2 {
+        client.process_node(offline_message(&chat, id)).await;
+        assert_eq!(client.offline_batch.admitted(), id + 1);
+        assert_eq!(
+            client.offline_batch.outstanding(),
+            10,
+            "arriving does not settle a message its lane now holds"
+        );
+    }
+
+    // 3. Cancelled before a lane: the guard settles the stanza anyway, since
+    // its arrival consumed one and the lane never will.
+    client.notify_connection_shutdown();
+    client.process_node(offline_message(&chat, 2)).await;
+    assert_eq!(
+        (
+            client.offline_batch.admitted(),
+            client.offline_batch.outstanding()
+        ),
+        (2, 9),
+        "a cancelled message settles its own stanza and holds nothing"
+    );
+    client.reset_connection_shutdown();
+
+    // 4. Cancelled after admission: a lane that drops a queued message without
+    // processing it (a worker that outlived its connection does exactly this).
+    drop(queued.try_recv().expect("the lane holds both messages"));
+    assert_eq!(
+        (
+            client.offline_batch.admitted(),
+            client.offline_batch.outstanding()
+        ),
+        (1, 8),
+        "an admitted message settles when its queue entry is dropped"
+    );
+
+    // 5-6. Refused: the lane hands the message straight back, and dropping it
+    // is what settles the gate.
+    client.process_node(offline_message(&chat, 3)).await;
+    assert_eq!(
+        (
+            client.offline_batch.admitted(),
+            client.offline_batch.outstanding()
+        ),
+        (2, 8),
+        "the lane is full again"
+    );
+    let generation = client.connection_generation.load(Ordering::Acquire);
+    let node = offline_message(&chat, 4);
+    let offline = client.offline_batch.admit(generation, &node);
+    assert_eq!(client.offline_batch.admitted(), 3);
+    match lane
+        .enqueue_scoped(
+            node,
+            client.connection_shutdown_signal(),
+            &*client.runtime,
+            offline,
+        )
+        .await
+    {
+        Err(async_channel::TrySendError::Full(refused)) => drop(refused),
+        Err(async_channel::TrySendError::Closed(_)) => panic!("the queue is still open"),
+        Ok(()) => panic!("a full lane must refuse the message"),
+    }
+    assert_eq!(
+        (
+            client.offline_batch.admitted(),
+            client.offline_batch.outstanding()
+        ),
+        (2, 7),
+        "a refused message settles when the queue gives it back"
+    );
+
+    // 7. Dropped with its queue: a teardown settles every admission with it.
+    client.chat_lanes.clear().await;
+    drop(lane);
+    drop(queued);
+    assert_eq!(
+        (
+            client.offline_batch.admitted(),
+            client.offline_batch.outstanding()
+        ),
+        (0, 5),
+        "the teardown's dropped queue settles the admissions it still held"
+    );
+}
+
+/// Verify round 1, blocker (1), as a named regression: a batch may take
+/// longer to arrive than the continuation's 100 ms debounce.
+///
+/// One stanza of the first batch is all that arrives before the timer fires, so
+/// the second request is sent with 199 stanzas of the first batch still owed.
+/// The first stanza of the second batch must therefore not release a third
+/// request: 201 queued plus 199 still owed already fill the 400 bound.
+#[tokio::test]
+async fn a_slow_batch_delivery_cannot_pull_a_third_batch_early() {
+    let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+    client.enter_drain_mode_for_tests();
+    let recorder = Arc::new(crate::test_utils::SentFrameRecorder::default());
+    let _subscription = client.subscribe_handler(recorder.clone());
+    let _lease = client.acquire_sent_frame_forwarding();
+    let chat: Jid = "120363000000000045@g.us".parse().unwrap();
+    let (lane, _queued) = detached_chat_lane(&client, crate::inbound_queue::CHAT_QUEUE_ITEMS);
+    client.chat_lanes.insert(chat.clone(), lane.clone()).await;
+
+    client
+        .process_node(node_to_owned_ref(offline_preview(1_000)))
+        .await;
+    crate::test_utils::poll_until("the resume's first batch request", || {
+        offline_batch_requests(&recorder).len() == 1
+    })
+    .await;
+
+    // Only the first stanza of batch one arrives before the timer fires.
+    client.process_node(offline_message(&chat, 0)).await;
+    crate::test_utils::poll_until("the first batch's continuation", || {
+        offline_batch_requests(&recorder).len() == 2
+    })
+    .await;
+    for id in 1..200 {
+        client.process_node(offline_message(&chat, id)).await;
+    }
+    // Longer than the debounce, then the first stanza of batch two.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    client.process_node(offline_message(&chat, 200)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        offline_batch_requests(&recorder),
+        vec![200, 200],
+        "201 queued plus the 199 the last request still owed already fill the 400 bound"
+    );
+    assert_eq!(lane.queue_tx.len(), 201);
+}
+
+/// Verify round 1, blocker (4), as a named regression: a drain that is parked
+/// by our own backpressure is not a drain the *server* stopped feeding.
+///
+/// The inactivity watchdog used to complete the resume after a minute of a
+/// blocked lane, and the completion then suppressed the request that processing
+/// would release — the third batch never left.
+#[tokio::test(start_paused = true)]
+async fn backpressure_outliving_the_watchdog_resumes_after_processing() {
+    let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+    client.enter_drain_mode_for_tests();
+    let recorder = Arc::new(crate::test_utils::SentFrameRecorder::default());
+    let _subscription = client.subscribe_handler(recorder.clone());
+    let _lease = client.acquire_sent_frame_forwarding();
+    let chat: Jid = "120363000000000046@g.us".parse().unwrap();
+    let (lane, queued) = detached_chat_lane(&client, crate::inbound_queue::CHAT_QUEUE_ITEMS);
+    client.chat_lanes.insert(chat.clone(), lane).await;
+
+    client
+        .process_node(node_to_owned_ref(offline_preview(1_000)))
+        .await;
+    crate::test_utils::poll_until("the resume's first batch request", || {
+        offline_batch_requests(&recorder).len() == 1
+    })
+    .await;
+    for id in 0..200 {
+        client.process_node(offline_message(&chat, id)).await;
+    }
+    crate::test_utils::poll_until("the first batch's continuation", || {
+        offline_batch_requests(&recorder).len() == 2
+    })
+    .await;
+    for id in 200..400 {
+        client.process_node(offline_message(&chat, id)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        offline_batch_requests(&recorder),
+        vec![200, 200],
+        "the third request is deferred while two batches are unprocessed"
+    );
+
+    // Two watchdog windows pass with the lane still blocked.
+    tokio::time::sleep(Duration::from_secs(121)).await;
+    assert!(
+        !client.offline_sync_completed.load(Ordering::Acquire),
+        "a drain we are holding back is not a drain the server stopped feeding"
+    );
+    assert_ne!(
+        client.offline_batch.stanza_activity(),
+        u64::MAX,
+        "a drain held open by backpressure is not left claimed as inactive"
+    );
+
+    // Processing catches up: the deferred request leaves, and the resume is
+    // still the one that was parked.
+    while let Ok(message) = queued.try_recv() {
+        drop(message);
+    }
+    crate::test_utils::poll_until("the deferred third batch request", || {
+        offline_batch_requests(&recorder).len() == 3
+    })
+    .await;
+    assert!(
+        !client.offline_sync_completed.load(Ordering::Acquire),
+        "the parked resume must not have been completed on the way"
+    );
+}
+
+/// One offline receipt: a stanza no lane holds, finished as it is handled.
+fn offline_receipt(chat: &Jid, id: usize) -> Arc<OwnedNodeRef> {
+    node_to_owned_ref(
+        NodeBuilder::new("receipt")
+            .attr("from", chat.clone())
+            .attr("id", format!("R-{id}"))
+            .attr("offline", "1")
+            .build(),
+    )
+}
+
+/// Review of whatsapp-rust#1814: durable group notifications are queued in the
+/// group's chat lane next to its messages, so they count against the same
+/// two-batch bound and finish when the lane is done with them.
+#[tokio::test]
+async fn group_notifications_queued_in_a_lane_obey_the_same_bound() {
+    struct Durable;
+    #[async_trait::async_trait]
+    impl crate::GroupNotificationDurabilityHook for Durable {
+        async fn on_notification(&self, _: Arc<OwnedNodeRef>) -> Result<()> {
+            Ok(())
+        }
+    }
+    let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+    client.enter_drain_mode_for_tests();
+    assert!(
+        client
+            .group_notification_durability_hook
+            .set(Arc::new(Durable))
+            .is_ok()
+    );
+    let recorder = Arc::new(crate::test_utils::SentFrameRecorder::default());
+    let _subscription = client.subscribe_handler(recorder.clone());
+    let _lease = client.acquire_sent_frame_forwarding();
+    let chat: Jid = "120363000000000048@g.us".parse().unwrap();
+    let (lane, queued) = detached_chat_lane(&client, crate::inbound_queue::CHAT_QUEUE_ITEMS);
+    client.chat_lanes.insert(chat.clone(), lane.clone()).await;
+
+    client
+        .process_node(node_to_owned_ref(offline_preview(1_000)))
+        .await;
+    crate::test_utils::poll_until("the resume's first batch request", || {
+        offline_batch_requests(&recorder).len() == 1
+    })
+    .await;
+    for batch in 0..2 {
+        for id in batch * 200..(batch + 1) * 200 {
+            let notification = node_to_owned_ref(
+                NodeBuilder::new("notification")
+                    .attr("from", chat.clone())
+                    .attr("type", "w:gp2")
+                    .attr("id", format!("N-{id}"))
+                    .attr("offline", "1")
+                    .build(),
+            );
+            client
+                .process_decrypted_node(Arc::try_unwrap(notification).unwrap())
+                .await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    assert_eq!(lane.queue_tx.len(), 400, "both batches are in the lane");
+    assert_eq!(
+        offline_batch_requests(&recorder),
+        vec![200, 200],
+        "a lane holding two batches of group notifications must not pull a third"
+    );
+
+    while let Ok(notification) = queued.try_recv() {
+        drop(notification);
+    }
+    crate::test_utils::poll_until("the third batch request", || {
+        offline_batch_requests(&recorder).len() == 3
+    })
+    .await;
+}
+
+/// Review of whatsapp-rust#1814: a watchdog window without a stanza does not
+/// mean the server dropped what it still owes. The resume completes as it did
+/// before pacing, but no request leaves on top of the late responses, so they
+/// can never add up to a third batch in one lane.
+#[tokio::test(start_paused = true)]
+async fn silence_does_not_forgive_responses_the_server_still_owes() {
+    let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+    client.enter_drain_mode_for_tests();
+    let recorder = Arc::new(crate::test_utils::SentFrameRecorder::default());
+    let _subscription = client.subscribe_handler(recorder.clone());
+    let _lease = client.acquire_sent_frame_forwarding();
+    let chat: Jid = "120363000000000049@g.us".parse().unwrap();
+    let (lane, _queued) = detached_chat_lane(&client, crate::inbound_queue::CHAT_QUEUE_ITEMS);
+    client.chat_lanes.insert(chat.clone(), lane.clone()).await;
+
+    client
+        .process_node(node_to_owned_ref(offline_preview(1_000)))
+        .await;
+    crate::test_utils::poll_until("the resume's first batch request", || {
+        offline_batch_requests(&recorder).len() == 1
+    })
+    .await;
+    client.process_node(offline_receipt(&chat, 0)).await;
+    crate::test_utils::poll_until("the first batch's continuation", || {
+        offline_batch_requests(&recorder).len() == 2
+    })
+    .await;
+    // The second batch's first stanza parks the third request: 398 are owed.
+    client.process_node(offline_receipt(&chat, 1)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    tokio::time::sleep(Duration::from_secs(121)).await;
+    assert!(
+        client.offline_sync_completed.load(Ordering::Acquire),
+        "with nothing in a lane, silence still completes the resume"
+    );
+    assert_eq!(
+        offline_batch_requests(&recorder),
+        vec![200, 200],
+        "silence must not release a request while 398 stanzas are still owed"
+    );
+
+    // The late responses arrive after all; nothing else was asked for.
+    for id in 0..398 {
+        client.process_node(offline_message(&chat, id)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(offline_batch_requests(&recorder), vec![200, 200]);
+    assert_eq!(lane.queue_tx.len(), 398);
+}
+
+/// Review of whatsapp-rust#1814: a message a stanza interceptor claims never
+/// reaches a lane, so it finishes when it is claimed. Otherwise the resume
+/// would wait on a guard that never exists until the watchdog gave up.
+#[tokio::test]
+async fn interceptor_claimed_offline_messages_finish_when_claimed() {
+    let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+    client.enter_drain_mode_for_tests();
+    let recorder = Arc::new(crate::test_utils::SentFrameRecorder::default());
+    let _subscription = client.subscribe_handler(recorder.clone());
+    let _lease = client.acquire_sent_frame_forwarding();
+    let (interceptor, _seen) = self::recorder("message");
+    let _interceptor = client.add_stanza_interceptor(interceptor);
+    let chat: Jid = "120363000000000050@g.us".parse().unwrap();
+
+    client
+        .process_node(node_to_owned_ref(offline_preview(1_000)))
+        .await;
+    crate::test_utils::poll_until("the resume's first batch request", || {
+        offline_batch_requests(&recorder).len() == 1
+    })
+    .await;
+    for id in 0..200 {
+        client.process_node(offline_message(&chat, id)).await;
+    }
+    crate::test_utils::poll_until("the first batch's continuation", || {
+        offline_batch_requests(&recorder).len() == 2
+    })
+    .await;
+    for id in 200..400 {
+        client.process_node(offline_message(&chat, id)).await;
+    }
+    crate::test_utils::poll_until("the second batch's continuation", || {
+        offline_batch_requests(&recorder).len() == 3
+    })
+    .await;
+    assert_eq!(offline_batch_requests(&recorder), vec![200, 200, 200]);
+    assert_eq!(
+        client.offline_batch.outstanding(),
+        200,
+        "only the third request is still owed"
+    );
+}
+
+/// Greptile's review of whatsapp-rust#1814: a request released after a long
+/// block starts a fresh inactivity window.
+///
+/// Without it, a release landing just before a watchdog tick lets the next
+/// tick find an unchanged activity counter, complete the resume, and from then
+/// on every continuation is suppressed — the third batch would never be
+/// answered.
+#[tokio::test(start_paused = true)]
+async fn a_released_request_restarts_the_watchdog_window() {
+    let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+    client.enter_drain_mode_for_tests();
+    let recorder = Arc::new(crate::test_utils::SentFrameRecorder::default());
+    let _subscription = client.subscribe_handler(recorder.clone());
+    let _lease = client.acquire_sent_frame_forwarding();
+    let chat: Jid = "120363000000000051@g.us".parse().unwrap();
+    let (lane, queued) = detached_chat_lane(&client, crate::inbound_queue::CHAT_QUEUE_ITEMS);
+    client.chat_lanes.insert(chat.clone(), lane).await;
+
+    client
+        .process_node(node_to_owned_ref(offline_preview(1_000)))
+        .await;
+    crate::test_utils::poll_until("the resume's first batch request", || {
+        offline_batch_requests(&recorder).len() == 1
+    })
+    .await;
+    for id in 0..200 {
+        client.process_node(offline_message(&chat, id)).await;
+    }
+    crate::test_utils::poll_until("the first batch's continuation", || {
+        offline_batch_requests(&recorder).len() == 2
+    })
+    .await;
+    for id in 200..400 {
+        client.process_node(offline_message(&chat, id)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(offline_batch_requests(&recorder), vec![200, 200]);
+
+    // Two watchdog windows pass with the lane still blocked, then the lane
+    // drains just before the third one fires.
+    tokio::time::sleep(Duration::from_secs(179)).await;
+    while let Ok(message) = queued.try_recv() {
+        drop(message);
+    }
+    crate::test_utils::poll_until("the released third batch request", || {
+        offline_batch_requests(&recorder).len() == 3
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    assert!(
+        !client.offline_sync_completed.load(Ordering::Acquire),
+        "a tick right after the release must not complete a resume whose batch just left"
+    );
+    assert_eq!(
+        client.offline_batch.outstanding(),
+        200,
+        "and the response it is waiting for is still owed"
+    );
+}

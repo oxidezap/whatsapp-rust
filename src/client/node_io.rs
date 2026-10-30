@@ -101,6 +101,15 @@ fn is_status_broadcast_stanza(node: &wacore_binary::NodeRef<'_>) -> bool {
     from_jid_matches(node, |jid| jid.is_status_broadcast())
 }
 
+/// Whether dispatch hands this stanza to the message handler, which queues it
+/// in a chat lane. The same split `dispatch_node_scoped` makes; the offline
+/// resume relies on it to know which stanzas finish on arrival and which finish
+/// when their lane lets go of them.
+fn reaches_message_handler(tag: Option<StanzaTag>, node: &wacore_binary::NodeRef<'_>) -> bool {
+    tag == Some(StanzaTag::Message)
+        || (tag == Some(StanzaTag::Status) && is_status_broadcast_stanza(node))
+}
+
 fn group_repair_time_left(
     ack_at: wacore::time::Instant,
     now: wacore::time::Instant,
@@ -610,7 +619,13 @@ impl Client {
                 // remaining drops to <=C and no batch request is in flight,
                 // schedule the next one.
                 let pending = total.saturating_sub(processed);
-                offline_resume::on_offline_stanza_arrived(self, pending);
+                // A stanza reaching a lane settles when the guard on its queue
+                // entry drops, not here, so its arrival cannot be counted twice
+                // or lost between the two. Durable group notifications share
+                // the chat lane with messages, so they count against the same
+                // bound.
+                let lane_bound = group_scope.is_some() || reaches_message_handler(tag, nr);
+                offline_resume::on_offline_stanza_arrived(self, pending, lane_bound);
 
                 if processed >= total {
                     let elapsed = match self.offline_sync_metrics.start_time.lock() {
@@ -786,6 +801,12 @@ impl Client {
                 })
             {
                 self.maybe_deferred_ack(node, shutdown).await;
+            }
+            // Its arrival was left for a lane guard that will never exist:
+            // whoever claimed it has finished with it as far as the resume's
+            // pacing is concerned.
+            if nr.get_attr("offline").is_some() && reaches_message_handler(tag, nr) {
+                offline_resume::finish_unqueued(self, generation);
             }
             return;
         }
