@@ -149,7 +149,7 @@ fn generate_reviewed(json: &str, oracle: &str, evidence: &str, wa_version: &str)
         "LINK oracle snapshot differs"
     );
     let mut out = header("qualified group LINK normalization", wa_version);
-    out.push_str(&format!("//! Source contract: https://github.com/oxidezap/whatspec/blob/{REV}/generated/notif/group-link.json\n//! Module-relative LINK case bytes {}..{}.\n//! Plain Object.prototype results remain explicitly unsupported.\n",contract.start_byte,contract.end_byte));
+    out.push_str(&format!("//! Source contract: <https://github.com/oxidezap/whatspec/blob/{REV}/generated/notif/group-link.json>\n//! Module-relative LINK case bytes {}..{}.\n//! Plain Object.prototype results remain explicitly unsupported.\n",contract.start_byte,contract.end_byte));
     for module in evidence["modules"]
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("missing LINK module evidence"))?

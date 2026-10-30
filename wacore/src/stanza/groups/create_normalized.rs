@@ -162,6 +162,7 @@ pub struct NormalizedGroupCreate {
     pub group_info: CreatedGroupInfo,
 }
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum CreateParseError {
     #[error("missing or invalid {0}")]
     Field(&'static str),

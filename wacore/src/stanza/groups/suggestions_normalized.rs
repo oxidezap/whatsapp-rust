@@ -48,6 +48,7 @@ pub struct SubgroupSuggestionsOwnerChanged {
     pub new_owner: Jid,
 }
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum SuggestionParseError {
     #[error("missing or invalid {0}")]
     Field(&'static str),
