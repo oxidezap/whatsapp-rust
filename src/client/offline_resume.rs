@@ -54,17 +54,6 @@ const INACTIVE_CLAIMED: u64 = u64::MAX;
 #[derive(Default)]
 pub(crate) struct OfflineBatchCoordinator {
     armed: AtomicBool,
-    generation: AtomicU64,
-    /// WA Web `$4`: true between sending a batch and observing the first
-    /// stanza of that batch's response. CAS-gated so concurrent arrivals
-    /// deterministically elect a single "first arrival" winner per cycle.
-    prev_batch_inflight: AtomicBool,
-    /// Bumped by every offline stanza. Stands in for WA Web's `ShiftTimer`
-    /// re-arm (`$13`): the watchdog compares the counter across a sleep
-    /// instead of reading a clock per stanza, which costs one relaxed
-    /// increment on the receive path and in exchange lets the timeout fire
-    /// anywhere in [timeout, 2 * timeout) after the last stanza.
-    stanza_activity: AtomicU64,
     /// Pacing owned by the armed generation. `arm` swaps a fresh object in and
     /// `reset` takes it out, so a guard or arrival retired by a reconnect can
     /// only ever reach the object it was minted with.
@@ -81,8 +70,6 @@ impl OfflineBatchCoordinator {
         // would count on is gone. Guards already minted keep their own `Arc`
         // and settle the retired object, where nobody reads them any more.
         self.armed.store(false, Ordering::Release);
-        self.generation.store(0, Ordering::Release);
-        self.prev_batch_inflight.store(false, Ordering::Release);
         *self.pacing.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 
@@ -99,23 +86,22 @@ impl OfflineBatchCoordinator {
         self.armed.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub(crate) fn stanza_activity(&self) -> u64 {
-        self.stanza_activity.load(Ordering::Acquire)
+        self.test_pacing().map_or(0, |p| p.stanza_activity())
     }
 
+    #[cfg(test)]
     pub(crate) fn note_stanza_activity(&self) {
-        self.stanza_activity.fetch_add(1, Ordering::AcqRel);
+        if let Some(pacing) = self.test_pacing() {
+            pacing.note_stanza_activity();
+        }
     }
 
-    /// Claim a drain as inactive, but only if no stanza has arrived since
-    /// `seen`. A bump landing between the watchdog's read and its decision
-    /// fails the CAS, so a drain that is still being fed is never completed
-    /// behind the server's back. The sentinel it parks on is never a value
-    /// `note_stanza_activity` can reach from a fresh `arm()`.
+    #[cfg(test)]
     fn try_claim_inactive(&self, seen: u64) -> bool {
-        self.stanza_activity
-            .compare_exchange(seen, INACTIVE_CLAIMED, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+        self.test_pacing()
+            .is_some_and(|p| p.try_claim_inactive(seen))
     }
 
     /// Arm the resume for `generation` and hand back the channel its parked
@@ -130,15 +116,12 @@ impl OfflineBatchCoordinator {
         // observe armed=true also see the matching generation, pacing and
         // inflight.
         *self.pacing.lock().unwrap_or_else(|p| p.into_inner()) = Some(pacing);
-        self.generation.store(generation, Ordering::Release);
-        self.stanza_activity.store(0, Ordering::Release);
-        self.prev_batch_inflight.store(true, Ordering::Release);
         self.armed.store(true, Ordering::Release);
         released
     }
 
     fn is_armed_for(&self, generation: u64) -> bool {
-        self.armed.load(Ordering::Acquire) && self.generation.load(Ordering::Acquire) == generation
+        self.current_pacing(generation).is_some()
     }
 
     /// The pacing of the connection this caller belongs to, or `None` when that
@@ -146,7 +129,7 @@ impl OfflineBatchCoordinator {
     /// stale caller harmless: it can only reach the generation it was minted
     /// for.
     fn current_pacing(&self, generation: u64) -> Option<Arc<Pacing>> {
-        if !self.is_armed_for(generation) {
+        if !self.armed.load(Ordering::Acquire) {
             return None;
         }
         self.pacing
@@ -165,19 +148,17 @@ impl OfflineBatchCoordinator {
         }
     }
 
-    /// Try to claim the "first arrival of just-sent batch" slot. Atomically
-    /// transitions prev_batch_inflight true → false. Only one concurrent
-    /// caller per batch cycle succeeds.
+    #[cfg(test)]
     fn try_claim_first_arrival(&self) -> bool {
-        self.prev_batch_inflight
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+        self.test_pacing()
+            .is_some_and(|p| p.try_claim_first_arrival())
     }
 
-    /// Republish "batch in flight" so the next stanza arrival can win the
-    /// `try_claim_first_arrival` CAS.
+    #[cfg(test)]
     fn mark_batch_inflight(&self) {
-        self.prev_batch_inflight.store(true, Ordering::Release);
+        if let Some(pacing) = self.test_pacing() {
+            pacing.mark_batch_inflight();
+        }
     }
 
     /// Count one offline stanza the message handler is about to queue in a
@@ -203,8 +184,10 @@ impl OfflineBatchCoordinator {
 
     #[cfg(test)]
     fn test_pacing(&self) -> Option<Arc<Pacing>> {
-        let generation = self.generation.load(Ordering::Acquire);
-        self.current_pacing(generation)
+        if !self.armed.load(Ordering::Acquire) {
+            return None;
+        }
+        self.pacing.lock().unwrap().as_ref().cloned()
     }
 
     #[cfg(test)]
@@ -236,6 +219,14 @@ impl OfflineBatchCoordinator {
 /// of separate counters that could be read and written a window apart.
 pub(crate) struct Pacing {
     generation: u64,
+    /// WA Web `$4`: true between sending a batch and observing the first
+    /// stanza of that batch's response. CAS-gated so concurrent arrivals
+    /// deterministically elect a single "first arrival" winner per cycle.
+    prev_batch_inflight: AtomicBool,
+    /// Stanza progress and newly booked requests shift the inactivity window.
+    /// Comparing across a sleep avoids a clock read per stanza and lets the
+    /// timeout fire within [timeout, 2 * timeout) after the last activity.
+    stanza_activity: AtomicU64,
     state: std::sync::Mutex<PacingState>,
     /// One message per released request, for the generation's sender task.
     /// A channel rather than a client handle: whoever settles a finish (a lane
@@ -282,12 +273,48 @@ pub(crate) enum SilentDrain {
 }
 
 impl Pacing {
+    fn stanza_activity(&self) -> u64 {
+        self.stanza_activity.load(Ordering::Acquire)
+    }
+
+    fn note_stanza_activity(&self) {
+        self.stanza_activity.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Claim a drain as inactive, but only if no stanza has arrived since
+    /// `seen`. A bump landing between the watchdog's read and its decision
+    /// fails the CAS, so a drain that is still being fed is never completed
+    /// behind the server's back. The sentinel it parks on is never a value
+    /// `note_stanza_activity` can reach from a fresh `arm()`.
+    fn try_claim_inactive(&self, seen: u64) -> bool {
+        self.stanza_activity
+            .compare_exchange(seen, INACTIVE_CLAIMED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Try to claim the "first arrival of just-sent batch" slot. Atomically
+    /// transitions prev_batch_inflight true → false. Only one concurrent
+    /// caller per batch cycle succeeds.
+    fn try_claim_first_arrival(&self) -> bool {
+        self.prev_batch_inflight
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Republish "batch in flight" so the next stanza arrival can win the
+    /// `try_claim_first_arrival` CAS.
+    fn mark_batch_inflight(&self) {
+        self.prev_batch_inflight.store(true, Ordering::Release);
+    }
+
     fn new(generation: u64, total: usize) -> (Self, async_channel::Receiver<()>) {
         // Unbounded: every release books its own request, so two releases
         // must never coalesce into one send.
         let (released, receiver) = async_channel::unbounded();
         let pacing = Self {
             generation,
+            stanza_activity: AtomicU64::new(0),
+            prev_batch_inflight: AtomicBool::new(true),
             state: std::sync::Mutex::new(PacingState {
                 unbooked: total,
                 ..PacingState::default()
@@ -331,6 +358,7 @@ impl Pacing {
             return Reservation::Deferred;
         }
         state.book();
+        self.note_stanza_activity();
         Reservation::Request
     }
 
@@ -349,7 +377,7 @@ impl Pacing {
             let mut state = self.state();
             state.settle_one();
             state.admitted = state.admitted.saturating_sub(1);
-            state.release_deferred()
+            self.release_deferred(&mut state)
         };
         self.notify(released)
     }
@@ -359,9 +387,19 @@ impl Pacing {
         let released = {
             let mut state = self.state();
             state.settle_one();
-            state.release_deferred()
+            self.release_deferred(&mut state)
         };
         self.notify(released)
+    }
+
+    fn release_deferred(&self, state: &mut PacingState) -> bool {
+        let released = state.release_deferred();
+        // Publish under the decision lock, before the final guard empties the
+        // lane and before the release sender is even polled.
+        if released {
+            self.note_stanza_activity();
+        }
+        released
     }
 
     /// Decide what a window without a single offline stanza means.
@@ -463,6 +501,9 @@ pub(crate) async fn send_first_batch(client: Arc<Client>, total: usize) {
 /// Bounded by the connection generation, since a drain that ends with the
 /// connection is reported as interrupted instead.
 pub(crate) fn spawn_inactivity_watchdog(client: Arc<Client>, generation: u64, timeout: Duration) {
+    let Some(pacing) = client.offline_batch.current_pacing(generation) else {
+        return;
+    };
     let runtime = client.runtime.clone();
     // Subscribed at the spawn, for the connection whose generation this
     // watchdog was armed with — subscribing inside the task would pick up
@@ -470,7 +511,7 @@ pub(crate) fn spawn_inactivity_watchdog(client: Arc<Client>, generation: u64, ti
     let shutdown = client.connection_shutdown_signal();
     runtime
         .spawn(Box::pin(async move {
-            let mut seen = client.offline_batch.stanza_activity();
+            let mut seen = pacing.stanza_activity();
             loop {
                 // Raced rather than merely re-checked after waking: the window
                 // is a minute long, so on a teardown this task otherwise stays
@@ -489,7 +530,7 @@ pub(crate) fn spawn_inactivity_watchdog(client: Arc<Client>, generation: u64, ti
                 {
                     return;
                 }
-                let current = client.offline_batch.stanza_activity();
+                let current = pacing.stanza_activity();
                 if current != seen {
                     seen = current;
                     continue;
@@ -506,10 +547,10 @@ pub(crate) fn spawn_inactivity_watchdog(client: Arc<Client>, generation: u64, ti
                 ) {
                     continue;
                 }
-                if !client.offline_batch.try_claim_inactive(seen) {
+                if !pacing.try_claim_inactive(seen) {
                     // A stanza arrived while this was deciding; the drain is
                     // alive after all, so give it another window.
-                    seen = client.offline_batch.stanza_activity();
+                    seen = pacing.stanza_activity();
                     continue;
                 }
                 let processed = client
@@ -543,7 +584,7 @@ pub(crate) fn on_offline_stanza_arrived(client: &Arc<Client>, pending: usize, la
     let Some(pacing) = coord.current_pacing(generation) else {
         return;
     };
-    coord.note_stanza_activity();
+    pacing.note_stanza_activity();
     // A stanza no lane will hold is finished as it is handled; a lane-bound one
     // is finished by the guard on its queue entry, so its arrival moves nothing.
     if !lane_bound {
@@ -553,7 +594,7 @@ pub(crate) fn on_offline_stanza_arrived(client: &Arc<Client>, pending: usize, la
         // Server has nothing more for us; let the end marker drive completion.
         return;
     }
-    if !coord.try_claim_first_arrival() {
+    if !pacing.try_claim_first_arrival() {
         return;
     }
     schedule_continuation(Arc::clone(client), generation);
@@ -625,18 +666,15 @@ fn continuation_allowed(client: &Client, generation: u64) -> bool {
 }
 
 async fn send_continuation(client: &Client, generation: u64) {
+    let Some(pacing) = client.offline_batch.current_pacing(generation) else {
+        return;
+    };
+    // A request waiting on the socket needs its response window already open.
+    // Touch only its generation, and publish inflight before the await so an
+    // arrival during the send cannot be overwritten by its completion.
+    pacing.note_stanza_activity();
+    pacing.mark_batch_inflight();
     let _ = send_batch(client, BATCH_SIZE).await;
-    // A request that just left starts a fresh inactivity window: without this
-    // a release landing just before a tick lets the watchdog complete the
-    // resume before the batch it asked for can be answered.
-    client.offline_batch.note_stanza_activity();
-    // Re-check generation after the await: a disconnect+reconnect+rearm
-    // during the send would leave the coordinator owned by a newer
-    // cycle, and republishing here would overwrite that cycle's CAS
-    // state and let a duplicate continuation slip through.
-    if client.offline_batch.is_armed_for(generation) {
-        client.offline_batch.mark_batch_inflight();
-    }
 }
 
 /// The generation's one sender of parked requests: each message on `released`
@@ -679,6 +717,119 @@ mod tests {
     use super::*;
     use std::sync::Barrier;
 
+    async fn gated_client() -> (
+        Arc<Client>,
+        async_channel::Receiver<()>,
+        async_channel::Sender<()>,
+    ) {
+        struct GatedTransport {
+            started: async_channel::Sender<()>,
+            release: async_channel::Receiver<()>,
+        }
+        #[async_trait::async_trait]
+        impl crate::transport::Transport for GatedTransport {
+            async fn send(&self, _: bytes::Bytes) -> anyhow::Result<()> {
+                self.started.send(()).await?;
+                self.release.recv().await?;
+                Ok(())
+            }
+            async fn disconnect(&self) {}
+        }
+        let (client, _) = crate::test_utils::create_iq_test_client().await;
+        let (started_tx, started) = async_channel::bounded(1);
+        let (release, release_rx) = async_channel::bounded(1);
+        let transport = Arc::new(GatedTransport {
+            started: started_tx,
+            release: release_rx,
+        });
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(crate::socket::NoiseSocket::new(
+            client.runtime.clone(),
+            transport,
+            wacore::handshake::NoiseCipher::new(&[0; 32]).unwrap(),
+            wacore::handshake::NoiseCipher::new(&[0; 32]).unwrap(),
+        )));
+        (client, started, release)
+    }
+
+    #[tokio::test]
+    async fn a_continuation_waiting_on_the_socket_keeps_its_watchdog_window() {
+        let (client, started, release) = gated_client().await;
+        let generation = client.connection_generation.load(Ordering::Acquire);
+        client.offline_batch.arm(generation, 1_000);
+        assert!(client.offline_batch.try_claim_first_arrival());
+        let seen = client.offline_batch.stanza_activity();
+        let send_client = client.clone();
+        let sender = tokio::spawn(async move { send_continuation(&send_client, generation).await });
+        started.recv().await.unwrap();
+        let activity = client.offline_batch.stanza_activity();
+        assert!(
+            client.offline_batch.try_claim_first_arrival(),
+            "the response may arrive before the send finishes"
+        );
+        release.send(()).await.unwrap();
+        sender.await.unwrap();
+        assert_ne!(
+            activity, seen,
+            "the watchdog must see the request before the socket answers"
+        );
+        assert!(
+            !client.offline_batch.try_claim_first_arrival(),
+            "send completion must not republish an arrival already claimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_old_send_cannot_shift_the_replacement_resumes_watchdog() {
+        let (client, started, release) = gated_client().await;
+        let generation = client.connection_generation.load(Ordering::Acquire);
+        client.offline_batch.arm(generation, 1_000);
+        let send_client = client.clone();
+        let sender = tokio::spawn(async move { send_continuation(&send_client, generation).await });
+        started.recv().await.unwrap();
+        client.offline_batch.reset();
+        client
+            .connection_generation
+            .store(generation + 1, Ordering::Release);
+        client.offline_batch.arm(generation + 1, 1_000);
+        let seen = client.offline_batch.stanza_activity();
+        release.send(()).await.unwrap();
+        sender.await.unwrap();
+        assert_eq!(
+            client.offline_batch.stanza_activity(),
+            seen,
+            "the retired send must leave the new timer alone"
+        );
+    }
+
+    #[test]
+    fn a_deferred_release_shifts_activity_before_its_sender_is_polled() {
+        let coord = OfflineBatchCoordinator::new();
+        let released = coord.arm(7, 1_000);
+        let pacing = coord.current_pacing(7).unwrap();
+        assert!(matches!(pacing.reserve(), Reservation::Request));
+        assert!(matches!(pacing.reserve(), Reservation::Deferred));
+        for _ in 0..400 {
+            pacing.admit_lane_bound();
+        }
+        let seen = coord.stanza_activity();
+        for _ in 0..400 {
+            pacing.finish_admitted();
+        }
+        assert!(
+            released.try_recv().is_ok(),
+            "the third request is ready, but no sender has polled it"
+        );
+        assert_eq!(
+            coord.outstanding(),
+            200,
+            "silence must not forgive the booked response"
+        );
+        assert!(
+            !coord.try_claim_inactive(seen),
+            "booking the release must invalidate the watchdog's stale observation"
+        );
+    }
+
     #[test]
     fn batch_request_stanza_shape() {
         let node = build_offline_batch_request(200);
@@ -698,6 +849,7 @@ mod tests {
     #[test]
     fn first_arrival_cas_is_exclusive() {
         let c = OfflineBatchCoordinator::new();
+        c.arm(7, 1_000);
         c.mark_batch_inflight();
         assert!(c.try_claim_first_arrival(), "first caller wins");
         assert!(

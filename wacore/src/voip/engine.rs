@@ -8273,23 +8273,25 @@ mod tests {
 
         let mut peer_tx = peer_pipeline();
         let body: Vec<u8> = core::iter::once(0x58u8).chain(0..80u8).collect();
-        for n in 0..10u64 {
+        let ceiling = playout_bounds(2 * SAMPLES as usize).1;
+        let rescued_packets = u32::try_from(ceiling / SAMPLES as usize + 1).unwrap();
+        let packets = 4 + rescued_packets;
+        for n in 0..u64::from(packets) {
             let packet = peer_tx.protect_audio(&body);
             eng.handle_input(1 + n * 60, Input::RelayPacket(&packet));
             let _ = drain(&mut eng);
         }
         assert_eq!(eng.active_audio_codec(), Some(AudioCodec::Opus));
         let stats = eng.media_stats();
-        // Exact, not "greater than zero": a rescue that recovered one packet in ten would satisfy a
-        // loose assertion and sound exactly as broken as no rescue at all.
+        // A rescue that recovers only one packet would satisfy a loose assertion
+        // but still sound broken. Count every packet after the switch.
         //
         // Four packets are spent before the switch -- one to give the timestamps a difference to
-        // measure, then three agreeing ones -- and every packet after it decodes. Ten in, four
-        // concealed, six rescued, and the two numbers have to add up to the packets received.
-        assert_eq!(stats.rtp_received, 10);
+        // measure, then three agreeing ones -- and every packet after it decodes.
+        assert_eq!(stats.rtp_received, packets);
         assert_eq!(
             (stats.audio_frames_concealed, stats.foreign_frames_decoded),
-            (4, 6),
+            (4, rescued_packets),
             "every packet after the switch must decode, got {stats:?}"
         );
         assert_eq!(stats.codec_switches, 1);
@@ -8297,26 +8299,14 @@ mod tests {
             stats.audio_frames_without_decoder, 0,
             "a rescued call never reports a missing decoder"
         );
-        // The first ten packets fit the larger jitter ceiling. Keep feeding rescued audio without
-        // a playout tick so this fixture still exercises the feed-side bound and trim accounting.
-        for n in 10..20u64 {
-            let packet = peer_tx.protect_audio(&body);
-            eng.handle_input(1 + n * 60, Input::RelayPacket(&packet));
-            let _ = drain(&mut eng);
-        }
-        let stats = eng.media_stats();
-        assert_eq!(stats.rtp_received, 20);
-        assert_eq!(
-            (stats.audio_frames_concealed, stats.foreign_frames_decoded),
-            (4, 16),
-        );
-        // The rescued samples go into the same buffer the MLOW path feeds, under the same ceiling.
+        // The rescued samples go into the SAME buffer the MLOW path feeds, under the same ceiling:
+        // enqueue more decoded samples than the larger ceiling with no playout
+        // tick in between, so the feed-side bound must trim and count the excess.
         assert!(eng.jitter_len() > 0, "decoded samples reach playout");
         // The ceiling in force is the one the MLOW reading left behind: those first four packets
         // declared 120 ms (TOC 0x58 under that grammar), so the cushion grew to fit them, and it
         // only comes back down once the backlog fits underneath -- otherwise dropping to a shorter
         // packet would trim audio that was legally queued under the previous bound.
-        let ceiling = playout_bounds(2 * SAMPLES as usize).1;
         assert!(
             eng.jitter_len() <= ceiling,
             "the rescued path is bounded by the ceiling in force ({ceiling}), got {}",
