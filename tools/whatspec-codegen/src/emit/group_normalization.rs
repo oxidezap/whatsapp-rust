@@ -85,7 +85,7 @@ pub fn generate(wa_version: &str) -> Result<String> {
         "oracle provenance version mismatch"
     );
     let mut out = header("experimental group unlink normalization", wa_version);
-    out.push_str(&format!("//! Independent contract pin: https://github.com/oxidezap/whatspec/blob/{REV}/generated/notif/group-unlink.json\n//! Module-relative helper bytes {}..{}. Payload parsing remains handwritten.\n\n",contract.start_byte,contract.end_byte));
+    out.push_str(&format!("//! Independent contract pin: <https://github.com/oxidezap/whatspec/blob/{REV}/generated/notif/group-unlink.json>\n//! Module-relative helper bytes {}..{}. Payload parsing remains handwritten.\n\n",contract.start_byte,contract.end_byte));
     for module in evidence["modules"]
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("missing oracle provenance"))?

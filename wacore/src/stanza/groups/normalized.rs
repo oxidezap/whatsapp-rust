@@ -22,6 +22,7 @@ pub struct GroupParseContext<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum GroupParseError {
     #[error("expected notification tag")]
     Tag,
@@ -39,8 +40,8 @@ pub enum GroupParseError {
     MissingContext(&'static str),
     #[error("envelope rejected: {0}")]
     Rejected(String),
-    #[error(transparent)]
-    Action(Box<super::actions_normalized::GroupActionParseError>),
+    #[error("{0}")]
+    Action(#[source] Box<super::actions_normalized::GroupActionParseError>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]

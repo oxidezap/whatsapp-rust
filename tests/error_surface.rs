@@ -253,6 +253,31 @@ fn assert_source_is<T: StdError + 'static>(err: &(dyn StdError + 'static), what:
     );
 }
 
+#[test]
+fn group_normalization_errors_preserve_display_and_typed_sources() {
+    use wacore::stanza::groups::actions_normalized::GroupActionParseError;
+    use wacore::stanza::groups::create_normalized::CreateParseError;
+    use wacore::stanza::groups::normalized::GroupParseError;
+    use wacore::stanza::groups::suggestions_normalized::SuggestionParseError;
+
+    let parse = GroupActionParseError::from(GroupParseError::Field("id"));
+    assert_eq!(parse.to_string(), "missing or invalid id");
+    assert_source_is::<GroupParseError>(&parse, "GroupActionParseError::Parse");
+
+    let create = GroupActionParseError::from(CreateParseError::Field("subject"));
+    assert_eq!(create.to_string(), "missing or invalid subject");
+    assert_source_is::<CreateParseError>(&create, "GroupActionParseError::Create");
+
+    let suggestion = GroupActionParseError::from(SuggestionParseError::Field("owner"));
+    assert_eq!(suggestion.to_string(), "missing or invalid owner");
+    assert_source_is::<SuggestionParseError>(&suggestion, "GroupActionParseError::Suggestion");
+
+    let envelope = GroupParseError::Action(Box::new(create));
+    assert_eq!(envelope.to_string(), "missing or invalid subject");
+    assert_source_is::<Box<GroupActionParseError>>(&envelope, "GroupParseError::Action");
+    assert_source_is::<CreateParseError>(envelope.source().unwrap(), "nested create error");
+}
+
 // ── Every wrapping variant keeps its typed source ───────────────────────────
 
 /// One sample per public variant that wraps a typed error. Complements

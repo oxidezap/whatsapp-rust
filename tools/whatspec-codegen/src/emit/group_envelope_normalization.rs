@@ -288,7 +288,7 @@ fn generate_contract(contract: &GroupEnvelopeContract, wa_version: &str) -> Resu
     action_fields.push(format!("(\"timestamp\",state.local({timestamp_local})?)"));
     let projection = compiler.expr(&contract.projection)?;
     let mut out = header("ordered group envelope guards", wa_version);
-    out.push_str(&format!("//! Source contract https://github.com/oxidezap/whatspec/blob/{REV}/generated/notif/group-envelope.json\n"));
+    out.push_str(&format!("//! Source contract <https://github.com/oxidezap/whatspec/blob/{REV}/generated/notif/group-envelope.json>\n"));
     out.push_str(&format!("//! {} callback bytes {}..{}; child action boundary {}..{}.\n//! Actions are supplied by the normalized action parser between prefix and projection.\n",contract.module_name,contract.start_byte,contract.end_byte,contract.actions.start_byte,contract.actions.end_byte));
     out.push_str("use super::{State,Value,Diagnostic,Read,Fact,Conversion,Binary,read,context,convert,is_empty,binary,reject};\nuse super::{GroupParseContext,GroupParseError,NodeRef};\n");
     out.push_str(&format!("pub(in crate::stanza::groups) const MISSING_IDENTIFICATION_TAG:&str={};\npub(in crate::stanza::groups) const UNKNOWN_ACTION_ERROR_PREFIX:&str={};\n",rust_str(&contract.actions.missing_identification_tag),rust_str(&contract.actions.unknown_action_error_prefix)));
