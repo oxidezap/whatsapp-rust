@@ -93,6 +93,13 @@ enum PreparedIq {
     Query(Box<InfoQuery<'static>>),
 }
 
+#[derive(Clone, Copy)]
+enum IqResponsePolicy {
+    Raw,
+    LegacySpec,
+    ContextualSpec,
+}
+
 /// A rejection stanza kept for the caller, wrapping the node the receive path decoded.
 ///
 /// Exists for its `Debug`, which names the stanza instead of printing it: background IQ
@@ -339,7 +346,7 @@ impl Client {
         &self,
         query: InfoQuery<'_>,
     ) -> Result<Arc<wacore_binary::OwnedNodeRef>, IqError> {
-        self.send_iq_inner(query, true).await
+        self.send_iq_inner(query, IqResponsePolicy::Raw).await
     }
 
     // Typed execution defers only the outcome counter until its parser finishes;
@@ -365,7 +372,7 @@ impl Client {
     async fn send_iq_inner(
         &self,
         query: InfoQuery<'_>,
-        record_outcome: bool,
+        policy: IqResponsePolicy,
     ) -> Result<Arc<wacore_binary::OwnedNodeRef>, IqError> {
         #[cfg(feature = "tracing")]
         self.record_identity_on_current_span("wa.iq", module_path!());
@@ -384,7 +391,7 @@ impl Client {
             iq_timeout,
             Box::pin(async { self.send_node(node).await }),
             None,
-            record_outcome,
+            policy,
         )
         .await
     }
@@ -437,7 +444,7 @@ impl Client {
             timeout.unwrap_or(DEFAULT_IQ_TIMEOUT),
             Box::pin(async { self.send_node(node).await }),
             on_sent,
-            true,
+            IqResponsePolicy::Raw,
         )
         .await
     }
@@ -469,19 +476,55 @@ impl Client {
         // Only the three spec calls live in this generic body; the send/wait
         // machinery sits behind the non-generic `execute_prepared` so it isn't
         // re-stamped for every IqSpec instantiation (~55 of them).
-        let req_id = self.generate_request_id();
+        let mut req_id = self.generate_request_id();
         let mut buf = Vec::new();
-        let prepared = match spec.encode_iq_direct(&req_id, &mut buf) {
+        let mut prepared = match spec.encode_iq_direct(&req_id, &mut buf) {
             Ok(true) => PreparedIq::Encoded(buf),
             Ok(false) => PreparedIq::Query(Box::new(spec.build_iq())),
             Err(e) => return Err(IqError::EncodeError(e)),
         };
 
+        let request = if spec.uses_contextual_response() {
+            Some(match &mut prepared {
+                PreparedIq::Query(iq) => {
+                    req_id = iq.id.get_or_insert(req_id).clone();
+                    self.get_request_utils()
+                        .build_iq_node((**iq).clone(), Some(req_id.clone()))
+                }
+                PreparedIq::Encoded(bytes) => {
+                    let node = wacore_binary::marshal::unmarshal_packed_ref(bytes)
+                        .map_err(|e| IqError::EncodeError(e.into()))?;
+                    if node.tag.as_ref() != IQ_TAG
+                        || node.get_attr(IQ_ID_ATTR).map(|v| v.as_str()).as_deref()
+                            != Some(req_id.as_str())
+                    {
+                        return Err(IqError::EncodeError(anyhow::anyhow!(
+                            "direct IQ encoder did not preserve the request ID"
+                        )));
+                    }
+                    node.to_owned()
+                }
+            })
+        } else {
+            None
+        };
+
+        let policy = if spec.handles_iq_errors() {
+            IqResponsePolicy::ContextualSpec
+        } else {
+            IqResponsePolicy::LegacySpec
+        };
         let result = self
-            .execute_prepared(req_id, prepared)
+            .execute_prepared(req_id, prepared, policy)
             .await
             .and_then(|response| {
-                spec.parse_response(response.get()).map_err(|error| {
+                let parsed = match &request {
+                    Some(request) => {
+                        spec.parse_response_with_context(response.get(), &request.as_node_ref())
+                    }
+                    None => spec.parse_response(response.get()),
+                };
+                parsed.map_err(|error| {
                     // A spec can report a typed rejection embedded in a result IQ.
                     // Attach its original response without changing ordinary parse errors.
                     match error.downcast_ref::<wacore::request::IqError>() {
@@ -520,6 +563,11 @@ impl Client {
         S: IqStreamSpec + Send + 'static,
         S::Response: Send + 'static,
     {
+        if spec.uses_contextual_response() || spec.handles_iq_errors() {
+            return Err(IqError::EncodeError(anyhow::anyhow!(
+                "contextual IQ contracts require execute, not execute_streaming"
+            )));
+        }
         let req_id = self.generate_request_id();
         let mut buf = Vec::new();
         let prepared = match spec.encode_iq_direct(&req_id, &mut buf) {
@@ -593,6 +641,7 @@ impl Client {
         &self,
         req_id: String,
         prepared: PreparedIq,
+        policy: IqResponsePolicy,
     ) -> Result<Arc<wacore_binary::OwnedNodeRef>, IqError> {
         match prepared {
             // Direct-encode fast path: skip the Node tree for hot IQ specs
@@ -604,7 +653,7 @@ impl Client {
                     DEFAULT_IQ_TIMEOUT,
                     Box::pin(async { self.send_raw_bytes(buf).await }),
                     None,
-                    false,
+                    policy,
                 )
                 .await
             }
@@ -615,7 +664,7 @@ impl Client {
                 if iq.id.is_none() {
                     iq.id = Some(req_id);
                 }
-                self.send_iq_inner(iq, false).await
+                self.send_iq_inner(iq, policy).await
             }
         }
     }
@@ -634,7 +683,7 @@ impl Client {
         timeout: Duration,
         send_fn: IqSendFuture<'_>,
         on_sent: Option<IqOnSent<'_>>,
-        record_outcome: bool,
+        policy: IqResponsePolicy,
     ) -> Result<Arc<wacore_binary::OwnedNodeRef>, IqError> {
         let (tx, rx) = futures::channel::oneshot::channel();
         let result = self
@@ -648,6 +697,16 @@ impl Client {
             )
             .await
             .and_then(|response_node| {
+                // Contracts see protocol alternatives before generic envelope
+                // conversion. Transport termination retains its existing owner.
+                if matches!(policy, IqResponsePolicy::ContextualSpec)
+                    && !matches!(
+                        response_node.get().tag.as_ref(),
+                        "stream:error" | "xmlstreamend"
+                    )
+                {
+                    return Ok(response_node);
+                }
                 match self
                     .get_request_utils()
                     .parse_iq_response(response_node.get())
@@ -656,7 +715,7 @@ impl Client {
                     Err(e) => Err(IqError::from_response(e, &response_node)),
                 }
             });
-        if record_outcome {
+        if matches!(policy, IqResponsePolicy::Raw) {
             record_iq_outcome(&result);
         }
         result
@@ -762,6 +821,10 @@ impl Client {
         Ok(waiter_guard)
     }
 }
+
+#[cfg(test)]
+#[path = "request_context_tests.rs"]
+mod context_tests;
 
 /// Run `spec` over a stream positioned inside the `<iq type="result">` root
 /// and close the stream out: the trailer is what says every inflated byte was

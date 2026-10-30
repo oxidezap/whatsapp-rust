@@ -37,7 +37,9 @@ libsqlite3-sys = { version = "0.38", default-features = false, optional = true }
 log = { workspace = true }
 # Shared across all r2d2 pools so each per-session store doesn't spawn its own pool of
 # management threads. Already in the tree transitively via r2d2 0.8.
-scheduled-thread-pool = "0.2"
+# 0.2.8 requires parking_lot 0.13 (Rust 1.95); retain the SDK's Rust 1.94 floor
+# for fresh standalone consumer resolves, as well as the workspace lock.
+scheduled-thread-pool = "=0.2.7"
 serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
 thiserror = { workspace = true }

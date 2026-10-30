@@ -4699,6 +4699,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "wa-codegen"
+version = "0.2.0"
+source = "git+https://github.com/oxidezap/whatspec.git?rev=ff5894a3c43dc3401dd7a7872ba358979b8200c9#ff5894a3c43dc3401dd7a7872ba358979b8200c9"
+dependencies = [
+ "regex",
+ "serde_json",
+ "wa-ir",
+]
+
+[[package]]
 name = "wa-fetch"
 version = "0.1.0"
 source = "git+https://github.com/oxidezap/whatspec.git?rev=eb16f595d455d8b0b3f7966a59444f4f9894c127#eb16f595d455d8b0b3f7966a59444f4f9894c127"
@@ -4706,6 +4716,14 @@ dependencies = [
  "anyhow",
  "serde_json",
  "wa-text",
+]
+
+[[package]]
+name = "wa-ir"
+version = "0.1.0"
+source = "git+https://github.com/oxidezap/whatspec.git?rev=ff5894a3c43dc3401dd7a7872ba358979b8200c9#ff5894a3c43dc3401dd7a7872ba358979b8200c9"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -5127,8 +5145,6 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-cache"
 version = "48.0.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b11ca8945aa341f944558622db59845dffa1435971f318d5fce2f2d9765a69b0"
 dependencies = [
  "base64 0.22.1",
  "directories-next",
@@ -5141,7 +5157,7 @@ dependencies = [
  "toml 0.9.12+spec-1.1.0",
  "wasmtime-environ",
  "windows-sys 0.61.2",
- "zstd 0.13.3",
+ "zstd",
 ]
 
 [[package]]
@@ -5482,6 +5498,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "toml 1.1.6+spec-1.1.0",
+ "wa-codegen",
+ "wa-ir",
  "xtask-support",
 ]
 
@@ -5801,7 +5820,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "tempfile",
- "zstd 0.14.3",
+ "zstd",
 ]
 
 [[package]]
@@ -5931,29 +5950,11 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zstd"
-version = "0.13.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
-dependencies = [
- "zstd-safe 7.3.0",
-]
-
-[[package]]
-name = "zstd"
 version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
 dependencies = [
- "zstd-safe 8.2.0",
-]
-
-[[package]]
-name = "zstd-safe"
-version = "7.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64d80649ab6db9d9f6f9c80a40becd948eda4714a0a5ac8c4d157a32231c7882"
-dependencies = [
- "zstd-sys",
+ "zstd-safe",
 ]
 
 [[package]]

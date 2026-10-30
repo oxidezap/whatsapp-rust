@@ -81,6 +81,24 @@ impl IqSpec for PassiveModeSpec {
         required_child(response, tag)?;
         Ok(())
     }
+
+    fn uses_contextual_response(&self) -> bool {
+        true
+    }
+
+    fn parse_response_with_context(
+        &self,
+        response: &NodeRef<'_>,
+        request: &NodeRef<'_>,
+    ) -> Result<Self::Response, anyhow::Error> {
+        use super::contextual::passive::{MakeActiveIQRequestSpec, MakePassiveIQRequestSpec};
+        if self.passive {
+            MakePassiveIQRequestSpec::parse_sent_response(response, request)?;
+        } else {
+            MakeActiveIQRequestSpec::parse_sent_response(response, request)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
