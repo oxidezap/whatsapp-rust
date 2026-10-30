@@ -655,6 +655,7 @@ mod racing_tests {
     /// path deterministic.
     #[derive(Clone)]
     struct ScriptedDialFactory {
+        stall_dial: bool,
         delay: Option<Duration>,
         fail_with: Option<&'static str>,
         stall_disconnect: bool,
@@ -670,6 +671,9 @@ mod racing_tests {
             self.counters.started.fetch_add(1, Ordering::AcqRel);
             self.counters.live.fetch_add(1, Ordering::AcqRel);
             let _live = LiveGuard(self.counters.clone());
+            if self.stall_dial {
+                std::future::pending::<()>().await;
+            }
             if let Some(delay) = self.delay {
                 tokio::time::sleep(delay).await;
             }
@@ -697,6 +701,7 @@ mod racing_tests {
         let counters = Arc::new(DialCounters::zero());
         (
             ScriptedDialFactory {
+                stall_dial: false,
                 delay: delay_ms.map(Duration::from_millis),
                 fail_with,
                 stall_disconnect,
@@ -738,13 +743,19 @@ mod racing_tests {
 
     #[tokio::test]
     async fn fastest_success_wins_and_loser_dial_is_aborted() {
-        let (primary, primary_c) = scripted(Some(100), None);
-        let (secondary, secondary_c) = scripted(Some(5), None);
+        // A descheduled test can observe both wall-clock timers ready on the
+        // same poll. Keep the loser pending until it is aborted instead.
+        let (mut primary, primary_c) = scripted(None, None);
+        primary.stall_dial = true;
+        let (secondary, secondary_c) = scripted(None, None);
 
-        let (_transport, _rx) = race(primary, secondary)
-            .create_transport()
-            .await
-            .expect("the fast dial succeeds");
+        let racing = race(primary, secondary);
+        let (_transport, _rx) =
+            tokio::time::timeout(Duration::from_secs(5), racing.create_transport())
+                .await
+                .expect("a pending loser must not hold the winner")
+                .expect("the fast dial succeeds");
+        assert_eq!(primary_c.get(|c| &c.started), 1);
 
         assert_eq!(secondary_c.get(|c| &c.opened), 1);
         assert_eq!(
