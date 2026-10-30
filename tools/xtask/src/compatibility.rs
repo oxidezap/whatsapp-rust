@@ -142,6 +142,44 @@ pub fn controls(root: &Path, lane: Lane, toolchain: &str) -> Result<()> {
     additive = additive
         .replace(participant_field, "    pub jid: Jid,\n    pub compatibility_optional: Option<String>,")
         .replace(participant_constructor, "                    Some(GroupParticipantInfo {\n                        compatibility_optional: None,\n                        jid,");
+    // The archive is disposable. Keep every internal constructor and parser in
+    // that copy valid so this control reaches the independent external host.
+    // Production received models and normalized adapters remain unchanged.
+    for (file, before, after) in [
+        (
+            "wacore/src/stanza/groups/normalized.rs",
+            "        Ok(Self {\n            group_jid: parsed.chat_id,",
+            "        Ok(Self {\n            compatibility_optional: None,\n            group_jid: parsed.chat_id,",
+        ),
+        (
+            "wacore/src/stanza/groups/legacy_adapter.rs",
+            "            Ok(GroupParticipantInfo {\n                jid:",
+            "            Ok(GroupParticipantInfo {\n                compatibility_optional: None,\n                jid:",
+        ),
+        (
+            "wacore/src/stanza/groups/legacy_adapter.rs",
+            "        .map(|p| GroupParticipantInfo {\n            jid:",
+            "        .map(|p| GroupParticipantInfo {\n            compatibility_optional: None,\n            jid:",
+        ),
+        (
+            "wacore/src/stanza/groups/legacy_adapter.rs",
+            "        } => L::Subject {\n            subject:",
+            "        } => L::Subject {\n            compatibility_optional: None,\n            subject:",
+        ),
+        (
+            "wacore/src/stanza/groups/actions_normalized.rs",
+            "        T::IsCapiHostedGroup | T::LimitSharingEnabled | T::Unknown(_) => {",
+            "        T::CompatibilityFuture | T::IsCapiHostedGroup | T::LimitSharingEnabled | T::Unknown(_) => {",
+        ),
+    ] {
+        let adapter = stage.path().join(file);
+        let source = std::fs::read_to_string(&adapter)?;
+        ensure!(
+            source.matches(before).count() == 1,
+            "group adapter mutation anchor changed: {file}; update the control explicitly"
+        );
+        std::fs::write(adapter, source.replace(before, after))?;
+    }
     let result = with_mutated_source(&path, &original, &additive, check)?;
     ensure!(
         result.status.success(),
