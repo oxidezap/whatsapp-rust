@@ -753,7 +753,8 @@ mod tests {
         let (client, started, release) = gated_client().await;
         let generation = client.connection_generation.load(Ordering::Acquire);
         client.offline_batch.arm(generation, 1_000);
-        let seen = pacing.stanza_activity();
+        assert!(client.offline_batch.try_claim_first_arrival());
+        let seen = client.offline_batch.stanza_activity();
         let send_client = client.clone();
         let sender = tokio::spawn(async move { send_continuation(&send_client, generation).await });
         started.recv().await.unwrap();
