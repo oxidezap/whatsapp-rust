@@ -59,6 +59,8 @@ ENV CARGO_UNSTABLE_BUILD_STD="std,panic_abort"
 # chef stage's copy at /; the nightly-only RUSTFLAGS above depends on it.
 COPY rust-toolchain.toml .
 COPY --from=planner /app/recipe.json recipe.json
+# Cargo resolves the workspace's path patch while cooking the dependency recipe.
+COPY vendor vendor
 # build-std demands an explicit --target; derive the image's own host triple so
 # buildx per-arch builds (linux/amd64, linux/arm64) each target their own arch.
 # No pipe, so a rustc failure isn't masked by sed's exit status (Hadolint DL4006).
