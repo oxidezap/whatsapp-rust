@@ -2988,7 +2988,17 @@ mod tests {
         // the looser of the two on purpose: the minimum this window observes
         // moved by 20 between one machine and CI (112 against 132), so the
         // bound leaves room for that without letting the replaced shape back in.
-        const MAX_BYTES_PER_CLIENT: i64 = 17_000;
+        #[cfg(feature = "generated-group-notifications")]
+        const GROUP_FACTS_PROVIDER_BYTES: i64 = size_of::<
+            std::sync::OnceLock<
+                Arc<dyn crate::types::group_notification_facts::GroupNotificationFactsProvider>,
+            >,
+        >() as i64;
+        #[cfg(not(feature = "generated-group-notifications"))]
+        const GROUP_FACTS_PROVIDER_BYTES: i64 = 0;
+        // Retain the fixed base; charge the opt-in cell by its representation,
+        // consistently with client_size_pins_runtime_cache_config_saving.
+        const MAX_BYTES_PER_CLIENT: i64 = 17_000 + GROUP_FACTS_PROVIDER_BYTES;
         const MAX_ALLOCS_PER_CLIENT: u64 = 160;
         const CLIENTS: usize = 16;
 
