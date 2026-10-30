@@ -184,6 +184,9 @@ impl OfflineBatchCoordinator {
 
     #[cfg(test)]
     fn test_pacing(&self) -> Option<Arc<Pacing>> {
+        if !self.armed.load(Ordering::Acquire) {
+            return None;
+        }
         self.pacing.lock().unwrap().as_ref().cloned()
     }
 

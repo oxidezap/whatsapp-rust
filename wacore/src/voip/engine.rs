@@ -8274,9 +8274,9 @@ mod tests {
         let mut peer_tx = peer_pipeline();
         let body: Vec<u8> = core::iter::once(0x58u8).chain(0..80u8).collect();
         let ceiling = playout_bounds(2 * SAMPLES as usize).1;
-        let rescued_packets = (ceiling / SAMPLES as usize + 1) as u64;
+        let rescued_packets = u32::try_from(ceiling / SAMPLES as usize + 1).unwrap();
         let packets = 4 + rescued_packets;
-        for n in 0..packets {
+        for n in 0..u64::from(packets) {
             let packet = peer_tx.protect_audio(&body);
             eng.handle_input(1 + n * 60, Input::RelayPacket(&packet));
             let _ = drain(&mut eng);
