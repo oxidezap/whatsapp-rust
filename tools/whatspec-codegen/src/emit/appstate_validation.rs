@@ -18,12 +18,13 @@ pub fn generate_appstate_validation(ir: &AppstateValidationIr) -> Result<String,
         }
         qualify_native_comparisons(name, &f.body)?;
         out.push_str(&format!("#[allow(unused_variables)]\n#[inline(never)]\npub(super) fn {}<'a>(transforms: &mut impl Transforms<'a>, {})->Result<Value<'a>,Box<ValidationError>>{{\n",snake_case(name),(0..f.parameters).map(|i|format!("a{i}:&Value<'a>")).collect::<Vec<_>>().join(",")));
-        for i in owned_slots(&f.body) {
+        let owned = owned_slots(&f.body);
+        for i in &owned {
             out.push_str(&format!(
                 "#[allow(unused_assignments,unused_mut)] let mut s{i}=Value::Undefined;\n"
             ));
         }
-        statements(&f.body, &mut out)?;
+        statements(&f.body, &mut out, &owned)?;
         out.push_str("}\n");
     }
     Ok(out)
@@ -44,16 +45,20 @@ fn owned_slots(body: &[S]) -> std::collections::BTreeSet<usize> {
     }
     slots
 }
-fn statements(body: &[S], out: &mut String) -> Result<(), String> {
+fn statements(
+    body: &[S],
+    out: &mut String,
+    owned: &std::collections::BTreeSet<usize>,
+) -> Result<(), String> {
     for s in body {
         match s {
             S::Bind { slot, value } => out.push_str(&format!("s{slot}={};\n", expr(value)?)),
             S::Evaluate { value } => out.push_str(&format!("let _={};\n", expr(value)?)),
             S::If { condition, yes, no } => {
                 out.push_str(&format!("if ({}).truthy() {{\n", receiver(condition)?));
-                statements(yes, out)?;
+                statements(yes, out, owned)?;
                 out.push_str("} else {\n");
-                statements(no, out)?;
+                statements(no, out, owned)?;
                 out.push_str("}\n");
             }
             S::Fatal { metric, message } => out.push_str(&format!(
@@ -61,7 +66,12 @@ fn statements(body: &[S], out: &mut String) -> Result<(), String> {
                 expr(metric)?,
                 rust_lit(message)
             )),
-            S::Return { value } => out.push_str(&format!("return Ok({});\n", expr(value)?)),
+            S::Return { value } => {
+                out.push_str(&format!(
+                    "return Ok({});\n",
+                    return_projection(value, owned)?
+                ));
+            }
         }
     }
     Ok(())
@@ -135,12 +145,13 @@ fn expr(e: &E) -> Result<String, String> {
         } => validation_call(validator, arguments)?,
         E::Map { input, body } => {
             let mut rendered = String::new();
-            for i in owned_slots(body) {
+            let owned = owned_slots(body);
+            for i in &owned {
                 rendered.push_str(&format!(
                     "#[allow(unused_assignments,unused_mut)] let mut s{i}=Value::Undefined;"
                 ));
             }
-            statements(body, &mut rendered)?;
+            statements(body, &mut rendered, &owned)?;
             format!(
                 "{{let input={};let mut mapped=Vec::new();for item in input.array()?{{mapped.push((||->Result<Value,Box<ValidationError>>{{{rendered}}})()?);}}Value::list(mapped)}}",
                 expr(input)?
@@ -154,17 +165,90 @@ fn expr(e: &E) -> Result<String, String> {
                 return Err("transform arity".into());
             }
             let value = expr(&arguments[0])?;
-            match transform {
-                T::SafeInteger => format!("transforms.number_or_throw_if_too_large({value})?"),
-                T::SyncKeyId => format!("transforms.to_sync_key_id({value})?"),
-                T::DecodePatchDebugData => format!("transforms.decode_patch_debug_data({value})?"),
-                T::DecodeSyncActionData => format!("transforms.decode_sync_action_data({value})?"),
-                T::MaybeNumber => {
-                    format!("transforms.maybe_number_or_throw_if_too_large({value})?")
-                }
-            }
+            transform_call(transform, value)
         }
     })
+}
+
+fn transform_call(transform: &T, value: String) -> String {
+    let method = match transform {
+        T::SafeInteger => "number_or_throw_if_too_large",
+        T::SyncKeyId => "to_sync_key_id",
+        T::DecodePatchDebugData => "decode_patch_debug_data",
+        T::DecodeSyncActionData => "decode_sync_action_data",
+        T::MaybeNumber => "maybe_number_or_throw_if_too_large",
+    };
+    format!("transforms.{method}({value})?")
+}
+
+// A terminal projection cannot revisit its locals. Only this closed grammar
+// excludes assignments, callbacks and conditional reads throughout the tree.
+fn projection_reads(value: &E, reads: &mut std::collections::BTreeMap<usize, usize>) -> bool {
+    match value {
+        E::Slot { index } => {
+            *reads.entry(*index).or_default() += 1;
+            true
+        }
+        E::Object { fields } => fields
+            .iter()
+            .all(|(_, value)| projection_reads(value, reads)),
+        E::Transform { arguments, .. } if arguments.len() == 1 => {
+            projection_reads(&arguments[0], reads)
+        }
+        E::Argument { .. }
+        | E::Undefined
+        | E::Null
+        | E::Integer { .. }
+        | E::String { .. }
+        | E::Metric { .. } => true,
+        _ => false,
+    }
+}
+fn return_projection(
+    value: &E,
+    owned: &std::collections::BTreeSet<usize>,
+) -> Result<String, String> {
+    let mut reads = std::collections::BTreeMap::new();
+    if !projection_reads(value, &mut reads) {
+        return expr(value);
+    }
+    // Callback returns cannot consume a captured outer slot across iterations.
+    let movable = reads
+        .into_iter()
+        .filter_map(|(slot, count)| (count == 1 && owned.contains(&slot)).then_some(slot))
+        .collect();
+    projection_expr(value, &movable)
+}
+fn projection_expr(
+    value: &E,
+    movable: &std::collections::BTreeSet<usize>,
+) -> Result<String, String> {
+    match value {
+        E::Slot { index } if movable.contains(index) => Ok(format!("s{index}")),
+        E::Object { fields } => Ok(format!(
+            "Value::object(vec![{}])",
+            fields
+                .iter()
+                .map(|(key, value)| {
+                    Ok(format!(
+                        "({}, {})",
+                        rust_lit(key),
+                        projection_expr(value, movable)?
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()?
+                .join(",")
+        )),
+        E::Transform {
+            transform,
+            arguments,
+        } => Ok(format!(
+            "{{let projection_value={};{}}}",
+            projection_expr(&arguments[0], movable)?,
+            transform_call(transform, "projection_value".into()),
+        )),
+        _ => expr(value),
+    }
 }
 
 fn validation_call(validator: &str, arguments: &[E]) -> Result<String, String> {
@@ -502,6 +586,288 @@ fn main() {
     assert!(host.trace.is_empty());
     assert_fields(generated::effect_probe(&mut host).expect("ordered transform arguments"));
     assert_eq!(host.trace, vec![1.0, 2.0]);
+}
+"#
+        );
+        run_generated_program(&source);
+    }
+
+    #[test]
+    fn terminal_projections_keep_aliases_transform_order_and_captured_slots() {
+        let slot = |index| E::Slot { index };
+        let argument = |index| E::Argument { index };
+        let transform = |transform, value| E::Transform {
+            transform,
+            arguments: vec![value],
+        };
+        let projection = E::Object {
+            fields: vec![
+                ("first".into(), slot(0)),
+                (
+                    "nested".into(),
+                    E::Object {
+                        fields: vec![
+                            ("second".into(), slot(0)),
+                            ("unique".into(), transform(T::SyncKeyId, slot(2))),
+                            (
+                                "value".into(),
+                                transform(T::SafeInteger, transform(T::SyncKeyId, slot(1))),
+                            ),
+                        ],
+                    },
+                ),
+                (
+                    "last".into(),
+                    transform(T::SafeInteger, E::Integer { value: 3 }),
+                ),
+            ],
+        };
+        let mut reads = std::collections::BTreeMap::new();
+        assert!(projection_reads(&projection, &mut reads));
+        assert_eq!(
+            reads,
+            std::collections::BTreeMap::from([(0, 2), (1, 1), (2, 1)])
+        );
+        let function = |parameters, body| wa_ir::ValidationFunction {
+            module: "synthetic terminal projection semantics".into(),
+            start_byte: 0,
+            end_byte: 1,
+            parameters,
+            body,
+        };
+        let rejected = E::Object {
+            fields: vec![
+                ("first".into(), slot(0)),
+                (
+                    "second".into(),
+                    E::Assign {
+                        slot: 0,
+                        value: Box::new(E::Integer { value: 2 }),
+                    },
+                ),
+                ("third".into(), slot(0)),
+            ],
+        };
+        assert!(!projection_reads(
+            &rejected,
+            &mut std::collections::BTreeMap::new()
+        ));
+        for unsupported in [
+            E::Field {
+                object: Box::new(slot(0)),
+                field: "id".into(),
+            },
+            E::Sequence {
+                values: vec![slot(0)],
+            },
+            E::Map {
+                input: Box::new(argument(0)),
+                body: vec![S::Return { value: slot(0) }],
+            },
+            E::Choose {
+                condition: Box::new(argument(0)),
+                yes: Box::new(slot(0)),
+                no: Box::new(E::Null),
+            },
+            E::And {
+                left: Box::new(slot(0)),
+                right: Box::new(E::Null),
+            },
+            E::Transform {
+                transform: T::SyncKeyId,
+                arguments: vec![],
+            },
+        ] {
+            assert!(!projection_reads(
+                &unsupported,
+                &mut std::collections::BTreeMap::new()
+            ));
+            assert_eq!(
+                return_projection(&unsupported, &std::collections::BTreeSet::from([0])),
+                expr(&unsupported)
+            );
+        }
+        let generated = generate_appstate_validation(&AppstateValidationIr {
+            format_version: 1,
+            wa_version: "synthetic".into(),
+            module_sha256: "0".repeat(64),
+            functions: std::collections::BTreeMap::from([
+                (
+                    "projection".into(),
+                    function(
+                        3,
+                        vec![
+                            S::Bind {
+                                slot: 0,
+                                value: argument(0),
+                            },
+                            S::Bind {
+                                slot: 1,
+                                value: argument(1),
+                            },
+                            S::Bind {
+                                slot: 2,
+                                value: argument(2),
+                            },
+                            S::Return { value: projection },
+                        ],
+                    ),
+                ),
+                (
+                    "mutationFallback".into(),
+                    function(
+                        0,
+                        vec![
+                            S::Bind {
+                                slot: 0,
+                                value: E::Integer { value: 1 },
+                            },
+                            S::Return { value: rejected },
+                        ],
+                    ),
+                ),
+                (
+                    "shadow".into(),
+                    function(
+                        2,
+                        vec![
+                            S::Bind {
+                                slot: 0,
+                                value: argument(0),
+                            },
+                            S::Return {
+                                value: E::Object {
+                                    fields: vec![
+                                        ("outer".into(), slot(0)),
+                                        (
+                                            "items".into(),
+                                            E::Map {
+                                                input: Box::new(argument(1)),
+                                                body: vec![
+                                                    S::Bind {
+                                                        slot: 0,
+                                                        value: argument(3),
+                                                    },
+                                                    S::Return {
+                                                        value: E::Object {
+                                                            fields: vec![
+                                                                ("shadow".into(), slot(0)),
+                                                                ("argument".into(), argument(0)),
+                                                            ],
+                                                        },
+                                                    },
+                                                ],
+                                            },
+                                        ),
+                                    ],
+                                },
+                            },
+                        ],
+                    ),
+                ),
+                (
+                    "capture".into(),
+                    function(
+                        2,
+                        vec![
+                            S::Bind {
+                                slot: 0,
+                                value: argument(0),
+                            },
+                            S::Return {
+                                value: E::Map {
+                                    input: Box::new(argument(1)),
+                                    body: vec![S::Return {
+                                        value: E::Object {
+                                            fields: vec![
+                                                ("captured".into(), slot(0)),
+                                                ("item".into(), argument(3)),
+                                            ],
+                                        },
+                                    }],
+                                },
+                            },
+                        ],
+                    ),
+                ),
+            ]),
+        })
+        .unwrap();
+        let source = format!(
+            "#![allow(dead_code,unused_variables,unused_assignments,unused_mut,unused_parens)]\nmod validation_value {{\n{}\n}}\nmod generated {{\n{generated}\n}}\n{}",
+            include_str!("appstate_validation_value.rs.txt"),
+            r#"
+use validation_value::{Transforms, ValidationError, Value};
+#[derive(Default)]
+struct Host { trace: Vec<String>, fail_at: Option<usize> }
+impl Host {
+    fn record(&mut self, entry: String) -> Result<(), Box<ValidationError>> {
+        self.trace.push(entry);
+        if self.fail_at == Some(self.trace.len()) {
+            return Err(ValidationError::dependency_boxed("DecodeError", "selected transform failed"));
+        }
+        Ok(())
+    }
+}
+impl<'a> Transforms<'a> for Host {
+    fn number_or_throw_if_too_large(&mut self, value: Value<'a>) -> Result<Value<'a>, Box<ValidationError>> {
+        let number = value.number()?;
+        self.record(format!("safe{number}"))?;
+        if number == 2.0 { return Err(ValidationError::dependency_boxed("DecodeError", "second transform failed")); }
+        Ok(value)
+    }
+    fn to_sync_key_id(&mut self, value: Value<'a>) -> Result<Value<'a>, Box<ValidationError>> { self.record("key".into())?; Ok(value) }
+    fn decode_sync_action_data(&mut self, value: Value<'a>) -> Result<Value<'a>, Box<ValidationError>> { Ok(value) }
+    fn decode_patch_debug_data(&mut self, value: Value<'a>) -> Result<Value<'a>, Box<ValidationError>> { Ok(value) }
+}
+fn same_object(a: &Value<'_>, b: &Value<'_>) {
+    let (Value::Object(a), Value::Object(b)) = (a, b) else { panic!("expected objects") };
+    assert!(std::sync::Arc::ptr_eq(a, b));
+}
+fn main() {
+    let shared = Value::object(vec![("id", Value::Number(11.0))]);
+    let unique = Value::object(vec![("id", Value::Number(22.0))]);
+    let mut host = Host::default();
+    let result = generated::projection(&mut host, &shared, &Value::Number(1.0), &unique).unwrap();
+    let first = result.field("first").unwrap();
+    let nested = result.field("nested").unwrap();
+    let second = nested.field("second").unwrap();
+    same_object(&first, &shared);
+    same_object(&second, &shared);
+    same_object(&nested.field("unique").unwrap(), &unique);
+    assert_eq!(nested.field("value").unwrap().number().unwrap(), 1.0);
+    assert_eq!(result.field("last").unwrap().number().unwrap(), 3.0);
+    assert_eq!(host.trace, ["key", "key", "safe1", "safe3"]);
+    host.trace.clear();
+    let error = generated::projection(&mut host, &shared, &Value::Number(2.0), &unique).unwrap_err();
+    assert_eq!(error.class, "DecodeError");
+    assert_eq!(error.message, "second transform failed");
+    assert_eq!(host.trace, ["key", "key", "safe2"]);
+    host.trace.clear();
+    host.fail_at = Some(2);
+    let error = generated::projection(&mut host, &shared, &Value::Number(1.0), &unique).unwrap_err();
+    assert_eq!(error.class, "DecodeError");
+    assert_eq!(error.message, "selected transform failed");
+    assert_eq!(host.trace, ["key", "key"]);
+    host.fail_at = None;
+    let result = generated::mutation_fallback(&mut host).unwrap();
+    assert_eq!(result.field("first").unwrap().number().unwrap(), 1.0);
+    assert_eq!(result.field("second").unwrap().number().unwrap(), 2.0);
+    assert_eq!(result.field("third").unwrap().number().unwrap(), 2.0);
+    let mapped = generated::capture(&mut host, &shared, &Value::list(vec![Value::Number(4.0), Value::Number(5.0)])).unwrap();
+    let items = mapped.array().unwrap();
+    assert_eq!(items.len(), 2);
+    for (item, expected) in items.iter().zip([4.0, 5.0]) {
+        same_object(&item.field("captured").unwrap(), &shared);
+        assert_eq!(item.field("item").unwrap().number().unwrap(), expected);
+    }
+    let result = generated::shadow(&mut host, &shared, &Value::list(vec![Value::Number(6.0), Value::Number(7.0)])).unwrap();
+    same_object(&result.field("outer").unwrap(), &shared);
+    let mapped = result.field("items").unwrap();
+    for (item, expected) in mapped.array().unwrap().iter().zip([6.0, 7.0]) {
+        assert_eq!(item.field("shadow").unwrap().number().unwrap(), expected);
+        same_object(&item.field("argument").unwrap(), &shared);
+    }
 }
 "#
         );

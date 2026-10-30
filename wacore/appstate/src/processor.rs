@@ -161,31 +161,37 @@ fn mutation_summary(mutations: &[Mutation]) -> String {
     // Only the best twelve entries are rendered. Keep that bounded prefix
     // ordered instead of sorting every distinct command. First positions are
     // unique, so the ordering stays independent of HashMap iteration order.
-    let mut selected: Vec<(MutationSummary<'_>, (usize, usize))> =
-        Vec::with_capacity(counts.len().min(MUTATION_SUMMARY_ENTRY_CAP));
+    let mut selected = [(
+        MutationSummary {
+            operation: "",
+            command: CommandSummary::Empty,
+        },
+        (0, 0),
+    ); MUTATION_SUMMARY_ENTRY_CAP];
+    let mut selected_len = 0;
     let mut hidden = 0;
     for (summary, (count, first)) in counts {
-        let position = selected
+        let position = selected[..selected_len]
             .iter()
             .position(|(_, (other_count, other_first))| {
                 count > *other_count || (count == *other_count && first < *other_first)
             })
-            .unwrap_or(selected.len());
+            .unwrap_or(selected_len);
         if position < MUTATION_SUMMARY_ENTRY_CAP {
-            // Pop before inserting so a full prefix never grows its allocation.
-            if selected.len() == MUTATION_SUMMARY_ENTRY_CAP
-                && let Some((_, (evicted_count, _))) = selected.pop()
-            {
-                hidden += evicted_count;
+            if selected_len == MUTATION_SUMMARY_ENTRY_CAP {
+                hidden += selected[MUTATION_SUMMARY_ENTRY_CAP - 1].1.0;
+            } else {
+                selected_len += 1;
             }
-            selected.insert(position, (summary, (count, first)));
+            selected.copy_within(position..selected_len - 1, position + 1);
+            selected[position] = (summary, (count, first));
         } else {
             hidden += count;
         }
     }
 
     let mut out = String::new();
-    for (i, (summary, (count, _))) in selected.iter().enumerate() {
+    for (i, (summary, (count, _))) in selected[..selected_len].iter().enumerate() {
         if i > 0 {
             out.push_str(", ");
         }

@@ -54,12 +54,12 @@ pub(super) fn validate_external_blob_reference<'a>(
     } else {
     }
     return Ok(Value::object(vec![
-        ("mediaKey", s5.clone()),
-        ("directPath", s0.clone()),
-        ("handle", s4.clone()),
-        ("fileSizeBytes", s3.clone()),
-        ("fileSha256", s2.clone()),
-        ("fileEncSha256", s1.clone()),
+        ("mediaKey", s5),
+        ("directPath", s0),
+        ("handle", s4),
+        ("fileSizeBytes", s3),
+        ("fileSha256", s2),
+        ("fileEncSha256", s1),
     ]));
 }
 #[allow(unused_variables)]
@@ -93,10 +93,10 @@ pub(super) fn validate_key_id_protobuf<'a>(
         ));
     } else {
     }
-    return Ok(Value::object(vec![(
-        "id",
-        transforms.to_sync_key_id(s0.clone())?,
-    )]));
+    return Ok(Value::object(vec![("id", {
+        let projection_value = s0;
+        transforms.to_sync_key_id(projection_value)?
+    })]));
 }
 #[allow(unused_variables)]
 #[inline(never)]
@@ -132,10 +132,7 @@ pub(super) fn validate_mutation_protobuf<'a>(
         let call_arg_1 = &s1;
         validate_record_protobuf(transforms, call_arg_0, call_arg_1)?
     };
-    return Ok(Value::object(vec![
-        ("operation", s0.clone()),
-        ("record", s2.clone()),
-    ]));
+    return Ok(Value::object(vec![("operation", s0), ("record", s2)]));
 }
 #[allow(unused_variables)]
 #[inline(never)]
@@ -270,18 +267,18 @@ pub(super) fn validate_patch_protobuf<'a>(
         return Ok(Value::object(vec![
             (
                 "version",
-                Value::object(vec![(
-                    "version",
-                    transforms.number_or_throw_if_too_large(s9.clone())?,
-                )]),
+                Value::object(vec![("version", {
+                    let projection_value = s9;
+                    transforms.number_or_throw_if_too_large(projection_value)?
+                })]),
             ),
             ("mutations", Value::Undefined),
-            ("externalMutations", s12.clone()),
-            ("snapshotMac", s7.clone()),
-            ("patchMac", s6.clone()),
-            ("keyId", s10.clone()),
-            ("deviceIndex", s1.clone()),
-            ("clientDebugData", s11.clone()),
+            ("externalMutations", s12),
+            ("snapshotMac", s7),
+            ("patchMac", s6),
+            ("keyId", s10),
+            ("deviceIndex", s1),
+            ("clientDebugData", s11),
         ]));
     } else {
     }
@@ -302,19 +299,19 @@ pub(super) fn validate_patch_protobuf<'a>(
     return Ok(Value::object(vec![
         (
             "version",
-            Value::object(vec![(
-                "version",
-                transforms.number_or_throw_if_too_large(s9.clone())?,
-            )]),
+            Value::object(vec![("version", {
+                let projection_value = s9;
+                transforms.number_or_throw_if_too_large(projection_value)?
+            })]),
         ),
-        ("mutations", s13.clone()),
+        ("mutations", s13),
         ("externalMutations", Value::Undefined),
-        ("exitCode", s2.clone()),
-        ("snapshotMac", s7.clone()),
-        ("patchMac", s6.clone()),
-        ("keyId", s10.clone()),
-        ("deviceIndex", s1.clone()),
-        ("clientDebugData", s11.clone()),
+        ("exitCode", s2),
+        ("snapshotMac", s7),
+        ("patchMac", s6),
+        ("keyId", s10),
+        ("deviceIndex", s1),
+        ("clientDebugData", s11),
     ]));
 }
 #[allow(unused_variables)]
@@ -388,9 +385,9 @@ pub(super) fn validate_record_protobuf<'a>(
         validate_key_id_protobuf(transforms, call_arg_0, call_arg_1, &call_arg_2)?
     };
     return Ok(Value::object(vec![
-        ("index", Value::object(vec![("blob", s3.clone())])),
-        ("value", Value::object(vec![("blob", s4.clone())])),
-        ("keyId", s5.clone()),
+        ("index", Value::object(vec![("blob", s3)])),
+        ("value", Value::object(vec![("blob", s4)])),
+        ("keyId", s5),
     ]));
 }
 #[allow(unused_variables)]
@@ -469,13 +466,13 @@ pub(super) fn validate_snapshot_protobuf<'a>(
     return Ok(Value::object(vec![
         (
             "version",
-            Value::object(vec![(
-                "version",
-                transforms.number_or_throw_if_too_large(s4.clone())?,
-            )]),
+            Value::object(vec![("version", {
+                let projection_value = s4;
+                transforms.number_or_throw_if_too_large(projection_value)?
+            })]),
         ),
-        ("records", s5.clone()),
-        ("mac", s1.clone()),
-        ("keyId", s6.clone()),
+        ("records", s5),
+        ("mac", s1),
+        ("keyId", s6),
     ]));
 }
