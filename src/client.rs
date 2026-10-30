@@ -496,10 +496,11 @@ impl ChatLane {
         mut node: Arc<wacore_binary::OwnedNodeRef>,
         mut shutdown: wacore::runtime::ShutdownSignal,
         runtime: &dyn Runtime,
+        mut offline: Option<Box<offline_resume::OfflinePendingGuard>>,
     ) -> Result<(), async_channel::TrySendError<QueuedChatMessage>> {
         let mut turns = crate::inbound_queue::SATURATION_RETRY_TURNS;
         loop {
-            let queued = match self.try_enqueue_scoped(node, shutdown) {
+            let queued = match self.try_enqueue_scoped(node, shutdown, offline) {
                 Err(async_channel::TrySendError::Full(queued)) => queued,
                 result => return result,
             };
@@ -513,6 +514,8 @@ impl ChatLane {
             turns -= 1;
             node = queued.node;
             shutdown = queued.shutdown;
+            // The refused attempt keeps its admission, so a retry counts once.
+            offline = queued.offline;
         }
     }
 
@@ -521,19 +524,21 @@ impl ChatLane {
         &self,
         node: Arc<wacore_binary::OwnedNodeRef>,
     ) -> Result<(), async_channel::TrySendError<QueuedChatMessage>> {
-        self.try_enqueue_scoped(node, wacore::runtime::ShutdownSignal::never())
+        self.try_enqueue_scoped(node, wacore::runtime::ShutdownSignal::never(), None)
     }
 
     pub(crate) fn try_enqueue_scoped(
         &self,
         node: Arc<wacore_binary::OwnedNodeRef>,
         shutdown: wacore::runtime::ShutdownSignal,
+        offline: Option<Box<offline_resume::OfflinePendingGuard>>,
     ) -> Result<(), async_channel::TrySendError<QueuedChatMessage>> {
         let queued = QueuedChatMessage {
             node,
             shutdown,
             lane_liveness: Arc::clone(&self.enqueue_lock),
             work: None,
+            offline,
         };
         if self.queue_tx.is_closed() {
             return Err(async_channel::TrySendError::Closed(queued));
@@ -579,6 +584,9 @@ pub(crate) struct QueuedChatMessage {
     pub node: Arc<wacore_binary::OwnedNodeRef>,
     pub lane_liveness: Arc<Mutex<()>>,
     pub work: Option<crate::flush_scope::FlushGuard>,
+    /// This message's claim on the offline resume's gate, boxed so a queued
+    /// item pays one word for it; see `OfflinePendingGuard`.
+    pub offline: Option<Box<offline_resume::OfflinePendingGuard>>,
 }
 
 const APP_STATE_RETRY_MAX_ATTEMPTS: u32 = 6;
