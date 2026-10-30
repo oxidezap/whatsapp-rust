@@ -1,0 +1,29 @@
+{
+  "waVersion": "2.3000.1047483476",
+  "setHash": "05609307e68b0f6ccfd2a121a573049999e38b752cfe7155ebbe5c661805751b",
+  "asset": "https://github.com/oxidezap/whatspec/releases/download/bundle-store/bundles-2.3000.1047483476-05609307e68b0f6ccfd2a121a573049999e38b752cfe7155ebbe5c661805751b.tar.xz",
+  "modules": [
+    {
+      "name": "WAWebHandleGroupNotification",
+      "bundleSha256": "09d91fdc4089c50ab1d35dd6c796ee82ef4c3296710316d20383c85738b871b8",
+      "startByte": 1693402,
+      "endByte": 1716842,
+      "moduleSha256": "a65d861ba0dacdcec52d2df48712a80677ecf10021d7df63c84183f195db13a1"
+    },
+    {
+      "name": "WAWebGroupType",
+      "bundleSha256": "082e0ef2faaa6247e6e17a225bb1685b7e583e946f7b0dc17ee58c431c1a07a8",
+      "startByte": 959207,
+      "endByte": 963377,
+      "moduleSha256": "d63035154901e9677bc08acd8ab3994845087875ca5ce84636ec765b72553519"
+    },
+    {
+      "name": "WAWebHandleGroupNotificationConst",
+      "bundleSha256": "09d91fdc4089c50ab1d35dd6c796ee82ef4c3296710316d20383c85738b871b8",
+      "startByte": 268451,
+      "endByte": 276687,
+      "moduleSha256": "176daa1a4d66aee3b907bc26ba2e40da1fde706e142f44bf1bdb8cfb9fd3581e"
+    }
+  ],
+  "archiveSha256": "22243b9c2ff18a66cea8fd66551821fe0f9f09786d107e2be8284637db86c349"
+}

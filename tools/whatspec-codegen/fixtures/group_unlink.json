@@ -1,0 +1,283 @@
+{
+  "moduleName": "WAWebHandleGroupNotification",
+  "startByte": 6032,
+  "endByte": 7222,
+  "rows": [
+    {
+      "unlinkType": null,
+      "reason": null,
+      "actionType": null
+    },
+    {
+      "unlinkType": null,
+      "reason": "delete_parent",
+      "actionType": null
+    },
+    {
+      "unlinkType": null,
+      "reason": "integrity_delete_parent",
+      "actionType": null
+    },
+    {
+      "unlinkType": "__defineGetter__",
+      "reason": null,
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "__defineGetter__",
+      "reason": "delete_parent",
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "__defineGetter__",
+      "reason": "integrity_delete_parent",
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "__defineSetter__",
+      "reason": null,
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "__defineSetter__",
+      "reason": "delete_parent",
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "__defineSetter__",
+      "reason": "integrity_delete_parent",
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "__lookupGetter__",
+      "reason": null,
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "__lookupGetter__",
+      "reason": "delete_parent",
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "__lookupGetter__",
+      "reason": "integrity_delete_parent",
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "__lookupSetter__",
+      "reason": null,
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "__lookupSetter__",
+      "reason": "delete_parent",
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "__lookupSetter__",
+      "reason": "integrity_delete_parent",
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "__proto__",
+      "reason": null,
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "__proto__",
+      "reason": "delete_parent",
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "__proto__",
+      "reason": "integrity_delete_parent",
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "constructor",
+      "reason": null,
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "constructor",
+      "reason": "delete_parent",
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "constructor",
+      "reason": "integrity_delete_parent",
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "hasOwnProperty",
+      "reason": null,
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "hasOwnProperty",
+      "reason": "delete_parent",
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "hasOwnProperty",
+      "reason": "integrity_delete_parent",
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "isPrototypeOf",
+      "reason": null,
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "isPrototypeOf",
+      "reason": "delete_parent",
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "isPrototypeOf",
+      "reason": "integrity_delete_parent",
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "parent_group",
+      "reason": null,
+      "actionType": "parent_group_unlink"
+    },
+    {
+      "unlinkType": "parent_group",
+      "reason": "delete_parent",
+      "actionType": "delete_parent_group_unlink"
+    },
+    {
+      "unlinkType": "parent_group",
+      "reason": "integrity_delete_parent",
+      "actionType": "integrity_parent_group_unlink"
+    },
+    {
+      "unlinkType": "propertyIsEnumerable",
+      "reason": null,
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "propertyIsEnumerable",
+      "reason": "delete_parent",
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "propertyIsEnumerable",
+      "reason": "integrity_delete_parent",
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "sibling_group",
+      "reason": null,
+      "actionType": "sibling_group_unlink"
+    },
+    {
+      "unlinkType": "sibling_group",
+      "reason": "delete_parent",
+      "actionType": "sibling_group_unlink"
+    },
+    {
+      "unlinkType": "sibling_group",
+      "reason": "integrity_delete_parent",
+      "actionType": "sibling_group_unlink"
+    },
+    {
+      "unlinkType": "sub_group",
+      "reason": null,
+      "actionType": "sub_group_unlink"
+    },
+    {
+      "unlinkType": "sub_group",
+      "reason": "delete_parent",
+      "actionType": "delete_parent_group_unlink"
+    },
+    {
+      "unlinkType": "sub_group",
+      "reason": "integrity_delete_parent",
+      "actionType": "integrity_sub_group_unlink"
+    },
+    {
+      "unlinkType": "toLocaleString",
+      "reason": null,
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "toLocaleString",
+      "reason": "delete_parent",
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "toLocaleString",
+      "reason": "integrity_delete_parent",
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "toString",
+      "reason": null,
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "toString",
+      "reason": "delete_parent",
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "toString",
+      "reason": "integrity_delete_parent",
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "valueOf",
+      "reason": null,
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "valueOf",
+      "reason": "delete_parent",
+      "actionType": null,
+      "unsupportedAction": true
+    },
+    {
+      "unlinkType": "valueOf",
+      "reason": "integrity_delete_parent",
+      "actionType": null,
+      "unsupportedAction": true
+    }
+  ]
+}

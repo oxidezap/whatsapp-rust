@@ -19,6 +19,8 @@ pub(crate) mod device_topology;
 mod durability_probe_id;
 #[cfg(feature = "client-lifecycle")]
 mod extension_lifecycle;
+#[cfg(feature = "generated-group-notifications")]
+mod group_notifications;
 pub mod interceptor;
 mod iq_ops;
 mod lid_pn;
@@ -2236,6 +2238,12 @@ pub struct Client {
     /// Optional whole-envelope group capture before effects and ACK; fixed at build.
     pub(crate) group_notification_durability_hook:
         std::sync::OnceLock<Arc<dyn crate::GroupNotificationDurabilityHook>>,
+
+    /// Optional effective account facts for contextual group parsing.
+    #[cfg(feature = "generated-group-notifications")]
+    pub(crate) group_notification_facts_provider: std::sync::OnceLock<
+        Arc<dyn crate::types::group_notification_facts::GroupNotificationFactsProvider>,
+    >,
 
     /// Notification recovery shares the inbound journal, independently of capture.
     pub(crate) history_sync_durability_hook:

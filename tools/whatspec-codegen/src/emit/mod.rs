@@ -7,6 +7,7 @@ pub mod abprops;
 pub mod appstate;
 pub mod community_create;
 pub mod enums;
+pub mod group_normalization;
 pub mod iq_conformance;
 pub mod iq_contextual;
 pub mod iq_pilots;
@@ -43,3 +44,11 @@ mod tests {
         );
     }
 }
+
+pub mod group_create_conformance;
+pub mod group_envelope_normalization;
+pub mod group_link_normalization;
+
+pub mod group_envelope_conformance;
+
+pub mod group_actions_conformance;

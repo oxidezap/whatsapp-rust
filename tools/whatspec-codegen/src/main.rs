@@ -317,6 +317,36 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
 
     Ok(vec![
         Artifact {
+            path: "wacore/src/stanza/groups/actions_conformance.rs",
+            content: emit::group_actions_conformance::generate(wa_version)?,
+            rust: true,
+        },
+        Artifact {
+            path: "wacore/src/stanza/groups/envelope_conformance.rs",
+            content: emit::group_envelope_conformance::generate(wa_version)?,
+            rust: true,
+        },
+        Artifact {
+            path: "wacore/src/stanza/groups/link_generated.rs",
+            content: emit::group_link_normalization::generate(wa_version)?,
+            rust: true,
+        },
+        Artifact {
+            path: "wacore/src/stanza/groups/envelope_generated.rs",
+            content: emit::group_envelope_normalization::generate(wa_version)?,
+            rust: true,
+        },
+        Artifact {
+            path: "wacore/src/stanza/groups/create_conformance.rs",
+            content: emit::group_create_conformance::generate(wa_version)?,
+            rust: true,
+        },
+        Artifact {
+            path: "wacore/src/stanza/groups/unlink_generated.rs",
+            content: emit::group_normalization::generate(wa_version)?,
+            rust: true,
+        },
+        Artifact {
             path: "wacore/src/version/generated.rs",
             content: emit::version::generate(wa_version)?,
             rust: true,
