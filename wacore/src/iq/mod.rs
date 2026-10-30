@@ -5,6 +5,9 @@ pub mod business;
 pub mod chatstate;
 mod community_create;
 pub mod contacts;
+mod contextual;
+#[cfg(test)]
+mod contextual_tests;
 pub mod devices;
 pub mod dirty;
 pub mod groups;

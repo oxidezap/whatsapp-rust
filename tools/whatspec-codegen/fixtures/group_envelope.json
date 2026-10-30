@@ -1,0 +1,555 @@
+{
+  "moduleName": "WAWebHandleGroupNotification",
+  "startByte": 10592,
+  "endByte": 22915,
+  "locals": 17,
+  "prefix": [
+    {
+      "op": "if",
+      "condition": {
+        "expr": "sequence",
+        "values": [
+          {
+            "expr": "read",
+            "method": "assertTag",
+            "name": "notification"
+          },
+          {
+            "expr": "read",
+            "method": "hasAttr",
+            "name": "to"
+          }
+        ]
+      },
+      "thenOps": [
+        {
+          "op": "bind",
+          "local": 0,
+          "value": null
+        },
+        {
+          "op": "bind",
+          "local": 1,
+          "value": {
+            "expr": "read",
+            "method": "attrString",
+            "name": "to"
+          }
+        },
+        {
+          "op": "bind",
+          "local": 2,
+          "value": {
+            "expr": "convert",
+            "conversion": "toJid",
+            "value": {
+              "expr": "context",
+              "fact": "meDeviceLid"
+            }
+          }
+        },
+        {
+          "op": "bind",
+          "local": 3,
+          "value": {
+            "expr": "conditional",
+            "condition": {
+              "expr": "binary",
+              "operator": "nullishEqual",
+              "left": {
+                "expr": "assign",
+                "local": 0,
+                "value": {
+                  "expr": "context",
+                  "fact": "maybeMeDevicePn"
+                }
+              },
+              "right": {
+                "expr": "null"
+              }
+            },
+            "thenValue": {
+              "expr": "undefined"
+            },
+            "elseValue": {
+              "expr": "convert",
+              "conversion": "toJid",
+              "value": {
+                "expr": "local",
+                "local": 0
+              }
+            }
+          }
+        },
+        {
+          "op": "bind",
+          "local": 4,
+          "value": {
+            "expr": "binary",
+            "operator": "strictEqual",
+            "left": {
+              "expr": "local",
+              "local": 1
+            },
+            "right": {
+              "expr": "local",
+              "local": 2
+            }
+          }
+        },
+        {
+          "op": "bind",
+          "local": 5,
+          "value": {
+            "expr": "logical",
+            "operator": "and",
+            "left": {
+              "expr": "not",
+              "value": {
+                "expr": "isEmpty",
+                "value": {
+                  "expr": "local",
+                  "local": 3
+                }
+              }
+            },
+            "right": {
+              "expr": "binary",
+              "operator": "strictEqual",
+              "left": {
+                "expr": "local",
+                "local": 1
+              },
+              "right": {
+                "expr": "local",
+                "local": 3
+              }
+            }
+          }
+        },
+        {
+          "op": "evaluate",
+          "value": {
+            "expr": "logical",
+            "operator": "and",
+            "left": {
+              "expr": "logical",
+              "operator": "and",
+              "left": {
+                "expr": "not",
+                "value": {
+                  "expr": "local",
+                  "local": 4
+                }
+              },
+              "right": {
+                "expr": "not",
+                "value": {
+                  "expr": "local",
+                  "local": 5
+                }
+              }
+            },
+            "right": {
+              "expr": "reject",
+              "message": {
+                "expr": "binary",
+                "operator": "add",
+                "left": {
+                  "expr": "binary",
+                  "operator": "add",
+                  "left": {
+                    "expr": "binary",
+                    "operator": "add",
+                    "left": {
+                      "expr": "binary",
+                      "operator": "add",
+                      "left": {
+                        "expr": "binary",
+                        "operator": "add",
+                        "left": {
+                          "expr": "binary",
+                          "operator": "add",
+                          "left": {
+                            "expr": "string",
+                            "value": "to have \"to\" matching meLid (\""
+                          },
+                          "right": {
+                            "expr": "local",
+                            "local": 2
+                          }
+                        },
+                        "right": {
+                          "expr": "string",
+                          "value": "\") or mePn (\""
+                        }
+                      },
+                      "right": {
+                        "expr": "conditional",
+                        "condition": {
+                          "expr": "binary",
+                          "operator": "nullishNotEqual",
+                          "left": {
+                            "expr": "local",
+                            "local": 3
+                          },
+                          "right": {
+                            "expr": "null"
+                          }
+                        },
+                        "thenValue": {
+                          "expr": "local",
+                          "local": 3
+                        },
+                        "elseValue": {
+                          "expr": "string",
+                          "value": ""
+                        }
+                      }
+                    },
+                    "right": {
+                      "expr": "string",
+                      "value": "\"), but instead has \""
+                    }
+                  },
+                  "right": {
+                    "expr": "local",
+                    "local": 1
+                  }
+                },
+                "right": {
+                  "expr": "string",
+                  "value": "\""
+                }
+              }
+            }
+          }
+        }
+      ],
+      "elseOps": []
+    },
+    {
+      "op": "bind",
+      "local": 6,
+      "value": {
+        "expr": "convert",
+        "conversion": "groupJidToWid",
+        "value": {
+          "expr": "read",
+          "method": "attrGroupJid",
+          "name": "from"
+        }
+      }
+    },
+    {
+      "op": "bind",
+      "local": 7,
+      "value": {
+        "expr": "conditional",
+        "condition": {
+          "expr": "read",
+          "method": "hasAttr",
+          "name": "participant"
+        },
+        "thenValue": {
+          "expr": "convert",
+          "conversion": "userJidToWid",
+          "value": {
+            "expr": "read",
+            "method": "attrUserJid",
+            "name": "participant"
+          }
+        },
+        "elseValue": {
+          "expr": "null"
+        }
+      }
+    },
+    {
+      "op": "bind",
+      "local": 8,
+      "value": {
+        "expr": "null"
+      }
+    },
+    {
+      "op": "tryDiagnostic",
+      "body": [
+        {
+          "op": "bind",
+          "local": 9,
+          "value": {
+            "expr": "read",
+            "method": "maybeAttrPhoneUserJid",
+            "name": "participant_pn"
+          }
+        },
+        {
+          "op": "evaluate",
+          "value": {
+            "expr": "assign",
+            "local": 8,
+            "value": {
+              "expr": "conditional",
+              "condition": {
+                "expr": "binary",
+                "operator": "nullishNotEqual",
+                "left": {
+                  "expr": "local",
+                  "local": 9
+                },
+                "right": {
+                  "expr": "null"
+                }
+              },
+              "thenValue": {
+                "expr": "convert",
+                "conversion": "userJidToWid",
+                "value": {
+                  "expr": "local",
+                  "local": 9
+                }
+              },
+              "elseValue": {
+                "expr": "null"
+              }
+            }
+          }
+        }
+      ],
+      "messageParts": [
+        "Known error T150827746: ",
+        ""
+      ]
+    },
+    {
+      "op": "bind",
+      "local": 10,
+      "value": {
+        "expr": "context",
+        "fact": "usernameDisplayed"
+      }
+    },
+    {
+      "op": "bind",
+      "local": 11,
+      "value": {
+        "expr": "read",
+        "method": "attrTime",
+        "name": "t"
+      }
+    },
+    {
+      "op": "bind",
+      "local": 12,
+      "value": {
+        "expr": "conditional",
+        "condition": {
+          "expr": "read",
+          "method": "hasAttr",
+          "name": "addressing_mode"
+        },
+        "thenValue": {
+          "expr": "binary",
+          "operator": "strictEqual",
+          "left": {
+            "expr": "read",
+            "method": "attrString",
+            "name": "addressing_mode"
+          },
+          "right": {
+            "expr": "string",
+            "value": "lid"
+          }
+        },
+        "elseValue": {
+          "expr": "not",
+          "value": {
+            "expr": "integer",
+            "value": 1
+          }
+        }
+      }
+    },
+    {
+      "op": "bind",
+      "local": 13,
+      "value": {
+        "expr": "conditional",
+        "condition": {
+          "expr": "logical",
+          "operator": "and",
+          "left": {
+            "expr": "read",
+            "method": "hasAttr",
+            "name": "participant_username"
+          },
+          "right": {
+            "expr": "local",
+            "local": 10
+          }
+        },
+        "thenValue": {
+          "expr": "read",
+          "method": "attrString",
+          "name": "participant_username"
+        },
+        "elseValue": {
+          "expr": "null"
+        }
+      }
+    },
+    {
+      "op": "bind",
+      "local": 14,
+      "value": {
+        "expr": "conditional",
+        "condition": {
+          "expr": "logical",
+          "operator": "and",
+          "left": {
+            "expr": "read",
+            "method": "hasAttr",
+            "name": "participant_country_code"
+          },
+          "right": {
+            "expr": "local",
+            "local": 10
+          }
+        },
+        "thenValue": {
+          "expr": "convert",
+          "conversion": "asIsoCountryCode",
+          "value": {
+            "expr": "read",
+            "method": "attrString",
+            "name": "participant_country_code"
+          }
+        },
+        "elseValue": {
+          "expr": "null"
+        }
+      }
+    }
+  ],
+  "actions": {
+    "startByte": 11866,
+    "endByte": 22623,
+    "resultLocal": 16,
+    "missingIdentificationLocal": 15,
+    "missingIdentificationTag": "missing_participant_identification",
+    "unknownActionErrorPrefix": "Unrecognized group action "
+  },
+  "projection": {
+    "expr": "object",
+    "fields": [
+      {
+        "name": "externalId",
+        "value": {
+          "expr": "read",
+          "method": "attrString",
+          "name": "id"
+        }
+      },
+      {
+        "name": "chatId",
+        "value": {
+          "expr": "local",
+          "local": 6
+        }
+      },
+      {
+        "name": "isLidAddressingMode",
+        "value": {
+          "expr": "local",
+          "local": 12
+        }
+      },
+      {
+        "name": "author",
+        "value": {
+          "expr": "local",
+          "local": 7
+        }
+      },
+      {
+        "name": "authorPhoneNumber",
+        "value": {
+          "expr": "local",
+          "local": 8
+        }
+      },
+      {
+        "name": "authorUsername",
+        "value": {
+          "expr": "local",
+          "local": 13
+        }
+      },
+      {
+        "name": "authorUsernameCountryCode",
+        "value": {
+          "expr": "local",
+          "local": 14
+        }
+      },
+      {
+        "name": "ts",
+        "value": {
+          "expr": "read",
+          "method": "attrTime",
+          "name": "t"
+        }
+      },
+      {
+        "name": "pushname",
+        "value": {
+          "expr": "read",
+          "method": "maybeAttrString",
+          "name": "notify"
+        }
+      },
+      {
+        "name": "offline",
+        "value": {
+          "expr": "read",
+          "method": "maybeAttrString",
+          "name": "offline"
+        }
+      },
+      {
+        "name": "actions",
+        "value": {
+          "expr": "local",
+          "local": 16
+        }
+      },
+      {
+        "name": "hasIncompleteParticipantInformation",
+        "value": {
+          "expr": "logical",
+          "operator": "and",
+          "left": {
+            "expr": "local",
+            "local": 10
+          },
+          "right": {
+            "expr": "binary",
+            "operator": "strictEqual",
+            "left": {
+              "expr": "local",
+              "local": 15
+            },
+            "right": {
+              "expr": "not",
+              "value": {
+                "expr": "integer",
+                "value": 0
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}

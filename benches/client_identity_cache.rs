@@ -157,3 +157,16 @@ fn pn_lookup_by_lid_miss(bencher: divan::Bencher, n: usize) {
         black_box(absent)
     });
 }
+
+/// Startup publication after the storage scan. Inputs already own the two
+/// identifier allocations, as `mapping_to_entry` does before cache insertion.
+#[divan::bench(args = [64usize, 512, 3443, 4096])]
+fn lid_pn_warm_up(bencher: divan::Bencher, n: usize) {
+    bencher
+        .counter(ItemsCount::new(n))
+        .with_inputs(|| (LidPnCache::new(), (0..n).map(entry).collect::<Vec<_>>()))
+        .bench_values(|(cache, entries)| {
+            block_on(cache.warm_up(entries));
+            black_box(cache)
+        });
+}

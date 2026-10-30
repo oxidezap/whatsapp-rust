@@ -61,6 +61,7 @@ fn every_generated_rust_file_stamps_the_locked_version() {
         "wacore/src/iq/pilots.rs",
         "wacore/src/iq/pilot_conformance.rs",
         "wacore/src/iq/community_create.rs",
+        "wacore/src/iq/contextual.rs",
         "plugins/wam-catalog/src/generated.rs",
         "plugins/wam-catalog/src/call_sites.rs",
         "wacore/src/stanza/wire_tags.rs",

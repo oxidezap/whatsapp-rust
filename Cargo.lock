@@ -4699,6 +4699,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "wa-codegen"
+version = "0.2.0"
+source = "git+https://github.com/oxidezap/whatspec.git?rev=ff5894a3c43dc3401dd7a7872ba358979b8200c9#ff5894a3c43dc3401dd7a7872ba358979b8200c9"
+dependencies = [
+ "regex",
+ "serde_json",
+ "wa-ir",
+]
+
+[[package]]
 name = "wa-fetch"
 version = "0.1.0"
 source = "git+https://github.com/oxidezap/whatspec.git?rev=eb16f595d455d8b0b3f7966a59444f4f9894c127#eb16f595d455d8b0b3f7966a59444f4f9894c127"
@@ -4706,6 +4716,14 @@ dependencies = [
  "anyhow",
  "serde_json",
  "wa-text",
+]
+
+[[package]]
+name = "wa-ir"
+version = "0.1.0"
+source = "git+https://github.com/oxidezap/whatspec.git?rev=ff5894a3c43dc3401dd7a7872ba358979b8200c9#ff5894a3c43dc3401dd7a7872ba358979b8200c9"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -5480,6 +5498,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "toml 1.1.6+spec-1.1.0",
+ "wa-codegen",
+ "wa-ir",
  "xtask-support",
 ]
 
