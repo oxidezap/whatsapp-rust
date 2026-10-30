@@ -413,6 +413,11 @@ name = "receive_footprint"
 test = false
 required-features = ["bench-harness"]
 
+[[example]]
+name = "lid_pn_footprint"
+test = false
+required-features = ["bench-harness"]
+
 # Client-level group-send sweep. `required-features` keeps the fixture out of
 # an ordinary `cargo bench`/`cargo build --all-targets`, which would otherwise
 # fail to find `whatsapp_rust::bench_support`.

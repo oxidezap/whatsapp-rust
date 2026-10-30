@@ -1350,7 +1350,13 @@ where
             return;
         }
         let now = self.entry_time();
-        let mut guard = self.inner.write().await;
+        // `write()` registers a heap-allocated listener even when there are
+        // no readers. Avoid that allocation for uncontended publication and
+        // retain the asynchronous wait when the same lock cannot be acquired.
+        let mut guard = match self.inner.try_write() {
+            Some(guard) => guard,
+            None => self.inner.write().await,
+        };
         match &mut *guard {
             Storage::Plain(inner) => {
                 inner.insert_or_replace(key, value);
@@ -1850,6 +1856,51 @@ impl<K, V, S> Clone for PortableCache<K, V, S> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn insert_waits_for_readers_and_cancelled_wait_does_not_publish() {
+        for capacity in [u64::MAX, 2] {
+            let cache = PortableCache::builder().max_capacity(capacity).build();
+            cache.insert(1, 10).await;
+            let reader = cache.inner.read().await;
+            {
+                let mut cancelled = std::pin::pin!(cache.insert(1, 20));
+                assert!(futures::poll!(&mut cancelled).is_pending());
+            }
+            let mut waiting = std::pin::pin!(cache.insert(2, 30));
+            assert!(futures::poll!(&mut waiting).is_pending());
+            drop(reader);
+            waiting.await;
+            assert_eq!(cache.get(&1).await, Some(10));
+            assert_eq!(cache.get(&2).await, Some(30));
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_fast_attempts_cannot_bypass_a_writer_waiting_for_readers() {
+        for capacity in [u64::MAX, 2] {
+            let cache = PortableCache::builder().max_capacity(capacity).build();
+            cache.insert(1, 0).await;
+            let reader = cache.inner.read().await;
+            let mut first = std::pin::pin!(cache.insert(1, 10));
+            assert!(futures::poll!(&mut first).is_pending());
+            drop(reader);
+
+            // The earlier writer owns the writer mutex while waiting for the
+            // reader to leave. Fresh fast attempts must not steal that grant,
+            // even after the reader has left and before the waiter is polled.
+            for _ in 0..64 {
+                let mut barger = std::pin::pin!(cache.insert(1, 99));
+                assert!(futures::poll!(&mut barger).is_pending());
+            }
+            let mut successor = std::pin::pin!(cache.insert(1, 20));
+            assert!(futures::poll!(&mut successor).is_pending());
+            first.await;
+            assert_eq!(cache.get(&1).await, Some(10));
+            successor.await;
+            assert_eq!(cache.get(&1).await, Some(20));
+        }
+    }
 
     #[test]
     fn sync_ttl_admission_is_atomic_and_bounded() {
