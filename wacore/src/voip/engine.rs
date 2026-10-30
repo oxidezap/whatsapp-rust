@@ -8297,9 +8297,20 @@ mod tests {
             stats.audio_frames_without_decoder, 0,
             "a rescued call never reports a missing decoder"
         );
-        // The rescued samples go into the SAME buffer the MLOW path feeds, under the same ceiling:
-        // this test pushes ten packets with no playout tick in between, so the feed-side bound is
-        // what keeps it finite.
+        // The first ten packets fit the larger jitter ceiling. Keep feeding rescued audio without
+        // a playout tick so this fixture still exercises the feed-side bound and trim accounting.
+        for n in 10..20u64 {
+            let packet = peer_tx.protect_audio(&body);
+            eng.handle_input(1 + n * 60, Input::RelayPacket(&packet));
+            let _ = drain(&mut eng);
+        }
+        let stats = eng.media_stats();
+        assert_eq!(stats.rtp_received, 20);
+        assert_eq!(
+            (stats.audio_frames_concealed, stats.foreign_frames_decoded),
+            (4, 16),
+        );
+        // The rescued samples go into the same buffer the MLOW path feeds, under the same ceiling.
         assert!(eng.jitter_len() > 0, "decoded samples reach playout");
         // The ceiling in force is the one the MLOW reading left behind: those first four packets
         // declared 120 ms (TOC 0x58 under that grammar), so the cushion grew to fit them, and it

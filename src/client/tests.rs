@@ -3813,6 +3813,15 @@ fn client_size_pins_runtime_cache_config_saving() {
     expected += size_of::<std::sync::OnceLock<Arc<dyn crate::HistorySyncDurabilityHook>>>();
     // Independent group capture adds one immutable hook cell; keep the fixed base.
     expected += size_of::<std::sync::OnceLock<Arc<dyn crate::GroupNotificationDurabilityHook>>>();
+    #[cfg(feature = "generated-group-notifications")]
+    {
+        // Contextual group parsing retains its own immutable provider cell.
+        expected += size_of::<
+            std::sync::OnceLock<
+                Arc<dyn crate::types::group_notification_facts::GroupNotificationFactsProvider>,
+            >,
+        >();
+    }
     // Immutable retry policies and handler map replace their synchronization cells.
     // Account for the actual representations without changing the fixed base.
     expected += size_of::<Option<Arc<dyn crate::DecryptFailureAdmission>>>();
