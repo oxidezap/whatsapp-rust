@@ -1821,6 +1821,12 @@ async fn build_scale_fixture(
 
 /// Deterministic blocked-worker fixture for CodSpeed Memory and Simulation.
 /// Payload construction stays outside the measured admission loop.
+///
+/// A lane holds `CHAT_QUEUE_ITEMS` items or `CHAT_BYTES` of them, whichever
+/// comes first, so the fixture needs more items than the queue holds and small
+/// enough payloads that the item limit is what stops admission: at 64 KiB each,
+/// the 16 MiB chat budget filled after 256 of the 512 items and `saturate`
+/// never reached the count it asserts.
 pub struct InboundQueueHarness {
     nodes: Vec<Arc<wacore_binary::OwnedNodeRef>>,
 }
@@ -1828,13 +1834,13 @@ impl Default for InboundQueueHarness {
     fn default() -> Self {
         use wacore_binary::builder::NodeBuilder;
         Self {
-            nodes: (0..128)
+            nodes: (0..1024)
                 .map(|id| {
                     decoded(
                         &NodeBuilder::new("message")
                             .attr("from", "120363000000042@g.us")
                             .attr("id", id.to_string())
-                            .bytes(vec![id as u8; 64 * 1024])
+                            .bytes(vec![id as u8; 8 * 1024])
                             .build(),
                     )
                 })
@@ -1863,8 +1869,12 @@ impl InboundQueueHarness {
             .nodes
             .iter()
             .filter(|node| {
-                lane.try_enqueue_scoped(Arc::clone(node), wacore::runtime::ShutdownSignal::never())
-                    .is_ok()
+                lane.try_enqueue_scoped(
+                    Arc::clone(node),
+                    wacore::runtime::ShutdownSignal::never(),
+                    None,
+                )
+                .is_ok()
             })
             .count();
         assert_eq!(accepted, crate::inbound_queue::CHAT_QUEUE_ITEMS);

@@ -56,6 +56,12 @@ impl MessageHandler {
         let generation = client
             .connection_generation
             .load(std::sync::atomic::Ordering::Acquire);
+        // An offline message counts against the resume's pacing from here until
+        // its lane is done with it, by whichever path it leaves: finished,
+        // cancelled, refused, or dropped with a retired queue. Taken before the
+        // first check so a cancellation still settles the arrival that booked
+        // it, instead of leaving the request permanently outstanding.
+        let offline = client.offline_batch.admit(generation, &node);
         if shutdown.is_fired()
             || scope.is_some_and(|scope| !scope.is_current(&client))
             || client
@@ -114,15 +120,15 @@ impl MessageHandler {
             lane.queue_tx.close();
         }
 
-        let node = match lane
-            .enqueue_scoped(node, shutdown.clone(), &*client.runtime)
+        let (node, offline) = match lane
+            .enqueue_scoped(node, shutdown.clone(), &*client.runtime, offline)
             .await
         {
             Ok(()) => return true,
             // The worker went idle and closed its queue (see
             // `LANE_IDLE_TIMEOUT`). Replace the lane; the successor worker
             // starts only once the idle one has finished draining.
-            Err(async_channel::TrySendError::Closed(queued)) => queued.node,
+            Err(async_channel::TrySendError::Closed(queued)) => (queued.node, queued.offline),
             Err(e) => {
                 warn!("Failed to enqueue message for processing: {e}");
                 // Cancel ack so server redelivers
@@ -164,7 +170,7 @@ impl MessageHandler {
             return true;
         }
         if let Err(e) = fresh
-            .enqueue_scoped(node, shutdown.clone(), &*client.runtime)
+            .enqueue_scoped(node, shutdown.clone(), &*client.runtime, offline)
             .await
         {
             warn!("Failed to enqueue message for processing: {e}");
@@ -287,6 +293,7 @@ async fn process_queued(
         node: msg_node,
         lane_liveness, // Prevents capacity eviction until processing finishes.
         work,
+        offline,
     }: QueuedChatMessage,
     spawn_generation: u64,
 ) -> bool {
@@ -329,6 +336,9 @@ async fn process_queued(
     }
     drop(lane_liveness);
     drop(work);
+    // Last, once the handler is done asking anything of the client: the
+    // resume may only request more backlog for what this lane has finished.
+    drop(offline);
     true
 }
 
@@ -395,26 +405,82 @@ mod tests {
             )),
         );
         let mut accepted = 0;
-        for id in 0..128 {
+        let items = crate::inbound_queue::CHAT_QUEUE_ITEMS;
+        for id in 0..2 * items {
             let node = node_to_owned_ref(
                 &NodeBuilder::new("message")
                     .attr("from", "120363000000042@g.us")
                     .attr("id", id.to_string())
-                    .bytes(vec![id as u8; 64 * 1024])
+                    .bytes(vec![id as u8; 16 * 1024])
                     .build(),
             );
             if lane.try_enqueue(node).is_ok() {
                 accepted += 1;
             }
         }
-        assert_eq!(lane.queue_tx.capacity(), Some(64));
-        assert_eq!(accepted, 64);
-        assert_eq!(lane.queue_tx.len(), 64);
+        assert_eq!(lane.queue_tx.capacity(), Some(items));
+        assert_eq!(accepted, items);
+        assert_eq!(lane.queue_tx.len(), items);
         let retained = 32 * 1024 * 1024 - client.inbound_queues().chat.available();
-        assert!((4 * 1024 * 1024..5 * 1024 * 1024).contains(&retained));
-        eprintln!("production lane: {accepted}/128 accepted, {retained} charged bytes");
+        assert!((items * 16 * 1024..crate::inbound_queue::CHAT_BYTES).contains(&retained));
+        eprintln!(
+            "production lane: {accepted}/{} accepted, {retained} charged bytes",
+            2 * items
+        );
         lane.queue_tx.close();
         drop(blocked);
+    }
+
+    /// S3: the release belongs to the queued message, so a worker that ends
+    /// without processing it still lets the resume go on.
+    #[tokio::test]
+    async fn a_lane_worker_that_stops_releases_the_resume_admission() {
+        let client = crate::test_utils::create_test_client().await;
+        // The send fails without a socket; the arming is what this needs.
+        crate::client::offline_resume::send_first_batch(Arc::clone(&client), 10).await;
+        let generation = client
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let chat: Jid = "120363000000000042@g.us".parse().unwrap();
+        let node = node_to_owned_ref(
+            &NodeBuilder::new("message")
+                .attr("from", chat)
+                .attr("id", "OFFLINE-1")
+                .attr("offline", "1")
+                .build(),
+        );
+        let offline = client
+            .offline_batch
+            .admit(generation, &node)
+            .expect("an armed resume admits an offline message");
+        assert_eq!(client.offline_batch.admitted(), 1);
+        let outstanding = client.offline_batch.outstanding();
+
+        let keep = process_queued(
+            &client,
+            QueuedChatMessage {
+                node,
+                shutdown: client.connection_shutdown_signal(),
+                lane_liveness: Arc::new(async_lock::Mutex::new(())),
+                work: None,
+                offline: Some(offline),
+            },
+            // The worker outlived its connection: it stops without handling.
+            generation + 1,
+        )
+        .await;
+
+        assert!(!keep, "a stale worker must stop");
+        assert_eq!(
+            client.offline_batch.admitted(),
+            0,
+            "the admission is settled even though the handler never ran"
+        );
+        assert_eq!(
+            client.offline_batch.outstanding(),
+            outstanding - 1,
+            "and the stanza it arrived with is settled with it"
+        );
     }
 
     fn message_for(chat: &Jid, id: &str) -> Arc<wacore_binary::OwnedNodeRef> {
@@ -559,11 +625,12 @@ mod tests {
         }
     }
 
-    // Exact and width independent: node, shutdown, lane liveness and drain guard.
-    // Rebaseline per [layout asserts](../../agent_docs/testing.md).
+    // Exact and width independent: node, shutdown, lane liveness, drain guard
+    // and the boxed resume-admission guard (one word; see
+    // `OfflinePendingGuard`). Rebaseline per [layout asserts](../../agent_docs/testing.md).
     #[test]
-    fn queued_chat_message_keeps_four_handles() {
-        assert_eq!(size_of::<QueuedChatMessage>(), 4 * size_of::<usize>());
+    fn queued_chat_message_keeps_five_handles() {
+        assert_eq!(size_of::<QueuedChatMessage>(), 5 * size_of::<usize>());
     }
 
     #[cfg(feature = "bench-harness")]
@@ -672,6 +739,7 @@ mod tests {
             node: Arc::clone(&dummy_node),
             lane_liveness: Arc::new(async_lock::Mutex::new(())),
             work: None,
+            offline: None,
         };
         let process_queued_fut = process_queued(&client, queued, 0);
         let process_queued_size = size_of_val(&process_queued_fut);
@@ -938,6 +1006,7 @@ mod tests {
                     shutdown: client.connection_shutdown_signal(),
                     lane_liveness: Arc::new(async_lock::Mutex::new(())),
                     work: None,
+                    offline: None,
                 },
                 generation
             )

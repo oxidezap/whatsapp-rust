@@ -87,7 +87,14 @@ impl<T> Drop for DrainingReceiver<T> {
     }
 }
 
-pub(crate) const CHAT_QUEUE_ITEMS: usize = 64;
+// Offline delivery is pulled in batches of `offline_resume::BATCH_SIZE`, and a
+// continuation is only reserved while the stanzas requested and not yet
+// finished fit one batch. That gate makes two batches the most one busy chat
+// can ever be handed; a lane smaller than that overflows on every resume: the
+// burst is refused, the connection recycles, the server redelivers the same
+// backlog, and the resume never gets past it. Memory stays bounded by the byte
+// budgets below.
+pub(crate) const CHAT_QUEUE_ITEMS: usize = 512;
 pub(crate) const CHAT_BYTES: usize = 16 * 1024 * 1024;
 const GLOBAL_CHAT_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const ACK_QUEUE_ITEMS: usize = 256;
@@ -422,7 +429,7 @@ mod tests {
         let (lane, rx) = lane(&client.inbound_queues().chat, CHAT_BYTES, 1);
         lane.try_enqueue(node(0, 0)).unwrap();
         let shutdown = client.connection_shutdown_signal();
-        let mut retry = Box::pin(lane.enqueue_scoped(node(1, 0), shutdown, &*client.runtime));
+        let mut retry = Box::pin(lane.enqueue_scoped(node(1, 0), shutdown, &*client.runtime, None));
         assert!(futures::poll!(&mut retry).is_pending());
         client.reset_connection_shutdown();
         drop(rx.try_recv().unwrap());
@@ -446,6 +453,7 @@ mod tests {
                 node(1, 64 * 1024),
                 client.connection_shutdown_signal(),
                 &*client.runtime,
+                None,
             ));
             if !close_before {
                 assert!(futures::poll!(&mut retry).is_pending());
