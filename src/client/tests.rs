@@ -3842,6 +3842,12 @@ fn client_size_pins_runtime_cache_config_saving() {
         )
         .unwrap();
 
+    // These locks have no independent owner, so they live in Client itself.
+    expected += size_of::<RwLock<Option<crate::mediaconn::MediaConn>>>()
+        - size_of::<Arc<RwLock<Option<crate::mediaconn::MediaConn>>>>();
+    expected += size_of::<std::sync::Mutex<HashSet<Jid>>>()
+        - size_of::<Arc<std::sync::Mutex<HashSet<Jid>>>>();
+
     let retry_slot = size_of::<Option<Arc<dyn crate::RetryAdmission>>>();
     let decrypt_slot = size_of::<Option<Arc<dyn crate::DecryptFailureAdmission>>>();
     let handler_slot = size_of::<Option<HashMap<String, Arc<dyn EncHandler>>>>();

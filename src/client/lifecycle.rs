@@ -575,7 +575,7 @@ impl Client {
                 runtime.clone(),
             ),
             persistence_manager: persistence_manager.clone(),
-            media_conn: Arc::new(RwLock::new(None)),
+            media_conn: RwLock::new(None),
             media_conn_flight: Arc::new(std::sync::Mutex::new(None)),
             media_conn_seq: AtomicU64::new(0),
             #[cfg(test)]
@@ -731,7 +731,7 @@ impl Client {
             outbound_flush: Arc::new(crate::flush_scope::FlushScope::new()),
             delivery_receipt_queue: std::sync::OnceLock::new(),
             inbound_queues: std::sync::OnceLock::new(),
-            presence_subscriptions: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            presence_subscriptions: std::sync::Mutex::new(HashSet::new()),
             socket_ready_notifier: event_listener::Event::new(),
             is_ready: AtomicBool::new(false),
             connected_notifier: event_listener::Event::new(),

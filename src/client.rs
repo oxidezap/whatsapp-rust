@@ -1784,7 +1784,8 @@ pub struct Client {
     /// Accumulates decrypted messages during the offline drain for per-batch
     /// commit (WA Web MessageProcessorCache parity).
     pub(crate) inbound_commit_batch: crate::message::commit_batch::InboundCommitBatcher,
-    pub(crate) media_conn: Arc<RwLock<Option<crate::mediaconn::MediaConn>>>,
+    // No independent owner: guards only borrow this Client.
+    pub(crate) media_conn: RwLock<Option<crate::mediaconn::MediaConn>>,
     /// The one in-flight `refresh_media_conn` fetch, shared by concurrent
     /// callers; `None` when no fetch is running. See `crate::mediaconn`.
     pub(crate) media_conn_flight:
@@ -2174,7 +2175,7 @@ pub struct Client {
     /// not guarantee.
     pub(crate) inbound_queues: std::sync::OnceLock<Box<crate::inbound_queue::QueueBudgets>>,
     /// Contacts with active presence subscriptions that must be re-subscribed on reconnect.
-    pub(crate) presence_subscriptions: Arc<std::sync::Mutex<HashSet<Jid>>>,
+    pub(crate) presence_subscriptions: std::sync::Mutex<HashSet<Jid>>,
     /// Metrics for granular offline sync logging
     pub(crate) offline_sync_metrics: Arc<OfflineSyncMetrics>,
     /// Drives the WA Web pull-batch loop for offline backlog delivery.
