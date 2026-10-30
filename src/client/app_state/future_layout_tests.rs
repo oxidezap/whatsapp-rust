@@ -47,7 +47,7 @@ async fn app_state_async_frames_fit_small_heap_blocks() {
         ),
         (
             "prefetch",
-            size_of_val(&client.pre_download_external_blobs(&lists)),
+            size_of_val(&client.pre_download_external_blobs(lists)),
         ),
         (
             "download",
@@ -162,7 +162,8 @@ async fn refused_prefetch_jobs_do_not_allocate_download_sized_nodes() {
             }
         })
         .collect();
-    let mut future = Box::pin(client.pre_download_external_blobs(&lists));
+    let eligible = vec![true; lists.len()];
+    let mut future = Box::pin(client.pre_download_validated_metadata(&lists, &eligible));
     let mut context = Context::from_waker(futures::task::noop_waker_ref());
     let mut ready = false;
     let largest = crate::test_alloc::min_max_block(usize::MAX, || {

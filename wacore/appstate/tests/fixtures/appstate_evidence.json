@@ -1,0 +1,45 @@
+{
+  "whatspecBase": "eb16f595d455d8b0b3f7966a59444f4f9894c127",
+  "waVersion": "2.3000.1047483476",
+  "schemaVersion": "4.4.0",
+  "setHash": "05609307e68b0f6ccfd2a121a573049999e38b752cfe7155ebbe5c661805751b",
+  "archiveSha256": "22243b9c2ff18a66cea8fd66551821fe0f9f09786d107e2be8284637db86c349",
+  "asset": "https://github.com/oxidezap/whatspec/releases/download/bundle-store/bundles-2.3000.1047483476-05609307e68b0f6ccfd2a121a573049999e38b752cfe7155ebbe5c661805751b.tar.xz",
+  "modules": [
+    {
+      "name": "WAWebSyncdValidateServerSyncProtobuf",
+      "bundleSha256": "f588ee2f033b87e018a3be34a37ec1347d8b6b8700de539e6be31481b29c4690",
+      "startByte": 1689683,
+      "endByte": 1695559,
+      "sha256": "ea9a7f85879cc90def030d69ddba472c599079845e663d03c9248d273f0255a1"
+    },
+    {
+      "name": "WAWebSyncdValidateMutations",
+      "bundleSha256": "f588ee2f033b87e018a3be34a37ec1347d8b6b8700de539e6be31481b29c4690",
+      "startByte": 1684555,
+      "endByte": 1689681,
+      "sha256": "05d3e49937060682ad61453ee04e820ca7b02dc8f4a44356bc86de08397892e4"
+    },
+    {
+      "name": "WAWebSyncdCollectionHandler",
+      "bundleSha256": "f588ee2f033b87e018a3be34a37ec1347d8b6b8700de539e6be31481b29c4690",
+      "startByte": 1711365,
+      "endByte": 1757083,
+      "sha256": "9c8e5af2bec4cde85ce3e11d53b51e1a105f4a7f638c42147ff945c8070aceab"
+    },
+    {
+      "name": "WALongInt",
+      "bundleSha256": "09d91fdc4089c50ab1d35dd6c796ee82ef4c3296710316d20383c85738b871b8",
+      "startByte": 2196684,
+      "endByte": 2198605,
+      "sha256": "3968226186a6b83882edacd9c96b7c0b43925d1d51b01ce83ad3cab1dde72de7"
+    },
+    {
+      "name": "WASyncdKeyTypes",
+      "bundleSha256": "09d91fdc4089c50ab1d35dd6c796ee82ef4c3296710316d20383c85738b871b8",
+      "startByte": 3000756,
+      "endByte": 3000986,
+      "sha256": "13b9e61b219032488e4b25d64990ae71d07c4b618b93df953f7025c739f9cc5a"
+    }
+  ]
+}

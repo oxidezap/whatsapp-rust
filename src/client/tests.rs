@@ -3813,6 +3813,15 @@ fn client_size_pins_runtime_cache_config_saving() {
     expected += size_of::<std::sync::OnceLock<Arc<dyn crate::HistorySyncDurabilityHook>>>();
     // Independent group capture adds one immutable hook cell; keep the fixed base.
     expected += size_of::<std::sync::OnceLock<Arc<dyn crate::GroupNotificationDurabilityHook>>>();
+    #[cfg(feature = "generated-group-notifications")]
+    {
+        // Contextual group parsing retains its own immutable provider cell.
+        expected += size_of::<
+            std::sync::OnceLock<
+                Arc<dyn crate::types::group_notification_facts::GroupNotificationFactsProvider>,
+            >,
+        >();
+    }
     // Immutable retry policies and handler map replace their synchronization cells.
     // Account for the actual representations without changing the fixed base.
     expected += size_of::<Option<Arc<dyn crate::DecryptFailureAdmission>>>();
@@ -3832,6 +3841,12 @@ fn client_size_pins_runtime_cache_config_saving() {
             crate::message::commit_batch::InboundCommitBatcher::storage_layout_delta(),
         )
         .unwrap();
+
+    // These locks have no independent owner, so they live in Client itself.
+    expected += size_of::<RwLock<Option<crate::mediaconn::MediaConn>>>()
+        - size_of::<Arc<RwLock<Option<crate::mediaconn::MediaConn>>>>();
+    expected += size_of::<std::sync::Mutex<HashSet<Jid>>>()
+        - size_of::<Arc<std::sync::Mutex<HashSet<Jid>>>>();
 
     let retry_slot = size_of::<Option<Arc<dyn crate::RetryAdmission>>>();
     let decrypt_slot = size_of::<Option<Arc<dyn crate::DecryptFailureAdmission>>>();

@@ -69,6 +69,37 @@ consumer docs and requires a declared hardware floor. Changing profile overrides
 must retain optimization on per-message crypto/protocol code and pass the linked
 size gate. See `Cargo.toml` and `.github/workflows/binary-size.yml`.
 
+App-state protobuf validation uses a separate reviewed pin in
+`tools/whatspec-codegen/fixtures/appstate-validation/lock.json`. This keeps the
+other domains on their existing commit while the new upstream format is reviewed.
+Regenerate with `cargo run -p whatspec-codegen --bin appstate-validation`; add
+`--check` to verify the vendored IR hashes and all three generated Rust files.
+Update this pin and its immutable JSON inputs together, after the upstream PR.
+The normal all-domain generator continues to own the existing action registry.
+
+The generated boundary covers six protobuf methods and the decoded SET method.
+The batch recipe preserves separate SET/REMOVE identities and exposes diagnostic
+hooks for Patch/Snapshot/Local. Its conformance fixtures qualify the ordered
+methods against the official Web snapshot; protobuf decoding is stubbed in that
+oracle and native adapter tests exercise the real buffa decoder separately.
+`wacore::appstate_sync` validates wire protobufs before downloading or mutating
+collection state. Crypto, persistence, recovery, and the existing processor's
+post-decryption batch integration remain handwritten. The public batch/SET APIs
+consume the original decrypted index string and binary payload; the existing
+`Mutation` API does not retain those inputs and is preserved.
+
+Runtime collection ingestion moves owned inputs through `prepare_patch_list` on
+blocking workers. Query keys through the prepared list, then pass that token to
+`process_prepared_patch_list` or `process_one_prepared_patch_list`; this preserves
+validation across the key wait without repeating snapshot scans. Runtime CDN
+prefetch also checks metadata before admitting jobs or reserving download budget.
+Missing snapshot MAC/key guards retain `SnapshotMACMissing` as recovery context
+while preserving the generated validation error for downcasting.
+
+The borrowed `missing_key_ids_after_inline` compatibility probe validates original
+metadata before inlining, so conflicting sources cannot disappear. It retains
+synchronous validation/decoding; owned runtime callers use the prepared API above.
+
 Group normalization consumes separately pinned whatspec envelope, LINK and UNLINK
 contracts, with checked digests. The normal generator emits static Rust guards,
 ordered projections and decision tables without changing the main IR pin.

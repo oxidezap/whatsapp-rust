@@ -1,0 +1,1422 @@
+{
+  "formatVersion": 1,
+  "waVersion": "2.3000.1047483476",
+  "moduleSha256": "ea9a7f85879cc90def030d69ddba472c599079845e663d03c9248d273f0255a1",
+  "functions": {
+    "validateExternalBlobReference": {
+      "module": "WAWebSyncdValidateServerSyncProtobuf",
+      "startByte": 2972,
+      "endByte": 4243,
+      "parameters": 2,
+      "body": [
+        {
+          "op": "bind",
+          "slot": 0,
+          "value": {
+            "op": "field",
+            "object": {
+              "op": "argument",
+              "index": 1
+            },
+            "field": "directPath"
+          }
+        },
+        {
+          "op": "bind",
+          "slot": 1,
+          "value": {
+            "op": "field",
+            "object": {
+              "op": "argument",
+              "index": 1
+            },
+            "field": "fileEncSha256"
+          }
+        },
+        {
+          "op": "bind",
+          "slot": 2,
+          "value": {
+            "op": "field",
+            "object": {
+              "op": "argument",
+              "index": 1
+            },
+            "field": "fileSha256"
+          }
+        },
+        {
+          "op": "bind",
+          "slot": 3,
+          "value": {
+            "op": "field",
+            "object": {
+              "op": "argument",
+              "index": 1
+            },
+            "field": "fileSizeBytes"
+          }
+        },
+        {
+          "op": "bind",
+          "slot": 4,
+          "value": {
+            "op": "field",
+            "object": {
+              "op": "argument",
+              "index": 1
+            },
+            "field": "handle"
+          }
+        },
+        {
+          "op": "bind",
+          "slot": 5,
+          "value": {
+            "op": "field",
+            "object": {
+              "op": "argument",
+              "index": 1
+            },
+            "field": "mediaKey"
+          }
+        },
+        {
+          "op": "if",
+          "condition": {
+            "op": "not",
+            "value": {
+              "op": "slot",
+              "index": 5
+            }
+          },
+          "yes": [
+            {
+              "op": "fatal",
+              "metric": {
+                "op": "metric",
+                "name": "MISSING_EXTERNAL_BLOB_REFERENCE_MEDIA_KEY"
+              },
+              "message": "missing external blob reference media key"
+            }
+          ],
+          "no": []
+        },
+        {
+          "op": "if",
+          "condition": {
+            "op": "nullish",
+            "value": {
+              "op": "slot",
+              "index": 0
+            },
+            "negate": false
+          },
+          "yes": [
+            {
+              "op": "fatal",
+              "metric": {
+                "op": "metric",
+                "name": "MISSING_EXTERNAL_BLOB_REFERENCE_DIRECT_PATH"
+              },
+              "message": "missing external blob reference direct path"
+            }
+          ],
+          "no": []
+        },
+        {
+          "op": "if",
+          "condition": {
+            "op": "not",
+            "value": {
+              "op": "slot",
+              "index": 2
+            }
+          },
+          "yes": [
+            {
+              "op": "fatal",
+              "metric": {
+                "op": "metric",
+                "name": "MISSING_EXTERNAL_BLOB_REFERENCE_FILE_SHA256"
+              },
+              "message": "missing external blob reference file SHA256"
+            }
+          ],
+          "no": []
+        },
+        {
+          "op": "if",
+          "condition": {
+            "op": "not",
+            "value": {
+              "op": "slot",
+              "index": 1
+            }
+          },
+          "yes": [
+            {
+              "op": "fatal",
+              "metric": {
+                "op": "metric",
+                "name": "MISSING_EXTERNAL_BLOB_REFERENCE_FILE_ENC_SHA256"
+              },
+              "message": "missing external blob reference file enc SHA256"
+            }
+          ],
+          "no": []
+        },
+        {
+          "op": "return",
+          "value": {
+            "op": "object",
+            "fields": [
+              [
+                "mediaKey",
+                {
+                  "op": "slot",
+                  "index": 5
+                }
+              ],
+              [
+                "directPath",
+                {
+                  "op": "slot",
+                  "index": 0
+                }
+              ],
+              [
+                "handle",
+                {
+                  "op": "slot",
+                  "index": 4
+                }
+              ],
+              [
+                "fileSizeBytes",
+                {
+                  "op": "slot",
+                  "index": 3
+                }
+              ],
+              [
+                "fileSha256",
+                {
+                  "op": "slot",
+                  "index": 2
+                }
+              ],
+              [
+                "fileEncSha256",
+                {
+                  "op": "slot",
+                  "index": 1
+                }
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    "validateKeyIdProtobuf": {
+      "module": "WAWebSyncdValidateServerSyncProtobuf",
+      "startByte": 5606,
+      "endByte": 5852,
+      "parameters": 3,
+      "body": [
+        {
+          "op": "bind",
+          "slot": 0,
+          "value": {
+            "op": "choose",
+            "condition": {
+              "op": "nullish",
+              "value": {
+                "op": "argument",
+                "index": 1
+              },
+              "negate": false
+            },
+            "yes": {
+              "op": "undefined"
+            },
+            "no": {
+              "op": "field",
+              "object": {
+                "op": "argument",
+                "index": 1
+              },
+              "field": "id"
+            }
+          }
+        },
+        {
+          "op": "if",
+          "condition": {
+            "op": "or",
+            "left": {
+              "op": "not",
+              "value": {
+                "op": "argument",
+                "index": 1
+              }
+            },
+            "right": {
+              "op": "not",
+              "value": {
+                "op": "slot",
+                "index": 0
+              }
+            }
+          },
+          "yes": [
+            {
+              "op": "fatal",
+              "metric": {
+                "op": "argument",
+                "index": 2
+              },
+              "message": "missing mutation key id"
+            }
+          ],
+          "no": []
+        },
+        {
+          "op": "return",
+          "value": {
+            "op": "object",
+            "fields": [
+              [
+                "id",
+                {
+                  "op": "transform",
+                  "transform": "syncKeyId",
+                  "arguments": [
+                    {
+                      "op": "slot",
+                      "index": 0
+                    }
+                  ]
+                }
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    "validateMutationProtobuf": {
+      "module": "WAWebSyncdValidateServerSyncProtobuf",
+      "startByte": 4271,
+      "endByte": 4844,
+      "parameters": 2,
+      "body": [
+        {
+          "op": "bind",
+          "slot": 0,
+          "value": {
+            "op": "field",
+            "object": {
+              "op": "argument",
+              "index": 1
+            },
+            "field": "operation"
+          }
+        },
+        {
+          "op": "bind",
+          "slot": 1,
+          "value": {
+            "op": "field",
+            "object": {
+              "op": "argument",
+              "index": 1
+            },
+            "field": "record"
+          }
+        },
+        {
+          "op": "if",
+          "condition": {
+            "op": "nullish",
+            "value": {
+              "op": "slot",
+              "index": 0
+            },
+            "negate": false
+          },
+          "yes": [
+            {
+              "op": "fatal",
+              "metric": {
+                "op": "metric",
+                "name": "MISSING_MUTATION_OPERATION"
+              },
+              "message": "missing mutation operation"
+            }
+          ],
+          "no": []
+        },
+        {
+          "op": "if",
+          "condition": {
+            "op": "not",
+            "value": {
+              "op": "slot",
+              "index": 1
+            }
+          },
+          "yes": [
+            {
+              "op": "fatal",
+              "metric": {
+                "op": "metric",
+                "name": "MISSING_MUTATION_RECORD"
+              },
+              "message": "missing mutation record"
+            }
+          ],
+          "no": []
+        },
+        {
+          "op": "bind",
+          "slot": 2,
+          "value": {
+            "op": "validate",
+            "validator": "validateRecordProtobuf",
+            "arguments": [
+              {
+                "op": "argument",
+                "index": 0
+              },
+              {
+                "op": "slot",
+                "index": 1
+              }
+            ]
+          }
+        },
+        {
+          "op": "return",
+          "value": {
+            "op": "object",
+            "fields": [
+              [
+                "operation",
+                {
+                  "op": "slot",
+                  "index": 0
+                }
+              ],
+              [
+                "record",
+                {
+                  "op": "slot",
+                  "index": 2
+                }
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    "validatePatchProtobuf": {
+      "module": "WAWebSyncdValidateServerSyncProtobuf",
+      "startByte": 1109,
+      "endByte": 2939,
+      "parameters": 2,
+      "body": [
+        {
+          "op": "bind",
+          "slot": 0,
+          "value": {
+            "op": "field",
+            "object": {
+              "op": "argument",
+              "index": 1
+            },
+            "field": "clientDebugData"
+          }
+        },
+        {
+          "op": "bind",
+          "slot": 1,
+          "value": {
+            "op": "field",
+            "object": {
+              "op": "argument",
+              "index": 1
+            },
+            "field": "deviceIndex"
+          }
+        },
+        {
+          "op": "bind",
+          "slot": 2,
+          "value": {
+            "op": "field",
+            "object": {
+              "op": "argument",
+              "index": 1
+            },
+            "field": "exitCode"
+          }
+        },
+        {
+          "op": "bind",
+          "slot": 3,
+          "value": {
+            "op": "field",
+            "object": {
+              "op": "argument",
+              "index": 1
+            },
+            "field": "externalMutations"
+          }
+        },
+        {
+          "op": "bind",
+          "slot": 4,
+          "value": {
+            "op": "field",
+            "object": {
+              "op": "argument",
+              "index": 1
+            },
+            "field": "keyId"
+          }
+        },
+        {
+          "op": "bind",
+          "slot": 5,
+          "value": {
+            "op": "field",
+            "object": {
+              "op": "argument",
+              "index": 1
+            },
+            "field": "mutations"
+          }
+        },
+        {
+          "op": "bind",
+          "slot": 6,
+          "value": {
+            "op": "field",
+            "object": {
+              "op": "argument",
+              "index": 1
+            },
+            "field": "patchMac"
+          }
+        },
+        {
+          "op": "bind",
+          "slot": 7,
+          "value": {
+            "op": "field",
+            "object": {
+              "op": "argument",
+              "index": 1
+            },
+            "field": "snapshotMac"
+          }
+        },
+        {
+          "op": "bind",
+          "slot": 8,
+          "value": {
+            "op": "field",
+            "object": {
+              "op": "argument",
+              "index": 1
+            },
+            "field": "version"
+          }
+        },
+        {
+          "op": "bind",
+          "slot": 9,
+          "value": {
+            "op": "choose",
+            "condition": {
+              "op": "nullish",
+              "value": {
+                "op": "slot",
+                "index": 8
+              },
+              "negate": false
+            },
+            "yes": {
+              "op": "undefined"
+            },
+            "no": {
+              "op": "field",
+              "object": {
+                "op": "slot",
+                "index": 8
+              },
+              "field": "version"
+            }
+          }
+        },
+        {
+          "op": "if",
+          "condition": {
+            "op": "or",
+            "left": {
+              "op": "not",
+              "value": {
+                "op": "slot",
+                "index": 8
+              }
+            },
+            "right": {
+              "op": "nullish",
+              "value": {
+                "op": "slot",
+                "index": 9
+              },
+              "negate": false
+            }
+          },
+          "yes": [
+            {
+              "op": "fatal",
+              "metric": {
+                "op": "metric",
+                "name": "MISSING_PATCH_VERSION"
+              },
+              "message": "missing patch version"
+            }
+          ],
+          "no": []
+        },
+        {
+          "op": "if",
+          "condition": {
+            "op": "and",
+            "left": {
+              "op": "and",
+              "left": {
+                "op": "slot",
+                "index": 5
+              },
+              "right": {
+                "op": "greater",
+                "left": {
+                  "op": "field",
+                  "object": {
+                    "op": "slot",
+                    "index": 5
+                  },
+                  "field": "length"
+                },
+                "right": {
+                  "op": "integer",
+                  "value": 0
+                }
+              }
+            },
+            "right": {
+              "op": "slot",
+              "index": 3
+            }
+          },
+          "yes": [
+            {
+              "op": "fatal",
+              "metric": {
+                "op": "metric",
+                "name": "PATCH_WITH_BOTH_INLINE_AND_EXTERNAL_MUTATIONS"
+              },
+              "message": "patch with both inline and external mutations"
+            }
+          ],
+          "no": []
+        },
+        {
+          "op": "if",
+          "condition": {
+            "op": "not",
+            "value": {
+              "op": "slot",
+              "index": 7
+            }
+          },
+          "yes": [
+            {
+              "op": "fatal",
+              "metric": {
+                "op": "metric",
+                "name": "MISSING_PATCH_SNAPSHOT_MAC"
+              },
+              "message": "missing patch snapshot mac"
+            }
+          ],
+          "no": []
+        },
+        {
+          "op": "if",
+          "condition": {
+            "op": "not",
+            "value": {
+              "op": "slot",
+              "index": 6
+            }
+          },
+          "yes": [
+            {
+              "op": "fatal",
+              "metric": {
+                "op": "metric",
+                "name": "MISSING_PATCH_MAC"
+              },
+              "message": "missing patch mac"
+            }
+          ],
+          "no": []
+        },
+        {
+          "op": "bind",
+          "slot": 10,
+          "value": {
+            "op": "validate",
+            "validator": "validateKeyIdProtobuf",
+            "arguments": [
+              {
+                "op": "argument",
+                "index": 0
+              },
+              {
+                "op": "slot",
+                "index": 4
+              },
+              {
+                "op": "metric",
+                "name": "MISSING_PATCH_KEY_ID"
+              }
+            ]
+          }
+        },
+        {
+          "op": "bind",
+          "slot": 11,
+          "value": {
+            "op": "undefined"
+          }
+        },
+        {
+          "op": "if",
+          "condition": {
+            "op": "sequence",
+            "values": [
+              {
+                "op": "and",
+                "left": {
+                  "op": "nullish",
+                  "value": {
+                    "op": "slot",
+                    "index": 0
+                  },
+                  "negate": true
+                },
+                "right": {
+                  "op": "assign",
+                  "slot": 11,
+                  "value": {
+                    "op": "transform",
+                    "transform": "decodePatchDebugData",
+                    "arguments": [
+                      {
+                        "op": "slot",
+                        "index": 0
+                      }
+                    ]
+                  }
+                }
+              },
+              {
+                "op": "slot",
+                "index": 3
+              }
+            ]
+          },
+          "yes": [
+            {
+              "op": "bind",
+              "slot": 12,
+              "value": {
+                "op": "validate",
+                "validator": "validateExternalBlobReference",
+                "arguments": [
+                  {
+                    "op": "argument",
+                    "index": 0
+                  },
+                  {
+                    "op": "slot",
+                    "index": 3
+                  }
+                ]
+              }
+            },
+            {
+              "op": "return",
+              "value": {
+                "op": "object",
+                "fields": [
+                  [
+                    "version",
+                    {
+                      "op": "object",
+                      "fields": [
+                        [
+                          "version",
+                          {
+                            "op": "transform",
+                            "transform": "safeInteger",
+                            "arguments": [
+                              {
+                                "op": "slot",
+                                "index": 9
+                              }
+                            ]
+                          }
+                        ]
+                      ]
+                    }
+                  ],
+                  [
+                    "mutations",
+                    {
+                      "op": "undefined"
+                    }
+                  ],
+                  [
+                    "externalMutations",
+                    {
+                      "op": "slot",
+                      "index": 12
+                    }
+                  ],
+                  [
+                    "snapshotMac",
+                    {
+                      "op": "slot",
+                      "index": 7
+                    }
+                  ],
+                  [
+                    "patchMac",
+                    {
+                      "op": "slot",
+                      "index": 6
+                    }
+                  ],
+                  [
+                    "keyId",
+                    {
+                      "op": "slot",
+                      "index": 10
+                    }
+                  ],
+                  [
+                    "deviceIndex",
+                    {
+                      "op": "slot",
+                      "index": 1
+                    }
+                  ],
+                  [
+                    "clientDebugData",
+                    {
+                      "op": "slot",
+                      "index": 11
+                    }
+                  ]
+                ]
+              }
+            }
+          ],
+          "no": []
+        },
+        {
+          "op": "bind",
+          "slot": 13,
+          "value": {
+            "op": "map",
+            "input": {
+              "op": "slot",
+              "index": 5
+            },
+            "body": [
+              {
+                "op": "return",
+                "value": {
+                  "op": "validate",
+                  "validator": "validateMutationProtobuf",
+                  "arguments": [
+                    {
+                      "op": "argument",
+                      "index": 0
+                    },
+                    {
+                      "op": "argument",
+                      "index": 3
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        {
+          "op": "return",
+          "value": {
+            "op": "object",
+            "fields": [
+              [
+                "version",
+                {
+                  "op": "object",
+                  "fields": [
+                    [
+                      "version",
+                      {
+                        "op": "transform",
+                        "transform": "safeInteger",
+                        "arguments": [
+                          {
+                            "op": "slot",
+                            "index": 9
+                          }
+                        ]
+                      }
+                    ]
+                  ]
+                }
+              ],
+              [
+                "mutations",
+                {
+                  "op": "slot",
+                  "index": 13
+                }
+              ],
+              [
+                "externalMutations",
+                {
+                  "op": "undefined"
+                }
+              ],
+              [
+                "exitCode",
+                {
+                  "op": "slot",
+                  "index": 2
+                }
+              ],
+              [
+                "snapshotMac",
+                {
+                  "op": "slot",
+                  "index": 7
+                }
+              ],
+              [
+                "patchMac",
+                {
+                  "op": "slot",
+                  "index": 6
+                }
+              ],
+              [
+                "keyId",
+                {
+                  "op": "slot",
+                  "index": 10
+                }
+              ],
+              [
+                "deviceIndex",
+                {
+                  "op": "slot",
+                  "index": 1
+                }
+              ],
+              [
+                "clientDebugData",
+                {
+                  "op": "slot",
+                  "index": 11
+                }
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    "validateRecordProtobuf": {
+      "module": "WAWebSyncdValidateServerSyncProtobuf",
+      "startByte": 4870,
+      "endByte": 5581,
+      "parameters": 2,
+      "body": [
+        {
+          "op": "bind",
+          "slot": 0,
+          "value": {
+            "op": "field",
+            "object": {
+              "op": "argument",
+              "index": 1
+            },
+            "field": "index"
+          }
+        },
+        {
+          "op": "bind",
+          "slot": 1,
+          "value": {
+            "op": "field",
+            "object": {
+              "op": "argument",
+              "index": 1
+            },
+            "field": "keyId"
+          }
+        },
+        {
+          "op": "bind",
+          "slot": 2,
+          "value": {
+            "op": "field",
+            "object": {
+              "op": "argument",
+              "index": 1
+            },
+            "field": "value"
+          }
+        },
+        {
+          "op": "bind",
+          "slot": 3,
+          "value": {
+            "op": "choose",
+            "condition": {
+              "op": "nullish",
+              "value": {
+                "op": "slot",
+                "index": 0
+              },
+              "negate": false
+            },
+            "yes": {
+              "op": "undefined"
+            },
+            "no": {
+              "op": "field",
+              "object": {
+                "op": "slot",
+                "index": 0
+              },
+              "field": "blob"
+            }
+          }
+        },
+        {
+          "op": "bind",
+          "slot": 4,
+          "value": {
+            "op": "choose",
+            "condition": {
+              "op": "nullish",
+              "value": {
+                "op": "slot",
+                "index": 2
+              },
+              "negate": false
+            },
+            "yes": {
+              "op": "undefined"
+            },
+            "no": {
+              "op": "field",
+              "object": {
+                "op": "slot",
+                "index": 2
+              },
+              "field": "blob"
+            }
+          }
+        },
+        {
+          "op": "if",
+          "condition": {
+            "op": "or",
+            "left": {
+              "op": "not",
+              "value": {
+                "op": "slot",
+                "index": 0
+              }
+            },
+            "right": {
+              "op": "not",
+              "value": {
+                "op": "slot",
+                "index": 3
+              }
+            }
+          },
+          "yes": [
+            {
+              "op": "fatal",
+              "metric": {
+                "op": "metric",
+                "name": "MISSING_MUTATION_INDEX"
+              },
+              "message": "missing mutation index"
+            }
+          ],
+          "no": []
+        },
+        {
+          "op": "if",
+          "condition": {
+            "op": "or",
+            "left": {
+              "op": "not",
+              "value": {
+                "op": "slot",
+                "index": 2
+              }
+            },
+            "right": {
+              "op": "not",
+              "value": {
+                "op": "slot",
+                "index": 4
+              }
+            }
+          },
+          "yes": [
+            {
+              "op": "fatal",
+              "metric": {
+                "op": "metric",
+                "name": "MISSING_MUTATION_VALUE"
+              },
+              "message": "missing mutation value"
+            }
+          ],
+          "no": []
+        },
+        {
+          "op": "bind",
+          "slot": 5,
+          "value": {
+            "op": "validate",
+            "validator": "validateKeyIdProtobuf",
+            "arguments": [
+              {
+                "op": "argument",
+                "index": 0
+              },
+              {
+                "op": "slot",
+                "index": 1
+              },
+              {
+                "op": "metric",
+                "name": "MISSING_MUTATION_KEY_ID"
+              }
+            ]
+          }
+        },
+        {
+          "op": "return",
+          "value": {
+            "op": "object",
+            "fields": [
+              [
+                "index",
+                {
+                  "op": "object",
+                  "fields": [
+                    [
+                      "blob",
+                      {
+                        "op": "slot",
+                        "index": 3
+                      }
+                    ]
+                  ]
+                }
+              ],
+              [
+                "value",
+                {
+                  "op": "object",
+                  "fields": [
+                    [
+                      "blob",
+                      {
+                        "op": "slot",
+                        "index": 4
+                      }
+                    ]
+                  ]
+                }
+              ],
+              [
+                "keyId",
+                {
+                  "op": "slot",
+                  "index": 5
+                }
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    "validateSnapshotProtobuf": {
+      "module": "WAWebSyncdValidateServerSyncProtobuf",
+      "startByte": 272,
+      "endByte": 1084,
+      "parameters": 2,
+      "body": [
+        {
+          "op": "bind",
+          "slot": 0,
+          "value": {
+            "op": "field",
+            "object": {
+              "op": "argument",
+              "index": 1
+            },
+            "field": "keyId"
+          }
+        },
+        {
+          "op": "bind",
+          "slot": 1,
+          "value": {
+            "op": "field",
+            "object": {
+              "op": "argument",
+              "index": 1
+            },
+            "field": "mac"
+          }
+        },
+        {
+          "op": "bind",
+          "slot": 2,
+          "value": {
+            "op": "field",
+            "object": {
+              "op": "argument",
+              "index": 1
+            },
+            "field": "records"
+          }
+        },
+        {
+          "op": "bind",
+          "slot": 3,
+          "value": {
+            "op": "field",
+            "object": {
+              "op": "argument",
+              "index": 1
+            },
+            "field": "version"
+          }
+        },
+        {
+          "op": "bind",
+          "slot": 4,
+          "value": {
+            "op": "choose",
+            "condition": {
+              "op": "nullish",
+              "value": {
+                "op": "slot",
+                "index": 3
+              },
+              "negate": false
+            },
+            "yes": {
+              "op": "undefined"
+            },
+            "no": {
+              "op": "field",
+              "object": {
+                "op": "slot",
+                "index": 3
+              },
+              "field": "version"
+            }
+          }
+        },
+        {
+          "op": "if",
+          "condition": {
+            "op": "or",
+            "left": {
+              "op": "not",
+              "value": {
+                "op": "slot",
+                "index": 3
+              }
+            },
+            "right": {
+              "op": "nullish",
+              "value": {
+                "op": "slot",
+                "index": 4
+              },
+              "negate": false
+            }
+          },
+          "yes": [
+            {
+              "op": "fatal",
+              "metric": {
+                "op": "metric",
+                "name": "MISSING_SNAPSHOT_VERSION"
+              },
+              "message": "missing snapshot version"
+            }
+          ],
+          "no": []
+        },
+        {
+          "op": "bind",
+          "slot": 5,
+          "value": {
+            "op": "map",
+            "input": {
+              "op": "slot",
+              "index": 2
+            },
+            "body": [
+              {
+                "op": "return",
+                "value": {
+                  "op": "validate",
+                  "validator": "validateRecordProtobuf",
+                  "arguments": [
+                    {
+                      "op": "argument",
+                      "index": 0
+                    },
+                    {
+                      "op": "argument",
+                      "index": 3
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        {
+          "op": "if",
+          "condition": {
+            "op": "not",
+            "value": {
+              "op": "slot",
+              "index": 1
+            }
+          },
+          "yes": [
+            {
+              "op": "fatal",
+              "metric": {
+                "op": "metric",
+                "name": "MISSING_SNAPSHOT_MAC"
+              },
+              "message": "missing snapshot mac"
+            }
+          ],
+          "no": []
+        },
+        {
+          "op": "bind",
+          "slot": 6,
+          "value": {
+            "op": "validate",
+            "validator": "validateKeyIdProtobuf",
+            "arguments": [
+              {
+                "op": "argument",
+                "index": 0
+              },
+              {
+                "op": "slot",
+                "index": 0
+              },
+              {
+                "op": "metric",
+                "name": "MISSING_SNAPSHOT_KEY_ID"
+              }
+            ]
+          }
+        },
+        {
+          "op": "return",
+          "value": {
+            "op": "object",
+            "fields": [
+              [
+                "version",
+                {
+                  "op": "object",
+                  "fields": [
+                    [
+                      "version",
+                      {
+                        "op": "transform",
+                        "transform": "safeInteger",
+                        "arguments": [
+                          {
+                            "op": "slot",
+                            "index": 4
+                          }
+                        ]
+                      }
+                    ]
+                  ]
+                }
+              ],
+              [
+                "records",
+                {
+                  "op": "slot",
+                  "index": 5
+                }
+              ],
+              [
+                "mac",
+                {
+                  "op": "slot",
+                  "index": 1
+                }
+              ],
+              [
+                "keyId",
+                {
+                  "op": "slot",
+                  "index": 6
+                }
+              ]
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

@@ -250,16 +250,56 @@ struct PatchListProgress {
     new_mutations: Vec<Mutation>,
 }
 
-/// Download and inline any external snapshot/mutation blobs referenced by `pl`,
-/// resolving each reference via `download`.
-///
-/// A download/decode failure for a referenced blob is propagated as an error, not
-/// swallowed: WA Web (WAWebSyncdCollectionHandler `Fe()`) throws on a failed
-/// external fetch and lets the collection error out, rather than applying an empty
-/// patch and advancing the version. Swallowing it here would silently drop the
-/// blob's mutations and still persist the new version, losing that data permanently.
-fn download_external_blobs(pl: &mut PatchList, download: &BlobDownloadFn<'_>) -> Result<()> {
+/// Validate collection metadata before admitting external downloads.
+/// Large lists belong on a blocking worker, as in [`AppStateProcessor::prepare_patch_list`].
+#[inline(never)]
+pub fn validate_patch_list_metadata(pl: &PatchList) -> Result<()> {
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    prepared_validation_tests::METADATA_VALIDATION_CALLS.with(|calls| calls.set(calls.get() + 1));
     let name = pl.name;
+    // Validate the untrusted protobuf boundary before handing references to a
+    // downloader or advancing any collection state.
+    let collection = name.as_str();
+    if let Some(reference) = &pl.snapshot_ref {
+        crate::appstate::validation::validate_external_reference(collection, reference)?;
+    }
+    if let Some(snapshot) = &pl.snapshot {
+        validate_snapshot_for_processing(collection, snapshot)?;
+    }
+    for patch in &pl.patches {
+        crate::appstate::validation::validate_patch(collection, patch)?;
+    }
+    Ok(())
+}
+
+#[inline(never)]
+fn validate_snapshot_for_processing(collection: &str, snapshot: &wa::SyncdSnapshot) -> Result<()> {
+    crate::appstate::validation::validate_snapshot(collection, snapshot).map_err(|error| {
+        if matches!(
+            error.metric.as_deref(),
+            Some("MISSING_SNAPSHOT_MAC" | "MISSING_SNAPSHOT_KEY_ID")
+        ) {
+            anyhow::Error::new(error).context(crate::appstate::AppStateError::SnapshotMACMissing)
+        } else {
+            anyhow::Error::new(error)
+        }
+    })
+}
+
+#[cfg(test)]
+fn download_external_blobs(pl: &mut PatchList, download: &BlobDownloadFn<'_>) -> Result<()> {
+    validate_patch_list_metadata(pl)?;
+    decode_external_blobs(pl, download, true)
+}
+
+#[inline(never)]
+fn decode_external_blobs(
+    pl: &mut PatchList,
+    download: &BlobDownloadFn<'_>,
+    validate: bool,
+) -> Result<()> {
+    let name = pl.name;
+    let collection = name.as_str();
     if pl.snapshot.is_none()
         && let Some(ext) = &pl.snapshot_ref
     {
@@ -267,6 +307,9 @@ fn download_external_blobs(pl: &mut PatchList, download: &BlobDownloadFn<'_>) ->
             download(ext).with_context(|| format!("download external snapshot for {name:?}"))?;
         let snapshot = waproto::codec::syncd_snapshot_decode(&data)
             .with_context(|| format!("decode external snapshot for {name:?}"))?;
+        if validate {
+            validate_snapshot_for_processing(collection, &snapshot)?;
+        }
         pl.snapshot = Some(snapshot);
     }
 
@@ -281,7 +324,14 @@ fn download_external_blobs(pl: &mut PatchList, download: &BlobDownloadFn<'_>) ->
                 .with_context(|| format!("download external mutations for {name:?} v{v}"))?;
             let ext_mutations = waproto::codec::syncd_mutations_decode(&data)
                 .with_context(|| format!("decode external mutations for {name:?} v{v}"))?;
+            if validate {
+                for mutation in &ext_mutations.mutations {
+                    crate::appstate::validation::validate_mutation(collection, mutation)?;
+                }
+            }
             patch.mutations = ext_mutations.mutations;
+            // The validated external arm omits exitCode.
+            patch.exit_code = buffa::MessageField::none();
             // Consumed: the reference is what marks a patch as still external,
             // so leaving it would make the next pass (`missing_key_ids_after_inline`
             // runs before `process_one_patch_list`) download and decode the
@@ -289,7 +339,64 @@ fn download_external_blobs(pl: &mut PatchList, download: &BlobDownloadFn<'_>) ->
             patch.external_mutations = buffa::MessageField::none();
         }
     }
+    if validate {
+        crate::appstate::validation::validate_no_duplicate_patch_version(
+            pl.patches.iter().filter_map(|patch| patch.version.version),
+        )?;
+    }
     Ok(())
+}
+
+/// An owned collection whose wire metadata has been checked before downloads.
+///
+/// The private fields prevent replacing or mutating the checked protobufs before
+/// preparation. Metadata failures travel with their original collection so batch
+/// processing can retain its existing per-collection error policy.
+///
+/// ```compile_fail
+/// use wacore::appstate::patch_decode::PatchList;
+/// use wacore::appstate_sync::MetadataValidatedPatchList;
+/// fn forge(list: PatchList) -> MetadataValidatedPatchList {
+///     MetadataValidatedPatchList { list, error: None }
+/// }
+/// ```
+#[derive(Debug)]
+pub struct MetadataValidatedPatchList {
+    list: PatchList,
+    error: Option<anyhow::Error>,
+}
+impl MetadataValidatedPatchList {
+    /// Validate an owned list. Large collections belong on a blocking worker.
+    pub fn validate(list: PatchList) -> Self {
+        let error = if list.error.is_none() {
+            validate_patch_list_metadata(&list).err()
+        } else {
+            None
+        };
+        Self { list, error }
+    }
+    pub fn list(&self) -> &PatchList {
+        &self.list
+    }
+    pub fn can_download(&self) -> bool {
+        self.error.is_none() && self.list.error.is_none()
+    }
+}
+
+/// A collection whose wire metadata and downloaded content have been checked.
+/// Owns preparation failures so batched callers can preserve per-collection policy.
+#[derive(Debug)]
+pub struct PreparedPatchList {
+    list: PatchList,
+    error: Option<anyhow::Error>,
+}
+impl PreparedPatchList {
+    pub fn list(&self) -> &PatchList {
+        &self.list
+    }
+    pub fn is_ready(&self) -> bool {
+        self.error.is_none() && self.list.error.is_none()
+    }
 }
 
 /// External-blob resolver as a trait object, so the large download/decode/apply
@@ -1082,12 +1189,113 @@ impl AppStateProcessor {
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.process_parsed", level = "debug", skip_all, fields(name = ?pl.name), err(Debug)))]
     pub async fn process_parsed_patch_list(
         &self,
-        mut pl: PatchList,
+        pl: PatchList,
         download: &BlobDownloadFn<'_>,
         validate_macs: bool,
     ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
-        download_external_blobs(&mut pl, download)?;
-        Box::pin(self.process_patch_list(pl, validate_macs)).await
+        let prepared = self.prepare_patch_list(pl, download).await;
+        self.process_prepared_patch_list(prepared, validate_macs)
+            .await
+    }
+
+    /// Validate and inline an owned list on the runtime's blocking executor.
+    /// Cache lookups remain borrowed callbacks; parsing and validation own their
+    /// inputs across the worker handoff and never clone encrypted payloads.
+    pub async fn prepare_patch_list(
+        &self,
+        pl: PatchList,
+        download: &BlobDownloadFn<'_>,
+    ) -> PreparedPatchList {
+        if pl.error.is_some() {
+            return PreparedPatchList {
+                list: pl,
+                error: None,
+            };
+        }
+        // Keep the compatibility wrapper's validation and decoding frames apart.
+        // Runtime callers already own a metadata token and call the next phase directly.
+        let preparing = {
+            let validated = crate::runtime::blocking(&*self.runtime, move || {
+                MetadataValidatedPatchList::validate(pl)
+            })
+            .await;
+            Box::pin(self.prepare_metadata_validated_patch_list(validated, download))
+        };
+        preparing.await
+    }
+
+    /// Inline downloaded content without revalidating the immutable wire metadata.
+    /// Decoded snapshots/mutations and batch rules are still checked on the worker.
+    pub async fn prepare_metadata_validated_patch_list(
+        &self,
+        validated: MetadataValidatedPatchList,
+        download: &BlobDownloadFn<'_>,
+    ) -> PreparedPatchList {
+        if !validated.can_download() {
+            return PreparedPatchList {
+                list: validated.list,
+                error: validated.error,
+            };
+        }
+        let MetadataValidatedPatchList { list: pl, .. } = validated;
+        let mut blobs = Vec::new();
+        for reference in pl
+            .snapshot_ref
+            .iter()
+            .filter(|_| pl.snapshot.is_none())
+            .chain(
+                pl.patches
+                    .iter()
+                    .filter_map(|patch| patch.external_mutations.as_option()),
+            )
+        {
+            match download(reference) {
+                Ok(bytes) => {
+                    blobs.push(bytes);
+                }
+                Err(error) => {
+                    return PreparedPatchList {
+                        list: pl,
+                        error: Some(error),
+                    };
+                }
+            }
+        }
+        crate::runtime::blocking(&*self.runtime, move || {
+            let mut pl = pl;
+            // Snapshot, then patch references, in the same order used above.
+            // Do not merge distinct references merely because their paths match.
+            let position = std::sync::atomic::AtomicUsize::new(0);
+            let resolver = |_: &wa::ExternalBlobReference| {
+                blobs
+                    .get(position.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                    .cloned()
+                    .ok_or_else(|| anyhow!("external blob was not resolved"))
+            };
+            let error = decode_external_blobs(&mut pl, &resolver, true).err();
+            PreparedPatchList { list: pl, error }
+        })
+        .await
+    }
+
+    pub async fn process_prepared_patch_list(
+        &self,
+        prepared: PreparedPatchList,
+        validate_macs: bool,
+    ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
+        let PreparedPatchList { list, error } = prepared;
+        if let Some(error) = error {
+            return Err(error);
+        }
+        if list.error.is_some() {
+            let state = self
+                .backend
+                .get_version(list.name.as_str())
+                .await?
+                .unwrap_or_default();
+            return Ok((Vec::new(), state, list));
+        }
+        Box::pin(self.process_patch_list(list, validate_macs)).await
     }
 
     /// Process already-parsed patch lists and download any external blobs.
@@ -1129,10 +1337,24 @@ impl AppStateProcessor {
     /// batch it can no longer take back.
     pub async fn process_one_patch_list(
         &self,
-        mut pl: PatchList,
+        pl: PatchList,
         download: &BlobDownloadFn<'_>,
         validate_macs: bool,
     ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
+        let prepared = self.prepare_patch_list(pl, download).await;
+        self.process_one_prepared_patch_list(prepared, validate_macs)
+            .await
+    }
+
+    pub async fn process_one_prepared_patch_list(
+        &self,
+        prepared: PreparedPatchList,
+        validate_macs: bool,
+    ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
+        let PreparedPatchList {
+            list: mut pl,
+            error,
+        } = prepared;
         // Skip collections with errors — caller handles them via pl.error
         if pl.error.is_some() {
             let state = self
@@ -1146,8 +1368,17 @@ impl AppStateProcessor {
         // A failed external-blob fetch must not advance the version with an empty
         // patch (silent data loss). Mark the collection retryable and skip it, so
         // the caller re-fetches it instead of persisting partial state.
-        if let Err(e) = download_external_blobs(&mut pl, download) {
-            log::warn!(target: "AppState", "External blob fetch failed for {:?}, will refetch: {e:#}", pl.name);
+        if let Some(e) = error {
+            if matches!(
+                e.downcast_ref::<crate::appstate::AppStateError>(),
+                Some(
+                    crate::appstate::AppStateError::SnapshotMACMissing
+                        | crate::appstate::AppStateError::SnapshotMACMismatch
+                )
+            ) {
+                return Err(e);
+            }
+            log::warn!(target: "AppState", "App-state preparation failed for {:?}, will refetch: {e:#}", pl.name);
             pl.error = Some(CollectionSyncError::Retry {
                 code: 0,
                 text: e.to_string(),
@@ -1588,14 +1819,19 @@ impl AppStateProcessor {
     /// its external blob, so [`get_missing_key_ids`](Self::get_missing_key_ids) alone (called before download)
     /// can't see it and would miss the snapshot's key — letting processing later abort
     /// with `KeyNotFound`. Used by the sync paths to request missing keys up front.
-    /// Idempotent: `download_external_blobs` no-ops once the blobs are inlined, and the
-    /// supplied `download` closure should read from the already-prefetched cache.
+    /// Compatibility key probe: metadata validation and decoding are synchronous.
+    /// This does not establish a validated processing phase.
+    /// Runtime sync paths use [`Self::prepare_patch_list`]
+    /// and query its borrowed list, retaining ownership across blocking work.
     pub async fn missing_key_ids_after_inline(
         &self,
         pl: &mut PatchList,
         download: &BlobDownloadFn<'_>,
     ) -> Result<Vec<Vec<u8>>> {
-        download_external_blobs(pl, download)?;
+        // Check the original metadata before inlining can erase conflicting
+        // inline mutations. Owned runtime callers use blocking preparation.
+        validate_patch_list_metadata(pl)?;
+        decode_external_blobs(pl, download, false)?;
         self.get_missing_key_ids(pl).await
     }
 }
@@ -1642,6 +1878,28 @@ mod external_blob_tests {
     use super::*;
     use crate::appstate::patch_decode::WAPatchName;
 
+    fn valid_reference(path: &str) -> wa::ExternalBlobReference {
+        let mut reference = wa::ExternalBlobReference::default();
+        reference.direct_path = Some(path.into());
+        reference.media_key = Some(vec![]);
+        reference.file_sha256 = Some(vec![]);
+        reference.file_enc_sha256 = Some(vec![]);
+        reference
+    }
+    fn valid_external_patch() -> wa::SyncdPatch {
+        let mut patch = wa::SyncdPatch::default();
+        let mut version = wa::SyncdVersion::default();
+        version.version = Some(1);
+        patch.version = version.into();
+        patch.snapshot_mac = Some(vec![]);
+        patch.patch_mac = Some(vec![]);
+        let mut key = wa::KeyId::default();
+        key.id = Some(vec![]);
+        patch.key_id = key.into();
+        patch.external_mutations = valid_reference("/mutations").into();
+        patch
+    }
+
     fn pl_with_snapshot_ref(snapshot_ref: Option<wa::ExternalBlobReference>) -> PatchList {
         PatchList {
             name: WAPatchName::Regular,
@@ -1657,30 +1915,24 @@ mod external_blob_tests {
     fn external_snapshot_download_failure_propagates() {
         // A referenced blob that fails to download must error, not be swallowed
         // (which would apply an empty patch and advance the version).
-        let mut pl = pl_with_snapshot_ref(Some({
-            let mut proto = wa::ExternalBlobReference::default();
-            proto.direct_path = Some("/blob".into());
-            proto
-        }));
+        let mut pl = pl_with_snapshot_ref(Some(valid_reference("/blob")));
         let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
             Err(anyhow!("simulated failure"))
         };
-        assert!(download_external_blobs(&mut pl, &download).is_err());
+        let error = download_external_blobs(&mut pl, &download).unwrap_err();
+        assert!(format!("{error:#}").contains("simulated failure"));
     }
 
     #[test]
     fn external_snapshot_decode_failure_propagates() {
         // Download succeeds but the bytes aren't a valid SyncdSnapshot: the decode
         // error must propagate too, not just download errors.
-        let mut pl = pl_with_snapshot_ref(Some({
-            let mut proto = wa::ExternalBlobReference::default();
-            proto.direct_path = Some("/blob".into());
-            proto
-        }));
+        let mut pl = pl_with_snapshot_ref(Some(valid_reference("/blob")));
         let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
             Ok(bytes::Bytes::from_static(&[0xFF, 0xFF, 0xFF]))
         };
-        assert!(download_external_blobs(&mut pl, &download).is_err());
+        let error = download_external_blobs(&mut pl, &download).unwrap_err();
+        assert!(format!("{error:#}").contains("decode external snapshot"));
     }
 
     #[test]
@@ -1689,15 +1941,7 @@ mod external_blob_tests {
         let mut pl = PatchList {
             name: WAPatchName::Regular,
             has_more_patches: false,
-            patches: vec![{
-                let mut proto = wa::SyncdPatch::default();
-                proto.external_mutations = buffa::MessageField::some({
-                    let mut proto = wa::ExternalBlobReference::default();
-                    proto.direct_path = Some("/mutations".into());
-                    proto
-                });
-                proto
-            }],
+            patches: vec![valid_external_patch()],
             snapshot: None,
             snapshot_ref: None,
             error: None,
@@ -1705,7 +1949,8 @@ mod external_blob_tests {
         let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
             Err(anyhow!("simulated failure"))
         };
-        assert!(download_external_blobs(&mut pl, &download).is_err());
+        let error = download_external_blobs(&mut pl, &download).unwrap_err();
+        assert!(format!("{error:#}").contains("simulated failure"));
     }
 
     /// The missing-key probe inlines before `process_one_patch_list` inlines
@@ -1715,15 +1960,7 @@ mod external_blob_tests {
         let mut pl = PatchList {
             name: WAPatchName::Regular,
             has_more_patches: false,
-            patches: vec![{
-                let mut proto = wa::SyncdPatch::default();
-                proto.external_mutations = buffa::MessageField::some({
-                    let mut proto = wa::ExternalBlobReference::default();
-                    proto.direct_path = Some("/mutations".into());
-                    proto
-                });
-                proto
-            }],
+            patches: vec![valid_external_patch()],
             snapshot: None,
             snapshot_ref: None,
             error: None,
@@ -1746,6 +1983,27 @@ mod external_blob_tests {
         let download =
             |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> { Ok(bytes::Bytes::new()) };
         assert!(download_external_blobs(&mut pl, &download).is_ok());
+    }
+
+    #[test]
+    fn conflicting_mutation_sources_are_rejected_before_downloading() {
+        let mut pl = pl_with_snapshot_ref(None);
+        let mut patch = valid_external_patch();
+        patch.mutations.push(wa::SyncdMutation::default());
+        pl.patches.push(patch);
+        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
+            panic!("invalid patch reached downloader")
+        };
+        let error = download_external_blobs(&mut pl, &download).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::appstate::validation::ValidationError>()
+                .unwrap()
+                .metric
+                .as_deref(),
+            Some("PATCH_WITH_BOTH_INLINE_AND_EXTERNAL_MUTATIONS")
+        );
+        assert!(pl.patches[0].external_mutations.is_set());
     }
 }
 
@@ -1948,5 +2206,441 @@ mod future_layout_tests {
             snapshot <= 2048 && patch <= 2048 && list <= 2048,
             "snapshot={snapshot}, patch={patch}, controller={list}"
         );
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod prepared_validation_tests {
+    use super::*;
+    use crate::runtime::{AbortHandle, Runtime};
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+    std::thread_local! {
+        pub(super) static METADATA_VALIDATION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    struct TestRuntime {
+        calls: Arc<AtomicUsize>,
+        metadata_calls: Arc<AtomicUsize>,
+        owner: std::thread::ThreadId,
+    }
+    #[async_trait]
+    impl Runtime for TestRuntime {
+        fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) -> AbortHandle {
+            let handle = tokio::spawn(future);
+            AbortHandle::new(move || handle.abort())
+        }
+        fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(tokio::time::sleep(duration))
+        }
+        fn spawn_blocking(
+            &self,
+            f: Box<dyn FnOnce() + Send>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            let calls = self.calls.clone();
+            let metadata_calls = self.metadata_calls.clone();
+            let owner = self.owner;
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    assert_ne!(std::thread::current().id(), owner);
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    METADATA_VALIDATION_CALLS.with(|calls| calls.set(0));
+                    f();
+                    METADATA_VALIDATION_CALLS.with(|calls| {
+                        metadata_calls.fetch_add(calls.get(), Ordering::SeqCst);
+                    });
+                })
+                .await
+                .expect("blocking validation worker");
+            })
+        }
+        fn yield_now(&self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+            None
+        }
+    }
+    fn snapshot(missing_mac: bool) -> wa::SyncdSnapshot {
+        let mut snapshot = wa::SyncdSnapshot::default();
+        let mut version = wa::SyncdVersion::default();
+        version.version = Some(1);
+        snapshot.version = version.into();
+        if !missing_mac {
+            snapshot.mac = Some(vec![]);
+        }
+        let mut key = wa::KeyId::default();
+        key.id = Some(vec![]);
+        snapshot.key_id = key.into();
+        snapshot
+    }
+    fn list(snapshot: wa::SyncdSnapshot) -> PatchList {
+        PatchList {
+            name: WAPatchName::Regular,
+            has_more_patches: false,
+            patches: vec![],
+            snapshot: Some(snapshot),
+            snapshot_ref: None,
+            error: None,
+        }
+    }
+    fn processor(calls: Arc<AtomicUsize>) -> AppStateProcessor {
+        processor_with_metadata_calls(calls, Arc::new(AtomicUsize::new(0)))
+    }
+    fn processor_with_metadata_calls(
+        calls: Arc<AtomicUsize>,
+        metadata_calls: Arc<AtomicUsize>,
+    ) -> AppStateProcessor {
+        AppStateProcessor::new(
+            Arc::new(crate::store::InMemoryBackend::new()),
+            Arc::new(TestRuntime {
+                calls,
+                metadata_calls,
+                owner: std::thread::current().id(),
+            }),
+        )
+    }
+    async fn metadata_token(
+        processor: &AppStateProcessor,
+        list: PatchList,
+    ) -> MetadataValidatedPatchList {
+        crate::runtime::blocking(&*processor.runtime, move || {
+            MetadataValidatedPatchList::validate(list)
+        })
+        .await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn compatibility_probe_rejects_conflicting_sources_without_mutating_or_downloading() {
+        let processor = processor(Arc::new(AtomicUsize::new(0)));
+        let mut patch = wa::SyncdPatch::default();
+        let mut version = wa::SyncdVersion::default();
+        version.version = Some(1);
+        patch.version = version.into();
+        patch.mutations.push(wa::SyncdMutation::default());
+        patch.external_mutations = wa::ExternalBlobReference::default().into();
+        let mut pl = PatchList {
+            name: WAPatchName::Regular,
+            has_more_patches: false,
+            patches: vec![patch],
+            snapshot: None,
+            snapshot_ref: None,
+            error: None,
+        };
+        let before = pl.patches[0].clone();
+        let error = processor
+            .missing_key_ids_after_inline(&mut pl, &|_| panic!("must reject before download"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::appstate::validation::ValidationError>()
+                .unwrap()
+                .metric
+                .as_deref(),
+            Some("PATCH_WITH_BOTH_INLINE_AND_EXTERNAL_MUTATIONS")
+        );
+        assert_eq!(pl.patches[0], before);
+        pl.patches[0].version = Default::default();
+        let error = processor
+            .missing_key_ids_after_inline(&mut pl, &|_| panic!("must reject before download"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::appstate::validation::ValidationError>()
+                .unwrap()
+                .metric
+                .as_deref(),
+            Some("MISSING_PATCH_VERSION")
+        );
+        assert_eq!(pl.patches[0].mutations.len(), 1);
+        assert!(pl.patches[0].external_mutations.as_option().is_some());
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn preparation_uses_blocking_workers_and_retains_snapshot_ownership() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let metadata_calls = Arc::new(AtomicUsize::new(0));
+        let processor = processor_with_metadata_calls(calls.clone(), metadata_calls.clone());
+        METADATA_VALIDATION_CALLS.with(|calls| calls.set(0));
+        let mut snapshot = snapshot(false);
+        let mut record = wa::SyncdRecord::default();
+        let mut index = wa::SyncdIndex::default();
+        index.blob = Some(vec![]);
+        record.index = index.into();
+        let mut value = wa::SyncdValue::default();
+        value.blob = Some(vec![7; 64]);
+        record.value = value.into();
+        let mut key = wa::KeyId::default();
+        key.id = Some(vec![]);
+        record.key_id = key.into();
+        snapshot.records.push(record);
+        let ptr = snapshot.records[0].value.blob.as_ref().unwrap().as_ptr() as usize;
+        let validated = metadata_token(&processor, list(snapshot)).await;
+        assert!(validated.can_download());
+        assert_eq!(metadata_calls.load(Ordering::SeqCst), 1);
+        let prepared = processor
+            .prepare_metadata_validated_patch_list(validated, &|_| {
+                panic!("inline snapshot must not download")
+            })
+            .await;
+        assert!(prepared.is_ready());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(metadata_calls.load(Ordering::SeqCst), 1);
+        METADATA_VALIDATION_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+        assert_eq!(
+            prepared.list().snapshot.as_ref().unwrap().records[0]
+                .value
+                .blob
+                .as_ref()
+                .unwrap()
+                .as_ptr() as usize,
+            ptr
+        );
+        assert!(
+            processor
+                .process_prepared_patch_list(prepared, false)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "processing adds only its crypto worker, not another validation pass"
+        );
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn both_processing_adapters_preserve_missing_snapshot_integrity_recovery() {
+        let processor = processor(Arc::new(AtomicUsize::new(0)));
+        for missing_mac in [true, false] {
+            let mut snapshot = snapshot(missing_mac);
+            if !missing_mac {
+                snapshot.key_id = Default::default();
+            }
+            let prepared = processor
+                .prepare_patch_list(list(snapshot.clone()), &|_| panic!("inline"))
+                .await;
+            let error = processor
+                .process_prepared_patch_list(prepared, true)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<crate::appstate::AppStateError>(),
+                Some(crate::appstate::AppStateError::SnapshotMACMissing)
+            ));
+            assert!(
+                error
+                    .downcast_ref::<crate::appstate::validation::ValidationError>()
+                    .is_some()
+            );
+            let prepared = processor
+                .prepare_patch_list(list(snapshot), &|_| panic!("inline"))
+                .await;
+            let error = processor
+                .process_one_prepared_patch_list(prepared, true)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<crate::appstate::AppStateError>(),
+                Some(crate::appstate::AppStateError::SnapshotMACMissing)
+            ));
+            assert!(
+                error
+                    .downcast_ref::<crate::appstate::validation::ValidationError>()
+                    .is_some()
+            );
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn metadata_failure_is_retained_before_any_download_or_second_validation() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let metadata_calls = Arc::new(AtomicUsize::new(0));
+        let processor = processor_with_metadata_calls(calls.clone(), metadata_calls.clone());
+        let mut snapshot = snapshot(true);
+        snapshot.key_id = Default::default();
+        let validated = metadata_token(&processor, list(snapshot)).await;
+        assert!(!validated.can_download());
+        let prepared = processor
+            .prepare_metadata_validated_patch_list(validated, &|_| panic!("invalid metadata"))
+            .await;
+        let error = processor
+            .process_prepared_patch_list(prepared, true)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::appstate::validation::ValidationError>()
+                .unwrap()
+                .metric
+                .as_deref(),
+            Some("MISSING_SNAPSHOT_MAC")
+        );
+        assert!(matches!(
+            error.downcast_ref::<crate::appstate::AppStateError>(),
+            Some(crate::appstate::AppStateError::SnapshotMACMissing)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(metadata_calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn external_reference() -> wa::ExternalBlobReference {
+        let mut reference = wa::ExternalBlobReference::default();
+        reference.direct_path = Some("/synthetic-appstate".into());
+        reference.media_key = Some(vec![1; 32]);
+        reference.file_sha256 = Some(vec![2; 32]);
+        reference.file_enc_sha256 = Some(vec![3; 32]);
+        reference
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::disallowed_methods)]
+    async fn checked_metadata_still_validates_decoded_content_and_then_batch_versions() {
+        use buffa::Message;
+        let processor = processor(Arc::new(AtomicUsize::new(0)));
+        let mut external_snapshot = list(snapshot(false));
+        external_snapshot.snapshot = None;
+        external_snapshot.snapshot_ref = Some(external_reference());
+        let validated = metadata_token(&processor, external_snapshot).await;
+        assert!(validated.can_download());
+        let downloads = AtomicUsize::new(0);
+        let invalid_snapshot = bytes::Bytes::from(snapshot(true).encode_to_vec());
+        let prepared = processor
+            .prepare_metadata_validated_patch_list(validated, &|_| {
+                downloads.fetch_add(1, Ordering::SeqCst);
+                Ok(invalid_snapshot.clone())
+            })
+            .await;
+        assert_eq!(downloads.load(Ordering::SeqCst), 1);
+        let error = processor
+            .process_prepared_patch_list(prepared, true)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::appstate::validation::ValidationError>()
+                .unwrap()
+                .metric
+                .as_deref(),
+            Some("MISSING_SNAPSHOT_MAC")
+        );
+
+        let mut patch = wa::SyncdPatch::default();
+        let mut version = wa::SyncdVersion::default();
+        version.version = Some(1);
+        patch.version = version.into();
+        patch.snapshot_mac = Some(vec![]);
+        patch.patch_mac = Some(vec![]);
+        let mut key = wa::KeyId::default();
+        key.id = Some(vec![]);
+        patch.key_id = key.into();
+        patch.external_mutations = external_reference().into();
+        let mut duplicate_versions = list(snapshot(false));
+        duplicate_versions.snapshot = None;
+        duplicate_versions.patches = vec![patch.clone(), patch];
+        let validated = metadata_token(&processor, duplicate_versions).await;
+        assert!(
+            validated.can_download(),
+            "batch errors belong after inlining"
+        );
+        downloads.store(0, Ordering::SeqCst);
+        let prepared = processor
+            .prepare_metadata_validated_patch_list(validated, &|_| {
+                downloads.fetch_add(1, Ordering::SeqCst);
+                Ok(bytes::Bytes::new())
+            })
+            .await;
+        assert_eq!(downloads.load(Ordering::SeqCst), 2);
+        let error = processor
+            .process_prepared_patch_list(prepared, true)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::appstate::validation::ValidationError>()
+                .unwrap()
+                .metric
+                .as_deref(),
+            Some("DUPLICATE_PATCH_VERSION_IN_COLLECTION")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_collection_errors_skip_metadata_and_downloads() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let metadata_calls = Arc::new(AtomicUsize::new(0));
+        let processor = processor_with_metadata_calls(calls.clone(), metadata_calls.clone());
+        let mut list = list(snapshot(true));
+        list.error = Some(CollectionSyncError::Retry {
+            code: 503,
+            text: "synthetic retry".into(),
+        });
+        let validated = metadata_token(&processor, list).await;
+        assert!(!validated.can_download());
+        let prepared = processor
+            .prepare_metadata_validated_patch_list(validated, &|_| panic!("collection error"))
+            .await;
+        assert!(prepared.list().error.is_some());
+        assert!(!prepared.is_ready());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(metadata_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::disallowed_methods)]
+    async fn preparation_keeps_distinct_references_with_the_same_path_separate() {
+        use buffa::Message;
+        let processor = processor(Arc::new(AtomicUsize::new(0)));
+        let mut pl = PatchList {
+            name: WAPatchName::Regular,
+            has_more_patches: false,
+            patches: vec![],
+            snapshot: None,
+            snapshot_ref: None,
+            error: None,
+        };
+        let mut blobs = Vec::new();
+        for index in [1u8, 2] {
+            let mut patch = wa::SyncdPatch::default();
+            let mut version = wa::SyncdVersion::default();
+            version.version = Some(u64::from(index));
+            patch.version = version.into();
+            patch.snapshot_mac = Some(vec![]);
+            patch.patch_mac = Some(vec![]);
+            let mut key = wa::KeyId::default();
+            key.id = Some(vec![]);
+            patch.key_id = key.clone().into();
+            let mut reference = wa::ExternalBlobReference::default();
+            reference.direct_path = Some("/same".into());
+            reference.media_key = Some(vec![index]);
+            reference.file_sha256 = Some(vec![]);
+            reference.file_enc_sha256 = Some(vec![]);
+            patch.external_mutations = reference.into();
+            pl.patches.push(patch);
+            let mut record = wa::SyncdRecord::default();
+            let mut blob = wa::SyncdIndex::default();
+            blob.blob = Some(vec![index]);
+            record.index = blob.into();
+            let mut value = wa::SyncdValue::default();
+            value.blob = Some(vec![index]);
+            record.value = value.into();
+            record.key_id = key.into();
+            let mut mutation = wa::SyncdMutation::default();
+            mutation.operation = Some(wa::syncd_mutation::SyncdOperation::SET.into());
+            mutation.record = record.into();
+            let mut mutations = wa::SyncdMutations::default();
+            mutations.mutations.push(mutation);
+            blobs.push(bytes::Bytes::from(mutations.encode_to_vec()));
+        }
+        let resolver = |reference: &wa::ExternalBlobReference| {
+            Ok(blobs[usize::from(reference.media_key.as_ref().unwrap()[0] - 1)].clone())
+        };
+        let prepared = processor.prepare_patch_list(pl, &resolver).await;
+        assert!(prepared.is_ready());
+        for (position, patch) in prepared.list().patches.iter().enumerate() {
+            assert_eq!(
+                patch.mutations[0].record.index.blob.as_deref(),
+                Some(&[(position + 1) as u8][..])
+            );
+        }
     }
 }

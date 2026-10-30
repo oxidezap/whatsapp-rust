@@ -83,7 +83,11 @@ impl PrefetchHarness {
             self.client.bench_startup.pending() == 0,
             "startup entered prefetch measurement"
         );
-        let blobs = self.client.pre_download_external_blobs(&self.lists).await;
+        // Repeated samples clone only four small reference headers, never payloads.
+        let (_, blobs) = self
+            .client
+            .pre_download_external_blobs(self.lists.clone())
+            .await;
         ensure!(blobs.len() == 4, "prefetch lost a blob");
         for blob in blobs.values() {
             ensure!(

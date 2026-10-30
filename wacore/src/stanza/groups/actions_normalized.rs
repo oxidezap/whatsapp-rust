@@ -45,12 +45,13 @@ impl ActionContext<'_> {
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum GroupActionParseError {
-    #[error(transparent)]
+    #[error("{0}")]
     Parse(#[from] GroupParseError),
-    #[error(transparent)]
+    #[error("{0}")]
     Create(#[from] CreateParseError),
-    #[error(transparent)]
+    #[error("{0}")]
     Suggestion(#[from] SuggestionParseError),
     /// Source r("nullthrows")(author) throws an ordinary Error, not a parsing
     /// failure, when the no-content request fallback has no envelope author.

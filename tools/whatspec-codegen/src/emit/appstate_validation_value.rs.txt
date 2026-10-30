@@ -1,0 +1,125 @@
+// Native data view for generated validation control flow. Byte payloads borrow
+// protobuf storage; constructing/returning a view never copies encrypted blobs.
+#[derive(Debug, PartialEq)]
+pub(super) enum Value<'a> {
+    Undefined, Null, Bool(bool), Number(f64), Long(u64),
+    Text(std::borrow::Cow<'a,str>), Bytes(&'a [u8]), Array(std::sync::Arc<[Self]>), Object(std::sync::Arc<[(&'static str, Self)]>),
+}
+impl Clone for Value<'_> {
+    // Generated expressions clone their inputs often. Keep the enum dispatch in
+    // one function instead of copying Cow/Arc branches into every expression.
+    #[inline(never)]
+    fn clone(&self) -> Self {
+        match self {
+            Self::Undefined => Self::Undefined,
+            Self::Null => Self::Null,
+            Self::Bool(value) => Self::Bool(*value),
+            Self::Number(value) => Self::Number(*value),
+            Self::Long(value) => Self::Long(*value),
+            Self::Text(value) => Self::Text(value.clone()),
+            Self::Bytes(value) => Self::Bytes(value),
+            Self::Array(value) => Self::Array(value.clone()),
+            Self::Object(value) => Self::Object(value.clone()),
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidationError {
+    pub class: &'static str,
+    pub metric: Option<String>,
+    pub message: String,
+}
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{write!(f,"{}: {}",self.class,self.message)}
+}
+impl std::error::Error for ValidationError {}
+// Generated helpers carry only a pointer on failure; unbox at the public API.
+impl From<Box<ValidationError>> for ValidationError {
+    fn from(error: Box<ValidationError>) -> Self { *error }
+}
+impl ValidationError {
+    #[cold]
+    #[inline(never)]
+    pub(super) fn fatal(metric:Value<'_>, message:&str)->Self {
+        Self {class:"SyncdFatalError",metric:match metric{Value::Text(s)=>Some(s.into_owned()),_=>None},message:message.into()}
+    }
+    #[cold]
+    #[inline(never)]
+    pub(super) fn dependency(class:&'static str,message:&str)->Self{Self{class,metric:None,message:message.into()}}
+    #[cold]
+    #[inline(never)]
+    pub(super) fn fatal_boxed(metric:Value<'_>,message:&str)->Box<Self>{Box::new(Self::fatal(metric,message))}
+    #[cold]
+    #[inline(never)]
+    pub(super) fn dependency_boxed(class:&'static str,message:&str)->Box<Self>{Box::new(Self::dependency(class,message))}
+}
+impl<'a> Value<'a> {
+    #[inline(never)]
+    pub(super) fn object(fields:Vec<(&'static str,Self)>)->Self{Self::Object(fields.into())}
+    #[inline(never)]
+    pub(super) fn list(items:Vec<Self>)->Self{Self::Array(items.into())}
+    pub(super) fn truthy(&self)->bool{match self{Self::Undefined|Self::Null=>false,Self::Bool(b)=>*b,Self::Number(n)=>*n!=0.0&&!n.is_nan(),Self::Text(s)=>!s.is_empty(),_=>true}}
+    pub(super) fn nullish(&self)->bool{matches!(self,Self::Undefined|Self::Null)}
+    #[inline(never)]
+    pub(super) fn field(&self,key:&str)->Result<Self,Box<ValidationError>>{
+        match self{
+            Self::Object(fields)=>Ok(fields.iter().find(|(k,_)|*k==key).map_or(Self::Undefined,|(_,v)|v.clone())),
+            Self::Text(text) if key=="length"=>Ok(Self::Number(text.encode_utf16().count() as f64)),
+            Self::Array(items) if key=="length"=>Ok(Self::Number(items.len() as f64)),
+            Self::Bytes(bytes) if matches!(key,"length"|"byteLength")=>Ok(Self::Number(bytes.len() as f64)),
+            Self::Undefined|Self::Null=>Err(ValidationError::dependency_boxed("TypeError","field access on nullish value")),
+            _=>Ok(Self::Undefined),
+        }
+    }
+    pub(super) fn number(&self)->Result<f64,Box<ValidationError>>{match self{Self::Number(n)=>Ok(*n),_=>Err(ValidationError::dependency_boxed("TypeError","expected number"))}}
+    pub(super) fn array(&self)->Result<&[Self],Box<ValidationError>>{match self{Self::Array(a)=>Ok(a),_=>Err(ValidationError::dependency_boxed("TypeError","expected array"))}}
+}
+/// Host calls stay outside the generated program. Implementations must qualify
+/// decoded LongInt/protobuf contracts and any specialized numeric comparator.
+pub(super) trait Transforms<'a> {
+    fn relational_greater(&mut self,left:Value<'a>,right:Value<'a>)->Result<bool,Box<ValidationError>>{Ok(left.greater_than(&right))}
+    fn number_or_throw_if_too_large(&mut self,value:Value<'a>)->Result<Value<'a>,Box<ValidationError>>;
+    fn to_sync_key_id(&mut self,value:Value<'a>)->Result<Value<'a>,Box<ValidationError>>;
+    fn maybe_number_or_throw_if_too_large(&mut self,value:Value<'a>)->Result<Value<'a>,Box<ValidationError>> {
+        if value.nullish(){Ok(value)}else{self.number_or_throw_if_too_large(value)}
+    }
+    fn decode_sync_action_data(&mut self,value:Value<'a>)->Result<Value<'a>,Box<ValidationError>>;
+    fn decode_patch_debug_data(&mut self,value:Value<'a>)->Result<Value<'a>,Box<ValidationError>>;
+}
+
+impl Value<'_> {
+    pub(super) fn greater_than(&self,other:&Self)->bool{
+        let left=self.primitive();let right=other.primitive();
+        match (&left,&right){(Self::Text(a),Self::Text(b))=>a.encode_utf16().cmp(b.encode_utf16()).is_gt(),_=>left.to_number()>right.to_number()}
+    }
+    fn primitive(&self)->Self{match self{
+        Self::Array(items)=>Self::Text(items.iter().map(|item|if item.nullish(){String::new()}else{item.js_string()}).collect::<Vec<_>>().join(",").into()),
+        Self::Bytes(bytes)=>Self::Text(bytes.iter().map(u8::to_string).collect::<Vec<_>>().join(",").into()),
+        Self::Object(_)|Self::Long(_)=>Self::Text("[object Object]".into()),
+        _=>self.clone(),
+    }}
+    fn js_string(&self)->String{match self.primitive(){
+        Self::Undefined=>"undefined".into(),Self::Null=>"null".into(),Self::Bool(b)=>b.to_string(),Self::Text(s)=>s.into_owned(),
+        Self::Number(n) if n.is_nan()=>"NaN".into(),Self::Number(n) if n==f64::INFINITY=>"Infinity".into(),Self::Number(n) if n==f64::NEG_INFINITY=>"-Infinity".into(),
+        Self::Number(0.0)=>"0".into(),
+        Self::Number(n) if n.abs()>=1e21 || n.abs()<1e-6=>{let text=format!("{n:e}");if let Some((mantissa,exponent))=text.split_once('e') && !exponent.starts_with('-'){return format!("{mantissa}e+{exponent}");}text},
+        Self::Number(n)=>n.to_string(),_=>"[object Object]".into(),
+    }}
+    fn to_number(&self)->f64{match self{
+        Self::Number(n)=>*n,Self::Null=>0.0,Self::Bool(b)=>u8::from(*b) as f64,Self::Text(text)=>string_number(text),_=>f64::NAN,
+    }}
+}
+fn string_number(text:&str)->f64{
+    let text=text.trim_matches(|c|matches!(c,'\u{9}'..='\u{d}'|' '|'\u{a0}'|'\u{1680}'|'\u{2000}'..='\u{200a}'|'\u{2028}'|'\u{2029}'|'\u{202f}'|'\u{205f}'|'\u{3000}'|'\u{feff}'));
+    if text.is_empty(){return 0.0;}
+    if matches!(text,"Infinity"|"+Infinity"){return f64::INFINITY;}
+    if text=="-Infinity"{return f64::NEG_INFINITY;}
+    for (prefix,radix) in [("0x",16),("0X",16),("0b",2),("0B",2),("0o",8),("0O",8)]{
+        if let Some(digits)=text.strip_prefix(prefix){
+            if digits.is_empty(){return f64::NAN;}
+            let mut value=0.0;for c in digits.chars(){let Some(digit)=c.to_digit(radix) else{return f64::NAN;};value=value*radix as f64+digit as f64;}return value;
+        }
+    }
+    if text.bytes().any(|c|!matches!(c,b'0'..=b'9'|b'.'|b'e'|b'E'|b'+'|b'-')){return f64::NAN;}
+    text.parse().unwrap_or(f64::NAN)
+}

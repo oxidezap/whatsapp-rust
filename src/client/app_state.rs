@@ -7,7 +7,7 @@ use super::*;
 use crate::features::{AppStateError, AppStateResyncMode, AppStateResyncReport};
 use crate::request::DEFAULT_IQ_TIMEOUT;
 use std::borrow::Cow;
-use wacore::appstate_sync::AppStateMutationPersistence;
+use wacore::appstate_sync::{AppStateMutationPersistence, MetadataValidatedPatchList};
 
 pub(crate) struct AppStateDownloads {
     config: crate::AppStateDownloadConfig,
@@ -31,6 +31,23 @@ impl AppStateDownloads {
 enum BlobKind {
     Snapshot(WAPatchName),
     Mutation(u64),
+}
+
+// Release builds can admit download metadata only through the owned validation
+// token. Resource tests have a separate view for their intentionally raw fixtures.
+enum PrefetchMetadata<'a> {
+    Checked(&'a MetadataValidatedPatchList),
+    #[cfg(test)]
+    ResourceTest(&'a wacore::appstate::patch_decode::PatchList),
+}
+impl<'a> PrefetchMetadata<'a> {
+    fn list(self) -> Option<&'a wacore::appstate::patch_decode::PatchList> {
+        match self {
+            Self::Checked(checked) => checked.can_download().then_some(checked.list()),
+            #[cfg(test)]
+            Self::ResourceTest(list) => Some(list),
+        }
+    }
 }
 
 type PrefetchedBlobs =
@@ -951,37 +968,99 @@ impl Client {
     /// referenced by `patch_lists`, keyed by directPath, fetching concurrently
     /// under the configured concurrency and shared capacity budget. Failures
     /// retain their source for the collection processor.
-    async fn pre_download_external_blobs(
+    fn pre_download_external_blobs(
+        &self,
+        patch_lists: impl Into<Vec<wacore::appstate::patch_decode::PatchList>>,
+    ) -> impl Future<Output = (Vec<MetadataValidatedPatchList>, PrefetchedBlobs)> + '_ {
+        self.pre_download_owned_external_blobs(patch_lists.into())
+    }
+
+    async fn pre_download_owned_external_blobs(
+        &self,
+        patch_lists: Vec<wacore::appstate::patch_decode::PatchList>,
+    ) -> (Vec<MetadataValidatedPatchList>, PrefetchedBlobs) {
+        let patch_lists = wacore::runtime::blocking(&*self.runtime, move || {
+            patch_lists
+                .into_iter()
+                .map(MetadataValidatedPatchList::validate)
+                .collect::<Vec<_>>()
+        })
+        .await;
+        let blobs = self
+            .pre_download_metadata_lists(patch_lists.iter().map(PrefetchMetadata::Checked))
+            .await;
+        (patch_lists, blobs)
+    }
+
+    fn pre_download_one_external_blobs(
+        &self,
+        patch_list: wacore::appstate::patch_decode::PatchList,
+    ) -> impl Future<Output = (MetadataValidatedPatchList, PrefetchedBlobs)> + '_ {
+        // Convert the owned input before constructing a future, so its large
+        // protobuf header does not overlap the prefetch future's async storage.
+        FutureExt::map(
+            self.pre_download_external_blobs([patch_list]),
+            |(mut lists, blobs)| {
+                let Some(list) = lists.pop() else {
+                    unreachable!("metadata validation preserves the single input collection");
+                };
+                (list, blobs)
+            },
+        )
+    }
+
+    // Resource tests isolate admission after metadata preflight; production only
+    // reaches the iterator below through immutable owned validation tokens.
+    #[cfg(test)]
+    async fn pre_download_validated_metadata(
         &self,
         patch_lists: &[wacore::appstate::patch_decode::PatchList],
+        eligible: &[bool],
+    ) -> PrefetchedBlobs {
+        self.pre_download_metadata_lists(patch_lists.iter().zip(eligible).filter_map(
+            |(list, eligible)| eligible.then_some(PrefetchMetadata::ResourceTest(list)),
+        ))
+        .await
+    }
+
+    async fn pre_download_metadata_lists<'a>(
+        &self,
+        patch_lists: impl Iterator<Item = PrefetchMetadata<'a>>,
     ) -> PrefetchedBlobs {
         use futures::StreamExt;
 
         // Patch lists outlive all jobs, so metadata need not be cloned before
         // admission. Shared paths still produce a single retained allocation.
-        let mut jobs = Vec::new();
-        let mut seen_paths: HashSet<&str> = HashSet::new();
-        for pl in patch_lists {
-            if let Some(ext) = &pl.snapshot_ref
-                && let Some(path) = ext.direct_path.as_deref()
-                && seen_paths.insert(path)
-            {
-                jobs.push((ext, BlobKind::Snapshot(pl.name)));
-            }
-            for patch in &pl.patches {
-                if let Some(ext) = patch.external_mutations.as_option()
+        let jobs = {
+            let mut jobs = Vec::new();
+            let mut seen_paths: HashSet<&str> = HashSet::new();
+            for metadata in patch_lists {
+                let Some(pl) = metadata.list() else {
+                    continue;
+                };
+                if pl.snapshot.is_none()
+                    && let Some(ext) = &pl.snapshot_ref
                     && let Some(path) = ext.direct_path.as_deref()
                     && seen_paths.insert(path)
                 {
-                    let v = patch
-                        .version
-                        .as_option()
-                        .and_then(|v| v.version)
-                        .unwrap_or(0);
-                    jobs.push((ext, BlobKind::Mutation(v)));
+                    jobs.push((ext, BlobKind::Snapshot(pl.name)));
+                }
+                for patch in &pl.patches {
+                    if let Some(ext) = patch.external_mutations.as_option()
+                        && let Some(path) = ext.direct_path.as_deref()
+                        && seen_paths.insert(path)
+                    {
+                        let v = patch
+                            .version
+                            .as_option()
+                            .and_then(|v| v.version)
+                            .unwrap_or(0);
+                        jobs.push((ext, BlobKind::Mutation(v)));
+                    }
                 }
             }
-        }
+            jobs
+        };
 
         if jobs.is_empty() {
             return HashMap::new();
@@ -2313,7 +2392,7 @@ impl Client {
             let proc = self.get_app_state_processor();
             // Pre-download all external blobs for all collections in the response,
             // concurrently (independent CDN GETs, keyed by directPath).
-            let pre_downloaded = self.pre_download_external_blobs(&patch_lists).await;
+            let (patch_lists, pre_downloaded) = self.pre_download_external_blobs(patch_lists).await;
 
             let download = external_blob_resolver(&pre_downloaded);
 
@@ -2324,11 +2403,26 @@ impl Client {
             // this batch instead of aborting; it re-syncs on a later cycle once the key
             // arrives (process_patch_lists is all-or-nothing on a missing key anyway).
             let mut missing_all: Vec<Vec<u8>> = Vec::new();
-            for pl in &mut patch_lists {
-                if let Ok(m) = proc.missing_key_ids_after_inline(pl, &download).await {
+            let mut prepared_lists = Vec::with_capacity(patch_lists.len());
+            // End owning-list temporaries before suspending on boxed operations.
+            let mut patch_lists = patch_lists.into_iter();
+            loop {
+                let preparing = {
+                    let Some(pl) = patch_lists.next() else {
+                        break;
+                    };
+                    Box::pin(proc.prepare_metadata_validated_patch_list(pl, &download))
+                };
+                prepared_lists.push(preparing.await);
+                if let Some(prepared) = prepared_lists.last()
+                    && prepared.is_ready()
+                    && let Ok(m) = proc.get_missing_key_ids(prepared.list()).await
+                {
                     missing_all.extend(m);
                 }
             }
+            drop(patch_lists);
+            let patch_lists = prepared_lists;
             // Bound the key wait by the critical-sync deadline when one was given
             // (initial bootstrap), so a late/never-auto-shared key still recovers via
             // the explicit request on this connection; otherwise a fixed short wait.
@@ -2380,17 +2474,28 @@ impl Client {
             // consumes it: a collection that came back and failed to apply is a
             // different fact from one the server never mentioned, and the two
             // used to reach the log as the same sentence.
-            let responded: HashSet<WAPatchName> = patch_lists.iter().map(|pl| pl.name).collect();
-            for pl in patch_lists {
-                if let Err(lost) = self.admits(scope) {
-                    warn!(
-                        target: "Client/AppState",
-                        "Batched sync: stopping before {:?} ({lost:?})", pl.name
-                    );
-                    break;
-                }
-                let name = pl.name;
-                match Box::pin(proc.process_one_patch_list(pl, &download, true)).await {
+            let responded: HashSet<WAPatchName> =
+                patch_lists.iter().map(|pl| pl.list().name).collect();
+            let mut patch_lists = patch_lists.into_iter();
+            loop {
+                let (name, processing) = {
+                    let Some(pl) = patch_lists.next() else {
+                        break;
+                    };
+                    if let Err(lost) = self.admits(scope) {
+                        warn!(
+                            target: "Client/AppState",
+                            "Batched sync: stopping before {:?} ({lost:?})", pl.list().name
+                        );
+                        break;
+                    }
+                    let name = pl.list().name;
+                    (
+                        name,
+                        Box::pin(proc.process_one_prepared_patch_list(pl, true)),
+                    )
+                };
+                match processing.await {
                     Ok(applied) => results.push(applied),
                     Err(e) => {
                         // Named here or nowhere: the loop stops on the first
@@ -2407,6 +2512,7 @@ impl Client {
                     }
                 }
             }
+            drop(patch_lists);
 
             let mut needs_refetch = Vec::new();
             // A `<sync>` that simply omits a requested `<collection>` parses
@@ -2689,7 +2795,7 @@ impl Client {
 
             // Parse the response once here; the same parsed list is handed to the
             // processor below (no second parse).
-            let mut pl = wacore::appstate::patch_decode::parse_patch_list_ref(resp.get())?;
+            let pl = wacore::appstate::patch_decode::parse_patch_list_ref(resp.get())?;
             debug!(target: "Client/AppState", "Parsed patch list for {:?}: has_snapshot_ref={} has_more_patches={} patches_count={}",
                 name, pl.snapshot_ref.is_some(), pl.has_more_patches, pl.patches.len());
 
@@ -2697,9 +2803,7 @@ impl Client {
 
             // Pre-download all external blobs (snapshot and patch mutations),
             // concurrently, keyed by directPath.
-            let pre_downloaded = self
-                .pre_download_external_blobs(std::slice::from_ref(&pl))
-                .await;
+            let (pl, pre_downloaded) = self.pre_download_one_external_blobs(pl).await;
 
             let download = external_blob_resolver(&pre_downloaded);
 
@@ -2708,10 +2812,15 @@ impl Client {
             // patch metadata) is visible -- else process aborts with KeyNotFound on the
             // snapshot key. If the share doesn't land in time, skip this collection
             // instead of aborting; it re-syncs on a later cycle once the key arrives.
-            let missing = proc
-                .missing_key_ids_after_inline(&mut pl, &download)
-                .await
-                .unwrap_or_default();
+            let prepared =
+                Box::pin(proc.prepare_metadata_validated_patch_list(pl, &download)).await;
+            let missing = if prepared.is_ready() {
+                proc.get_missing_key_ids(prepared.list())
+                    .await
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             if !missing.is_empty()
                 && !self
                     .request_keys_and_wait(missing, APP_STATE_KEY_REQUEST_TIMEOUT)
@@ -2726,7 +2835,7 @@ impl Client {
             }
 
             let (mutations, new_state, list) =
-                match proc.process_parsed_patch_list(pl, &download, true).await {
+                match proc.process_prepared_patch_list(prepared, true).await {
                     Ok(applied) => applied,
                     Err(error) => {
                         // The single-collection path fails the same way the batched
@@ -3343,13 +3452,14 @@ impl Client {
         let applied = if list.patches.is_empty() && list.snapshot_ref.is_none() {
             false
         } else {
-            let pre_downloaded = self
-                .pre_download_external_blobs(std::slice::from_ref(&list))
-                .await;
+            let (list, pre_downloaded) = self.pre_download_one_external_blobs(list).await;
             let download = external_blob_resolver(&pre_downloaded);
-            let replaying_snapshot = list.snapshot.is_some() || list.snapshot_ref.is_some();
+            let replaying_snapshot =
+                list.list().snapshot.is_some() || list.list().snapshot_ref.is_some();
             let proc = self.get_app_state_processor();
-            match proc.process_parsed_patch_list(list, &download, true).await {
+            let prepared =
+                Box::pin(proc.prepare_metadata_validated_patch_list(list, &download)).await;
+            match proc.process_prepared_patch_list(prepared, true).await {
                 // The third element is the processor's own verdict, and it is
                 // not always agreement: a collection with an empty ltHash and a
                 // non-genesis first patch is refused here, with `Retry` set and
@@ -9599,3 +9709,55 @@ mod download_memory_tests;
 #[cfg(test)]
 #[path = "app_state/future_layout_tests.rs"]
 mod future_layout_tests;
+
+#[cfg(test)]
+mod validation_prefetch_tests {
+    use super::*;
+    #[tokio::test]
+    async fn invalid_patch_metadata_cannot_reserve_a_download_budget() {
+        let client =
+            crate::test_utils::create_test_client_with_name("appstate-validation-prefetch").await;
+        let mut reference = wa::ExternalBlobReference::default();
+        reference.direct_path = Some("/synthetic-appstate".into());
+        reference.media_key = Some(vec![1; 32]);
+        reference.file_sha256 = Some(vec![2; 32]);
+        reference.file_enc_sha256 = Some(vec![3; 32]);
+        let mut patch = wa::SyncdPatch::default();
+        let mut version = wa::SyncdVersion::default();
+        version.version = Some(1);
+        patch.version = version.into();
+        patch.snapshot_mac = Some(vec![4; 32]);
+        // patchMac is missing; the external reference itself is complete.
+        patch.external_mutations = reference.into();
+        let mut key = wa::KeyId::default();
+        key.id = Some(vec![5]);
+        patch.key_id = key.into();
+        let list = wacore::appstate::patch_decode::PatchList {
+            name: WAPatchName::Regular,
+            has_more_patches: false,
+            patches: vec![patch],
+            snapshot: None,
+            snapshot_ref: None,
+            error: None,
+        };
+        assert!(
+            client
+                .cache_config
+                .app_state_downloads
+                .budget
+                .get()
+                .is_none()
+        );
+        let (returned, blobs) = client.pre_download_one_external_blobs(list).await;
+        assert!(blobs.is_empty());
+        assert_eq!(returned.list().patches.len(), 1);
+        assert!(
+            client
+                .cache_config
+                .app_state_downloads
+                .budget
+                .get()
+                .is_none()
+        );
+    }
+}

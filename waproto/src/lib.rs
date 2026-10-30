@@ -449,6 +449,13 @@ pub mod codec {
     }
 
     #[inline(never)]
+    pub fn patch_debug_data_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::PatchDebugData, buffa::DecodeError> {
+        whatsapp::PatchDebugData::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
     pub fn sync_action_data_decode(
         bytes: &[u8],
     ) -> Result<whatsapp::SyncActionData, buffa::DecodeError> {
