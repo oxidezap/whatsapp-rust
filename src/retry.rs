@@ -6040,4 +6040,5 @@ mod tests {
         assert_eq!(info.chat.device(), 0);
         assert_eq!(info.requester.device(), 5);
     }
+    include!("retry_conformance_tests.rs");
 }
