@@ -1,8 +1,8 @@
 {
   "crate": "wasmtime-internal-cache",
-  "version": "48.0.7",
-  "archiveSha256": "b11ca8945aa341f944558622db59845dffa1435971f318d5fce2f2d9765a69b0",
-  "upstreamRevision": "c6846e13f64b07b7912d372db141397058b55f99",
+  "version": "48.0.8",
+  "archiveSha256": "bc15ec65327e0dc659da1c15658e94a3d4ad3a2ed75a35a320c84af5984b13c2",
+  "upstreamRevision": "7b6c29ec3e9a49c97da231665cbd8eead9ccbda0",
   "dependencyBackport": "04f0fcf70248909cc0b6a3ec1d406c7e2d543637",
   "files": {
     "LICENSE": "268872b9816f90fd8e85db5a28d33f8150ebb8dd016653fb39ef1f94f2686bc5",

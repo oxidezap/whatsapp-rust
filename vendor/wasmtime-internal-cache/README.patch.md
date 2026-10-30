@@ -1,6 +1,6 @@
 # Wasmtime cache dependency backport
 
-This is the published `wasmtime-internal-cache` 48.0.7 crate, with its Rust source,
+This is the published `wasmtime-internal-cache` 48.0.8 crate, with its Rust source,
 tests and license copied unchanged from the verified registry archive.
 `UPSTREAM.json` records the archive digest, original revision and file digests.
 
