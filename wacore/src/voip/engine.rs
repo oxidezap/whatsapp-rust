@@ -107,9 +107,21 @@ const PLAYOUT_DRAIN: usize = 320;
 /// 60ms @ 16kHz: the peer packet size the playout constants were written for, and the assumption
 /// used until the first decode reports what the peer actually sends.
 const OPUS_FRAME_SAMPS_60MS: usize = 960;
-/// ~150ms latency ceiling for a 60ms peer frame; a burst past this resyncs (drops oldest) instead
+/// ~400ms latency ceiling for a 60ms peer frame; a burst past this resyncs (drops oldest) instead
 /// of lagging. The floor for [`playout_bounds`], which scales it to the peer's packet.
-const PLAYOUT_CAP: usize = 2400;
+///
+/// It was ~150ms, 30ms above [`PLAYOUT_TARGET`]: a packet arriving 30ms early was enough to trim
+/// queued speech, and ordinary relay jitter does that many times a minute. One 88s call to a linked
+/// device trimmed 76,640 samples (4.8s of the caller's speech, `playout_trimmed_samples`) with no
+/// packet loss at all. A trim is audible as a chop; the extra ceiling only costs latency during the
+/// burst that would have been trimmed.
+const PLAYOUT_CAP: usize = 6400;
+/// Room above the prime target before a burst is trimmed (280ms). Sized so a 60ms peer lands
+/// exactly on [`PLAYOUT_CAP`] (1920 + 4480 = 6400) and the ceiling still scales with the packet,
+/// so the 120ms and 60ms ceilings stay a full packet apart: [`effective_playout_cap`] gives the
+/// difference back one packet at a time, and with less than that between them the first step
+/// would land on the smaller ceiling and trim a backlog that was legal under the larger one.
+const PLAYOUT_HEADROOM: usize = 4480;
 /// Prebuffer target: prime playout until the jitter buffer holds two 60ms peer frames, so the
 /// steady-state buffer never drains below one frame (a 60ms cushion that absorbs the relay's
 /// inter-arrival jitter). Priming to a single frame is a zero cushion: that one frame drains away
@@ -123,10 +135,10 @@ const PLAYOUT_TARGET: usize = 1920;
 /// A 120ms packet is a full [`PLAYOUT_TARGET`] on its own, so priming would end on the first one
 /// with no cushion at all, and two in flight would exceed [`PLAYOUT_CAP`] and be trimmed on arrival.
 /// Keep the same shape instead: prime to two packets so the steady-state buffer never drains below
-/// one, and let the ceiling hold that cushion plus a drain slice.
+/// one, and let the ceiling hold that cushion plus [`PLAYOUT_HEADROOM`] of jitter.
 fn playout_bounds(packet_samps: usize) -> (usize, usize) {
     let target = PLAYOUT_TARGET.max(packet_samps.saturating_mul(2));
-    (target, PLAYOUT_CAP.max(target + PLAYOUT_DRAIN))
+    (target, PLAYOUT_CAP.max(target + PLAYOUT_HEADROOM))
 }
 
 /// The ceiling to enforce now, given the one in force, the peer's current packet and what is queued.
@@ -8874,12 +8886,12 @@ mod tests {
             }
         }
         // The number is the assertion because the loss is a prefix of the buffer, not a failure:
-        // purging unconditionally gives 1920 here, keeping what decoded gives 2400. Two 60ms packets
-        // of real speech in this fixture -- less than an unconditional purge costs a call whose
-        // buffer is fuller, and enough to fail if the condition is dropped.
+        // keeping what decoded gives all six 60ms packets (6 x 960 = 5760), which fit under the
+        // playout ceiling, and an unconditional purge loses the corroboration window from that
+        // count. Enough to fail if the condition is dropped.
         let decoded = heard.iter().filter(|s| **s == 1234).count();
         assert_eq!(
-            decoded, 2400,
+            decoded, 5760,
             "the packets decoded before the verdict have to survive it"
         );
     }
