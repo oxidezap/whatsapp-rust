@@ -86,7 +86,8 @@ jobs:
 
   clippy:
     name: Clippy Linter
-    runs-on: ubuntu-latest
+    # Keep ALSA-dependent builds on a fixed Ubuntu LTS release.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -116,7 +117,8 @@ jobs:
 
   test:
     name: Build & Test
-    runs-on: ubuntu-latest
+    # Keep ALSA-dependent builds on a fixed Ubuntu LTS release.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -233,7 +235,8 @@ jobs:
 
   test-all-features:
     name: Build & Lint (all features)
-    runs-on: ubuntu-latest
+    # Keep ALSA-dependent builds on a fixed Ubuntu LTS release.
+    runs-on: ubuntu-24.04
     # Runs on every PR (no voip path filter): the voip-gated code is scattered across the client,
     # handler, send and stanza layers, so enumerating its files in a path filter kept leaking. The
     # webrtc/opus tree compiles once and is cached (sccache), so the steady-state cost is the
@@ -296,7 +299,8 @@ jobs:
 
   rustdoc:
     name: Rustdoc
-    runs-on: ubuntu-latest
+    # Keep ALSA-dependent builds on a fixed Ubuntu LTS release.
+    runs-on: ubuntu-24.04
     env:
       # Broken intra-doc links and malformed doc attributes are only surfaced by
       # rustdoc, never by clippy or rustc, so they need their own gate.

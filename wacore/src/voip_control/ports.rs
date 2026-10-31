@@ -39,7 +39,8 @@ pub trait EncodedAudioSink: Send + Sync + 'static {
 }
 
 /// One received access unit, reassembled back into Annex-B form.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// External media backends construct it through the builder without depending on an engine.
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 #[non_exhaustive]
 pub struct VideoFrame {
     /// Annex-B access unit (`00 00 00 01` start codes included).

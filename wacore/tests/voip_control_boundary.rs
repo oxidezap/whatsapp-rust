@@ -119,3 +119,47 @@ fn the_contract_never_names_the_engine() {
         offenders.join("\n"),
     );
 }
+
+#[cfg(feature = "voip-control")]
+#[test]
+fn external_backends_construct_owned_video_frames_without_an_engine() {
+    use wacore::voip_control::{VideoFrame, VideoSink};
+    let frame = VideoFrame::builder()
+        .data(vec![0, 0, 0, 1, 0x65, 0x80])
+        .keyframe(true)
+        .orientation(3)
+        .sender("100000000000001@lid".parse().unwrap())
+        .device("100000000000001:2@lid".parse().unwrap())
+        .pid(0)
+        .timestamp(u32::MAX)
+        .generation(42)
+        .build();
+    let expected = frame.clone();
+    let (sink, receiver) = async_channel::bounded(1);
+    VideoSink::playout(&sink).try_send(frame).unwrap();
+    let delivered = receiver.try_recv().unwrap();
+    assert_eq!(delivered, expected);
+    assert_eq!(delivered.data, [0, 0, 0, 1, 0x65, 0x80]);
+    assert!(delivered.keyframe);
+    assert_eq!(delivered.orientation, 3);
+    assert_eq!(delivered.sender.unwrap().to_string(), "100000000000001@lid");
+    assert_eq!(
+        delivered.device.unwrap().to_string(),
+        "100000000000001:2@lid"
+    );
+    assert_eq!(delivered.pid, Some(0));
+    assert_eq!(delivered.timestamp, u32::MAX);
+    assert_eq!(delivered.generation, 42);
+
+    let direct = VideoFrame::builder()
+        .data(vec![])
+        .keyframe(false)
+        .orientation(0)
+        .timestamp(0)
+        .generation(1)
+        .build();
+    assert!(direct.sender.is_none());
+    assert!(direct.device.is_none());
+    assert!(direct.pid.is_none());
+    assert_eq!(direct.timestamp, 0);
+}
