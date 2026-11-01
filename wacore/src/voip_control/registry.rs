@@ -7,7 +7,7 @@
 //! drives the Tokio driver task, a wasm `spawn_local` task, or any other runtime without coupling
 //! the portable core to a specific executor.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::mem::{size_of, size_of_val};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -52,6 +52,8 @@ pub(crate) use crate::voip_control::control::{
 /// of `<preaccept>`s can make this call allocate.
 const PEER_CAPABILITY_DEVICE_CAP: usize = 8;
 const MAX_RINGING_GROUP_CALLS: usize = 64;
+const MAX_RINGING_CALLS: usize = 256;
+const MAX_RINGING_CALL_ID_BYTES: usize = 64 * 1024;
 const MAX_RINGING_GROUP_CALL_BYTES: usize = 1024 * 1024;
 
 /// Identifies one peer video-upgrade request within one call generation.
@@ -611,7 +613,7 @@ pub struct CallRegistry {
     /// `_ringingCalls`: it is the ONLY signal that distinguishes a genuine missed call (a `<terminate>`
     /// for an offer still ringing) from a `<terminate>` for an answered or outgoing call. Active-call
     /// absence cannot tell them apart, since an answered call leaves the map on teardown too.
-    ringing: Mutex<HashSet<String>>,
+    ringing: Mutex<HashMap<String, u64>>,
 }
 
 impl Default for CallRegistry {
@@ -622,7 +624,7 @@ impl Default for CallRegistry {
             backend: std::sync::OnceLock::new(),
             pending_initial_group_controls: Mutex::new(VecDeque::new()),
             registration_event: Arc::new(event_listener::Event::new()),
-            ringing: Mutex::new(HashSet::new()),
+            ringing: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -682,7 +684,7 @@ impl CallRegistry {
     }
 
     /// The ringing-offer set. Poison policy as in [`active_calls`](Self::active_calls).
-    fn ringing_calls(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+    fn ringing_calls(&self) -> std::sync::MutexGuard<'_, HashMap<String, u64>> {
         self.ringing
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -696,7 +698,7 @@ impl CallRegistry {
     }
 
     fn ringing_group_update_fits(
-        ringing: &HashSet<String>,
+        ringing: &HashMap<String, u64>,
         map: &HashMap<String, CallEntry>,
         call_id: &str,
         entry: &CallEntry,
@@ -705,7 +707,7 @@ impl CallRegistry {
     ) -> bool {
         use crate::stats::HeapSize;
 
-        if !ringing.contains(call_id)
+        if !ringing.contains_key(call_id)
             || !entry.is_group_call
             || entry.session.phase() != CallPhase::Ringing
         {
@@ -726,7 +728,7 @@ impl CallRegistry {
         let ringing_group_bytes = map
             .iter()
             .filter(|(candidate_call_id, candidate)| {
-                ringing.contains(*candidate_call_id)
+                ringing.contains_key(*candidate_call_id)
                     && candidate.is_group_call
                     && candidate.session.phase() == CallPhase::Ringing
             })
@@ -764,8 +766,8 @@ impl CallRegistry {
         let (ringing_entries, ringing_bytes) = {
             let ringing = self.ringing_calls();
             let bytes = ringing
-                .iter()
-                .map(|call_id| size_of::<String>() + call_id.heap_bytes())
+                .keys()
+                .map(|call_id| size_of::<(String, u64)>() + call_id.heap_bytes())
                 .sum::<usize>();
             (ringing.len(), bytes)
         };
@@ -1665,15 +1667,18 @@ impl CallRegistry {
                     .cloned();
                 entry.video = VideoNegotiation::new(session.is_video);
                 entry.adopt_session(session);
-                ringing.insert(call_id);
+                ringing.insert(call_id, entry.generation);
                 entry.generation
             } else {
+                if !Self::ringing_admits(&ringing, &call_id) {
+                    return Err(GroupStateApply::InvalidSnapshot);
+                }
                 // Only a brand-new registration is charged against the aggregate, so the walk over
                 // every ringing group call belongs here rather than ahead of the update branch.
                 let (ringing_group_entries, ringing_group_bytes) = map
                     .iter()
                     .filter(|(call_id, entry)| {
-                        ringing.contains(*call_id)
+                        ringing.contains_key(*call_id)
                             && entry.is_group_call
                             && entry.session.phase() == CallPhase::Ringing
                     })
@@ -1691,7 +1696,7 @@ impl CallRegistry {
                 {
                     return Err(GroupStateApply::InvalidSnapshot);
                 }
-                ringing.insert(call_id.clone());
+                ringing.insert(call_id.clone(), generation);
                 map.insert(call_id, entry);
                 generation
             }
@@ -1733,6 +1738,29 @@ impl CallRegistry {
         drop(prev);
         self.registration_event.notify(usize::MAX);
         generation
+    }
+
+    /// Register a direct answer only while its dispatched offer still owns the ringing token.
+    pub fn insert_direct_for_offer(&self, session: CallSession, token: u64) -> Option<u64> {
+        let generation = {
+            let mut ringing = self.ringing_calls();
+            if ringing.get(&session.call_id).copied() != Some(token) {
+                return None;
+            }
+            let mut map = self.active_calls();
+            if map.contains_key(&session.call_id) {
+                return None;
+            }
+            let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
+            ringing.remove(&session.call_id);
+            map.insert(
+                session.call_id.clone(),
+                Self::new_entry(&self.backend(), session, generation, false, false),
+            );
+            generation
+        };
+        self.registration_event.notify(usize::MAX);
+        Some(generation)
     }
 
     /// Accept exactly the ringing generation observed before the signaling await.
@@ -3283,14 +3311,64 @@ impl CallRegistry {
     /// Record an incoming offer as ringing (not yet answered) so a later `<terminate>` for it can be
     /// surfaced as a missed call. Idempotent; the flag is consumed by [`take_ringing`](Self::take_ringing)
     /// on answer or terminate. Do not call for an offline-queued offer: that one is already surfaced
-    /// as missed-offline and must not double-fire.
+    /// as missed-offline and must not double-fire. This compatibility helper is bounded best-effort:
+    /// a new marker is ignored at 256 retained calls or 64 KiB of call IDs. Production dispatchers
+    /// use [`admit_incoming_offer`](Self::admit_incoming_offer) and refuse an unadmitted offer.
     pub fn mark_incoming_ringing(&self, call_id: &str) {
-        self.ringing_calls().insert(call_id.to_string());
+        self.try_mark_incoming_ringing(call_id);
+    }
+
+    /// Admit an offer marker without allowing unsolicited call IDs to retain unbounded memory.
+    /// Duplicates remain admitted at capacity; a new ID never evicts an existing ringing call.
+    pub fn try_mark_incoming_ringing(&self, call_id: &str) -> bool {
+        self.admit_ringing(call_id, false).is_some()
+    }
+
+    /// Admit one offer attempt and return a token that an asynchronous handler can fence against.
+    /// A same-ID redelivery supersedes the previous attempt without consuming another slot.
+    pub fn admit_incoming_offer(&self, call_id: &str) -> Option<u64> {
+        self.admit_ringing(call_id, true)
+    }
+
+    fn admit_ringing(&self, call_id: &str, replace: bool) -> Option<u64> {
+        let mut ringing = self.ringing_calls();
+        if !replace && let Some(token) = ringing.get(call_id) {
+            return Some(*token);
+        }
+        if !Self::ringing_admits(&ringing, call_id) {
+            return None;
+        }
+        let token = self.next_gen.fetch_add(1, Ordering::Relaxed);
+        ringing.insert(call_id.to_owned(), token);
+        Some(token)
+    }
+
+    fn ringing_admits(ringing: &HashMap<String, u64>, call_id: &str) -> bool {
+        ringing.contains_key(call_id)
+            || (ringing.len() < MAX_RINGING_CALLS
+                && call_id.len() <= MAX_RINGING_CALL_ID_BYTES
+                && ringing.keys().map(String::len).sum::<usize>()
+                    <= MAX_RINGING_CALL_ID_BYTES.saturating_sub(call_id.len()))
+    }
+
+    /// Whether this exact offer attempt still owns the ringing marker after an asynchronous wait.
+    pub fn is_current_ringing_offer(&self, call_id: &str, token: u64) -> bool {
+        self.ringing_calls().get(call_id).copied() == Some(token)
+    }
+
+    /// Cancel an asynchronous offer attempt without removing a newer same-ID redelivery.
+    pub fn take_current_ringing_offer(&self, call_id: &str, token: u64) -> bool {
+        let mut ringing = self.ringing_calls();
+        if ringing.get(call_id).copied() != Some(token) {
+            return false;
+        }
+        ringing.remove(call_id);
+        true
     }
 
     /// Whether a pending incoming-offer marker still exists for `call_id`.
     pub fn is_ringing(&self, call_id: &str) -> bool {
-        self.ringing_calls().contains(call_id)
+        self.ringing_calls().contains_key(call_id)
     }
 
     /// Consume the ringing flag for `call_id`, returning whether it was still ringing. True means a
@@ -3298,7 +3376,7 @@ impl CallRegistry {
     /// was answered, was outgoing, or was already resolved (so a duplicate `<terminate>` is ended,
     /// never a second missed). One-shot.
     pub fn take_ringing(&self, call_id: &str) -> bool {
-        self.ringing_calls().remove(call_id)
+        self.ringing_calls().remove(call_id).is_some()
     }
 
     /// Remove a call, aborting its media task. Returns true if it existed.
@@ -4032,6 +4110,9 @@ mod tests {
         assert!(reg.transition("GROUP-CALL", CallPhase::Connecting));
         assert!(reg.take_ringing("GROUP-CALL"));
 
+        for index in 0..256 {
+            assert!(reg.try_mark_incoming_ringing(&format!("SATURATED-{index}")));
+        }
         assert_eq!(reg.insert_ringing_group_if_inactive(incoming()), Ok(None));
         assert_eq!(reg.generation_of("GROUP-CALL"), Some(generation));
         assert!(
@@ -4480,7 +4561,7 @@ mod tests {
             reg.ringing
                 .lock()
                 .expect("registry lock")
-                .contains("GROUP-CALL"),
+                .contains_key("GROUP-CALL"),
             "a stale accept must not consume the replacement's ringing marker"
         );
     }
@@ -4506,7 +4587,7 @@ mod tests {
             reg.ringing
                 .lock()
                 .expect("registry lock")
-                .contains("GROUP-CALL"),
+                .contains_key("GROUP-CALL"),
             "a stale reject must not consume the replacement's ringing marker"
         );
     }
@@ -4526,7 +4607,7 @@ mod tests {
             reg.ringing
                 .lock()
                 .expect("registry lock")
-                .contains("GROUP-CALL"),
+                .contains_key("GROUP-CALL"),
             "registering the enriched offer must not mark it answered"
         );
 
@@ -7603,6 +7684,70 @@ mod tests {
         );
         // A call we never rang (outgoing, or a terminate with no preceding offer) is never missed.
         assert!(!reg.take_ringing("NEVER"));
+    }
+
+    #[test]
+    fn ringing_admission_bounds_count_preserves_duplicates_and_releases_slots() {
+        let reg = CallRegistry::new();
+        for index in 0..MAX_RINGING_CALLS {
+            assert!(reg.try_mark_incoming_ringing(&format!("RING-{index}")));
+        }
+        assert!(reg.try_mark_incoming_ringing("RING-0"));
+        assert!(!reg.try_mark_incoming_ringing("OVERFLOW"));
+        assert!(!reg.is_ringing("OVERFLOW"));
+        assert!(reg.take_ringing("RING-0"));
+        assert!(reg.try_mark_incoming_ringing("REPLACEMENT"));
+        assert_eq!(reg.memory_stats().entries, MAX_RINGING_CALLS as u64);
+        reg.abort_all();
+        assert_eq!(reg.memory_stats().entries, 0);
+        assert!(reg.try_mark_incoming_ringing("AFTER-DISCONNECT"));
+    }
+
+    #[test]
+    fn ringing_offer_tokens_fence_supersession_and_cleanup() {
+        let reg = CallRegistry::new();
+        let first = reg.admit_incoming_offer("SAME-ID").expect("first");
+        reg.mark_incoming_ringing("SAME-ID");
+        assert!(reg.is_current_ringing_offer("SAME-ID", first));
+        let second = reg.admit_incoming_offer("SAME-ID").expect("second");
+        assert_ne!(first, second);
+        assert!(!reg.is_current_ringing_offer("SAME-ID", first));
+        assert!(!reg.take_current_ringing_offer("SAME-ID", first));
+        assert!(reg.is_current_ringing_offer("SAME-ID", second));
+        assert!(reg.take_current_ringing_offer("SAME-ID", second));
+        assert!(!reg.is_ringing("SAME-ID"));
+    }
+
+    #[test]
+    fn direct_offer_acceptance_atomically_consumes_only_the_retained_token() {
+        let reg = CallRegistry::new();
+        let stale = reg.admit_incoming_offer("CID").expect("old offer");
+        let current = reg.admit_incoming_offer("CID").expect("new offer");
+        assert!(reg.insert_direct_for_offer(session("CID"), stale).is_none());
+        assert!(reg.is_current_ringing_offer("CID", current));
+        assert_eq!(reg.active_count(), 0);
+        let active = reg
+            .insert_direct_for_offer(session("CID"), current)
+            .expect("new answer");
+        assert!(!reg.is_ringing("CID"));
+        assert_eq!(reg.generation_of("CID"), Some(active));
+        assert!(
+            reg.insert_direct_for_offer(session("CID"), current)
+                .is_none()
+        );
+        assert_eq!(reg.generation_of("CID"), Some(active));
+    }
+
+    #[test]
+    fn ringing_admission_bounds_total_call_id_bytes() {
+        let reg = CallRegistry::new();
+        let large = "X".repeat(MAX_RINGING_CALL_ID_BYTES);
+        assert!(reg.try_mark_incoming_ringing(&large));
+        assert!(reg.try_mark_incoming_ringing(&large));
+        assert!(!reg.try_mark_incoming_ringing("Y"));
+        assert!(reg.take_ringing(&large));
+        assert!(!reg.try_mark_incoming_ringing(&format!("{large}Y")));
+        assert!(reg.try_mark_incoming_ringing("Y"));
     }
 
     #[test]

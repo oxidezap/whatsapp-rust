@@ -32,6 +32,12 @@ compile_error!(
 );
 
 pub mod audio;
+pub mod direct;
+mod direct_client;
+pub(crate) mod direct_control;
+pub mod direct_ingress;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod direct_tests;
 pub mod driver;
 mod events;
 pub mod facade;

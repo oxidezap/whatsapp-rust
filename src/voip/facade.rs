@@ -1,11 +1,9 @@
-//! The incoming-call facade: `client.voip().accept(&incoming).audio(src, sink).start()` ->
-//! [`CallHandle`]. It internalizes the preaccept -> offer-decrypt -> accept -> relay-connect ->
-//! engine-spawn orchestration the example drove by hand, so a consumer never touches call-signaling
-//! builders, the relay socket, the Signal session, or the sans-IO engine directly. Behind the `voip`
-//! feature; reject/terminate stay feature-free in `super`.
+//! Native call builders and the shared lifecycle used by injected hosts. Signal sessions stay
+//! host-owned; media runs through the registry's selected backend. Native group/video extensions
+//! retain their Client access, while direct PCM calls use the same host-neutral startup and handle.
 
 use std::future::Future;
-#[cfg(test)]
+#[cfg(all(test, feature = "voip-engine-wacore", not(target_arch = "wasm32")))]
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,12 +13,14 @@ use log::warn;
 use portable_atomic::{AtomicU64, Ordering as PortableOrdering};
 use wacore::message_processing::EncType;
 use wacore::messages::MessageUtils;
+#[cfg(all(test, feature = "voip-engine-wacore", not(target_arch = "wasm32")))]
 use wacore::stanza::call::{
-    AcceptParams, CAPABILITY_OFFER, CAPABILITY_PREACCEPT, CAPABILITY_STANDARD_OPUS_OFFER,
-    CAPABILITY_STANDARD_OPUS_PREACCEPT, CAPABILITY_STANDARD_OPUS_VIDEO_OFFER,
-    CAPABILITY_VIDEO_OFFER, OfferDeviceKey, OfferParams, TerminateParams, VideoStateParams,
-    build_accept, build_offer, build_preaccept_with_capability, build_terminate, build_video_state,
-    standard_opus_voip_settings,
+    CAPABILITY_OFFER, CAPABILITY_PREACCEPT, CAPABILITY_STANDARD_OPUS_OFFER,
+    CAPABILITY_STANDARD_OPUS_VIDEO_OFFER, CAPABILITY_VIDEO_OFFER, standard_opus_voip_settings,
+};
+use wacore::stanza::call::{
+    OfferDeviceKey, OfferParams, TerminateParams, VideoStateParams, build_offer, build_terminate,
+    build_video_state,
 };
 use wacore::stanza::group_call::{
     GroupInviteOfferParams, InitialGroupOfferParams, build_group_invite_offer,
@@ -43,14 +43,15 @@ use wacore::voip_control::control::{
 use wacore::voip_control::relay_parse::RelayData;
 use wacore::voip_control::{
     CallDirection, CallEvent, CallPhase, MediaAudioCodec as AudioCodec,
-    MediaAudioFormat as AudioFormat, MediaAudioRtpProfile as AudioRtpProfile,
-    MediaKeyframeUrgency as KeyframeUrgency, MediaVideoUpgradeToken as VideoUpgradeToken,
-    VideoFecConfig, VideoFrame, VideoInput, VideoTeardownHook, VoipMediaSession,
+    MediaAudioFormat as AudioFormat, MediaKeyframeUrgency as KeyframeUrgency,
+    MediaVideoUpgradeToken as VideoUpgradeToken, VideoFecConfig, VideoFrame, VideoInput,
+    VideoTeardownHook, VoipMediaSession,
 };
 use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
 use zeroize::{Zeroize, Zeroizing};
 
+use super::direct::{CallAckFuture, DirectCallHost, DirectCallKeys};
 use crate::client::{CallError, Client, ResponseWaiter};
 #[cfg(all(test, feature = "voip-engine-wacore"))]
 use crate::voip::audio::WA_FRAME_SAMPLES;
@@ -187,6 +188,249 @@ macro_rules! impl_media_builder_methods {
     };
 }
 
+async fn build_direct_spec(
+    client: &dyn DirectCallHost,
+    incoming: &IncomingCall,
+    enable_video: bool,
+    audio: wacore::voip_control::MediaAudioSpec,
+    generation: u64,
+) -> Result<(wacore::voip_control::MediaSessionSpec, String), CallError> {
+    let CallAction::Offer {
+        call_id,
+        call_creator,
+        ..
+    } = &incoming.action
+    else {
+        return Err(CallError::NotAnOffer);
+    };
+    let own_lid = client.own_lid().ok_or(CallError::Media("no own LID"))?;
+    let key = wacore::voip_control::MediaSessionKey::builder()
+        .call_id(call_id.clone())
+        .generation(generation)
+        .build();
+    let media = incoming
+        .media()
+        .ok_or(CallError::Media("offer carried no media block"))?;
+    let enc = media
+        .enc_for(Some(&own_lid))
+        .ok_or(CallError::Media("offer carried no callKey for this device"))?;
+
+    let enc_type = EncType::from_wire(&enc.enc_type).ok_or(CallError::Media("unknown enc type"))?;
+    let plaintext = client
+        .decrypt(call_creator, enc_type, &enc.ciphertext)
+        .await
+        .map_err(|e| CallError::Decrypt(e.to_string()))?;
+    let unpadded = MessageUtils::unpad_message_ref(&plaintext, enc.version)
+        .map_err(|e| CallError::Decrypt(e.to_string()))?;
+    let msg = waproto::codec::message_decode(unpadded)
+        .map_err(|e| CallError::Decrypt(format!("decode call message: {e}")))?;
+    let call_key = msg
+        .call
+        .into_option()
+        .and_then(|c| c.call_key)
+        .ok_or(CallError::Media("offer carried no callKey"))?;
+
+    // E2E SRTP keys derive from the participant LIDs: ours for send, the peer's for recv. Each
+    // crypto layer normalizes the JID with its own rule, so pass the raw JIDs through.
+    let self_lid = own_lid.to_string();
+    let peer_lid = call_creator.to_string();
+    let relay = media
+        .relay
+        .as_ref()
+        .ok_or(CallError::Media("offer carried no <relay>"))?;
+
+    let mut spec = wacore::voip_control::MediaSessionSpec::from_relay(
+        CallDirection::Incoming,
+        key,
+        &self_lid,
+        &peer_lid,
+        call_key,
+        relay,
+    )
+    .map_err(|e| CallError::Setup(e.to_string()))?;
+    spec.audio = audio;
+    spec.enable_video = enable_video;
+    Ok((spec, call_id.clone()))
+}
+
+pub(super) async fn call_direct_pcm(
+    host: Arc<dyn DirectCallHost>,
+    peer: &Jid,
+    source: Arc<dyn AudioSource>,
+    sink: Arc<dyn AudioSink>,
+) -> Result<CallHandle, CallError> {
+    start_direct_outgoing(host, peer, AudioEndpoints::Pcm { source, sink }, None).await
+}
+
+pub(super) async fn accept_direct_pcm(
+    host: Arc<dyn DirectCallHost>,
+    incoming: &IncomingCall,
+    source: Arc<dyn AudioSource>,
+    sink: Arc<dyn AudioSink>,
+) -> Result<CallHandle, CallError> {
+    start_direct_accept(
+        host,
+        incoming,
+        AudioEndpoints::Pcm { source, sink },
+        None,
+        false,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn start_direct_accept(
+    client: Arc<dyn DirectCallHost>,
+    incoming: &IncomingCall,
+    audio: AudioEndpoints,
+    video: Option<VideoEndpoints>,
+    local_only_on_cancel: bool,
+    #[cfg(test)] cleanup_completed: Option<async_channel::Sender<()>>,
+) -> Result<CallHandle, CallError> {
+    let epoch = client.call_state().epoch();
+    let CallAction::Offer {
+        call_id,
+        call_creator,
+        is_video: offered_video,
+        audio: offered_audio,
+        ..
+    } = &incoming.action
+    else {
+        return Err(CallError::NotAnOffer);
+    };
+    if incoming.group.is_none() && client.call_registry().is_group_call(call_id) {
+        // A retained direct offer cannot borrow a newer group generation with the same ID.
+        return Err(CallError::CallEndedDuringSetup);
+    }
+    if incoming.group.is_some() {
+        return Err(CallError::Media(
+            "direct call control does not accept group offers",
+        ));
+    }
+    if call_id.is_empty() {
+        return Err(CallError::EmptyCallId);
+    }
+    if video
+        .as_ref()
+        .is_some_and(|video| !video.has_valid_timing())
+    {
+        return Err(CallError::Media(
+            "video RTP timestamp stride must be non-zero",
+        ));
+    }
+    if video.is_some() && !offered_video {
+        return Err(CallError::VideoNotOffered);
+    }
+    let mut audio_config = audio.config();
+    let selected = peer_selected_codec_from_offer(incoming, audio_config.format);
+    let plan = negotiated_audio_plan(
+        audio_config.format,
+        matches!(&audio, AudioEndpoints::Encoded { .. }),
+        selected,
+    )?;
+    audio_config.format = plan.engine_format;
+    if !offered_audio.is_empty()
+        && !offered_audio.iter().any(|codec| {
+            codec.enc.eq_ignore_ascii_case("opus") && codec.rate == plan.wire_format.signaling_rate
+        })
+    {
+        return Err(CallError::AudioFormatNotOffered(
+            plan.wire_format.signaling_rate,
+        ));
+    }
+    if incoming.media().is_none() {
+        return Err(CallError::Media("offer carried no media block"));
+    }
+    let mut session = wacore::voip_control::CallSession::new_incoming(
+        call_id,
+        incoming.from.clone(),
+        call_creator.clone(),
+    );
+    session.audio_format = Some(plan.wire_format);
+    session.is_video = video.is_some();
+    session.peer_video_orientation = incoming
+        .video_orientation
+        .map(|orientation| (incoming.from.clone(), orientation));
+    let has_video = video.is_some();
+    let mut registration =
+        RegisteredCall::new_direct(&*client, session, incoming.ringing_generation()).await?;
+    client.call_state().ensure_epoch(epoch)?;
+    let mut teardown = AnswerTeardown::for_host(&client, &registration);
+    teardown.local_only_on_cancel = local_only_on_cancel;
+    #[cfg(test)]
+    {
+        teardown.cleanup_completed = cleanup_completed;
+    }
+    let (preaccept, accept) = build_answer_signaling(
+        incoming,
+        plan.wire_format,
+        video.is_some(),
+        false,
+        &client.generate_request_id(),
+        &client.generate_request_id(),
+    )?;
+    teardown.arm();
+    registration.disarm();
+    let result = async {
+        let (spec, _) = send_preaccept_then_prepare(
+            &*client,
+            &registration,
+            &mut teardown,
+            Some(preaccept),
+            build_direct_spec(
+                &*client,
+                incoming,
+                video.is_some(),
+                audio_config,
+                registration.generation,
+            ),
+        )
+        .await?;
+        if !client.is_connected() {
+            return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
+        }
+        registration.ensure_current()?;
+        send_answer_node(&*client, &registration, &mut teardown, accept).await?;
+        open_registered_media_host(
+            client.clone(),
+            &registration,
+            spec,
+            audio,
+            video,
+            None,
+            plan.engine_switch,
+        )
+        .await
+    }
+    .await;
+    match result {
+        Ok(handle) => {
+            teardown.disarm();
+            if let Some(own_lid) = client.own_lid() {
+                registration.registry.set_group_invite_self_device(
+                    &handle.call_id,
+                    handle.generation,
+                    GroupCallDevice::new(own_lid)
+                        .with_capability(1, offer_capability(has_video, plan.wire_format)),
+                );
+                if let Some(peer) = incoming.media().and_then(|media| media.peer_device.clone()) {
+                    registration.registry.set_group_invite_peer_device(
+                        &handle.call_id,
+                        handle.generation,
+                        peer,
+                    );
+                }
+            }
+            Ok(handle)
+        }
+        Err(error) => {
+            teardown.terminate(&*client).await;
+            Err(error)
+        }
+    }
+}
+
 /// Builder returned by [`Voip::accept`](crate::Voip::accept). Holds the offer and, once
 /// [`audio`](Self::audio) is called, the source/sink; [`start`](Self::start) prepares the engine,
 /// sends the callee's `<preaccept>` then `<accept>`, and starts the media plane. Borrows the
@@ -271,6 +515,22 @@ impl<'a> AcceptCall<'a> {
         )
     )]
     pub async fn start(mut self) -> Result<CallHandle, CallError> {
+        if self.incoming.group.is_none() {
+            let audio = self.audio.take().ok_or(CallError::MissingAudio)?;
+            let mut handle = start_direct_accept(
+                self.client.direct_host()?,
+                self.incoming,
+                audio,
+                self.video.take(),
+                self.local_only_on_cancel,
+                #[cfg(test)]
+                self.cleanup_completed.take(),
+            )
+            .await?;
+            handle.client = client_weak(self.client);
+            return Ok(handle);
+        }
+
         // Take the audio endpoints out first; the offline setup (decrypt + config + addr) only
         // borrows `&self`, so move the fields before those borrows to avoid a partial-move clash.
         let audio = self.audio.take().ok_or(CallError::MissingAudio)?;
@@ -311,10 +571,6 @@ impl<'a> AcceptCall<'a> {
             return Err(CallError::EmptyCallId);
         }
         let video = self.video.take();
-        let peer_invite_device = self
-            .incoming
-            .media()
-            .and_then(|media| media.peer_device.clone());
         let has_video = video.is_some();
         if video.as_ref().is_some_and(|v| !v.has_valid_timing()) {
             return Err(CallError::Media(
@@ -533,21 +789,6 @@ impl<'a> AcceptCall<'a> {
                 return Err(error);
             }
         };
-        if !is_group && let Some(own_lid) = self.client.lid() {
-            self.client.call_registry().set_group_invite_self_device(
-                &handle.call_id,
-                handle.generation,
-                GroupCallDevice::new(own_lid)
-                    .with_capability(1, offer_capability(has_video, wire_format)),
-            );
-            if let Some(peer_device) = peer_invite_device {
-                self.client.call_registry().set_group_invite_peer_device(
-                    &handle.call_id,
-                    handle.generation,
-                    peer_device,
-                );
-            }
-        }
         Ok(handle)
     }
 
@@ -605,53 +846,7 @@ impl<'a> AcceptCall<'a> {
             return Ok((spec, call_id.clone()));
         }
 
-        let media = self
-            .incoming
-            .media()
-            .ok_or(CallError::Media("offer carried no media block"))?;
-        let enc = media
-            .enc_for(Some(&own_lid))
-            .ok_or(CallError::Media("offer carried no callKey for this device"))?;
-
-        let enc_type =
-            EncType::from_wire(&enc.enc_type).ok_or(CallError::Media("unknown enc type"))?;
-        let plaintext = self
-            .client
-            .signal()
-            .decrypt_message(call_creator, enc_type, &enc.ciphertext)
-            .await
-            .map_err(|e| CallError::Decrypt(e.to_string()))?;
-        let unpadded = MessageUtils::unpad_message_ref(&plaintext, enc.version)
-            .map_err(|e| CallError::Decrypt(e.to_string()))?;
-        let msg = waproto::codec::message_decode(unpadded)
-            .map_err(|e| CallError::Decrypt(format!("decode call message: {e}")))?;
-        let call_key = msg
-            .call
-            .into_option()
-            .and_then(|c| c.call_key)
-            .ok_or(CallError::Media("offer carried no callKey"))?;
-
-        // E2E SRTP keys derive from the participant LIDs: ours for send, the peer's for recv. Each
-        // crypto layer normalizes the JID with its own rule, so pass the raw JIDs through.
-        let self_lid = own_lid.to_string();
-        let peer_lid = call_creator.to_string();
-        let relay = media
-            .relay
-            .as_ref()
-            .ok_or(CallError::Media("offer carried no <relay>"))?;
-
-        let mut spec = wacore::voip_control::MediaSessionSpec::from_relay(
-            CallDirection::Incoming,
-            key,
-            &self_lid,
-            &peer_lid,
-            call_key,
-            relay,
-        )
-        .map_err(|e| CallError::Setup(e.to_string()))?;
-        spec.audio = audio;
-        spec.enable_video = enable_video;
-        Ok((spec, call_id.clone()))
+        build_direct_spec(self.client, self.incoming, enable_video, audio, generation).await
     }
 }
 
@@ -678,33 +873,6 @@ impl<'a> OutgoingCall<'a> {
 
     impl_media_builder_methods!();
 
-    /// Resolve a PN callee to its LID, querying the server when the local cache misses so a first-ever
-    /// call to a never-messaged contact still works. The cache-only `get_current_lid` returns `None`
-    /// for an unknown PN; a usync device-list query side-effect-learns the LID↔PN mapping (warming the
-    /// cache synchronously), so we retry the cache after it. A persisting miss means the server has no
-    /// LID for this PN, which is unrecoverable for key derivation, so reject.
-    async fn resolve_callee_lid(
-        &self,
-        pn: &Jid,
-    ) -> Result<wacore_binary::CompactString, CallError> {
-        if let Some(lid) = self.client.lid_pn_cache.get_current_lid(&pn.user).await {
-            return Ok(lid);
-        }
-        // The query's device records are not used here; it is the LID-PN learning side effect we want.
-        self.client
-            .signal()
-            .get_user_devices(std::slice::from_ref(pn))
-            .await
-            .map_err(|e| CallError::Setup(e.to_string()))?;
-        self.client
-            .lid_pn_cache
-            .get_current_lid(&pn.user)
-            .await
-            .ok_or(CallError::Media(
-                "no known LID for the PN callee; cannot derive media keys",
-            ))
-    }
-
     /// Generate the callKey, encrypt it per peer device, send the `<offer>`, register the outgoing
     /// call, and return a dormant [`CallHandle`]. The initiator's relay is NOT in the offer; it
     /// arrives in the server's `<ack type=offer>` reply, so the media engine attaches later via
@@ -722,102 +890,10 @@ impl<'a> OutgoingCall<'a> {
     )]
     pub async fn start(mut self) -> Result<CallHandle, CallError> {
         let audio = self.audio.take().ok_or(CallError::MissingAudio)?;
-        let video = self.video.take();
-        if video.as_ref().is_some_and(|v| !v.has_valid_timing()) {
-            return Err(CallError::Media(
-                "video RTP timestamp stride must be non-zero",
-            ));
-        }
-
-        // WA Web `_e()`: call-id is "00" + 15 random bytes as lowercase hex (32 hex chars total).
-        let call_id = gen_call_id();
-
-        // Our own LID is the send-side SRTP participant id; required for E2E key derivation.
-        let own_lid = self.client.lid().ok_or(CallError::Media("no own LID"))?;
-
-        // The media keys (SFrame/SRTP) derive from the peer's LID, so a PN callee must be resolved to
-        // its LID first; without a known LID we would derive non-matching keys, so reject. The offer
-        // is then LID-addressed end to end.
-        let peer = match self.peer.server {
-            Server::Lid => self.peer.clone(),
-            _ => {
-                let lid_user = self.resolve_callee_lid(self.peer).await?;
-                Jid::new(lid_user.as_str(), Server::Lid)
-            }
-        };
-        let call_creator = own_lid.clone();
-
-        // Resolve the peer's devices and make sure we hold a Signal session for each. Drop hosted
-        // (Cloud-API) companions, same as the DM fan-out: the rest of the client never establishes
-        // sessions for them, so encrypting a callKey to one would fail or emit an unusable <to>.
-        let fetched = self
-            .client
-            .signal()
-            .get_user_devices(std::slice::from_ref(&peer))
-            .await
-            .map_err(|e| CallError::Setup(e.to_string()))?;
-        let mut devices = drop_hosted_devices(fetched);
-        if devices.is_empty() {
-            return Err(CallError::NoDevices);
-        }
-        // The FULL callee device set the server will ring, captured BEFORE the no-account pkmsg filter
-        // (or a per-device encrypt skip) shrinks it to the encryptable survivors. The server rings
-        // EVERY device of the callee -- including ones we don't encrypt a callKey for (e.g. the primary
-        // phone we drop as pkmsg without an ADV account) -- so the sibling-dismiss target set must be
-        // this full set, or an un-dismissed device keeps ringing and times the call out. Also keeps the
-        // addressed `<destination>` offer shape when only one device survives encryption.
-        let ring_devices = devices.clone();
-
-        // A device whose encrypt would emit pkmsg needs a <device-identity> from our ADV account.
-        // Without the account we can't supply it, so offer ONLY to devices that encrypt as plain msg
-        // and drop the rest before assert_sessions/encrypt, rather than failing the whole call
-        // (consistent with the per-device encrypt skip below). This reuses the send path's pkmsg
-        // pre-flight, so a session-present-but-unacked device is correctly treated as pkmsg, not msg
-        // (a bare contains_session check would wrongly keep it and let a no-identity pkmsg <enc> out).
-        if self
-            .client
-            .persistence_manager()
-            .get_device_snapshot()
-            .account
-            .is_none()
-        {
-            // would_emit_pkmsg does a load_session + store_session round-trip (a redundant write-back
-            // in the shared pre-flight); hold the per-device session locks place_call's encrypt also
-            // takes, so it can't clobber a concurrent send advancing the same session.
-            let lock_jids = self.client.build_session_lock_keys(&devices).await;
-            let session_guards = self.client.session_guards_for(&lock_jids).await;
-
-            let mut would_pkmsg = Vec::with_capacity(devices.len());
-            for d in &devices {
-                would_pkmsg.push(
-                    self.client
-                        .would_emit_pkmsg(d)
-                        .await
-                        .map_err(|e| CallError::Setup(e.to_string()))?,
-                );
-            }
-            drop(session_guards);
-            devices = keep_non_pkmsg_devices(devices, &would_pkmsg)?;
-        }
-
-        self.client
-            .signal()
-            .assert_sessions(&devices)
-            .await
-            .map_err(|e| CallError::Setup(e.to_string()))?;
-
-        place_call(
-            self.client,
-            call_id,
-            &peer,
-            &call_creator,
-            &own_lid,
-            &devices,
-            &ring_devices,
-            audio,
-            video,
-        )
-        .await
+        let host = self.client.direct_host()?;
+        let mut handle = start_direct_outgoing(host, self.peer, audio, self.video.take()).await?;
+        handle.client = client_weak(self.client);
+        Ok(handle)
     }
 }
 
@@ -1341,7 +1417,7 @@ impl VideoEndpoints {
 
 /// Drop hosted (Cloud-API) companions from the offer's device set: the client never establishes
 /// Signal sessions for them, so a callKey `<enc>` to one would fail or emit an unusable `<to>`.
-fn drop_hosted_devices(mut devices: Vec<Jid>) -> Vec<Jid> {
+pub(super) fn drop_hosted_devices(mut devices: Vec<Jid>) -> Vec<Jid> {
     devices.retain(|d| !d.is_hosted());
     devices
 }
@@ -1350,7 +1426,10 @@ fn drop_hosted_devices(mut devices: Vec<Jid>) -> Vec<Jid> {
 /// parallel to `devices`. Used when we hold no ADV account and so can't attach the `<device-identity>`
 /// a pkmsg `<enc>` requires. Errors `MissingDeviceIdentity` when every device would be pkmsg (nothing
 /// left to offer), rather than letting an unvalidatable pkmsg out or failing the whole call silently.
-fn keep_non_pkmsg_devices(devices: Vec<Jid>, would_pkmsg: &[bool]) -> Result<Vec<Jid>, CallError> {
+pub(super) fn keep_non_pkmsg_devices(
+    devices: Vec<Jid>,
+    would_pkmsg: &[bool],
+) -> Result<Vec<Jid>, CallError> {
     debug_assert_eq!(devices.len(), would_pkmsg.len());
     let kept: Vec<Jid> = devices
         .into_iter()
@@ -1363,118 +1442,28 @@ fn keep_non_pkmsg_devices(devices: Vec<Jid>, would_pkmsg: &[bool]) -> Result<Vec
     Ok(kept)
 }
 
-pub(crate) fn offer_capability(video: bool, audio: AudioFormat) -> &'static [u8] {
-    let standard_opus = matches!(audio.rtp_profile, AudioRtpProfile::StandardOpus);
-    match (video, standard_opus) {
-        (true, true) => &CAPABILITY_STANDARD_OPUS_VIDEO_OFFER,
-        (false, true) => &CAPABILITY_STANDARD_OPUS_OFFER,
-        (true, false) => &CAPABILITY_VIDEO_OFFER,
-        (false, false) => &CAPABILITY_OFFER,
-    }
-}
-
-/// The codec the offering peer's `<capability>` selects, or `None` when the local choice stands.
-///
-/// Mirrors `reset_voip_params_if_no_capability`: a peer that announced nothing resets nothing, a
-/// peer whose blob is unreadable resets everything, and MLow needs both sides to have asked for it.
-/// Only the MLow/Opus pair at one RTP timing is swappable, so a locally-selected profile outside
-/// that pair (the 48 kHz RFC 7587 one) is left exactly as the consumer configured it.
-/// What the peer's capability decides about a call that has not started yet.
-///
-/// Three facts come out of one selection and they are not the same fact: which format the ENGINE is
-/// built with, which one the SIGNALING announces, and whether the engine has to be switched after
-/// construction. They coincide for a PCM endpoint and part company for an encoded one, whose format
-/// is a promise the APPLICATION made about the bytes it will hand us -- the source is already built
-/// and carries no per-frame codec, so nothing can tell it the call chose the other one.
-#[derive(Debug, PartialEq, Eq)]
-struct NegotiatedAudioPlan {
-    /// What the engine is constructed with. For an encoded endpoint this stays the source's own
-    /// format, because that is what `audio.format` means to the engine: what arrives from the
-    /// application, not what goes on the wire. Overwriting it is what let escape-profile bytes
-    /// reach a native-Opus peer with their rewritten TOCs intact -- the engine compares the two to
-    /// decide whether to translate, and had been told they agreed.
-    engine_format: AudioFormat,
-    /// What the peer is told, and what the wire actually carries.
-    wire_format: AudioFormat,
-    /// Set when the engine must be moved off the format it was built with, before media flows.
-    engine_switch: Option<AudioCodec>,
-}
+pub(crate) use wacore::voip_control::signaling_plan::offer_capability;
+use wacore::voip_control::signaling_plan::{NegotiatedAudioPlan, peer_selected_codec_from_offer};
 
 fn negotiated_audio_plan(
     configured: AudioFormat,
     encoded_endpoint: bool,
     selected: Option<AudioCodec>,
 ) -> Result<NegotiatedAudioPlan, CallError> {
-    let unchanged = NegotiatedAudioPlan {
-        engine_format: configured,
-        wire_format: configured,
-        engine_switch: None,
-    };
-    let Some(codec) = selected else {
-        return Ok(unchanged);
-    };
-    // A codec with no sibling at this timing cannot be reached without re-signalling, so the call
-    // stays as configured rather than silently changing what the peer was told.
-    let Some(format) = configured.sibling_for(codec) else {
-        return Ok(unchanged);
-    };
-    // Only a change of CODEC is unanswerable: the source emits one grammar and cannot be told to
-    // emit another, so the application has to pick again. A change of container is answerable --
-    // the escape profile and native Opus carry the same Opus bytes, and the engine is what stops
-    // rewriting their TOCs.
-    if encoded_endpoint && configured.codec != codec {
-        return Err(CallError::EncodedAudioCodecNotNegotiated {
-            configured: configured.codec,
-            selected: codec,
-        });
-    }
-    Ok(NegotiatedAudioPlan {
-        engine_format: if encoded_endpoint { configured } else { format },
-        wire_format: format,
-        engine_switch: encoded_endpoint.then_some(codec),
-    })
-}
-
-fn peer_selected_codec_from_offer(
-    incoming: &IncomingCall,
-    format: AudioFormat,
-) -> Option<AudioCodec> {
-    use wacore::stanza::call::{CAPABILITY_INDEX_MLOW_V1, CapabilityBit, capability_bit};
-    use wacore::voip_control::{MediaAudioCodec as AudioCodec, MediaAudioFormat as AudioFormat};
-
-    // 1:1 only, and the guard lives here rather than at the call site because the question itself
-    // does not have a call-wide answer for a group. A group offer carries the capability of the ONE
-    // device that invited us, while the engine applies the call's format to every participant: read
-    // as a decision, it decodes the whole roster under one member's grammar and every member still
-    // on negotiated MLOW goes silent. A group answers per participant instead, which the engine's
-    // own classification and probe provide.
-    if incoming.group.is_some() {
-        return None;
-    }
-    if format != AudioFormat::MLOW_16KHZ_60MS
-        && format != AudioFormat::OPUS_16KHZ_60MS
-        && format != AudioFormat::OPUS_MLOW_16KHZ_60MS
-    {
-        return None;
-    }
-    let peer = incoming
-        .media()
-        .and_then(|media| media.peer_device.as_ref())
-        .map_or(CapabilityBit::Unknown, |device| {
-            capability_bit(
-                device.capability_version,
-                device.capability(),
-                CAPABILITY_INDEX_MLOW_V1,
-            )
-        });
-    // The capability gates MLOW's CONTAINER, not the codec inside it -- the escape profile carries
-    // standard Opus in MLOW's framing, and a peer that cleared the bit cannot parse that either.
-    let local_mlow = format.rtp_profile == AudioRtpProfile::Mlow;
-    let effective_mlow = wacore::stanza::call::mlow_after_peer_capability(local_mlow, peer);
-    (effective_mlow != local_mlow).then_some(if effective_mlow {
-        AudioCodec::Mlow
-    } else {
-        AudioCodec::Opus
+    wacore::voip_control::signaling_plan::negotiated_audio_plan(
+        configured,
+        encoded_endpoint,
+        selected,
+    )
+    .map_err(|error| match error {
+        wacore::voip_control::signaling_plan::AudioPlanError::EncodedAudioCodecNotNegotiated {
+            configured,
+            selected,
+        } => CallError::EncodedAudioCodecNotNegotiated {
+            configured,
+            selected,
+        },
+        _ => CallError::Media("unsupported audio negotiation plan"),
     })
 }
 
@@ -1551,16 +1540,6 @@ fn ensure_call_link_admitted_snapshot(
     ensure_call_link_admitted_media(update, requested)
 }
 
-fn answer_preaccept_capability(video: bool, audio: AudioFormat) -> &'static [u8] {
-    let standard_opus = matches!(audio.rtp_profile, AudioRtpProfile::StandardOpus);
-    match (video, standard_opus) {
-        (true, true) => &CAPABILITY_STANDARD_OPUS_OFFER,
-        (false, true) => &CAPABILITY_STANDARD_OPUS_PREACCEPT,
-        (true, false) => &CAPABILITY_OFFER,
-        (false, false) => &CAPABILITY_PREACCEPT,
-    }
-}
-
 fn build_answer_signaling(
     incoming: &IncomingCall,
     audio: AudioFormat,
@@ -1569,61 +1548,19 @@ fn build_answer_signaling(
     preaccept_id: &str,
     accept_id: &str,
 ) -> Result<(wacore_binary::Node, wacore_binary::Node), CallError> {
-    let CallAction::Offer {
-        call_id,
-        call_creator,
-        ..
-    } = &incoming.action
-    else {
-        return Err(CallError::NotAnOffer);
-    };
-    let audio_rate = audio.signaling_rate.to_string();
-    let audio_rates = [audio_rate.as_str()];
-    let standard_opus = matches!(audio.rtp_profile, AudioRtpProfile::StandardOpus);
-    let target = if is_group {
-        Jid::new(call_id, Server::Call)
-    } else {
-        incoming.from.clone()
-    };
-    let preaccept = build_preaccept_with_capability(
-        call_id,
-        &target,
-        call_creator,
+    wacore::voip_control::signaling_plan::build_answer_signaling(
+        incoming,
+        audio,
+        video,
+        is_group,
         preaccept_id,
-        &audio_rates,
-        answer_preaccept_capability(video, audio),
-        video,
-    );
-    // Captured video accepts mirror the offer's peer experiment metadata; audio accepts omit it.
-    let metadata = if video { incoming.media() } else { None };
-    let accept = build_accept(&AcceptParams {
-        call_id,
-        to: &target,
-        id: accept_id,
-        call_creator,
-        audio_rates: &audio_rates,
-        relay_te: None,
-        rte: None,
-        voip_settings: standard_opus
-            .then(|| standard_opus_voip_settings(audio.rtp_clock_rate == 48_000)),
-        // A captured from-start video accept carries no capability child; audio answers advertise
-        // the selected MLOW/standard-Opus capability.
-        capability: if video {
-            None
-        } else if standard_opus {
-            Some(&CAPABILITY_STANDARD_OPUS_OFFER)
-        } else {
-            Some(&CAPABILITY_OFFER)
-        },
-        video,
-        peer_abtest_bucket: metadata.and_then(|offer| offer.peer_abtest_bucket.as_deref()),
-        peer_abtest_bucket_id_list: metadata
-            .and_then(|offer| offer.peer_abtest_bucket_id_list.as_deref()),
-    });
-    Ok((preaccept, accept))
+        accept_id,
+    )
+    .ok_or(CallError::NotAnOffer)
 }
 
 #[cfg(test)]
+#[cfg(all(feature = "voip-engine-wacore", not(target_arch = "wasm32")))]
 async fn send_answer_signaling_with_ids(
     client: &Client,
     incoming: &IncomingCall,
@@ -1646,7 +1583,7 @@ async fn send_answer_signaling_with_ids(
 }
 
 async fn send_answer_node(
-    client: &Client,
+    client: &dyn DirectCallHost,
     registration: &RegisteredCall,
     teardown: &mut AnswerTeardown,
     node: wacore_binary::Node,
@@ -1657,14 +1594,14 @@ async fn send_answer_node(
     teardown.arm();
     if let Err(error) = client.send_node(node).await {
         teardown.terminate(client).await;
-        return Err(error.into());
+        return Err(error);
     }
     registration.ensure_current()?;
     Ok(())
 }
 
 async fn send_preaccept_then_prepare<T>(
-    client: &Client,
+    client: &dyn DirectCallHost,
     registration: &RegisteredCall,
     teardown: &mut AnswerTeardown,
     preaccept: Option<wacore_binary::Node>,
@@ -1917,10 +1854,10 @@ async fn publish_group_epoch_ciphertexts(
 /// outgoing call can't survive a disconnect; the registry's `abort_all` already covers attached calls,
 /// but those have no media-task drop-guard yet, so this is their only end-notify path. Called from the
 /// client's connection teardown.
-pub(crate) fn drain_pending_outgoing_on_disconnect(client: &Client) {
+pub(super) fn drain_direct_pending(client: &dyn DirectCallHost) {
     let drained: Vec<PendingOutgoing> = {
         let mut map = client
-            .voip_state()
+            .call_state()
             .pending_outgoing_calls
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1934,6 +1871,8 @@ pub(crate) fn drain_pending_outgoing_on_disconnect(client: &Client) {
 /// Generate the callKey, encrypt it per device, send the `<offer>`, register the outgoing call, and
 /// park the relay-attach material. Split from device resolution (usync) so it is offline testable
 /// with a seeded device list. The relay attach is the only live-only piece.
+#[cfg(test)]
+#[cfg(all(feature = "voip-engine-wacore", not(target_arch = "wasm32")))]
 #[allow(clippy::too_many_arguments)]
 async fn place_call(
     client: &Client,
@@ -1941,122 +1880,117 @@ async fn place_call(
     peer: &Jid,
     call_creator: &Jid,
     own_lid: &Jid,
-    // The devices we encrypt the callKey for (the offer's `<enc>` recipients).
     devices: &[Jid],
-    // The FULL callee device set the server rings (a superset of `devices` -- it includes devices we
-    // can't encrypt for). Drives the sibling-dismiss target set and the addressed offer shape.
     ring_devices: &[Jid],
     audio: AudioEndpoints,
     video: Option<VideoEndpoints>,
 ) -> Result<CallHandle, CallError> {
-    // The offer keeps the addressed `<destination><to jid>` shape whenever the callee is multi-device
-    // (computed before any pkmsg/encrypt filtering), even if one encryptable survivor remains.
-    let multi_device = ring_devices.len() > 1;
-    // Diagnostic: the resolved callee device set drives sibling-dismiss. If a multi-device callee
-    // shows only one here, a device-list resolution gap (e.g. the primary missing) is why a sibling
-    // keeps ringing -- a lone device has no sibling to dismiss.
-    log::debug!(
-        "voip: call {call_id} resolved {} callee device(s) (sibling-dismiss {}): [{}]",
-        ring_devices.len(),
-        if multi_device { "armed" } else { "off" },
-        // Observed (PII-safe) device list, matching the rest of the call paths; the args only format
-        // when debug logging is enabled, so the join is free otherwise.
-        ring_devices
-            .iter()
-            .map(|j| j.observe().to_string())
-            .collect::<Vec<_>>()
-            .join(", "),
-    );
-    // The callKey we generate is what the engine and SFrame key from; the peer learns it by
-    // decrypting the per-device <enc> we send below.
+    let epoch = client.call_state().epoch();
     let call_key = rand::random::<[u8; 32]>();
-    let padded = MessageUtils::encode_and_pad(&{
-        let mut proto = wa::Message::default();
-        proto.call = buffa::MessageField::some({
-            let mut proto = wa::message::Call::default();
-            proto.call_key = Some(call_key.to_vec());
-            proto
-        });
-        proto
-    });
+    let plaintext = encode_call_key(&call_key);
+    let keys =
+        super::direct_client::encrypt_known_call_keys(client, devices, ring_devices, &plaintext)
+            .await?;
+    let mut handle = place_call_prepared(
+        client.direct_host()?,
+        call_id,
+        peer,
+        call_creator,
+        own_lid,
+        audio,
+        video,
+        call_key.to_vec(),
+        keys,
+        epoch,
+    )
+    .await?;
+    handle.client = client_weak(client);
+    Ok(handle)
+}
 
-    // Encrypt the callKey for each peer device, reusing the message send path's per-device encrypt
-    // core (`encrypt_for_devices_with_sessions_raw`): same parallel fan-out + skip-on-fail contract.
-    // A per-device failure (no session, identity/backend error) only SKIPS that device (mirrors the
-    // message send fan-out's log+skip): aborting the whole offer would strand the already-encrypted
-    // devices with an advanced Signal chain for a ciphertext they never receive, making a later send
-    // undecryptable. The offer is built from the survivors.
-    //
-    // Take the per-device session locks once (the send path's batch model) instead of a per-device
-    // lock; concurrent ratchet mutations would corrupt session state.
-    let raw = {
-        let lock_jids = client.build_session_lock_keys(devices).await;
-        let _session_guards = client.session_guards_for(&lock_jids).await;
+fn encode_call_key(call_key: &[u8]) -> Vec<u8> {
+    let mut message = wa::Message::default();
+    let mut call = wa::message::Call::default();
+    call.call_key = Some(call_key.to_vec());
+    message.call = buffa::MessageField::some(call);
+    MessageUtils::encode_and_pad(&message)
+}
 
-        // Sessions were asserted upstream (`OutgoingCall::start`), so skip the network session-ensure and
-        // encrypt against the existing sessions directly: a device whose session is somehow still
-        // missing fails its encrypt and is skipped, exactly as the old per-device loop did.
-        let plan = wacore::send::SessionPlan::assume_ready(devices.len());
-        let mut adapter = client.signal_adapter();
-        let mut stores = adapter.as_signal_stores();
-        let raw = wacore::send::encrypt_for_devices_with_sessions_raw(
-            &*client.runtime,
-            &mut stores,
-            devices,
-            &padded,
-            plan,
-        )
-        .await
-        .map_err(|e| CallError::Setup(e.to_string()))?;
-        // Before the persist below, which can bail with `?`: the devices this
-        // fan-out dropped are dropped whether or not the offer goes out.
-        client
-            .stats
-            .record_unkeyable_devices(UnkeyableDevice::Encrypt, raw.unkeyed_at_encrypt);
-        drop(_session_guards);
-        client
-            .persist_signal_state_pre_wire()
-            .await
-            .map_err(|e| CallError::Setup(e.to_string()))?;
-        raw
-    };
-
-    // The raw fan-out yields survivors in completion order; re-order to the input `devices` order so
-    // the offer addresses devices deterministically (the offer's `<destination><to>` order).
-    let mut device_keys: Vec<OfferDeviceKey> = Vec::with_capacity(raw.devices.len());
-    for device in devices {
-        if let Some(one) = raw.devices.iter().find(|d| &d.device_jid == device) {
-            device_keys.push(OfferDeviceKey {
-                device_jid: one.device_jid.clone(),
-                ciphertext: one.ciphertext.clone(),
-                enc_type: one.enc_type.to_string(),
-            });
-        }
+async fn start_direct_outgoing(
+    client: Arc<dyn DirectCallHost>,
+    peer: &Jid,
+    audio: AudioEndpoints,
+    video: Option<VideoEndpoints>,
+) -> Result<CallHandle, CallError> {
+    if !matches!(peer.server, Server::Pn | Server::Lid) || peer.user.is_empty() {
+        return Err(CallError::Media(
+            "direct calls require a PN or LID user JID",
+        ));
     }
-    // Every device failed to encrypt: there is no one to address the offer to.
+    let epoch = client.call_state().epoch();
+    if video.as_ref().is_some_and(|v| !v.has_valid_timing()) {
+        return Err(CallError::Media(
+            "video RTP timestamp stride must be non-zero",
+        ));
+    }
+    let own_lid = client.own_lid().ok_or(CallError::Media("no own LID"))?;
+    if own_lid.server != Server::Lid || own_lid.user.is_empty() {
+        return Err(CallError::Media("direct calls require an own LID user JID"));
+    }
+    let peer = client.resolve_peer(peer).await?;
+    client.call_state().ensure_epoch(epoch)?;
+    if peer.server != Server::Lid || peer.user.is_empty() {
+        return Err(CallError::Media(
+            "resolved call peer must be a LID user JID",
+        ));
+    }
+    let call_key = rand::random::<[u8; 32]>();
+    let keys = client
+        .prepare_keys(&peer, &encode_call_key(&call_key))
+        .await?;
+    client.call_state().ensure_epoch(epoch)?;
+    place_call_prepared(
+        client,
+        gen_call_id(),
+        &peer,
+        &own_lid,
+        &own_lid,
+        audio,
+        video,
+        call_key.to_vec(),
+        keys,
+        epoch,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn place_call_prepared(
+    client: Arc<dyn DirectCallHost>,
+    call_id: String,
+    peer: &Jid,
+    call_creator: &Jid,
+    own_lid: &Jid,
+    audio: AudioEndpoints,
+    video: Option<VideoEndpoints>,
+    call_key: Vec<u8>,
+    keys: DirectCallKeys,
+    epoch: u64,
+) -> Result<CallHandle, CallError> {
+    let DirectCallKeys {
+        device_keys,
+        ring_devices,
+        device_identity,
+    } = keys;
     if device_keys.is_empty() {
         return Err(CallError::NoDevices);
     }
-
-    // A pkmsg device must be able to validate our identity, so attach the encoded ADV account
-    // identity (same blob the message send path attaches alongside a pkmsg). A pkmsg without a
-    // <device-identity> advances our sender chain while the peer can't validate or consume the pre-key
-    // message, so `needs_device_identity` refuses here before any registration/send.
-    let account = client
-        .persistence_manager()
-        .get_device_snapshot()
-        .account
-        .clone();
-    let device_identity = match wacore::send::needs_device_identity(
-        raw.includes_prekey_message,
-        account.as_deref(),
-    ) {
-        Ok(bytes) => bytes,
-        Err(_) => return Err(CallError::MissingDeviceIdentity),
-    };
-
-    // A privacy-restricted callee rejects the offer unless it carries our stored token for them.
-    let privacy_token = client.lookup_tc_token_for_jid(peer).await;
+    let multi_device = ring_devices.len() > 1;
+    let privacy_token = client.read_token(peer).await?;
+    client.call_state().ensure_epoch(epoch)?;
+    if !client.is_connected() {
+        return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
+    }
 
     // The offer needs a stanza id so the server can ack-correlate it: the initiator's relay rides
     // back on the `<ack type=offer>` reply to THIS id, not on a later <call>.
@@ -2082,14 +2016,7 @@ async fn place_call(
     // Register the ack-waiter for the offer's stanza id BEFORE send_node so a fast server reply can't
     // arrive before we are listening. The ack carries the relay; the spawned task below attaches the
     // engine when it resolves.
-    let (ack_rx, ack_generation) = client
-        .try_register_ack_waiter(&offer_stanza_id)
-        .ok_or_else(|| CallError::Response("duplicate offer request id".into()))?;
-    let ack_guard = crate::request::ResponseWaiterGuard::new(
-        client.response_waiters.clone(),
-        offer_stanza_id.clone(),
-        ack_generation,
-    );
+    let ack = client.watch_ack(&offer_stanza_id)?;
 
     // Register the outgoing call AND park the relay-attach material BEFORE send_node, mirroring the
     // incoming register-before-connect ordering. The handle starts dormant; the ack-waiter task
@@ -2109,12 +2036,12 @@ async fn place_call(
     // dropped as pkmsg without an ADV account) still rings and must be dismissed, or it times the call
     // out. Retained for a single-device callee too: it has no sibling to dismiss, but it is still the
     // device a `<terminate>` has to reach if the call is cancelled before anyone answers.
-    session.ring_devices = ring_devices.to_vec();
+    session.ring_devices = ring_devices;
     let _ = session.transition_to(CallPhase::Calling);
     let generation = registry.insert(session);
     let mut startup = OutgoingStartTeardown {
         registry: registry.clone(),
-        pending: client.voip_state().pending_outgoing_calls.clone(),
+        pending: client.call_state().pending_outgoing_calls.clone(),
         call_id: call_id.clone(),
         generation,
         armed: true,
@@ -2155,7 +2082,7 @@ async fn place_call(
 
     // Park the material needed to spawn the engine once the relay arrives. Keyed by call-id.
     client
-        .voip_state()
+        .call_state()
         .pending_outgoing_calls
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2165,7 +2092,7 @@ async fn place_call(
                 generation,
                 self_lid: own_lid.to_string(),
                 peer_lid: peer.to_string(),
-                call_key: call_key.to_vec(),
+                call_key,
                 audio,
                 video,
                 video_shared: video_shared.clone(),
@@ -2176,36 +2103,50 @@ async fn place_call(
             },
         );
 
+    // Cleanup may have run during the host's synchronous ACK registration or backend reservation.
+    // Both entries are now published, so check before the first write can suspend.
+    client.call_state().ensure_epoch(epoch)?;
+    if !registry.is_current(&call_id, generation) {
+        return Err(CallError::CallEndedDuringSetup);
+    }
+
     // If the send fails, undo the registration: drop the (generation-guarded) pending entry, reap our
     // registry generation, drop the dangling ack-waiter, and wake any wait_ended() waiter, then
     // propagate. Guarded so a same-call-id replacement that already superseded us isn't evicted.
     if let Err(e) = client.send_node(offer).await {
         let removed = take_pending_if_current(
-            &client.voip_state().pending_outgoing_calls,
+            &client.call_state().pending_outgoing_calls,
             &call_id,
             generation,
         );
         registry.remove_if_current(&call_id, generation);
         // No ack will ever arrive for the failed offer; drop the waiter so it can't leak.
-        drop(ack_guard);
+        drop(ack);
         if removed.is_some() {
             ended.notify();
         }
-        return Err(e.into());
+        return Err(e);
     }
 
+    client.call_state().ensure_epoch(epoch)?;
+    if !registry.is_current(&call_id, generation) {
+        return Err(CallError::CallEndedDuringSetup);
+    }
     // Prevents 463 nacks on later offers to this contact (WA Web's post-offer sendTcToken).
-    spawn_call_tc_token_issuance(client, peer);
+    let token_host = client.clone();
+    let token_peer = peer.clone();
+    client.runtime().spawn_detached(Box::pin(async move {
+        token_host.issue_token(&token_peer).await;
+    }));
 
     // The relay arrives in the `<ack type=offer>` reply to the offer's stanza id (live-only, needs a
     // real server). Wait on the ack-waiter with a bounded timeout; attach the engine when the relay
     // lands, else fail the call so a parked wait_ended() resolves.
-    spawn_outgoing_relay_waiter(
-        client,
+    spawn_direct_relay_waiter(
+        client.clone(),
         call_id.clone(),
         generation,
-        ack_guard,
-        ack_rx,
+        ack,
         Some((peer.clone(), call_creator.clone())),
     );
 
@@ -2219,8 +2160,9 @@ async fn place_call(
         peer_jid: peer.clone(),
         call_creator: call_creator.clone(),
         client_registry: registry.clone(),
-        pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
-        client: client_weak(client),
+        pending_outgoing_calls: client.call_state().pending_outgoing_calls.clone(),
+        client: std::sync::Weak::new(),
+        host: Some(Arc::downgrade(&client)),
         muted,
         video: video_shared,
         events: Arc::new(std::sync::Mutex::new(Some(ev_rx))),
@@ -2246,9 +2188,11 @@ const OFFER_ACK_RELAY_TIMEOUT: Duration = Duration::from_secs(10);
 const ERR_DISCONNECTED_DURING_SETUP: &str = "connection dropped during call setup";
 
 /// Spawn the task that turns the offer's `<ack>` into a connected media engine: await the ack-waiter
-/// (bounded), and on a node carrying a `<relay>` attach the engine via [`attach_outgoing_relay`]
+/// (bounded), and on a node carrying a `<relay>` attach the engine via [`attach_outgoing_relay_host`]
 /// (reusing its for_outgoing + generation handling). On timeout / no relay / closed channel the call
 /// failed to connect, so drain its pending entry and notify `ended` to resolve wait_ended().
+#[cfg(test)]
+#[cfg(all(feature = "voip-engine-wacore", not(target_arch = "wasm32")))]
 fn spawn_outgoing_relay_waiter(
     client: &Client,
     call_id: String,
@@ -2257,55 +2201,101 @@ fn spawn_outgoing_relay_waiter(
     ack_rx: futures::channel::oneshot::Receiver<Arc<wacore_binary::OwnedNodeRef>>,
     caller: Option<(Jid, Jid)>,
 ) {
-    // Upgrade the client's self-weak so the task owns an Arc<Client> for the duration of the wait.
-    let Some(client) = client.self_weak.get().and_then(|w| w.upgrade()) else {
+    let Ok(host) = client.direct_host() else {
         return;
     };
-    let runtime = client.runtime.clone();
+    let ack = Box::pin(async move {
+        let _guard = ack_guard;
+        ack_rx
+            .await
+            .map(|node| node.to_owned_node())
+            .map_err(|_| CallError::Response("connection dropped before offer ACK".into()))
+    });
+    spawn_direct_relay_waiter(host, call_id, generation, ack, caller);
+}
+
+fn spawn_direct_relay_waiter(
+    client: Arc<dyn DirectCallHost>,
+    call_id: String,
+    generation: u64,
+    ack: CallAckFuture,
+    caller: Option<(Jid, Jid)>,
+) {
+    let ended = client
+        .call_state()
+        .pending_outgoing_calls
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&call_id)
+        .filter(|pending| pending.generation == generation)
+        .map(|pending| pending.ended.clone());
+    let Some(ended) = ended else {
+        return;
+    };
+    let runtime = client.runtime();
     runtime
         .clone()
         .spawn(Box::pin(async move {
-            let _ack_guard = ack_guard;
             // Three outcomes and not two. They used to collapse into one `None`, which was fine
             // while the only consumer was a log line saying "(timeout or absent)" -- and is not,
             // now that the reason reaches the caller: an ack that arrived carrying no relay and an
             // ack that never arrived are different faults, and telling somebody the server's reply
             // lacked something when there was no reply sends them looking in the wrong place.
-            let relay =
-                match wacore::runtime::timeout(&*runtime, OFFER_ACK_RELAY_TIMEOUT, ack_rx).await {
-                    // The ack node re-encoded as OwnedNodeRef; find its <relay> child and parse it (same
-                    // path the incoming offer uses). handle_ack_response already removed our waiter entry.
-                    Ok(Ok(ack)) => {
-                        let relay = wacore::stanza::call::find_relay(ack.get())
-                            .and_then(wacore::voip_control::relay_parse::parse_relay_data)
-                            .ok_or("the server acked the offer but carried no relay");
-                        if let (Ok(relay), Some((peer, call_creator))) = (&relay, &caller) {
-                            let devices = offer_ack_devices(ack.get());
-                            send_caller_relay_latency(
-                                &client,
-                                &call_id,
-                                peer,
-                                call_creator,
-                                relay,
-                                &devices,
-                            )
-                            .await;
-                        }
-                        relay
+            let waiting = wacore::runtime::timeout(&*runtime, OFFER_ACK_RELAY_TIMEOUT, ack);
+            let ending = ended.wait();
+            futures::pin_mut!(waiting, ending);
+            let response = match futures::future::select(waiting, ending).await {
+                futures::future::Either::Left((response, _)) => response,
+                futures::future::Either::Right(((), _)) => return,
+            };
+            let relay = match response {
+                // The ack node re-encoded as OwnedNodeRef; find its <relay> child and parse it (same
+                // path the incoming offer uses). handle_ack_response already removed our waiter entry.
+                Ok(Ok(ack)) => {
+                    if !client.call_registry().is_current(&call_id, generation) {
+                        return;
                     }
-                    // Sender dropped (disconnect cleared the waiter map) or the timeout elapsed:
-                    // handle_ack_response never ran, so our still-registered waiter entry must be dropped
-                    // here or send_keepalive suppresses pings for the life of the connection.
-                    Ok(Err(_)) => Err("the connection dropped before the server acked the offer"),
-                    Err(_) => Err("the server did not ack the offer in time"),
-                };
+                    let relay = if let Some(error) = ack
+                        .attrs
+                        .get("error")
+                        .map(|value| value.as_str())
+                        .filter(|error| !error.is_empty() && *error != "0")
+                    {
+                        Err(format!("the server rejected the offer: {error}"))
+                    } else {
+                        wacore::stanza::call::find_relay(&ack.as_node_ref())
+                            .and_then(wacore::voip_control::relay_parse::parse_relay_data)
+                            .ok_or_else(|| {
+                                "the server acked the offer but carried no relay".to_string()
+                            })
+                    };
+                    if let (Ok(relay), Some((peer, call_creator))) = (&relay, &caller) {
+                        let devices = offer_ack_devices(&ack.as_node_ref());
+                        send_caller_relay_latency(
+                            &client,
+                            &call_id,
+                            peer,
+                            call_creator,
+                            relay,
+                            &devices,
+                        )
+                        .await;
+                    }
+                    relay
+                }
+                // Sender dropped (disconnect cleared the waiter map) or the timeout elapsed:
+                // handle_ack_response never ran, so our still-registered waiter entry must be dropped
+                // here or send_keepalive suppresses pings for the life of the connection.
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(_) => Err("the server did not ack the offer in time".to_string()),
+            };
 
             match relay {
                 Ok(relay) => {
-                    if let Err(e) = attach_outgoing_relay(&client, &call_id, &relay).await {
+                    if let Err(e) = attach_outgoing_relay_host(&*client, &call_id, &relay).await {
                         warn!("voip: failed to attach outgoing relay for {call_id}: {e}");
-                        fail_pending_outgoing_with(
-                            &client,
+                        fail_pending_outgoing_host(
+                            &*client,
                             &call_id,
                             generation,
                             Some(e.to_string()),
@@ -2314,8 +2304,8 @@ fn spawn_outgoing_relay_waiter(
                 }
                 Err(reason) => {
                     warn!("voip: {reason} for {call_id}; call failed");
-                    fail_pending_outgoing_with(
-                        &client,
+                    fail_pending_outgoing_host(
+                        &*client,
                         &call_id,
                         generation,
                         Some(reason.to_string()),
@@ -2361,49 +2351,35 @@ const CALLER_SIGNAL_ACK_WATCH: Duration = Duration::from_secs(5);
 /// #1098: as the caller the library sent neither `<relaylatency>` nor `<transport>`, and the relay
 /// then never routed the callee's RTP to us. Both need an `id` on the `<call>` wrapper, or the
 /// server ignores them (reported on the issue by a second implementation).
-pub(crate) async fn send_caller_call_signal(
-    client: &Arc<Client>,
+pub(crate) async fn send_caller_call_signal_host(
+    client: &Arc<dyn DirectCallHost>,
     mut node: wacore_binary::Node,
     what: &'static str,
     call_id: &str,
 ) {
     let id = client.generate_request_id();
     node.attrs.insert("id", id.clone());
-    let waiter = client.try_register_ack_waiter(&id);
-    if let Err(e) = client.send_node(node).await {
-        warn!("voip: failed to send caller {what} for {call_id}: {e}");
-        if let Some((_, generation)) = waiter {
-            drop(crate::request::ResponseWaiterGuard::new(
-                client.response_waiters.clone(),
-                id,
-                generation,
-            ));
-        }
+    let ack = client.watch_ack(&id);
+    if let Err(error) = client.send_node(node).await {
+        warn!("voip: failed to send caller {what} for {call_id}: {error}");
         return;
     }
-    let Some((rx, generation)) = waiter else {
-        log::info!("voip: sent caller {what} for {call_id}");
+    let Ok(ack) = ack else {
         return;
     };
-    let guard =
-        crate::request::ResponseWaiterGuard::new(client.response_waiters.clone(), id, generation);
-    let runtime = client.runtime.clone();
+    let runtime = client.runtime();
     let call_id = call_id.to_string();
-    runtime
-        .clone()
-        .spawn(Box::pin(async move {
-            let _guard = guard;
-            match wacore::runtime::timeout(&*runtime, CALLER_SIGNAL_ACK_WATCH, rx).await {
-                Ok(Ok(_)) => log::info!("voip: server acked caller {what} for {call_id}"),
-                _ => log::warn!("voip: no server ack for caller {what} for {call_id}"),
-            }
-        }))
-        .detach();
+    runtime.clone().spawn_detached(Box::pin(async move {
+        match wacore::runtime::timeout(&*runtime, CALLER_SIGNAL_ACK_WATCH, ack).await {
+            Ok(Ok(_)) => log::info!("voip: server acked caller {what} for {call_id}"),
+            _ => log::warn!("voip: no server ack for caller {what} for {call_id}"),
+        }
+    }));
 }
 
 /// #1098: announce, as the caller, the relay we dial, the way the phone does for its own calls.
 async fn send_caller_relay_latency(
-    client: &Arc<Client>,
+    client: &Arc<dyn DirectCallHost>,
     call_id: &str,
     peer: &Jid,
     call_creator: &Jid,
@@ -2435,26 +2411,7 @@ async fn send_caller_relay_latency(
         endpoint.relay_name,
         devices.len()
     );
-    send_caller_call_signal(client, node, "relaylatency", call_id).await;
-}
-
-/// Fire-and-forget issuance of our trusted-contact token to the callee after an outgoing offer,
-/// mirroring WA Web's `sendTcToken` in StartCall.js. Rate-limited by the sender bucket so repeat
-/// calls to the same contact within a window don't re-issue. Best-effort: a failed issuance only
-/// risks a later re-issue, never the call itself.
-fn spawn_call_tc_token_issuance(client: &Client, peer: &Jid) {
-    let Some(client) = client.self_weak.get().and_then(|w| w.upgrade()) else {
-        return;
-    };
-    let runtime = client.runtime.clone();
-    let peer = peer.clone();
-    runtime
-        .spawn(Box::pin(async move {
-            if client.should_issue_tc_token(&peer).await {
-                client.issue_tc_token_after_send(&peer).await;
-            }
-        }))
-        .detach();
+    send_caller_call_signal_host(client, node, "relaylatency", call_id).await;
 }
 
 /// Tear down a still-dormant outgoing call that never got its relay: drop the (generation-guarded)
@@ -2546,8 +2503,17 @@ fn fail_pending_outgoing_with(
     generation: u64,
     reason: Option<String>,
 ) {
+    fail_pending_outgoing_host(client, call_id, generation, reason)
+}
+
+fn fail_pending_outgoing_host(
+    client: &dyn DirectCallHost,
+    call_id: &str,
+    generation: u64,
+    reason: Option<String>,
+) {
     let pending = take_pending_if_current(
-        &client.voip_state().pending_outgoing_calls,
+        &client.call_state().pending_outgoing_calls,
         call_id,
         generation,
     );
@@ -2578,6 +2544,10 @@ pub(crate) fn terminate_call(client: &Client, call_id: &str) {
 /// Tear down only the generation whose terminal stanza was authorized.
 pub(crate) fn terminate_call_if_current(client: &Client, call_id: &str, generation: u64) {
     fail_pending_outgoing(client, call_id, generation);
+}
+
+pub(crate) fn terminate_direct_local(client: &dyn DirectCallHost, call_id: &str, generation: u64) {
+    fail_pending_outgoing_host(client, call_id, generation, None);
 }
 
 /// "00" + 15 random bytes as lowercase hex (WA Web `_e()`): 32 hex chars total.
@@ -2612,7 +2582,7 @@ pub(crate) struct PendingOutgoing {
 /// Take the video plumbing's loop halves and wire the out-drain, yielding the neutral channels the
 /// backend's `open` consumes. Shared by the outgoing relay-attach path and the other three.
 fn take_video_channels(
-    client: &Client,
+    client: &dyn DirectCallHost,
     video_shared: &Arc<VideoShared>,
     ended: Arc<EndedFlag>,
     generation: u64,
@@ -2621,7 +2591,7 @@ fn take_video_channels(
     let control_sender = video_shared.ctl_tx.clone();
     let (video_out, video_out_rx) = async_channel::bounded::<VideoFrame>(VIDEO_OUT_CHANNEL_CAP);
     let sink_slot = video_shared.sink_slot.clone();
-    client.runtime.spawn_detached(Box::pin(async move {
+    client.runtime().spawn_detached(Box::pin(async move {
         while let Ok(mut frame) = video_out_rx.recv().await {
             frame.generation = generation;
             let tx = sink_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -2685,15 +2655,24 @@ fn relay_endpoint_from_config(
 /// The relay rides back in the server's `<ack type=offer>` reply to the offer's stanza id; the
 /// ack-waiter task captures it and calls this with the `<relay>` parsed by the same
 /// `find_relay`/`parse_relay_data` the incoming offer uses.
+#[cfg(test)]
 pub(crate) async fn attach_outgoing_relay(
     client: &Client,
+    call_id: &str,
+    relay: &RelayData,
+) -> Result<bool, CallError> {
+    attach_outgoing_relay_host(client, call_id, relay).await
+}
+
+async fn attach_outgoing_relay_host(
+    client: &dyn DirectCallHost,
     call_id: &str,
     relay: &RelayData,
 ) -> Result<bool, CallError> {
     // Remove-on-match: a second relay for the same call-id is ignored (the engine is already up).
     let pending = {
         let mut map = client
-            .voip_state()
+            .call_state()
             .pending_outgoing_calls
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -2898,7 +2877,7 @@ impl RegisteredCall {
     }
 
     async fn new_inner(
-        client: &Client,
+        client: &dyn DirectCallHost,
         session: wacore::voip_control::CallSession,
         force_group: bool,
     ) -> Self {
@@ -2919,6 +2898,41 @@ impl RegisteredCall {
         } else {
             registry.insert(session)
         };
+        Self::with_generation(registry, call_id, peer_jid, call_creator, generation)
+    }
+
+    async fn new_direct(
+        client: &dyn DirectCallHost,
+        session: wacore::voip_control::CallSession,
+        offer: Option<u64>,
+    ) -> Result<Self, CallError> {
+        let Some(token) = offer else {
+            return Ok(Self::new_inner(client, session, false).await);
+        };
+        let registry = client.call_registry();
+        let call_id = session.call_id.clone();
+        let peer_jid = session.peer_jid.clone();
+        let call_creator = session.call_creator.clone();
+        let _transition = client.lock_answer_transition(&call_id).await;
+        let generation = registry
+            .insert_direct_for_offer(session, token)
+            .ok_or(CallError::CallEndedDuringSetup)?;
+        Ok(Self::with_generation(
+            registry,
+            call_id,
+            peer_jid,
+            call_creator,
+            generation,
+        ))
+    }
+
+    fn with_generation(
+        registry: Arc<wacore::voip_control::registry::CallRegistry>,
+        call_id: String,
+        peer_jid: Jid,
+        call_creator: Jid,
+        generation: u64,
+    ) -> Self {
         let ended = Arc::new(EndedFlag::default());
         // Wake setup/connect and any eventual CallHandle whenever this generation is removed,
         // including before a media task exists.
@@ -2942,20 +2956,13 @@ impl RegisteredCall {
         let session = registry
             .snapshot_if_current(call_id, generation)
             .ok_or(CallError::CallEndedDuringSetup)?;
-        let ended = Arc::new(EndedFlag::default());
-        registry.set_ended_notify(call_id, generation, {
-            let ended = ended.clone();
-            move || ended.notify()
-        });
-        Ok(Self {
+        Ok(Self::with_generation(
             registry,
-            call_id: call_id.to_string(),
-            peer_jid: session.peer_jid,
-            call_creator: session.call_creator,
+            call_id.to_string(),
+            session.peer_jid,
+            session.call_creator,
             generation,
-            ended,
-            armed: true,
-        })
+        ))
     }
 
     fn ensure_current(&self) -> Result<(), CallError> {
@@ -2985,6 +2992,8 @@ impl Drop for RegisteredCall {
 /// superseding same-call-id offer cannot be installed in the removal-before-send window.
 struct AnswerTeardown {
     client: std::sync::Weak<Client>,
+    host: Option<std::sync::Weak<dyn DirectCallHost>>,
+    epoch: u64,
     registry: Arc<wacore::voip_control::registry::CallRegistry>,
     call_id: String,
     peer_jid: Jid,
@@ -3075,7 +3084,7 @@ impl Drop for GroupRekeyTeardown {
                 .spawn(Box::pin(async move {
                     let _transition = transition;
                     let target = Jid::new(&call_id, Server::Call);
-                    send_answer_terminate(&client, &call_id, &target, &call_creator).await;
+                    send_answer_terminate(&*client, &call_id, &target, &call_creator).await;
                 }))
                 .detach();
             return;
@@ -3087,7 +3096,7 @@ impl Drop for GroupRekeyTeardown {
                     return;
                 }
                 let target = Jid::new(&call_id, Server::Call);
-                send_answer_terminate(&client, &call_id, &target, &call_creator).await;
+                send_answer_terminate(&*client, &call_id, &target, &call_creator).await;
             }))
             .detach();
     }
@@ -3149,7 +3158,7 @@ impl Drop for GroupOfferTeardown {
                     return;
                 }
                 let target = Jid::new(&call_id, Server::Call);
-                send_answer_terminate(&client, &call_id, &target, &call_creator).await;
+                send_answer_terminate(&*client, &call_id, &target, &call_creator).await;
             }))
             .detach();
     }
@@ -3158,7 +3167,28 @@ impl Drop for GroupOfferTeardown {
 impl AnswerTeardown {
     fn new(client: &Client, registration: &RegisteredCall) -> Self {
         Self {
+            epoch: client.call_state().epoch(),
             client: client_weak(client),
+            host: None,
+            registry: registration.registry.clone(),
+            call_id: registration.call_id.clone(),
+            peer_jid: registration.peer_jid.clone(),
+            call_creator: registration.call_creator.clone(),
+            generation: registration.generation,
+            armed: false,
+            claimed: false,
+            transition: None,
+            local_only_on_cancel: false,
+            #[cfg(test)]
+            cleanup_completed: None,
+        }
+    }
+
+    fn for_host(host: &Arc<dyn DirectCallHost>, registration: &RegisteredCall) -> Self {
+        Self {
+            epoch: host.call_state().epoch(),
+            client: std::sync::Weak::new(),
+            host: Some(Arc::downgrade(host)),
             registry: registration.registry.clone(),
             call_id: registration.call_id.clone(),
             peer_jid: registration.peer_jid.clone(),
@@ -3187,13 +3217,17 @@ impl AnswerTeardown {
         }
     }
 
-    async fn terminate(&mut self, client: &Client) {
+    async fn terminate(&mut self, client: &dyn DirectCallHost) {
         if !self.armed {
             return;
         }
         // Store the owned guard in `self`: if this future is cancelled during the terminal write,
         // Drop can move the still-held lane into its detached retry without reopening the race.
         self.transition = Some(client.lock_answer_transition(&self.call_id).await);
+        if client.call_state().epoch() != self.epoch {
+            self.disarm();
+            return;
+        }
         if self
             .registry
             .remove_if_current(&self.call_id, self.generation)
@@ -3215,9 +3249,22 @@ impl Drop for AnswerTeardown {
             self.disarm();
             return;
         }
-        let Some(client) = self.client.upgrade() else {
+        let client: Option<Arc<dyn DirectCallHost>> = self
+            .host
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .or_else(|| {
+                self.client
+                    .upgrade()
+                    .map(|client| client as Arc<dyn DirectCallHost>)
+            });
+        let Some(client) = client else {
             return;
         };
+        if client.call_state().epoch() != self.epoch {
+            return;
+        }
+        let epoch = self.epoch;
         let call_id = self.call_id.clone();
         let peer_jid = self.peer_jid.clone();
         let call_creator = self.call_creator.clone();
@@ -3227,15 +3274,18 @@ impl Drop for AnswerTeardown {
         let transition = self.transition.take();
         #[cfg(test)]
         let completed = self.cleanup_completed.take();
-        let runtime = client.runtime.clone();
+        let runtime = client.runtime();
         runtime
             .spawn(Box::pin(async move {
                 let _transition = match transition {
                     Some(transition) => transition,
                     None => client.lock_answer_transition(&call_id).await,
                 };
+                if client.call_state().epoch() != epoch {
+                    return;
+                }
                 if claimed || registry.remove_if_current(&call_id, generation) {
-                    send_answer_terminate(&client, &call_id, &peer_jid, &call_creator).await;
+                    send_answer_terminate(&*client, &call_id, &peer_jid, &call_creator).await;
                 }
                 #[cfg(test)]
                 if let Some(completed) = completed {
@@ -3247,7 +3297,7 @@ impl Drop for AnswerTeardown {
 }
 
 pub(crate) async fn send_answer_terminate(
-    client: &Client,
+    client: &dyn DirectCallHost,
     call_id: &str,
     peer_jid: &Jid,
     call_creator: &Jid,
@@ -3287,6 +3337,30 @@ fn map_setup_error(error: wacore::voip_control::MediaSetupError) -> CallError {
 async fn open_registered_media(
     client: &Client,
     registration: &RegisteredCall,
+    spec: wacore::voip_control::MediaSessionSpec,
+    audio: AudioEndpoints,
+    video: Option<VideoEndpoints>,
+    group_epoch: Option<(u32, Vec<u8>)>,
+    initial_codec: Option<AudioCodec>,
+) -> Result<CallHandle, CallError> {
+    let mut handle = open_registered_media_host(
+        client.direct_host()?,
+        registration,
+        spec,
+        audio,
+        video,
+        group_epoch,
+        initial_codec,
+    )
+    .await?;
+    handle.client = client_weak(client);
+    Ok(handle)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_registered_media_host(
+    client: Arc<dyn DirectCallHost>,
+    registration: &RegisteredCall,
     mut spec: wacore::voip_control::MediaSessionSpec,
     audio: AudioEndpoints,
     video: Option<VideoEndpoints>,
@@ -3311,7 +3385,7 @@ async fn open_registered_media(
     // Drain the loop's output into whatever sink is currently attached (swappable mid-call).
     let sink_slot = video_shared.sink_slot.clone();
     let generation = registration.generation;
-    client.runtime.spawn_detached(Box::pin(async move {
+    client.runtime().spawn_detached(Box::pin(async move {
         while let Ok(mut frame) = video_out_rx.recv().await {
             frame.generation = generation;
             let tx = sink_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -3322,7 +3396,7 @@ async fn open_registered_media(
     }));
     if let Some(v) = &video {
         // `.video()` from the start: attach the endpoints now.
-        video_shared.attach_endpoints(client, &v.source, &v.sink, registration.ended.clone());
+        video_shared.attach_endpoints(&*client, &v.source, &v.sink, registration.ended.clone());
         video_shared.send_control(VideoControl::Enable);
     }
 
@@ -3405,8 +3479,9 @@ async fn open_registered_media(
         peer_jid: registration.peer_jid.clone(),
         call_creator: registration.call_creator.clone(),
         client_registry: client.call_registry(),
-        pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
-        client: client_weak(client),
+        pending_outgoing_calls: client.call_state().pending_outgoing_calls.clone(),
+        client: std::sync::Weak::new(),
+        host: Some(Arc::downgrade(&client)),
         muted,
         video: video_shared,
         events: Arc::new(std::sync::Mutex::new(Some(ev_rx))),
@@ -3506,7 +3581,7 @@ impl VideoShared {
     /// fresh `VideoFeed` pumps the source; a previous feed is aborted (its source is released).
     fn attach_endpoints(
         &self,
-        client: &Client,
+        client: &dyn DirectCallHost,
         source: &Arc<dyn VideoSource>,
         sink: &Arc<dyn VideoSink>,
         ended: Arc<EndedFlag>,
@@ -3542,7 +3617,7 @@ impl VideoShared {
                 ended,
                 generation,
             };
-            client.runtime.spawn(Box::pin(feed.run()))
+            client.runtime().spawn(Box::pin(feed.run()))
         } else {
             let feed = VideoFeed {
                 source: source.clone(),
@@ -3550,7 +3625,7 @@ impl VideoShared {
                 out: self.in_tx.clone(),
                 ended,
             };
-            client.runtime.spawn(Box::pin(feed.run()))
+            client.runtime().spawn(Box::pin(feed.run()))
         };
         *self.feed.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
     }
@@ -3804,6 +3879,17 @@ impl CallTermination {
     }
 }
 
+struct DirectHandleTeardown<'a> {
+    host: &'a dyn DirectCallHost,
+    call_id: &'a str,
+    generation: u64,
+}
+impl Drop for DirectHandleTeardown<'_> {
+    fn drop(&mut self) {
+        super::direct::terminate_local_if_current(self.host, self.call_id, self.generation);
+    }
+}
+
 /// Opaque handle to a live call. Drop does NOT end the call (the driver task owns its own lifetime);
 /// call [`terminate`](Self::terminate) to end it. No public fields, so the surface can grow without
 /// breaking callers. `Clone` is cheap (shared `Arc` state); every clone controls the SAME live call.
@@ -3826,6 +3912,7 @@ pub struct CallHandle {
         Arc<std::sync::Mutex<std::collections::HashMap<String, PendingOutgoing>>>,
     /// Weak so a lingering handle can't keep the client alive; upgraded to send `<video>` stanzas.
     client: std::sync::Weak<Client>,
+    host: Option<std::sync::Weak<dyn DirectCallHost>>,
     muted: Arc<AtomicBool>,
     video: Arc<VideoShared>,
     // Acquisition belongs to the call, not to any one handle clone.
@@ -4260,7 +4347,7 @@ impl CallHandle {
     /// this again once the call is up to announce a state chosen while it rang.
     pub async fn set_muted(&self, muted: bool) -> Result<(), CallError> {
         self.ensure_current()?;
-        let client = self.upgrade_client()?;
+        let client = self.upgrade_host()?;
         // One ordered transition per call: two cloned handles muting at once would otherwise race,
         // and the older value could land on the wire after the newer one.
         let _transition = client.lock_answer_transition(&self.call_id).await;
@@ -4282,17 +4369,16 @@ impl CallHandle {
         if muted {
             self.muted.store(true, Ordering::Relaxed);
         }
-        client
-            .voip()
-            .announce_muted_locked(
-                &self.call_id,
-                &target,
-                &self.call_creator,
-                self.generation,
-                muted,
-            )
-            .await
-            .inspect(|()| self.muted.store(muted, Ordering::Relaxed))
+        super::direct::announce_muted_locked(
+            &*client,
+            &self.call_id,
+            &target,
+            &self.call_creator,
+            self.generation,
+            muted,
+        )
+        .await
+        .inspect(|()| self.muted.store(muted, Ordering::Relaxed))
     }
 
     /// Where this call's mute state can land: the call scope once it is a group call, the peer device
@@ -4668,7 +4754,7 @@ impl CallHandle {
         let source: Arc<dyn VideoSource> = Arc::new(source);
         let sink: Arc<dyn VideoSink> = Arc::new(sink);
         self.video
-            .attach_endpoints(&client, &source, &sink, self.ended.clone());
+            .attach_endpoints(&*client, &source, &sink, self.ended.clone());
         if !self.client_registry.set_video_teardown(
             &self.call_id,
             self.generation,
@@ -4813,7 +4899,7 @@ impl CallHandle {
             }
         };
         self.video
-            .attach_endpoints(&client, &source, &sink, self.ended.clone());
+            .attach_endpoints(&*client, &source, &sink, self.ended.clone());
         if !self.client_registry.set_video_teardown(
             &self.call_id,
             self.generation,
@@ -5003,10 +5089,22 @@ impl CallHandle {
             .detach();
     }
 
+    fn upgrade_host(&self) -> Result<Arc<dyn DirectCallHost>, CallError> {
+        if let Some(host) = self.host.as_ref() {
+            return host.upgrade().ok_or(CallError::Media("call host dropped"));
+        }
+        let client = self.upgrade_client()?;
+        Ok(client)
+    }
+
     fn upgrade_client(&self) -> Result<Arc<Client>, CallError> {
         self.client
             .upgrade()
-            .ok_or(CallError::Media("client dropped"))
+            .ok_or(CallError::Media(if self.host.is_some() {
+                "operation requires native group/video call control"
+            } else {
+                "client dropped"
+            }))
     }
 
     /// Reject a video op from a handle that no longer owns its call-id (superseded by a same-call-id
@@ -5070,7 +5168,7 @@ impl CallHandle {
     /// out, which is why this reports its outcome instead of returning an error the caller must
     /// handle to hang up.
     pub async fn terminate(&self) -> CallTermination {
-        let client = match self.upgrade_client() {
+        let client = match self.upgrade_host() {
             Ok(client) => client,
             Err(error) => {
                 self.hangup_local().await;
@@ -5080,8 +5178,8 @@ impl CallHandle {
         // Armed before the first await: waiting for the lane is cancellable too, and a caller that
         // drops this future must not be left with a live call. Generation-scoped, so a superseded
         // handle tears down nothing.
-        let _teardown = crate::client::voip::LocalTeardown {
-            client: &client,
+        let _teardown = DirectHandleTeardown {
+            host: &*client,
             call_id: &self.call_id,
             generation: self.generation,
         };
@@ -5095,10 +5193,14 @@ impl CallHandle {
             return CallTermination::AlreadyEnded;
         }
         let targets = self.terminate_targets();
-        let delivery = client
-            .voip()
-            .terminate_for_generation(&self.call_id, &targets, &self.call_creator, self.generation)
-            .await;
+        let delivery = super::direct::terminate_for_generation(
+            &*client,
+            &self.call_id,
+            &targets,
+            &self.call_creator,
+            self.generation,
+        )
+        .await;
         match delivery.failure {
             None => CallTermination::PeerNotified,
             Some(error) if delivery.notified == 0 => CallTermination::LocalOnly(error),
@@ -5169,6 +5271,7 @@ mod event_ownership_tests {
                 client_registry: Arc::new(wacore::voip_control::registry::CallRegistry::new()),
                 pending_outgoing_calls: Arc::new(std::sync::Mutex::new(Default::default())),
                 client: std::sync::Weak::new(),
+                host: None,
                 muted: Arc::new(AtomicBool::new(false)),
                 video: Arc::new(VideoShared::new()),
                 events: Arc::new(std::sync::Mutex::new(Some(receiver))),
@@ -7156,7 +7259,7 @@ mod tests {
         };
 
         let answer = send_preaccept_then_prepare(
-            &client,
+            client.as_ref(),
             &registration,
             &mut teardown,
             Some(preaccept),
@@ -7198,7 +7301,7 @@ mod tests {
 
         let answer = async {
             send_preaccept_then_prepare(
-                &client,
+                client.as_ref(),
                 &registration,
                 &mut teardown,
                 Some(preaccept),
@@ -7209,7 +7312,7 @@ mod tests {
             )
             .await?;
             registration.ensure_current()?;
-            send_answer_node(&client, &registration, &mut teardown, accept).await
+            send_answer_node(client.as_ref(), &registration, &mut teardown, accept).await
         };
         let end_peer = async {
             preaccept_waiter.await.expect("preaccept waiter");
@@ -7328,6 +7431,7 @@ mod tests {
             client_registry: client.call_registry(),
             pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
             client: std::sync::Weak::new(),
+            host: None,
             muted: Arc::new(AtomicBool::new(false)),
             video: Arc::new(VideoShared::new()),
             events: Arc::new(Mutex::new(Some(ev_rx))),
@@ -8221,6 +8325,7 @@ mod tests {
             client_registry: client.call_registry(),
             pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
             client: Arc::downgrade(client),
+            host: None,
             muted: Arc::new(AtomicBool::new(false)),
             video: Arc::new(VideoShared::new()),
             events: Arc::new(Mutex::new(Some(ev_rx))),
@@ -8344,6 +8449,7 @@ mod tests {
             client_registry: client.call_registry(),
             pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
             client: std::sync::Weak::new(),
+            host: None,
             muted: Arc::new(AtomicBool::new(false)),
             video: Arc::new(VideoShared::new()),
             events: Arc::new(Mutex::new(Some(ev_rx))),
@@ -8804,6 +8910,9 @@ mod tests {
             "src/voip/facade.rs",
             "src/client/voip.rs",
             "src/handlers/call.rs",
+            "src/voip/direct_control.rs",
+            "src/voip/direct_ingress.rs",
+            "wacore/src/voip_control/signaling_plan.rs",
             "wacore/src/stanza/group_call.rs",
         ];
 
@@ -10319,7 +10428,7 @@ mod tests {
         let (client, _count) = make_sending_client().await;
         let (handle, _call_id) = place_dormant_outgoing(&client).await;
 
-        drain_pending_outgoing_on_disconnect(&client);
+        drain_direct_pending(&*client);
 
         assert!(
             client
@@ -11398,7 +11507,7 @@ mod tests {
         let mut teardown = AnswerTeardown::new(&client, &registration);
         teardown.arm();
 
-        let terminate = teardown.terminate(&client);
+        let terminate = teardown.terminate(client.as_ref());
         let replace = async {
             entered_rx
                 .recv()
@@ -11704,9 +11813,14 @@ mod tests {
                 "CANCEL-ACCEPT",
             )
             .expect("answer signaling");
-            send_answer_node(&starting_client, &registration, &mut teardown, accept)
-                .await
-                .expect("accept committed");
+            send_answer_node(
+                starting_client.as_ref(),
+                &registration,
+                &mut teardown,
+                accept,
+            )
+            .await
+            .expect("accept committed");
             ready_tx.send(events).await.expect("observer");
             // These guards are owned inside the cancelled future, matching actual Accept.start.
             std::future::pending::<()>().await;
@@ -12711,6 +12825,7 @@ mod tests {
             client_registry: registry.clone(),
             pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
             client: Arc::downgrade(&client),
+            host: None,
             muted: Arc::new(AtomicBool::new(false)),
             video: video_shared.clone(),
             events: Arc::new(Mutex::new(Some(ev_rx))),
@@ -12792,6 +12907,7 @@ mod tests {
             client_registry: registry.clone(),
             pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
             client: Arc::downgrade(&client),
+            host: None,
             muted: Arc::new(AtomicBool::new(false)),
             video: video.clone(),
             events: Arc::new(Mutex::new(Some(events))),
@@ -12883,6 +12999,7 @@ mod tests {
             client_registry: registry.clone(),
             pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
             client: Arc::downgrade(&client),
+            host: None,
             muted: Arc::new(AtomicBool::new(false)),
             video: video.clone(),
             events: Arc::new(Mutex::new(Some(events))),
@@ -13017,6 +13134,7 @@ mod tests {
             client_registry: registry.clone(),
             pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
             client: Arc::downgrade(&client),
+            host: None,
             muted: Arc::new(AtomicBool::new(false)),
             video: video.clone(),
             events: Arc::new(Mutex::new(Some(events))),
@@ -13255,6 +13373,7 @@ mod tests {
             client_registry: registry.clone(),
             pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
             client: Arc::downgrade(&client),
+            host: None,
             muted: Arc::new(AtomicBool::new(false)),
             video: video.clone(),
             events: Arc::new(Mutex::new(Some(events))),
@@ -13417,7 +13536,7 @@ mod tests {
             timestamp_stride: 4500,
         });
         let ended = Arc::new(EndedFlag::default());
-        shared.attach_endpoints(&client, &source, &sink, ended.clone());
+        shared.attach_endpoints(&*client, &source, &sink, ended.clone());
 
         assert_eq!(
             ctl_rx.recv().await.unwrap(),
@@ -13462,7 +13581,7 @@ mod tests {
         );
         let source: Arc<dyn VideoSource> = source_impl;
         let sink: Arc<dyn VideoSink> = Arc::new(vout_tx);
-        shared.attach_endpoints(&client, &source, &sink, Arc::new(EndedFlag::default()));
+        shared.attach_endpoints(&*client, &source, &sink, Arc::new(EndedFlag::default()));
         assert_eq!(
             ctl_rx.recv().await.unwrap(),
             VideoControl::SetInputGeneration(1)
@@ -13507,7 +13626,7 @@ mod tests {
             timestamp_stride: 6000,
         });
         let ended = Arc::new(EndedFlag::default());
-        shared.attach_endpoints(&client, &old, &sink, ended.clone());
+        shared.attach_endpoints(&*client, &old, &sink, ended.clone());
         assert_eq!(
             ctl_rx.recv().await.unwrap(),
             VideoControl::SetInputGeneration(1)
@@ -13516,7 +13635,7 @@ mod tests {
             ctl_rx.recv().await.unwrap(),
             VideoControl::SetTimestampStride(6000)
         );
-        shared.attach_endpoints(&client, &new, &sink, ended);
+        shared.attach_endpoints(&*client, &new, &sink, ended);
         new_tx.send(vec![7, 7, 7]).await.unwrap();
         assert_eq!(
             ctl_rx.recv().await.unwrap(),
@@ -13633,9 +13752,9 @@ mod tests {
         // own and let the timeout report the deadlock instead of hanging the suite.
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
-            shared.attach_endpoints(&client, &source, &sink, ended.clone());
+            shared.attach_endpoints(&*client, &source, &sink, ended.clone());
             // Replacing an existing feed aborts it...
-            shared.attach_endpoints(&client, &source, &sink, ended.clone());
+            shared.attach_endpoints(&*client, &source, &sink, ended.clone());
             // ...and so does releasing the endpoints.
             shared.detach_endpoints();
             let _ = done_tx.send(());
@@ -13685,8 +13804,9 @@ mod control_only_tests {
     use super::*;
     use wacore::voip_control::fake_backend::FakeMediaBackend;
     use wacore::voip_control::{
-        CallDirection, MediaCommand, MediaEvent, MediaOpenContext, MediaSessionKey,
-        MediaSessionSpec, MediaSetupError, VoipMediaBackend, VoipMediaSession,
+        CallDirection, CallSession, MediaAudioIo, MediaAudioSpec, MediaCloseReason, MediaCommand,
+        MediaEvent, MediaOpenContext, MediaSessionKey, MediaSessionSpec, MediaSetupError,
+        MediaStats, VoipMediaBackend, VoipMediaSession,
     };
 
     async fn client_with_fake_backend() -> (Arc<Client>, Arc<FakeMediaBackend>) {
@@ -13782,8 +13902,8 @@ mod control_only_tests {
         }
     }
 
-    fn sample_relay() -> wacore::voip_control::relay_parse::RelayData {
-        use wacore::voip_control::relay_parse::{RelayAddress, RelayData, RelayEndpoint};
+    fn sample_relay() -> RelayData {
+        use wacore::voip_control::relay_parse::{RelayAddress, RelayEndpoint};
         RelayData {
             relay_key_ascii: Some(b"relay-key".to_vec()),
             warp_mi_tag_len: Some(4),
@@ -13805,8 +13925,8 @@ mod control_only_tests {
         }
     }
 
-    fn session(id: &str) -> wacore::voip_control::CallSession {
-        wacore::voip_control::CallSession::new_outgoing(
+    fn session(id: &str) -> CallSession {
+        CallSession::new_outgoing(
             id,
             Jid::new("222222222222222", Server::Lid),
             Jid::new("111111111111111", Server::Lid),
@@ -13831,7 +13951,7 @@ mod control_only_tests {
                     CallDirection::Outgoing,
                 )
                 .stats(),
-            wacore::voip_control::MediaStats::default(),
+            MediaStats::default(),
             "the injected backend is the one the registry reserves from"
         );
 
@@ -13861,11 +13981,7 @@ mod control_only_tests {
         );
 
         // Stats flow through the seam and outlive the registry entry.
-        media.set_stats(
-            wacore::voip_control::MediaStats::builder()
-                .rtp_received(42)
-                .build(),
-        );
+        media.set_stats(MediaStats::builder().rtp_received(42).build());
         let handle_stats = registry.media_session("SEAM-VERTICAL", generation);
         assert_eq!(handle_stats.expect("session held").stats().rtp_received, 42);
 
@@ -13873,13 +13989,10 @@ mod control_only_tests {
         client.call_registry().set_close_reason(
             "SEAM-VERTICAL",
             generation,
-            wacore::voip_control::MediaCloseReason::Local,
+            MediaCloseReason::Local,
         );
         assert!(registry.remove_if_current("SEAM-VERTICAL", generation));
-        assert_eq!(
-            media.record().closed,
-            Some(wacore::voip_control::MediaCloseReason::Local)
-        );
+        assert_eq!(media.record().closed, Some(MediaCloseReason::Local));
     }
 
     /// Starting media with no backend injected is the typed refusal the control-only build promises,
@@ -13910,9 +14023,9 @@ mod control_only_tests {
                         .call_key(vec![0u8; 32])
                         .ssrc(1)
                         .audio(
-                            wacore::voip_control::MediaAudioSpec::builder()
-                                .format(wacore::voip_control::MediaAudioFormat::MLOW_16KHZ_60MS)
-                                .io(wacore::voip_control::MediaAudioIo::Pcm)
+                            MediaAudioSpec::builder()
+                                .format(AudioFormat::MLOW_16KHZ_60MS)
+                                .io(MediaAudioIo::Pcm)
                                 .build()
                         )
                         .relay_token(vec![])
@@ -13925,7 +14038,7 @@ mod control_only_tests {
                         .enable_video(false)
                         .enable_sframe(false)
                         .build(),
-                    wacore::voip_control::MediaOpenContext::for_test(),
+                    MediaOpenContext::for_test(),
                 )
                 .await,
             Err(MediaSetupError::NoBackend)
@@ -13961,15 +14074,11 @@ mod control_only_tests {
             .expect("live reserved");
 
         // A late command/close for the old generation must not reach the live session.
-        registry.set_close_reason(
-            "ABA",
-            old,
-            wacore::voip_control::MediaCloseReason::SendFailed("stale".into()),
-        );
+        registry.set_close_reason("ABA", old, MediaCloseReason::SendFailed("stale".into()));
         assert!(registry.remove_if_current("ABA", live));
         assert_eq!(
             live_media.record().closed,
-            Some(wacore::voip_control::MediaCloseReason::Local),
+            Some(MediaCloseReason::Local),
             "the live generation closed with its own reason"
         );
         assert!(
@@ -14007,7 +14116,7 @@ mod control_only_tests {
         let call_id = handle.call_id.clone();
         let generation = handle.generation;
         assert!(
-            super::attach_outgoing_relay(&client, &call_id, &sample_relay())
+            attach_outgoing_relay(&client, &call_id, &sample_relay())
                 .await
                 .expect("attach_outgoing_relay runs the production open"),
             "the relay attaches through the production path"
@@ -14031,11 +14140,9 @@ mod control_only_tests {
         // `send_video_ctl` the signaling handler calls once `voip-runtime` accepts the peer's
         // upgrade (that handler path is covered by the fixture suite, which runs with the
         // runtime on; here there is no runtime, only the seam).
-        client.call_registry().send_video_ctl(
-            &call_id,
-            generation,
-            wacore::voip_control::control::VideoControl::Enable,
-        );
+        client
+            .call_registry()
+            .send_video_ctl(&call_id, generation, VideoControl::Enable);
         assert!(
             media
                 .record()
@@ -14062,11 +14169,7 @@ mod control_only_tests {
         assert_eq!(events.try_recv(), Ok(peer_video));
 
         // Counters the backend sets are what the handle reports.
-        media.set_stats(
-            wacore::voip_control::MediaStats::builder()
-                .rtp_received(42)
-                .build(),
-        );
+        media.set_stats(MediaStats::builder().rtp_received(42).build());
         assert_eq!(handle.media_stats().rtp_received, 42);
 
         // Terminal close records its reason on the session and ends the handle's stream, so a
@@ -14075,10 +14178,7 @@ mod control_only_tests {
         tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
             .await
             .expect("hangup resolves wait_ended");
-        assert_eq!(
-            media.record().closed,
-            Some(wacore::voip_control::MediaCloseReason::Local)
-        );
+        assert_eq!(media.record().closed, Some(MediaCloseReason::Local));
         assert!(
             matches!(events.try_recv(), Err(async_channel::TryRecvError::Closed)),
             "the closed stream ends the consumer instead of parking it"
@@ -14100,7 +14200,7 @@ mod control_only_tests {
         Arc<FakeMediaBackend>,
         async_channel::Receiver<()>,
         async_channel::Sender<()>,
-        super::RegisteredCall,
+        RegisteredCall,
     ) {
         let (entered_tx, entered_rx) = async_channel::bounded::<()>(1);
         let (release_tx, release_rx) = async_channel::bounded::<()>(1);
@@ -14112,8 +14212,8 @@ mod control_only_tests {
         });
         let client = crate::test_utils::create_test_client_with_voip_backend(stalled).await;
         let peer = Jid::new("333333333333333", Server::Lid);
-        let session = wacore::voip_control::CallSession::new_incoming(call_id, peer.clone(), peer);
-        let registration = super::RegisteredCall::new(&client, session).await;
+        let session = CallSession::new_incoming(call_id, peer.clone(), peer);
+        let registration = RegisteredCall::new(&client, session).await;
         (client, inner, entered_rx, release_tx, registration)
     }
 
@@ -14126,9 +14226,9 @@ mod control_only_tests {
             .call_key(vec![0u8; 32])
             .ssrc(1)
             .audio(
-                wacore::voip_control::MediaAudioSpec::builder()
-                    .format(wacore::voip_control::MediaAudioFormat::MLOW_16KHZ_60MS)
-                    .io(wacore::voip_control::MediaAudioIo::Pcm)
+                MediaAudioSpec::builder()
+                    .format(AudioFormat::MLOW_16KHZ_60MS)
+                    .io(MediaAudioIo::Pcm)
                     .build(),
             )
             .relay_token(vec![])
@@ -14168,7 +14268,7 @@ mod control_only_tests {
         let open = tokio::spawn({
             let client = client.clone();
             async move {
-                super::open_registered_media(
+                open_registered_media(
                     &client,
                     &registration,
                     spec,
@@ -14199,7 +14299,7 @@ mod control_only_tests {
                 .expect("the session outlives the entry")
                 .record()
                 .closed,
-            Some(wacore::voip_control::MediaCloseReason::Local),
+            Some(MediaCloseReason::Local),
             "the mid-open session is closed, not leaked running"
         );
         assert_eq!(
@@ -14225,7 +14325,7 @@ mod control_only_tests {
         let open = tokio::spawn({
             let client = client.clone();
             async move {
-                super::open_registered_media(
+                open_registered_media(
                     &client,
                     &registration,
                     spec,
@@ -14242,9 +14342,8 @@ mod control_only_tests {
             .await
             .expect("the backend parks inside open");
         let peer = Jid::new("333333333333333", Server::Lid);
-        let replacement_session =
-            wacore::voip_control::CallSession::new_incoming(&call_id, peer.clone(), peer);
-        let replacement = super::RegisteredCall::new(&client, replacement_session).await;
+        let replacement_session = CallSession::new_incoming(&call_id, peer.clone(), peer);
+        let replacement = RegisteredCall::new(&client, replacement_session).await;
         let live_generation = replacement.generation;
         assert_ne!(live_generation, generation);
         release_tx.send(()).await.expect("release the open");
@@ -14259,7 +14358,7 @@ mod control_only_tests {
                 .expect("the stale session outlives the entry")
                 .record()
                 .closed,
-            Some(wacore::voip_control::MediaCloseReason::Local),
+            Some(MediaCloseReason::Local),
             "the stale mid-open session is closed"
         );
         assert_eq!(
@@ -14293,11 +14392,7 @@ mod control_only_tests {
         let generation =
             client
                 .call_registry()
-                .insert(wacore::voip_control::CallSession::new_outgoing(
-                    call_id,
-                    peer.clone(),
-                    peer,
-                ));
+                .insert(CallSession::new_outgoing(call_id, peer.clone(), peer));
         let media = client
             .call_registry()
             .media_session(call_id, generation)
@@ -14305,20 +14400,20 @@ mod control_only_tests {
         let video_shared = Arc::new(VideoShared::new());
         let (_mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(1);
         let (spk_tx, _spk_rx) = async_channel::bounded::<Vec<i16>>(1);
-        let pending = super::PendingOutgoing {
+        let pending = PendingOutgoing {
             generation,
             self_lid: "111111111111111:0@lid".into(),
             peer_lid: "333333333333333:0@lid".into(),
             call_key: vec![0u8; 32],
-            audio: super::AudioEndpoints::Pcm {
+            audio: AudioEndpoints::Pcm {
                 source: Arc::new(mic_rx),
                 sink: Arc::new(spk_tx),
             },
             video: None,
             video_shared: video_shared.clone(),
-            video_teardown: super::video_teardown_hook(&video_shared),
-            muted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            ended: Arc::new(super::EndedFlag::default()),
+            video_teardown: video_teardown_hook(&video_shared),
+            muted: Arc::new(AtomicBool::new(false)),
+            ended: Arc::new(EndedFlag::default()),
             media,
         };
         client
@@ -14348,7 +14443,7 @@ mod control_only_tests {
         let attaching = tokio::spawn({
             let client = client.clone();
             let call_id = call_id.clone();
-            async move { super::attach_outgoing_relay(&client, &call_id, &sample_relay()).await }
+            async move { attach_outgoing_relay(&client, &call_id, &sample_relay()).await }
         });
         entered_rx
             .recv()
@@ -14369,7 +14464,7 @@ mod control_only_tests {
                 .expect("the session outlives the entry")
                 .record()
                 .closed,
-            Some(wacore::voip_control::MediaCloseReason::Local),
+            Some(MediaCloseReason::Local),
             "the mid-open session is closed, not leaked running"
         );
         assert_eq!(
@@ -14397,16 +14492,16 @@ mod control_only_tests {
         let attaching = tokio::spawn({
             let client = client.clone();
             let call_id = call_id.clone();
-            async move { super::attach_outgoing_relay(&client, &call_id, &sample_relay()).await }
+            async move { attach_outgoing_relay(&client, &call_id, &sample_relay()).await }
         });
         entered_rx
             .recv()
             .await
             .expect("the backend parks inside open");
         let peer = Jid::new("333333333333333", Server::Lid);
-        let replacement = super::RegisteredCall::new(
+        let replacement = RegisteredCall::new(
             &client,
-            wacore::voip_control::CallSession::new_incoming(&call_id, peer.clone(), peer),
+            CallSession::new_incoming(&call_id, peer.clone(), peer),
         )
         .await;
         let live_generation = replacement.generation;
@@ -14423,7 +14518,7 @@ mod control_only_tests {
                 .expect("the stale session outlives the entry")
                 .record()
                 .closed,
-            Some(wacore::voip_control::MediaCloseReason::Local),
+            Some(MediaCloseReason::Local),
             "the stale mid-open session is closed"
         );
         assert_eq!(

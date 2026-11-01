@@ -6,7 +6,6 @@
 //! `src/voip/`, `src/client/voip.rs` and `src/handlers/call.rs` names VoIP any
 //! more.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_lock::Mutex;
@@ -35,9 +34,6 @@ pub mod collections {
         SubsystemCollection::new(Voip::NAME, "pending_outgoing");
 }
 
-/// How many lanes stripe [`VoipState::answer_transition_locks`].
-const ANSWER_TRANSITION_LANES: usize = 16;
-
 /// VoIP's attachment to the core. It claims no notification type: calls arrive
 /// as `<call>` stanzas, which the stanza router already dispatches to
 /// `CallHandler`, so the two hooks below are all it takes from the core.
@@ -51,10 +47,7 @@ impl Subsystem for Voip {
     /// The relay socket and signaling are connection-scoped, so no call
     /// survives a disconnect or reconnect.
     async fn on_connection_cleanup(client: &Client) {
-        client.voip_state().call_registry.abort_all();
-        // Dormant outgoing calls (the relay never arrived) live in pending_outgoing_calls, not the
-        // registry, so abort_all misses them. Drain them and notify `ended` so any waiter wakes.
-        super::facade::drain_pending_outgoing_on_disconnect(client);
+        super::direct::disconnect(client);
     }
 
     fn on_response(client: &Client, node: &NodeRef<'_>) {
@@ -79,7 +72,7 @@ impl Subsystem for Voip {
             ),
             (
                 collections::ACTIVE_CALLS.collection,
-                state.call_registry.memory_stats(),
+                state.direct.call_registry.memory_stats(),
             ),
             // Entry count only: each parked call retains engine material this
             // side cannot size without walking it.
@@ -93,8 +86,7 @@ impl Subsystem for Voip {
 
 /// Everything one client retains for VoIP.
 pub(crate) struct VoipState {
-    /// Active calls and their media-task abort handles.
-    pub(crate) call_registry: Arc<wacore::voip_control::registry::CallRegistry>,
+    pub(crate) direct: super::direct::DirectCallState,
     /// Admission snapshots that can race a call-link join ACK before its call id is registered.
     /// Kept client-side so `wacore` never has to authorize a call it does not know.
     pub(crate) pending_call_link_joins:
@@ -104,18 +96,6 @@ pub(crate) struct VoipState {
     /// one caller locks it through `&Client`, unlike the striped answer lanes, which hand out an
     /// owned guard via `lock_arc` and so have to be `Arc`.
     pub(crate) pending_call_link_join_lane: Mutex<()>,
-    /// Serializes incoming-answer registration with generation-aware teardown. A failed answer
-    /// holds its call-id lane until `<terminate>` has been written, so a same-call-id re-offer
-    /// cannot become current in the removal-before-send window.
-    /// Allocate the lanes only on first use; clients that never answer a call
-    /// need none. Once initialized, lane identity survives every reconnect.
-    pub(crate) answer_transition_locks:
-        std::sync::OnceLock<[Arc<Mutex<()>>; ANSWER_TRANSITION_LANES]>,
-    /// Outgoing calls awaiting their relay. The initiator's relay is not in the offer; it arrives
-    /// from the server AFTER it, so each `voip().call()` parks the material needed to spawn the
-    /// engine here, keyed by call-id, until a `<call>` carrying a `<relay>` for that id arrives.
-    pub(crate) pending_outgoing_calls:
-        Arc<std::sync::Mutex<HashMap<String, super::facade::PendingOutgoing>>>,
     /// How a relay endpoint becomes a media transport, when the platform supplies its own.
     ///
     /// `None` means "use whatever this build has": the UDP/DTLS/SCTP dialer on a `voip-relay-native`
@@ -132,13 +112,21 @@ pub(crate) struct VoipState {
 impl Default for VoipState {
     fn default() -> Self {
         Self {
-            call_registry: Arc::new(wacore::voip_control::registry::CallRegistry::new()),
+            direct: super::direct::DirectCallState::new(Arc::new(
+                wacore::voip_control::registry::CallRegistry::new(),
+            )),
             pending_call_link_joins: Arc::new(std::sync::Mutex::new(Default::default())),
             pending_call_link_join_lane: Mutex::new(()),
-            answer_transition_locks: std::sync::OnceLock::new(),
-            pending_outgoing_calls: Arc::new(std::sync::Mutex::new(HashMap::new())),
             relay_transport_provider: std::sync::Mutex::new(None),
         }
+    }
+}
+
+impl std::ops::Deref for VoipState {
+    type Target = super::direct::DirectCallState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.direct
     }
 }
 
