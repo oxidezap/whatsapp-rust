@@ -1,7 +1,7 @@
 use wacore::iq::abprops::{self, AbDefault, AbProp};
 
 #[test]
-fn historical_flag_imports_keep_codes_defaults_and_registry_boundaries() {
+fn historical_flag_imports_keep_registry_boundaries_and_sampled_metadata() {
     let retired_web: &[AbProp] = &[
         abprops::web::AI_CHAT_THREADS_INFRA_WEB_ENABLED,
         abprops::web::AI_CHAT_THREADS_WEB_KILLSWITCH_ENABLED,
