@@ -4,6 +4,7 @@ use super::actions_normalized::{
     self, ActionContext, GroupActionParseError, NormalizedGroupAction,
 };
 use super::envelope_runtime::{self, Value};
+use super::normalization_warning::{GroupWarningSink, IgnoreWarnings};
 use super::normalized::{GroupParseContext, GroupParseError};
 use wacore_binary::{Jid, NodeRef};
 
@@ -99,6 +100,16 @@ pub fn parse_normalized_group_notification(
     node: &NodeRef<'_>,
     context: &GroupParseContext<'_>,
 ) -> Result<NormalizedGroupNotification, GroupParseError> {
+    parse_normalized_group_notification_with_warnings(node, context, &mut IgnoreWarnings)
+}
+
+/// Like the pure parser, with an explicit ordered warning boundary. The sink
+/// can fail; such failures propagate before/after payload reads as in Web.
+pub fn parse_normalized_group_notification_with_warnings(
+    node: &NodeRef<'_>,
+    context: &GroupParseContext<'_>,
+    warnings: &mut dyn GroupWarningSink,
+) -> Result<NormalizedGroupNotification, GroupParseError> {
     let mut state = envelope_runtime::parse_prefix(node, context).map_err(|error| match error {
         GroupParseError::Rejected(_) => GroupParseError::Destination,
         other => other,
@@ -125,7 +136,8 @@ pub fn parse_normalized_group_notification(
         if child.tag.as_ref() == envelope_runtime::MISSING_IDENTIFICATION_TAG {
             state.mark_missing()?;
         } else if let Some(action) =
-            actions_normalized::parse_action_result(child, &action_context).map_err(action_error)?
+            actions_normalized::parse_action_result_with_warnings(child, &action_context, warnings)
+                .map_err(action_error)?
         {
             actions.push(action);
         }

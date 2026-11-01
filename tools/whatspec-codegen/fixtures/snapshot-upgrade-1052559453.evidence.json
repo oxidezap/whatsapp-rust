@@ -1,6 +1,6 @@
 {
-  "whatspecRev": "6cc5b0766eac00fc387a6a1f50d71a9ef6d5385a",
-  "coreBase": "0d1373a8f",
+  "whatspecRev": "afa3e343f37b0b64f03cffcacf2448ef883a2d8b",
+  "coreBase": "0d1373a8f06e0dfa72f3ea1c4c33abae9fd21d61",
   "fromWaVersion": "2.3000.1047483476",
   "toWaVersion": "2.3000.1052559453",
   "schemaVersion": "4.5.0",
@@ -8,33 +8,16 @@
   "setHash": "d6ab7ae601eda281cfac570a68de1d787adde8f4d778f0bb994416f661a21abf",
   "archiveSha256": "2958d99a3d84141fa8479f1f991e06246e68c063ca8f618a8d5d361287387f62",
   "integrity": "Archive digest and exact bundle multiset of SHA-256 and size verified locally.",
-  "generation": {
-    "command": "cargo run -p whatspec-codegen -- --update-lock --rev 6cc5b0766eac00fc387a6a1f50d71a9ef6d5385a --verify-iq-bundles ../bundles-new",
-    "result": "action oracle snapshot requires qualification",
-    "outputsWritten": false
-  },
-  "upstreamQualification": {
-    "command": "cargo run -p wa-notif --example group_envelope_contract -- ../bundles-new/a018f64e2c88a44300ee70b669e4fbfdb09d2491aa0552b48bbad42d39614d42.js",
-    "result": "unqualified group provider initialization: WAWebEphemeralityTypes",
-    "handler": {
-      "module": "WAWebHandleGroupNotification",
-      "bundleSha256": "a018f64e2c88a44300ee70b669e4fbfdb09d2491aa0552b48bbad42d39614d42",
-      "startByte": 2363888,
-      "endByte": 2387756,
-      "moduleSha256": "d1641fad966fd3b32d6b9859e074f804526e67181584811364774047208c273d"
-    },
-    "required": "Requalify exact new group-notification suppliers, envelope/action/create/link/unlink contracts and independent notification oracle captures in whatspec before refreshing their consumer fixtures. This requirement concerns the notification parser, not the independently reviewed Create IQ request builder."
-  },
   "limits": [
     "No authenticated client/server execution.",
-    "Runtime version, stable catalog lock and generated outputs remain at the previous snapshot because all-domain generation has not passed.",
-    "Only tooling dependencies were repinned. No server API support was removed.",
-    "No bridge or Baileyrs checkouts changed."
+    "The exact qualification commit is pinned from whatspec PR 65, which is not yet merged.",
+    "No server API support removed. Historical experimental fixtures remain separate from current qualification.",
+    "Only required generator Git dependencies were updated. No bridge or Baileyrs checkouts changed."
   ],
   "requiredExternalInputs": {
     "whatspecCheckout": {
       "directory": "../whatspec relative to the whatsapp-rust checkout",
-      "revision": "6cc5b0766eac00fc387a6a1f50d71a9ef6d5385a"
+      "revision": "afa3e343f37b0b64f03cffcacf2448ef883a2d8b"
     },
     "bundles": {
       "directory": "../bundles-new relative to the whatsapp-rust checkout",
@@ -166,5 +149,107 @@
       "before": "The new regression failed with actual 7200 and expected 1209600.",
       "after": "All 16 features::group_history::tests passed with cargo-nextest. cargo clippy -p whatsapp-rust --lib -- -D warnings passed. Workspace formatting and git diff whitespace checks passed."
     }
+  },
+  "snapshotRev": "6cc5b0766eac00fc387a6a1f50d71a9ef6d5385a",
+  "initialGenerationFailure": {
+    "command": "cargo run -p whatspec-codegen -- --update-lock --rev 6cc5b0766eac00fc387a6a1f50d71a9ef6d5385a --verify-iq-bundles ../bundles-new",
+    "result": "action oracle snapshot requires qualification",
+    "outputsWritten": false
+  },
+  "initialUpstreamQualificationFailure": {
+    "command": "cargo run -p wa-notif --example group_envelope_contract -- ../bundles-new/a018f64e2c88a44300ee70b669e4fbfdb09d2491aa0552b48bbad42d39614d42.js",
+    "result": "unqualified group provider initialization: WAWebEphemeralityTypes",
+    "handler": {
+      "module": "WAWebHandleGroupNotification",
+      "bundleSha256": "a018f64e2c88a44300ee70b669e4fbfdb09d2491aa0552b48bbad42d39614d42",
+      "startByte": 2363888,
+      "endByte": 2387756,
+      "moduleSha256": "d1641fad966fd3b32d6b9859e074f804526e67181584811364774047208c273d"
+    },
+    "required": "Requalify exact new group-notification suppliers, envelope/action/create/link/unlink contracts and independent notification oracle captures in whatspec before refreshing their consumer fixtures. This requirement concerns the notification parser, not the independently reviewed Create IQ request builder.",
+    "supersededBy": "whatspec PR 65 qualification at afa3e343f37b0b64f03cffcacf2448ef883a2d8b"
+  },
+  "generation": {
+    "command": "cargo run -p whatspec-codegen -- --update-lock --rev afa3e343f37b0b64f03cffcacf2448ef883a2d8b --verify-iq-bundles ../bundles-new",
+    "result": "24 artifacts generated atomically; offline --check matches the pinned IR.",
+    "outputsWritten": true,
+    "groupContractsIncludedInMainLock": true
+  },
+  "qualificationDependency": {
+    "pullRequest": "https://github.com/oxidezap/whatspec/pull/65",
+    "revision": "afa3e343f37b0b64f03cffcacf2448ef883a2d8b",
+    "merged": false,
+    "completeModulesVerifiedAgainstLockedBundles": 18,
+    "currentCaptureCommand": "node tests/conformance/groups/versions/2.3000.1052559453/verify.cjs",
+    "reproduced": {
+      "actions": 64,
+      "envelope": 29,
+      "create": 13,
+      "normalization": 204,
+      "rejectedMutations": 8
+    },
+    "historicalConsumerFixtures": "tools/whatspec-codegen/fixtures/groups/versions/2.3000.1047483476",
+    "reviewStatus": "Qualified upstream handoff afa3e343; PR 65 remains open and is an explicit dependency.",
+    "lateReviewRegressionProof": {
+      "baselineFailed": 3,
+      "baselinePassed": 5,
+      "qualifiedPassed": 8,
+      "source": "tests/conformance/groups/versions/2.3000.1052559453/semantic-review.json"
+    }
+  },
+  "wallpaperWireCompatibility": {
+    "upstreamChange": "Message.ChatSolidColorWallpaper fields 1 and 2 changed from colorLight/colorDark strings to backgroundLightArgb/backgroundDarkArgb fixed32.",
+    "source": "WAWebProtobufsE2E.pb in bundle a018f64e2c88a44300ee70b669e4fbfdb09d2491aa0552b48bbad42d39614d42; generated/proto/WAProto.proto at the pinned revision.",
+    "consumer": "Retain both historical string API fields at their original numbers in the build descriptor. The qualified AST emitter dispatches by field number AND wire type for owned and view decoders. The committed upstream proto/descriptor stay unmodified by this retention step.",
+    "guard": "waproto/api.snapshot is unchanged. Retention rejects renamed, moved or retyped current fields and pre-existing legacy-name collisions. Decoder shape changes fail closed.",
+    "tests": "Raw string/fixed32 fixtures round-trip through owned and view encoders and owned-view accessors; unrelated wire types and truncated fixed32 inputs are rejected.",
+    "module": {
+      "name": "WAWebProtobufsE2E.pb",
+      "startByte": 3349284,
+      "endByte": 3440300,
+      "sha256": "df704ce7fd38103e91d32d6a20225fac55307a7811c00a9749b144ddac14583d"
+    }
+  },
+  "consumerChanges": [
+    "Participant history fields are read independently of the retained legacy context flag. CREATE exposes isNewGroup and typed memberShareGroupHistoryMode.",
+    "Ordinary unknown LINK/UNLINK types return no action. LINK warnings precede group reads; UNLINK group reads precede warnings. Explicit warning-sink APIs preserve WARN/sendLogs ordering and propagate sink errors; existing pure parsing APIs retain their signatures.",
+    "New Message payload fields 135-138 and MessageContextInfo.lightE2Ee are rejected by the text-only history admission whitelist, including explicitly false context flags.",
+    "New platform enum variants WAIL_WAI/WAIL_ALEXA/AUTOMOTIVE retain the SDK generic-Web fallback policy; no native attestation or native-client behavior is inferred.",
+    "ContactManagerCustomerProfiles retains candidate_lids arrays and uses bool for the newly captured includeCustomFields variable, verified from the same raw module.",
+    "Expose both new direct ContextInfo carriers through shared helpers and streaming history metadata; retain original carrier precedence and memory budgets."
+  ],
+  "independentValidationCheckpoint": {
+    "publishedHead": "005010cae35484cb5e8149fd99a3c2895a7074be",
+    "publishedCi": {
+      "terminal": true,
+      "success": 41,
+      "failure": 3,
+      "skipped": 3,
+      "failures": {
+        "Generated Artifacts": "Oracle revision/pin guard; superseded by candidate atomic regeneration, not yet published.",
+        "rederive": "Same oracle revision/pin guard, not a runtime VoIP failure.",
+        "CodSpeed Performance Analysis": "Service reports NoBenchmarks despite successful benchmark execution/upload and 470 benchmarks returned by the run API; unresolved external analysis."
+      }
+    },
+    "candidateLocal": {
+      "groupsTestsPassed": 85,
+      "protobufTestsPassed": 39,
+      "runtimeTestsPassed": 2917,
+      "runtimeTestsSkipped": 3,
+      "historyTestsPassed": 16,
+      "generatorTestsPassed": 144,
+      "generatedArtifacts": 24,
+      "deterministicCheck": true,
+      "allTargetsClippyPassed": true,
+      "finalProtobufClippyPassed": true,
+      "broadRustTests": {
+        "selected": 5218,
+        "passedBeforeFinalCountFix": 5217,
+        "skipped": 9,
+        "remainingFailure": "History carrier assertion expected 42 instead of 44; fixed and targeted test passed."
+      },
+      "contextAndPropsBudget": "New carrier integration tests and unchanged C3 allocation budgets passed."
+    },
+    "publication": "Qualified afa3e343 integration prepared for publication; upstream PR 65 remains open. No merge or release performed."
   }
 }

@@ -1,0 +1,4188 @@
+{
+  "waVersion": "2.3000.1052559453",
+  "setHash": "d6ab7ae601eda281cfac570a68de1d787adde8f4d778f0bb994416f661a21abf",
+  "cases": [
+    {
+      "family": "link",
+      "kind": "parent_group",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": "parent_group_link",
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "parent_group",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": "parent_group_link",
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "sub_group",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": "sub_group_link",
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "sub_group",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": "sub_group_link",
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "sibling_group",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": "sibling_group_link",
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "sibling_group",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": "sibling_group_link",
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": true,
+      "actionType": null,
+      "reads": [
+        "link_type"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized link_type: ",
+            ""
+          ],
+          ""
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-link-type"
+        ]
+      ]
+    },
+    {
+      "family": "link",
+      "kind": "",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": true,
+      "actionType": null,
+      "reads": [
+        "link_type"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized link_type: ",
+            ""
+          ],
+          ""
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-link-type"
+        ]
+      ]
+    },
+    {
+      "family": "link",
+      "kind": "future_type",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": true,
+      "actionType": null,
+      "reads": [
+        "link_type"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized link_type: ",
+            ""
+          ],
+          "future_type"
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-link-type"
+        ]
+      ]
+    },
+    {
+      "family": "link",
+      "kind": "future_type",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": true,
+      "actionType": null,
+      "reads": [
+        "link_type"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized link_type: ",
+            ""
+          ],
+          "future_type"
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-link-type"
+        ]
+      ]
+    },
+    {
+      "family": "link",
+      "kind": "constructor",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "constructor",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "__defineGetter__",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "__defineGetter__",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "__defineSetter__",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "__defineSetter__",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "hasOwnProperty",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "hasOwnProperty",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "__lookupGetter__",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "__lookupGetter__",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "__lookupSetter__",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "__lookupSetter__",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "isPrototypeOf",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "isPrototypeOf",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "propertyIsEnumerable",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "propertyIsEnumerable",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "toString",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "toString",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "valueOf",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "valueOf",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "__proto__",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "object"
+      },
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "__proto__",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "object"
+      },
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "toLocaleString",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "link",
+      "kind": "toLocaleString",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "parent_group",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": "parent_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "parent_group",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": "parent_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "parent_group",
+      "reason": "delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": "delete_parent_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "parent_group",
+      "reason": "delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": "delete_parent_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "parent_group",
+      "reason": "integrity_delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": "integrity_parent_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "parent_group",
+      "reason": "integrity_delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": "integrity_parent_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "parent_group",
+      "reason": "",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": "parent_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "parent_group",
+      "reason": "",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": "parent_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "parent_group",
+      "reason": "future_reason",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": "parent_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "parent_group",
+      "reason": "future_reason",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": "parent_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "sub_group",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": "sub_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "sub_group",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": "sub_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "sub_group",
+      "reason": "delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": "delete_parent_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "sub_group",
+      "reason": "delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": "delete_parent_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "sub_group",
+      "reason": "integrity_delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": "integrity_sub_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "sub_group",
+      "reason": "integrity_delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": "integrity_sub_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "sub_group",
+      "reason": "",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": "sub_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "sub_group",
+      "reason": "",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": "sub_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "sub_group",
+      "reason": "future_reason",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": "sub_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "sub_group",
+      "reason": "future_reason",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": "sub_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "sibling_group",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": "sibling_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "sibling_group",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": "sibling_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "sibling_group",
+      "reason": "delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": "sibling_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "sibling_group",
+      "reason": "delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": "sibling_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "sibling_group",
+      "reason": "integrity_delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": "sibling_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "sibling_group",
+      "reason": "integrity_delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": "sibling_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "sibling_group",
+      "reason": "",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": "sibling_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "sibling_group",
+      "reason": "",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": "sibling_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "sibling_group",
+      "reason": "future_reason",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": "sibling_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "sibling_group",
+      "reason": "future_reason",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": "sibling_group_unlink",
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": true,
+      "actionType": null,
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized unlink_type: ",
+            ""
+          ],
+          ""
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-unlink-type"
+        ]
+      ]
+    },
+    {
+      "family": "unlink",
+      "kind": "",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": true,
+      "actionType": null,
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized unlink_type: ",
+            ""
+          ],
+          ""
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-unlink-type"
+        ]
+      ]
+    },
+    {
+      "family": "unlink",
+      "kind": "",
+      "reason": "delete_parent",
+      "hidden": false,
+      "returnsNull": true,
+      "actionType": null,
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized unlink_type: ",
+            ""
+          ],
+          ""
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-unlink-type"
+        ]
+      ]
+    },
+    {
+      "family": "unlink",
+      "kind": "",
+      "reason": "delete_parent",
+      "hidden": true,
+      "returnsNull": true,
+      "actionType": null,
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized unlink_type: ",
+            ""
+          ],
+          ""
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-unlink-type"
+        ]
+      ]
+    },
+    {
+      "family": "unlink",
+      "kind": "",
+      "reason": "integrity_delete_parent",
+      "hidden": false,
+      "returnsNull": true,
+      "actionType": null,
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized unlink_type: ",
+            ""
+          ],
+          ""
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-unlink-type"
+        ]
+      ]
+    },
+    {
+      "family": "unlink",
+      "kind": "",
+      "reason": "integrity_delete_parent",
+      "hidden": true,
+      "returnsNull": true,
+      "actionType": null,
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized unlink_type: ",
+            ""
+          ],
+          ""
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-unlink-type"
+        ]
+      ]
+    },
+    {
+      "family": "unlink",
+      "kind": "",
+      "reason": "",
+      "hidden": false,
+      "returnsNull": true,
+      "actionType": null,
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized unlink_type: ",
+            ""
+          ],
+          ""
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-unlink-type"
+        ]
+      ]
+    },
+    {
+      "family": "unlink",
+      "kind": "",
+      "reason": "",
+      "hidden": true,
+      "returnsNull": true,
+      "actionType": null,
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized unlink_type: ",
+            ""
+          ],
+          ""
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-unlink-type"
+        ]
+      ]
+    },
+    {
+      "family": "unlink",
+      "kind": "",
+      "reason": "future_reason",
+      "hidden": false,
+      "returnsNull": true,
+      "actionType": null,
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized unlink_type: ",
+            ""
+          ],
+          ""
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-unlink-type"
+        ]
+      ]
+    },
+    {
+      "family": "unlink",
+      "kind": "",
+      "reason": "future_reason",
+      "hidden": true,
+      "returnsNull": true,
+      "actionType": null,
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized unlink_type: ",
+            ""
+          ],
+          ""
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-unlink-type"
+        ]
+      ]
+    },
+    {
+      "family": "unlink",
+      "kind": "future_type",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": true,
+      "actionType": null,
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized unlink_type: ",
+            ""
+          ],
+          "future_type"
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-unlink-type"
+        ]
+      ]
+    },
+    {
+      "family": "unlink",
+      "kind": "future_type",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": true,
+      "actionType": null,
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized unlink_type: ",
+            ""
+          ],
+          "future_type"
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-unlink-type"
+        ]
+      ]
+    },
+    {
+      "family": "unlink",
+      "kind": "future_type",
+      "reason": "delete_parent",
+      "hidden": false,
+      "returnsNull": true,
+      "actionType": null,
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized unlink_type: ",
+            ""
+          ],
+          "future_type"
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-unlink-type"
+        ]
+      ]
+    },
+    {
+      "family": "unlink",
+      "kind": "future_type",
+      "reason": "delete_parent",
+      "hidden": true,
+      "returnsNull": true,
+      "actionType": null,
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized unlink_type: ",
+            ""
+          ],
+          "future_type"
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-unlink-type"
+        ]
+      ]
+    },
+    {
+      "family": "unlink",
+      "kind": "future_type",
+      "reason": "integrity_delete_parent",
+      "hidden": false,
+      "returnsNull": true,
+      "actionType": null,
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized unlink_type: ",
+            ""
+          ],
+          "future_type"
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-unlink-type"
+        ]
+      ]
+    },
+    {
+      "family": "unlink",
+      "kind": "future_type",
+      "reason": "integrity_delete_parent",
+      "hidden": true,
+      "returnsNull": true,
+      "actionType": null,
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized unlink_type: ",
+            ""
+          ],
+          "future_type"
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-unlink-type"
+        ]
+      ]
+    },
+    {
+      "family": "unlink",
+      "kind": "future_type",
+      "reason": "",
+      "hidden": false,
+      "returnsNull": true,
+      "actionType": null,
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized unlink_type: ",
+            ""
+          ],
+          "future_type"
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-unlink-type"
+        ]
+      ]
+    },
+    {
+      "family": "unlink",
+      "kind": "future_type",
+      "reason": "",
+      "hidden": true,
+      "returnsNull": true,
+      "actionType": null,
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized unlink_type: ",
+            ""
+          ],
+          "future_type"
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-unlink-type"
+        ]
+      ]
+    },
+    {
+      "family": "unlink",
+      "kind": "future_type",
+      "reason": "future_reason",
+      "hidden": false,
+      "returnsNull": true,
+      "actionType": null,
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized unlink_type: ",
+            ""
+          ],
+          "future_type"
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-unlink-type"
+        ]
+      ]
+    },
+    {
+      "family": "unlink",
+      "kind": "future_type",
+      "reason": "future_reason",
+      "hidden": true,
+      "returnsNull": true,
+      "actionType": null,
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized unlink_type: ",
+            ""
+          ],
+          "future_type"
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-unlink-type"
+        ]
+      ]
+    },
+    {
+      "family": "unlink",
+      "kind": "constructor",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "constructor",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "constructor",
+      "reason": "delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "constructor",
+      "reason": "delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "constructor",
+      "reason": "integrity_delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "constructor",
+      "reason": "integrity_delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "constructor",
+      "reason": "",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "constructor",
+      "reason": "",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "constructor",
+      "reason": "future_reason",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "constructor",
+      "reason": "future_reason",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__defineGetter__",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__defineGetter__",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__defineGetter__",
+      "reason": "delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__defineGetter__",
+      "reason": "delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__defineGetter__",
+      "reason": "integrity_delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__defineGetter__",
+      "reason": "integrity_delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__defineGetter__",
+      "reason": "",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__defineGetter__",
+      "reason": "",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__defineGetter__",
+      "reason": "future_reason",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__defineGetter__",
+      "reason": "future_reason",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__defineSetter__",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__defineSetter__",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__defineSetter__",
+      "reason": "delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__defineSetter__",
+      "reason": "delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__defineSetter__",
+      "reason": "integrity_delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__defineSetter__",
+      "reason": "integrity_delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__defineSetter__",
+      "reason": "",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__defineSetter__",
+      "reason": "",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__defineSetter__",
+      "reason": "future_reason",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__defineSetter__",
+      "reason": "future_reason",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "hasOwnProperty",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "hasOwnProperty",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "hasOwnProperty",
+      "reason": "delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "hasOwnProperty",
+      "reason": "delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "hasOwnProperty",
+      "reason": "integrity_delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "hasOwnProperty",
+      "reason": "integrity_delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "hasOwnProperty",
+      "reason": "",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "hasOwnProperty",
+      "reason": "",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "hasOwnProperty",
+      "reason": "future_reason",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "hasOwnProperty",
+      "reason": "future_reason",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__lookupGetter__",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__lookupGetter__",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__lookupGetter__",
+      "reason": "delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__lookupGetter__",
+      "reason": "delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__lookupGetter__",
+      "reason": "integrity_delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__lookupGetter__",
+      "reason": "integrity_delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__lookupGetter__",
+      "reason": "",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__lookupGetter__",
+      "reason": "",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__lookupGetter__",
+      "reason": "future_reason",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__lookupGetter__",
+      "reason": "future_reason",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__lookupSetter__",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__lookupSetter__",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__lookupSetter__",
+      "reason": "delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__lookupSetter__",
+      "reason": "delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__lookupSetter__",
+      "reason": "integrity_delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__lookupSetter__",
+      "reason": "integrity_delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__lookupSetter__",
+      "reason": "",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__lookupSetter__",
+      "reason": "",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__lookupSetter__",
+      "reason": "future_reason",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__lookupSetter__",
+      "reason": "future_reason",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "isPrototypeOf",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "isPrototypeOf",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "isPrototypeOf",
+      "reason": "delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "isPrototypeOf",
+      "reason": "delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "isPrototypeOf",
+      "reason": "integrity_delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "isPrototypeOf",
+      "reason": "integrity_delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "isPrototypeOf",
+      "reason": "",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "isPrototypeOf",
+      "reason": "",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "isPrototypeOf",
+      "reason": "future_reason",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "isPrototypeOf",
+      "reason": "future_reason",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "propertyIsEnumerable",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "propertyIsEnumerable",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "propertyIsEnumerable",
+      "reason": "delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "propertyIsEnumerable",
+      "reason": "delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "propertyIsEnumerable",
+      "reason": "integrity_delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "propertyIsEnumerable",
+      "reason": "integrity_delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "propertyIsEnumerable",
+      "reason": "",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "propertyIsEnumerable",
+      "reason": "",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "propertyIsEnumerable",
+      "reason": "future_reason",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "propertyIsEnumerable",
+      "reason": "future_reason",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "toString",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "toString",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "toString",
+      "reason": "delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "toString",
+      "reason": "delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "toString",
+      "reason": "integrity_delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "toString",
+      "reason": "integrity_delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "toString",
+      "reason": "",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "toString",
+      "reason": "",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "toString",
+      "reason": "future_reason",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "toString",
+      "reason": "future_reason",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "valueOf",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "valueOf",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "valueOf",
+      "reason": "delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "valueOf",
+      "reason": "delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "valueOf",
+      "reason": "integrity_delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "valueOf",
+      "reason": "integrity_delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "valueOf",
+      "reason": "",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "valueOf",
+      "reason": "",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "valueOf",
+      "reason": "future_reason",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "valueOf",
+      "reason": "future_reason",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__proto__",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "object"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__proto__",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "object"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__proto__",
+      "reason": "delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "object"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__proto__",
+      "reason": "delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "object"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__proto__",
+      "reason": "integrity_delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "object"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__proto__",
+      "reason": "integrity_delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "object"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__proto__",
+      "reason": "",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "object"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__proto__",
+      "reason": "",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "object"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__proto__",
+      "reason": "future_reason",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "object"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "__proto__",
+      "reason": "future_reason",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "object"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "toLocaleString",
+      "reason": null,
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "toLocaleString",
+      "reason": null,
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "toLocaleString",
+      "reason": "delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "toLocaleString",
+      "reason": "delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "toLocaleString",
+      "reason": "integrity_delete_parent",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "toLocaleString",
+      "reason": "integrity_delete_parent",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "toLocaleString",
+      "reason": "",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "toLocaleString",
+      "reason": "",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "toLocaleString",
+      "reason": "future_reason",
+      "hidden": false,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "family": "unlink",
+      "kind": "toLocaleString",
+      "reason": "future_reason",
+      "hidden": true,
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    }
+  ]
+}

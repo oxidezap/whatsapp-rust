@@ -1,4 +1,4 @@
-//! Auto-generated community Create request projection (WhatsApp 2.3000.1047483476). DO NOT EDIT.
+//! Auto-generated community Create request projection (WhatsApp 2.3000.1052559453). DO NOT EDIT.
 //!
 use crate::request::InfoQuery;
 use wacore_binary::{Jid, NodeContent, builder::NodeBuilder, jid::Server};

@@ -1,4 +1,4 @@
-//! Auto-generated IQ stanza specs (WhatsApp 2.3000.1047483476). DO NOT EDIT.
+//! Auto-generated IQ stanza specs (WhatsApp 2.3000.1052559453). DO NOT EDIT.
 //!
 //! One `pub mod` per IQ namespace; each holds the namespace const, shared child
 //! types, and one `IqSpec` impl per stanza. Regenerated from the IQ IR by wa-codegen.
@@ -271,7 +271,7 @@ pub mod md {
     }
 }
 
-/// IQ namespace `passive`. Source: WASmaxOutPassiveModeActiveIQRequest, WASmaxOutPassiveModePassiveIQRequest.
+/// IQ namespace `passive`. Source: WASmaxPassiveModeActiveIQRPC, WASmaxPassiveModePassiveIQRPC.
 pub mod passive {
     use crate::iq::spec::IqSpec;
     use crate::request::InfoQuery;
@@ -286,7 +286,7 @@ pub mod passive {
 
     /// makeActiveIQRequest:set IQ spec.
     ///
-    /// Source: `WASmaxOutPassiveModeActiveIQRequest`
+    /// Source: `WASmaxPassiveModeActiveIQRPC`
     #[derive(Debug, Clone, Default)]
     pub struct MakeActiveIQRequestSpec;
 
@@ -320,7 +320,7 @@ pub mod passive {
             _response: &wacore_binary::NodeRef<'_>,
         ) -> Result<Self::Response, anyhow::Error> {
             anyhow::bail!(
-                "WASmaxOutPassiveModeActiveIQRequest: guards.request_context_required: use parse_response_with_request"
+                "WASmaxPassiveModeActiveIQRPC: guards.request_context_required: use parse_response_with_request"
             )
         }
         fn uses_contextual_response(&self) -> bool {
@@ -367,7 +367,7 @@ pub mod passive {
         ) -> Result<MakeActiveIQRequestResponse, anyhow::Error> {
             if response.get_attr("id").map(|v| v.as_str()).as_deref() != Some(request_id) {
                 anyhow::bail!(
-                    "WASmaxOutPassiveModeActiveIQRequest: response.id does not match request_id"
+                    "WASmaxPassiveModeActiveIQRPC: response.id does not match request_id"
                 );
             }
             if response.tag.as_ref() == "iq"
@@ -413,7 +413,7 @@ pub mod passive {
 
     /// makePassiveIQRequest:set IQ spec.
     ///
-    /// Source: `WASmaxOutPassiveModePassiveIQRequest`
+    /// Source: `WASmaxPassiveModePassiveIQRPC`
     #[derive(Debug, Clone, Default)]
     pub struct MakePassiveIQRequestSpec;
 
@@ -447,7 +447,7 @@ pub mod passive {
             _response: &wacore_binary::NodeRef<'_>,
         ) -> Result<Self::Response, anyhow::Error> {
             anyhow::bail!(
-                "WASmaxOutPassiveModePassiveIQRequest: guards.request_context_required: use parse_response_with_request"
+                "WASmaxPassiveModePassiveIQRPC: guards.request_context_required: use parse_response_with_request"
             )
         }
         fn uses_contextual_response(&self) -> bool {
@@ -494,7 +494,7 @@ pub mod passive {
         ) -> Result<MakePassiveIQRequestResponse, anyhow::Error> {
             if response.get_attr("id").map(|v| v.as_str()).as_deref() != Some(request_id) {
                 anyhow::bail!(
-                    "WASmaxOutPassiveModePassiveIQRequest: response.id does not match request_id"
+                    "WASmaxPassiveModePassiveIQRPC: response.id does not match request_id"
                 );
             }
             if response.tag.as_ref() == "iq"
@@ -539,7 +539,7 @@ pub mod passive {
     }
 }
 
-/// IQ namespace `w:g2`. Source: WASmaxOutGroupsAcceptGroupAddRequest, WASmaxOutGroupsDeleteParentGroupRequest, WASmaxOutGroupsJoinLinkedGroupRequest, WASmaxOutGroupsSetSubjectRequest.
+/// IQ namespace `w:g2`. Source: WASmaxGroupsAcceptGroupAddRPC, WASmaxGroupsDeleteParentGroupRPC, WASmaxGroupsJoinLinkedGroupRPC, WASmaxGroupsSetSubjectRPC.
 pub mod w_g2 {
     use crate::iq::spec::IqSpec;
     use crate::request::InfoQuery;
@@ -554,7 +554,7 @@ pub mod w_g2 {
 
     /// makeAcceptGroupAddRequest:set IQ spec.
     ///
-    /// Source: `WASmaxOutGroupsAcceptGroupAddRequest`
+    /// Source: `WASmaxGroupsAcceptGroupAddRPC`
     #[derive(Debug, Clone)]
     pub struct MakeAcceptGroupAddRequestSpec {
         pub code: String,
@@ -769,7 +769,7 @@ pub mod w_g2 {
             _response: &wacore_binary::NodeRef<'_>,
         ) -> Result<Self::Response, anyhow::Error> {
             anyhow::bail!(
-                "WASmaxOutGroupsAcceptGroupAddRequest: guards.request_context_required: use parse_response_with_request"
+                "WASmaxGroupsAcceptGroupAddRPC: guards.request_context_required: use parse_response_with_request"
             )
         }
         fn uses_contextual_response(&self) -> bool {
@@ -819,12 +819,12 @@ pub mod w_g2 {
         ) -> Result<MakeAcceptGroupAddRequestResponse, anyhow::Error> {
             if response.get_attr("from").map(|v| v.as_str()).as_deref() != Some(request_to) {
                 anyhow::bail!(
-                    "WASmaxOutGroupsAcceptGroupAddRequest: response.from does not match request_to"
+                    "WASmaxGroupsAcceptGroupAddRPC: response.from does not match request_to"
                 );
             }
             if response.get_attr("id").map(|v| v.as_str()).as_deref() != Some(request_id) {
                 anyhow::bail!(
-                    "WASmaxOutGroupsAcceptGroupAddRequest: response.id does not match request_id"
+                    "WASmaxGroupsAcceptGroupAddRPC: response.id does not match request_id"
                 );
             }
             fn __iq_error_code(value: &str) -> Option<i64> {
@@ -1292,7 +1292,7 @@ pub mod w_g2 {
 
     /// makeDeleteParentGroupRequest:set IQ spec.
     ///
-    /// Source: `WASmaxOutGroupsDeleteParentGroupRequest`
+    /// Source: `WASmaxGroupsDeleteParentGroupRPC`
     #[derive(Debug, Clone)]
     pub struct MakeDeleteParentGroupRequestSpec {
         pub target: Jid,
@@ -1315,6 +1315,7 @@ pub mod w_g2 {
         IQErrorBadRequest(MakeDeleteParentGroupRequestClientErrorErrorDeleteParentGroupClientErrorIQErrorBadRequest),
         IQErrorNotAuthorized(MakeDeleteParentGroupRequestClientErrorErrorDeleteParentGroupClientErrorIQErrorNotAuthorized),
         IQErrorItemNotFound(MakeDeleteParentGroupRequestClientErrorErrorDeleteParentGroupClientErrorIQErrorItemNotFound),
+        IQErrorRateOverlimit(MakeDeleteParentGroupRequestClientErrorErrorDeleteParentGroupClientErrorIQErrorRateOverlimit),
     }
 
     #[derive(Debug, Clone, Default)]
@@ -1333,6 +1334,13 @@ pub mod w_g2 {
 
     #[derive(Debug, Clone, Default)]
     pub struct MakeDeleteParentGroupRequestClientErrorErrorDeleteParentGroupClientErrorIQErrorItemNotFound
+    {
+        pub text: String,
+        pub code: u64,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    pub struct MakeDeleteParentGroupRequestClientErrorErrorDeleteParentGroupClientErrorIQErrorRateOverlimit
     {
         pub text: String,
         pub code: u64,
@@ -1419,7 +1427,7 @@ pub mod w_g2 {
             _response: &wacore_binary::NodeRef<'_>,
         ) -> Result<Self::Response, anyhow::Error> {
             anyhow::bail!(
-                "WASmaxOutGroupsDeleteParentGroupRequest: guards.request_context_required: use parse_response_with_request"
+                "WASmaxGroupsDeleteParentGroupRPC: guards.request_context_required: use parse_response_with_request"
             )
         }
         fn uses_contextual_response(&self) -> bool {
@@ -1469,12 +1477,12 @@ pub mod w_g2 {
         ) -> Result<MakeDeleteParentGroupRequestResponse, anyhow::Error> {
             if response.get_attr("from").map(|v| v.as_str()).as_deref() != Some(request_to) {
                 anyhow::bail!(
-                    "WASmaxOutGroupsDeleteParentGroupRequest: response.from does not match request_to"
+                    "WASmaxGroupsDeleteParentGroupRPC: response.from does not match request_to"
                 );
             }
             if response.get_attr("id").map(|v| v.as_str()).as_deref() != Some(request_id) {
                 anyhow::bail!(
-                    "WASmaxOutGroupsDeleteParentGroupRequest: response.id does not match request_id"
+                    "WASmaxGroupsDeleteParentGroupRPC: response.id does not match request_id"
                 );
             }
             fn __iq_error_code(value: &str) -> Option<i64> {
@@ -1541,6 +1549,12 @@ pub mod w_g2 {
                                                 .map(|v| v.as_str())
                                                 .as_deref()
                                                 == Some("item-not-found"))
+                                        || (code == 429i64
+                                            && error
+                                                .get_attr("text")
+                                                .map(|v| v.as_str())
+                                                .as_deref()
+                                                == Some("rate-overlimit"))
                                 })
                     }))
             {
@@ -1595,6 +1609,20 @@ pub mod w_g2 {
                                 })
                             })();
                             if let Ok(mut value) = parsed { value.code = code as u64; return Ok(MakeDeleteParentGroupRequestClientErrorErrorDeleteParentGroupClientError::IQErrorItemNotFound(value)); }
+                        }
+                        if (code == 429i64 && error.get_attr("text").map(|v| v.as_str()).as_deref() == Some("rate-overlimit")) {
+                            let parsed = (|| -> Result<MakeDeleteParentGroupRequestClientErrorErrorDeleteParentGroupClientErrorIQErrorRateOverlimit, anyhow::Error> {
+                                let text = error.get_attr("text")
+                                    .ok_or_else(|| anyhow::anyhow!("missing text"))?
+                                    .as_str()
+                                    .to_string();
+                                anyhow::ensure!(text.as_str() == "rate-overlimit", "text is pinned to rate-overlimit: {:?}", text);
+                                Ok(MakeDeleteParentGroupRequestClientErrorErrorDeleteParentGroupClientErrorIQErrorRateOverlimit {
+                                    text,
+                                    ..Default::default()
+                                })
+                            })();
+                            if let Ok(mut value) = parsed { value.code = code as u64; return Ok(MakeDeleteParentGroupRequestClientErrorErrorDeleteParentGroupClientError::IQErrorRateOverlimit(value)); }
                         }
                         anyhow::bail!("no error payload matched")
                     })()?;
@@ -1719,7 +1747,7 @@ pub mod w_g2 {
 
     /// makeJoinLinkedGroupRequest:set IQ spec.
     ///
-    /// Source: `WASmaxOutGroupsJoinLinkedGroupRequest`
+    /// Source: `WASmaxGroupsJoinLinkedGroupRPC`
     #[derive(Debug, Clone)]
     pub struct MakeJoinLinkedGroupRequestSpec {
         pub r#type: Option<String>,
@@ -1925,7 +1953,7 @@ pub mod w_g2 {
             _response: &wacore_binary::NodeRef<'_>,
         ) -> Result<Self::Response, anyhow::Error> {
             anyhow::bail!(
-                "WASmaxOutGroupsJoinLinkedGroupRequest: guards.request_context_required: use parse_response_with_request"
+                "WASmaxGroupsJoinLinkedGroupRPC: guards.request_context_required: use parse_response_with_request"
             )
         }
         fn uses_contextual_response(&self) -> bool {
@@ -1975,12 +2003,12 @@ pub mod w_g2 {
         ) -> Result<MakeJoinLinkedGroupRequestResponse, anyhow::Error> {
             if response.get_attr("from").map(|v| v.as_str()).as_deref() != Some(request_to) {
                 anyhow::bail!(
-                    "WASmaxOutGroupsJoinLinkedGroupRequest: response.from does not match request_to"
+                    "WASmaxGroupsJoinLinkedGroupRPC: response.from does not match request_to"
                 );
             }
             if response.get_attr("id").map(|v| v.as_str()).as_deref() != Some(request_id) {
                 anyhow::bail!(
-                    "WASmaxOutGroupsJoinLinkedGroupRequest: response.id does not match request_id"
+                    "WASmaxGroupsJoinLinkedGroupRPC: response.id does not match request_id"
                 );
             }
             fn __iq_error_code(value: &str) -> Option<i64> {
@@ -2421,7 +2449,7 @@ pub mod w_g2 {
 
     /// makeSetSubjectRequest:set IQ spec.
     ///
-    /// Source: `WASmaxOutGroupsSetSubjectRequest`
+    /// Source: `WASmaxGroupsSetSubjectRPC`
     #[derive(Debug, Clone)]
     pub struct MakeSetSubjectRequestSpec {
         pub target: Jid,
@@ -2602,7 +2630,7 @@ pub mod w_g2 {
             _response: &wacore_binary::NodeRef<'_>,
         ) -> Result<Self::Response, anyhow::Error> {
             anyhow::bail!(
-                "WASmaxOutGroupsSetSubjectRequest: guards.request_context_required: use parse_response_with_request"
+                "WASmaxGroupsSetSubjectRPC: guards.request_context_required: use parse_response_with_request"
             )
         }
         fn uses_contextual_response(&self) -> bool {
@@ -2651,14 +2679,10 @@ pub mod w_g2 {
             request_to: &str,
         ) -> Result<MakeSetSubjectRequestResponse, anyhow::Error> {
             if response.get_attr("from").map(|v| v.as_str()).as_deref() != Some(request_to) {
-                anyhow::bail!(
-                    "WASmaxOutGroupsSetSubjectRequest: response.from does not match request_to"
-                );
+                anyhow::bail!("WASmaxGroupsSetSubjectRPC: response.from does not match request_to");
             }
             if response.get_attr("id").map(|v| v.as_str()).as_deref() != Some(request_id) {
-                anyhow::bail!(
-                    "WASmaxOutGroupsSetSubjectRequest: response.id does not match request_id"
-                );
+                anyhow::bail!("WASmaxGroupsSetSubjectRPC: response.id does not match request_id");
             }
             fn __iq_error_code(value: &str) -> Option<i64> {
                 let value = value.trim_start_matches(|c| matches!(c, '\u{0009}'..='\u{000d}' | ' ' | '\u{00a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}'));

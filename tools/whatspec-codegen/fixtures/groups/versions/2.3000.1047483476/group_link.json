@@ -1,0 +1,119 @@
+{
+  "moduleName": "WAWebHandleGroupNotification",
+  "startByte": 17137,
+  "endByte": 17639,
+  "wireTag": "link",
+  "linkTypeAttribute": "link_type",
+  "groupChildTag": "group",
+  "groupFields": [
+    {
+      "name": "id",
+      "wireName": "jid",
+      "method": "attrGroupJid"
+    },
+    {
+      "name": "subject",
+      "wireName": "subject",
+      "method": "attrString"
+    },
+    {
+      "name": "subjectTime",
+      "wireName": "s_t",
+      "method": "attrInt"
+    }
+  ],
+  "rows": [
+    {
+      "linkType": null,
+      "actionType": null,
+      "hiddenSubgroupChild": "hidden_group"
+    },
+    {
+      "linkType": "__defineGetter__",
+      "actionType": null,
+      "unsupportedAction": true,
+      "hiddenSubgroupChild": "hidden_group"
+    },
+    {
+      "linkType": "__defineSetter__",
+      "actionType": null,
+      "unsupportedAction": true,
+      "hiddenSubgroupChild": "hidden_group"
+    },
+    {
+      "linkType": "__lookupGetter__",
+      "actionType": null,
+      "unsupportedAction": true,
+      "hiddenSubgroupChild": "hidden_group"
+    },
+    {
+      "linkType": "__lookupSetter__",
+      "actionType": null,
+      "unsupportedAction": true,
+      "hiddenSubgroupChild": "hidden_group"
+    },
+    {
+      "linkType": "__proto__",
+      "actionType": null,
+      "unsupportedAction": true,
+      "hiddenSubgroupChild": "hidden_group"
+    },
+    {
+      "linkType": "constructor",
+      "actionType": null,
+      "unsupportedAction": true,
+      "hiddenSubgroupChild": "hidden_group"
+    },
+    {
+      "linkType": "hasOwnProperty",
+      "actionType": null,
+      "unsupportedAction": true,
+      "hiddenSubgroupChild": "hidden_group"
+    },
+    {
+      "linkType": "isPrototypeOf",
+      "actionType": null,
+      "unsupportedAction": true,
+      "hiddenSubgroupChild": "hidden_group"
+    },
+    {
+      "linkType": "parent_group",
+      "actionType": "parent_group_link",
+      "hiddenSubgroupChild": null
+    },
+    {
+      "linkType": "propertyIsEnumerable",
+      "actionType": null,
+      "unsupportedAction": true,
+      "hiddenSubgroupChild": "hidden_group"
+    },
+    {
+      "linkType": "sibling_group",
+      "actionType": "sibling_group_link",
+      "hiddenSubgroupChild": "hidden_group"
+    },
+    {
+      "linkType": "sub_group",
+      "actionType": "sub_group_link",
+      "hiddenSubgroupChild": "hidden_group"
+    },
+    {
+      "linkType": "toLocaleString",
+      "actionType": null,
+      "unsupportedAction": true,
+      "hiddenSubgroupChild": "hidden_group"
+    },
+    {
+      "linkType": "toString",
+      "actionType": null,
+      "unsupportedAction": true,
+      "hiddenSubgroupChild": "hidden_group"
+    },
+    {
+      "linkType": "valueOf",
+      "actionType": null,
+      "unsupportedAction": true,
+      "hiddenSubgroupChild": "hidden_group"
+    }
+  ]
+}

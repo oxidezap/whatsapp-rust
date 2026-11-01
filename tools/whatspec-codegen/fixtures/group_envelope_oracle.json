@@ -1,11 +1,11 @@
 {
-  "waVersion": "2.3000.1047483476",
-  "setHash": "05609307e68b0f6ccfd2a121a573049999e38b752cfe7155ebbe5c661805751b",
+  "waVersion": "2.3000.1052559453",
+  "setHash": "d6ab7ae601eda281cfac570a68de1d787adde8f4d778f0bb994416f661a21abf",
   "callback": {
     "name": "groupNotificationParser",
-    "startByte": 10592,
-    "endByte": 22915,
-    "sha256": "c795544e7e6f20cf484cbac4c40ccfe731b4460f31b7ae4863e6ab3bab1bb4d9"
+    "startByte": 10858,
+    "endByte": 23344,
+    "sha256": "0c9b28f4c4ac5e27d2032dae378710cb9cc7dd17f9dcbf17769f8962f2ec4fb0"
   },
   "cases": [
     {
@@ -42,7 +42,88 @@
         "hasIncompleteParticipantInformation": false
       },
       "telemetryErrors": 0,
-      "localLidReads": 0
+      "localLidReads": 0,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrGroupJid",
+          "from"
+        ],
+        [
+          "attrString",
+          "from"
+        ],
+        [
+          "hasAttr",
+          "participant"
+        ],
+        [
+          "maybeAttrPhoneUserJid",
+          "participant_pn"
+        ],
+        [
+          "hasAttr",
+          "participant_pn"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "hasAttr",
+          "addressing_mode"
+        ],
+        [
+          "hasAttr",
+          "participant_username"
+        ],
+        [
+          "hasAttr",
+          "participant_country_code"
+        ],
+        [
+          "mapChildren"
+        ],
+        [
+          "attrString",
+          "id"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "maybeAttrString",
+          "notify"
+        ],
+        [
+          "hasAttr",
+          "notify"
+        ],
+        [
+          "maybeAttrString",
+          "offline"
+        ],
+        [
+          "hasAttr",
+          "offline"
+        ]
+      ]
     },
     {
       "name": "exact-local-lid-device",
@@ -79,7 +160,92 @@
         "hasIncompleteParticipantInformation": false
       },
       "telemetryErrors": 0,
-      "localLidReads": 1
+      "localLidReads": 1,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrString",
+          "to"
+        ],
+        [
+          "attrGroupJid",
+          "from"
+        ],
+        [
+          "attrString",
+          "from"
+        ],
+        [
+          "hasAttr",
+          "participant"
+        ],
+        [
+          "maybeAttrPhoneUserJid",
+          "participant_pn"
+        ],
+        [
+          "hasAttr",
+          "participant_pn"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "hasAttr",
+          "addressing_mode"
+        ],
+        [
+          "hasAttr",
+          "participant_username"
+        ],
+        [
+          "hasAttr",
+          "participant_country_code"
+        ],
+        [
+          "mapChildren"
+        ],
+        [
+          "attrString",
+          "id"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "maybeAttrString",
+          "notify"
+        ],
+        [
+          "hasAttr",
+          "notify"
+        ],
+        [
+          "maybeAttrString",
+          "offline"
+        ],
+        [
+          "hasAttr",
+          "offline"
+        ]
+      ]
     },
     {
       "name": "exact-local-pn-device",
@@ -116,7 +282,92 @@
         "hasIncompleteParticipantInformation": false
       },
       "telemetryErrors": 0,
-      "localLidReads": 1
+      "localLidReads": 1,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrString",
+          "to"
+        ],
+        [
+          "attrGroupJid",
+          "from"
+        ],
+        [
+          "attrString",
+          "from"
+        ],
+        [
+          "hasAttr",
+          "participant"
+        ],
+        [
+          "maybeAttrPhoneUserJid",
+          "participant_pn"
+        ],
+        [
+          "hasAttr",
+          "participant_pn"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "hasAttr",
+          "addressing_mode"
+        ],
+        [
+          "hasAttr",
+          "participant_username"
+        ],
+        [
+          "hasAttr",
+          "participant_country_code"
+        ],
+        [
+          "mapChildren"
+        ],
+        [
+          "attrString",
+          "id"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "maybeAttrString",
+          "notify"
+        ],
+        [
+          "hasAttr",
+          "notify"
+        ],
+        [
+          "maybeAttrString",
+          "offline"
+        ],
+        [
+          "hasAttr",
+          "offline"
+        ]
+      ]
     },
     {
       "name": "same-account-other-device-is-not-destination",
@@ -143,7 +394,24 @@
       "errorParser": "synthetic",
       "errorReason": "expected <notification> to have \"to\" matching meLid (\"100001:2@lid\") or mePn (\"200002:2@s.whatsapp.net\"), but instead has \"100001:3@lid\"",
       "telemetryErrors": 0,
-      "localLidReads": 1
+      "localLidReads": 1,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrString",
+          "to"
+        ],
+        [
+          "tag"
+        ]
+      ]
     },
     {
       "name": "destination-error-precedes-missing-from-time-and-unknown-action",
@@ -173,7 +441,24 @@
       "errorParser": "synthetic",
       "errorReason": "expected <notification> to have \"to\" matching meLid (\"100001:2@lid\") or mePn (\"200002:2@s.whatsapp.net\"), but instead has \"100001:3@lid\"",
       "telemetryErrors": 0,
-      "localLidReads": 1
+      "localLidReads": 1,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrString",
+          "to"
+        ],
+        [
+          "tag"
+        ]
+      ]
     },
     {
       "name": "missing-from-is-required",
@@ -198,7 +483,28 @@
       "errorParser": "synthetic",
       "errorReason": "expected <notification> to have attribute \"from\"",
       "telemetryErrors": 0,
-      "localLidReads": 0
+      "localLidReads": 0,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrGroupJid",
+          "from"
+        ],
+        [
+          "attrString",
+          "from"
+        ],
+        [
+          "tag"
+        ]
+      ]
     },
     {
       "name": "participant-is-optional",
@@ -234,7 +540,88 @@
         "hasIncompleteParticipantInformation": false
       },
       "telemetryErrors": 0,
-      "localLidReads": 0
+      "localLidReads": 0,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrGroupJid",
+          "from"
+        ],
+        [
+          "attrString",
+          "from"
+        ],
+        [
+          "hasAttr",
+          "participant"
+        ],
+        [
+          "maybeAttrPhoneUserJid",
+          "participant_pn"
+        ],
+        [
+          "hasAttr",
+          "participant_pn"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "hasAttr",
+          "addressing_mode"
+        ],
+        [
+          "hasAttr",
+          "participant_username"
+        ],
+        [
+          "hasAttr",
+          "participant_country_code"
+        ],
+        [
+          "mapChildren"
+        ],
+        [
+          "attrString",
+          "id"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "maybeAttrString",
+          "notify"
+        ],
+        [
+          "hasAttr",
+          "notify"
+        ],
+        [
+          "maybeAttrString",
+          "offline"
+        ],
+        [
+          "hasAttr",
+          "offline"
+        ]
+      ]
     },
     {
       "name": "invalid-participant-is-not-a-user",
@@ -261,7 +648,40 @@
       "errorParser": "synthetic",
       "errorReason": "expected <notification> to have \"participant\"={UserJid}, but instead has \"123456@g.us\"",
       "telemetryErrors": 0,
-      "localLidReads": 0
+      "localLidReads": 0,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrGroupJid",
+          "from"
+        ],
+        [
+          "attrString",
+          "from"
+        ],
+        [
+          "hasAttr",
+          "participant"
+        ],
+        [
+          "attrUserJid",
+          "participant"
+        ],
+        [
+          "attrString",
+          "participant"
+        ],
+        [
+          "tag"
+        ]
+      ]
     },
     {
       "name": "missing-time-is-required",
@@ -286,7 +706,48 @@
       "errorParser": "synthetic",
       "errorReason": "expected <notification> to have attribute \"t\"",
       "telemetryErrors": 0,
-      "localLidReads": 0
+      "localLidReads": 0,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrGroupJid",
+          "from"
+        ],
+        [
+          "attrString",
+          "from"
+        ],
+        [
+          "hasAttr",
+          "participant"
+        ],
+        [
+          "maybeAttrPhoneUserJid",
+          "participant_pn"
+        ],
+        [
+          "hasAttr",
+          "participant_pn"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "tag"
+        ]
+      ]
     },
     {
       "name": "missing-id-is-required-after-action-processing",
@@ -316,7 +777,70 @@
       "errorParser": "synthetic",
       "errorReason": "expected <notification> to have attribute \"id\"",
       "telemetryErrors": 0,
-      "localLidReads": 0
+      "localLidReads": 0,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrGroupJid",
+          "from"
+        ],
+        [
+          "attrString",
+          "from"
+        ],
+        [
+          "hasAttr",
+          "participant"
+        ],
+        [
+          "maybeAttrPhoneUserJid",
+          "participant_pn"
+        ],
+        [
+          "hasAttr",
+          "participant_pn"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "hasAttr",
+          "addressing_mode"
+        ],
+        [
+          "hasAttr",
+          "participant_username"
+        ],
+        [
+          "hasAttr",
+          "participant_country_code"
+        ],
+        [
+          "mapChildren"
+        ],
+        [
+          "tag"
+        ],
+        [
+          "attrString",
+          "id"
+        ],
+        [
+          "tag"
+        ]
+      ]
     },
     {
       "name": "invalid-participant-pn-lid-is-caught-locally",
@@ -354,7 +878,103 @@
         "hasIncompleteParticipantInformation": false
       },
       "telemetryErrors": 1,
-      "localLidReads": 0
+      "localLidReads": 0,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrGroupJid",
+          "from"
+        ],
+        [
+          "attrString",
+          "from"
+        ],
+        [
+          "hasAttr",
+          "participant"
+        ],
+        [
+          "attrUserJid",
+          "participant"
+        ],
+        [
+          "attrString",
+          "participant"
+        ],
+        [
+          "maybeAttrPhoneUserJid",
+          "participant_pn"
+        ],
+        [
+          "hasAttr",
+          "participant_pn"
+        ],
+        [
+          "attrString",
+          "participant_pn"
+        ],
+        [
+          "tag"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "hasAttr",
+          "addressing_mode"
+        ],
+        [
+          "hasAttr",
+          "participant_username"
+        ],
+        [
+          "hasAttr",
+          "participant_country_code"
+        ],
+        [
+          "mapChildren"
+        ],
+        [
+          "attrString",
+          "id"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "maybeAttrString",
+          "notify"
+        ],
+        [
+          "hasAttr",
+          "notify"
+        ],
+        [
+          "maybeAttrString",
+          "offline"
+        ],
+        [
+          "hasAttr",
+          "offline"
+        ]
+      ]
     },
     {
       "name": "invalid-participant-pn-device-is-caught-locally",
@@ -391,7 +1011,95 @@
         "hasIncompleteParticipantInformation": false
       },
       "telemetryErrors": 1,
-      "localLidReads": 0
+      "localLidReads": 0,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrGroupJid",
+          "from"
+        ],
+        [
+          "attrString",
+          "from"
+        ],
+        [
+          "hasAttr",
+          "participant"
+        ],
+        [
+          "maybeAttrPhoneUserJid",
+          "participant_pn"
+        ],
+        [
+          "hasAttr",
+          "participant_pn"
+        ],
+        [
+          "attrString",
+          "participant_pn"
+        ],
+        [
+          "tag"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "hasAttr",
+          "addressing_mode"
+        ],
+        [
+          "hasAttr",
+          "participant_username"
+        ],
+        [
+          "hasAttr",
+          "participant_country_code"
+        ],
+        [
+          "mapChildren"
+        ],
+        [
+          "attrString",
+          "id"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "maybeAttrString",
+          "notify"
+        ],
+        [
+          "hasAttr",
+          "notify"
+        ],
+        [
+          "maybeAttrString",
+          "offline"
+        ],
+        [
+          "hasAttr",
+          "offline"
+        ]
+      ]
     },
     {
       "name": "valid-participant-pn-is-retained",
@@ -428,7 +1136,92 @@
         "hasIncompleteParticipantInformation": false
       },
       "telemetryErrors": 0,
-      "localLidReads": 0
+      "localLidReads": 0,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrGroupJid",
+          "from"
+        ],
+        [
+          "attrString",
+          "from"
+        ],
+        [
+          "hasAttr",
+          "participant"
+        ],
+        [
+          "maybeAttrPhoneUserJid",
+          "participant_pn"
+        ],
+        [
+          "hasAttr",
+          "participant_pn"
+        ],
+        [
+          "attrString",
+          "participant_pn"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "hasAttr",
+          "addressing_mode"
+        ],
+        [
+          "hasAttr",
+          "participant_username"
+        ],
+        [
+          "hasAttr",
+          "participant_country_code"
+        ],
+        [
+          "mapChildren"
+        ],
+        [
+          "attrString",
+          "id"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "maybeAttrString",
+          "notify"
+        ],
+        [
+          "hasAttr",
+          "notify"
+        ],
+        [
+          "maybeAttrString",
+          "offline"
+        ],
+        [
+          "hasAttr",
+          "offline"
+        ]
+      ]
     },
     {
       "name": "disabled-username-gate-drops-marker-action-only",
@@ -472,7 +1265,95 @@
         "hasIncompleteParticipantInformation": false
       },
       "telemetryErrors": 0,
-      "localLidReads": 0
+      "localLidReads": 0,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrGroupJid",
+          "from"
+        ],
+        [
+          "attrString",
+          "from"
+        ],
+        [
+          "hasAttr",
+          "participant"
+        ],
+        [
+          "maybeAttrPhoneUserJid",
+          "participant_pn"
+        ],
+        [
+          "hasAttr",
+          "participant_pn"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "hasAttr",
+          "addressing_mode"
+        ],
+        [
+          "attrString",
+          "addressing_mode"
+        ],
+        [
+          "hasAttr",
+          "participant_username"
+        ],
+        [
+          "hasAttr",
+          "participant_country_code"
+        ],
+        [
+          "mapChildren"
+        ],
+        [
+          "tag"
+        ],
+        [
+          "attrString",
+          "id"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "maybeAttrString",
+          "notify"
+        ],
+        [
+          "hasAttr",
+          "notify"
+        ],
+        [
+          "maybeAttrString",
+          "offline"
+        ],
+        [
+          "hasAttr",
+          "offline"
+        ]
+      ]
     },
     {
       "name": "enabled-username-gate-stamps-incomplete-marker",
@@ -516,7 +1397,103 @@
         "hasIncompleteParticipantInformation": true
       },
       "telemetryErrors": 0,
-      "localLidReads": 0
+      "localLidReads": 0,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrGroupJid",
+          "from"
+        ],
+        [
+          "attrString",
+          "from"
+        ],
+        [
+          "hasAttr",
+          "participant"
+        ],
+        [
+          "maybeAttrPhoneUserJid",
+          "participant_pn"
+        ],
+        [
+          "hasAttr",
+          "participant_pn"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "hasAttr",
+          "addressing_mode"
+        ],
+        [
+          "attrString",
+          "addressing_mode"
+        ],
+        [
+          "hasAttr",
+          "participant_username"
+        ],
+        [
+          "attrString",
+          "participant_username"
+        ],
+        [
+          "hasAttr",
+          "participant_country_code"
+        ],
+        [
+          "attrString",
+          "participant_country_code"
+        ],
+        [
+          "mapChildren"
+        ],
+        [
+          "tag"
+        ],
+        [
+          "attrString",
+          "id"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "maybeAttrString",
+          "notify"
+        ],
+        [
+          "hasAttr",
+          "notify"
+        ],
+        [
+          "maybeAttrString",
+          "offline"
+        ],
+        [
+          "hasAttr",
+          "offline"
+        ]
+      ]
     },
     {
       "name": "unknown-action-is-an-error",
@@ -547,7 +1524,66 @@
       "errorParser": "synthetic",
       "errorReason": "expected <notification> Unrecognized group action future_action",
       "telemetryErrors": 0,
-      "localLidReads": 0
+      "localLidReads": 0,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrGroupJid",
+          "from"
+        ],
+        [
+          "attrString",
+          "from"
+        ],
+        [
+          "hasAttr",
+          "participant"
+        ],
+        [
+          "maybeAttrPhoneUserJid",
+          "participant_pn"
+        ],
+        [
+          "hasAttr",
+          "participant_pn"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "hasAttr",
+          "addressing_mode"
+        ],
+        [
+          "hasAttr",
+          "participant_username"
+        ],
+        [
+          "hasAttr",
+          "participant_country_code"
+        ],
+        [
+          "mapChildren"
+        ],
+        [
+          "tag"
+        ],
+        [
+          "tag"
+        ]
+      ]
     },
     {
       "name": "unknown-action-precedes-final-id",
@@ -577,7 +1613,66 @@
       "errorParser": "synthetic",
       "errorReason": "expected <notification> Unrecognized group action future_action",
       "telemetryErrors": 0,
-      "localLidReads": 0
+      "localLidReads": 0,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrGroupJid",
+          "from"
+        ],
+        [
+          "attrString",
+          "from"
+        ],
+        [
+          "hasAttr",
+          "participant"
+        ],
+        [
+          "maybeAttrPhoneUserJid",
+          "participant_pn"
+        ],
+        [
+          "hasAttr",
+          "participant_pn"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "hasAttr",
+          "addressing_mode"
+        ],
+        [
+          "hasAttr",
+          "participant_username"
+        ],
+        [
+          "hasAttr",
+          "participant_country_code"
+        ],
+        [
+          "mapChildren"
+        ],
+        [
+          "tag"
+        ],
+        [
+          "tag"
+        ]
+      ]
     },
     {
       "name": "timestamp-wraps-to-signed32",
@@ -613,7 +1708,88 @@
         "hasIncompleteParticipantInformation": false
       },
       "telemetryErrors": 0,
-      "localLidReads": 0
+      "localLidReads": 0,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrGroupJid",
+          "from"
+        ],
+        [
+          "attrString",
+          "from"
+        ],
+        [
+          "hasAttr",
+          "participant"
+        ],
+        [
+          "maybeAttrPhoneUserJid",
+          "participant_pn"
+        ],
+        [
+          "hasAttr",
+          "participant_pn"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "hasAttr",
+          "addressing_mode"
+        ],
+        [
+          "hasAttr",
+          "participant_username"
+        ],
+        [
+          "hasAttr",
+          "participant_country_code"
+        ],
+        [
+          "mapChildren"
+        ],
+        [
+          "attrString",
+          "id"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "maybeAttrString",
+          "notify"
+        ],
+        [
+          "hasAttr",
+          "notify"
+        ],
+        [
+          "maybeAttrString",
+          "offline"
+        ],
+        [
+          "hasAttr",
+          "offline"
+        ]
+      ]
     },
     {
       "name": "timestamp-reserved-minimum-is-clamped",
@@ -649,7 +1825,88 @@
         "hasIncompleteParticipantInformation": false
       },
       "telemetryErrors": 0,
-      "localLidReads": 0
+      "localLidReads": 0,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrGroupJid",
+          "from"
+        ],
+        [
+          "attrString",
+          "from"
+        ],
+        [
+          "hasAttr",
+          "participant"
+        ],
+        [
+          "maybeAttrPhoneUserJid",
+          "participant_pn"
+        ],
+        [
+          "hasAttr",
+          "participant_pn"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "hasAttr",
+          "addressing_mode"
+        ],
+        [
+          "hasAttr",
+          "participant_username"
+        ],
+        [
+          "hasAttr",
+          "participant_country_code"
+        ],
+        [
+          "mapChildren"
+        ],
+        [
+          "attrString",
+          "id"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "maybeAttrString",
+          "notify"
+        ],
+        [
+          "hasAttr",
+          "notify"
+        ],
+        [
+          "maybeAttrString",
+          "offline"
+        ],
+        [
+          "hasAttr",
+          "offline"
+        ]
+      ]
     },
     {
       "name": "simple-unit-action-is-normalized",
@@ -695,7 +1952,91 @@
         "hasIncompleteParticipantInformation": false
       },
       "telemetryErrors": 0,
-      "localLidReads": 0
+      "localLidReads": 0,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrGroupJid",
+          "from"
+        ],
+        [
+          "attrString",
+          "from"
+        ],
+        [
+          "hasAttr",
+          "participant"
+        ],
+        [
+          "maybeAttrPhoneUserJid",
+          "participant_pn"
+        ],
+        [
+          "hasAttr",
+          "participant_pn"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "hasAttr",
+          "addressing_mode"
+        ],
+        [
+          "hasAttr",
+          "participant_username"
+        ],
+        [
+          "hasAttr",
+          "participant_country_code"
+        ],
+        [
+          "mapChildren"
+        ],
+        [
+          "tag"
+        ],
+        [
+          "attrString",
+          "id"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "maybeAttrString",
+          "notify"
+        ],
+        [
+          "hasAttr",
+          "notify"
+        ],
+        [
+          "maybeAttrString",
+          "offline"
+        ],
+        [
+          "hasAttr",
+          "offline"
+        ]
+      ]
     },
     {
       "name": "tag-error-precedes-local-device-access",
@@ -722,7 +2063,16 @@
       "errorParser": "synthetic",
       "errorReason": "expected <iq> to be <notification>",
       "telemetryErrors": 0,
-      "localLidReads": 0
+      "localLidReads": 0,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "tag"
+        ]
+      ]
     },
     {
       "name": "absent-children-content-is-empty-actions",
@@ -757,7 +2107,88 @@
         "hasIncompleteParticipantInformation": false
       },
       "telemetryErrors": 0,
-      "localLidReads": 0
+      "localLidReads": 0,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrGroupJid",
+          "from"
+        ],
+        [
+          "attrString",
+          "from"
+        ],
+        [
+          "hasAttr",
+          "participant"
+        ],
+        [
+          "maybeAttrPhoneUserJid",
+          "participant_pn"
+        ],
+        [
+          "hasAttr",
+          "participant_pn"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "hasAttr",
+          "addressing_mode"
+        ],
+        [
+          "hasAttr",
+          "participant_username"
+        ],
+        [
+          "hasAttr",
+          "participant_country_code"
+        ],
+        [
+          "mapChildren"
+        ],
+        [
+          "attrString",
+          "id"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "maybeAttrString",
+          "notify"
+        ],
+        [
+          "hasAttr",
+          "notify"
+        ],
+        [
+          "maybeAttrString",
+          "offline"
+        ],
+        [
+          "hasAttr",
+          "offline"
+        ]
+      ]
     },
     {
       "name": "empty-byte-content-is-not-children-before-final-id",
@@ -782,7 +2213,63 @@
       "errorParser": "synthetic",
       "errorReason": "expected <notification> to have children",
       "telemetryErrors": 0,
-      "localLidReads": 0
+      "localLidReads": 0,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrGroupJid",
+          "from"
+        ],
+        [
+          "attrString",
+          "from"
+        ],
+        [
+          "hasAttr",
+          "participant"
+        ],
+        [
+          "maybeAttrPhoneUserJid",
+          "participant_pn"
+        ],
+        [
+          "hasAttr",
+          "participant_pn"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "hasAttr",
+          "addressing_mode"
+        ],
+        [
+          "hasAttr",
+          "participant_username"
+        ],
+        [
+          "hasAttr",
+          "participant_country_code"
+        ],
+        [
+          "mapChildren"
+        ],
+        [
+          "tag"
+        ]
+      ]
     },
     {
       "name": "empty-string-content-is-not-children",
@@ -808,7 +2295,63 @@
       "errorParser": "synthetic",
       "errorReason": "expected <notification> to have children",
       "telemetryErrors": 0,
-      "localLidReads": 0
+      "localLidReads": 0,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrGroupJid",
+          "from"
+        ],
+        [
+          "attrString",
+          "from"
+        ],
+        [
+          "hasAttr",
+          "participant"
+        ],
+        [
+          "maybeAttrPhoneUserJid",
+          "participant_pn"
+        ],
+        [
+          "hasAttr",
+          "participant_pn"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "hasAttr",
+          "addressing_mode"
+        ],
+        [
+          "hasAttr",
+          "participant_username"
+        ],
+        [
+          "hasAttr",
+          "participant_country_code"
+        ],
+        [
+          "mapChildren"
+        ],
+        [
+          "tag"
+        ]
+      ]
     },
     {
       "name": "to-requires-lid-fact-before-matching-pn",
@@ -835,7 +2378,21 @@
       "errorParser": null,
       "errorReason": null,
       "telemetryErrors": 0,
-      "localLidReads": 1
+      "localLidReads": 1,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrString",
+          "to"
+        ]
+      ]
     },
     {
       "name": "invalid-time-precedes-unknown-action",
@@ -866,7 +2423,48 @@
       "errorParser": "synthetic",
       "errorReason": "expected <notification> to have \"t\"={integer} but has value \"future_time\"",
       "telemetryErrors": 0,
-      "localLidReads": 0
+      "localLidReads": 0,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrGroupJid",
+          "from"
+        ],
+        [
+          "attrString",
+          "from"
+        ],
+        [
+          "hasAttr",
+          "participant"
+        ],
+        [
+          "maybeAttrPhoneUserJid",
+          "participant_pn"
+        ],
+        [
+          "hasAttr",
+          "participant_pn"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "tag"
+        ]
+      ]
     },
     {
       "name": "bot-participant-is-a-supported-user-class",
@@ -903,7 +2501,96 @@
         "hasIncompleteParticipantInformation": false
       },
       "telemetryErrors": 0,
-      "localLidReads": 0
+      "localLidReads": 0,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrGroupJid",
+          "from"
+        ],
+        [
+          "attrString",
+          "from"
+        ],
+        [
+          "hasAttr",
+          "participant"
+        ],
+        [
+          "attrUserJid",
+          "participant"
+        ],
+        [
+          "attrString",
+          "participant"
+        ],
+        [
+          "maybeAttrPhoneUserJid",
+          "participant_pn"
+        ],
+        [
+          "hasAttr",
+          "participant_pn"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "hasAttr",
+          "addressing_mode"
+        ],
+        [
+          "hasAttr",
+          "participant_username"
+        ],
+        [
+          "hasAttr",
+          "participant_country_code"
+        ],
+        [
+          "mapChildren"
+        ],
+        [
+          "attrString",
+          "id"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "maybeAttrString",
+          "notify"
+        ],
+        [
+          "hasAttr",
+          "notify"
+        ],
+        [
+          "maybeAttrString",
+          "offline"
+        ],
+        [
+          "hasAttr",
+          "offline"
+        ]
+      ]
     },
     {
       "name": "pn-prefix-outside-official-user-class-is-caught",
@@ -940,7 +2627,95 @@
         "hasIncompleteParticipantInformation": false
       },
       "telemetryErrors": 1,
-      "localLidReads": 0
+      "localLidReads": 0,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrGroupJid",
+          "from"
+        ],
+        [
+          "attrString",
+          "from"
+        ],
+        [
+          "hasAttr",
+          "participant"
+        ],
+        [
+          "maybeAttrPhoneUserJid",
+          "participant_pn"
+        ],
+        [
+          "hasAttr",
+          "participant_pn"
+        ],
+        [
+          "attrString",
+          "participant_pn"
+        ],
+        [
+          "tag"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "hasAttr",
+          "addressing_mode"
+        ],
+        [
+          "hasAttr",
+          "participant_username"
+        ],
+        [
+          "hasAttr",
+          "participant_country_code"
+        ],
+        [
+          "mapChildren"
+        ],
+        [
+          "attrString",
+          "id"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "maybeAttrString",
+          "notify"
+        ],
+        [
+          "hasAttr",
+          "notify"
+        ],
+        [
+          "maybeAttrString",
+          "offline"
+        ],
+        [
+          "hasAttr",
+          "offline"
+        ]
+      ]
     },
     {
       "name": "unknown-country-is-undefined-with-username-gate-enabled",
@@ -976,7 +2751,92 @@
         "hasIncompleteParticipantInformation": false
       },
       "telemetryErrors": 0,
-      "localLidReads": 0
+      "localLidReads": 0,
+      "reads": [
+        [
+          "assertTag",
+          "notification"
+        ],
+        [
+          "hasAttr",
+          "to"
+        ],
+        [
+          "attrGroupJid",
+          "from"
+        ],
+        [
+          "attrString",
+          "from"
+        ],
+        [
+          "hasAttr",
+          "participant"
+        ],
+        [
+          "maybeAttrPhoneUserJid",
+          "participant_pn"
+        ],
+        [
+          "hasAttr",
+          "participant_pn"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "hasAttr",
+          "addressing_mode"
+        ],
+        [
+          "hasAttr",
+          "participant_username"
+        ],
+        [
+          "hasAttr",
+          "participant_country_code"
+        ],
+        [
+          "attrString",
+          "participant_country_code"
+        ],
+        [
+          "mapChildren"
+        ],
+        [
+          "attrString",
+          "id"
+        ],
+        [
+          "attrTime",
+          "t"
+        ],
+        [
+          "attrString",
+          "t"
+        ],
+        [
+          "maybeAttrString",
+          "notify"
+        ],
+        [
+          "hasAttr",
+          "notify"
+        ],
+        [
+          "maybeAttrString",
+          "offline"
+        ],
+        [
+          "hasAttr",
+          "offline"
+        ]
+      ]
     }
   ]
 }

@@ -50,6 +50,7 @@ fn every_generated_rust_file_stamps_the_locked_version() {
     // artifact left over from another build when `--check` cannot reach the
     // network to fetch the IR.
     for rel in [
+        "wacore/src/stanza/groups/normalization_conformance.rs",
         "wacore/src/version/generated.rs",
         "wacore/src/iq/abprops.rs",
         "wacore/src/iq/mex_operations.rs",

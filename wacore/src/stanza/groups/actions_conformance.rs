@@ -1,7 +1,7 @@
-//! Auto-generated complete official nonraw group action conformance (WhatsApp 2.3000.1047483476). DO NOT EDIT.
+//! Auto-generated complete official nonraw group action conformance (WhatsApp 2.3000.1052559453). DO NOT EDIT.
 //!
-//! Original callback source: https://github.com/oxidezap/whatspec/blob/adbe317bf0320bb0cb83824722f6eb60c2ac69da/tests/conformance/groups/actions.cjs
-//! Module SHA-256 a65d861ba0dacdcec52d2df48712a80677ecf10021d7df63c84183f195db13a1.
+//! Original callback source: https://github.com/oxidezap/whatspec/blob/afa3e343f37b0b64f03cffcacf2448ef883a2d8b/tests/conformance/groups/versions/2.3000.1052559453/actions.json
+//! Module SHA-256 d1641fad966fd3b32d6b9859e074f804526e67181584811364774047208c273d.
 //! Account facts/Wid conversion/logging are explicit test mocks; runtime handlers are not run.
 
 mod projection {
@@ -20,12 +20,12 @@ mod projection {
     fn string<T: ToString>(value: &T) -> Value {
         Value::String(value.to_string())
     }
-    fn participant(p: &CreateParticipant, history: bool) -> Value {
+    fn participant(p: &CreateParticipant, _history: bool) -> Value {
         let mut value = json!({
             "displayName":p.display_name,"id":p.id.to_string(),"isSuperAdmin":p.is_super_admin,"isAdmin":p.is_admin,
             "lid":p.lid.as_ref().map(ToString::to_string),"phoneNumber":p.phone_number.as_ref().map(ToString::to_string),"username":p.username,
         });
-        if history {
+        {
             value["joinTime"] = json!(p.join_time);
             value["groupHistorySentState"] = json!(p.history_sent_state_code());
         }
@@ -335,7 +335,7 @@ fn complete_nonraw_actions_match_the_original_callback() {
                 .map(|action| projection::project(action, context.history_after_join).unwrap())
                 .collect(),
         );
-        let expected:Value=serde_json::from_str("[{\"actionType\":\"add\",\"isLidAddressingMode\":true,\"participants\":[{\"displayName\":null,\"id\":\"100001@lid\",\"isAdmin\":true,\"isSuperAdmin\":true,\"lid\":null,\"phoneNumber\":null,\"username\":\"ungated\"}],\"reason\":\"default_subgroup_admin_add\"}]").unwrap();
+        let expected:Value=serde_json::from_str("[{\"actionType\":\"add\",\"isLidAddressingMode\":true,\"participants\":[{\"displayName\":null,\"groupHistorySentState\":null,\"id\":\"100001@lid\",\"isAdmin\":true,\"isSuperAdmin\":true,\"joinTime\":null,\"lid\":null,\"phoneNumber\":null,\"username\":\"ungated\"}],\"reason\":\"default_subgroup_admin_add\"}]").unwrap();
         assert_eq!(actual, expected, "{}", "add-reason-normalizes-admin-key");
     }
     {
@@ -547,7 +547,7 @@ fn complete_nonraw_actions_match_the_original_callback() {
                 .map(|action| projection::project(action, context.history_after_join).unwrap())
                 .collect(),
         );
-        let expected:Value=serde_json::from_str("[{\"actionType\":\"promote\",\"participants\":[{\"displayName\":null,\"id\":\"200003@s.whatsapp.net\",\"isAdmin\":false,\"isSuperAdmin\":false,\"lid\":null,\"phoneNumber\":null,\"username\":null}]}]").unwrap();
+        let expected:Value=serde_json::from_str("[{\"actionType\":\"promote\",\"participants\":[{\"displayName\":null,\"groupHistorySentState\":null,\"id\":\"200003@s.whatsapp.net\",\"isAdmin\":false,\"isSuperAdmin\":false,\"joinTime\":null,\"lid\":null,\"phoneNumber\":null,\"username\":null}]}]").unwrap();
         assert_eq!(actual, expected, "{}", "promote");
     }
     {

@@ -117,6 +117,7 @@ fn main() -> std::io::Result<()> {
         names::ONEOFS,
     )?;
     apply_local_fields(&mut fds)?;
+    emission::retain_wallpaper_fields(&mut fds)?;
     signal_storage::check(&names::wire_api(&fds))?;
 
     // Emit the wire-tag consts (field numbers) for hand-written partial decoders.

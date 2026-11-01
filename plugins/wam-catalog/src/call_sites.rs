@@ -1,4 +1,4 @@
-//! Auto-generated WAM call-site evidence (WhatsApp 2.3000.1047483476). DO NOT EDIT.
+//! Auto-generated WAM call-site evidence (WhatsApp 2.3000.1052559453). DO NOT EDIT.
 //!
 //! Where WA Web constructs each event and which fields it is seen writing
 //! there. This is *where* and *with which fields*, never *when*: the guard a
@@ -17,10 +17,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "AboutConsumption",
         code: 6814,
-        fields: &[CatalogField {
-            name: "aboutConsumptionSurface",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "aboutConsumptionSurface",
+                id: 1,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 3,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebAboutWamLogger",
             partial: false,
@@ -49,6 +55,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "aboutMessageSendCount",
                 id: 4,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 5,
             },
         ],
         sites: &[CallSite {
@@ -113,6 +123,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "aboutSaveOutcome",
                 id: 11,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 12,
             },
             CatalogField {
                 name: "preset",
@@ -186,6 +200,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 name: "aboutSuccessCount",
                 id: 6,
             },
+            CatalogField {
+                name: "dedupKey",
+                id: 7,
+            },
         ],
         sites: &[CallSite {
             module: "WAWebTasksDailyStatsTask",
@@ -222,6 +240,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 name: "aboutLocale",
                 id: 2,
             },
+            CatalogField {
+                name: "dedupKey",
+                id: 3,
+            },
         ],
         sites: &[CallSite {
             module: "WAWebAboutWamLogger",
@@ -236,6 +258,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "AddressingModeMismatch",
         code: 4750,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 7,
+            },
             CatalogField {
                 name: "iqResponse",
                 id: 1,
@@ -275,10 +301,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "AdvMetadataCreationFailure",
         code: 3048,
-        fields: &[CatalogField {
-            name: "advMetadataIsMe",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "advMetadataIsMe",
+                id: 1,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+        ],
         sites: &[
             CallSite {
                 module: "WAWebGetGroupKeyDistributionMsg",
@@ -325,10 +357,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "AdvStoredTimestampExpired",
         code: 3036,
-        fields: &[CatalogField {
-            name: "advExpireTimeInHours",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "advExpireTimeInHours",
+                id: 1,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebAdvDeviceInfoCheckJob",
             partial: false,
@@ -342,6 +380,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "AiSubsBenefitUj",
         code: 8220,
         fields: &[
+            CatalogField {
+                name: "aiSubBlockSource",
+                id: 8,
+            },
             CatalogField {
                 name: "aiSubComponent",
                 id: 1,
@@ -363,8 +405,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 4,
             },
             CatalogField {
+                name: "aiSubWaffleLinked",
+                id: 9,
+            },
+            CatalogField {
                 name: "aiSubscriptionTier",
                 id: 5,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 7,
             },
         ],
         sites: &[CallSite {
@@ -415,6 +465,18 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 4,
             },
             CatalogField {
+                name: "creationFailureReason",
+                id: 12,
+            },
+            CatalogField {
+                name: "creationStatus",
+                id: 13,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 11,
+            },
+            CatalogField {
                 name: "eventTsMs",
                 id: 5,
             },
@@ -437,6 +499,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "threadActionType",
                 id: 8,
+            },
+            CatalogField {
+                name: "threadInboxPosition",
+                id: 14,
             },
         ],
         sites: &[CallSite {
@@ -501,6 +567,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "bucketedSenderKeyDistributionHashTime",
                 id: 35,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 51,
             },
             CatalogField {
                 name: "deviceCount",
@@ -613,6 +683,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "prekeysEligibleForPrallelProcessing",
                 id: 28,
+            },
+            CatalogField {
+                name: "privateAiFeatureName",
+                id: 52,
             },
             CatalogField {
                 name: "receiverDeviceCount",
@@ -737,6 +811,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 9,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 27,
+            },
+            CatalogField {
                 name: "lowPowerModeEnabled",
                 id: 12,
             },
@@ -793,6 +871,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 2,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
+            CatalogField {
                 name: "nuxVersion",
                 id: 3,
             },
@@ -835,6 +917,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "attachmentTrayActionTarget",
                 id: 3,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 10,
             },
             CatalogField {
                 name: "groupSizeBucket",
@@ -918,6 +1004,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 name: "audienceResolutionTrigger",
                 id: 5,
             },
+            CatalogField {
+                name: "dedupKey",
+                id: 6,
+            },
         ],
         sites: &[
             CallSite {
@@ -967,8 +1057,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 6636,
         fields: &[
             CatalogField {
+                name: "aeOffboardingSurveyOtherText",
+                id: 6,
+            },
+            CatalogField {
                 name: "automaticEventsTargetComponent",
                 id: 1,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 5,
             },
             CatalogField {
                 name: "extraAttributes",
@@ -985,8 +1083,8 @@ pub const CALL_SITES: &[EventCallSites] = &[
         ],
         sites: &[
             CallSite {
-                module: "WAWebBizLabelDrawer.react",
-                partial: false,
+                module: "WAWebAECompanionJourneyLogging",
+                partial: true,
                 fields: &[
                     CallSiteField {
                         name: "automaticEventsTargetComponent",
@@ -1021,25 +1119,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebBizLabelItemDrawer.react",
-                partial: false,
-                fields: &[
-                    CallSiteField {
-                        name: "automaticEventsTargetComponent",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "smbUserActionType",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "surface",
-                        write: FieldWrite::Constructor,
-                    },
-                ],
-            },
-            CallSite {
-                module: "WAWebBizLabelItemDrawer.react",
+                module: "WAWebBizLabelDrawer.react",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -1183,6 +1263,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 6,
+            },
+            CatalogField {
                 name: "deviceId",
                 id: 4,
             },
@@ -1249,9 +1333,13 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebBizPixKeyPromo.react",
+                module: "WAWebBizPaymentsHomeManagementDrawer.react",
                 partial: false,
                 fields: &[
+                    CallSiteField {
+                        name: "bannerId",
+                        write: FieldWrite::Constructor,
+                    },
                     CallSiteField {
                         name: "bannerOperation",
                         write: FieldWrite::Constructor,
@@ -1277,7 +1365,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebChatlistCallingActivationBanner.react",
+                module: "WAWebBizPixKeyPromo.react",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -1306,6 +1394,34 @@ pub const CALL_SITES: &[EventCallSites] = &[
             },
             CallSite {
                 module: "WAWebChatlistCallingActivationBanner.react",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "bannerOperation",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "bannerType",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebChatlistCallingActivationBanner.react",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "bannerOperation",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "bannerType",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebChatlistCallingActivationBannerImpression",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -1398,24 +1514,6 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebUpdatesTabPrivacyFooter.react",
-                partial: false,
-                fields: &[
-                    CallSiteField {
-                        name: "bannerId",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "bannerOperation",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "bannerType",
-                        write: FieldWrite::Constructor,
-                    },
-                ],
-            },
-            CallSite {
                 module: "useWAWebContextualBanner",
                 partial: true,
                 fields: &[],
@@ -1462,6 +1560,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 name: "bizAiRenderOutcome",
                 id: 4,
             },
+            CatalogField {
+                name: "dedupKey",
+                id: 12,
+            },
         ],
         sites: &[CallSite {
             module: "WAWebInteractiveBloksWidgetLogger",
@@ -1494,6 +1596,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "BizAiHandoffNotification",
         code: 6528,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 6,
+            },
             CatalogField {
                 name: "handoffNotifAction",
                 id: 1,
@@ -1759,6 +1865,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 4,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 7,
+            },
+            CatalogField {
                 name: "pastCall",
                 id: 5,
             },
@@ -1813,6 +1923,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "botType",
                 id: 4,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 8,
             },
         ],
         sites: &[
@@ -2005,6 +2119,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 28,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 57,
+            },
+            CatalogField {
                 name: "deviceLanguage",
                 id: 16,
             },
@@ -2053,8 +2171,20 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 10,
             },
             CatalogField {
+                name: "metaAiReadOnlyReason",
+                id: 58,
+            },
+            CatalogField {
+                name: "metaData",
+                id: 59,
+            },
+            CatalogField {
                 name: "metricCount",
                 id: 17,
+            },
+            CatalogField {
+                name: "museChannelStatus",
+                id: 60,
             },
             CatalogField {
                 name: "newBadgeVisible",
@@ -2089,56 +2219,126 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 15,
             },
         ],
-        sites: &[CallSite {
-            module: "WAWebBotJourneyLogger",
-            partial: false,
-            fields: &[
-                CallSiteField {
-                    name: "actionType",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "additionalCategory",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "aiSessionId",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "appSessionId",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "botEntryPoint",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "botPersonaId",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "conversationStarterIndex",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "conversationStarterName",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "eventTsMs",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "rawBotEntryPoint",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "uiSurface",
-                    write: FieldWrite::Constructor,
-                },
-            ],
-        }],
+        sites: &[
+            CallSite {
+                module: "WAWebBotJourneyLogger",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "actionType",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "additionalCategory",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "aiSessionId",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "appSessionId",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "botEntryPoint",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "botPersonaId",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "conversationStarterIndex",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "conversationStarterName",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "eventTsMs",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "rawBotEntryPoint",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "uiSurface",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebBotJourneyLogger",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "actionType",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "appSessionId",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "botEntryPoint",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "eventTsMs",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "isMetaAiAssistant",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "museChannelStatus",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "rawBotEntryPoint",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebBotJourneyLogger",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "actionType",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "appSessionId",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "botEntryPoint",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "eventTsMs",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "isMetaAiAssistant",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "museChannelStatus",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "rawBotEntryPoint",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+        ],
     },
     EventCallSites {
         event: "BroadcastInvalidChannelsContextSourceMessageDrop",
@@ -2203,6 +2403,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "clientServerJoinKey",
                 id: 13,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 15,
             },
             CatalogField {
                 name: "submitBugCategory",
@@ -2484,6 +2688,42 @@ pub const CALL_SITES: &[EventCallSites] = &[
                     },
                 ],
             },
+            CallSite {
+                module: "WAWebSupportBugReportCreateDogfoodingTaskMutation",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "bugReportErrorMessage",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "bugReportFlowAction",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "clientServerJoinKey",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebSupportBugReportCreateDogfoodingTaskMutation",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "bugReportFlowAction",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "bugReportTaskId",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "clientServerJoinKey",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
         ],
     },
     EventCallSites {
@@ -2575,6 +2815,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 1376,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 3,
+            },
+            CatalogField {
                 name: "muteT",
                 id: 2,
             },
@@ -2587,6 +2831,86 @@ pub const CALL_SITES: &[EventCallSites] = &[
             module: "WAWebActionListener",
             partial: false,
             fields: &[],
+        }],
+    },
+    EventCallSites {
+        event: "BusinessTemplateBookingStatus",
+        code: 7528,
+        fields: &[
+            CatalogField {
+                name: "actionTypeBookingStatus",
+                id: 1,
+            },
+            CatalogField {
+                name: "businessJid",
+                id: 2,
+            },
+            CatalogField {
+                name: "chatsFolderType",
+                id: 3,
+            },
+            CatalogField {
+                name: "contactType",
+                id: 4,
+            },
+            CatalogField {
+                name: "isBizIntent",
+                id: 5,
+            },
+            CatalogField {
+                name: "isInsubContact",
+                id: 6,
+            },
+            CatalogField {
+                name: "isMuted",
+                id: 7,
+            },
+            CatalogField {
+                name: "readReceiptsEnabled",
+                id: 8,
+            },
+            CatalogField {
+                name: "templateId",
+                id: 9,
+            },
+        ],
+        sites: &[CallSite {
+            module: "WAWebBookingConfirmationLogging",
+            partial: false,
+            fields: &[
+                CallSiteField {
+                    name: "actionTypeBookingStatus",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "businessJid",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "chatsFolderType",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "contactType",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "isInsubContact",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "isMuted",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "readReceiptsEnabled",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "templateId",
+                    write: FieldWrite::Constructor,
+                },
+            ],
         }],
     },
     EventCallSites {
@@ -2698,6 +3022,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 7,
+            },
+            CatalogField {
                 name: "linkingTarget",
                 id: 4,
             },
@@ -2741,6 +3069,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 name: "businessToolsSessionId",
                 id: 1,
             },
+            CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
         ],
         sites: &[CallSite {
             module: "WAWebBizToolsUtils",
@@ -2777,6 +3109,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 name: "businessToolsSessionId",
                 id: 1,
             },
+            CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
         ],
         sites: &[CallSite {
             module: "WAWebBizToolsUtils",
@@ -2800,10 +3136,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "BusinessUnmute",
         code: 1378,
-        fields: &[CatalogField {
-            name: "muteeId",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+            CatalogField {
+                name: "muteeId",
+                id: 1,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebActionListener",
             partial: false,
@@ -2821,6 +3163,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "cadminDemoteResult",
                 id: 2,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 5,
             },
             CatalogField {
                 name: "isLastCadminOrCreator",
@@ -3179,6 +3525,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1119,
             },
             CatalogField {
+                name: "audioBelowSwbDurationMs",
+                id: 3214,
+            },
+            CatalogField {
                 name: "audioCalleeAcceptToDecodeT",
                 id: 1565,
             },
@@ -3269,6 +3619,18 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "audioDecodeErrors",
                 id: 1521,
+            },
+            CatalogField {
+                name: "audioDecodedMlowSwbBwenetDurationMs",
+                id: 3271,
+            },
+            CatalogField {
+                name: "audioDecodedMlowSwbNativeDurationMs",
+                id: 3272,
+            },
+            CatalogField {
+                name: "audioDecodedMlowWbDurationMs",
+                id: 3273,
             },
             CatalogField {
                 name: "audioDevIsStalled",
@@ -3481,6 +3843,38 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "audioRxAvgFpp",
                 id: 728,
+            },
+            CatalogField {
+                name: "audioRxParseErrPtMlow",
+                id: 3187,
+            },
+            CatalogField {
+                name: "audioRxParseErrPtMlowRed",
+                id: 3188,
+            },
+            CatalogField {
+                name: "audioRxParseErrPtOpus",
+                id: 3189,
+            },
+            CatalogField {
+                name: "audioRxParseErrPtOther",
+                id: 3190,
+            },
+            CatalogField {
+                name: "audioRxPktPtMlow",
+                id: 3191,
+            },
+            CatalogField {
+                name: "audioRxPktPtMlowRed",
+                id: 3192,
+            },
+            CatalogField {
+                name: "audioRxPktPtOpus",
+                id: 3193,
+            },
+            CatalogField {
+                name: "audioRxPktPtOther",
+                id: 3194,
             },
             CatalogField {
                 name: "audioStreamRecreations",
@@ -4095,6 +4489,14 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 3001,
             },
             CatalogField {
+                name: "ca2dAbandonedCount",
+                id: 3211,
+            },
+            CatalogField {
+                name: "ca2dActiveDurationT",
+                id: 3212,
+            },
+            CatalogField {
                 name: "ca2dAttemptCount",
                 id: 3093,
             },
@@ -4175,6 +4577,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 3092,
             },
             CatalogField {
+                name: "ca2dT1FaultFramesPct",
+                id: 3259,
+            },
+            CatalogField {
                 name: "ca2dVideoLagMsAvg",
                 id: 3145,
             },
@@ -4185,6 +4591,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "ca2dVideoLagMsP95",
                 id: 3147,
+            },
+            CatalogField {
+                name: "ca2dVideoLagNegativePct",
+                id: 3260,
             },
             CatalogField {
                 name: "caCathodeEmitToWireAvg",
@@ -4571,6 +4981,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1569,
             },
             CatalogField {
+                name: "callNcWamReason",
+                id: 3252,
+            },
+            CatalogField {
                 name: "callNetwork",
                 id: 76,
             },
@@ -4617,6 +5031,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "callPeakThermalState",
                 id: 2539,
+            },
+            CatalogField {
+                name: "callPeerAbpropBucketIdList",
+                id: 3162,
             },
             CatalogField {
                 name: "callPeerAppVersion",
@@ -4891,6 +5309,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 30,
             },
             CatalogField {
+                name: "callSelfAbpropBucketIdList",
+                id: 3163,
+            },
+            CatalogField {
                 name: "callSelfIpStr",
                 id: 9,
             },
@@ -5009,6 +5431,30 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "callTestString",
                 id: 1328,
+            },
+            CatalogField {
+                name: "callTransferAckT",
+                id: 3246,
+            },
+            CatalogField {
+                name: "callTransferDeliverDroppedCount",
+                id: 3247,
+            },
+            CatalogField {
+                name: "callTransferHandoverT",
+                id: 3248,
+            },
+            CatalogField {
+                name: "callTransferResult",
+                id: 3249,
+            },
+            CatalogField {
+                name: "callTransferRole",
+                id: 3250,
+            },
+            CatalogField {
+                name: "callTransferSwitchable",
+                id: 3251,
             },
             CatalogField {
                 name: "callTransitionCount",
@@ -5179,12 +5625,24 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1596,
             },
             CatalogField {
+                name: "callerDisplayNameType",
+                id: 3215,
+            },
+            CatalogField {
                 name: "callerInContact",
                 id: 476,
             },
             CatalogField {
                 name: "callerOfferToDecodeT",
                 id: 445,
+            },
+            CatalogField {
+                name: "callerPnPresent",
+                id: 3216,
+            },
+            CatalogField {
+                name: "callerUsernamePresent",
+                id: 3217,
             },
             CatalogField {
                 name: "callerVidRtpToDecodeT",
@@ -5375,6 +5833,34 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1582,
             },
             CatalogField {
+                name: "cmModelInferenceFailureCount",
+                id: 3261,
+            },
+            CatalogField {
+                name: "cmModelInferenceTimeUsec",
+                id: 3262,
+            },
+            CatalogField {
+                name: "cmModelPathFailureCount",
+                id: 3263,
+            },
+            CatalogField {
+                name: "cmModelPathTimeUsec",
+                id: 3264,
+            },
+            CatalogField {
+                name: "cmModelPredictionIntervalTimeMsec",
+                id: 3265,
+            },
+            CatalogField {
+                name: "cmModelShimAvgCreationTimeUsec",
+                id: 3266,
+            },
+            CatalogField {
+                name: "cmModelShimCreationFailureCount",
+                id: 3267,
+            },
+            CatalogField {
                 name: "combinedE2eAvgRtt",
                 id: 760,
             },
@@ -5431,6 +5917,22 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 2189,
             },
             CatalogField {
+                name: "cpuArch",
+                id: 3195,
+            },
+            CatalogField {
+                name: "cpuClockMhz",
+                id: 3196,
+            },
+            CatalogField {
+                name: "cpuLogicalCores",
+                id: 3197,
+            },
+            CatalogField {
+                name: "cpuName",
+                id: 3198,
+            },
+            CatalogField {
                 name: "cpuOverUtilizationPct",
                 id: 1223,
             },
@@ -5441,6 +5943,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "cpuUtilizationPeak",
                 id: 1821,
+            },
+            CatalogField {
+                name: "cpuVendor",
+                id: 3199,
             },
             CatalogField {
                 name: "createdFromGroupCallDowngrade",
@@ -5643,6 +6149,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1858,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 3161,
+            },
+            CatalogField {
                 name: "defaultMicMode",
                 id: 2647,
             },
@@ -5713,6 +6223,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "droppedNetEventCount",
                 id: 2005,
+            },
+            CatalogField {
+                name: "dsmDurationT",
+                id: 3170,
             },
             CatalogField {
                 name: "dtlsConnectionSetupT",
@@ -6335,12 +6849,28 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1967,
             },
             CatalogField {
+                name: "gpuCount",
+                id: 3200,
+            },
+            CatalogField {
+                name: "gpuDriverVersion",
+                id: 3201,
+            },
+            CatalogField {
+                name: "gpuName",
+                id: 3202,
+            },
+            CatalogField {
                 name: "gpuUtilizationAvg",
                 id: 1822,
             },
             CatalogField {
                 name: "gpuUtilizationPeak",
                 id: 1823,
+            },
+            CatalogField {
+                name: "gpuVendor",
+                id: 3203,
             },
             CatalogField {
                 name: "greaterThanLowPlrIsRandomCount",
@@ -6835,6 +7365,34 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1350,
             },
             CatalogField {
+                name: "imuHmcRxDroppedCount",
+                id: 3204,
+            },
+            CatalogField {
+                name: "imuHmcRxFrameCount",
+                id: 3205,
+            },
+            CatalogField {
+                name: "imuHmcRxHandoffCount",
+                id: 3206,
+            },
+            CatalogField {
+                name: "imuHmcRxLostCount",
+                id: 3207,
+            },
+            CatalogField {
+                name: "imuHmcTxBufferDropCount",
+                id: 3208,
+            },
+            CatalogField {
+                name: "imuHmcTxEnqueuedCount",
+                id: 3209,
+            },
+            CatalogField {
+                name: "imuHmcTxSentCount",
+                id: 3210,
+            },
+            CatalogField {
                 name: "imuTxBitrate",
                 id: 3041,
             },
@@ -7043,42 +7601,6 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 146,
             },
             CatalogField {
-                name: "jbAvgDelayFromDisorderDistanceHist",
-                id: 1413,
-            },
-            CatalogField {
-                name: "jbAvgDelayFromPutHist",
-                id: 1414,
-            },
-            CatalogField {
-                name: "jbAvgDelayUniform",
-                id: 644,
-            },
-            CatalogField {
-                name: "jbAvgDisorderTargetSize",
-                id: 1086,
-            },
-            CatalogField {
-                name: "jbAvgPutHistTargetSize",
-                id: 1415,
-            },
-            CatalogField {
-                name: "jbAvgTargetSize",
-                id: 1012,
-            },
-            CatalogField {
-                name: "jbAvgTargetSizeAddedFromDisorderDistanceHist",
-                id: 1416,
-            },
-            CatalogField {
-                name: "jbAvgTargetSizeFromDisorderDistanceHist",
-                id: 1417,
-            },
-            CatalogField {
-                name: "jbAvgTargetSizeFromPutHist",
-                id: 1418,
-            },
-            CatalogField {
                 name: "jbCng",
                 id: 1718,
             },
@@ -7089,30 +7611,6 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "jbEmpties",
                 id: 151,
-            },
-            CatalogField {
-                name: "jbEmptyPeriods1x",
-                id: 997,
-            },
-            CatalogField {
-                name: "jbEmptyPeriods2x",
-                id: 998,
-            },
-            CatalogField {
-                name: "jbEmptyPeriods4x",
-                id: 999,
-            },
-            CatalogField {
-                name: "jbEmptyPeriods8x",
-                id: 1000,
-            },
-            CatalogField {
-                name: "jbGetFromDisorderDistanceHist",
-                id: 1419,
-            },
-            CatalogField {
-                name: "jbGetFromPutHist",
-                id: 1420,
             },
             CatalogField {
                 name: "jbGets",
@@ -7147,52 +7645,12 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 776,
             },
             CatalogField {
-                name: "jbMaxDelay",
-                id: 148,
-            },
-            CatalogField {
-                name: "jbMaxDelayFromDisorderDistanceHist",
-                id: 1421,
-            },
-            CatalogField {
-                name: "jbMaxDelayFromPutHist",
-                id: 1422,
-            },
-            CatalogField {
-                name: "jbMaxDisorderTargetSize",
-                id: 1087,
-            },
-            CatalogField {
-                name: "jbMaxPutHistTargetSize",
-                id: 1423,
-            },
-            CatalogField {
-                name: "jbMaxTargetSizeAddedFromDisorderDistanceHist",
-                id: 1424,
-            },
-            CatalogField {
-                name: "jbMaxTargetSizeFromDisorderDistanceHist",
-                id: 1425,
-            },
-            CatalogField {
-                name: "jbMaxTargetSizeFromPutHist",
-                id: 1426,
-            },
-            CatalogField {
                 name: "jbMeanWaitTime",
                 id: 1656,
             },
             CatalogField {
                 name: "jbMeanWaitTimeDominantSpeaker",
                 id: 2218,
-            },
-            CatalogField {
-                name: "jbMinDelay",
-                id: 147,
-            },
-            CatalogField {
-                name: "jbNonSpeechDiscards",
-                id: 846,
             },
             CatalogField {
                 name: "jbPlc",
@@ -7225,10 +7683,6 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "jbPutsDominantSpeaker",
                 id: 2221,
-            },
-            CatalogField {
-                name: "jbTotalEmptyPeriods",
-                id: 996,
             },
             CatalogField {
                 name: "jbTotalPlc1xMs",
@@ -7323,20 +7777,8 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 3109,
             },
             CatalogField {
-                name: "lastMinJbAvgDelay",
-                id: 1607,
-            },
-            CatalogField {
-                name: "lastMinJbEmpties",
-                id: 1608,
-            },
-            CatalogField {
                 name: "lastMinJbGets",
                 id: 1609,
-            },
-            CatalogField {
-                name: "lastMinJbLost",
-                id: 1610,
             },
             CatalogField {
                 name: "lastMinJbMeanWaitTime",
@@ -7637,6 +8079,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "minP2pSessionMs",
                 id: 2304,
+            },
+            CatalogField {
+                name: "miniPlayerWebWindowMsT",
+                id: 3283,
             },
             CatalogField {
                 name: "mlBweUsedFallbackModel",
@@ -8011,6 +8457,26 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 2044,
             },
             CatalogField {
+                name: "mlUaqcRlModelAvgInferenceTimeMs",
+                id: 3221,
+            },
+            CatalogField {
+                name: "mlUaqcRlModelDownloadFailureCount",
+                id: 3222,
+            },
+            CatalogField {
+                name: "mlUaqcRlModelInferenceFailureCount",
+                id: 3223,
+            },
+            CatalogField {
+                name: "mlUaqcRlShimAvgCreationTime",
+                id: 3224,
+            },
+            CatalogField {
+                name: "mlUaqcRlShimCreationFailureCount",
+                id: 3225,
+            },
+            CatalogField {
                 name: "mlUndershootModelAvailableInCall",
                 id: 1633,
             },
@@ -8205,6 +8671,14 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "niCallId",
                 id: 2412,
+            },
+            CatalogField {
+                name: "niPassingTileQuadkey",
+                id: 3253,
+            },
+            CatalogField {
+                name: "niTileStatus",
+                id: 3254,
             },
             CatalogField {
                 name: "noAudioDuration",
@@ -9239,6 +9713,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 2394,
             },
             CatalogField {
+                name: "redPacketsDecoded",
+                id: 3213,
+            },
+            CatalogField {
                 name: "redPacketsDiscarded",
                 id: 2395,
             },
@@ -9623,6 +10101,26 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1594,
             },
             CatalogField {
+                name: "screenActionShown",
+                id: 3256,
+            },
+            CatalogField {
+                name: "screeningRecordingOnlyMs",
+                id: 3284,
+            },
+            CatalogField {
+                name: "screeningResult",
+                id: 3257,
+            },
+            CatalogField {
+                name: "screeningStreamingMs",
+                id: 3285,
+            },
+            CatalogField {
+                name: "screeningTriggerMode",
+                id: 3258,
+            },
+            CatalogField {
                 name: "sctpConnectionSetupT",
                 id: 2121,
             },
@@ -9639,8 +10137,36 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 2648,
             },
             CatalogField {
+                name: "selfBgTotalT",
+                id: 3230,
+            },
+            CatalogField {
+                name: "selfBgVideoRxBytes",
+                id: 3231,
+            },
+            CatalogField {
+                name: "selfBgWindowCount",
+                id: 3232,
+            },
+            CatalogField {
                 name: "selfBusyHours",
                 id: 2368,
+            },
+            CatalogField {
+                name: "selfFgToFirstVideoRenderT",
+                id: 3233,
+            },
+            CatalogField {
+                name: "selfFgToFirstVideoRxT",
+                id: 3234,
+            },
+            CatalogField {
+                name: "selfFgVideoRenderResumeCount",
+                id: 3235,
+            },
+            CatalogField {
+                name: "selfFgVideoRxResumeCount",
+                id: 3236,
             },
             CatalogField {
                 name: "selfMuteSuccessCount",
@@ -11091,6 +11617,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1867,
             },
             CatalogField {
+                name: "transportDrainTimeout",
+                id: 3237,
+            },
+            CatalogField {
                 name: "transportLastSendOsError",
                 id: 555,
             },
@@ -11359,6 +11889,22 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 2471,
             },
             CatalogField {
+                name: "uaqcRlAgreements",
+                id: 3226,
+            },
+            CatalogField {
+                name: "uaqcRlDecisions",
+                id: 3227,
+            },
+            CatalogField {
+                name: "uaqcRlDefers",
+                id: 3228,
+            },
+            CatalogField {
+                name: "uaqcRlUnavailable",
+                id: 3229,
+            },
+            CatalogField {
                 name: "uaqcTimeInBwManagedStateMs",
                 id: 2472,
             },
@@ -11473,6 +12019,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "uvmCellId",
                 id: 2415,
+            },
+            CatalogField {
+                name: "uvmTileId",
+                id: 3255,
             },
             CatalogField {
                 name: "uvqAvgInferenceLatencyMs",
@@ -11605,10 +12155,6 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "uwpVoipWindowIncomingAcceptToCallLayoutTime",
                 id: 1841,
-            },
-            CatalogField {
-                name: "uwpVoipWindowIncomingOfferToLayoutTime",
-                id: 1842,
             },
             CatalogField {
                 name: "uwpVoipWindowOutgoingLaunchTime",
@@ -11745,6 +12291,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "videoAv1Time",
                 id: 1687,
+            },
+            CatalogField {
+                name: "videoAv1TimePerSegment",
+                id: 3218,
             },
             CatalogField {
                 name: "videoAveDelayLtrp",
@@ -12435,8 +12985,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 334,
             },
             CatalogField {
+                name: "videoH264TimePerSegment",
+                id: 3219,
+            },
+            CatalogField {
                 name: "videoH265Time",
                 id: 335,
+            },
+            CatalogField {
+                name: "videoH265TimePerSegment",
+                id: 3220,
             },
             CatalogField {
                 name: "videoHeight",
@@ -13107,6 +13665,14 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 271,
             },
             CatalogField {
+                name: "videoVsrAppleTime",
+                id: 3171,
+            },
+            CatalogField {
+                name: "videoVsrTime",
+                id: 3172,
+            },
+            CatalogField {
                 name: "videoWebcodecsDecFatalErrorNum",
                 id: 2874,
             },
@@ -13217,6 +13783,34 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "voipWindowOutgoingLaunchTime",
                 id: 2281,
+            },
+            CatalogField {
+                name: "vsrAsyncFramesRendered",
+                id: 3238,
+            },
+            CatalogField {
+                name: "vsrAsyncFramesSubmitted",
+                id: 3239,
+            },
+            CatalogField {
+                name: "vsrAsyncRendersDuplicate",
+                id: 3240,
+            },
+            CatalogField {
+                name: "vsrAsyncRendersFallback",
+                id: 3241,
+            },
+            CatalogField {
+                name: "vsrAsyncRendersSkipped",
+                id: 3242,
+            },
+            CatalogField {
+                name: "vsrAsyncResultsDiscardedResChange",
+                id: 3243,
+            },
+            CatalogField {
+                name: "vsrAsyncSubmitsSkippedBusy",
+                id: 3244,
             },
             CatalogField {
                 name: "vsrAvgInferenceLatencyMs",
@@ -13575,6 +14169,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 2062,
             },
             CatalogField {
+                name: "weakNetConditionByMlModel",
+                id: 3245,
+            },
+            CatalogField {
                 name: "weakNetConditionByPlr",
                 id: 2063,
             },
@@ -13621,6 +14219,30 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "wearableDeviceTypes",
                 id: 3004,
+            },
+            CatalogField {
+                name: "webAtCallPermissionCamera",
+                id: 3276,
+            },
+            CatalogField {
+                name: "webAtCallPermissionMic",
+                id: 3277,
+            },
+            CatalogField {
+                name: "webAtCallPermissionNotification",
+                id: 3278,
+            },
+            CatalogField {
+                name: "webAtCallSettingBackgroundSync",
+                id: 3279,
+            },
+            CatalogField {
+                name: "webAtCallSettingCallNotifications",
+                id: 3280,
+            },
+            CatalogField {
+                name: "webAtCallSettingCallSound",
+                id: 3281,
             },
             CatalogField {
                 name: "webAudioCaptureOverrunCount",
@@ -13727,6 +14349,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 2851,
             },
             CatalogField {
+                name: "webAvSyncReorderCount",
+                id: 3180,
+            },
+            CatalogField {
                 name: "webAvSyncTimeOutOfSyncMs",
                 id: 2852,
             },
@@ -13747,6 +14373,62 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 2898,
             },
             CatalogField {
+                name: "webTabStateAtOffer",
+                id: 3282,
+            },
+            CatalogField {
+                name: "webTransportConfigEnabled",
+                id: 3164,
+            },
+            CatalogField {
+                name: "webTransportConnectAttempted",
+                id: 3165,
+            },
+            CatalogField {
+                name: "webTransportConnectOpened",
+                id: 3166,
+            },
+            CatalogField {
+                name: "webTransportFallbackPhase",
+                id: 3173,
+            },
+            CatalogField {
+                name: "webTransportFallbackReason",
+                id: 3174,
+            },
+            CatalogField {
+                name: "webTransportFallbackSctpConnectedMs",
+                id: 3175,
+            },
+            CatalogField {
+                name: "webTransportFallbackSctpStartMs",
+                id: 3176,
+            },
+            CatalogField {
+                name: "webTransportFallbackSinceAcceptMs",
+                id: 3177,
+            },
+            CatalogField {
+                name: "webTransportFallbackSinceCallStartMs",
+                id: 3178,
+            },
+            CatalogField {
+                name: "webTransportFallbackToFirstActiveMs",
+                id: 3179,
+            },
+            CatalogField {
+                name: "webTransportFallbackTriggered",
+                id: 3167,
+            },
+            CatalogField {
+                name: "webTransportRelayTrafficSent",
+                id: 3168,
+            },
+            CatalogField {
+                name: "webTransportRuntimeEligible",
+                id: 3169,
+            },
+            CatalogField {
                 name: "webTransportUsed",
                 id: 2900,
             },
@@ -13759,8 +14441,32 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 2908,
             },
             CatalogField {
+                name: "webVideoDecOrderingMode",
+                id: 3181,
+            },
+            CatalogField {
+                name: "webVideoDecOutOfOrderFrames",
+                id: 3182,
+            },
+            CatalogField {
+                name: "webVideoDecRefChainBreakCount",
+                id: 3183,
+            },
+            CatalogField {
+                name: "webVideoDecRefChainBrokenT",
+                id: 3184,
+            },
+            CatalogField {
                 name: "webVideoEncoderType",
                 id: 3032,
+            },
+            CatalogField {
+                name: "webVideoRenderFreezeT",
+                id: 3185,
+            },
+            CatalogField {
+                name: "webVideoRenderNumFreezes",
+                id: 3186,
             },
             CatalogField {
                 name: "webrtcCompatible",
@@ -13899,6 +14605,64 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 partial: false,
                 fields: &[],
             },
+            CallSite {
+                module: "WAWebVoipStaleOfferMissedCallFieldstats",
+                partial: true,
+                fields: &[
+                    CallSiteField {
+                        name: "callOfferElapsedT",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "callPeerAppVersion",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "callPeerPlatform",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "callRandomId",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "callReplayerId",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "callResult",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "callSide",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "callTermReason",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "callTestBucket",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "callWakeupSource",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "fieldStatsRowType",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "isLidCall",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "videoEnabled",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
         ],
     },
     EventCallSites {
@@ -13920,6 +14684,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "callType",
                 id: 4,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 12,
             },
             CatalogField {
                 name: "genaiBots",
@@ -13989,6 +14757,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 7,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 11,
+            },
+            CatalogField {
                 name: "isWaitingRoomEnabled",
                 id: 10,
             },
@@ -14026,7 +14798,25 @@ pub const CALL_SITES: &[EventCallSites] = &[
             },
             CallSite {
                 module: "WAWebVoipCallLinkSharePanel.react",
-                partial: false,
+                partial: true,
+                fields: &[
+                    CallSiteField {
+                        name: "callLinkAction",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "callLinkActionEntryPoint",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "callLinkMedia",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebVoipCallLinkSharePanel.react",
+                partial: true,
                 fields: &[
                     CallSiteField {
                         name: "callLinkAction",
@@ -14048,7 +14838,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
             },
             CallSite {
                 module: "WAWebVoipCallParticipantsDrawer.react",
-                partial: false,
+                partial: true,
                 fields: &[
                     CallSiteField {
                         name: "callLinkAction",
@@ -14070,7 +14860,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
             },
             CallSite {
                 module: "WAWebVoipCreateCallLinksPopup.react",
-                partial: false,
+                partial: true,
                 fields: &[
                     CallSiteField {
                         name: "callLinkAction",
@@ -14093,9 +14883,80 @@ pub const CALL_SITES: &[EventCallSites] = &[
         ],
     },
     EventCallSites {
+        event: "CallUserJourney",
+        code: 4568,
+        fields: &[
+            CatalogField {
+                name: "aiSessionId",
+                id: 10,
+            },
+            CatalogField {
+                name: "appSessionId",
+                id: 1,
+            },
+            CatalogField {
+                name: "callActionType",
+                id: 2,
+            },
+            CatalogField {
+                name: "callRandomId",
+                id: 3,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 15,
+            },
+            CatalogField {
+                name: "isCallConnected",
+                id: 7,
+            },
+            CatalogField {
+                name: "isGenaiAdded",
+                id: 11,
+            },
+            CatalogField {
+                name: "isGroupCall",
+                id: 12,
+            },
+            CatalogField {
+                name: "isVideoCall",
+                id: 13,
+            },
+            CatalogField {
+                name: "numConnectedParticipants",
+                id: 14,
+            },
+            CatalogField {
+                name: "subSurface",
+                id: 4,
+            },
+            CatalogField {
+                name: "traceIdInt",
+                id: 9,
+            },
+            CatalogField {
+                name: "uiSurface",
+                id: 6,
+            },
+            CatalogField {
+                name: "userJourneyEventMs",
+                id: 8,
+            },
+        ],
+        sites: &[CallSite {
+            module: "WAWebCallUserJourneyLogger",
+            partial: true,
+            fields: &[],
+        }],
+    },
+    EventCallSites {
         event: "CanonicalEntRecoveryCompanion",
         code: 7434,
         fields: &[
+            CatalogField {
+                name: "canonicalEntAuthVersion",
+                id: 14,
+            },
             CatalogField {
                 name: "canonicalEntEventCompanionMarker",
                 id: 1,
@@ -14131,6 +14992,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "canonicalEntStorageSource",
                 id: 10,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 13,
             },
             CatalogField {
                 name: "deviceId",
@@ -14193,6 +15058,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 7442,
         fields: &[
             CatalogField {
+                name: "canonicalEntAuthVersion",
+                id: 10,
+            },
+            CatalogField {
                 name: "canonicalEntRecoveryCriticalEventMetadata",
                 id: 1,
             },
@@ -14211,6 +15080,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "canonicalEntSequenceNumberSinceLastRegistration",
                 id: 7,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 9,
             },
             CatalogField {
                 name: "deviceId",
@@ -14295,6 +15168,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "collectionIndex",
                 id: 15,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 25,
             },
             CatalogField {
                 name: "deepLinkOpenFrom",
@@ -14995,6 +15872,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 2,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 9,
+            },
+            CatalogField {
                 name: "leafCertCommonName",
                 id: 3,
             },
@@ -15073,6 +15954,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "channelAdminSessionId",
                 id: 4,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 7,
             },
             CatalogField {
                 name: "unifiedSessionId",
@@ -15154,6 +16039,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "coreEventTrigger",
                 id: 21,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 22,
             },
             CatalogField {
                 name: "directoryChannelIndex",
@@ -15293,6 +16182,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 8,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 17,
+            },
+            CatalogField {
                 name: "impReason",
                 id: 9,
             },
@@ -15410,6 +16303,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 7,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 21,
+            },
+            CatalogField {
                 name: "discoverySurface",
                 id: 8,
             },
@@ -15498,6 +16395,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
+            CatalogField {
                 name: "unifiedSessionId",
                 id: 2,
             },
@@ -15543,6 +16444,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             },
             CatalogField { name: "cid", id: 3 },
             CatalogField {
+                name: "dedupKey",
+                id: 7,
+            },
+            CatalogField {
                 name: "unifiedSessionId",
                 id: 5,
             },
@@ -15583,6 +16488,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1,
             },
             CatalogField { name: "cid", id: 2 },
+            CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
             CatalogField {
                 name: "unifiedSessionId",
                 id: 3,
@@ -15629,16 +16538,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 9,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 15,
+            },
+            CatalogField {
                 name: "isOriginalAuthor",
                 id: 12,
             },
             CatalogField {
                 name: "isStarredPost",
                 id: 8,
-            },
-            CatalogField {
-                name: "isVpvImpression",
-                id: 7,
             },
             CatalogField {
                 name: "postId",
@@ -15679,10 +16588,6 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 },
                 CallSiteField {
                     name: "isStarredPost",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "isVpvImpression",
                     write: FieldWrite::Constructor,
                 },
                 CallSiteField {
@@ -15729,6 +16634,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 4,
             },
             CatalogField { name: "cid", id: 6 },
+            CatalogField {
+                name: "dedupKey",
+                id: 22,
+            },
             CatalogField {
                 name: "deeplinkSource",
                 id: 20,
@@ -15859,6 +16768,83 @@ pub const CALL_SITES: &[EventCallSites] = &[
         }],
     },
     EventCallSites {
+        event: "ChannelPostInteraction",
+        code: 8458,
+        fields: &[
+            CatalogField {
+                name: "channelDirectorySessionId",
+                id: 1,
+            },
+            CatalogField {
+                name: "channelEntryPoint",
+                id: 2,
+            },
+            CatalogField {
+                name: "channelPostInteractionType",
+                id: 3,
+            },
+            CatalogField {
+                name: "channelPostLinkPlacement",
+                id: 10,
+            },
+            CatalogField {
+                name: "channelUserType",
+                id: 4,
+            },
+            CatalogField { name: "cid", id: 5 },
+            CatalogField {
+                name: "dedupKey",
+                id: 9,
+            },
+            CatalogField {
+                name: "discoverySurface",
+                id: 6,
+            },
+            CatalogField {
+                name: "postId",
+                id: 7,
+            },
+            CatalogField {
+                name: "responseServerId",
+                id: 11,
+            },
+            CatalogField {
+                name: "responseSheetSessionId",
+                id: 12,
+            },
+            CatalogField {
+                name: "updatesTabSessionId",
+                id: 8,
+            },
+        ],
+        sites: &[CallSite {
+            module: "WAWebLogChannelPostInteraction",
+            partial: false,
+            fields: &[
+                CallSiteField {
+                    name: "channelPostInteractionType",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "channelPostLinkPlacement",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "channelUserType",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "cid",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "postId",
+                    write: FieldWrite::Constructor,
+                },
+            ],
+        }],
+    },
+    EventCallSites {
         event: "ChannelProducerInsightsNavigation",
         code: 5626,
         fields: &[
@@ -15883,6 +16869,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 5,
             },
             CatalogField { name: "cid", id: 6 },
+            CatalogField {
+                name: "dedupKey",
+                id: 10,
+            },
             CatalogField {
                 name: "producerInsightsSessionId",
                 id: 7,
@@ -15944,6 +16934,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 2,
             },
             CatalogField { name: "cid", id: 3 },
+            CatalogField {
+                name: "dedupKey",
+                id: 13,
+            },
             CatalogField {
                 name: "similarChannelDisplayRank",
                 id: 4,
@@ -16053,95 +17047,6 @@ pub const CALL_SITES: &[EventCallSites] = &[
         ],
     },
     EventCallSites {
-        event: "ChannelsVideoPlay",
-        code: 6556,
-        fields: &[
-            CatalogField {
-                name: "autoPlayT",
-                id: 1,
-            },
-            CatalogField { name: "cid", id: 2 },
-            CatalogField {
-                name: "finishCount",
-                id: 13,
-            },
-            CatalogField {
-                name: "height",
-                id: 3,
-            },
-            CatalogField {
-                name: "postId",
-                id: 4,
-            },
-            CatalogField {
-                name: "videoDuration",
-                id: 5,
-            },
-            CatalogField {
-                name: "videoInitialBufferingT",
-                id: 6,
-            },
-            CatalogField {
-                name: "videoPlayOrigin",
-                id: 7,
-            },
-            CatalogField {
-                name: "videoPlayResult",
-                id: 8,
-            },
-            CatalogField {
-                name: "videoPlayT",
-                id: 9,
-            },
-            CatalogField {
-                name: "videoPlayType",
-                id: 10,
-            },
-            CatalogField {
-                name: "videoSize",
-                id: 11,
-            },
-            CatalogField {
-                name: "watchingModule",
-                id: 14,
-            },
-            CatalogField {
-                name: "width",
-                id: 12,
-            },
-        ],
-        sites: &[CallSite {
-            module: "useWAWebNewsletterVideoPlayMetric",
-            partial: false,
-            fields: &[
-                CallSiteField {
-                    name: "cid",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "postId",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "videoPlayOrigin",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "videoPlayResult",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "videoPlayType",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "watchingModule",
-                    write: FieldWrite::Constructor,
-                },
-            ],
-        }],
-    },
-    EventCallSites {
         event: "ChatAction",
         code: 2312,
         fields: &[
@@ -16161,21 +17066,69 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 name: "chatActionType",
                 id: 1,
             },
+            CatalogField {
+                name: "conversationThreadId",
+                id: 6,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
+            CatalogField {
+                name: "threadInboxPosition",
+                id: 7,
+            },
         ],
-        sites: &[CallSite {
-            module: "WAWebWamChatActionEventsLogger",
-            partial: false,
-            fields: &[
-                CallSiteField {
-                    name: "chatActionEntryPoint",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "chatActionType",
-                    write: FieldWrite::Constructor,
-                },
-            ],
-        }],
+        sites: &[
+            CallSite {
+                module: "WAWebMetaAiChatActionEvents",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "chatActionChatType",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "chatActionEntryPoint",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "chatActionType",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "conversationThreadId",
+                        write: FieldWrite::Assigned,
+                    },
+                    CallSiteField {
+                        name: "threadInboxPosition",
+                        write: FieldWrite::Assigned,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebWamChatActionEventsLogger",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "chatActionChatType",
+                        write: FieldWrite::Assigned,
+                    },
+                    CallSiteField {
+                        name: "chatActionEntryPoint",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "chatActionType",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "conversationThreadId",
+                        write: FieldWrite::Assigned,
+                    },
+                ],
+            },
+        ],
     },
     EventCallSites {
         event: "ChatExport",
@@ -16184,6 +17137,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "chatType",
                 id: 1,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 10,
             },
             CatalogField {
                 name: "exportDateRangeUsed",
@@ -16272,6 +17229,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "activitySessionId",
                 id: 6,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 16,
             },
             CatalogField {
                 name: "filterType",
@@ -16405,6 +17366,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 2,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
+            CatalogField {
                 name: "folderType",
                 id: 1,
             },
@@ -16450,6 +17415,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 name: "chatThemesEnabled",
                 id: 2,
             },
+            CatalogField {
+                name: "dedupKey",
+                id: 3,
+            },
         ],
         sites: &[CallSite {
             module: "WAWebChatThemeLogger",
@@ -16490,6 +17459,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 name: "chatLockIsGroup",
                 id: 2,
             },
+            CatalogField {
+                name: "dedupKey",
+                id: 6,
+            },
         ],
         sites: &[CallSite {
             module: "WAWebChatLockWAMUtils",
@@ -16522,6 +17495,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "ChatLockDaily",
         code: 4214,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 7,
+            },
             CatalogField {
                 name: "folderChatsCount",
                 id: 1,
@@ -16761,6 +17738,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "commerceMsgsSent",
                 id: 40,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 265,
             },
             CatalogField {
                 name: "deviceLanguage",
@@ -17559,14 +18540,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 77,
             },
         ],
-        sites: &[CallSite {
-            module: "WAWebHandleGrowthNotification",
-            partial: false,
-            fields: &[CallSiteField {
-                name: "isInviteCreatedThread",
-                write: FieldWrite::Constructor,
-            }],
-        }],
+        sites: &[],
     },
     EventCallSites {
         event: "ChatMute",
@@ -17579,6 +18553,14 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "chatMuteNotificationChoice",
                 id: 5,
+            },
+            CatalogField {
+                name: "conversationThreadId",
+                id: 9,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 8,
             },
             CatalogField {
                 name: "muteChatType",
@@ -17597,6 +18579,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 2,
             },
             CatalogField {
+                name: "threadInboxPosition",
+                id: 10,
+            },
+            CatalogField {
                 name: "waOfficialAccountName",
                 id: 7,
             },
@@ -17607,19 +18593,11 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 partial: true,
                 fields: &[
                     CallSiteField {
-                        name: "actionConducted",
-                        write: FieldWrite::Constructor,
+                        name: "conversationThreadId",
+                        write: FieldWrite::Assigned,
                     },
                     CallSiteField {
                         name: "muteChatType",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "muteDuration",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "muteEntryPoint",
                         write: FieldWrite::Constructor,
                     },
                 ],
@@ -17627,20 +18605,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CallSite {
                 module: "WAWebChatMuteLogger",
                 partial: true,
-                fields: &[
-                    CallSiteField {
-                        name: "actionConducted",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "muteChatType",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "muteEntryPoint",
-                        write: FieldWrite::Constructor,
-                    },
-                ],
+                fields: &[CallSiteField {
+                    name: "muteChatType",
+                    write: FieldWrite::Constructor,
+                }],
             },
             CallSite {
                 module: "WAWebWamChatPSALogger",
@@ -17700,6 +18668,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "ChatPsaAction",
         code: 3572,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 6,
+            },
             CatalogField {
                 name: "messageMediaType",
                 id: 1,
@@ -17813,6 +18785,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 3574,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 6,
+            },
+            CatalogField {
                 name: "messageMediaType",
                 id: 1,
             },
@@ -17856,6 +18832,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "ChatPsaRemove",
         code: 3582,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 11,
+            },
             CatalogField {
                 name: "lastReceivedMediaType",
                 id: 2,
@@ -17969,6 +18949,14 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 6,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 8,
+            },
+            CatalogField {
+                name: "sharingResult",
+                id: 9,
+            },
+            CatalogField {
                 name: "wallpaperId",
                 id: 7,
             },
@@ -18035,6 +19023,14 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "colorSchemeId",
                 id: 8,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 10,
+            },
+            CatalogField {
+                name: "sharedThemeSetter",
+                id: 11,
             },
             CatalogField {
                 name: "threadId",
@@ -18116,6 +19112,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 name: "chatWallpaperVisit",
                 id: 4,
             },
+            CatalogField {
+                name: "dedupKey",
+                id: 6,
+            },
         ],
         sites: &[CallSite {
             module: "WAWebChatThemeLogger",
@@ -18158,6 +19158,58 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 name: "clockSkewHourly",
                 write: FieldWrite::Constructor,
             }],
+        }],
+    },
+    EventCallSites {
+        event: "CloudApiSignalEvent",
+        code: 8572,
+        fields: &[
+            CatalogField {
+                name: "cloudApiSignalCarouselCardIndex",
+                id: 1,
+            },
+            CatalogField {
+                name: "cloudApiSignalCtaAction",
+                id: 2,
+            },
+            CatalogField {
+                name: "cloudApiSignalCtaButtonIndex",
+                id: 3,
+            },
+            CatalogField {
+                name: "cloudApiSignalData",
+                id: 4,
+            },
+            CatalogField {
+                name: "cloudApiSignalTemplateType",
+                id: 5,
+            },
+            CatalogField {
+                name: "cloudApiSignalType",
+                id: 6,
+            },
+        ],
+        sites: &[CallSite {
+            module: "WAWebCloudApiSignalLogger",
+            partial: true,
+            fields: &[
+                CallSiteField {
+                    name: "cloudApiSignalCarouselCardIndex",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "cloudApiSignalCtaButtonIndex",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "cloudApiSignalData",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "cloudApiSignalType",
+                    write: FieldWrite::Constructor,
+                },
+            ],
         }],
     },
     EventCallSites {
@@ -18252,6 +19304,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 name: "communityId",
                 id: 6,
             },
+            CatalogField {
+                name: "dedupKey",
+                id: 7,
+            },
         ],
         sites: &[CallSite {
             module: "WAWebCommunityCreationFlowMetricUtils",
@@ -18299,6 +19355,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "communityUiFeature",
                 id: 3,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 5,
             },
         ],
         sites: &[
@@ -18400,6 +19460,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 name: "communityHomeViews",
                 id: 5,
             },
+            CatalogField {
+                name: "dedupKey",
+                id: 6,
+            },
         ],
         sites: &[CallSite {
             module: "WAWebTasksDailyStatsTask",
@@ -18452,6 +19516,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 name: "communityTabViewsViaContextMenu",
                 id: 5,
             },
+            CatalogField {
+                name: "dedupKey",
+                id: 6,
+            },
         ],
         sites: &[CallSite {
             module: "WAWebTasksDailyStatsTask",
@@ -18481,6 +19549,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 8576,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
+            CatalogField {
                 name: "webcEmailInviteAction",
                 id: 1,
             },
@@ -18492,21 +19564,65 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 name: "webcEmailInviteEntryPoint",
                 id: 3,
             },
+            CatalogField {
+                name: "webcEmailInviteFailedCount",
+                id: 5,
+            },
+            CatalogField {
+                name: "webcEmailInviteSentCount",
+                id: 6,
+            },
+            CatalogField {
+                name: "webcEmailInviteServerSendResult",
+                id: 7,
+            },
         ],
-        sites: &[CallSite {
-            module: "WAWebEmailInviteLoggingUtils",
-            partial: true,
-            fields: &[
-                CallSiteField {
-                    name: "webcEmailInviteAction",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "webcEmailInviteEntryPoint",
-                    write: FieldWrite::Constructor,
-                },
-            ],
-        }],
+        sites: &[
+            CallSite {
+                module: "WAWebEmailInviteLoggingUtils",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "webcEmailInviteAction",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "webcEmailInviteCount",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "webcEmailInviteEntryPoint",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "webcEmailInviteFailedCount",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "webcEmailInviteSentCount",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "webcEmailInviteServerSendResult",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebEmailInviteLoggingUtils",
+                partial: true,
+                fields: &[
+                    CallSiteField {
+                        name: "webcEmailInviteAction",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "webcEmailInviteEntryPoint",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+        ],
     },
     EventCallSites {
         event: "CompanionInviteContact",
@@ -18543,6 +19659,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "companionValidInviteCode",
                 id: 7,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 9,
             },
         ],
         sites: &[
@@ -18682,6 +19802,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 name: "companionWhatsappContactStatus",
                 id: 16,
             },
+            CatalogField {
+                name: "dedupKey",
+                id: 17,
+            },
         ],
         sites: &[CallSite {
             module: "WAWebContactLogging",
@@ -18815,6 +19939,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 2,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
+            CatalogField {
                 name: "groupSize",
                 id: 3,
             },
@@ -18855,12 +19983,20 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 5,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 7,
+            },
+            CatalogField {
                 name: "isSearchTargetBusiness",
                 id: 6,
             },
             CatalogField {
                 name: "isUsernameSearch",
                 id: 1,
+            },
+            CatalogField {
+                name: "keyEntryErrorType",
+                id: 8,
             },
             CatalogField {
                 name: "searchActionName",
@@ -18872,7 +20008,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
             },
         ],
         sites: &[CallSite {
-            module: "WAWebUsernameSearchLogger",
+            module: "WAWebContactSearchExperienceLogger",
             partial: true,
             fields: &[CallSiteField {
                 name: "isUsernameSearch",
@@ -18895,6 +20031,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "contactSyncConsecutiveCount",
                 id: 26,
+            },
+            CatalogField {
+                name: "contactSyncCreationTimestamp",
+                id: 42,
             },
             CatalogField {
                 name: "contactSyncDeviceResponseNew",
@@ -19043,6 +20183,14 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "contactSyncTypeIsSnapshot",
                 id: 32,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 41,
+            },
+            CatalogField {
+                name: "followupType",
+                id: 43,
             },
         ],
         sites: &[
@@ -19209,6 +20357,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 11,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 23,
+            },
+            CatalogField {
                 name: "languageCode",
                 id: 21,
             },
@@ -19299,6 +20451,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "crashType",
                 id: 6,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 37,
             },
             CatalogField {
                 name: "iphoneProcessNonGlobal",
@@ -19393,6 +20549,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 3,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 10,
+            },
+            CatalogField {
                 name: "extraDebug",
                 id: 7,
             },
@@ -19409,20 +20569,98 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 9,
             },
         ],
-        sites: &[CallSite {
-            module: "WAWebFetchAndUpdateBlocklistJob",
-            partial: false,
-            fields: &[
-                CallSiteField {
-                    name: "debug",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
+        sites: &[
+            CallSite {
+                module: "WAWebChatdLoginIdentity",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "debug",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "name",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebChatdLoginIdentity",
+                partial: false,
+                fields: &[CallSiteField {
                     name: "name",
                     write: FieldWrite::Constructor,
-                },
-            ],
-        }],
+                }],
+            },
+            CallSite {
+                module: "WAWebFetchAndUpdateBlocklistJob",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "debug",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "name",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebHatchCvmCriticalEvents",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "crashlogType",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "name",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebMetaAiOpenGroupNux",
+                partial: false,
+                fields: &[CallSiteField {
+                    name: "name",
+                    write: FieldWrite::Constructor,
+                }],
+            },
+            CallSite {
+                module: "WAWebReportingTokenUtils",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "context",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "name",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebSendMsgCommonApi",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "context",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "debug",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "name",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+        ],
     },
     EventCallSites {
         event: "Ctwa1pdConversion",
@@ -19553,6 +20791,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 10,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 12,
+            },
+            CatalogField {
                 name: "threadIdHmac",
                 id: 11,
             },
@@ -19648,6 +20890,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 name: "ctwaTrackingPayload",
                 id: 6,
             },
+            CatalogField {
+                name: "dedupKey",
+                id: 11,
+            },
         ],
         sites: &[CallSite {
             module: "WAWebSmb3pdConversionSignalAction",
@@ -19738,6 +20984,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "ctwaAdAccountType",
                 id: 1,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 13,
             },
             CatalogField {
                 name: "extraAttributes",
@@ -19863,6 +21113,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 name: "ctwaBizUserJourneyOperation",
                 id: 2,
             },
+            CatalogField {
+                name: "dedupKey",
+                id: 8,
+            },
         ],
         sites: &[CallSite {
             module: "WAWebCtwaLogger",
@@ -19964,6 +21218,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 10,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 12,
+            },
+            CatalogField {
                 name: "deepLinkConversionData",
                 id: 4,
             },
@@ -20005,6 +21263,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "customerAdsSharingSettingEnabled",
                 id: 11,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 12,
             },
             CatalogField {
                 name: "deepLinkConversionData",
@@ -20243,6 +21505,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 206,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 263,
+            },
+            CatalogField {
                 name: "defaultAfterReadDuration",
                 id: 248,
             },
@@ -20317,6 +21583,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "inNetworkContactsSize",
                 id: 190,
+            },
+            CatalogField {
+                name: "inNetworkUniqueLidContactsSize",
+                id: 264,
             },
             CatalogField {
                 name: "installedAnimatedStickerPackCount",
@@ -20623,10 +21893,6 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 8,
             },
             CatalogField {
-                name: "receivedExperienceIds",
-                id: 262,
-            },
-            CatalogField {
                 name: "secretCodeActive",
                 id: 172,
             },
@@ -20739,6 +22005,14 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 22,
             },
             CatalogField {
+                name: "webPermissionCamera",
+                id: 267,
+            },
+            CatalogField {
+                name: "webPermissionMic",
+                id: 268,
+            },
+            CatalogField {
                 name: "webcContactsTableSize",
                 id: 207,
             },
@@ -20785,6 +22059,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "DeepLinkClick",
         code: 1156,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 7,
+            },
             CatalogField {
                 name: "deepLinkHasPhoneNumber",
                 id: 2,
@@ -20892,6 +22170,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 3198,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 3,
+            },
+            CatalogField {
                 name: "deepLinkAction",
                 id: 1,
             },
@@ -20922,6 +22204,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "campaign",
                 id: 8,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 10,
             },
             CatalogField {
                 name: "deepLinkOpenFrom",
@@ -20984,6 +22270,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
+            CatalogField {
                 name: "defenseModeClickAccepted",
                 id: 2,
             },
@@ -21015,6 +22305,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "DefenseModeQuarantine",
         code: 7098,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
             CatalogField {
                 name: "defenseModeQuarantineEventCount",
                 id: 2,
@@ -21108,6 +22402,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 7068,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
+            CatalogField {
                 name: "dialogEventSource",
                 id: 1,
             },
@@ -21146,6 +22444,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "chatsSelected",
                 id: 1,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 10,
             },
             CatalogField {
                 name: "dmChatPickerEntryPoint",
@@ -21262,6 +22564,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 17,
+            },
+            CatalogField {
                 name: "isAGroup",
                 id: 2,
             },
@@ -21317,24 +22623,6 @@ pub const CALL_SITES: &[EventCallSites] = &[
         sites: &[
             CallSite {
                 module: "WAWebChatlistFunctional.react",
-                partial: false,
-                fields: &[
-                    CallSiteField {
-                        name: "isAGroup",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "isAdmin",
-                        write: FieldWrite::Assigned,
-                    },
-                    CallSiteField {
-                        name: "kicActionName",
-                        write: FieldWrite::Constructor,
-                    },
-                ],
-            },
-            CallSite {
-                module: "WAWebChatlist_DEPRECATED.react",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -21504,6 +22792,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 5,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 11,
+            },
+            CatalogField {
                 name: "disappearingModeEntryPoint",
                 id: 4,
             },
@@ -21620,6 +22912,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 3446,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 7,
+            },
+            CatalogField {
                 name: "disappearingModeEntryPoint",
                 id: 5,
             },
@@ -21706,6 +23002,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 7162,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
+            CatalogField {
                 name: "dyiDownloadErrorMessage",
                 id: 3,
             },
@@ -21737,6 +23037,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "DyiReportRequest",
         code: 7166,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
             CatalogField {
                 name: "dyiReportType",
                 id: 1,
@@ -21780,6 +23084,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "botType",
                 id: 19,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 33,
             },
             CatalogField {
                 name: "e2eCiphertextType",
@@ -21856,6 +23164,14 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "offline",
                 id: 9,
+            },
+            CatalogField {
+                name: "pqReceiveGateState",
+                id: 34,
+            },
+            CatalogField {
+                name: "privateAiFeatureName",
+                id: 35,
             },
             CatalogField {
                 name: "processingDeferred",
@@ -21990,6 +23306,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 17,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 29,
+            },
+            CatalogField {
                 name: "e2eBackfill",
                 id: 18,
             },
@@ -22076,6 +23396,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "messageTypeStr",
                 id: 28,
+            },
+            CatalogField {
+                name: "privateAiFeatureName",
+                id: 30,
             },
             CatalogField {
                 name: "retryCount",
@@ -22210,6 +23534,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 3578,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 14,
+            },
+            CatalogField {
                 name: "e2eSenderType",
                 id: 10,
             },
@@ -22275,11 +23603,19 @@ pub const CALL_SITES: &[EventCallSites] = &[
                     write: FieldWrite::Assigned,
                 },
                 CallSiteField {
+                    name: "isPq",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
                     name: "messageType",
                     write: FieldWrite::Constructor,
                 },
                 CallSiteField {
                     name: "msgRetryCount",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "pqFallbackReason",
                     write: FieldWrite::Constructor,
                 },
                 CallSiteField {
@@ -22308,6 +23644,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "businessProfileEntryPoint",
                 id: 10,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 14,
             },
             CatalogField {
                 name: "editBusinessProfileSessionId",
@@ -22434,6 +23774,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 3990,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 11,
+            },
+            CatalogField {
                 name: "editDuration",
                 id: 1,
             },
@@ -22513,6 +23857,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "EphemeralOutOfSyncInfo",
         code: 3892,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 10,
+            },
             CatalogField {
                 name: "groupSizeBucket",
                 id: 1,
@@ -22594,6 +23942,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 13,
+            },
+            CatalogField {
                 name: "ephemeralSettingEntryPoint",
                 id: 3,
             },
@@ -22655,6 +24007,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "clientEphemeralityTriggerAction",
                 id: 5,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 15,
             },
             CatalogField {
                 name: "esrDisappearingModeInitiator",
@@ -22779,6 +24135,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "clientEphemeralityTriggerAction",
                 id: 5,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 21,
             },
             CatalogField {
                 name: "esrDisappearingModeInitiator",
@@ -23233,6 +24593,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 13,
+            },
+            CatalogField {
                 name: "forwardActionUserJourneyAction",
                 id: 2,
             },
@@ -23324,6 +24688,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "ForwardSend",
         code: 1728,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 29,
+            },
             CatalogField {
                 name: "disappearingChatInitiator",
                 id: 21,
@@ -23444,6 +24812,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 7952,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 6,
+            },
+            CatalogField {
                 name: "signupEntryPoint",
                 id: 1,
             },
@@ -23496,6 +24868,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 3,
+            },
+            CatalogField {
                 name: "selfInitiated",
                 id: 2,
             },
@@ -23534,10 +24910,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "GatedMessageReceived",
         code: 3152,
-        fields: &[CatalogField {
-            name: "chatGatedReason",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "chatGatedReason",
+                id: 1,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+        ],
         sites: &[
             CallSite {
                 module: "WAWebLogReceivedMessages",
@@ -23560,10 +24942,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "GifFromProviderSent",
         code: 1124,
-        fields: &[CatalogField {
-            name: "gifSearchProvider",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+            CatalogField {
+                name: "gifSearchProvider",
+                id: 1,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebGifPanelGifSearch.react",
             partial: false,
@@ -23576,10 +24964,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "GifSearchCancelled",
         code: 1126,
-        fields: &[CatalogField {
-            name: "gifSearchProvider",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+            CatalogField {
+                name: "gifSearchProvider",
+                id: 1,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebGifPanelGifSearch.react",
             partial: false,
@@ -23593,6 +24987,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "GifSearchNoResults",
         code: 1128,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
             CatalogField {
                 name: "gifSearchProvider",
                 id: 1,
@@ -23620,6 +25018,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 1122,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 3,
+            },
+            CatalogField {
                 name: "gifSearchProvider",
                 id: 1,
             },
@@ -23646,10 +25048,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "GifSearchSessionStarted",
         code: 1134,
-        fields: &[CatalogField {
-            name: "gifSearchProvider",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+            CatalogField {
+                name: "gifSearchProvider",
+                id: 1,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebGifPanelGifSearch.react",
             partial: false,
@@ -23716,6 +25124,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 2,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 6,
+            },
+            CatalogField {
                 name: "groupBulkRemovalAction",
                 id: 3,
             },
@@ -23758,10 +25170,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "GroupCatchUp",
         code: 3058,
-        fields: &[CatalogField {
-            name: "mentionsCountPendingPercentage",
-            id: 4,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
+            CatalogField {
+                name: "mentionsCountPendingPercentage",
+                id: 4,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebConversationMsgs.react",
             partial: false,
@@ -23775,6 +25193,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "GroupCreate",
         code: 594,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
             CatalogField {
                 name: "ephemeralityDuration",
                 id: 2,
@@ -23810,7 +25232,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "GroupCreateC",
         code: 156,
-        fields: &[],
+        fields: &[CatalogField {
+            name: "dedupKey",
+            id: 1,
+        }],
         sites: &[CallSite {
             module: "WAWebGroupCreateJob",
             partial: false,
@@ -23821,6 +25246,14 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "GroupHistoryReceiverUserJourney",
         code: 7064,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 15,
+            },
+            CatalogField {
+                name: "groupHistoryBundleApplyDurationMs",
+                id: 16,
+            },
             CatalogField {
                 name: "groupHistoryDbIgnoredOlderMessages",
                 id: 9,
@@ -23848,6 +25281,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "groupHistoryUncountedMessagesCount",
                 id: 14,
+            },
+            CatalogField {
+                name: "hasChatThemeMessage",
+                id: 17,
             },
             CatalogField {
                 name: "isAutoProcess",
@@ -23906,12 +25343,24 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 22,
+            },
+            CatalogField {
                 name: "groupAddMemberEntryPoint",
                 id: 17,
             },
             CatalogField {
                 name: "groupCreateEntryPoint",
                 id: 20,
+            },
+            CatalogField {
+                name: "groupHistoryBundleBuildDurationMs",
+                id: 23,
+            },
+            CatalogField {
+                name: "groupHistoryBundleDeflatedBytes",
+                id: 24,
             },
             CatalogField {
                 name: "groupHistoryMessagesCount",
@@ -23934,12 +25383,20 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 6,
             },
             CatalogField {
+                name: "groupHistoryToggleMode",
+                id: 25,
+            },
+            CatalogField {
                 name: "groupHistoryUncountedMessagesCount",
                 id: 7,
             },
             CatalogField {
                 name: "groupSize",
                 id: 8,
+            },
+            CatalogField {
+                name: "hasChatThemeMessage",
+                id: 30,
             },
             CatalogField {
                 name: "ineligibleReason",
@@ -23960,6 +25417,22 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "recipientCount",
                 id: 10,
+            },
+            CatalogField {
+                name: "toggleAdminActivated",
+                id: 26,
+            },
+            CatalogField {
+                name: "toggleDefaultOn",
+                id: 27,
+            },
+            CatalogField {
+                name: "togglePerGroupUsageActivated",
+                id: 28,
+            },
+            CatalogField {
+                name: "toggleUserActivated",
+                id: 29,
             },
             CatalogField {
                 name: "uiSurface",
@@ -23998,9 +25471,96 @@ pub const CALL_SITES: &[EventCallSites] = &[
         }],
     },
     EventCallSites {
+        event: "GroupInviteLinkClick",
+        code: 3526,
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
+            CatalogField {
+                name: "groupInviteLinkClickAction",
+                id: 3,
+            },
+            CatalogField {
+                name: "groupInviteLinkClickGroupId",
+                id: 4,
+            },
+            CatalogField {
+                name: "groupInviteLinkEntryPoint",
+                id: 1,
+            },
+            CatalogField {
+                name: "groupTypeClient",
+                id: 2,
+            },
+        ],
+        sites: &[CallSite {
+            module: "WAWebAddMemberInviteLinkLogger",
+            partial: false,
+            fields: &[
+                CallSiteField {
+                    name: "groupInviteLinkClickGroupId",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "groupInviteLinkEntryPoint",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "groupTypeClient",
+                    write: FieldWrite::Constructor,
+                },
+            ],
+        }],
+    },
+    EventCallSites {
+        event: "GroupInviteLinkPageVisit",
+        code: 7380,
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
+            CatalogField {
+                name: "groupId",
+                id: 1,
+            },
+            CatalogField {
+                name: "inviteLinkEntryPoint",
+                id: 2,
+            },
+            CatalogField {
+                name: "userJourneyEventMs",
+                id: 3,
+            },
+        ],
+        sites: &[CallSite {
+            module: "WAWebAddMemberInviteLinkLogger",
+            partial: false,
+            fields: &[
+                CallSiteField {
+                    name: "groupId",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "inviteLinkEntryPoint",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "userJourneyEventMs",
+                    write: FieldWrite::Constructor,
+                },
+            ],
+        }],
+    },
+    EventCallSites {
         event: "GroupJoinC",
         code: 158,
-        fields: &[],
+        fields: &[CatalogField {
+            name: "dedupKey",
+            id: 1,
+        }],
         sites: &[CallSite {
             module: "WAWebHandleGroupCreation",
             partial: false,
@@ -24018,6 +25578,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "appSessionId",
                 id: 2,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 8,
             },
             CatalogField {
                 name: "groupSize",
@@ -24086,6 +25650,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "bundleSendSource",
                 id: 20,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 31,
             },
             CatalogField {
                 name: "frequentlyContactedIndex",
@@ -24197,11 +25765,27 @@ pub const CALL_SITES: &[EventCallSites] = &[
             partial: true,
             fields: &[
                 CallSiteField {
+                    name: "groupAddMemberEntryPoint",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "isAdmin",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "uiSurface",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
                     name: "unifiedSessionId",
                     write: FieldWrite::Constructor,
                 },
                 CallSiteField {
                     name: "userJourneyEventMs",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "userJourneyFunnelId",
                     write: FieldWrite::Constructor,
                 },
             ],
@@ -24211,6 +25795,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "GroupMemberTagUpdate",
         code: 7010,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 8,
+            },
             CatalogField {
                 name: "groupId",
                 id: 1,
@@ -24280,6 +25868,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 7768,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 6,
+            },
+            CatalogField {
                 name: "fetchedMessageCount",
                 id: 1,
             },
@@ -24313,6 +25905,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "GroupProfilePicture",
         code: 3652,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 8,
+            },
             CatalogField {
                 name: "groupCreationDs",
                 id: 1,
@@ -24402,6 +25998,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 7574,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 8,
+            },
+            CatalogField {
                 name: "groupJid",
                 id: 5,
             },
@@ -24466,6 +26066,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 7146,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 3,
+            },
+            CatalogField {
                 name: "guestUpsellAction",
                 id: 1,
             },
@@ -24498,8 +26102,48 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1,
             },
             CatalogField {
+                name: "connectorId",
+                id: 12,
+            },
+            CatalogField {
+                name: "connectorPermissionDecisionType",
+                id: 13,
+            },
+            CatalogField {
+                name: "connectorPermissionFlow",
+                id: 14,
+            },
+            CatalogField {
+                name: "connectorPermissionType",
+                id: 15,
+            },
+            CatalogField {
+                name: "connectorType",
+                id: 16,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 11,
+            },
+            CatalogField {
+                name: "featureEntryPoint",
+                id: 17,
+            },
+            CatalogField {
                 name: "hatchActionType",
                 id: 3,
+            },
+            CatalogField {
+                name: "hatchSubSurface",
+                id: 18,
+            },
+            CatalogField {
+                name: "hatchSurface",
+                id: 19,
+            },
+            CatalogField {
+                name: "hatchUserJourneyMetadata",
+                id: 20,
             },
             CatalogField {
                 name: "hitlIsMulti",
@@ -24539,7 +26183,39 @@ pub const CALL_SITES: &[EventCallSites] = &[
                     write: FieldWrite::Constructor,
                 },
                 CallSiteField {
+                    name: "connectorId",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "connectorPermissionDecisionType",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "connectorPermissionFlow",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "connectorPermissionType",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "connectorType",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "featureEntryPoint",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
                     name: "hatchActionType",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "hatchSurface",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "hatchUserJourneyMetadata",
                     write: FieldWrite::Constructor,
                 },
                 CallSiteField {
@@ -24576,7 +26252,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "HfmTextSearchComplete",
         code: 2186,
-        fields: &[],
+        fields: &[CatalogField {
+            name: "dedupKey",
+            id: 1,
+        }],
         sites: &[
             CallSite {
                 module: "WAWebSearchTheWebCommonUtils",
@@ -24604,6 +26283,18 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 14,
             },
             CatalogField {
+                name: "aiSubSessionId",
+                id: 25,
+            },
+            CatalogField {
+                name: "componentId",
+                id: 24,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 19,
+            },
+            CatalogField {
                 name: "imagineAction",
                 id: 1,
             },
@@ -24628,8 +26319,28 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 5,
             },
             CatalogField {
+                name: "imagineBlockReason",
+                id: 20,
+            },
+            CatalogField {
+                name: "imagineErrorReason",
+                id: 27,
+            },
+            CatalogField {
+                name: "imagineImagesRequested",
+                id: 28,
+            },
+            CatalogField {
+                name: "imagineImagesSucceeded",
+                id: 29,
+            },
+            CatalogField {
                 name: "imagineMediaType",
                 id: 12,
+            },
+            CatalogField {
+                name: "imagineRequestId",
+                id: 31,
             },
             CatalogField {
                 name: "implementationType",
@@ -24640,8 +26351,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 6,
             },
             CatalogField {
+                name: "isCanonicalThread",
+                id: 26,
+            },
+            CatalogField {
                 name: "isSent",
                 id: 7,
+            },
+            CatalogField {
+                name: "isSuggestedPrompt",
+                id: 21,
             },
             CatalogField {
                 name: "maxIndex",
@@ -24652,8 +26371,20 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 16,
             },
             CatalogField {
+                name: "proactiveMessageCampaignId",
+                id: 30,
+            },
+            CatalogField {
                 name: "selectedImageIndex",
                 id: 10,
+            },
+            CatalogField {
+                name: "suggestedPromptIndex",
+                id: 22,
+            },
+            CatalogField {
+                name: "suggestionCount",
+                id: 23,
             },
             CatalogField {
                 name: "textModality",
@@ -24686,6 +26417,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 },
                 CallSiteField {
                     name: "imagineActionTarget",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "imagineActionThreadType",
                     write: FieldWrite::Constructor,
                 },
                 CallSiteField {
@@ -24726,6 +26461,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "botType",
                 id: 14,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 25,
             },
             CatalogField {
                 name: "e2eCiphertextType",
@@ -24782,6 +26521,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "offlineCount",
                 id: 11,
+            },
+            CatalogField {
+                name: "privateAiFeatureName",
+                id: 26,
             },
             CatalogField {
                 name: "processingDeferred",
@@ -24928,6 +26671,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 partial: false,
                 fields: &[
                     CallSiteField {
+                        name: "botType",
+                        write: FieldWrite::Assigned,
+                    },
+                    CallSiteField {
                         name: "e2eCiphertextType",
                         write: FieldWrite::Constructor,
                     },
@@ -24994,6 +26741,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "chatSize",
                 id: 14,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 17,
             },
             CatalogField {
                 name: "inlineVideoCancelBeforePlayStateT",
@@ -25096,6 +26847,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 41,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 57,
+            },
+            CatalogField {
                 name: "groupAcceptNoCriticalGroupUpdate",
                 id: 37,
             },
@@ -25126,6 +26881,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "isFromCallLink",
                 id: 32,
+            },
+            CatalogField {
+                name: "isGuestParticipant",
+                id: 58,
             },
             CatalogField {
                 name: "isLidCall",
@@ -25299,6 +27058,44 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 partial: false,
                 fields: &[],
             },
+            CallSite {
+                module: "WAWebVoipOneOnOneJoinableCall",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "callRandomId",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "callSide",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "isOneOnOneCall",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "legacyCallResult",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "lobbyEntryPoint",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "lobbyExit",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "lobbyVisibleT",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "videoEnabled",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
         ],
     },
     EventCallSites {
@@ -25308,6 +27105,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "canEditDmSettings",
                 id: 7,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 8,
             },
             CatalogField {
                 name: "isAGroup",
@@ -25362,6 +27163,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 3484,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 11,
+            },
+            CatalogField {
                 name: "kicGroupNotificationTaps",
                 id: 3,
             },
@@ -25408,6 +27213,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "chatEphemeralityDuration",
                 id: 1,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 5,
             },
             CatalogField {
                 name: "kicNuxActionName",
@@ -25520,6 +27329,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "chatEphemeralityDuration",
                 id: 1,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 8,
             },
             CatalogField {
                 name: "kicErrorCode",
@@ -25690,6 +27503,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 9,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 21,
+            },
+            CatalogField {
                 name: "entryPointConversionSource",
                 id: 10,
             },
@@ -25777,6 +27594,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 10,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 16,
+            },
+            CatalogField {
                 name: "fakeLidCount",
                 id: 3,
             },
@@ -25853,6 +27674,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 24,
+            },
+            CatalogField {
                 name: "lidMigrationSource",
                 id: 7,
             },
@@ -25867,6 +27692,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "numberOfChatsWithClientAssignedLid",
                 id: 8,
+            },
+            CatalogField {
+                name: "numberOfChatsWithInvalidPnMapping",
+                id: 25,
             },
             CatalogField {
                 name: "numberOfDeprecatedChats",
@@ -25952,6 +27781,22 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 6390,
         fields: &[
             CatalogField {
+                name: "acpInteractionType",
+                id: 5,
+            },
+            CatalogField {
+                name: "acpSurface",
+                id: 6,
+            },
+            CatalogField {
+                name: "acpVersion",
+                id: 7,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
+            CatalogField {
                 name: "opusAction",
                 id: 3,
             },
@@ -25978,6 +27823,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 5830,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 16,
+            },
+            CatalogField {
                 name: "groupsAdded",
                 id: 9,
             },
@@ -25996,6 +27845,14 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "listType",
                 id: 3,
+            },
+            CatalogField {
+                name: "mentionsAndRepliesCacheBuildChatCount",
+                id: 14,
+            },
+            CatalogField {
+                name: "mentionsAndRepliesCacheBuildDurationMs",
+                id: 15,
             },
             CatalogField {
                 name: "predefinedId",
@@ -26033,6 +27890,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 7,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 13,
+            },
+            CatalogField {
                 name: "listAction",
                 id: 1,
             },
@@ -26047,6 +27908,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "listUpdateUserJourneyAction",
                 id: 4,
+            },
+            CatalogField {
+                name: "mentionsAndRepliesFilterChatCount",
+                id: 12,
             },
             CatalogField {
                 name: "predefinedId",
@@ -26079,6 +27944,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "LockFolderUnlock",
         code: 4218,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
             CatalogField {
                 name: "landingSurface",
                 id: 1,
@@ -26138,6 +28007,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "connectionT",
                 id: 5,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 30,
             },
             CatalogField {
                 name: "dnsResolutionMethod",
@@ -26255,6 +28128,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 13,
+            },
+            CatalogField {
                 name: "itemsCount",
                 id: 7,
             },
@@ -26337,6 +28214,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "catalogSessionId",
                 id: 2,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 20,
             },
             CatalogField {
                 name: "itemsCount",
@@ -26469,6 +28350,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "ctwaLoginType",
                 id: 59,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 68,
             },
             CatalogField {
                 name: "defaultAdsContentSelected",
@@ -26689,6 +28574,36 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 partial: false,
                 fields: &[
                     CallSiteField {
+                        name: "adsContentSelected",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "itemCount",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "lwiFlowId",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "lwiScreenAction",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "lwiScreenReference",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "userHasCatalogItemsToPromote",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebAdCreationLogger",
+                partial: false,
+                fields: &[
+                    CallSiteField {
                         name: "lwiAdsIdentityType",
                         write: FieldWrite::Constructor,
                     },
@@ -26732,6 +28647,28 @@ pub const CALL_SITES: &[EventCallSites] = &[
                     },
                     CallSiteField {
                         name: "lwiScreenReference",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebAdCreationLogger",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "lwiFlowId",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "lwiScreenAction",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "lwiScreenReference",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "userHasCatalogItemsToPromote",
                         write: FieldWrite::Constructor,
                     },
                 ],
@@ -26827,10 +28764,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "ManageAdsEntryPointImpression",
         code: 4124,
-        fields: &[CatalogField {
-            name: "manageAdsEntryPoint",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+            CatalogField {
+                name: "manageAdsEntryPoint",
+                id: 1,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebBizNativeAdsWamLogger",
             partial: false,
@@ -26867,6 +28810,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "mmUserControlsRolloutVariant",
                 id: 5,
+            },
+            CatalogField {
+                name: "psIdNewSot",
+                id: 11,
             },
             CatalogField {
                 name: "sequenceNumber",
@@ -26923,10 +28870,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "MdAppStateDirtyBits",
         code: 2520,
-        fields: &[CatalogField {
-            name: "dirtyBitsFalsePositive",
-            id: 2,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 3,
+            },
+            CatalogField {
+                name: "dirtyBitsFalsePositive",
+                id: 2,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebHandleDirtyBits",
             partial: false,
@@ -26947,6 +28900,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "companionSessionIds",
                 id: 3,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 11,
             },
             CatalogField {
                 name: "mdAppStateKeyRotationReason",
@@ -26985,10 +28942,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "MdAppStateMessageRange",
         code: 2522,
-        fields: &[CatalogField {
-            name: "additionalMessagesCount",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "additionalMessagesCount",
+                id: 1,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebCollectionHandlerWamMutation",
             partial: false,
@@ -27001,10 +28964,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "MdAppStateOfflineNotifications",
         code: 2602,
-        fields: &[CatalogField {
-            name: "redundantCount",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+            CatalogField {
+                name: "redundantCount",
+                id: 1,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebHandleReportServerSyncNotification",
             partial: false,
@@ -27021,6 +28990,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "crossIndexConflictCount",
                 id: 11,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 13,
             },
             CatalogField {
                 name: "invalidActionCount",
@@ -27159,6 +29132,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 2176,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 11,
+            },
+            CatalogField {
                 name: "dsmError",
                 id: 2,
             },
@@ -27219,12 +29196,20 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 6,
+            },
+            CatalogField {
                 name: "mdBootstrapPayloadType",
                 id: 2,
             },
             CatalogField {
                 name: "mdRegAttemptId",
                 id: 3,
+            },
+            CatalogField {
+                name: "mdRegAttemptIdPn",
+                id: 7,
             },
             CatalogField {
                 name: "mdSessionId",
@@ -27271,6 +29256,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 13,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 18,
+            },
+            CatalogField {
                 name: "historySyncRetryRequestId",
                 id: 16,
             },
@@ -27301,6 +29290,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "mdRegAttemptId",
                 id: 10,
+            },
+            CatalogField {
+                name: "mdRegAttemptIdPn",
+                id: 19,
             },
             CatalogField {
                 name: "mdSessionId",
@@ -27395,6 +29388,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 5,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 27,
+            },
+            CatalogField {
                 name: "gkContext",
                 id: 26,
             },
@@ -27453,6 +29450,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "mdRegAttemptId",
                 id: 9,
+            },
+            CatalogField {
+                name: "mdRegAttemptIdPn",
+                id: 28,
             },
             CatalogField {
                 name: "mdSessionId",
@@ -27585,6 +29586,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 17,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 22,
+            },
+            CatalogField {
                 name: "historySyncChunkOrder",
                 id: 15,
             },
@@ -27635,6 +29640,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "mdRegAttemptId",
                 id: 12,
+            },
+            CatalogField {
+                name: "mdRegAttemptIdPn",
+                id: 23,
             },
             CatalogField {
                 name: "mdSessionId",
@@ -27700,6 +29709,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "MdBootstrapHistoryDataReceived",
         code: 2998,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 9,
+            },
             CatalogField {
                 name: "historySyncChunkOrder",
                 id: 6,
@@ -27768,6 +29781,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "MdBootstrapHistoryDataStartDownloading",
         code: 4650,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 10,
+            },
             CatalogField {
                 name: "historySyncChunkOrder",
                 id: 1,
@@ -27845,6 +29862,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 13,
+            },
+            CatalogField {
                 name: "isLoopRunning",
                 id: 12,
             },
@@ -27890,7 +29911,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
             },
         ],
         sites: &[CallSite {
-            module: "WAWebLogHistorySyncStatusAfterPairingJob",
+            module: "WAWebCommitHistorySyncStatusData",
             partial: false,
             fields: &[
                 CallSiteField {
@@ -27984,6 +30005,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 name: "chatsCnt",
                 id: 10,
             },
+            CatalogField {
+                name: "dedupKey",
+                id: 11,
+            },
         ],
         sites: &[CallSite {
             module: "WAWebChatAssignmentLogEvents",
@@ -28024,6 +30049,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "MdChatAssignmentSecondaryAction",
         code: 3716,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 9,
+            },
             CatalogField {
                 name: "mdChatAssignmentSecondaryActionAgentId",
                 id: 1,
@@ -28089,6 +30118,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 2,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 6,
+            },
+            CatalogField {
                 name: "mdCriticalEventCode",
                 id: 1,
             },
@@ -28131,6 +30164,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "chatType",
                 id: 1,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 9,
             },
             CatalogField {
                 name: "encryptionType",
@@ -28205,6 +30242,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 5,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 10,
+            },
+            CatalogField {
                 name: "isCustomAgentName",
                 id: 6,
             },
@@ -28269,6 +30310,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "daysSinceLastPeriodicSync",
                 id: 11,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 52,
             },
             CatalogField {
                 name: "didBootstrapFromSnapshot",
@@ -28403,6 +30448,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 44,
             },
             CatalogField {
+                name: "mdRegAttemptIdPn",
+                id: 53,
+            },
+            CatalogField {
                 name: "patchSnapshotMutationCount",
                 id: 9,
             },
@@ -28453,6 +30502,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "MdGroupParticipantMissAck",
         code: 4146,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 7,
+            },
             CatalogField {
                 name: "groupSizeBucket",
                 id: 1,
@@ -28514,6 +30567,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 7638,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 11,
+            },
+            CatalogField {
                 name: "labelSyncDeviceRole",
                 id: 1,
             },
@@ -28565,6 +30622,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 2576,
         fields: &[
             CatalogField {
+                name: "appCampaignDownloadSource",
+                id: 18,
+            },
+            CatalogField {
                 name: "appContext",
                 id: 13,
             },
@@ -28575,6 +30636,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "applicationState",
                 id: 12,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 16,
             },
             CatalogField {
                 name: "mdCompanionRefHash",
@@ -28601,6 +30666,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 9,
             },
             CatalogField {
+                name: "mdRegAttemptIdPn",
+                id: 17,
+            },
+            CatalogField {
                 name: "mdSessionId",
                 id: 1,
             },
@@ -28615,6 +30684,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "userLocale",
                 id: 15,
+            },
+            CatalogField {
+                name: "waWebVisitId",
+                id: 19,
             },
         ],
         sites: &[
@@ -28659,6 +30732,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "MdLinkedDevicesWindowsXdr",
         code: 7804,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 7,
+            },
             CatalogField {
                 name: "mdLinkedDevicesWindowsXdrStage",
                 id: 1,
@@ -28748,6 +30825,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 2178,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 3,
+            },
+            CatalogField {
                 name: "offline",
                 id: 2,
             },
@@ -28790,6 +30871,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "computedLthash",
                 id: 4,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 18,
             },
             CatalogField {
                 name: "expectedMac",
@@ -28922,10 +31007,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "MdSyncdDogfoodingFeatureUsage",
         code: 3016,
-        fields: &[CatalogField {
-            name: "mdSyncdDogfoodingFeature",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+            CatalogField {
+                name: "mdSyncdDogfoodingFeature",
+                id: 1,
+            },
+        ],
         sites: &[
             CallSite {
                 module: "WAWebClearChatSync",
@@ -28976,6 +31067,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "contentLength",
                 id: 3,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 16,
             },
             CatalogField {
                 name: "isInBootstrap",
@@ -29104,6 +31199,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "companionSessionIds",
                 id: 2,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 14,
             },
             CatalogField {
                 name: "isInBootstrap",
@@ -29238,6 +31337,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 31,
             },
             CatalogField {
+                name: "containerType",
+                id: 75,
+            },
+            CatalogField {
                 name: "daysSinceReceive",
                 id: 46,
             },
@@ -29252,6 +31355,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "debugUrl",
                 id: 23,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 73,
             },
             CatalogField {
                 name: "deviceCount",
@@ -29366,6 +31473,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 30,
             },
             CatalogField {
+                name: "nonStreamingFallbackReason",
+                id: 74,
+            },
+            CatalogField {
                 name: "overallAttemptCount",
                 id: 4,
             },
@@ -29460,6 +31571,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "prefetchOrder",
                 id: 66,
+            },
+            CatalogField {
+                name: "senderPlatform",
+                id: 76,
             },
             CatalogField {
                 name: "sleepModeAffected",
@@ -29614,6 +31729,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 8,
+            },
+            CatalogField {
                 name: "mediaHubAction",
                 id: 2,
             },
@@ -29696,6 +31815,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "chatRecipients",
                 id: 16,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 56,
             },
             CatalogField {
                 name: "hasCollectionCaption",
@@ -29846,6 +31969,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 46,
             },
             CatalogField {
+                name: "numberOfDualCapture",
+                id: 57,
+            },
+            CatalogField {
                 name: "numberOfIgluPostCapture",
                 id: 49,
             },
@@ -29888,114 +32015,6 @@ pub const CALL_SITES: &[EventCallSites] = &[
         }],
     },
     EventCallSites {
-        event: "MediaStreamPlayback",
-        code: 1584,
-        fields: &[
-            CatalogField {
-                name: "bytesDownloadedStart",
-                id: 4,
-            },
-            CatalogField {
-                name: "bytesTransferred",
-                id: 5,
-            },
-            CatalogField {
-                name: "didPlay",
-                id: 15,
-            },
-            CatalogField {
-                name: "experienceIds",
-                id: 19,
-            },
-            CatalogField {
-                name: "forcedPlayCount",
-                id: 12,
-            },
-            CatalogField {
-                name: "initialBufferingT",
-                id: 7,
-            },
-            CatalogField {
-                name: "mediaSize",
-                id: 2,
-            },
-            CatalogField {
-                name: "mediaType",
-                id: 3,
-            },
-            CatalogField {
-                name: "overallPlayT",
-                id: 10,
-            },
-            CatalogField {
-                name: "overallT",
-                id: 1,
-            },
-            CatalogField {
-                name: "playbackCount",
-                id: 14,
-            },
-            CatalogField {
-                name: "playbackError",
-                id: 17,
-            },
-            CatalogField {
-                name: "playbackOrigin",
-                id: 16,
-            },
-            CatalogField {
-                name: "playbackState",
-                id: 11,
-            },
-            CatalogField {
-                name: "seekCount",
-                id: 13,
-            },
-            CatalogField {
-                name: "statusId",
-                id: 18,
-            },
-            CatalogField {
-                name: "totalRebufferingCount",
-                id: 9,
-            },
-            CatalogField {
-                name: "totalRebufferingT",
-                id: 8,
-            },
-            CatalogField {
-                name: "videoDuration",
-                id: 6,
-            },
-        ],
-        sites: &[CallSite {
-            module: "useWAWebMediaStreamPlaybackMetric",
-            partial: false,
-            fields: &[
-                CallSiteField {
-                    name: "didPlay",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "experienceIds",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "mediaType",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "playbackOrigin",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "playbackState",
-                    write: FieldWrite::Constructor,
-                },
-            ],
-        }],
-    },
-    EventCallSites {
         event: "MediaUpload2",
         code: 1588,
         fields: &[
@@ -30016,6 +32035,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 43,
             },
             CatalogField {
+                name: "containerType",
+                id: 66,
+            },
+            CatalogField {
                 name: "debugMediaException",
                 id: 34,
             },
@@ -30026,6 +32049,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "debugUrl",
                 id: 33,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 65,
             },
             CatalogField {
                 name: "estimatedBandwidth",
@@ -30206,6 +32233,14 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "resumeNetworkT",
                 id: 18,
+            },
+            CatalogField {
+                name: "streamingAbandonReason",
+                id: 67,
+            },
+            CatalogField {
+                name: "streamingUploadOutcome",
+                id: 68,
             },
             CatalogField {
                 name: "uploadBytesTransferred",
@@ -30404,6 +32439,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 15,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 17,
+            },
+            CatalogField {
                 name: "hasVerifiedNumber",
                 id: 7,
             },
@@ -30467,6 +32506,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "MentionPickerAction",
         code: 7082,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 7,
+            },
             CatalogField {
                 name: "groupSize",
                 id: 1,
@@ -30564,6 +32607,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 10,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 23,
+            },
+            CatalogField {
                 name: "extraAttributes",
                 id: 11,
             },
@@ -30647,6 +32694,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "MessageCapping",
         code: 6854,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 10,
+            },
             CatalogField {
                 name: "extraAttributes",
                 id: 2,
@@ -30818,6 +32869,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 3694,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 6,
+            },
+            CatalogField {
                 name: "isAGroup",
                 id: 1,
             },
@@ -30841,32 +32896,6 @@ pub const CALL_SITES: &[EventCallSites] = &[
         sites: &[
             CallSite {
                 module: "WAWebMediaHubMessageDropdownMenu.react",
-                partial: false,
-                fields: &[
-                    CallSiteField {
-                        name: "isAGroup",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "isMultiAction",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "isOriginalSender",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "messageContextMenuAction",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "messageContextMenuOption",
-                        write: FieldWrite::Constructor,
-                    },
-                ],
-            },
-            CallSite {
-                module: "WAWebMessageDebugMenuItems.react",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -30968,6 +32997,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 3626,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 9,
+            },
+            CatalogField {
                 name: "deleteActionType",
                 id: 1,
             },
@@ -31027,6 +33060,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "MessageHighRetryCount",
         code: 3132,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 12,
+            },
             CatalogField {
                 name: "deviceSizeBucket",
                 id: 5,
@@ -31134,6 +33171,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "chatOrigins",
                 id: 38,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 68,
             },
             CatalogField {
                 name: "deviceCount",
@@ -31348,8 +33389,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 63,
             },
             CatalogField {
+                name: "sourceExperienceIds",
+                id: 70,
+            },
+            CatalogField {
                 name: "stanzaProcessCount",
                 id: 48,
+            },
+            CatalogField {
+                name: "stickerHasSound",
+                id: 69,
             },
             CatalogField {
                 name: "stickerIsAi",
@@ -31612,6 +33661,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 3686,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
+            CatalogField {
                 name: "messageMediaType",
                 id: 3,
             },
@@ -31726,6 +33779,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "chatSessionId",
                 id: 67,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 98,
             },
             CatalogField {
                 name: "deviceCount",
@@ -32036,6 +34093,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 79,
             },
             CatalogField {
+                name: "stickerHasSound",
+                id: 99,
+            },
+            CatalogField {
                 name: "stickerIsAi",
                 id: 50,
             },
@@ -32296,6 +34357,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 2,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 6,
+            },
+            CatalogField {
                 name: "favoritesUpdateEntryPoint",
                 id: 3,
             },
@@ -32342,6 +34407,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "appSessionId",
                 id: 1,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 11,
             },
             CatalogField {
                 name: "isSelfPin",
@@ -32408,12 +34477,28 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 6532,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 3,
+            },
+            CatalogField {
+                name: "metaAiReadOnlyReason",
+                id: 5,
+            },
+            CatalogField {
                 name: "metaAiUpsellCtaOperation",
                 id: 1,
             },
             CatalogField {
                 name: "metaAiUpsellCtaSource",
                 id: 2,
+            },
+            CatalogField {
+                name: "proactiveMessageCampaignId",
+                id: 6,
+            },
+            CatalogField {
+                name: "upsellBannerVariant",
+                id: 4,
             },
         ],
         sites: &[CallSite {
@@ -32478,6 +34563,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "MetaVerifiedUserAction",
         code: 4986,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 23,
+            },
             CatalogField {
                 name: "isProfileLocked",
                 id: 16,
@@ -32611,6 +34700,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 3782,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 15,
+            },
+            CatalogField {
                 name: "isMex",
                 id: 1,
             },
@@ -32694,6 +34787,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "MexEventV2",
         code: 4336,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 14,
+            },
             CatalogField {
                 name: "mexEventV2DurationMs",
                 id: 1,
@@ -32949,6 +35046,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 6796,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 13,
+            },
+            CatalogField {
                 name: "disclosureEventType",
                 id: 1,
             },
@@ -33015,8 +35116,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 10,
             },
             CatalogField {
+                name: "containsFirstMm",
+                id: 11,
+            },
+            CatalogField {
                 name: "disclosed",
                 id: 4,
+            },
+            CatalogField {
+                name: "firstMmPosition",
+                id: 12,
             },
             CatalogField {
                 name: "isLatestConversionToken",
@@ -33131,12 +35240,20 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 29,
             },
             CatalogField {
+                name: "containsFirstMm",
+                id: 31,
+            },
+            CatalogField {
                 name: "deltaTimeReceived",
                 id: 18,
             },
             CatalogField {
                 name: "entSourceSubplatform",
                 id: 17,
+            },
+            CatalogField {
+                name: "firstMmPosition",
+                id: 32,
             },
             CatalogField {
                 name: "isCompanionDevice",
@@ -33191,6 +35308,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 8,
             },
             CatalogField {
+                name: "signalNativeMessageType",
+                id: 30,
+            },
+            CatalogField {
                 name: "signalOrigin",
                 id: 9,
             },
@@ -33239,6 +35360,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                     name: "isShimmingSignal",
                     write: FieldWrite::Constructor,
                 },
+                CallSiteField {
+                    name: "signalNativeMessageType",
+                    write: FieldWrite::Constructor,
+                },
             ],
         }],
     },
@@ -33253,6 +35378,18 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "consentSource",
                 id: 20,
+            },
+            CatalogField {
+                name: "containsFirstMm",
+                id: 22,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 21,
+            },
+            CatalogField {
+                name: "firstMmPosition",
+                id: 23,
             },
             CatalogField {
                 name: "isCompanionDevice",
@@ -33355,8 +35492,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 24,
             },
             CatalogField {
+                name: "containsFirstMm",
+                id: 25,
+            },
+            CatalogField {
                 name: "entSourceSubplatform",
                 id: 1,
+            },
+            CatalogField {
+                name: "firstMmPosition",
+                id: 26,
             },
             CatalogField {
                 name: "isCompanionDevice",
@@ -33511,6 +35656,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 5788,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
+            CatalogField {
                 name: "nativeContactsNuxEntryPoint",
                 id: 3,
             },
@@ -33539,6 +35688,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 7112,
         fields: &[
             CatalogField { name: "cid", id: 1 },
+            CatalogField {
+                name: "dedupKey",
+                id: 8,
+            },
             CatalogField {
                 name: "enforcementInteractionEvent",
                 id: 2,
@@ -33603,6 +35756,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "NonMessagePeerDataMediaUpload",
         code: 3902,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 10,
+            },
             CatalogField {
                 name: "peerDataErrorCount",
                 id: 1,
@@ -33679,6 +35836,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "NonMessagePeerDataOperationResponse",
         code: 3904,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 10,
+            },
             CatalogField {
                 name: "peerDataErrorCount",
                 id: 1,
@@ -33806,6 +35967,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 3906,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
+            CatalogField {
                 name: "peerDataRequestCount",
                 id: 1,
             },
@@ -33856,6 +36021,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "clientMessageId",
                 id: 1,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 17,
             },
             CatalogField {
                 name: "isSilenced",
@@ -33920,6 +36089,40 @@ pub const CALL_SITES: &[EventCallSites] = &[
                         write: FieldWrite::Constructor,
                     },
                     CallSiteField {
+                        name: "notificationAction",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "notificationId",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "triggeredByOfflineMessage",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "uiNotificationType",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebBaseNotification",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "isSilenced",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "notificationAction",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "notificationId",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
                         name: "triggeredByOfflineMessage",
                         write: FieldWrite::Constructor,
                     },
@@ -33952,6 +36155,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "avgNotifEngagementT",
                 id: 1,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 25,
             },
             CatalogField {
                 name: "groupSizeBucket",
@@ -34078,6 +36285,14 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 partial: false,
                 fields: &[
                     CallSiteField {
+                        name: "totalNotifRtcVoipAccept",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "totalNotifRtcVoipDecline",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
                         name: "totalNotifShown",
                         write: FieldWrite::Constructor,
                     },
@@ -34093,6 +36308,18 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "NotificationSetting",
         code: 3684,
         fields: &[
+            CatalogField {
+                name: "callNotificationSound",
+                id: 25,
+            },
+            CatalogField {
+                name: "callShowNotification",
+                id: 26,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 24,
+            },
             CatalogField {
                 name: "groupReactionNotification",
                 id: 1,
@@ -34172,7 +36399,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
         ],
         sites: &[CallSite {
             module: "WAWebTasksDailyStatsTask",
-            partial: false,
+            partial: true,
             fields: &[
                 CallSiteField {
                     name: "groupReactionNotification",
@@ -34232,6 +36459,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "callStanzaType",
                 id: 7,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 11,
             },
             CatalogField {
                 name: "e2eSenderType",
@@ -34346,12 +36577,20 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 42,
             },
             CatalogField {
+                name: "dbOperationCountsByDatabase",
+                id: 59,
+            },
+            CatalogField {
                 name: "dbReadsCount",
                 id: 43,
             },
             CatalogField {
                 name: "dbWritesCount",
                 id: 44,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 58,
             },
             CatalogField {
                 name: "disconnected",
@@ -34376,6 +36615,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "expectedOfflineReceiptCount",
                 id: 19,
+            },
+            CatalogField {
+                name: "expectedOfflineStatusCount",
+                id: 60,
             },
             CatalogField {
                 name: "isOfflineCompleteMissed",
@@ -34452,6 +36695,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "offlineSizeBytes",
                 id: 10,
+            },
+            CatalogField {
+                name: "offlineStatusCount",
+                id: 61,
             },
             CatalogField {
                 name: "onTrickleMode",
@@ -34549,6 +36796,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 18,
+            },
+            CatalogField {
                 name: "isResumeInForeground",
                 id: 5,
             },
@@ -34622,6 +36873,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "actionCategory",
                 id: 2,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 17,
             },
             CatalogField {
                 name: "entryPointConversionSource",
@@ -34874,7 +37129,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebOrderDetailsCreationActionWamEventUtil",
+                module: "WAWebOrderDetailsCreationActionWamEventUtilCreateClickAddItemWamEvent",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -34900,7 +37155,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebOrderDetailsCreationActionWamEventUtil",
+                module: "WAWebOrderDetailsCreationActionWamEventUtilCreateClickAddItemsWamEvent",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -35128,6 +37383,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 8,
             },
             CatalogField {
+                name: "psIdNewSot",
+                id: 30,
+            },
+            CatalogField {
                 name: "receiverCountryCode",
                 id: 18,
             },
@@ -35244,6 +37503,14 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 3,
             },
             CatalogField {
+                name: "capiPairBusinessChannel",
+                id: 31,
+            },
+            CatalogField {
+                name: "capiPairBusinessLid",
+                id: 32,
+            },
+            CatalogField {
                 name: "chatsFolderType",
                 id: 4,
             },
@@ -35258,6 +37525,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "decisionId",
                 id: 7,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 30,
             },
             CatalogField {
                 name: "deltaTime",
@@ -35576,6 +37847,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 7688,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 3,
+            },
+            CatalogField {
                 name: "pathfinderHealthEventData",
                 id: 1,
             },
@@ -35614,6 +37889,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "customPaymentMethodsSyncStatus",
                 id: 48,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 53,
             },
             CatalogField {
                 name: "eventTsMs",
@@ -35824,6 +38103,44 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 fields: &[],
             },
             CallSite {
+                module: "WAWebPaymentDetailsLogger",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "actionTarget",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "paymentActionType",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "paymentsCountryCode",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "paymentsEventId",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "previousScreenName",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "queryParams",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "referral",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "screen",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
                 module: "WAWebPaymentsUserActionLogging",
                 partial: false,
                 fields: &[
@@ -35913,6 +38230,14 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 4436,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 11,
+            },
+            CatalogField {
+                name: "groupId",
+                id: 12,
+            },
+            CatalogField {
                 name: "groupRole",
                 id: 1,
             },
@@ -36001,6 +38326,14 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 4438,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 10,
+            },
+            CatalogField {
+                name: "groupId",
+                id: 11,
+            },
+            CatalogField {
                 name: "groupRole",
                 id: 1,
             },
@@ -36085,6 +38418,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 7630,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 3,
+            },
+            CatalogField {
                 name: "pinnedChatNumber",
                 id: 1,
             },
@@ -36117,6 +38454,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
+            CatalogField {
                 name: "premiumStatus",
                 id: 2,
             },
@@ -36141,6 +38482,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "botType",
                 id: 24,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 26,
             },
             CatalogField {
                 name: "deviceCount",
@@ -36223,6 +38568,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1,
             },
             CatalogField {
+                name: "privateAiFeatureName",
+                id: 27,
+            },
+            CatalogField {
                 name: "senderPlatform",
                 id: 25,
             },
@@ -36295,6 +38644,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 9,
+            },
+            CatalogField {
                 name: "mappingMissing",
                 id: 7,
             },
@@ -36359,6 +38712,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 3808,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 6,
+            },
+            CatalogField {
                 name: "pnhAction",
                 id: 1,
             },
@@ -36417,6 +38774,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "chatType",
                 id: 8,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 13,
             },
             CatalogField {
                 name: "groupSizeBucket",
@@ -36499,6 +38860,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 2,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 13,
+            },
+            CatalogField {
                 name: "genaiBots",
                 id: 11,
             },
@@ -36567,6 +38932,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 7,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 15,
+            },
+            CatalogField {
                 name: "genaiBots",
                 id: 14,
             },
@@ -36623,6 +38992,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 3014,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
+            CatalogField {
                 name: "deviceSizeBucket",
                 id: 3,
             },
@@ -36642,9 +39015,69 @@ pub const CALL_SITES: &[EventCallSites] = &[
         }],
     },
     EventCallSites {
+        event: "PrekeysFetch",
+        code: 2540,
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 7,
+            },
+            CatalogField {
+                name: "encryptionType",
+                id: 4,
+            },
+            CatalogField {
+                name: "onIdentityChange",
+                id: 1,
+            },
+            CatalogField {
+                name: "pqPrekeyFetchCounts",
+                id: 5,
+            },
+            CatalogField {
+                name: "prekeysFetchContext",
+                id: 3,
+            },
+            CatalogField {
+                name: "prekeysFetchCount",
+                id: 2,
+            },
+            CatalogField {
+                name: "prekeysFetchHostedDeviceCount",
+                id: 6,
+            },
+        ],
+        sites: &[CallSite {
+            module: "WAWebFetchPrekeysJob",
+            partial: false,
+            fields: &[
+                CallSiteField {
+                    name: "onIdentityChange",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "prekeysFetchContext",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "prekeysFetchCount",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "prekeysFetchHostedDeviceCount",
+                    write: FieldWrite::Constructor,
+                },
+            ],
+        }],
+    },
+    EventCallSites {
         event: "PrivacyHighlightDaily",
         code: 3522,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 6,
+            },
             CatalogField {
                 name: "dialogAppearCount",
                 id: 1,
@@ -36830,6 +39263,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 3726,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
+            CatalogField {
                 name: "privacyControlEntryPoint",
                 id: 1,
             },
@@ -36856,10 +39293,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "PrivacyTipAction",
         code: 4794,
-        fields: &[CatalogField {
-            name: "privacyTipActionType",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+            CatalogField {
+                name: "privacyTipActionType",
+                id: 1,
+            },
+        ],
         sites: &[
             CallSite {
                 module: "WAWebGroupInfoIntegritySection.react",
@@ -36899,6 +39342,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "ProtobufValidationError",
         code: 6110,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 11,
+            },
             CatalogField {
                 name: "protobufCorrelationOutcome",
                 id: 8,
@@ -37030,6 +39477,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "applicationState",
                 id: 6,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 16,
             },
             CatalogField {
                 name: "isFromWamsys",
@@ -37182,6 +39633,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "countryShown",
                 id: 2,
+            },
+            CatalogField {
+                name: "fmxBusinessHoldoutGroup",
+                id: 11,
             },
             CatalogField {
                 name: "fmxEntryPoint",
@@ -37588,6 +40043,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 2862,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
+            CatalogField {
                 name: "isFromWamsys",
                 id: 4,
             },
@@ -37826,12 +40285,60 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 3052,
         fields: &[
             CatalogField {
+                name: "bizBotOnboarded",
+                id: 10,
+            },
+            CatalogField {
                 name: "bizPlatform",
                 id: 1,
             },
             CatalogField {
                 name: "businessOwnerJid",
                 id: 7,
+            },
+            CatalogField {
+                name: "buttonActionType",
+                id: 11,
+            },
+            CatalogField {
+                name: "carouselCardIndex",
+                id: 12,
+            },
+            CatalogField {
+                name: "chatTypeInd",
+                id: 13,
+            },
+            CatalogField {
+                name: "clickComponent",
+                id: 14,
+            },
+            CatalogField {
+                name: "clickComponentCount",
+                id: 15,
+            },
+            CatalogField {
+                name: "clickComponentIndex",
+                id: 16,
+            },
+            CatalogField {
+                name: "createdByBizBotWithEdits",
+                id: 17,
+            },
+            CatalogField {
+                name: "createdByBizBotWithoutEdits",
+                id: 18,
+            },
+            CatalogField {
+                name: "isCoex",
+                id: 19,
+            },
+            CatalogField {
+                name: "isOutgoingMessage",
+                id: 20,
+            },
+            CatalogField {
+                name: "linkCategory",
+                id: 21,
             },
             CatalogField {
                 name: "messageClass",
@@ -37850,6 +40357,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 2,
             },
             CatalogField {
+                name: "sentByBizBot",
+                id: 22,
+            },
+            CatalogField {
                 name: "templateId",
                 id: 8,
             },
@@ -37860,7 +40371,41 @@ pub const CALL_SITES: &[EventCallSites] = &[
         ],
         sites: &[
             CallSite {
-                module: "WAWebGetBrazilnteractiveActions",
+                module: "WAWebBizAiPaymentRequestWamLogger",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "bizPlatform",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "businessOwnerJid",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageClass",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageClassAttributes",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageInteraction",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageMediaType",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "templateId",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebBrPaymentInteractionLogger",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -37890,7 +40435,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebGetBrazilnteractiveActions",
+                module: "WAWebBrPaymentInteractionLogger",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -37920,7 +40465,37 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebGetBrazilnteractiveActions",
+                module: "WAWebBrPaymentInteractionLogger",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "bizPlatform",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "businessOwnerJid",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageClass",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageClassAttributes",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageInteraction",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageMediaType",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebBrPaymentInteractionLogger",
                 partial: true,
                 fields: &[CallSiteField {
                     name: "messageInteraction",
@@ -37928,7 +40503,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 }],
             },
             CallSite {
-                module: "WAWebGetBrazilnteractiveActions",
+                module: "WAWebBrPaymentInteractionLogger",
                 partial: true,
                 fields: &[CallSiteField {
                     name: "messageInteraction",
@@ -37937,6 +40512,66 @@ pub const CALL_SITES: &[EventCallSites] = &[
             },
             CallSite {
                 module: "WAWebNativeFlowMessage",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "bizPlatform",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "businessOwnerJid",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageClass",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageClassAttributes",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageInteraction",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageMediaType",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebPaymentDetailsLogger",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "bizPlatform",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "businessOwnerJid",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageClass",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageClassAttributes",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageInteraction",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageMediaType",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebPaymentDetailsLogger",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -38014,6 +40649,28 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
+                module: "WAWebPaymentRequestWamLogger",
+                partial: true,
+                fields: &[
+                    CallSiteField {
+                        name: "businessOwnerJid",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageClass",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageMediaType",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "templateId",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
                 module: "WAWebUprWamLogger",
                 partial: false,
                 fields: &[
@@ -38056,6 +40713,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "audioDriverRestartReason",
                 id: 53,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 66,
             },
             CatalogField {
                 name: "deviceAgcState",
@@ -38317,6 +40978,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "PttDaily",
         code: 2938,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 52,
+            },
             CatalogField {
                 name: "pttCancelBroadcast",
                 id: 9,
@@ -38682,6 +41347,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 7,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 15,
+            },
+            CatalogField {
                 name: "isMetaAiThread",
                 id: 12,
             },
@@ -38694,12 +41363,24 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 2,
             },
             CatalogField {
+                name: "pttMessageUserJourneyCancelReason",
+                id: 16,
+            },
+            CatalogField {
                 name: "pttMessageUserJourneyContainsQuotedItem",
                 id: 11,
             },
             CatalogField {
+                name: "pttMessageUserJourneyDraftSavedReason",
+                id: 17,
+            },
+            CatalogField {
                 name: "pttMessageUserJourneyFailureReason",
                 id: 9,
+            },
+            CatalogField {
+                name: "pttMessageUserJourneyPauseReason",
+                id: 18,
             },
             CatalogField {
                 name: "pttMessageUserJourneyStage",
@@ -38788,6 +41469,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "audioStreamType",
                 id: 19,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 29,
             },
             CatalogField {
                 name: "messageKeyHash",
@@ -38954,6 +41639,134 @@ pub const CALL_SITES: &[EventCallSites] = &[
         }],
     },
     EventCallSites {
+        event: "QbmBookingStatusInteraction",
+        code: 7530,
+        fields: &[
+            CatalogField {
+                name: "actionTypeBookingStatus",
+                id: 1,
+            },
+            CatalogField {
+                name: "chatsFolderType",
+                id: 2,
+            },
+            CatalogField {
+                name: "contactType",
+                id: 3,
+            },
+            CatalogField {
+                name: "decisionId",
+                id: 4,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 18,
+            },
+            CatalogField {
+                name: "deltaTime",
+                id: 5,
+            },
+            CatalogField {
+                name: "deltaTimeReceived",
+                id: 6,
+            },
+            CatalogField {
+                name: "entryPoint",
+                id: 7,
+            },
+            CatalogField {
+                name: "hsmTagStr",
+                id: 8,
+            },
+            CatalogField {
+                name: "isBizIntent",
+                id: 9,
+            },
+            CatalogField {
+                name: "isBroadcastMessage",
+                id: 10,
+            },
+            CatalogField {
+                name: "isInsubContact",
+                id: 11,
+            },
+            CatalogField {
+                name: "isMuted",
+                id: 12,
+            },
+            CatalogField {
+                name: "messageIdHmac",
+                id: 13,
+            },
+            CatalogField {
+                name: "qbmFlag",
+                id: 14,
+            },
+            CatalogField {
+                name: "readReceiptsEnabled",
+                id: 15,
+            },
+            CatalogField {
+                name: "threadIdHmac",
+                id: 16,
+            },
+            CatalogField {
+                name: "unifiedSessionId",
+                id: 17,
+            },
+        ],
+        sites: &[CallSite {
+            module: "WAWebBookingConfirmationLogging",
+            partial: false,
+            fields: &[
+                CallSiteField {
+                    name: "actionTypeBookingStatus",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "chatsFolderType",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "contactType",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "deltaTime",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "deltaTimeReceived",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "isInsubContact",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "isMuted",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "messageIdHmac",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "readReceiptsEnabled",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "threadIdHmac",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "unifiedSessionId",
+                    write: FieldWrite::Constructor,
+                },
+            ],
+        }],
+    },
+    EventCallSites {
         event: "QbmIncomingMessage",
         code: 3790,
         fields: &[
@@ -39022,6 +41835,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 41,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 67,
+            },
+            CatalogField {
                 name: "entSourceSubplatform",
                 id: 40,
             },
@@ -39052,6 +41869,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "isBizIntent",
                 id: 37,
+            },
+            CatalogField {
+                name: "isBizMetaVerified",
+                id: 68,
             },
             CatalogField {
                 name: "isBroadcastMessage",
@@ -39198,6 +42019,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 42,
             },
             CatalogField {
+                name: "unifiedSessionId",
+                id: 66,
+            },
+            CatalogField {
                 name: "urlUniqueCountInt",
                 id: 55,
             },
@@ -39290,6 +42115,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 17,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 40,
+            },
+            CatalogField {
                 name: "deltaTime",
                 id: 4,
             },
@@ -39316,6 +42145,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "isBizIntent",
                 id: 13,
+            },
+            CatalogField {
+                name: "isBizMetaVerified",
+                id: 41,
             },
             CatalogField {
                 name: "isBroadcastMessage",
@@ -39386,6 +42219,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 12,
             },
             CatalogField {
+                name: "unifiedSessionId",
+                id: 39,
+            },
+            CatalogField {
                 name: "urlUniqueCountInt",
                 id: 30,
             },
@@ -39438,6 +42275,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 16,
             },
             CatalogField {
+                name: "chatsFolderType",
+                id: 40,
+            },
+            CatalogField {
                 name: "contactType",
                 id: 2,
             },
@@ -39450,12 +42291,20 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 13,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 36,
+            },
+            CatalogField {
                 name: "deltaTimeReceived",
                 id: 3,
             },
             CatalogField {
                 name: "entSourceSubplatform",
                 id: 12,
+            },
+            CatalogField {
+                name: "hsmTagStr",
+                id: 37,
             },
             CatalogField {
                 name: "iasEntryPoint",
@@ -39468,6 +42317,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "isBizIntent",
                 id: 10,
+            },
+            CatalogField {
+                name: "isBizMetaVerified",
+                id: 38,
             },
             CatalogField {
                 name: "isBroadcastMessage",
@@ -39526,6 +42379,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 33,
             },
             CatalogField {
+                name: "qbmFlag",
+                id: 39,
+            },
+            CatalogField {
                 name: "submessageFieldJsonArray",
                 id: 18,
             },
@@ -39536,6 +42393,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "threadLidHmac",
                 id: 14,
+            },
+            CatalogField {
+                name: "unifiedSessionId",
+                id: 35,
             },
             CatalogField {
                 name: "urlUniqueCountInt",
@@ -39646,6 +42507,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 40,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 64,
+            },
+            CatalogField {
                 name: "deltaTime",
                 id: 3,
             },
@@ -39672,6 +42537,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "isBizIntent",
                 id: 37,
+            },
+            CatalogField {
+                name: "isBizMetaVerified",
+                id: 65,
             },
             CatalogField {
                 name: "isBroadcastMessage",
@@ -39810,6 +42679,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 36,
             },
             CatalogField {
+                name: "unifiedSessionId",
+                id: 63,
+            },
+            CatalogField {
                 name: "urlUniqueCountInt",
                 id: 54,
             },
@@ -39872,6 +42745,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "decisionId",
                 id: 4,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 18,
             },
             CatalogField {
                 name: "deltaTime",
@@ -39992,6 +42869,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "attachmentVideoCount",
                 id: 6,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 21,
             },
             CatalogField {
                 name: "isSmartDefault",
@@ -40219,20 +43100,6 @@ pub const CALL_SITES: &[EventCallSites] = &[
                     },
                 ],
             },
-            CallSite {
-                module: "WAWebQuickReplyLogging",
-                partial: false,
-                fields: &[
-                    CallSiteField {
-                        name: "quickReplyAction",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "quickReplyEntryPoint",
-                        write: FieldWrite::Constructor,
-                    },
-                ],
-            },
         ],
     },
     EventCallSites {
@@ -40246,6 +43113,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "chatbarInitialState",
                 id: 12,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 14,
             },
             CatalogField {
                 name: "messageMediaType",
@@ -40340,6 +43211,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 5582,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
+            CatalogField {
                 name: "reachoutTimelockAction",
                 id: 3,
             },
@@ -40399,6 +43274,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "ReactionActions",
         code: 3184,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
             CatalogField {
                 name: "mediaType",
                 id: 3,
@@ -40476,6 +43355,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "appSessionId",
                 id: 1,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 13,
             },
             CatalogField {
                 name: "messageHasOwnReaction",
@@ -40590,6 +43473,14 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 13,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 17,
+            },
+            CatalogField {
+                name: "groupSizeBucket",
+                id: 18,
+            },
+            CatalogField {
                 name: "mediaType",
                 id: 2,
             },
@@ -40646,37 +43537,65 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 16,
             },
         ],
-        sites: &[CallSite {
-            module: "WAWebCreateReceiptStanzaReceiveMetric",
-            partial: false,
-            fields: &[
-                CallSiteField {
-                    name: "messageType",
-                    write: FieldWrite::Assigned,
-                },
-                CallSiteField {
-                    name: "receiptStanzaOfflineCount",
-                    write: FieldWrite::Assigned,
-                },
-                CallSiteField {
-                    name: "receiptStanzaStage",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "receiptStanzaTotalCount",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "receiptStanzaType",
-                    write: FieldWrite::Assigned,
-                },
-            ],
-        }],
+        sites: &[
+            CallSite {
+                module: "WAWebCreateReceiptStanzaReceiveMetric",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "messageType",
+                        write: FieldWrite::Assigned,
+                    },
+                    CallSiteField {
+                        name: "receiptStanzaOfflineCount",
+                        write: FieldWrite::Assigned,
+                    },
+                    CallSiteField {
+                        name: "receiptStanzaStage",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "receiptStanzaTotalCount",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "receiptStanzaType",
+                        write: FieldWrite::Assigned,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebCreateReceiptStanzaReceiveMetric",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "messageType",
+                        write: FieldWrite::Assigned,
+                    },
+                    CallSiteField {
+                        name: "receiptStanzaStage",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "receiptStanzaTotalCount",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "receiptStanzaType",
+                        write: FieldWrite::Assigned,
+                    },
+                ],
+            },
+        ],
     },
     EventCallSites {
         event: "ReportToAdminEvents",
         code: 4420,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 3,
+            },
             CatalogField {
                 name: "reportToAdminInteraction",
                 id: 1,
@@ -40705,6 +43624,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "ReportingTokenValidationFailure",
         code: 5466,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 15,
+            },
             CatalogField {
                 name: "editType",
                 id: 1,
@@ -40889,6 +43812,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 3656,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 7,
+            },
+            CatalogField {
                 name: "messageSendResultIsTerminal",
                 id: 1,
             },
@@ -40945,9 +43872,59 @@ pub const CALL_SITES: &[EventCallSites] = &[
         }],
     },
     EventCallSites {
+        event: "RichTextFormatMessageSend",
+        code: 8206,
+        fields: &[
+            CatalogField {
+                name: "chatType",
+                id: 1,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 8,
+            },
+            CatalogField {
+                name: "hasBold",
+                id: 2,
+            },
+            CatalogField {
+                name: "hasCodeBlock",
+                id: 3,
+            },
+            CatalogField {
+                name: "hasItalic",
+                id: 4,
+            },
+            CatalogField {
+                name: "hasMonospace",
+                id: 5,
+            },
+            CatalogField {
+                name: "hasSpoiler",
+                id: 6,
+            },
+            CatalogField {
+                name: "hasStrikethrough",
+                id: 7,
+            },
+        ],
+        sites: &[CallSite {
+            module: "WAWebRichTextFormatMessageSendLogger",
+            partial: true,
+            fields: &[CallSiteField {
+                name: "chatType",
+                write: FieldWrite::Constructor,
+            }],
+        }],
+    },
+    EventCallSites {
         event: "ScheduledMessageAction",
         code: 8502,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 11,
+            },
             CatalogField {
                 name: "groupRole",
                 id: 1,
@@ -41007,10 +43984,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "ScreenLockSettingsData",
         code: 4802,
-        fields: &[CatalogField {
-            name: "screenAutoLockDuration",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+            CatalogField {
+                name: "screenAutoLockDuration",
+                id: 1,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebTasksDailyStatsTask",
             partial: true,
@@ -41024,6 +44007,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "bizSearchCount",
                 id: 1,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 12,
             },
             CatalogField {
                 name: "resultPageShown",
@@ -41110,6 +44097,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 5702,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 6,
+            },
+            CatalogField {
                 name: "imageSearchFailedErrorType",
                 id: 5,
             },
@@ -41161,6 +44152,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "SearchUserJourney",
         code: 6358,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 35,
+            },
             CatalogField {
                 name: "searchDsSendContentType",
                 id: 32,
@@ -41418,6 +44413,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 2172,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
+            CatalogField {
                 name: "documentExt",
                 id: 3,
             },
@@ -41457,6 +44456,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "SendRevokeMessage",
         code: 1348,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
             CatalogField {
                 name: "messageMediaType",
                 id: 2,
@@ -41498,6 +44501,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
+            CatalogField {
                 name: "deviceSizeBucket",
                 id: 2,
             },
@@ -41534,6 +44541,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 4,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
+            CatalogField {
                 name: "previousSettingValue",
                 id: 2,
             },
@@ -41561,6 +44572,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "SettingsClick",
         code: 2214,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
             CatalogField {
                 name: "isBookmarkAppInstalled",
                 id: 4,
@@ -41603,10 +44618,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "SettingsSearchInitiate",
         code: 4014,
-        fields: &[CatalogField {
-            name: "settingsPageType",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+            CatalogField {
+                name: "settingsPageType",
+                id: 1,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebSettingsLoggerUtils",
             partial: true,
@@ -41617,6 +44638,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "SettingsSearchTap",
         code: 4016,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 3,
+            },
             CatalogField {
                 name: "tapItemName",
                 id: 1,
@@ -41652,6 +44677,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "captionAdded",
                 id: 12,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 28,
             },
             CatalogField {
                 name: "forwardUserJourneyFunnelId",
@@ -41806,6 +44835,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 6,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 9,
+            },
+            CatalogField {
                 name: "isFromWameta",
                 id: 8,
             },
@@ -41869,6 +44902,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "SmbDataSharingConsentScreen",
         code: 3972,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 8,
+            },
             CatalogField {
                 name: "elapsedTimeMs",
                 id: 4,
@@ -41950,6 +44987,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 3974,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
+            CatalogField {
                 name: "smbDataSharingConsentSettingEntryPoint",
                 id: 1,
             },
@@ -42000,6 +45041,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "customListTitle",
                 id: 1,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 22,
             },
             CatalogField {
                 name: "entryPointConversionSource",
@@ -42145,6 +45190,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 8232,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 8,
+            },
+            CatalogField {
                 name: "smbPerCustomerDataSharingControlAction",
                 id: 1,
             },
@@ -42209,6 +45258,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 6746,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
+            CatalogField {
                 name: "fetchExceptionMessage",
                 id: 1,
             },
@@ -42251,6 +45304,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "contactIsSaved",
                 id: 2,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 23,
             },
             CatalogField {
                 name: "entryPoint",
@@ -42334,6 +45391,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                     write: FieldWrite::Assigned,
                 },
                 CallSiteField {
+                    name: "prevSurface",
+                    write: FieldWrite::Assigned,
+                },
+                CallSiteField {
                     name: "seqId",
                     write: FieldWrite::Assigned,
                 },
@@ -42364,6 +45425,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "SnackbarDeleteUndo",
         code: 3628,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 7,
+            },
             CatalogField {
                 name: "isAGroup",
                 id: 1,
@@ -42413,6 +45478,126 @@ pub const CALL_SITES: &[EventCallSites] = &[
         }],
     },
     EventCallSites {
+        event: "SpamReportPerf",
+        code: 6310,
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 6,
+            },
+            CatalogField {
+                name: "reportAttemptCount",
+                id: 3,
+            },
+            CatalogField {
+                name: "reportDurationMs",
+                id: 1,
+            },
+            CatalogField {
+                name: "reportErrorCode",
+                id: 4,
+            },
+            CatalogField {
+                name: "reportSpamFlow",
+                id: 5,
+            },
+            CatalogField {
+                name: "reportStatus",
+                id: 2,
+            },
+            CatalogField {
+                name: "wiTraceId",
+                id: 7,
+            },
+        ],
+        sites: &[
+            CallSite {
+                module: "WAWebSpamReportAttempt",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "reportAttemptCount",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "reportDurationMs",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "reportSpamFlow",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "reportStatus",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wiTraceId",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebSpamReportAttempt",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "reportAttemptCount",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "reportDurationMs",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "reportSpamFlow",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "reportStatus",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wiTraceId",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+        ],
+    },
+    EventCallSites {
+        event: "SpoilerReveal",
+        code: 8208,
+        fields: &[
+            CatalogField {
+                name: "chatType",
+                id: 1,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 3,
+            },
+            CatalogField {
+                name: "isOwnMessage",
+                id: 2,
+            },
+        ],
+        sites: &[CallSite {
+            module: "WAWebSpoilerRevealLogger",
+            partial: false,
+            fields: &[
+                CallSiteField {
+                    name: "chatType",
+                    write: FieldWrite::Constructor,
+                },
+                CallSiteField {
+                    name: "isOwnMessage",
+                    write: FieldWrite::Constructor,
+                },
+            ],
+        }],
+    },
+    EventCallSites {
         event: "StatusCrosspostRequest",
         code: 4994,
         fields: &[
@@ -42431,6 +45616,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "crosspostOrigin",
                 id: 4,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 18,
             },
             CatalogField {
                 name: "defaultStatusPrivacySettings",
@@ -42542,6 +45731,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             },
             CatalogField { name: "cid", id: 8 },
             CatalogField {
+                name: "dedupKey",
+                id: 10,
+            },
+            CatalogField {
                 name: "statusId",
                 id: 1,
             },
@@ -42608,6 +45801,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "cid",
                 id: 12,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 13,
             },
             CatalogField {
                 name: "statusId",
@@ -42721,6 +45918,24 @@ pub const CALL_SITES: &[EventCallSites] = &[
                     },
                 ],
             },
+            CallSite {
+                module: "WAWebStatusReshareAction",
+                partial: true,
+                fields: &[
+                    CallSiteField {
+                        name: "statusId",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "statusInteractionType",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "unifiedSessionId",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
         ],
     },
     EventCallSites {
@@ -42730,6 +45945,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "bytesDownloadedStartView",
                 id: 47,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 59,
             },
             CatalogField {
                 name: "estimatedBandwidth",
@@ -42976,6 +46195,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 15,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 16,
+            },
+            CatalogField {
                 name: "isPosterBiz",
                 id: 9,
             },
@@ -43073,6 +46296,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         fields: &[
             CatalogField { name: "cid", id: 1 },
             CatalogField {
+                name: "dedupKey",
+                id: 9,
+            },
+            CatalogField {
                 name: "pogIndex",
                 id: 2,
             },
@@ -43155,6 +46382,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "containsPrompt",
                 id: 19,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 63,
             },
             CatalogField {
                 name: "defaultStatusPrivacySetting",
@@ -43509,6 +46740,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 48,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 57,
+            },
+            CatalogField {
                 name: "entryMethod",
                 id: 29,
             },
@@ -43659,6 +46894,14 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "statusPosterId",
                 id: 40,
+            },
+            CatalogField {
+                name: "statusSpeedUpCount",
+                id: 58,
+            },
+            CatalogField {
+                name: "statusSpeedUpTime",
+                id: 59,
             },
             CatalogField {
                 name: "statusViewEntrypoint",
@@ -43891,6 +47134,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "cid",
                 id: 36,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 39,
             },
             CatalogField {
                 name: "defaultTrimmedVideoDuration",
@@ -44145,6 +47392,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 14,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 17,
+            },
+            CatalogField {
                 name: "lastSuccessfulRankingUpdate",
                 id: 15,
             },
@@ -44232,6 +47483,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "StatusReply",
         code: 1180,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 27,
+            },
             CatalogField {
                 name: "isMentioned",
                 id: 7,
@@ -44401,6 +47656,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 3920,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 3,
+            },
+            CatalogField {
                 name: "statusPosterContactType",
                 id: 2,
             },
@@ -44422,6 +47681,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "StatusRevoke",
         code: 1250,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 7,
+            },
             CatalogField {
                 name: "mediaType",
                 id: 2,
@@ -44474,6 +47737,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "StatusRowView",
         code: 1656,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 11,
+            },
             CatalogField {
                 name: "psaCampaigns",
                 id: 8,
@@ -44563,6 +47830,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 3,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 14,
+            },
+            CatalogField {
                 name: "externalSourceDomainType",
                 id: 5,
             },
@@ -44571,12 +47842,20 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 11,
             },
             CatalogField {
+                name: "replyEntryMethod",
+                id: 15,
+            },
+            CatalogField {
                 name: "statusCategory",
                 id: 4,
             },
             CatalogField {
                 name: "statusId",
                 id: 12,
+            },
+            CatalogField {
+                name: "statusSpeedUpHoldTime",
+                id: 16,
             },
             CatalogField {
                 name: "statusViewerSessionId",
@@ -44596,6 +47875,20 @@ pub const CALL_SITES: &[EventCallSites] = &[
             },
         ],
         sites: &[
+            CallSite {
+                module: "WAWebStatusReshareAction",
+                partial: true,
+                fields: &[
+                    CallSiteField {
+                        name: "statusCategory",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "viewerActionType",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
             CallSite {
                 module: "WAWebStatusSubtitle.react",
                 partial: false,
@@ -44634,6 +47927,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "StickerAddToFavorite",
         code: 1842,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 14,
+            },
             CatalogField {
                 name: "stickerAddToFavoriteOrigin",
                 id: 1,
@@ -44715,6 +48012,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 2740,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
+            CatalogField {
                 name: "httpResponseCode",
                 id: 2,
             },
@@ -44793,6 +48094,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 5024,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 3,
+            },
+            CatalogField {
                 name: "stickerErrorType",
                 id: 1,
             },
@@ -44824,6 +48129,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "StickerLatency",
         code: 5026,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
             CatalogField {
                 name: "size",
                 id: 1,
@@ -44859,10 +48168,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "StickerPickerOpened",
         code: 1854,
-        fields: &[CatalogField {
-            name: "stickerPickerEntryPoint",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+            CatalogField {
+                name: "stickerPickerEntryPoint",
+                id: 1,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebStickerPanel.react",
             partial: false,
@@ -44873,6 +48188,14 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "StickerSend",
         code: 1840,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 16,
+            },
+            CatalogField {
+                name: "stickerHasSound",
+                id: 17,
+            },
             CatalogField {
                 name: "stickerIsAi",
                 id: 7,
@@ -44991,10 +48314,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "StickerStoreOpened",
         code: 3020,
-        fields: &[CatalogField {
-            name: "stickerStoreOpenedOrigin",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+            CatalogField {
+                name: "stickerStoreOpenedOrigin",
+                id: 1,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebStickerPanel.react",
             partial: false,
@@ -45008,6 +48337,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "bizPlatform",
                 id: 1,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 6,
             },
             CatalogField {
                 name: "messageClass",
@@ -45027,6 +48360,32 @@ pub const CALL_SITES: &[EventCallSites] = &[
             },
         ],
         sites: &[
+            CallSite {
+                module: "WAWebBizAiPaymentRequestWamLogger",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "bizPlatform",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageClass",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageClassAttributes",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageInteraction",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageMediaType",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
             CallSite {
                 module: "WAWebBuyerEventLogger",
                 partial: false,
@@ -45080,6 +48439,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 partial: false,
                 fields: &[
                     CallSiteField {
+                        name: "bizPlatform",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
                         name: "messageClass",
                         write: FieldWrite::Constructor,
                     },
@@ -45108,6 +48471,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 6,
+            },
+            CatalogField {
                 name: "messageClass",
                 id: 2,
             },
@@ -45125,6 +48492,28 @@ pub const CALL_SITES: &[EventCallSites] = &[
             },
         ],
         sites: &[
+            CallSite {
+                module: "WAWebBizAiPaymentRequestWamLogger",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "bizPlatform",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageClass",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageClassAttributes",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageMediaType",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
             CallSite {
                 module: "WAWebGalaxyFlowWamLoggerUtils",
                 partial: false,
@@ -45201,6 +48590,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 module: "WAWebPaymentRequestWamLogger",
                 partial: false,
                 fields: &[
+                    CallSiteField {
+                        name: "bizPlatform",
+                        write: FieldWrite::Constructor,
+                    },
                     CallSiteField {
                         name: "messageClass",
                         write: FieldWrite::Constructor,
@@ -45289,6 +48682,36 @@ pub const CALL_SITES: &[EventCallSites] = &[
             },
         ],
         sites: &[
+            CallSite {
+                module: "WAWebBizAiPaymentRequestWamLogger",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "bizPlatform",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "businessOwnerJid",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageClass",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageClassAttributes",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "messageMediaType",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "templateId",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
             CallSite {
                 module: "WAWebGalaxyFlowWamLoggerUtils",
                 partial: false,
@@ -45434,6 +48857,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 7458,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 14,
+            },
+            CatalogField {
                 name: "wsuaAction",
                 id: 1,
             },
@@ -45486,40 +48913,218 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 12,
             },
         ],
-        sites: &[CallSite {
-            module: "WAWebMetaOneUpsellLogger",
-            partial: false,
-            fields: &[
-                CallSiteField {
-                    name: "wsuaAction",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "wsuaActionTarget",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "wsuaProductType",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "wsuaReferral",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "wsuaScreen",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "wsuaScreenElement",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "wsuaSessionId",
-                    write: FieldWrite::Constructor,
-                },
-            ],
-        }],
+        sites: &[
+            CallSite {
+                module: "WAWebCustomerManagerMetaOneEntryPointLogger",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "wsuaAction",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaActionTarget",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaActiveSubscriptions",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaEligibleSubscriptions",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaProductType",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaReferral",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaScreen",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaScreenElement",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaSessionId",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebHatchSubscriptionLogger",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "wsuaAction",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaProductType",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaReferral",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaScreen",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaSessionId",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebHatchSubscriptionLogger",
+                partial: true,
+                fields: &[
+                    CallSiteField {
+                        name: "wsuaAction",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaSessionId",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebHatchSubscriptionLogger",
+                partial: true,
+                fields: &[
+                    CallSiteField {
+                        name: "wsuaAction",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaSessionId",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebMetaOneEntryPointLogger",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "wsuaAction",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaActionTarget",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaActiveSubscriptions",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaEligibleSubscriptions",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaProductType",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaReferral",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaScreen",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaScreenElement",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaSessionId",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebMetaOneUpsellLogger",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "wsuaAction",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaActionTarget",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaProductType",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaReferral",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaScreen",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaScreenElement",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaSessionId",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebSubscriptionDesktopNotification",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "wsuaAction",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaActionTarget",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaActiveSubscriptions",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaEligibleSubscriptions",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaProductType",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaReferral",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaScreen",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "wsuaSessionId",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+        ],
     },
     EventCallSites {
         event: "SupportAiSession",
@@ -45528,6 +49133,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "citationCmsId",
                 id: 5,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 6,
             },
             CatalogField {
                 name: "supportAiErrorCode",
@@ -45593,14 +49202,6 @@ pub const CALL_SITES: &[EventCallSites] = &[
             },
             CallSite {
                 module: "WAWebSendFeedbackModal.react",
-                partial: false,
-                fields: &[CallSiteField {
-                    name: "supportAiEventType",
-                    write: FieldWrite::Constructor,
-                }],
-            },
-            CallSite {
-                module: "WAWebSendSupportBotFeedbackActions",
                 partial: false,
                 fields: &[CallSiteField {
                     name: "supportAiEventType",
@@ -45792,6 +49393,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 3978,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 6,
+            },
+            CatalogField {
                 name: "keysUsedInSnapshotCount",
                 id: 1,
             },
@@ -45822,6 +49427,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "SystemMessageClick",
         code: 5082,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
             CatalogField {
                 name: "isAGroup",
                 id: 1,
@@ -45954,6 +49563,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 6,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 11,
+            },
+            CatalogField {
                 name: "textMessageUserJourneyAction",
                 id: 2,
             },
@@ -46078,6 +49691,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 11,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 30,
+            },
+            CatalogField {
                 name: "imagineCommandClick",
                 id: 14,
             },
@@ -46088,6 +49705,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "imagineMePromptsInitiatedCount",
                 id: 16,
+            },
+            CatalogField {
+                name: "imagineMediaEdit",
+                id: 31,
             },
             CatalogField {
                 name: "metaAiMentionClick",
@@ -46132,25 +49753,8 @@ pub const CALL_SITES: &[EventCallSites] = &[
         ],
         sites: &[CallSite {
             module: "WAWebThreadLoggingAi",
-            partial: false,
-            fields: &[
-                CallSiteField {
-                    name: "threadDs",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "threadId",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "totalMessageFromAgentCnt",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "totalMessageToAgentCnt",
-                    write: FieldWrite::Constructor,
-                },
-            ],
+            partial: true,
+            fields: &[],
         }],
     },
     EventCallSites {
@@ -46204,6 +49808,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "commerceMsgsSent",
                 id: 8,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 55,
             },
             CatalogField {
                 name: "entryPointConversionApp",
@@ -46368,63 +49976,18 @@ pub const CALL_SITES: &[EventCallSites] = &[
         ],
         sites: &[CallSite {
             module: "WAWebThreadLoggingBiz",
-            partial: false,
-            fields: &[
-                CallSiteField {
-                    name: "bizCatalogType",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "chatOrigins",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "commerceMsgsReceived",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "commerceMsgsSent",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "isCommerceViewed",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "isCtaOnPdpClicked",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "isUserAgent",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "ordersSent",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "pdpInquiriesSent",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "pdpViews",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "threadDs",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "threadId",
-                    write: FieldWrite::Constructor,
-                },
-            ],
+            partial: true,
+            fields: &[],
         }],
     },
     EventCallSites {
         event: "ThreadInteractionDataCoreConsumer",
         code: 6466,
         fields: &[
+            CatalogField {
+                name: "acpVersion",
+                id: 160,
+            },
             CatalogField {
                 name: "afterReadDuration",
                 id: 138,
@@ -46452,6 +50015,70 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "afterReadTurnedOn",
                 id: 143,
+            },
+            CatalogField {
+                name: "ar12hMediaMessagesExpired",
+                id: 163,
+            },
+            CatalogField {
+                name: "ar12hMediaMessagesReceived",
+                id: 164,
+            },
+            CatalogField {
+                name: "ar12hMediaMessagesSent",
+                id: 165,
+            },
+            CatalogField {
+                name: "ar12hMediaMessagesUnreadExpired",
+                id: 166,
+            },
+            CatalogField {
+                name: "ar12hTextMessagesExpired",
+                id: 167,
+            },
+            CatalogField {
+                name: "ar12hTextMessagesReceived",
+                id: 168,
+            },
+            CatalogField {
+                name: "ar12hTextMessagesSent",
+                id: 169,
+            },
+            CatalogField {
+                name: "ar12hTextMessagesUnreadExpired",
+                id: 170,
+            },
+            CatalogField {
+                name: "ar6hMediaMessagesExpired",
+                id: 171,
+            },
+            CatalogField {
+                name: "ar6hMediaMessagesReceived",
+                id: 172,
+            },
+            CatalogField {
+                name: "ar6hMediaMessagesSent",
+                id: 173,
+            },
+            CatalogField {
+                name: "ar6hMediaMessagesUnreadExpired",
+                id: 174,
+            },
+            CatalogField {
+                name: "ar6hTextMessagesExpired",
+                id: 175,
+            },
+            CatalogField {
+                name: "ar6hTextMessagesReceived",
+                id: 176,
+            },
+            CatalogField {
+                name: "ar6hTextMessagesSent",
+                id: 177,
+            },
+            CatalogField {
+                name: "ar6hTextMessagesUnreadExpired",
+                id: 178,
             },
             CatalogField {
                 name: "audioMessagesReceived",
@@ -46490,6 +50117,110 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 10,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 159,
+            },
+            CatalogField {
+                name: "dm24hMediaMessagesExpired",
+                id: 179,
+            },
+            CatalogField {
+                name: "dm24hMediaMessagesReceived",
+                id: 180,
+            },
+            CatalogField {
+                name: "dm24hMediaMessagesSent",
+                id: 181,
+            },
+            CatalogField {
+                name: "dm24hMediaMessagesUnreadExpired",
+                id: 182,
+            },
+            CatalogField {
+                name: "dm24hTextMessagesExpired",
+                id: 183,
+            },
+            CatalogField {
+                name: "dm24hTextMessagesReceived",
+                id: 184,
+            },
+            CatalogField {
+                name: "dm24hTextMessagesSent",
+                id: 185,
+            },
+            CatalogField {
+                name: "dm24hTextMessagesUnreadExpired",
+                id: 186,
+            },
+            CatalogField {
+                name: "dm7dMediaMessagesExpired",
+                id: 187,
+            },
+            CatalogField {
+                name: "dm7dMediaMessagesReceived",
+                id: 188,
+            },
+            CatalogField {
+                name: "dm7dMediaMessagesSent",
+                id: 189,
+            },
+            CatalogField {
+                name: "dm7dMediaMessagesUnreadExpired",
+                id: 190,
+            },
+            CatalogField {
+                name: "dm7dTextMessagesExpired",
+                id: 191,
+            },
+            CatalogField {
+                name: "dm7dTextMessagesReceived",
+                id: 192,
+            },
+            CatalogField {
+                name: "dm7dTextMessagesSent",
+                id: 193,
+            },
+            CatalogField {
+                name: "dm7dTextMessagesUnreadExpired",
+                id: 194,
+            },
+            CatalogField {
+                name: "dm90dMediaMessagesExpired",
+                id: 195,
+            },
+            CatalogField {
+                name: "dm90dMediaMessagesReceived",
+                id: 196,
+            },
+            CatalogField {
+                name: "dm90dMediaMessagesSent",
+                id: 197,
+            },
+            CatalogField {
+                name: "dm90dMediaMessagesUnreadExpired",
+                id: 198,
+            },
+            CatalogField {
+                name: "dm90dTextMessagesExpired",
+                id: 199,
+            },
+            CatalogField {
+                name: "dm90dTextMessagesReceived",
+                id: 200,
+            },
+            CatalogField {
+                name: "dm90dTextMessagesSent",
+                id: 201,
+            },
+            CatalogField {
+                name: "dm90dTextMessagesUnreadExpired",
+                id: 202,
+            },
+            CatalogField {
+                name: "dmSettingChangeCount",
+                id: 162,
+            },
+            CatalogField {
                 name: "documentMessagesReceived",
                 id: 13,
             },
@@ -46516,6 +50247,14 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "ephemeralMessagesUnreadExpired",
                 id: 18,
+            },
+            CatalogField {
+                name: "ephemeralityInitiator",
+                id: 19,
+            },
+            CatalogField {
+                name: "ephemeralityTriggerAction",
+                id: 20,
             },
             CatalogField {
                 name: "eventCreationMessagesReceived",
@@ -46782,6 +50521,14 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 68,
             },
             CatalogField {
+                name: "mutedUnreadMsgCount",
+                id: 203,
+            },
+            CatalogField {
+                name: "mutedUnreadThreadCount",
+                id: 204,
+            },
+            CatalogField {
                 name: "oppositePartyHasProfilePhoto",
                 id: 146,
             },
@@ -46922,6 +50669,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 109,
             },
             CatalogField {
+                name: "threadType",
+                id: 161,
+            },
+            CatalogField {
                 name: "tombstoneAiFutureproofedMessagesReceived",
                 id: 130,
             },
@@ -46932,6 +50683,14 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "tombstoneViewOnceMessagesReceived",
                 id: 129,
+            },
+            CatalogField {
+                name: "totalUnreadMsgCount",
+                id: 205,
+            },
+            CatalogField {
+                name: "totalUnreadThreadCount",
+                id: 206,
             },
             CatalogField {
                 name: "typeOfGroup",
@@ -47016,245 +50775,8 @@ pub const CALL_SITES: &[EventCallSites] = &[
         ],
         sites: &[CallSite {
             module: "WAWebThreadLoggingCoreConsumer",
-            partial: false,
-            fields: &[
-                CallSiteField {
-                    name: "afterReadDuration",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "afterReadMessagesExpired",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "afterReadMessagesReceived",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "afterReadMessagesSent",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "afterReadMessagesUnreadExpired",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "afterReadTurnedOff",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "afterReadTurnedOn",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "chatMuted",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "chatOverflowClicks",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "commentsReceived",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "editedMsgsSent",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "eventCreationMessagesReceived",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "eventCreationMessagesSent",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "eventResponseMessagesReceived",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "eventResponseMessagesSent",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "forwardMessagesReceived",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "forwardMessagesSent",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "groupMembershipReplies",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "groupPrivateReplies",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "groupSize",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "groupStatusLikesOthersToOthers",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "groupStatusLikesOthersToOwn",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "groupStatusRepliesOthersToOthers",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "groupStatusRepliesOthersToOwn",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "groupStatusRepliesOwnToOthers",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "groupStatusRepliesOwnToOwn",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "hasReplied1On1",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "hasUsername",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "hasUsernamePin",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "isAContact",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "isAGroup",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "isArchived",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "isMessageYourself",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "isPinned",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "isPnhEnabledChat",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "isUsernameThread",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "isUsernameThreadAtCreation",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "messagesRead",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "messagesReceived",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "messagesSent",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "messagesUnread",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "oppositePartyHasProfilePhoto",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "oppositeVisibleIdentification",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "profileReplies",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "profileViews",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "reactionsReceived",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "reactionsSent",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "repliesSent",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "sharesCommonGroup",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "statusReactionsReceived",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "statusReactionsSent",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "statusReplies",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "statusViews",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "threadDs",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "threadId",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "typeOfGroup",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "viewOnceMessagesOpened",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "viewOnceMessagesReceived",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "viewOnceMessagesSent",
-                    write: FieldWrite::Constructor,
-                },
-            ],
+            partial: true,
+            fields: &[],
         }],
     },
     EventCallSites {
@@ -47264,6 +50786,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "blockReason",
                 id: 1,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 10,
             },
             CatalogField {
                 name: "isBlocked",
@@ -47300,23 +50826,18 @@ pub const CALL_SITES: &[EventCallSites] = &[
         ],
         sites: &[CallSite {
             module: "WAWebThreadLoggingIntegrity",
-            partial: false,
-            fields: &[
-                CallSiteField {
-                    name: "threadDs",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "threadId",
-                    write: FieldWrite::Constructor,
-                },
-            ],
+            partial: true,
+            fields: &[],
         }],
     },
     EventCallSites {
         event: "ThreadInteractionDataNotification",
         code: 6412,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 27,
+            },
             CatalogField {
                 name: "groupSizeBucket",
                 id: 1,
@@ -47420,21 +50941,8 @@ pub const CALL_SITES: &[EventCallSites] = &[
         ],
         sites: &[CallSite {
             module: "WAWebThreadLoggingNotification",
-            partial: false,
-            fields: &[
-                CallSiteField {
-                    name: "isAGroup",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "threadDs",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "threadId",
-                    write: FieldWrite::Constructor,
-                },
-            ],
+            partial: true,
+            fields: &[],
         }],
     },
     EventCallSites {
@@ -47474,6 +50982,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 8,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 17,
+            },
+            CatalogField {
                 name: "threadCreationDate",
                 id: 16,
             },
@@ -47504,29 +51016,8 @@ pub const CALL_SITES: &[EventCallSites] = &[
         ],
         sites: &[CallSite {
             module: "WAWebThreadLoggingVoip",
-            partial: false,
-            fields: &[
-                CallSiteField {
-                    name: "callOffersReceived",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "callOffersSent",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "threadDs",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "threadId",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "totalCallDuration",
-                    write: FieldWrite::Constructor,
-                },
-            ],
+            partial: true,
+            fields: &[],
         }],
     },
     EventCallSites {
@@ -47548,6 +51039,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "cumulativeBits",
                 id: 4,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 10,
             },
             CatalogField {
                 name: "relativeTimestampMs",
@@ -47618,6 +51113,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 4574,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 7,
+            },
+            CatalogField {
                 name: "relativeTimestampMs",
                 id: 1,
             },
@@ -47663,6 +51162,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "cid",
                 id: 19,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 45,
             },
             CatalogField {
                 name: "entryPointConversationInitiated",
@@ -47933,6 +51436,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 15,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 31,
+            },
+            CatalogField {
                 name: "deviceCount",
                 id: 5,
             },
@@ -48191,6 +51698,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 3780,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
+            CatalogField {
                 name: "uiMessageYourselfActionSessionId",
                 id: 1,
             },
@@ -48227,6 +51738,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 3298,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
+            CatalogField {
                 name: "messageAction",
                 id: 1,
             },
@@ -48262,6 +51777,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "UnknownStanza",
         code: 3448,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
             CatalogField {
                 name: "unknownStanzaDropReason",
                 id: 3,
@@ -48301,6 +51820,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "channelsFollowedCount",
                 id: 1,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 14,
             },
             CatalogField {
                 name: "premiumChannelsFollowedCount",
@@ -48357,6 +51880,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "UserActivity",
         code: 1384,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 8,
+            },
             CatalogField {
                 name: "userActivityBitmapHigh",
                 id: 4,
@@ -48426,6 +51953,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 2472,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 7,
+            },
+            CatalogField {
                 name: "noticeTriggeredBy",
                 id: 5,
             },
@@ -48477,6 +52008,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "UserNoticeError",
         code: 2474,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
             CatalogField {
                 name: "noticeType",
                 id: 4,
@@ -48592,6 +52127,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 5224,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 19,
+            },
+            CatalogField {
                 name: "eligibleToLink",
                 id: 14,
             },
@@ -48638,6 +52177,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "usernameCreationFlowType",
                 id: 9,
+            },
+            CatalogField {
+                name: "usernameCreationRequiredAccounts",
+                id: 20,
             },
             CatalogField {
                 name: "usernameCreationUsernameSessionId",
@@ -48776,10 +52319,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "UsernameExposed",
         code: 7614,
-        fields: &[CatalogField {
-            name: "usernameExposureContext",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+            CatalogField {
+                name: "usernameExposureContext",
+                id: 1,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebContactInfoTopCard.react",
             partial: false,
@@ -48796,6 +52345,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "clientTsMs",
                 id: 2,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 12,
             },
             CatalogField {
                 name: "durationInSecs",
@@ -48893,6 +52446,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "VideoTranscoder",
         code: 1802,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 28,
+            },
             CatalogField {
                 name: "sourceAudioBitRate",
                 id: 12,
@@ -49074,6 +52631,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 6,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 13,
+            },
+            CatalogField {
                 name: "hasCoverPhoto",
                 id: 12,
             },
@@ -49148,6 +52709,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 3606,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
+            CatalogField {
                 name: "isAGroup",
                 id: 1,
             },
@@ -49191,6 +52756,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "WaFsGroupJoinRequestAction",
         code: 3944,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 7,
+            },
             CatalogField {
                 name: "groupJid",
                 id: 1,
@@ -49260,6 +52829,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 3,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 10,
+            },
+            CatalogField {
                 name: "emojiClickCnt",
                 id: 4,
             },
@@ -49306,10 +52879,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "WaOldCode",
         code: 3940,
-        fields: &[CatalogField {
-            name: "deviceId",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+            CatalogField {
+                name: "deviceId",
+                id: 1,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebHandleDeviceSwitchingNotification",
             partial: false,
@@ -49323,6 +52902,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "WaPlusBenefitUserJourney",
         code: 7896,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 12,
+            },
             CatalogField {
                 name: "wpbujAction",
                 id: 1,
@@ -49379,6 +52962,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 2908,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
+            CatalogField {
                 name: "isShopsProductPreviewVisible",
                 id: 2,
             },
@@ -49415,6 +53002,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 8248,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 11,
+            },
+            CatalogField {
                 name: "waffleLifecycleElapsedMs",
                 id: 1,
             },
@@ -49437,6 +53028,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "waffleLifecycleLinkState",
                 id: 6,
+            },
+            CatalogField {
+                name: "waffleLifecyclePkiVersion",
+                id: 12,
             },
             CatalogField {
                 name: "waffleLifecycleRetryCount",
@@ -49481,6 +53076,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                         write: FieldWrite::Constructor,
                     },
                     CallSiteField {
+                        name: "waffleLifecyclePkiVersion",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
                         name: "waffleLifecycleTraceAction",
                         write: FieldWrite::Constructor,
                     },
@@ -49515,6 +53114,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                         write: FieldWrite::Constructor,
                     },
                     CallSiteField {
+                        name: "waffleLifecyclePkiVersion",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
                         name: "waffleLifecycleTraceAction",
                         write: FieldWrite::Constructor,
                     },
@@ -49534,6 +53137,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                     },
                     CallSiteField {
                         name: "waffleLifecycleErrorCode",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "waffleLifecyclePkiVersion",
                         write: FieldWrite::Constructor,
                     },
                     CallSiteField {
@@ -49855,6 +53462,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 4560,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 3,
+            },
+            CatalogField {
                 name: "webContactListStartNewChatSearch",
                 id: 1,
             },
@@ -49883,6 +53494,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 4814,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 3,
+            },
+            CatalogField {
                 name: "webDbLoader",
                 id: 1,
             },
@@ -49901,6 +53516,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "WebDbTableUsage",
         code: 5074,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 7,
+            },
             CatalogField {
                 name: "offlineSessionId",
                 id: 1,
@@ -49954,6 +53573,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 4816,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 3,
+            },
+            CatalogField {
                 name: "webDbName",
                 id: 1,
             },
@@ -49982,6 +53605,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 4784,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 3,
+            },
+            CatalogField {
                 name: "webDbVersionSource",
                 id: 1,
             },
@@ -50008,7 +53635,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "WebDynamicSamplingTestEventWithSampling",
         code: 5320,
-        fields: &[],
+        fields: &[CatalogField {
+            name: "dedupKey",
+            id: 1,
+        }],
         sites: &[CallSite {
             module: "WAWebTasksDailyStatsTask",
             partial: false,
@@ -50018,7 +53648,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "WebDynamicSamplingTestEventWithoutSampling",
         code: 5322,
-        fields: &[],
+        fields: &[CatalogField {
+            name: "dedupKey",
+            id: 1,
+        }],
         sites: &[CallSite {
             module: "WAWebTasksDailyStatsTask",
             partial: false,
@@ -50028,10 +53661,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "WebHdMediaAwarenessInteraction",
         code: 5426,
-        fields: &[CatalogField {
-            name: "hdMediaSelected",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+            CatalogField {
+                name: "hdMediaSelected",
+                id: 1,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebHDPhotoMediaEditorDropdown.react",
             partial: false,
@@ -50044,7 +53683,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "WebWamForceFlush",
         code: 3264,
-        fields: &[],
+        fields: &[CatalogField {
+            name: "dedupKey",
+            id: 1,
+        }],
         sites: &[CallSite {
             module: "WAWebForceFlushWamBuffers",
             partial: false,
@@ -50055,6 +53697,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "WebcAssetLoad",
         code: 1358,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 6,
+            },
             CatalogField {
                 name: "webcAssetCacheType",
                 id: 4,
@@ -50120,6 +53766,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 5302,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
+            CatalogField {
                 name: "offboardSource",
                 id: 1,
             },
@@ -50163,6 +53813,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "WebcButterbarEvent",
         code: 3932,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 3,
+            },
             CatalogField {
                 name: "webcButterbarAction",
                 id: 1,
@@ -50240,6 +53894,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 1,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 3,
+            },
+            CatalogField {
                 name: "noCreated",
                 id: 2,
             },
@@ -50263,6 +53921,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "WebcChatOpen",
         code: 864,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 9,
+            },
             CatalogField {
                 name: "webcChatOpenBeforePaintT",
                 id: 7,
@@ -50311,6 +53973,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "WebcDbOpen",
         code: 1940,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
             CatalogField {
                 name: "webcDbName",
                 id: 1,
@@ -50366,10 +54032,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "WebcEmojiOpen",
         code: 1166,
-        fields: &[CatalogField {
-            name: "webcEmojiOpenTab",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+            CatalogField {
+                name: "webcEmojiOpenTab",
+                id: 1,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebGifPanel.react",
             partial: false,
@@ -50410,6 +54082,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "cpuMake",
                 id: 38,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 55,
             },
             CatalogField {
                 name: "deviceMemory",
@@ -50520,128 +54196,144 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 21,
             },
         ],
-        sites: &[CallSite {
-            module: "WAWebWamFingerprintReporter",
-            partial: false,
-            fields: &[
-                CallSiteField {
-                    name: "automationSignals",
+        sites: &[
+            CallSite {
+                module: "WAWebVoipCameraFingerprint",
+                partial: false,
+                fields: &[CallSiteField {
+                    name: "peripherals",
                     write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "browserEngine",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "chromeStructure",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "connectionRtt",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "cpuMake",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "deviceMemory",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "extentionIds",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "externalSources",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "foreignDbList",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "gpuMake",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "hasChrome",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "hasTaskbar",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "hasWebShare",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "historyLength",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "mimeTypeCount",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "notificationPermission",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "pdfViewerEnabled",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "platformEstimate",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "pluginCount",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "screenResolution",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "sessionStorageLength",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "timezone",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "touchPresence",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "viewportSize",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "webcCanvasFingerprint",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "webcWebglFingerprint",
-                    write: FieldWrite::Constructor,
-                },
-                CallSiteField {
-                    name: "webcWindowNavigatorWebdriver",
-                    write: FieldWrite::Constructor,
-                },
-            ],
-        }],
+                }],
+            },
+            CallSite {
+                module: "WAWebWamFingerprintReporter",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "automationSignals",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "browserEngine",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "chromeStructure",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "connectionRtt",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "cpuMake",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "deviceMemory",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "extentionIds",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "externalSources",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "foreignDbList",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "gpuMake",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "hasChrome",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "hasTaskbar",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "hasWebShare",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "historyLength",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "mimeTypeCount",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "notificationPermission",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "pdfViewerEnabled",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "platformEstimate",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "pluginCount",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "screenResolution",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "sessionStorageLength",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "timezone",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "touchPresence",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "viewportSize",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "webcCanvasFingerprint",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "webcWebglFingerprint",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "webcWindowNavigatorWebdriver",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+        ],
     },
     EventCallSites {
         event: "WebcFtsStorage",
         code: 3642,
-        fields: &[CatalogField {
-            name: "ftsTotalSize",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+            CatalogField {
+                name: "ftsTotalSize",
+                id: 1,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebTasksDailyStatsTask",
             partial: false,
@@ -50654,10 +54346,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "WebcImgError",
         code: 1700,
-        fields: &[CatalogField {
-            name: "webcImgErrorCode",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+            CatalogField {
+                name: "webcImgErrorCode",
+                id: 1,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebImgRetry",
             partial: false,
@@ -50671,6 +54369,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "WebcJobInfo",
         code: 3054,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 9,
+            },
             CatalogField {
                 name: "jobName",
                 id: 1,
@@ -50748,6 +54450,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 3864,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
+            CatalogField {
                 name: "didFallbackNonHq",
                 id: 2,
             },
@@ -50792,6 +54498,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 3860,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 6,
+            },
+            CatalogField {
                 name: "didRespondHqPreview",
                 id: 5,
             },
@@ -50835,6 +54545,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "WebcLogin",
         code: 1664,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 18,
+            },
             CatalogField {
                 name: "webcBrowserNetworkType",
                 id: 14,
@@ -50915,6 +54629,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 912,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
+            CatalogField {
                 name: "webcMediaAnalyzeT",
                 id: 3,
             },
@@ -50949,6 +54667,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "blurImageCount",
                 id: 7,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 8,
             },
             CatalogField {
                 name: "editedImageCount",
@@ -51015,6 +54737,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 2352,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
+            CatalogField {
                 name: "mediaId",
                 id: 1,
             },
@@ -51059,6 +54785,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 1202,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 3,
+            },
+            CatalogField {
                 name: "webcMediaLoadResult",
                 id: 2,
             },
@@ -51090,6 +54820,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "WebcMediaRmr",
         code: 1906,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 15,
+            },
             CatalogField {
                 name: "messageMediaType",
                 id: 10,
@@ -51215,6 +54949,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 20,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 28,
+            },
+            CatalogField {
                 name: "isForeground",
                 id: 13,
             },
@@ -51287,6 +55025,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 2504,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
+            CatalogField {
                 name: "webcMenuAction",
                 id: 2,
             },
@@ -51321,6 +55063,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "decryptionT",
                 id: 1,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 10,
             },
             CatalogField {
                 name: "isOffline",
@@ -51364,6 +55110,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "WebcMessageQuery",
         code: 1876,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 22,
+            },
             CatalogField {
                 name: "webcAudioMessageCount",
                 id: 14,
@@ -51501,6 +55251,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 2072,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
+            CatalogField {
                 name: "messageIsForward",
                 id: 3,
             },
@@ -51543,6 +55297,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "additionalDebugContext",
                 id: 1,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 6,
             },
             CatalogField {
                 name: "logContext",
@@ -51588,6 +55346,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "WebcNativeUpsellCta",
         code: 3934,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 6,
+            },
             CatalogField {
                 name: "webcNativeUpsellCtaEventType",
                 id: 2,
@@ -51703,6 +55465,28 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
+                module: "WAWebLinkDeviceAndroidTabletOverlayWam",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "webcNativeUpsellCtaEventType",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "webcNativeUpsellCtaIsBetaUser",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "webcNativeUpsellCtaReleaseChannel",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "webcNativeUpsellCtaSource",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
                 module: "WAWebMacBetaUpsellToastbar.react",
                 partial: false,
                 fields: &[
@@ -51755,10 +55539,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "WebcNavbar",
         code: 5258,
-        fields: &[CatalogField {
-            name: "webcNavbarItemLabel",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+            CatalogField {
+                name: "webcNavbarItemLabel",
+                id: 1,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebNavBarLogEvents",
             partial: false,
@@ -51775,6 +55565,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "currentOfflineProcessStage",
                 id: 4,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 13,
             },
             CatalogField {
                 name: "offlineProcessDecryptErrorCount",
@@ -51840,6 +55634,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "WebcPageLoad",
         code: 642,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 55,
+            },
             CatalogField {
                 name: "webcAppcacheStatus",
                 id: 29,
@@ -52037,10 +55835,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "WebcPageLoad2",
         code: 5392,
-        fields: &[CatalogField {
-            name: "webcPageLoadId",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+            CatalogField {
+                name: "webcPageLoadId",
+                id: 1,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebPageLoadLoggingImpl",
             partial: false,
@@ -52053,10 +55857,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "WebcPageResume",
         code: 884,
-        fields: &[CatalogField {
-            name: "webcResumeCount",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+            CatalogField {
+                name: "webcResumeCount",
+                id: 1,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebStreamModel",
             partial: false,
@@ -52070,6 +55880,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "WebcProgressiveImage",
         code: 2226,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
             CatalogField {
                 name: "webcFirstRenderScans",
                 id: 1,
@@ -52099,10 +55913,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "WebcPwaEvent",
         code: 4116,
-        fields: &[CatalogField {
-            name: "webcPwaAction",
-            id: 2,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 3,
+            },
+            CatalogField {
+                name: "webcPwaAction",
+                id: 2,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebPwaEventListeners",
             partial: false,
@@ -52116,6 +55936,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "WebcQuickAction",
         code: 8326,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 7,
+            },
             CatalogField {
                 name: "webcQuickActionEventType",
                 id: 1,
@@ -52229,10 +56053,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "WebcRawPlatforms",
         code: 2416,
-        fields: &[CatalogField {
-            name: "webcRawPlatform",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+            CatalogField {
+                name: "webcRawPlatform",
+                id: 1,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebConnModel",
             partial: false,
@@ -52246,6 +56076,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "WebcResourceLoad",
         code: 688,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
             CatalogField {
                 name: "webcResourceCached",
                 id: 3,
@@ -52283,6 +56117,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 5450,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
+            CatalogField {
                 name: "webcAuthHandshakeDuration",
                 id: 1,
             },
@@ -52309,6 +56147,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "WebcStatusSession",
         code: 1880,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 8,
+            },
             CatalogField {
                 name: "webcStatusMutedItemCount",
                 id: 4,
@@ -52378,6 +56220,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 1878,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 8,
+            },
+            CatalogField {
                 name: "webcStatusMutedItemCount",
                 id: 4,
             },
@@ -52418,10 +56264,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "WebcStickerMakerEvents",
         code: 3104,
-        fields: &[CatalogField {
-            name: "stickerMakerEventName",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+            CatalogField {
+                name: "stickerMakerEventName",
+                id: 1,
+            },
+        ],
         sites: &[
             CallSite {
                 module: "WAWebAttachMenuPopupItemStickers.react",
@@ -52510,6 +56362,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 1504,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
+            CatalogField {
                 name: "webcAgeOfStorage",
                 id: 3,
             },
@@ -52568,10 +56424,16 @@ pub const CALL_SITES: &[EventCallSites] = &[
     EventCallSites {
         event: "WebcStreamModeChange",
         code: 770,
-        fields: &[CatalogField {
-            name: "webcStreamMode",
-            id: 1,
-        }],
+        fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 2,
+            },
+            CatalogField {
+                name: "webcStreamMode",
+                id: 1,
+            },
+        ],
         sites: &[CallSite {
             module: "WAWebStreamModel",
             partial: false,
@@ -52585,6 +56447,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "WebcWebtpPdfViewer",
         code: 7506,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 11,
+            },
             CatalogField {
                 name: "webtpErrorCode",
                 id: 1,
@@ -52830,6 +56696,92 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 partial: false,
                 fields: &[
                     CallSiteField {
+                        name: "webtpErrorMessage",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "webtpErrorType",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "webtpEvent",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "webtpFileSize",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "webtpSessionId",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "webtpSource",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebTPLoggingUtils",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "webtpEvent",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "webtpFileSize",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "webtpSdkVersion",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "webtpSessionId",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "webtpSource",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "webtpTelemetryData",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebTPLoggingUtils",
+                partial: false,
+                fields: &[
+                    CallSiteField {
+                        name: "webtpEvent",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "webtpFileSize",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "webtpSessionId",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "webtpSource",
+                        write: FieldWrite::Constructor,
+                    },
+                    CallSiteField {
+                        name: "webtpTelemetryData",
+                        write: FieldWrite::Constructor,
+                    },
+                ],
+            },
+            CallSite {
+                module: "WAWebTPPdfLoggingUtils",
+                partial: false,
+                fields: &[
+                    CallSiteField {
                         name: "webtpErrorCode",
                         write: FieldWrite::Constructor,
                     },
@@ -52868,7 +56820,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebTPLoggingUtils",
+                module: "WAWebTPPdfLoggingUtils",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -52902,7 +56854,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebTPLoggingUtils",
+                module: "WAWebTPPdfLoggingUtils",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -52936,7 +56888,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebTPLoggingUtils",
+                module: "WAWebTPPdfLoggingUtils",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -52966,7 +56918,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebTPLoggingUtils",
+                module: "WAWebTPPdfLoggingUtils",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -53000,7 +56952,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebTPLoggingUtils",
+                module: "WAWebTPPdfLoggingUtils",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -53030,37 +56982,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebTPLoggingUtils",
-                partial: false,
-                fields: &[
-                    CallSiteField {
-                        name: "webtpErrorMessage",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "webtpErrorType",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "webtpEvent",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "webtpFileSize",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "webtpSessionId",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "webtpSource",
-                        write: FieldWrite::Constructor,
-                    },
-                ],
-            },
-            CallSite {
-                module: "WAWebTPLoggingUtils",
+                module: "WAWebTPPdfLoggingUtils",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -53090,7 +57012,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebTPLoggingUtils",
+                module: "WAWebTPPdfLoggingUtils",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -53120,37 +57042,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebTPLoggingUtils",
-                partial: false,
-                fields: &[
-                    CallSiteField {
-                        name: "webtpEvent",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "webtpFileSize",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "webtpSdkVersion",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "webtpSessionId",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "webtpSource",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "webtpTelemetryData",
-                        write: FieldWrite::Constructor,
-                    },
-                ],
-            },
-            CallSite {
-                module: "WAWebTPLoggingUtils",
+                module: "WAWebTPPdfLoggingUtils",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -53172,7 +57064,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebTPLoggingUtils",
+                module: "WAWebTPPdfLoggingUtils",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -53194,7 +57086,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebTPLoggingUtils",
+                module: "WAWebTPPdfLoggingUtils",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -53220,7 +57112,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebTPLoggingUtils",
+                module: "WAWebTPPdfLoggingUtils",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -53246,7 +57138,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebTPLoggingUtils",
+                module: "WAWebTPPdfLoggingUtils",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -53272,7 +57164,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebTPLoggingUtils",
+                module: "WAWebTPPdfLoggingUtils",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -53298,7 +57190,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebTPLoggingUtils",
+                module: "WAWebTPPdfLoggingUtils",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -53324,33 +57216,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebTPLoggingUtils",
-                partial: false,
-                fields: &[
-                    CallSiteField {
-                        name: "webtpEvent",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "webtpFileSize",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "webtpSessionId",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "webtpSource",
-                        write: FieldWrite::Constructor,
-                    },
-                    CallSiteField {
-                        name: "webtpTelemetryData",
-                        write: FieldWrite::Constructor,
-                    },
-                ],
-            },
-            CallSite {
-                module: "WAWebTPLoggingUtils",
+                module: "WAWebTPPdfLoggingUtils",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -53368,7 +57234,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebTPLoggingUtils",
+                module: "WAWebTPPdfLoggingUtils",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -53386,7 +57252,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebTPLoggingUtils",
+                module: "WAWebTPPdfLoggingUtils",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -53404,7 +57270,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebTPLoggingUtils",
+                module: "WAWebTPPdfLoggingUtils",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -53426,7 +57292,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebTPLoggingUtils",
+                module: "WAWebTPPdfLoggingUtils",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -53448,7 +57314,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebTPLoggingUtils",
+                module: "WAWebTPPdfLoggingUtils",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -53470,7 +57336,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebTPLoggingUtils",
+                module: "WAWebTPPdfLoggingUtils",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -53492,7 +57358,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebTPLoggingUtils",
+                module: "WAWebTPPdfLoggingUtils",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -53514,7 +57380,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebTPLoggingUtils",
+                module: "WAWebTPPdfLoggingUtils",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -53528,7 +57394,7 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 ],
             },
             CallSite {
-                module: "WAWebTPLoggingUtils",
+                module: "WAWebTPPdfLoggingUtils",
                 partial: false,
                 fields: &[
                     CallSiteField {
@@ -53551,6 +57417,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "WebcWhatsNewImpression",
         code: 8200,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
             CatalogField {
                 name: "webcWhatsNewAction",
                 id: 1,
@@ -53642,6 +57512,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
                 id: 8,
             },
             CatalogField {
+                name: "dedupKey",
+                id: 10,
+            },
+            CatalogField {
                 name: "deviceExpId",
                 id: 5,
             },
@@ -53681,6 +57555,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         code: 6640,
         fields: &[
             CatalogField {
+                name: "dedupKey",
+                id: 4,
+            },
+            CatalogField {
                 name: "exposureKey",
                 id: 1,
             },
@@ -53706,6 +57584,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
             CatalogField {
                 name: "clientExtraData",
                 id: 6,
+            },
+            CatalogField {
+                name: "dedupKey",
+                id: 7,
             },
             CatalogField {
                 name: "eligibilityStatus",
@@ -53755,6 +57637,10 @@ pub const CALL_SITES: &[EventCallSites] = &[
         event: "WindowsDefaultProtocolActivation",
         code: 8504,
         fields: &[
+            CatalogField {
+                name: "dedupKey",
+                id: 5,
+            },
             CatalogField {
                 name: "defaultProtocolResult",
                 id: 1,

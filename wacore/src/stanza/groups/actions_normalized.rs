@@ -1,14 +1,13 @@
 //! Complete owned normalization of the qualified group-notification action switch.
-//! Source: WAWebHandleGroupNotification, WA 2.3000.1047483476, module SHA-256
-//! a65d861ba0dacdcec52d2df48712a80677ecf10021d7df63c84183f195db13a1,
-//! handler bundle 09d91fdc4089c50ab1d35dd6c796ee82ef4c3296710316d20383c85738b871b8,
-//! bytes 1693402..1716842. The action switch occupies module bytes11926..22539.
-//! Runtime logging, cache/session changes, storage and ACK handling stay outside.
+//! Source: WAWebHandleGroupNotification, WA 2.3000.1052559453. Module hashes
+//! and semantic review are in the codegen group_qualification_review fixture.
+//! Runtime cache/session changes, storage and ACK handling stay outside.
 use super::create_normalized::{
     self, CreateParseError, CreateParticipant, GroupCreateContext, NormalizedGroupCreate,
 };
 use super::identity::{self, IntegerReadError};
 use super::link_normalized::{self, GroupLinkKind, NormalizedLink};
+use super::normalization_warning::{GroupWarningSink, IgnoreWarnings};
 use super::normalized::{self, GroupParseError, GroupUnlinkKind, NormalizedUnlink};
 use super::suggestions_normalized::{
     self, CreatedSubgroupSuggestion, RevokedSubgroupSuggestions, SubgroupSuggestionsOwnerChanged,
@@ -27,6 +26,7 @@ pub struct ActionContext<'a> {
     pub timestamp: i64,
     pub is_lid_addressing_mode: bool,
     pub username_displayed: bool,
+    /// Retained for caller compatibility; this snapshot reads participant history unconditionally.
     pub history_after_join: bool,
     pub is_me_account: &'a dyn Fn(&Jid) -> bool,
     pub opus_enabled: bool,
@@ -539,6 +539,14 @@ pub fn parse_action_result(
     node: &NodeRef<'_>,
     context: &ActionContext<'_>,
 ) -> ParseResult<Option<NormalizedGroupAction>> {
+    parse_action_result_with_warnings(node, context, &mut IgnoreWarnings)
+}
+
+pub fn parse_action_result_with_warnings(
+    node: &NodeRef<'_>,
+    context: &ActionContext<'_>,
+    warnings: &mut dyn GroupWarningSink,
+) -> ParseResult<Option<NormalizedGroupAction>> {
     use GroupNotificationActionTag as T;
     if node.tag.as_ref() == super::MISSING_PARTICIPANT_IDENTIFICATION_TAG {
         return Ok(None);
@@ -690,12 +698,20 @@ pub fn parse_action_result(
                 lock_type,
             }
         }
-        T::Link => NormalizedGroupAction::Link {
-            data: link_normalized::parse_link(node)?,
-        },
-        T::Unlink => NormalizedGroupAction::Unlink {
-            data: normalized::parse_unlink(node)?,
-        },
+        T::Link => {
+            let data = link_normalized::parse_link_with_warnings(node, warnings)?;
+            if data.kind.is_none() {
+                return Ok(None);
+            }
+            NormalizedGroupAction::Link { data }
+        }
+        T::Unlink => {
+            let data = normalized::parse_unlink_with_warnings(node, warnings)?;
+            if data.kind.is_none() {
+                return Ok(None);
+            }
+            NormalizedGroupAction::Unlink { data }
+        }
         T::MembershipApprovalMode => {
             let group_join = child(node, "group_join")?;
             let value = text(group_join, "state")? == "on";

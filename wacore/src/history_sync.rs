@@ -3065,7 +3065,7 @@ mod tests {
             };
         }
         crate::proto_helpers::with_context_info_fields!(check!());
-        assert_eq!(slots.len(), 42);
+        assert_eq!(slots.len(), 44);
         assert_eq!(slots.len(), N_CARRIERS);
         assert_eq!(
             slots.into_iter().collect::<Vec<_>>(),

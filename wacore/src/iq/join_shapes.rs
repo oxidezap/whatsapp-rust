@@ -1,4 +1,4 @@
-//! Auto-generated response presence-gate shapes (WhatsApp 2.3000.1047483476). DO NOT EDIT.
+//! Auto-generated response presence-gate shapes (WhatsApp 2.3000.1052559453). DO NOT EDIT.
 //!
 //! The success shapes of RPCs whose answers carry presence gates, from the
 //! whatspec IQ index.

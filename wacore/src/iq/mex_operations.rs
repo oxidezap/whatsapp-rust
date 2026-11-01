@@ -1,4 +1,4 @@
-//! Auto-generated typed mex operations (WhatsApp 2.3000.1047483476). DO NOT EDIT.
+//! Auto-generated typed mex operations (WhatsApp 2.3000.1052559453). DO NOT EDIT.
 //!
 //! One module per persisted GraphQL operation: typed `Variables` + `Response`
 //! plus `DOC_ID`/`OPERATION_KIND`/`NAME`. Depends only on `serde`.
@@ -131,6 +131,72 @@ pub mod acs_server_provider_issuance {
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_wa_acs_issue_credentials: Option<XwaWaAcsIssueCredentials>,
+    }
+}
+
+/// `WAWebAECompanionOffboardMutation` (mutation).
+pub mod ae_companion_offboard {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebAECompanionOffboardMutation";
+    pub const DOC_ID: &str = "28559481720386041";
+    pub const OPERATION_KIND: &str = "mutation";
+    pub const VARIABLE_KEYS: &[&str] = &["phoneNumber"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(rename = "phoneNumber")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub phone_number: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XfbWhatsappCoexistenceOffboardProduct {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub success: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xfb_whatsapp_coexistence_offboard_product:
+            Option<XfbWhatsappCoexistenceOffboardProduct>,
+    }
+}
+
+/// `WAWebAECompanionOnboardMutation` (mutation).
+pub mod ae_companion_onboard {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebAECompanionOnboardMutation";
+    pub const DOC_ID: &str = "28609245015427378";
+    pub const OPERATION_KIND: &str = "mutation";
+    pub const VARIABLE_KEYS: &[&str] = &["phoneNumber"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(rename = "phoneNumber")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub phone_number: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XfbWhatsappCoexistenceProcessNativeOnboarding {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub success: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xfb_whatsapp_coexistence_process_native_onboarding:
+            Option<XfbWhatsappCoexistenceProcessNativeOnboarding>,
     }
 }
 
@@ -396,57 +462,6 @@ pub mod biz_create_order {
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_checkout_place_order: Option<XwaCheckoutPlaceOrder>,
-    }
-}
-
-/// `WAWebBizCustomUrlGetUserGraphqlQuery` (query).
-pub mod biz_custom_url_get_user_graphql {
-    use super::{Deserialize, Serialize};
-
-    pub const NAME: &str = "WAWebBizCustomUrlGetUserGraphqlQuery";
-    pub const DOC_ID: &str = "26867176859566677";
-    pub const OPERATION_KIND: &str = "query";
-    pub const VARIABLE_KEYS: &[&str] = &["data"];
-
-    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-    #[non_exhaustive]
-    pub struct CustomUrl {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub path: Option<String>,
-    }
-
-    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-    #[non_exhaustive]
-    pub struct Data {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub custom_url: Option<CustomUrl>,
-    }
-
-    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-    #[non_exhaustive]
-    pub struct Variables {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub data: Option<Data>,
-    }
-
-    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-    #[non_exhaustive]
-    pub struct XwaCustomUrlGetUser {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub error_code: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub error_text: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub lid: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub success: Option<String>,
-    }
-
-    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-    #[non_exhaustive]
-    pub struct Response {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub xwa_custom_url_get_user: Option<XwaCustomUrlGetUser>,
     }
 }
 
@@ -1202,8 +1217,6 @@ pub mod biz_query_order {
     #[non_exhaustive]
     pub struct Order {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub direct_connection_encrypted_info: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub image_dimensions: Option<ImageDimensions>,
@@ -1508,6 +1521,69 @@ pub mod change_newsletter_owner {
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_change_owner: Option<Xwa2NewsletterChangeOwner>,
+    }
+}
+
+/// `WAWebCoexCanonicalStateQuery` (query).
+pub mod coex_canonical_state {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebCoexCanonicalStateQuery";
+    pub const DOC_ID: &str = "38737092685936550";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &["request"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Request {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub phone_number: Option<i64>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub request: Option<Request>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct CoexConnectionDescriptor {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub product: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub provider_id: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct States {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub coex_connection_descriptor: Option<CoexConnectionDescriptor>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub onboarding_status: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct ProductStates {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub states: Option<Vec<States>>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XfbWhatsappCoexistenceBspInfoQuery {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub product_states: Option<ProductStates>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xfb_whatsapp_coexistence_bsp_info_query: Option<XfbWhatsappCoexistenceBspInfoQuery>,
     }
 }
 
@@ -1869,7 +1945,7 @@ pub mod contact_manager_customer_profile {
     use super::{Deserialize, Serialize};
 
     pub const NAME: &str = "WAWebContactManagerCustomerProfileQuery";
-    pub const DOC_ID: &str = "37925750573706165";
+    pub const DOC_ID: &str = "29469025239347803";
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["lid"];
 
@@ -1884,6 +1960,10 @@ pub mod contact_manager_customer_profile {
     #[non_exhaustive]
     pub struct LastUpdates {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub field_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub source: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub ts: Option<String>,
     }
 
@@ -1897,17 +1977,25 @@ pub mod contact_manager_customer_profile {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub address: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub ai_summary: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub confirmed_appointment_date: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub dob: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub email: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub last_order_date: Option<String>,
+        pub etag: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub last_order: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub last_updates: Option<Vec<LastUpdates>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub lead_stage: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub order_preferences: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1918,12 +2006,43 @@ pub mod contact_manager_customer_profile {
     }
 }
 
+/// `WAWebContactManagerCustomerProfileDeleteMutation` (mutation).
+pub mod contact_manager_customer_profile_delete {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebContactManagerCustomerProfileDeleteMutation";
+    pub const DOC_ID: &str = "27993814970320462";
+    pub const OPERATION_KIND: &str = "mutation";
+    pub const VARIABLE_KEYS: &[&str] = &["lid"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lid: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XfbWaDeleteCustomerProfile {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub deleted_lid: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xfb_wa_delete_customer_profile: Option<XfbWaDeleteCustomerProfile>,
+    }
+}
+
 /// `WAWebContactManagerCustomerProfileUpsertMutation` (mutation).
 pub mod contact_manager_customer_profile_upsert {
     use super::{Deserialize, Serialize};
 
     pub const NAME: &str = "WAWebContactManagerCustomerProfileUpsertMutation";
-    pub const DOC_ID: &str = "27789071790751197";
+    pub const DOC_ID: &str = "29102382062699337";
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
@@ -1931,21 +2050,32 @@ pub mod contact_manager_customer_profile_upsert {
     #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub input: Option<Vec<String>>,
+        pub input: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Conflicts {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lid_jid: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
     #[non_exhaustive]
     pub struct Profiles {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub lid: Option<String>,
+        pub lid_jid: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
     #[non_exhaustive]
     pub struct XfbWaUpsertCustomerProfiles {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub conflicts: Option<Vec<Conflicts>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub profiles: Option<Vec<Profiles>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub unresolved_lids: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1961,9 +2091,9 @@ pub mod contact_manager_customer_profiles {
     use super::{Deserialize, Serialize};
 
     pub const NAME: &str = "WAWebContactManagerCustomerProfilesQuery";
-    pub const DOC_ID: &str = "27796221486653417";
+    pub const DOC_ID: &str = "29693690733569730";
     pub const OPERATION_KIND: &str = "query";
-    pub const VARIABLE_KEYS: &[&str] = &["input"];
+    pub const VARIABLE_KEYS: &[&str] = &["includeCustomFields", "input"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
     #[non_exhaustive]
@@ -1994,8 +2124,49 @@ pub mod contact_manager_customer_profiles {
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
     #[non_exhaustive]
     pub struct Variables {
+        #[serde(rename = "includeCustomFields")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub include_custom_fields: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct CustomFieldDefinition {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub currency: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub currency_decimal_places: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub enum_option_keys: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub enum_values: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub field_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct CustomFieldValues {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub custom_field_definition: Option<CustomFieldDefinition>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub date_value: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub enum_option_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub money_amount: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub numeric_value: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub text_value: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2011,15 +2182,21 @@ pub mod contact_manager_customer_profiles {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub acquisition_source: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub address: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub custom_field_values: Option<Vec<CustomFieldValues>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub dob: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub email: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub last_order_date: Option<String>,
+        pub last_order: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub last_updates: Option<Vec<LastUpdates>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub lead_stage: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub lid: Option<String>,
+        pub lid_jid: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
     }
@@ -2046,7 +2223,7 @@ pub mod create_invite_code {
     use super::{Deserialize, Serialize};
 
     pub const NAME: &str = "WAWebMexCreateInviteCodeJobMutation";
-    pub const DOC_ID: &str = "26155584267463745";
+    pub const DOC_ID: &str = "28250338504572715";
     pub const OPERATION_KIND: &str = "mutation";
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
@@ -2073,6 +2250,8 @@ pub mod create_invite_code {
     pub struct Xwa2GrowthCreateInviteCode {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error_reason: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2411,9 +2590,9 @@ pub mod create_whats_app_ads_identity {
     use super::{Deserialize, Serialize};
 
     pub const NAME: &str = "WAWebCreateWhatsAppAdsIdentityMutation";
-    pub const DOC_ID: &str = "24393949203623093";
+    pub const DOC_ID: &str = "28563449513306594";
     pub const OPERATION_KIND: &str = "mutation";
-    pub const VARIABLE_KEYS: &[&str] = &["code", "phone_number"];
+    pub const VARIABLE_KEYS: &[&str] = &["code", "lid", "phone_number"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
     #[non_exhaustive]
@@ -2434,6 +2613,8 @@ pub mod create_whats_app_ads_identity {
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub code: Option<Code>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lid: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub phone_number: Option<PhoneNumber>,
     }
@@ -2489,6 +2670,80 @@ pub mod custom_label3pd_event {
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_get_3pd_event: Option<Vec<XwaGet3pdEvent>>,
+    }
+}
+
+/// `WAWebCustomerManagerAccessStateQuery` (query).
+pub mod customer_manager_access_state {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebCustomerManagerAccessStateQuery";
+    pub const DOC_ID: &str = "28677428258581927";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &[];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {}
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XfbWaContactManagerAccessState {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub state: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub trial_end_time: Option<i64>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xfb_wa_contact_manager_access_state: Option<XfbWaContactManagerAccessState>,
+    }
+}
+
+/// `WAWebCustomerManagerStartTrialMutation` (mutation).
+pub mod customer_manager_start_trial {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebCustomerManagerStartTrialMutation";
+    pub const DOC_ID: &str = "28905083339086977";
+    pub const OPERATION_KIND: &str = "mutation";
+    pub const VARIABLE_KEYS: &[&str] = &["input"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Input {}
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input: Option<Input>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct AccessState {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub state: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub trial_end_time: Option<i64>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XfbWaStartContactManagerTrial {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub access_state: Option<AccessState>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xfb_wa_start_contact_manager_trial: Option<XfbWaStartContactManagerTrial>,
     }
 }
 
@@ -2591,6 +2846,65 @@ pub mod edit_biz_profile {
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub edit_wa_web_biz_profile: Option<String>,
+    }
+}
+
+/// `WAWebEmailInviteSendGroupMutation` (mutation).
+pub mod email_invite_send_group {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebEmailInviteSendGroupMutation";
+    pub const DOC_ID: &str = "28484430131216234";
+    pub const OPERATION_KIND: &str = "mutation";
+    pub const VARIABLE_KEYS: &[&str] = &["input"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Input {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub emails: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub inviter_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub source: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub target_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub target_type: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input: Option<Input>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Results {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub email: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaSendEmailInvites {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub results: Option<Vec<Results>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_send_email_invites: Option<XwaSendEmailInvites>,
     }
 }
 
@@ -3485,6 +3799,463 @@ pub mod fetch_group_info_includ_bots {
         pub member_share_group_history_mode: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub membership_approval_mode_enabled: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub support: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Subject {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub creation_time: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub creator: Option<Creator>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub value: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Xwa2GroupQueryById {
+        #[serde(rename = "__typename")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub typename: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub creation_time: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub creator: Option<Creator>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub description: Option<Description>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub membership_approval_request: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub missing_participant_identification: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub participants: Option<Participants>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub properties: Option<Properties>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub state: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub subject: Option<Subject>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub total_participants_count: Option<i64>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa2_group_query_by_id: Option<Xwa2GroupQueryById>,
+    }
+}
+
+/// `WAWebMexFetchGroupInfoIncludBotsJobAcp2Query` (query).
+pub mod fetch_group_info_includ_bots_job_acp2 {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebMexFetchGroupInfoIncludBotsJobAcp2Query";
+    pub const DOC_ID: &str = "28036426022701940";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &[
+        "id",
+        "include_username",
+        "participants_phash",
+        "query_context",
+    ];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub include_username: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub participants_phash: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub query_context: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct UsernameInfo {
+        #[serde(rename = "__typename")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub typename: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub username: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Creator {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub pn: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub username_info: Option<UsernameInfo>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Description {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub creation_time: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub creator: Option<Creator>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub value: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Participant {
+        #[serde(rename = "__typename")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub typename: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub display_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub jid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub pn: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub username_info: Option<UsernameInfo>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Edges {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub group_history_sent: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub join_time: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub participant: Option<Participant>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub role: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Participants {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub edges: Option<Vec<Edges>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub participants_phash_match: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Ephemeral {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub expiration_time_in_sec: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct GrowthLocked2 {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub locked: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct LidMigrationState {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub addressing_mode: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct LimitSharing {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub limit_companion_sharing_enabled: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub limit_sharing_enabled: Option<bool>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Properties {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub allow_admin_reports: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub allow_non_admin_sub_group_creation: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub announcement: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub appeal_status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub appeal_update_time: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub auto_add_disabled: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub capi: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub closed_by_membership_approval_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub ephemeral: Option<Ephemeral>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub general_chat: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub group_safety_check: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub growth_locked2: Option<GrowthLocked2>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub hidden_group: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lid_migration_state: Option<LidMigrationState>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub limit_sharing: Option<LimitSharing>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub locked: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_add_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_link_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_share_group_history_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub membership_approval_mode_enabled: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub support: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Subject {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub creation_time: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub creator: Option<Creator>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub value: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Xwa2GroupQueryById {
+        #[serde(rename = "__typename")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub typename: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub creation_time: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub creator: Option<Creator>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub description: Option<Description>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub membership_approval_request: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub missing_participant_identification: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub participants: Option<Participants>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub properties: Option<Properties>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub state: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub subject: Option<Subject>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub total_participants_count: Option<i64>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa2_group_query_by_id: Option<Xwa2GroupQueryById>,
+    }
+}
+
+/// `WAWebMexFetchGroupInfoJobAcp2Query` (query).
+pub mod fetch_group_info_job_acp2 {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebMexFetchGroupInfoJobAcp2Query";
+    pub const DOC_ID: &str = "38735621546085739";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &[
+        "id",
+        "include_username",
+        "participants_phash",
+        "query_context",
+    ];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub include_username: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub participants_phash: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub query_context: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct UsernameInfo {
+        #[serde(rename = "__typename")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub typename: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub username: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Creator {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub pn: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub username_info: Option<UsernameInfo>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Description {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub creation_time: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub creator: Option<Creator>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub value: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Node {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub display_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub pn: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub username_info: Option<UsernameInfo>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Edges {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub group_history_sent: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub join_time: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub node: Option<Node>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub role: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Participants {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub edges: Option<Vec<Edges>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub participants_phash_match: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Ephemeral {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub expiration_time_in_sec: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct GrowthLocked2 {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub locked: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct LidMigrationState {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub addressing_mode: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct LimitSharing {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub limit_companion_sharing_enabled: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub limit_sharing_enabled: Option<bool>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Properties {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub allow_admin_reports: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub allow_non_admin_sub_group_creation: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub announcement: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub appeal_status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub appeal_update_time: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub auto_add_disabled: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub capi: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub closed_by_membership_approval_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub ephemeral: Option<Ephemeral>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub general_chat: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub growth_locked2: Option<GrowthLocked2>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub hidden_group: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lid_migration_state: Option<LidMigrationState>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub limit_sharing: Option<LimitSharing>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub locked: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_add_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_link_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_share_group_history_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub membership_approval_mode_enabled: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub parent_group_jid: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub support: Option<String>,
     }
@@ -5202,7 +5973,7 @@ pub mod fetch_newsletter_pending_invites {
     use super::{Deserialize, Serialize};
 
     pub const NAME: &str = "WAWebMexFetchNewsletterPendingInvitesJobQuery";
-    pub const DOC_ID: &str = "9783111038412085";
+    pub const DOC_ID: &str = "28049623068067370";
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["newsletter_id"];
 
@@ -5218,8 +5989,6 @@ pub mod fetch_newsletter_pending_invites {
     pub struct User {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub pn: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -6245,13 +7014,31 @@ pub mod fetch_subscription_entry_points {
     use super::{Deserialize, Serialize};
 
     pub const NAME: &str = "WAWebFetchSubscriptionEntryPointsQuery";
-    pub const DOC_ID: &str = "9569660009784796";
+    pub const DOC_ID: &str = "28640361858996486";
     pub const OPERATION_KIND: &str = "query";
-    pub const VARIABLE_KEYS: &[&str] = &[];
+    pub const VARIABLE_KEYS: &[&str] = &["subscriptionTypes"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
     #[non_exhaustive]
-    pub struct Variables {}
+    pub struct SubscriptionTypes {
+        #[serde(rename = "subscriptionType")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub subscription_type: Option<String>,
+        #[serde(rename = "webEntryPointEligibility")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub web_entry_point_eligibility: Option<String>,
+        #[serde(rename = "webEntryPointRedirectionUri")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub web_entry_point_redirection_uri: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(rename = "subscriptionTypes")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub subscription_types: Option<Vec<SubscriptionTypes>>,
+    }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
     #[non_exhaustive]
@@ -6409,7 +7196,7 @@ pub mod fetch_wass_bot_list_profiles_gql {
     use super::{Deserialize, Serialize};
 
     pub const NAME: &str = "WAWebFetchWassBotListProfilesGQLQuery";
-    pub const DOC_ID: &str = "28479090065021614";
+    pub const DOC_ID: &str = "39261984743449137";
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &[];
 
@@ -6422,6 +7209,12 @@ pub mod fetch_wass_bot_list_profiles_gql {
     pub struct WassAccountListProfiles {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub bot_fbid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub creator_lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub generated_emoji: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub hca_entrypoint_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub is_deprecated: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6447,9 +7240,9 @@ pub mod fetch_wass_bot_profile_gql {
     use super::{Deserialize, Serialize};
 
     pub const NAME: &str = "WAWebFetchWassBotProfileGQLQuery";
-    pub const DOC_ID: &str = "27911751148486446";
+    pub const DOC_ID: &str = "29031553939815852";
     pub const OPERATION_KIND: &str = "query";
-    pub const VARIABLE_KEYS: &[&str] = &["botFbid"];
+    pub const VARIABLE_KEYS: &[&str] = &["botFbid", "groupJid"];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
     #[non_exhaustive]
@@ -6457,11 +7250,36 @@ pub mod fetch_wass_bot_profile_gql {
         #[serde(rename = "botFbid")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub bot_fbid: Option<String>,
+        #[serde(rename = "groupJid")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub group_jid: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Group {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub blocking: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Tos {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub group: Option<Vec<Group>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
     #[non_exhaustive]
     pub struct GetWassAccountProfile {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub creator_lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub generated_emoji: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub hca_entrypoint_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub is_deprecated: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6472,6 +7290,8 @@ pub mod fetch_wass_bot_profile_gql {
         pub profile_pic_full_url: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub profile_pic_thumb_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tos: Option<Tos>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -6644,7 +7464,7 @@ pub mod get_numbers_for_brand_ids {
     use super::{Deserialize, Serialize};
 
     pub const NAME: &str = "WAWebGetNumbersForBrandIdsJobQuery";
-    pub const DOC_ID: &str = "33391034967211217";
+    pub const DOC_ID: &str = "28724500483870087";
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["input"];
 
@@ -6932,6 +7752,74 @@ pub mod get_waa_eligibility {
     }
 }
 
+/// `WAWebMexGetWoasAgeSignalQuery` (query).
+pub mod get_woas_age_signal {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebMexGetWoasAgeSignalQuery";
+    pub const DOC_ID: &str = "38845990424986108";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &["input"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct QueryInput {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub jid: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Input {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub query_input: Option<Vec<QueryInput>>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input: Option<Input>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Assets {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub ttl_sec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub value: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct AgeCollectionInfo {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub assets: Option<Vec<Assets>>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Xwa2FetchWaUsers {
+        #[serde(rename = "__typename")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub typename: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub age_collection_info: Option<AgeCollectionInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa2_fetch_wa_users: Option<Vec<Xwa2FetchWaUsers>>,
+    }
+}
+
 /// `WAWebGraphQLProductCatalogGetPublicKeyJobQuery` (query).
 pub mod graph_ql_product_catalog_get_public_key {
     use super::{Deserialize, Serialize};
@@ -7041,6 +7929,70 @@ pub mod graph_ql_verify_postcode {
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa_product_catalog_get_verify_postcode: Option<XwaProductCatalogGetVerifyPostcode>,
+    }
+}
+
+/// `WAWebMexGroupStoreAndSendInviteSmsJobMutation` (mutation).
+pub mod group_store_and_send_invite_sms {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebMexGroupStoreAndSendInviteSmsJobMutation";
+    pub const DOC_ID: &str = "29313771494886407";
+    pub const OPERATION_KIND: &str = "mutation";
+    pub const VARIABLE_KEYS: &[&str] = &["input"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Participants {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub participant: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub server_sent_sms: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Input {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub entry_point: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub group_jid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub participants: Option<Vec<Participants>>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input: Option<Input>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct ParticipantResponses {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error_code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub jid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub server_sent: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Xwa2GroupStoreAndSendInvitesSms {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub group_jid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub participant_responses: Option<Vec<ParticipantResponses>>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa2_group_store_and_send_invites_sms: Option<Xwa2GroupStoreAndSendInvitesSms>,
     }
 }
 
@@ -7187,6 +8139,84 @@ pub mod integrity_challenge_response {
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_submit_integrity_challenge_response: Option<Xwa2SubmitIntegrityChallengeResponse>,
+    }
+}
+
+/// `WAWebInternalDirectoryFetchMembersJobQuery` (query).
+pub mod internal_directory_fetch_members {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebInternalDirectoryFetchMembersJobQuery";
+    pub const DOC_ID: &str = "28645118498472724";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &["after", "first"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct After {
+        #[serde(rename = "invalidLidCount")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub invalid_lid_count: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub after: Option<After>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub first: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Node {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub designation: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub enrollment_status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub team: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Edges {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub node: Option<Node>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct PageInfo {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub end_cursor: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub has_next_page: Option<bool>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaWhatsappForWorkEmployeeDirectory {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub edges: Option<Vec<Edges>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub page_info: Option<PageInfo>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_whatsapp_for_work_employee_directory: Option<XwaWhatsappForWorkEmployeeDirectory>,
     }
 }
 
@@ -7345,6 +8375,39 @@ pub mod log_newsletter_exposures {
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xwa2_newsletter_log_exposures: Option<Xwa2NewsletterLogExposures>,
+    }
+}
+
+/// `WAWebMexLogServerSentInviteIntentJobMutation` (mutation).
+pub mod log_server_sent_invite_intent {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebMexLogServerSentInviteIntentJobMutation";
+    pub const DOC_ID: &str = "28486062674347663";
+    pub const OPERATION_KIND: &str = "mutation";
+    pub const VARIABLE_KEYS: &[&str] = &["input"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Input {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub entry_point: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub receiver: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input: Option<Input>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa2_growth_log_server_sent_invite_intent: Option<String>,
     }
 }
 
@@ -7665,6 +8728,1376 @@ pub mod newsletter_unpin_messages {
     }
 }
 
+/// `WAWebOrgAdminGraphQLAddChannelMutation` (mutation).
+pub mod org_admin_graph_ql_add_channel {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebOrgAdminGraphQLAddChannelMutation";
+    pub const DOC_ID: &str = "28447256928278589";
+    pub const OPERATION_KIND: &str = "mutation";
+    pub const VARIABLE_KEYS: &[&str] = &["channelID", "orgID"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(rename = "channelID")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub channel_id: Option<String>,
+        #[serde(rename = "orgID")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_id: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Picture {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub uri: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Channel {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub creation_timestamp_s: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub follower_count: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub invite_code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub picture: Option<Picture>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaOrgManagedChannelAdd {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub channel: Option<Channel>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_org_managed_channel_add: Option<XwaOrgManagedChannelAdd>,
+    }
+}
+
+/// `WAWebOrgAdminGraphQLAddGroupMutation` (mutation).
+pub mod org_admin_graph_ql_add_group {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebOrgAdminGraphQLAddGroupMutation";
+    pub const DOC_ID: &str = "28671827069172109";
+    pub const OPERATION_KIND: &str = "mutation";
+    pub const VARIABLE_KEYS: &[&str] = &["gid", "orgID"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub gid: Option<String>,
+        #[serde(rename = "orgID")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_id: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Group {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub creation_timestamp_s: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub gid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub participant_count: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub subject: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaOrgManagedGroupAdd {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub group: Option<Group>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_org_managed_group_add: Option<XwaOrgManagedGroupAdd>,
+    }
+}
+
+/// `WAWebOrgAdminGraphQLAdminRosterQuery` (query).
+pub mod org_admin_graph_ql_admin_roster {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebOrgAdminGraphQLAdminRosterQuery";
+    pub const DOC_ID: &str = "40493889943531509";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &["orgID"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(rename = "orgID")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_id: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Entries {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub email_address: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub invite_expiry: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_tag: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub phone_number: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub secondary_member_tag: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct AdminRoster {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub entries: Option<Vec<Entries>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub is_truncated: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub total_count: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub version: Option<i64>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct OrgInfo {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub admin_roster: Option<AdminRoster>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_tag_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub secondary_member_tag_name: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaOrgGet {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_info: Option<OrgInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_org_get: Option<XwaOrgGet>,
+    }
+}
+
+/// `WAWebOrgAdminGraphQLApplyAdminRosterChangesMutation` (mutation).
+pub mod org_admin_graph_ql_apply_admin_roster_changes {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebOrgAdminGraphQLApplyAdminRosterChangesMutation";
+    pub const DOC_ID: &str = "40256649857252491";
+    pub const OPERATION_KIND: &str = "mutation";
+    pub const VARIABLE_KEYS: &[&str] = &["input"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Input {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub adds: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub changes: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub expected_version: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_id: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input: Option<Input>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct InvalidChange {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub index: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub kind: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaOrgAdminRosterApplyChanges {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub added_entry_ids: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub invalid_change: Option<InvalidChange>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub version: Option<i64>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_org_admin_roster_apply_changes: Option<XwaOrgAdminRosterApplyChanges>,
+    }
+}
+
+/// `WAWebOrgAdminGraphQLDirectoryPageQuery` (query).
+pub mod org_admin_graph_ql_directory_page {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebOrgAdminGraphQLDirectoryPageQuery";
+    pub const DOC_ID: &str = "28707165072226731";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &["first", "orgID"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub first: Option<String>,
+        #[serde(rename = "orgID")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_id: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Nodes {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub display_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_tag: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub phone_number: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub role: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub username: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct PageInfo {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub has_next_page: Option<bool>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Members {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub count: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub nodes: Option<Vec<Nodes>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub page_info: Option<PageInfo>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct OrgInfo {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub members: Option<Members>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_member_updated_ts_usec: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaOrgGet {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_info: Option<OrgInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_org_get: Option<XwaOrgGet>,
+    }
+}
+
+/// `WAWebOrgAdminGraphQLGroupQuery` (query).
+pub mod org_admin_graph_ql_group {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebOrgAdminGraphQLGroupQuery";
+    pub const DOC_ID: &str = "28395729336786789";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &["gid", "orgID"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub gid: Option<String>,
+        #[serde(rename = "orgID")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_id: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Participants {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub role: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Picture {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub uri: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct ManagedGroup {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub creation_timestamp_s: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub gid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub participant_count: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub participants: Option<Vec<Participants>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub picture: Option<Picture>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub roster_partial: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub subject: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct OrgInfo {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub managed_group: Option<ManagedGroup>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaOrgGet {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_info: Option<OrgInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_org_get: Option<XwaOrgGet>,
+    }
+}
+
+/// `WAWebOrgAdminGraphQLInviteMembersMutation` (mutation).
+pub mod org_admin_graph_ql_invite_members {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebOrgAdminGraphQLInviteMembersMutation";
+    pub const DOC_ID: &str = "28461077290259979";
+    pub const OPERATION_KIND: &str = "mutation";
+    pub const VARIABLE_KEYS: &[&str] = &["orgID", "resend", "rosterEntryIDs"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Resend {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub icon_blob: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_tag_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_tag_options: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub secondary_member_tag_name: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(rename = "orgID")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub resend: Option<Resend>,
+        #[serde(rename = "rosterEntryIDs")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub roster_entry_i_ds: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaOrgInviteMembers {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_org_invite_members: Option<XwaOrgInviteMembers>,
+    }
+}
+
+/// `WAWebOrgAdminGraphQLManagedChannelAdminsQuery` (query).
+pub mod org_admin_graph_ql_managed_channel_admins {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebOrgAdminGraphQLManagedChannelAdminsQuery";
+    pub const DOC_ID: &str = "29593944580197266";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &["channelID", "orgID"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(rename = "channelID")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub channel_id: Option<String>,
+        #[serde(rename = "orgID")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_id: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Members {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub role: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Admins {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub members: Option<Vec<Members>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub outside_organization_count: Option<i64>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct ManagedChannel {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub admins: Option<Admins>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct OrgInfo {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub managed_channel: Option<ManagedChannel>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaOrgGet {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_info: Option<OrgInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_org_get: Option<XwaOrgGet>,
+    }
+}
+
+/// `WAWebOrgAdminGraphQLManagedChannelsQuery` (query).
+pub mod org_admin_graph_ql_managed_channels {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebOrgAdminGraphQLManagedChannelsQuery";
+    pub const DOC_ID: &str = "39052330251080657";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &["orgID"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(rename = "orgID")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_id: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Picture {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub uri: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Nodes {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub creation_timestamp_s: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub follower_count: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub invite_code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub picture: Option<Picture>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct ManagedChannels {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub nodes: Option<Vec<Nodes>>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct OrgInfo {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub managed_channels: Option<ManagedChannels>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaOrgGet {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_info: Option<OrgInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_org_get: Option<XwaOrgGet>,
+    }
+}
+
+/// `WAWebOrgAdminGraphQLManagedEventsQuery` (query).
+pub mod org_admin_graph_ql_managed_events {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebOrgAdminGraphQLManagedEventsQuery";
+    pub const DOC_ID: &str = "39566074213037984";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &["orgID"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(rename = "orgID")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_id: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Nodes {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub end_timestamp_s: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub start_timestamp_s: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct ManagedEvents {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub nodes: Option<Vec<Nodes>>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct OrgInfo {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub managed_events: Option<ManagedEvents>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaOrgGet {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_info: Option<OrgInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_org_get: Option<XwaOrgGet>,
+    }
+}
+
+/// `WAWebOrgAdminGraphQLManagedGroupsQuery` (query).
+pub mod org_admin_graph_ql_managed_groups {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebOrgAdminGraphQLManagedGroupsQuery";
+    pub const DOC_ID: &str = "28885446151060025";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &["orgID"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(rename = "orgID")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_id: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Participants {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub role: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Nodes {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub creation_timestamp_s: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub gid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub participant_count: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub participants: Option<Vec<Participants>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub roster_partial: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub subject: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct ManagedGroups {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub nodes: Option<Vec<Nodes>>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct OrgInfo {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub managed_groups: Option<ManagedGroups>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaOrgGet {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_info: Option<OrgInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_org_get: Option<XwaOrgGet>,
+    }
+}
+
+/// `WAWebOrgAdminGraphQLMemberSearchQuery` (query).
+pub mod org_admin_graph_ql_member_search {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebOrgAdminGraphQLMemberSearchQuery";
+    pub const DOC_ID: &str = "28641250612201754";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &["after", "first", "memberTag", "orgID", "query"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct MemberTag {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub icon_blob: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_tag_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_tag_options: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub secondary_member_tag_name: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub after: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub first: Option<String>,
+        #[serde(rename = "memberTag")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_tag: Option<MemberTag>,
+        #[serde(rename = "orgID")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub query: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Member {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub display_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_tag: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub phone_number: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub role: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub username: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Nodes {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member: Option<Member>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct PageInfo {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub end_cursor: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub has_next_page: Option<bool>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaOrgMemberSearch {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub count: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub nodes: Option<Vec<Nodes>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub page_info: Option<PageInfo>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_org_member_search: Option<XwaOrgMemberSearch>,
+    }
+}
+
+/// `WAWebOrgAdminGraphQLOrgsQuery` (query).
+pub mod org_admin_graph_ql_orgs {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebOrgAdminGraphQLOrgsQuery";
+    pub const DOC_ID: &str = "28528010626842072";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &[];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {}
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct IconLarge {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub uri: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct IconSmall {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub handle: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub uri: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Members {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub count: Option<i64>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Orgs {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub icon_large: Option<IconLarge>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub icon_small: Option<IconSmall>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub is_member_directory_enabled: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_tag_options: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub members: Option<Members>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_member_updated_ts_usec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_updated_ts_usec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub viewer_role: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaOrgList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub orgs: Option<Vec<Orgs>>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_org_list: Option<XwaOrgList>,
+    }
+}
+
+/// `WAWebOrgAdminGraphQLRemoveMemberMutation` (mutation).
+pub mod org_admin_graph_ql_remove_member {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebOrgAdminGraphQLRemoveMemberMutation";
+    pub const DOC_ID: &str = "28986698047634303";
+    pub const OPERATION_KIND: &str = "mutation";
+    pub const VARIABLE_KEYS: &[&str] = &["input"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Input {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_id: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input: Option<Input>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Members {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub count: Option<i64>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Org {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub members: Option<Members>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaOrgMemberRemove {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org: Option<Org>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_org_member_remove: Option<XwaOrgMemberRemove>,
+    }
+}
+
+/// `WAWebOrgAdminGraphQLSendManagedGroupEmailInvitesMutation` (mutation).
+pub mod org_admin_graph_ql_send_managed_group_email_invites {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebOrgAdminGraphQLSendManagedGroupEmailInvitesMutation";
+    pub const DOC_ID: &str = "38981821098132867";
+    pub const OPERATION_KIND: &str = "mutation";
+    pub const VARIABLE_KEYS: &[&str] = &["gid", "orgID", "rosterEntryIDs"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct RosterEntryIDs {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub icon_blob: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_tag_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_tag_options: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub secondary_member_tag_name: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub gid: Option<String>,
+        #[serde(rename = "orgID")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_id: Option<String>,
+        #[serde(rename = "rosterEntryIDs")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub roster_entry_i_ds: Option<RosterEntryIDs>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Results {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaOrgManagedGroupSendEmailInvites {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub results: Option<Vec<Results>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_org_managed_group_send_email_invites: Option<XwaOrgManagedGroupSendEmailInvites>,
+    }
+}
+
+/// `WAWebOrgAdminGraphQLSetMemberRoleMutation` (mutation).
+pub mod org_admin_graph_ql_set_member_role {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebOrgAdminGraphQLSetMemberRoleMutation";
+    pub const DOC_ID: &str = "28722796247384351";
+    pub const OPERATION_KIND: &str = "mutation";
+    pub const VARIABLE_KEYS: &[&str] = &["input"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Role {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub icon_blob: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_tag_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_tag_options: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub secondary_member_tag_name: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Input {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub role: Option<Role>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input: Option<Input>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Members {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub count: Option<i64>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Org {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub members: Option<Members>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaOrgMemberSetRole {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org: Option<Org>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_org_member_set_role: Option<XwaOrgMemberSetRole>,
+    }
+}
+
+/// `WAWebOrgAdminGraphQLSubmitBulkGroupRequestMutation` (mutation).
+pub mod org_admin_graph_ql_submit_bulk_group_request {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebOrgAdminGraphQLSubmitBulkGroupRequestMutation";
+    pub const DOC_ID: &str = "27966707869675123";
+    pub const OPERATION_KIND: &str = "mutation";
+    pub const VARIABLE_KEYS: &[&str] = &["createGroupsPlan", "operation", "orgID"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct CreateGroupsPlan {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub announcement: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub locked: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_add_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub membership_approval: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub participant_roster_entry_ids: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub subject: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(rename = "createGroupsPlan")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub create_groups_plan: Option<Vec<CreateGroupsPlan>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub operation: Option<String>,
+        #[serde(rename = "orgID")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_id: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaOrgBulkGroupRequestSubmit {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub invalid_group_index: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub request_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_org_bulk_group_request_submit: Option<XwaOrgBulkGroupRequestSubmit>,
+    }
+}
+
+/// `WAWebOrgAdminGraphQLUpdateOrgMutation` (mutation).
+pub mod org_admin_graph_ql_update_org {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebOrgAdminGraphQLUpdateOrgMutation";
+    pub const DOC_ID: &str = "26730170143346991";
+    pub const OPERATION_KIND: &str = "mutation";
+    pub const VARIABLE_KEYS: &[&str] = &["input"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Input {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub icon_blob: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_tag_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_tag_options: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub secondary_member_tag_name: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input: Option<Input>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct IconLarge {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub uri: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct IconSmall {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub handle: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub uri: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Members {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub count: Option<i64>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Org {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub icon_large: Option<IconLarge>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub icon_small: Option<IconSmall>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub is_member_directory_enabled: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_tag_options: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub members: Option<Members>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_member_updated_ts_usec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_updated_ts_usec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub viewer_role: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaOrgUpdate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org: Option<Org>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_org_update: Option<XwaOrgUpdate>,
+    }
+}
+
+/// `WAWebMexOrgMemberUpdateNotificationHandlerQuery` (query).
+pub mod org_member_update_notification_handler {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebMexOrgMemberUpdateNotificationHandlerQuery";
+    pub const DOC_ID: &str = "29119014437722960";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &[];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {}
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Members {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub display_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_action: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_tag: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub role: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Xwa2NotifyOrgOnMemberUpdate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub members: Option<Vec<Members>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_member_updated_ts_usec: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa2_notify_org_on_member_update: Option<Xwa2NotifyOrgOnMemberUpdate>,
+    }
+}
+
 /// `WAWebMexPaymentsPasskeyHasCredentialJobQuery` (query).
 pub mod payments_passkey_has_credential {
     use super::{Deserialize, Serialize};
@@ -7711,8 +10144,6 @@ pub mod query_catalog {
         pub allow_shop_source: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub catalog_session_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub direct_connection_encrypted_info: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub height: Option<i64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -8018,8 +10449,6 @@ pub mod query_catalog_has_categories {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub catalog_session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub direct_connection_encrypted_info: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub image_dimensions: Option<String>,
     }
 
@@ -8072,8 +10501,6 @@ pub mod query_catalog_product {
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
     #[non_exhaustive]
     pub struct Product {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub direct_connection_encrypted_info: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub fetch_compliance_info: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -8368,8 +10795,6 @@ pub mod query_product_collections {
         pub biz_jid: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub collection_limit: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub direct_connection_encrypted_info: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub height: Option<i64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -8981,8 +11406,6 @@ pub mod query_product_single_collection {
         pub after: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub biz_jid: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub direct_connection_encrypted_info: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub height: Option<i64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -9625,12 +12048,1004 @@ pub mod set_username_key {
     }
 }
 
+/// `WAWebSharableEventAddInvitationsJobMutation` (mutation).
+pub mod sharable_event_add_invitations {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebSharableEventAddInvitationsJobMutation";
+    pub const DOC_ID: &str = "27221189747579014";
+    pub const OPERATION_KIND: &str = "mutation";
+    pub const VARIABLE_KEYS: &[&str] = &["input"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Input {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub event_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub invited_user_lids: Option<Vec<String>>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input: Option<Input>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct InvitationAddOutcome {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub failed_count: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub invalid_count: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub is_retryable: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub newly_added_lids: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub successful_count: Option<i64>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct CountByRsvpStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub going: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub maybe: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub no_response: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub not_going: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct InvitationList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub created_ts_sec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub extra_guest_count: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub guest_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub invitee_lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub is_wa_user: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub last_updated_ts_sec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub phone_number: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub rsvp_status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub username: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct PrivacyAwareInvitation {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub count_by_rsvp_status: Option<CountByRsvpStatus>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub invitation_list: Option<Vec<InvitationList>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub last_updated_ts_usec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub total_invited_count: Option<i64>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct EventAddInvitations {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub invitation_add_outcome: Option<InvitationAddOutcome>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub privacy_aware_invitation: Option<PrivacyAwareInvitation>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub event_add_invitations: Option<EventAddInvitations>,
+    }
+}
+
+/// `WAWebSharableEventDeleteJobMutation` (mutation).
+pub mod sharable_event_delete {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebSharableEventDeleteJobMutation";
+    pub const DOC_ID: &str = "28495617843470831";
+    pub const OPERATION_KIND: &str = "mutation";
+    pub const VARIABLE_KEYS: &[&str] = &["input"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Input {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub event_id: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input: Option<Input>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaEventDelete {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub success: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_event_delete: Option<XwaEventDelete>,
+    }
+}
+
+/// `WAWebSharableEventGetJobQuery` (query).
+pub mod sharable_event_get {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebSharableEventGetJobQuery";
+    pub const DOC_ID: &str = "28647847534844030";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &["input"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Input {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub event_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub event_last_updated_ts_usec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub invitation_last_updated_ts_usec: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input: Option<Input>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct CallLink {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub is_waiting_room_enabled: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub media_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub token: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct CoverImage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub is_preset_image: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub uri: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Coordinates {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub latitude: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub longitude: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Location {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub address: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub coordinates: Option<Coordinates>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub web_url: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct PrivacyAwareEvent {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub call_link: Option<CallLink>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cover_image: Option<CoverImage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cover_image_handle: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub created_ts_sec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub creator_lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub end_ts_sec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub last_updated_ts_usec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub location: Option<Location>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_additional_guests: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub reminder_ts_sec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub start_ts_sec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct CountByRsvpStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub going: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub maybe: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub no_response: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub not_going: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct InvitationList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub created_ts_sec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub extra_guest_count: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub guest_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub invitee_lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub is_wa_user: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub last_updated_ts_sec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub phone_number: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub rsvp_status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub username: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct PrivacyAwareInvitation {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub count_by_rsvp_status: Option<CountByRsvpStatus>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub invitation_list: Option<Vec<InvitationList>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub last_updated_ts_usec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub total_invited_count: Option<i64>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaEventGet {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub is_event_metadata_unchanged: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub is_invitation_metadata_unchanged: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub privacy_aware_event: Option<PrivacyAwareEvent>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub privacy_aware_invitation: Option<PrivacyAwareInvitation>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_event_get: Option<XwaEventGet>,
+    }
+}
+
+/// `WAWebMexSharableEventGuestJoinedWaNotificationsQuery` (query).
+pub mod sharable_event_guest_joined_wa_notifications {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebMexSharableEventGuestJoinedWaNotificationsQuery";
+    pub const DOC_ID: &str = "28828665613459115";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &[];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {}
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Xwa2NotifyEventOnGuestJoinedWa {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub event_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub event_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub guest_lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub is_user_visible: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub pn: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub username: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa2_notify_event_on_guest_joined_wa: Option<Xwa2NotifyEventOnGuestJoinedWa>,
+    }
+}
+
+/// `WAWebSharableEventListJobQuery` (query).
+pub mod sharable_event_list {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebSharableEventListJobQuery";
+    pub const DOC_ID: &str = "28535944269435609";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &["input"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct TimeRange {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub end_ts_sec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub start_ts_sec: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Input {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub categories: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub page_size: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub time_range: Option<TimeRange>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input: Option<Input>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct CallLink {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub is_waiting_room_enabled: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub media_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub token: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct CoverImage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub is_preset_image: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub uri: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Coordinates {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub latitude: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub longitude: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Location {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub address: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub coordinates: Option<Coordinates>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub web_url: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct PrivacyAwareEvent {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub call_link: Option<CallLink>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cover_image: Option<CoverImage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cover_image_handle: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub created_ts_sec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub creator_lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub end_ts_sec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub last_updated_ts_usec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub location: Option<Location>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_additional_guests: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub reminder_ts_sec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub start_ts_sec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct PrivacyAwareMyInvitation {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub created_ts_sec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub extra_guest_count: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub guest_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub invitee_lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub is_wa_user: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub last_updated_ts_sec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub phone_number: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub rsvp_status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub username: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Past {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub privacy_aware_event: Option<PrivacyAwareEvent>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub privacy_aware_my_invitation: Option<PrivacyAwareMyInvitation>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct ScheduledCalls {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub privacy_aware_event: Option<PrivacyAwareEvent>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub privacy_aware_my_invitation: Option<PrivacyAwareMyInvitation>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Upcoming {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub privacy_aware_event: Option<PrivacyAwareEvent>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub privacy_aware_my_invitation: Option<PrivacyAwareMyInvitation>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaEventList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub past: Option<Vec<Past>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub scheduled_calls: Option<Vec<ScheduledCalls>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub upcoming: Option<Vec<Upcoming>>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_event_list: Option<XwaEventList>,
+    }
+}
+
+/// `WAWebSharableEventPlaceSearchJobQuery` (query).
+pub mod sharable_event_place_search {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebSharableEventPlaceSearchJobQuery";
+    pub const DOC_ID: &str = "29474105825541283";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &["input"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Center {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub latitude: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub longitude: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Input {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub center: Option<Center>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub query: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub use_case_id: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input: Option<Input>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Address {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub city: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub stateprovince: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub streetaddress: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Location {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub latitude: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub longitude: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Items {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub address: Option<Address>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub location: Option<Location>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub title: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct WhatsappMapsTypeahead {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub items: Option<Vec<Items>>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub whatsapp_maps_typeahead: Option<WhatsappMapsTypeahead>,
+    }
+}
+
+/// `WAWebSharableEventPresetCoversJobQuery` (query).
+pub mod sharable_event_preset_covers {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebSharableEventPresetCoversJobQuery";
+    pub const DOC_ID: &str = "28576224488725983";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &["input"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Input {}
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input: Option<Input>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct CoverImage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub uri: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct PresetImages {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub category: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cover_image: Option<CoverImage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cover_image_handle: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub display_order: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaEventListPresetCoverImages {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub preset_images: Option<Vec<PresetImages>>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_event_list_preset_cover_images: Option<XwaEventListPresetCoverImages>,
+    }
+}
+
+/// `WAWebSharableEventReconcileJobQuery` (query).
+pub mod sharable_event_reconcile {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebSharableEventReconcileJobQuery";
+    pub const DOC_ID: &str = "26914147061616374";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &["input"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Input {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub event_ids: Option<Vec<String>>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input: Option<Input>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaEventValidateCachedEventIds {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub retained_event_ids: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_event_validate_cached_event_ids: Option<XwaEventValidateCachedEventIds>,
+    }
+}
+
+/// `WAWebSharableEventRemoveInvitationsJobMutation` (mutation).
+pub mod sharable_event_remove_invitations {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebSharableEventRemoveInvitationsJobMutation";
+    pub const DOC_ID: &str = "28775803215445491";
+    pub const OPERATION_KIND: &str = "mutation";
+    pub const VARIABLE_KEYS: &[&str] = &["input"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Input {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub event_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub invited_user_lids: Option<Vec<String>>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input: Option<Input>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct CountByRsvpStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub going: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub maybe: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub no_response: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub not_going: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct InvitationList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub created_ts_sec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub extra_guest_count: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub guest_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub invitee_lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub is_wa_user: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub last_updated_ts_sec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub phone_number: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub rsvp_status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub username: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct PrivacyAwareInvitation {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub count_by_rsvp_status: Option<CountByRsvpStatus>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub invitation_list: Option<Vec<InvitationList>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub last_updated_ts_usec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub total_invited_count: Option<i64>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaEventRemoveInvitations {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub privacy_aware_invitation: Option<PrivacyAwareInvitation>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_event_remove_invitations: Option<XwaEventRemoveInvitations>,
+    }
+}
+
+/// `WAWebSharableEventUpdateJobMutation` (mutation).
+pub mod sharable_event_update {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebSharableEventUpdateJobMutation";
+    pub const DOC_ID: &str = "40284114741201878";
+    pub const OPERATION_KIND: &str = "mutation";
+    pub const VARIABLE_KEYS: &[&str] = &["input"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct CallLink {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub is_waiting_room_enabled: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub media_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub token: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct CoverImage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub is_preset_image: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub uri: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Coordinates {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub latitude: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub longitude: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Location {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub address: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub coordinates: Option<Coordinates>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub web_url: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct PrivacyAwareEvent {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub call_link: Option<CallLink>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cover_image: Option<CoverImage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cover_image_handle: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub created_ts_sec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub creator_lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub end_ts_sec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub last_updated_ts_usec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub location: Option<Location>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_additional_guests: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub reminder_ts_sec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub start_ts_sec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaEventUpdate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub privacy_aware_event: Option<PrivacyAwareEvent>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_event_update: Option<XwaEventUpdate>,
+    }
+}
+
+/// `WAWebSharableEventUpdateRsvpJobMutation` (mutation).
+pub mod sharable_event_update_rsvp {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebSharableEventUpdateRsvpJobMutation";
+    pub const DOC_ID: &str = "29299336146421342";
+    pub const OPERATION_KIND: &str = "mutation";
+    pub const VARIABLE_KEYS: &[&str] = &["input"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct CountByRsvpStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub going: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub maybe: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub no_response: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub not_going: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct InvitationList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub created_ts_sec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub extra_guest_count: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub guest_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub invitee_lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub is_wa_user: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub last_updated_ts_sec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub phone_number: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub rsvp_status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub username: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct PrivacyAwareInvitation {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub count_by_rsvp_status: Option<CountByRsvpStatus>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub invitation_list: Option<Vec<InvitationList>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub last_updated_ts_usec: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub total_invited_count: Option<i64>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct EventUpdateRsvp {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub privacy_aware_invitation: Option<PrivacyAwareInvitation>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub event_update_rsvp: Option<EventUpdateRsvp>,
+    }
+}
+
 /// `WAWebSignupMetadataQuery` (query).
 pub mod signup_metadata {
     use super::{Deserialize, Serialize};
 
     pub const NAME: &str = "WAWebSignupMetadataQuery";
-    pub const DOC_ID: &str = "26378108788468347";
+    pub const DOC_ID: &str = "28516250088045061";
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &["phone_number", "signup_id"];
 
@@ -9659,6 +13074,72 @@ pub mod signup_metadata {
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub wa_signup_metadata: Option<WaSignupMetadata>,
+    }
+}
+
+/// `WAWebSubscriptionWaffleAgeCheckQuery` (query).
+pub mod subscription_waffle_age_check {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebSubscriptionWaffleAgeCheckQuery";
+    pub const DOC_ID: &str = "38399102469704585";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &[];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {}
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub pass_age_check_for_wa_meta_one_v2: Option<String>,
+    }
+}
+
+/// `WAWebSupportBugReportCreateDogfoodingTaskMutation` (mutation).
+pub mod support_bug_report_create_dogfooding_task {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebSupportBugReportCreateDogfoodingTaskMutation";
+    pub const DOC_ID: &str = "28720207430973409";
+    pub const OPERATION_KIND: &str = "mutation";
+    pub const VARIABLE_KEYS: &[&str] = &["input"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Input {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub category: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input: Option<Input>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct WaSupportBugReportCreateDogfoodingTask {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error_code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error_message: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub success: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub task_id: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub wa_support_bug_report_create_dogfooding_task:
+            Option<WaSupportBugReportCreateDogfoodingTask>,
     }
 }
 
@@ -10157,11 +13638,12 @@ pub mod usync {
     use super::{Deserialize, Serialize};
 
     pub const NAME: &str = "WAWebMexUsyncQuery";
-    pub const DOC_ID: &str = "29829202653362039";
+    pub const DOC_ID: &str = "28496738596651319";
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &[
         "include_about_status",
         "include_country_code",
+        "include_orgs",
         "include_username",
         "input",
     ];
@@ -10183,6 +13665,8 @@ pub mod usync {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub include_country_code: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub include_orgs: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub include_username: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub input: Option<Input>,
@@ -10200,6 +13684,31 @@ pub mod usync {
         pub text: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub timestamp: Option<i64>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Orgs {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub display_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub member_tag: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub role: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct OrgsInfo {
+        #[serde(rename = "__typename")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub typename: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub orgs: Option<Vec<Orgs>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -10234,6 +13743,8 @@ pub mod usync {
         pub id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub jid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub orgs_info: Option<OrgsInfo>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub username_info: Option<UsernameInfo>,
     }
@@ -10503,18 +14014,21 @@ pub mod use_wa_web_estimated_daily_reach {
     use super::{Deserialize, Serialize};
 
     pub const NAME: &str = "useWAWebEstimatedDailyReachQuery";
-    pub const DOC_ID: &str = "26555147174103537";
+    pub const DOC_ID: &str = "28449519141342172";
     pub const OPERATION_KIND: &str = "query";
     pub const VARIABLE_KEYS: &[&str] = &[
         "audienceOptionAudience",
         "configuredPlacementSpec",
         "currency",
+        "fetchOfsForecast",
         "flow",
         "flowID",
+        "forecastRequest",
         "legacyAdAccountID",
         "optimizationGoalInput",
         "postID",
         "targetingSpecAudience",
+        "useOfsForecast",
     ];
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -10528,11 +14042,17 @@ pub mod use_wa_web_estimated_daily_reach {
         pub configured_placement_spec: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub currency: Option<String>,
+        #[serde(rename = "fetchOfsForecast")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub fetch_ofs_forecast: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub flow: Option<String>,
         #[serde(rename = "flowID")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub flow_id: Option<String>,
+        #[serde(rename = "forecastRequest")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub forecast_request: Option<String>,
         #[serde(rename = "legacyAdAccountID")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub legacy_ad_account_id: Option<String>,
@@ -10545,6 +14065,9 @@ pub mod use_wa_web_estimated_daily_reach {
         #[serde(rename = "targetingSpecAudience")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub targeting_spec_audience: Option<String>,
+        #[serde(rename = "useOfsForecast")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub use_ofs_forecast: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -10586,9 +14109,60 @@ pub mod use_wa_web_estimated_daily_reach {
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
     #[non_exhaustive]
+    pub struct EstimatedDailyImpressions {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lower_bound: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub upper_bound: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct WhatsappCtwaPreflightForecast {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub estimated_daily_impressions: Option<EstimatedDailyImpressions>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub lwi: Option<Lwi>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub whatsapp_ctwa_preflight_forecast: Option<WhatsappCtwaPreflightForecast>,
+    }
+}
+
+/// `useWAWebEstimatedDailyReachShadowQuery` (query).
+pub mod use_wa_web_estimated_daily_reach_shadow {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "useWAWebEstimatedDailyReachShadowQuery";
+    pub const DOC_ID: &str = "28286021457733285";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &["forecastRequest"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(rename = "forecastRequest")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub forecast_request: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct WhatsappCtwaPreflightForecast {
+        #[serde(rename = "__typename")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub typename: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub whatsapp_ctwa_preflight_forecast: Option<WhatsappCtwaPreflightForecast>,
     }
 }
 
@@ -10621,6 +14195,38 @@ pub mod use_wa_web_smart_composer_coach_suggested_reply {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub xfb_meta_ai_biz_agent_wa_coach_suggested_reply:
             Option<XfbMetaAiBizAgentWaCoachSuggestedReply>,
+    }
+}
+
+/// `useWAWebSmartComposerReportThreadEventMutation` (mutation).
+pub mod use_wa_web_smart_composer_report_thread_event {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "useWAWebSmartComposerReportThreadEventMutation";
+    pub const DOC_ID: &str = "28777618758528424";
+    pub const OPERATION_KIND: &str = "mutation";
+    pub const VARIABLE_KEYS: &[&str] = &["input"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub input: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct MetaAiBizAgentWaSuggestedReplyThreadEvent {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub success: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub meta_ai_biz_agent_wa_suggested_reply_thread_event:
+            Option<MetaAiBizAgentWaSuggestedReplyThreadEvent>,
     }
 }
 

@@ -1,6 +1,7 @@
-//! Auto-generated isolated official group envelope conformance cases (WhatsApp 2.3000.1047483476). DO NOT EDIT.
+//! Auto-generated isolated official group envelope conformance cases (WhatsApp 2.3000.1052559453). DO NOT EDIT.
 //!
-//! Original callback SHA-256 c795544e7e6f20cf484cbac4c40ccfe731b4460f31b7ae4863e6ab3bab1bb4d9, module-relative bytes 10592..22915.
+//! Original callback SHA-256 0c9b28f4c4ac5e27d2032dae378710cb9cc7dd17f9dcbf17769f8962f2ec4fb0, module-relative bytes 10858..23344.
+//! Source accessor traces are checked by the upstream capture verifier; Rust assertions below cover outputs and errors.
 //! Original XML/Wap/JID/time methods run in the fixture harness. Account facts, country/Wid/binary bridges and telemetry are mocked.
 //! Only empty/marker/unknown/suspended actions are exercised here; complex actions have separate conformance cases.
 

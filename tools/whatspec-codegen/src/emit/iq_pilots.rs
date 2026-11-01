@@ -412,6 +412,15 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn pilot_root_alternatives_cannot_be_silently_flattened() {
+        let mut value = fixture();
+        value["stanzas"][0]["request"]["variantGroups"] = json!([{ "variants": [
+            {"children":[{"tag":"one"}]}, {"children":[{"tag":"other"}]}
+        ] }]);
+        assert!(emit(&value).is_err());
+    }
+
+    #[test]
     fn unmodeled_request_contracts_fail_generation() {
         for (pointer, replacement) in [
             ("/request/children/0/repeats", json!(true)),

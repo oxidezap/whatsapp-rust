@@ -77,6 +77,8 @@ fn carriers() -> Vec<(&'static str, wa::Message)> {
         event_invite_message,
         split_payment_message,
         music_message,
+        instant_image_message,
+        request_location_message,
     );
     messages
 }
@@ -138,7 +140,7 @@ fn independent_carrier_fixtures_match_the_schema() {
 
 #[test]
 fn all_direct_carriers_share_context_helpers() {
-    assert_eq!(carriers().len(), 42);
+    assert_eq!(carriers().len(), 44);
     for (name, mut message) in carriers() {
         let borrowed = message.context_info().expect(name);
         assert_eq!(

@@ -1,8 +1,9 @@
-//! Contextual validation and a qualified unlink projection. This is deliberately
-//! opt-in until create/link and effective account gates are qualified. Existing
+//! Contextual validation and source-qualified owned group projections. Existing
 //! public events and the legacy raw-node adapter keep their shape.
+use super::normalization_warning::{Decision, GroupWarningSink, IgnoreWarnings};
 pub use super::normalized_notification::{
     GroupNotificationDiagnostic, NormalizedGroupNotification, parse_normalized_group_notification,
+    parse_normalized_group_notification_with_warnings,
 };
 use super::{GroupNotification, GroupParticipantInfo};
 use crate::WireEnum;
@@ -15,6 +16,7 @@ pub struct GroupParseContext<'a> {
     pub me_device_lid: Option<&'a Jid>,
     pub me_device_pn: Option<&'a Jid>,
     pub username_displayed: bool,
+    /// Retained for caller compatibility; this snapshot reads participant history unconditionally.
     pub history_after_join: bool,
     pub opus_enabled: bool,
     pub is_me_account: &'a dyn Fn(&Jid) -> bool,
@@ -67,13 +69,20 @@ pub struct UnlinkedGroup {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedUnlink {
-    /// Upstream returns an undefined action for an unknown unlink type.
+    /// Unknown types warn and return null after payload validation.
     pub kind: Option<GroupUnlinkKind>,
     pub groups: Vec<UnlinkedGroup>,
 }
 
-/// Decode data first, then apply the generated decision table, matching I().
+/// Decode payload before the decision and its warnings, preserving source error order.
 pub fn parse_unlink(node: &NodeRef<'_>) -> Result<NormalizedUnlink, GroupParseError> {
+    parse_unlink_with_warnings(node, &mut IgnoreWarnings)
+}
+
+pub fn parse_unlink_with_warnings(
+    node: &NodeRef<'_>,
+    warnings: &mut dyn GroupWarningSink,
+) -> Result<NormalizedUnlink, GroupParseError> {
     let kind = node
         .get_attr("unlink_type")
         .ok_or(GroupParseError::Field("unlink_type"))?;
@@ -96,7 +105,16 @@ pub fn parse_unlink(node: &NodeRef<'_>) -> Result<NormalizedUnlink, GroupParseEr
         });
     }
     let action =
-        generated::normalize_unlink(&kind.as_str(), reason.map(|v| v.as_str()).as_deref())?;
+        match generated::decide_unlink(&kind.as_str(), reason.map(|v| v.as_str()).as_deref())? {
+            Decision::Action(value) => Some(value),
+            Decision::Null(warning) => {
+                warning.emit(&kind.as_str(), warnings)?;
+                return Ok(NormalizedUnlink {
+                    kind: None,
+                    groups: Vec::new(),
+                });
+            }
+        };
     let kind = action
         .map(|a| {
             GroupUnlinkKind::try_from(a)
@@ -280,7 +298,7 @@ mod tests {
         );
     }
     #[test]
-    fn participant_defaults_and_history_gate() {
+    fn participant_defaults_and_history_are_independent_of_old_gate() {
         let lid = Jid::lid_device("100001", 2);
         for enabled in [false, true] {
             let context = GroupParseContext {
@@ -316,7 +334,7 @@ mod tests {
                 participants[0].r#type,
                 Some(super::super::GroupParticipantType::Participant)
             );
-            assert_eq!(participants[0].join_time.is_some(), enabled);
+            assert_eq!(participants[0].join_time, Some(123));
             assert!(participants[1].is_admin());
             assert!(participants[1].is_super_admin());
         }

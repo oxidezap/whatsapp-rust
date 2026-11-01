@@ -56,6 +56,14 @@ pub fn preserve_compatibility(ir: &mut MexIr) -> anyhow::Result<()> {
             op.doc_id == "29693690733569730",
             "review ContactManagerCustomerProfiles before changing its retained input shape"
         );
+        // The same reviewed module passes includeCustomFields === true. It is a
+        // newly captured variable, not a string-valued compatibility field.
+        match op.variables_shape.get_mut("includeCustomFields") {
+            Some(TypeNode::Leaf(kind)) if matches!(kind.as_str(), "string" | "boolean") => {
+                *kind = "boolean".into()
+            }
+            _ => anyhow::bail!("review ContactManagerCustomerProfiles includeCustomFields type"),
+        }
         let Some(TypeNode::Object(input)) = op.variables_shape.get_mut("input") else {
             anyhow::bail!("ContactManagerCustomerProfiles input is no longer an object");
         };
@@ -285,13 +293,17 @@ mod tests {
     #[test]
     fn candidate_array_override_is_bound_to_the_reviewed_document() {
         let mut operation = op(
-            &[("input", obj(&[("candidate_lids", leaf("string"))]))],
+            &[
+                ("input", obj(&[("candidate_lids", leaf("string"))])),
+                ("includeCustomFields", leaf("string")),
+            ],
             &[],
         );
         operation.doc_id = "29693690733569730".into();
         let mut ir = ir("ContactManagerCustomerProfiles", operation);
         preserve_compatibility(&mut ir).unwrap();
         assert!(generate(&ir).contains("pub candidate_lids: Option<Vec<String>>"));
+        assert!(generate(&ir).contains("pub include_custom_fields: Option<bool>"));
         preserve_compatibility(&mut ir).unwrap();
         ir.operations
             .get_mut("ContactManagerCustomerProfiles")

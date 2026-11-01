@@ -115,20 +115,20 @@ fn opt_jid(out: &mut String, actual: &str, value: &Value, label: &str) -> Result
 pub fn generate(wa_version: &str) -> Result<String> {
     let oracle: Value = serde_json::from_str(ORACLE)?;
     ensure!(
-        wa_version == "2.3000.1047483476" && oracle["waVersion"].as_str() == Some(wa_version),
+        wa_version == "2.3000.1052559453" && oracle["waVersion"].as_str() == Some(wa_version),
         "CREATE oracle requires snapshot review"
     );
     ensure!(
-        oracle["setHash"] == "05609307e68b0f6ccfd2a121a573049999e38b752cfe7155ebbe5c661805751b",
+        oracle["setHash"] == "d6ab7ae601eda281cfac570a68de1d787adde8f4d778f0bb994416f661a21abf",
         "CREATE oracle bundle mismatch"
     );
     exact_keys(&oracle, &["waVersion", "setHash", "cases"])?;
     let cases = oracle["cases"]
         .as_array()
         .context("missing CREATE oracle cases")?;
-    ensure!(cases.len() >= 8, "CREATE oracle coverage decreased");
+    ensure!(cases.len() == 13, "CREATE oracle coverage requires review");
     let mut out = header("isolated official CREATE conformance cases", wa_version);
-    out.push_str("//! Original handler module SHA-256 a65d861ba0dacdcec52d2df48712a80677ecf10021d7df63c84183f195db13a1.\n//! T/g/h/y and actual official XML/Wap/JID/time/enum dependency modules are executed by the fixture harness.\n//! Effective account flags/country registry, Wid conversion, binary adapter, native-Error bridge and telemetry are mocked.\n\nuse super::{parse_group_create,GroupCreateContext,CreateParseError};\nuse crate::stanza::groups::{GroupParticipantType,GroupHistorySentState};\nuse wacore_binary::{Jid,builder::NodeBuilder};\n\n#[test]\nfn isolated_official_create_helpers_match_rust_projection() {\n");
+    out.push_str("//! Original handler module SHA-256 d1641fad966fd3b32d6b9859e074f804526e67181584811364774047208c273d.\n//! The complete original groupNotificationParser callback and official XML/Wap/JID/time/enum dependencies run in the versioned fixture harness.\n//! Effective account flags/country registry, Wid conversion, binary adapter, native-Error bridge and telemetry are mocked.\n\nuse super::{parse_group_create,GroupCreateContext,CreateParseError};\nuse crate::stanza::groups::{GroupParticipantType,GroupHistorySentState};\nuse wacore_binary::{Jid,builder::NodeBuilder};\n\n#[test]\nfn isolated_official_create_helpers_match_rust_projection() {\n");
     for case in cases {
         exact_keys(case, &["name", "flags", "input", "success", "error"])?;
         let name = case["name"].as_str().context("missing CREATE case name")?;
@@ -166,6 +166,10 @@ pub fn generate(wa_version: &str) -> Result<String> {
                 "type"
             } else if error.contains("to have attribute \"id\"") {
                 "id"
+            } else if error
+                == "XmppParsingFailure: synthetic: expected <participant> to have \"join_time\"={integer} but has value \"invalid\""
+            {
+                "join_time"
             } else {
                 anyhow::bail!("unqualified CREATE oracle error {error}");
             };
@@ -181,13 +185,28 @@ pub fn generate(wa_version: &str) -> Result<String> {
         let expected = &case["success"];
         exact_keys(
             expected,
-            &["actionType", "reason", "contextGroupId", "groupInfo"],
+            &[
+                "actionType",
+                "reason",
+                "contextGroupId",
+                "groupInfo",
+                "isNewGroup",
+            ],
         )?;
         ensure!(
             expected["actionType"] == "create",
             "non-CREATE oracle action"
         );
         out.push_str("let parsed=parse_group_create(&node.as_node_ref(),&context).unwrap();\n");
+        compare(
+            &mut out,
+            "parsed.is_new_group",
+            &expected["isNewGroup"]
+                .as_bool()
+                .context("missing isNewGroup")?
+                .to_string(),
+            name,
+        );
         opt_text(
             &mut out,
             "parsed.reason.as_ref().map(|v|v.normalized_value())",
@@ -240,6 +259,7 @@ pub fn generate(wa_version: &str) -> Result<String> {
                 "limitSharingEnabled",
                 "memberLinkMode",
                 "memberAddMode",
+                "memberShareGroupHistoryMode",
             ],
         )?;
         out.push_str("let group=&parsed.group_info;\n");
@@ -329,6 +349,7 @@ pub fn generate(wa_version: &str) -> Result<String> {
         for (wire, rust) in [
             ("memberLinkMode", "member_link_mode"),
             ("memberAddMode", "member_add_mode"),
+            ("memberShareGroupHistoryMode", "member_share_history_mode"),
         ] {
             opt_text(
                 &mut out,
@@ -468,7 +489,7 @@ mod tests {
     }
     #[test]
     fn emits_independent_output_and_error_checks() {
-        let rust = generate("2.3000.1047483476").unwrap();
+        let rust = generate("2.3000.1052559453").unwrap();
         assert!(rust.contains("group.ephemerality"));
         assert!(rust.contains("CreateParseError::Field(\"type\")"));
         assert!(rust.contains("group.participants"));

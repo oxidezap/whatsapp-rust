@@ -439,6 +439,10 @@ history_field_whitelist!(
                 newsletter_scheduled_message => is_unset,
                 acp2_setting_message => is_unset,
                 audio_sticker_message => is_unset,
+                instant_image_message => is_unset,
+                request_location_message => is_unset,
+                bot_group_participant_message => is_unset,
+                request_location_update_message => is_unset,
             ]
 );
 
@@ -463,6 +467,7 @@ history_field_whitelist!(
                         associated_primary_identity_key => is_none,
                         tee_context_anchor_message_id => is_none,
                         acp2_setting => is_unset,
+                        light_e2_ee => is_none,
                     ]
 );
 
@@ -1124,10 +1129,17 @@ mod tests {
 
     #[test]
     fn new_capture_message_fields_are_not_forwarded_as_plain_history_text() {
-        // conversation="x" plus an empty field 132, 133 or 134. Presence of
+        // conversation="x" plus an empty field 132 through 138. Presence of
         // the new payload is enough to reject it from the text-only path.
-        for tag in [0xa2, 0xaa, 0xb2] {
+        for tag in [0xa2, 0xaa, 0xb2, 0xba, 0xc2, 0xca, 0xd2] {
             let content = waproto::codec::message_decode(&[0x0a, 1, b'x', tag, 8, 0]).unwrap();
+            assert!(!is_shareable_history_text(&content));
+        }
+        // Field 22 in context info is significant even when explicitly false.
+        for flag in [0, 1] {
+            let content =
+                waproto::codec::message_decode(&[0x0a, 1, b'x', 0x9a, 2, 3, 0xb0, 1, flag])
+                    .unwrap();
             assert!(!is_shareable_history_text(&content));
         }
     }

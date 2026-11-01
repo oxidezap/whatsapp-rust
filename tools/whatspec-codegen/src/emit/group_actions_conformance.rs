@@ -7,8 +7,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 const ORACLE: &str = include_str!("../../fixtures/group_actions_oracle.json");
-const REV: &str = "adbe317bf0320bb0cb83824722f6eb60c2ac69da";
-const ORACLE_SHA: &str = "1e132eaa76698909e07ae33e90e624400b55cc6c6f061940b6553d394095031a";
+const REV: &str = "afa3e343f37b0b64f03cffcacf2448ef883a2d8b";
+const ORACLE_SHA: &str = "d5f59844a2c0bd87a919bb52104860ba310af195e4850cc0dc5991740be1eadd";
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Oracle {
@@ -70,7 +70,7 @@ enum ExpectedError {
 
 pub fn generate(wa_version: &str) -> Result<String> {
     ensure!(
-        wa_version == "2.3000.1047483476",
+        wa_version == "2.3000.1052559453",
         "action oracle snapshot requires qualification"
     );
     ensure!(
@@ -88,7 +88,7 @@ fn generate_reviewed(json: &str, wa_version: &str) -> Result<String> {
     ensure!(
         oracle.wa_version == wa_version
             && oracle.set_hash
-                == "05609307e68b0f6ccfd2a121a573049999e38b752cfe7155ebbe5c661805751b",
+                == "d6ab7ae601eda281cfac570a68de1d787adde8f4d778f0bb994416f661a21abf",
         "action oracle provenance differs"
     );
     ensure!(
@@ -100,7 +100,7 @@ fn generate_reviewed(json: &str, wa_version: &str) -> Result<String> {
         "complete official nonraw group action conformance",
         wa_version,
     );
-    out.push_str(&format!("//! Original callback source: https://github.com/oxidezap/whatspec/blob/{REV}/tests/conformance/groups/actions.cjs\n//! Module SHA-256 a65d861ba0dacdcec52d2df48712a80677ecf10021d7df63c84183f195db13a1.\n//! Account facts/Wid conversion/logging are explicit test mocks; runtime handlers are not run.\n\n"));
+    out.push_str(&format!("//! Original callback source: https://github.com/oxidezap/whatspec/blob/{REV}/tests/conformance/groups/versions/2.3000.1052559453/actions.json\n//! Module SHA-256 d1641fad966fd3b32d6b9859e074f804526e67181584811364774047208c273d.\n//! Account facts/Wid conversion/logging are explicit test mocks; runtime handlers are not run.\n\n"));
     out.push_str("mod projection {\n");
     out.push_str(include_str!(
         "../../../../wacore/src/stanza/groups/actions_oracle_projection.rs"
@@ -297,7 +297,7 @@ fn records<'a>(value: &'a Value, name: &str) -> Result<&'a Vec<Value>> {
         .as_array()
         .with_context(|| format!("missing complete {name} records"))
 }
-fn participant(value: &Value, flags: &Flags) -> Result<()> {
+fn participant(value: &Value, _flags: &Flags) -> Result<()> {
     keys(
         value,
         &[
@@ -328,11 +328,10 @@ fn participant(value: &Value, flags: &Flags) -> Result<()> {
         );
     }
     ensure!(
-        object.contains_key("joinTime") == flags.history
-            && object.contains_key("groupHistorySentState") == flags.history,
-        "participant history presence differs from source gate"
+        object.contains_key("joinTime") && object.contains_key("groupHistorySentState"),
+        "participant history fields must be present in the qualified source"
     );
-    if flags.history {
+    {
         ensure!(
             value["groupHistorySentState"].is_null()
                 || matches!(value["groupHistorySentState"].as_i64(), Some(1..=3)),
@@ -452,7 +451,7 @@ mod tests {
     use super::*;
     #[test]
     fn independent_matrix_is_complete_and_generates_static_tests() {
-        let output = generate_reviewed(ORACLE, "2.3000.1047483476").unwrap();
+        let output = generate_reviewed(ORACLE, "2.3000.1052559453").unwrap();
         assert!(output.contains("MissingRequestFallbackAuthor"));
         assert!(output.contains("projection::project"));
     }
@@ -466,7 +465,7 @@ mod tests {
             .find(|c| c.get("success").is_some())
             .unwrap();
         success["success"]["actions"][0]["unexpected_output"] = "unqualified".into();
-        assert!(generate_reviewed(&oracle.to_string(), "2.3000.1047483476").is_err());
+        assert!(generate_reviewed(&oracle.to_string(), "2.3000.1052559453").is_err());
     }
     #[test]
     fn unknown_error_class_rejects_generation() {
@@ -478,6 +477,6 @@ mod tests {
             .find(|c| c.get("error").is_some())
             .unwrap();
         error["error"]["name"] = "future_error_class".into();
-        assert!(generate_reviewed(&oracle.to_string(), "2.3000.1047483476").is_err());
+        assert!(generate_reviewed(&oracle.to_string(), "2.3000.1052559453").is_err());
     }
 }

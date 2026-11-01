@@ -1,7 +1,7 @@
 {
   "moduleName": "WAWebHandleGroupNotification",
-  "startByte": 17137,
-  "endByte": 17639,
+  "startByte": 17403,
+  "endByte": 18068,
   "wireTag": "link",
   "linkTypeAttribute": "link_type",
   "groupChildTag": "group",
@@ -26,7 +26,14 @@
     {
       "linkType": null,
       "actionType": null,
-      "hiddenSubgroupChild": "hidden_group"
+      "nullResult": {
+        "template": [
+          "Unrecognized link_type: ",
+          ""
+        ],
+        "event": "group-unrecognized-link-type"
+      },
+      "hiddenSubgroupChild": null
     },
     {
       "linkType": "__defineGetter__",

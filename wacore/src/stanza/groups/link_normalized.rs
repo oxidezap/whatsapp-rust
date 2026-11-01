@@ -2,6 +2,7 @@
 //! retain its raw Node; callers opt into this parsed, source-backed projection.
 use super::GroupNotificationActionTag;
 use super::identity::{IntegerReadError, parse_group, parse_js_integer};
+use super::normalization_warning::{Decision, GroupWarningSink, IgnoreWarnings};
 use super::normalized::GroupParseError;
 use crate::WireEnum;
 use wacore_binary::{Jid, NodeRef};
@@ -29,13 +30,21 @@ pub struct LinkedGroup {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedLink {
-    /// Ordinary unknown type strings produce an undefined action upstream.
+    /// Ordinary unknown types warn and return null upstream; this API represents
+    /// that result as no kind and an empty payload.
     /// Inherited prototype properties are rejected as unqualified non-strings.
     pub kind: Option<GroupLinkKind>,
     pub groups: Vec<LinkedGroup>,
 }
 
 pub fn parse_link(node: &NodeRef<'_>) -> Result<NormalizedLink, GroupParseError> {
+    parse_link_with_warnings(node, &mut IgnoreWarnings)
+}
+
+pub fn parse_link_with_warnings(
+    node: &NodeRef<'_>,
+    warnings: &mut dyn GroupWarningSink,
+) -> Result<NormalizedLink, GroupParseError> {
     if !matches!(
         GroupNotificationActionTag::from(node.tag.as_ref()),
         GroupNotificationActionTag::Link
@@ -48,7 +57,14 @@ pub fn parse_link(node: &NodeRef<'_>) -> Result<NormalizedLink, GroupParseError>
         .as_str();
     // Keep payload read/error order even when a plain-object lookup produced an
     // unsupported action identity. Official JS constructs groupDatas afterward.
-    let action = generated::normalize_link(&kind);
+    let action = generated::decide_link(&kind);
+    if let Ok(Decision::Null(warning)) = action {
+        warning.emit(&kind, warnings)?;
+        return Ok(NormalizedLink {
+            kind: None,
+            groups: Vec::new(),
+        });
+    }
     let hidden_child = generated::hidden_subgroup_child(&kind);
     if node.content.is_some() && node.children().is_none() {
         return Err(GroupParseError::Field("children"));
@@ -88,7 +104,11 @@ pub fn parse_link(node: &NodeRef<'_>) -> Result<NormalizedLink, GroupParseError>
             hidden_subgroup,
         });
     }
-    let kind = action?
+    let action = match action? {
+        Decision::Action(value) => Some(value),
+        Decision::Null(_) => None,
+    };
+    let kind = action
         .map(|value| {
             GroupLinkKind::try_from(value)
                 .map_err(|_| GroupParseError::Field("generated link action"))
