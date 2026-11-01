@@ -58,13 +58,13 @@ jobs:
           HEAD_REVISION: ${{ github.event.pull_request.head.sha }}
         run: |
           mkdir -p .retention-out
-          cargo build -p whatsapp-xtask
+          cargo build --locked -p whatsapp-xtask
           cp target/debug/whatsapp-xtask .retention-out/compare
           git checkout --detach "$BASE_REVISION"
-          cargo build --release -p whatsapp-rust --no-default-features --features bench-harness,sqlite-storage-bundled --example connected_idle
+          cargo build --locked --release -p whatsapp-rust --no-default-features --features bench-harness,sqlite-storage-bundled --example connected_idle
           cp target/release/examples/connected_idle .retention-out/base
           git checkout --detach "$HEAD_REVISION"
-          cargo build --release -p whatsapp-rust --no-default-features --features bench-harness,sqlite-storage-bundled --example connected_idle
+          cargo build --locked --release -p whatsapp-rust --no-default-features --features bench-harness,sqlite-storage-bundled --example connected_idle
           cp target/release/examples/connected_idle .retention-out/head
       - name: Compare connected requested heap on the same host
         env:

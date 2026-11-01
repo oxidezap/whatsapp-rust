@@ -1649,6 +1649,7 @@ impl ResponseWaiterMap {
 struct SessionState {
     status: AtomicU16,
     reconnect_errors: AtomicU32,
+    cleanup_serial: Mutex<()>,
     lifecycle_state: std::sync::Mutex<wacore::session_engine::lifecycle::Lifecycle>,
 }
 
@@ -1665,12 +1666,14 @@ impl SessionState {
     const INTENTIONAL: u16 = 512;
     const PAUSE_EXIT: u16 = 1024;
     const PENALTY: u16 = 2048;
+    const ORPHANED: u16 = 4096;
 
     fn new(enabled: bool) -> Self {
         use wacore::session_engine::lifecycle::{Lifecycle, ReconnectPolicy};
         Self {
             status: AtomicU16::new(u16::from(enabled)),
             reconnect_errors: AtomicU32::new(0),
+            cleanup_serial: Mutex::new(()),
             lifecycle_state: std::sync::Mutex::new(Lifecycle::new(if enabled {
                 ReconnectPolicy::Enabled
             } else {
@@ -1725,6 +1728,9 @@ impl SessionState {
         if snapshot.penalty_pending() {
             bits |= Self::PENALTY;
         }
+        if snapshot.needs_cleanup() {
+            bits |= Self::ORPHANED;
+        }
         bits
     }
 
@@ -1746,6 +1752,21 @@ impl SessionState {
         let result = apply(&mut state);
         self.publish(&state, ordering);
         result
+    }
+
+    fn reachable(&self) -> bool {
+        const REQUIRED: u16 =
+            SessionState::CONNECTED | SessionState::LOGGED_IN | SessionState::DRIVING;
+        const CHECKED: u16 =
+            REQUIRED | SessionState::EXPECTED | SessionState::PAUSED | SessionState::ORPHANED;
+        self.status.load(Ordering::Acquire) & CHECKED == REQUIRED
+    }
+
+    fn ready(&self) -> bool {
+        const REQUIRED: u16 =
+            SessionState::CONNECTED | SessionState::LOGGED_IN | SessionState::READY;
+        const CHECKED: u16 = REQUIRED | SessionState::PAUSED | SessionState::ORPHANED;
+        self.status.load(Ordering::Acquire) & CHECKED == REQUIRED
     }
 
     fn driving(&self, ordering: Ordering) -> bool {

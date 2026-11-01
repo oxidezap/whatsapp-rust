@@ -141,6 +141,7 @@ impl<'a> Comments<'a> {
             });
             proto
         };
+        let sent_at = crate::send::SendInstant::from_runtime(&client.runtime);
         let result = client.send_message(chat, message).await?;
 
         // The send path only persists reporting-token secrets, so store the
@@ -153,7 +154,7 @@ impl<'a> Comments<'a> {
                 result.message_id.as_str(),
                 &comment_secret,
                 wacore::msg_secret::RetentionClass::Text,
-                crate::send::SendInstant::from_runtime(&client.runtime),
+                sent_at,
             )
             .await;
         Ok(result)

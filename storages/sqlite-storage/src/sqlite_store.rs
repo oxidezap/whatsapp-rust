@@ -175,10 +175,6 @@ struct FreshDeviceRow {
 impl FreshDeviceRow {
     /// Build the row for a brand-new, unpaired account, optionally pinning the
     /// id. Serialization of the key pairs is the only fallible step.
-    fn new(id: Option<i32>) -> Result<Self> {
-        Self::from_device(id, CoreDevice::new())
-    }
-
     fn from_device(id: Option<i32>, device: CoreDevice) -> Result<Self> {
         Ok(Self {
             id,
@@ -2007,7 +2003,10 @@ impl SqliteStore {
     }
 
     pub(crate) async fn create_sibling_device_impl(&self) -> Result<(i32, SqliteStore)> {
-        let row = Arc::new(FreshDeviceRow::new(None)?);
+        let row = Arc::new(FreshDeviceRow::from_device(
+            None,
+            self.insertion_time().device(),
+        )?);
         let device_id = self
             .with_retry("create_sibling_device", move || {
                 let row = Arc::clone(&row);
@@ -2025,7 +2024,10 @@ impl SqliteStore {
     }
 
     pub(crate) async fn reset_device_impl(&self, device_id: i32) -> Result<SqliteStore> {
-        let row = Arc::new(FreshDeviceRow::new(Some(device_id))?);
+        let row = Arc::new(FreshDeviceRow::from_device(
+            Some(device_id),
+            self.insertion_time().device(),
+        )?);
         self.with_retry("reset_device", move || {
             let row = Arc::clone(&row);
             Box::new(move |conn: &mut SqliteConnection| {
@@ -5260,6 +5262,24 @@ mod tests {
     }
 
     #[cfg(not(target_family = "wasm"))]
+    #[cfg(feature = "instance-clock")]
+    #[tokio::test]
+    async fn sibling_and_reset_device_creation_use_the_configured_clock() {
+        use wacore::time::{Instant, VirtualClock};
+        let clock = Arc::new(VirtualClock::new(1_700_000_000_000, Instant::ZERO).unwrap());
+        let store = SqliteStore::open("file:instance-account-clock?mode=memory&cache=shared")
+            .await
+            .unwrap()
+            .with_clock(clock.clone());
+        let (id, sibling) = store.create_sibling_device_impl().await.unwrap();
+        let created = DeviceStore::load(&sibling).await.unwrap().unwrap();
+        assert_eq!(created.last_signed_pre_key_rotation_ms, 1_700_000_000_000);
+        clock.advance(Duration::from_secs(5)).unwrap();
+        let reset = store.reset_device_impl(id).await.unwrap();
+        let created = DeviceStore::load(&reset).await.unwrap().unwrap();
+        assert_eq!(created.last_signed_pre_key_rotation_ms, 1_700_000_005_000);
+    }
+
     #[tokio::test]
     async fn shared_retry_accepts_send_only_factory_and_preserves_commit_barrier() {
         use std::cell::Cell;

@@ -20,6 +20,7 @@ use crate::sync_marker::{MaybeSend, MaybeSendSync};
 pub trait Runtime: MaybeSendSync + 'static {
     /// An instance clock with a fixed domain for this runtime's lifetime.
     /// `None` preserves the existing process-wide providers.
+    /// Decorators must forward this port to preserve the wrapped clock and its timers.
     #[cfg(feature = "instance-clock")]
     fn clock(&self) -> Option<&std::sync::Arc<dyn crate::time::Clock>> {
         None
@@ -70,6 +71,7 @@ pub trait Runtime: MaybeSendSync + 'static {
 pub trait Runtime: MaybeSendSync + 'static {
     /// An instance clock with a fixed domain for this runtime's lifetime.
     /// `None` preserves the existing process-wide providers.
+    /// Decorators must forward this port to preserve the wrapped clock and its timers.
     #[cfg(feature = "instance-clock")]
     fn clock(&self) -> Option<&std::sync::Arc<dyn crate::time::Clock>> {
         None
@@ -100,6 +102,14 @@ pub trait Runtime: MaybeSendSync + 'static {
 
 impl dyn Runtime {
     #[inline]
+    pub fn instance_clock(&self) -> Option<&std::sync::Arc<dyn crate::time::Clock>> {
+        #[cfg(feature = "instance-clock")]
+        return self.clock();
+        #[cfg(not(feature = "instance-clock"))]
+        None
+    }
+
+    #[inline]
     pub fn has_instance_clock(&self) -> bool {
         #[cfg(feature = "instance-clock")]
         return self.clock().is_some();
@@ -116,6 +126,10 @@ impl dyn Runtime {
         crate::time::now_millis()
     }
 
+    /// Read calendar time from the selected provider.
+    ///
+    /// # Panics
+    /// Panics if a custom clock violates its calendar-range contract after construction.
     pub fn wall_time_utc(&self) -> chrono::DateTime<chrono::Utc> {
         #[cfg(feature = "instance-clock")]
         if let Some(clock) = self.clock() {

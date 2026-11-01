@@ -690,7 +690,7 @@ pub(crate) async fn handle_account_sync_devices(
         .attrs()
         .optional_u64("t")
         .map(|v| v as i64)
-        .unwrap_or_else(wacore::time::now_secs);
+        .unwrap_or_else(|| client.runtime.wall_time_secs());
 
     // Preserve existing raw_id so account_sync doesn't erase it
     let existing_raw_id = client

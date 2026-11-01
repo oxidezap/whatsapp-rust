@@ -339,10 +339,22 @@ impl Client {
     /// headers and AEAD tags included; handshake and TLS/WebSocket overhead
     /// excluded), so two clients in one process can be compared directly.
     pub fn stats(&self) -> StatsSnapshot {
-        let mut snapshot = self.stats.snapshot_with_clock(
-            || self.runtime.wall_time_millis(),
-            || self.runtime.monotonic_time(),
-        );
+        let mut snapshot = {
+            #[cfg(feature = "instance-clock")]
+            {
+                if let Some(clock) = self.runtime.instance_clock() {
+                    self.stats.snapshot_with_clock(|| {
+                        clock
+                            .reading()
+                            .expect("clock implementation returned an invalid calendar time")
+                    })
+                } else {
+                    self.stats.snapshot()
+                }
+            }
+            #[cfg(not(feature = "instance-clock"))]
+            self.stats.snapshot()
+        };
         snapshot.reconnect_errors = self.reconnect_errors(Ordering::Relaxed);
         snapshot.resends_throttled = self.resend_rate_limiter.throttled_total();
         snapshot.messages_suppressed_duplicate =

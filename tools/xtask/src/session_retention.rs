@@ -15,6 +15,7 @@ struct Sample {
 struct Run {
     backend: String,
     mode: String,
+    lanes: usize,
     messages: usize,
     text_bytes: usize,
     history_messages: usize,
@@ -37,12 +38,25 @@ struct SampleMetrics {
     rss_anon_kib: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct MedianBytes(i128);
+
+impl Serialize for MedianBytes {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut value = serializer.serialize_struct("MedianBytes", 2)?;
+        value.serialize_field("numerator", &self.0)?;
+        value.serialize_field("denominator", &2_u8)?;
+        value.end()
+    }
+}
+
 #[derive(Serialize)]
 struct Comparison {
     checkpoint: String,
-    base_retained_bytes: i128,
-    head_retained_bytes: i128,
-    delta_bytes: i128,
+    base_retained_bytes: MedianBytes,
+    head_retained_bytes: MedianBytes,
+    delta_bytes: MedianBytes,
     regression: bool,
     base_samples: Vec<SampleMetrics>,
     head_samples: Vec<SampleMetrics>,
@@ -57,6 +71,7 @@ struct StreamReport {
 
 #[derive(Serialize)]
 struct Report {
+    schema_version: u32,
     base_revision: String,
     head_revision: String,
     base_executable: PathBuf,
@@ -122,9 +137,19 @@ fn retained(run: &Run, checkpoint: &str) -> Result<i128> {
         - i128::from(sample(run, "runtime_baseline")?.rust_live_bytes))
 }
 
-fn median(mut values: Vec<i128>) -> i128 {
+fn median(mut values: Vec<i128>) -> MedianBytes {
+    assert!(!values.is_empty(), "median needs samples");
     values.sort_unstable();
-    values[values.len() / 2]
+    let middle = values.len() / 2;
+    MedianBytes(if values.len().is_multiple_of(2) {
+        values[middle - 1]
+            .checked_add(values[middle])
+            .expect("allocation samples fit twice the u64 range")
+    } else {
+        values[middle]
+            .checked_mul(2)
+            .expect("allocation samples fit twice the u64 range")
+    })
 }
 
 fn compare(base: &[Run], head: &[Run], checkpoint: &str) -> Result<Comparison> {
@@ -135,12 +160,14 @@ fn compare(base: &[Run], head: &[Run], checkpoint: &str) -> Result<Comparison> {
     for (base, head) in base.iter().zip(head) {
         ensure!(
             (
+                base.lanes,
                 base.messages,
                 base.text_bytes,
                 base.history_messages,
                 base.workload_seed,
                 base.idle_seconds
             ) == (
+                head.lanes,
                 head.messages,
                 head.text_bytes,
                 head.history_messages,
@@ -176,7 +203,7 @@ fn compare(base: &[Run], head: &[Run], checkpoint: &str) -> Result<Comparison> {
         checkpoint: checkpoint.into(),
         base_retained_bytes: base_live,
         head_retained_bytes: head_live,
-        delta_bytes: head_live - base_live,
+        delta_bytes: MedianBytes(head_live.0 - base_live.0),
         regression: head_live > base_live,
         base_samples: metrics(base)?,
         head_samples: metrics(head)?,
@@ -254,6 +281,7 @@ pub fn run(root: &Path, options: Options) -> Result<()> {
             .collect::<Result<Vec<_>>>()
     })?;
     let report = Report {
+        schema_version: 2,
         base_revision: options.base_revision,
         head_revision: options.head_revision,
         base_executable_sha256: xtask_support::sha256(&std::fs::read(&base_executable)?),
@@ -302,6 +330,7 @@ mod tests {
         Run {
             backend: "memory".into(),
             mode: "control".into(),
+            lanes: if messages == 0 { 0 } else { 32 },
             messages,
             text_bytes: 4096,
             history_messages: 0,
@@ -326,7 +355,7 @@ mod tests {
     #[test]
     fn a_one_byte_retention_regression_fails_even_when_absolute_heap_is_lower() {
         let result = compare(&[run_with(100, 10, 0)], &[run_with(92, 1, 0)], "after_61s").unwrap();
-        assert_eq!(result.delta_bytes, 1);
+        assert_eq!(result.delta_bytes, MedianBytes(2));
         assert!(result.regression);
     }
     #[test]
@@ -353,8 +382,32 @@ mod tests {
             run_with(200, 10, 0),
         ];
         let result = compare(&base, &head, "after_61s").unwrap();
-        assert_eq!(result.delta_bytes, -1);
+        assert_eq!(result.delta_bytes, MedianBytes(-2));
         assert!(!result.regression);
         assert_eq!(result.head_samples.len(), 3);
+    }
+    #[test]
+    fn even_repeat_medians_keep_half_bytes_exact() {
+        assert_eq!(median(vec![90, 90, 91, 91]), MedianBytes(181));
+        let value = serde_json::to_value(median(vec![90, 90, 91, 91])).unwrap();
+        assert_eq!(value["numerator"], 181);
+        assert_eq!(value["denominator"], 2);
+    }
+
+    #[test]
+    fn changed_lane_count_is_not_a_valid_comparison() {
+        let base = run_with(100, 10, 0);
+        let mut head = run_with(50, 10, 0);
+        head.lanes = 32;
+        assert!(compare(&[base], &[head], "after_61s").is_err());
+    }
+
+    #[test]
+    fn a_one_byte_regression_above_floating_point_precision_stays_visible() {
+        let base = run_with(1_u64 << 60, 0, 0);
+        let head = run_with((1_u64 << 60) + 1, 0, 0);
+        let result = compare(&[base], &[head], "after_61s").unwrap();
+        assert!(result.regression);
+        assert_eq!(result.delta_bytes, MedianBytes(2));
     }
 }

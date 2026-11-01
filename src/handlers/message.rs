@@ -368,9 +368,7 @@ mod tests {
         );
         client.notify_connection_shutdown();
         client.chat_lanes.clear().await;
-        client
-            .connection_generation
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        client.advance_generation_for_test(1, std::sync::atomic::Ordering::AcqRel);
         client.reset_connection_shutdown();
         // Finish the old cache initializer after the reconnect's clear.
         client

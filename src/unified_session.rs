@@ -170,6 +170,27 @@ mod tests {
     use wacore_binary::builder::NodeBuilder;
 
     #[test]
+    fn explicit_server_offset_keeps_the_previous_value_on_overflow() {
+        let session = UnifiedSessionManager::new();
+        let valid = NodeBuilder::new("success").attr("t", "1700000010").build();
+        session.update_server_time_offset_at(&valid.as_node_ref(), 1_700_000_000);
+        assert_eq!(session.server_time_offset_ms(), 10_000);
+        assert_eq!(
+            session.calculate_session_id_at(1_700_000_000_000),
+            UnifiedSession::calculate_id_at(10_000, 1_700_000_000_000)
+        );
+        let invalid = NodeBuilder::new("success")
+            .attr("t", "1000000000000000000")
+            .build();
+        session.update_server_time_offset_at(&invalid.as_node_ref(), 1_700_000_000);
+        assert_eq!(session.server_time_offset_ms(), 10_000);
+        assert_eq!(
+            session.calculate_session_id_at(1_700_000_000_000),
+            UnifiedSession::calculate_id_at(10_000, 1_700_000_000_000)
+        );
+    }
+
+    #[test]
     fn test_manager_fields_are_inline() {
         // Locks the inline shape: every field lives in the manager itself, so
         // `new()` performs zero heap allocations. Reintroducing an `Arc`

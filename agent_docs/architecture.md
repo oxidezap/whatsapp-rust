@@ -58,7 +58,7 @@ Read device state through `get_device_snapshot`. Publish mutations through
 Signal encryption/decryption uses per-address locks. Incoming chat lanes
 serialize processing, including offline commit ordering. Outgoing sends do not
 use a chat lock. Advance and return Signal state before publishing ciphertext;
-`persist_signal_state_pre_wire` must succeed when a lease gate is pending.
+`confirm_signal_state_pre_wire` must succeed when a lease gate is pending.
 Never replace the batch-safe flush with a raw cache flush during offline drain.
 
 Session/sender-key reservations are exclusive ceilings for one chain. Only
@@ -107,3 +107,31 @@ open implementation points. Required trait methods and tighter thread bounds
 break implementers. Add defaults only when absence has an honest, safe meaning;
 never replace atomic persistence with sequential writes or silently accept an
 unsupported capability. Batch overrides inherit the owning method's contracts.
+
+## Session transitions and host completions
+
+`wacore::session_engine` owns lifecycle transitions, IQ exchange stages, retry
+policy stages and prepared Signal output. Feed it explicit time and completion
+inputs. Keep transport, executor and storage calls in the SDK adapters.
+The optional `session-simulator` feature exposes replay helpers; it is not
+linked into default consumers.
+
+The SDK keeps the lifecycle model behind one mutex and publishes its atomic
+projection for frequent reads. Worker generations retire background work;
+transport tickets identify physical connections and survive authentication's
+generation increment. Cleanup must validate its physical owner after waiting
+for serialization. A cancelled reader loses its frame decoder, so a restarted
+supervisor retires that connection before dialing again.
+
+`SignalCommitOutcome` is a trusted fact reported by the persistence adapter.
+The core orders preparation, confirmation and publication but cannot verify
+I/O. The SDK must obtain the outcome from the global, batch-safe persistence
+gate before exposing prepared output. Keep the durable-lease fast path and
+per-address Signal locks intact.
+
+Instance-clock clients bind the same clock allocation to runtime and storage.
+Validate alignment after wrapping runtimes, and forward clock ports through
+runtime decorators. Built-in virtual clocks drive their own sleeps and wake
+on monotonic advancement. A clock without a timer port must advance with its
+inner executor. Public legacy time helpers retain process-clock behavior;
+instance-aware SDK paths supply explicit time or the selected provider.

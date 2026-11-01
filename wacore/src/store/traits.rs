@@ -1608,6 +1608,16 @@ pub trait Backend:
 {
 }
 
+impl dyn Backend + '_ {
+    #[inline]
+    pub fn instance_clock(&self) -> Option<&Arc<dyn crate::time::Clock>> {
+        #[cfg(feature = "instance-clock")]
+        return self.clock();
+        #[cfg(not(feature = "instance-clock"))]
+        None
+    }
+}
+
 impl<T> Backend for T where
     T: SignalStore + AppSyncStore + ProtocolStore + MsgSecretStore + DeviceStore + Send + Sync
 {

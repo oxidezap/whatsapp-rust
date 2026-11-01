@@ -655,7 +655,19 @@ mod tests {
                 client.advance_generation_for_test(1, Ordering::SeqCst);
             }
             let replacement = Arc::new(CapturingMockTransport::new());
-            connect(&client, replacement.clone());
+            if shutdown {
+                // Inject a replacement sink without reopening the terminal lifecycle.
+                // A retained grant must reject it even if a transport is present.
+                let socket = NoiseSocket::new(
+                    client.runtime.clone(),
+                    replacement.clone(),
+                    NoiseCipher::new(&[0; 32]).unwrap(),
+                    NoiseCipher::new(&[0; 32]).unwrap(),
+                );
+                *client.noise_socket.lock().unwrap() = Some(Arc::new(socket));
+            } else {
+                connect(&client, replacement.clone());
+            }
             assert!(reply.result(vec![]).await.is_err());
             assert!(old_transport.sent().is_empty());
             assert!(replacement.sent().is_empty());

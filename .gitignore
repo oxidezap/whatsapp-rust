@@ -27,3 +27,5 @@ file:memdb_*.snapshot-*
 /.cache/
 /scripts/mlow-vectors/__pycache__/
 /.oracle-tool/
+
+/.retention-out

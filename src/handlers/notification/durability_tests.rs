@@ -219,8 +219,7 @@ async fn retirement_from_group_event_stops_remaining_actions_and_ack() {
         fn handle_event(&self, event: Arc<Event>) {
             if matches!(&*event, Event::GroupUpdate(_)) {
                 self.0
-                    .connection_generation
-                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    .advance_generation_for_test(1, std::sync::atomic::Ordering::AcqRel);
             }
         }
     }
@@ -939,9 +938,7 @@ async fn metadata_commit_finishes_cache_publication_after_retirement() {
         if shutdown_only {
             client.notify_connection_shutdown();
         } else {
-            client
-                .connection_generation
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            client.advance_generation_for_test(1, std::sync::atomic::Ordering::AcqRel);
         }
         release_tx.send(()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), task)

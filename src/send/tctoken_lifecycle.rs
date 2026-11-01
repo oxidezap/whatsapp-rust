@@ -269,7 +269,7 @@ impl Client {
     /// Uses session_locks to deduplicate concurrent spawns for the same sender.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.reissue_tc_token", level = "debug", skip_all, fields(sender = %sender.observe())))]
     pub(crate) async fn reissue_tc_token_after_identity_change(&self, sender: &Jid) {
-        use wacore::iq::tctoken::{IssuePrivacyTokensSpec, is_sender_tc_token_expired};
+        use wacore::iq::tctoken::{IssuePrivacyTokensSpec, is_sender_tc_token_expired_at};
 
         // Dedup via session_locks — bare JID won't collide with protocol addresses ("user:device")
         let bare = sender.to_non_ad_string();
@@ -292,7 +292,7 @@ impl Client {
 
         // Sender-side expiration (may use different bucket config than receiver)
         let tc_config = self.tc_token_config().await;
-        if is_sender_tc_token_expired(sender_ts, &tc_config) {
+        if is_sender_tc_token_expired_at(sender_ts, &tc_config, self.runtime.wall_time_secs()) {
             return;
         }
 

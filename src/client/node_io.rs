@@ -1390,12 +1390,8 @@ impl Client {
             "Successfully authenticated with WhatsApp servers! (gen={})",
             current_generation
         );
-        // The generation this connection will be admitted under is now final.
-        // Published here, after the increment, and not by `is_logged_in` above —
-        // that one is the duplicate-`<success>` guard and has to be set first,
-        // which leaves a window where the client looks authenticated on a
-        // generation that is about to change. Work binding a scope in that
-        // window had every attempt rejected as retired.
+        // The claim retires old workers. Admission follows scope publication
+        // and the reset of generation-bound props.
         if !self.admit_session_authentication(authentication) {
             debug!("Ignoring retired authentication completion");
             return;

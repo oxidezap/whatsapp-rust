@@ -1,6 +1,11 @@
-/// Ciphertext whose cache advance has not yet crossed its durability barrier.
+/// Prepared output waiting for its Signal state to cross the adapter's persistence barrier.
 ///
-/// ```compile_fail
+/// ```
+/// use wacore::session_engine::publication::PreparedSignal;
+/// let _prepared = PreparedSignal::new(vec![1, 2, 3]);
+/// ```
+///
+/// ```compile_fail,E0599
 /// use wacore::session_engine::publication::PreparedSignal;
 /// let pending = PreparedSignal::new(vec![1, 2, 3]);
 /// let bytes = pending.into_payload();
@@ -9,17 +14,21 @@
 #[repr(transparent)]
 pub struct PreparedSignal<T>(T);
 
+/// Output awaiting the host adapter's persistence completion.
 #[must_use]
 #[repr(transparent)]
 pub struct CommittingSignal<T>(T);
 
+/// Output confirmed by the host adapter under its storage contract.
 #[must_use]
 #[repr(transparent)]
 pub struct DurableSignal<T>(T);
 
-/// Evidence supplied by the owning persistence adapter, never by the transport.
+/// A trusted completion reported by the owning persistence adapter.
+/// This pure reducer does not perform or verify I/O. The SDK obtains this
+/// outcome only after its persistence gate succeeds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SignalDurability {
+pub enum SignalCommitOutcome {
     DurableLease,
     CommittedWrite,
 }
@@ -28,16 +37,13 @@ impl<T> PreparedSignal<T> {
     pub fn new(payload: T) -> Self {
         Self(payload)
     }
-    pub fn payload(&self) -> &T {
-        &self.0
-    }
     pub fn begin_commit(self) -> CommittingSignal<T> {
         CommittingSignal(self.0)
     }
 }
 
 impl<T> CommittingSignal<T> {
-    pub fn confirm(self, _: SignalDurability) -> DurableSignal<T> {
+    pub fn confirm(self, _: SignalCommitOutcome) -> DurableSignal<T> {
         DurableSignal(self.0)
     }
 }
@@ -64,7 +70,7 @@ mod tests {
         let allocation = bytes.as_ptr();
         let ready = PreparedSignal::new(bytes)
             .begin_commit()
-            .confirm(SignalDurability::CommittedWrite);
+            .confirm(SignalCommitOutcome::CommittedWrite);
         assert_eq!(ready.payload().as_ptr(), allocation);
         assert_eq!(ready.into_payload().len(), 1024);
     }

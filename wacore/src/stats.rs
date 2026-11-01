@@ -430,14 +430,22 @@ impl SessionStats {
     /// (`reconnect_errors`, `resends_throttled`,
     /// `messages_suppressed_duplicate`) are left zero for the owner to fill.
     pub fn snapshot(&self) -> StatsSnapshot {
-        self.snapshot_with_clock(crate::time::now_millis, Self::now)
+        self.snapshot_with_time(|| (crate::time::now_millis(), Self::now()))
     }
 
+    /// Sample wall and monotonic time together, from the same provider.
+    /// The source is read only when receive activity exists.
     pub fn snapshot_with_clock(
         &self,
-        wall: impl FnOnce() -> i64,
-        monotonic: impl FnOnce() -> Instant,
+        now: impl FnOnce() -> crate::time::ClockReading,
     ) -> StatsSnapshot {
+        self.snapshot_with_time(|| {
+            let now = now();
+            (now.wall_time_millis(), now.monotonic_time())
+        })
+    }
+
+    fn snapshot_with_time(&self, now: impl FnOnce() -> (i64, Instant)) -> StatsSnapshot {
         StatsSnapshot {
             bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
             bytes_received: self.bytes_received.load(Ordering::Relaxed),
@@ -465,8 +473,9 @@ impl SessionStats {
                 .last_data_received
                 .load()
                 .map(|at| {
-                    let now = wall().max(0) as u64;
-                    now.saturating_sub(monotonic().saturating_duration_since(at).as_millis() as u64)
+                    let (wall, monotonic) = now();
+                    (wall.max(0) as u64)
+                        .saturating_sub(monotonic.saturating_duration_since(at).as_millis() as u64)
                 })
                 .unwrap_or(0),
         }
@@ -1003,6 +1012,11 @@ impl InstrumentedRuntime {
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait::async_trait]
 impl Runtime for InstrumentedRuntime {
+    #[cfg(feature = "instance-clock")]
+    fn clock(&self) -> Option<&Arc<dyn crate::time::Clock>> {
+        self.inner.clock()
+    }
+
     // The re-box is structural: `spawn` takes and returns an erased future, so
     // wrapping it changes the type and needs a new allocation. It is the meter's
     // only per-spawn allocation.
@@ -1051,6 +1065,11 @@ impl Runtime for InstrumentedRuntime {
 #[cfg(target_arch = "wasm32")]
 #[async_trait::async_trait(?Send)]
 impl Runtime for InstrumentedRuntime {
+    #[cfg(feature = "instance-clock")]
+    fn clock(&self) -> Option<&Arc<dyn crate::time::Clock>> {
+        self.inner.clock()
+    }
+
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + 'static>>) -> AbortHandle {
         self.inner.spawn(Box::pin(MeteredFuture::new(
             future,
@@ -1091,6 +1110,31 @@ impl Runtime for InstrumentedRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_frame_batches_do_not_sample_the_clock() {
+        let stats = SessionStats::new();
+        stats.record_recv_batch_with(0, 0, || panic!("empty batch read the clock"));
+        stats.record_recv_batch_with(16, 1, || panic!("single frame read the clock"));
+        let reads = std::cell::Cell::new(0);
+        stats.record_recv_batch_with(32, 2, || {
+            reads.set(reads.get() + 1);
+            Instant::ZERO
+        });
+        assert_eq!(reads.get(), 1);
+    }
+
+    #[test]
+    fn snapshot_reads_one_clock_pair_only_after_activity() {
+        let stats = SessionStats::new();
+        stats.snapshot_with_clock(|| panic!("empty stats read the clock"));
+        stats.mark_recv_activity_at(Instant::ZERO);
+        let now = crate::time::ClockReading::new(1000, Instant::ZERO).unwrap();
+        assert_eq!(
+            stats.snapshot_with_clock(|| now).last_data_received_ms,
+            1000
+        );
+    }
 
     #[test]
     fn snapshot_reflects_recorded_traffic() {

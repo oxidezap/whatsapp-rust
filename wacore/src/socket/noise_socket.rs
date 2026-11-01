@@ -642,15 +642,15 @@ mod tests {
             SocketError::Cipher(NoiseError::CounterExhausted)
         ));
     }
-}
-
-#[cfg(all(test, target_pointer_width = "64", not(target_arch = "wasm32")))]
-#[test]
-fn sender_future_stays_within_baseline_budget() {
-    use std::mem::size_of;
-    fn bytes<F, A, B, C, D, E>(_: impl FnOnce(A, B, C, D, E) -> F) -> usize {
-        size_of::<F>()
+    #[cfg(all(target_pointer_width = "64", not(target_arch = "wasm32")))]
+    #[test]
+    fn sender_future_stays_within_baseline_budget() {
+        use std::mem::size_of;
+        fn bytes<F, A, B, C, D, E>(_: impl FnOnce(A, B, C, D, E) -> F) -> usize {
+            size_of::<F>()
+        }
+        let bytes = bytes(NoiseSocket::sender_task);
+        // Measured test-build baseline on x86_64 with nightly-2026-06-16.
+        assert!(bytes <= 736, "sender future grew to {bytes} bytes");
     }
-    let bytes = bytes(NoiseSocket::sender_task);
-    assert!(bytes <= 736, "sender future grew to {bytes} bytes");
 }

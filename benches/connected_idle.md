@@ -174,6 +174,11 @@ Peak requested heap and Linux RSS remain separate diagnostics. CPU and activity
 allocation comparisons run through the existing CodSpeed benchmarks. The native
 idle gate does not establish CPU equivalence or WhatsApp network behavior.
 
-For local comparisons, build and preserve both release executables first, then
-pass their paths and full source SHAs to `cargo xt ci session-retention --help`.
-The command does not build, switch checkouts, or change Cargo target directories.
+For local comparisons, build and preserve both release executables first.
+Run `cargo xt ci session-retention` with `--base-executable`, `--head-executable`,
+`--base-revision` and `--head-revision`. Use full source SHAs. The command does not
+build, switch checkouts, or change Cargo target directories.
+
+The comparison report records medians as byte-valued rational numbers with a
+numerator and denominator. This preserves exact half-byte medians for even
+repeat counts without rounding the regression decision through floating point.

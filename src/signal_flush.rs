@@ -315,7 +315,7 @@ mod tests {
         let covered = dirty_session(&client, "15550003001");
         assert_eq!(
             client.confirm_signal_state_pre_wire().await.unwrap(),
-            wacore::session_engine::publication::SignalDurability::DurableLease
+            wacore::session_engine::publication::SignalCommitOutcome::DurableLease
         );
         assert!(
             backend_session(&client, &covered).await.is_none(),
@@ -331,7 +331,7 @@ mod tests {
         assert!(client.signal_cache.try_put_session(&addr, record).is_ok());
         assert_eq!(
             client.confirm_signal_state_pre_wire().await.unwrap(),
-            wacore::session_engine::publication::SignalDurability::CommittedWrite
+            wacore::session_engine::publication::SignalCommitOutcome::CommittedWrite
         );
         assert!(
             backend_session(&client, &addr).await.is_some(),

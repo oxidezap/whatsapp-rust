@@ -1505,7 +1505,7 @@ impl Client {
     /// answer to decide whether to hand the leftovers to the background sync, and
     /// a pause is precisely when that work must survive: the sync parks until the
     /// client resumes rather than being dropped. The report stays honest either
-    /// way, since its `connected` flag is read from `is_ready`, which only the
+    /// way, since its `connected` flag is read from `session_ready_reached`, which only the
     /// publication sets.
     pub(crate) async fn finish_critical_bootstrap(
         self: &Arc<Self>,
@@ -4795,7 +4795,8 @@ impl Client {
         // Event provenance, never the logging mode: what the event claims
         // about `from_full_sync` must not change because the replay was
         // logged at TRACE volume.
-        let chat_outcome = crate::features::chat_actions::dispatch_chat_mutation_outcome(
+        let chat_outcome = crate::features::chat_actions::dispatch_chat_mutation_outcome_with_clock(
+            || self.runtime.wall_time_utc(),
             &self.core.event_bus,
             m,
             event_full_sync,
@@ -4806,7 +4807,8 @@ impl Client {
 
         // Labels have their own index shape. Sublist deletion is a Remove,
         // so this handler must also run before the Set-only gate.
-        let outcome = crate::features::labels::dispatch_label_mutation_outcome(
+        let outcome = crate::features::labels::dispatch_label_mutation_outcome_with_clock(
+            || self.runtime.wall_time_utc(),
             &self.core.event_bus,
             m,
             event_full_sync,
@@ -4850,7 +4852,8 @@ impl Client {
                 self.core.event_bus.dispatch(Event::StatusPrivacyUpdate(
                     wacore::types::events::StatusPrivacyUpdate::builder()
                         .timestamp(action_timestamp.unwrap_or_else(|| {
-                            wacore::time::from_millis_or_now(wacore::time::now_millis())
+                            wacore::time::from_millis(self.runtime.wall_time_millis())
+                                .unwrap_or_else(|| self.runtime.wall_time_utc())
                         }))
                         .maybe_action_timestamp(action_timestamp)
                         .action(Box::new(action))
@@ -4867,7 +4870,8 @@ impl Client {
         // A call's direction is its creator compared against this account; the
         // predicate is only consulted once the mutation is known to be a call
         // log, so the other mutation kinds do not pay for the snapshot.
-        let outcome = crate::features::call_log::dispatch_call_log_mutation_outcome(
+        let outcome = crate::features::call_log::dispatch_call_log_mutation_outcome_with_clock(
+            || self.runtime.wall_time_utc(),
             &self.core.event_bus,
             m,
             event_full_sync,
@@ -4879,15 +4883,18 @@ impl Client {
 
         // Quick replies and account-level syncd settings key on their own index
         // shapes (an opaque id, or no argument at all).
-        let outcome = crate::features::quick_replies::dispatch_quick_reply_mutation_outcome(
-            &self.core.event_bus,
-            m,
-            event_full_sync,
-        );
+        let outcome =
+            crate::features::quick_replies::dispatch_quick_reply_mutation_outcome_with_clock(
+                || self.runtime.wall_time_utc(),
+                &self.core.event_bus,
+                m,
+                event_full_sync,
+            );
         if outcome != AppStateDispatchOutcome::Unclaimed {
             return report("quick_replies", m, outcome, effect_detail);
         }
-        let outcome = crate::features::stickers::dispatch_sticker_mutation_outcome(
+        let outcome = crate::features::stickers::dispatch_sticker_mutation_outcome_with_clock(
+            || self.runtime.wall_time_utc(),
             &self.core.event_bus,
             m,
             event_full_sync,
@@ -4895,7 +4902,8 @@ impl Client {
         if outcome != AppStateDispatchOutcome::Unclaimed {
             return report("stickers", m, outcome, effect_detail);
         }
-        let outcome = crate::features::favorites::dispatch_favorites_mutation_outcome(
+        let outcome = crate::features::favorites::dispatch_favorites_mutation_outcome_with_clock(
+            || self.runtime.wall_time_utc(),
             &self.core.event_bus,
             m,
             event_full_sync,
@@ -4904,7 +4912,7 @@ impl Client {
             return report("favorites", m, outcome, effect_detail);
         }
         let outcome =
-            crate::features::app_state_settings::dispatch_app_state_setting_mutation_outcome(
+            crate::features::app_state_settings::dispatch_app_state_setting_mutation_outcome_with_clock(||self.runtime.wall_time_utc(),
                 &self.core.event_bus,
                 m,
                 event_full_sync,
@@ -9103,7 +9111,7 @@ mod critical_bootstrap_tests {
 
     /// A 429 or 503 clears `is_logged_in` inline and falls through without
     /// retiring the connection, so the generation check alone still admits it.
-    /// Announcing there would set `is_ready` on a session the client has already
+    /// Announcing there would set `session_ready_reached` on a session the client has already
     /// stopped treating as authenticated, and the reconnect that follows is what
     /// gets to announce. The gap is still reported and still retried, because
     /// the collections are no less owed for the socket having gone bad.

@@ -4,10 +4,21 @@ use std::time::Duration;
 
 /// Shared by runtime and storage adapters, including blocking storage workers.
 /// Wall time must stay in the range accepted by [`ClockReading::new`].
-/// Reads must not re-enter the owning client or storage adapter.
+/// Monotonic readings must not go backwards. Reads must not re-enter the
+/// owning client or storage adapter.
 pub trait Clock: Send + Sync + 'static {
     fn wall_time_millis(&self) -> i64;
     fn monotonic_time(&self) -> Instant;
+
+    /// Override for an independently driven monotonic clock. Otherwise the
+    /// clock must advance with the executor that supplies its timers.
+    #[cfg(feature = "instance-clock")]
+    fn sleep(
+        self: std::sync::Arc<Self>,
+        _duration: Duration,
+    ) -> Option<crate::runtime::BoxFuture<'static, ()>> {
+        None
+    }
 
     fn reading(&self) -> Result<ClockReading, ClockError> {
         ClockReading::new(self.wall_time_millis(), self.monotonic_time())
@@ -72,6 +83,8 @@ impl Clock for GlobalClock {
 
 pub struct VirtualClock {
     state: Mutex<VirtualTime>,
+    #[cfg(feature = "instance-clock")]
+    changed: event_listener::Event,
 }
 
 struct VirtualTime {
@@ -86,6 +99,8 @@ impl VirtualClock {
                 reading: ClockReading::new(wall_millis, monotonic)?,
                 fractional_nanos: 0,
             }),
+            #[cfg(feature = "instance-clock")]
+            changed: event_listener::Event::new(),
         })
     }
 
@@ -109,6 +124,11 @@ impl VirtualClock {
         let reading = ClockReading::new(wall, monotonic)?;
         state.reading = reading;
         state.fractional_nanos = (nanos % 1_000_000) as u32;
+        drop(state);
+        #[cfg(feature = "instance-clock")]
+        if !duration.is_zero() {
+            self.changed.notify(usize::MAX);
+        }
         Ok(reading)
     }
 
@@ -124,6 +144,26 @@ impl VirtualClock {
 }
 
 impl Clock for VirtualClock {
+    #[cfg(feature = "instance-clock")]
+    fn sleep(
+        self: std::sync::Arc<Self>,
+        duration: Duration,
+    ) -> Option<crate::runtime::BoxFuture<'static, ()>> {
+        let deadline = self.monotonic_time().checked_add(duration);
+        Some(Box::pin(async move {
+            let Some(deadline) = deadline else {
+                return std::future::pending().await;
+            };
+            loop {
+                let changed = self.changed.listen();
+                if self.monotonic_time() >= deadline {
+                    return;
+                }
+                changed.await;
+            }
+        }))
+    }
+
     fn wall_time_millis(&self) -> i64 {
         self.state
             .lock()

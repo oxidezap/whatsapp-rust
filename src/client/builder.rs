@@ -701,22 +701,11 @@ impl ClientBuilder {
                 .as_ref()
                 .cloned()
                 .ok_or(ClientBuilderError::MissingPersistenceManager)?;
-            #[cfg(feature = "instance-clock")]
-            {
-                let backend = persistence_manager.backend();
-                let aligned = match (runtime.clock(), backend.clock()) {
-                    (None, None) => true,
-                    (Some(runtime), Some(storage)) => Arc::ptr_eq(runtime, storage),
-                    _ => false,
-                };
-                if !aligned {
-                    return Err(ClientBuilderError::InstanceClockMismatch);
-                }
-                if let Some(clock) = runtime.clock() {
-                    clock
-                        .reading()
-                        .map_err(ClientBuilderError::InvalidInstanceClock)?;
-                }
+            validate_clock_alignment(&runtime, &persistence_manager)?;
+            if let Some(clock) = runtime.instance_clock() {
+                clock
+                    .reading()
+                    .map_err(ClientBuilderError::InvalidInstanceClock)?;
             }
             let transport_factory = self
                 .transport_factory
@@ -774,6 +763,8 @@ impl ClientBuilder {
             }
             None => runtime,
         };
+
+        validate_clock_alignment(&runtime, &persistence_manager)?;
 
         #[cfg(feature = "client-lifecycle")]
         let lifecycle_handler = self.lifecycle;
@@ -1036,6 +1027,26 @@ async fn probe_durability_backend_owned(
         return Err(ClientBuilderError::UnsupportedDurabilityBackend(
             "bounded pending-inbound CAS did not round-trip and clean up".to_string(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_clock_alignment(
+    runtime: &Arc<dyn Runtime>,
+    persistence: &PersistenceManager,
+) -> Result<(), ClientBuilderError> {
+    let runtime = runtime.instance_clock();
+    let storage = persistence.backend_ref().instance_clock();
+    if !cfg!(feature = "instance-clock") && (runtime.is_some() || storage.is_some()) {
+        return Err(ClientBuilderError::InstanceClockFeatureDisabled);
+    }
+    let aligned = match (runtime, storage) {
+        (None, None) => true,
+        (Some(runtime), Some(storage)) => Arc::ptr_eq(runtime, storage),
+        _ => false,
+    };
+    if !aligned {
+        return Err(ClientBuilderError::InstanceClockMismatch);
     }
     Ok(())
 }

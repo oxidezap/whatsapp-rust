@@ -3854,6 +3854,22 @@ fn client_size_pins_runtime_cache_config_saving() {
     expected += size_of::<std::sync::Mutex<HashSet<Jid>>>()
         - size_of::<Arc<std::sync::Mutex<HashSet<Jid>>>>();
 
+    // The lifecycle model replaces ten flags, its timer/counter and the old Arc.
+    // Keep the fixed base and total retained-memory budget independent of this inline move.
+    let legacy_status = size_of::<Arc<AtomicU8>>()
+        + 10 * size_of::<AtomicBool>()
+        + size_of::<AtomicU32>()
+        + size_of::<wacore::time::AtomicInstant>();
+    // Six of the legacy bytes occupied padding shared with neighboring fields.
+    let legacy_status = legacy_status / align_of::<SessionState>() * align_of::<SessionState>();
+    expected = expected
+        .checked_add_signed(size_of::<SessionState>() as isize - legacy_status as isize)
+        .unwrap();
+    #[cfg(feature = "instance-clock")]
+    {
+        expected += size_of::<Option<Arc<dyn wacore::time::Clock>>>();
+    }
+
     let retry_slot = size_of::<Option<Arc<dyn crate::RetryAdmission>>>();
     let decrypt_slot = size_of::<Option<Arc<dyn crate::DecryptFailureAdmission>>>();
     let handler_slot = size_of::<Option<HashMap<String, Arc<dyn EncHandler>>>>();

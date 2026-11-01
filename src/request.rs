@@ -770,8 +770,8 @@ impl Client {
         }
     }
 
-    /// Register `waiter` under `req_id`, send the request, and hand back the
-    /// guard that removes the registration when the caller is done waiting.
+    /// Register `waiter`, send the request and return the response-awaiting
+    /// exchange whose guard removes the registration when waiting ends.
     async fn register_and_send(
         &self,
         req_id: String,

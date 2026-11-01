@@ -172,14 +172,14 @@ impl Client {
     /// statement about what this send REQUIRES, not a promise it never flushes.
     pub(crate) async fn confirm_signal_state_pre_wire(
         &self,
-    ) -> Result<wacore::session_engine::publication::SignalDurability, anyhow::Error> {
-        use wacore::session_engine::publication::SignalDurability;
+    ) -> Result<wacore::session_engine::publication::SignalCommitOutcome, anyhow::Error> {
+        use wacore::session_engine::publication::SignalCommitOutcome;
         if self.signal_cache.needs_pre_wire_flush().await {
             self.flush_signal_cache_batch_safe().await?;
-            return Ok(SignalDurability::CommittedWrite);
+            return Ok(SignalCommitOutcome::CommittedWrite);
         }
         self.schedule_signal_flush(self.connection_generation.load(Ordering::Acquire));
-        Ok(SignalDurability::DurableLease)
+        Ok(SignalCommitOutcome::DurableLease)
     }
 
     /// [`flush_signal_cache_batch_safe`](Self::flush_signal_cache_batch_safe)

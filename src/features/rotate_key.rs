@@ -215,7 +215,7 @@ impl Client {
                         ))
                     })?;
                 let record =
-                    new_signed_pre_key_record(new_id, &kp, signature, wacore::time::now_utc());
+                    new_signed_pre_key_record(new_id, &kp, signature, self.runtime.wall_time_utc());
                 backend
                     .store_signed_prekey(
                         new_id,
@@ -235,7 +235,7 @@ impl Client {
             old_id,
             &snapshot.signed_pre_key,
             snapshot.signed_pre_key_signature,
-            wacore::time::now_utc(),
+            self.runtime.wall_time_utc(),
         );
         backend
             .store_signed_prekey(

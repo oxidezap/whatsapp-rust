@@ -32,6 +32,11 @@ type HistoryBlockingJob = Box<dyn FnOnce() + Send + 'static>;
 type HistoryBlockingJob = Box<dyn FnOnce() + 'static>;
 
 impl wacore::runtime::Runtime for HistoryDownloadRuntime {
+    #[cfg(feature = "instance-clock")]
+    fn clock(&self) -> Option<&Arc<dyn wacore::time::Clock>> {
+        self.inner.clock()
+    }
+
     fn spawn(
         &self,
         future: wacore::runtime::BoxFuture<'static, ()>,

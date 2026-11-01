@@ -30,7 +30,17 @@ use waproto::whatsapp as wa;
 /// Dispatch inbound label mutations synced from a linked device, returning the
 /// [`crate::client::AppStateDispatchOutcome`] for the semantic per-mutation
 /// log line.
+#[cfg(test)]
 pub(crate) fn dispatch_label_mutation_outcome(
+    event_bus: &wacore::types::events::CoreEventBus,
+    m: &mut Mutation,
+    event_full_sync: bool,
+) -> AppStateDispatchOutcome {
+    dispatch_label_mutation_outcome_with_clock(wacore::time::now_utc, event_bus, m, event_full_sync)
+}
+
+pub(crate) fn dispatch_label_mutation_outcome_with_clock(
+    now: impl FnOnce() -> chrono::DateTime<chrono::Utc>,
     event_bus: &wacore::types::events::CoreEventBus,
     m: &mut Mutation,
     event_full_sync: bool,
@@ -55,7 +65,7 @@ pub(crate) fn dispatch_label_mutation_outcome(
     // Preserve the legacy epoch fallback for absence and local dispatch time
     // for an unrepresentable value. Only `action_timestamp` preserves absence;
     // its presence does not distinguish replayed mutations from live changes.
-    let time = wacore::time::from_millis_or_now(ts.unwrap_or(0));
+    let time = wacore::time::from_millis(ts.unwrap_or(0)).unwrap_or_else(now);
 
     let Some(label_id) = m.index.get(1).cloned() else {
         log::warn!("Skipping label mutation '{kind}': missing label id in index");

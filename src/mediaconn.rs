@@ -56,7 +56,8 @@ impl std::fmt::Debug for MediaConn {
 
 impl MediaConn {
     /// Check if this connection info has expired.
-    /// Uses the earlier of route TTL and auth TTL (auth may expire before routes).
+    /// Uses the process clock and the earlier route/auth TTL.
+    /// For an instance-clock client, use [`Self::is_expired_at`] with its monotonic clock.
     pub fn is_expired(&self) -> bool {
         self.is_expired_at(Instant::now())
     }

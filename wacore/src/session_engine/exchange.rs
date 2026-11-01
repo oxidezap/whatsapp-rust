@@ -1,6 +1,12 @@
 /// A registered exchange cannot consume a response before its send completes.
 ///
-/// ```compile_fail
+/// ```
+/// use wacore::session_engine::exchange::RegisteredExchange;
+/// let reply = RegisteredExchange::new(()).begin_send().sent().response(42).into_response();
+/// assert_eq!(reply, 42);
+/// ```
+///
+/// ```compile_fail,E0599
 /// use wacore::session_engine::exchange::RegisteredExchange;
 /// let registered = RegisteredExchange::new(());
 /// registered.response(42);

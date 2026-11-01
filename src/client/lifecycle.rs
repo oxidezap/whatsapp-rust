@@ -136,6 +136,12 @@ pub enum ConflictKind {
     Unknown,
 }
 
+#[derive(Clone, Copy)]
+enum CleanupRequest {
+    Owner(Option<wacore::session_engine::lifecycle::TransportTicket>),
+    Orphaned,
+}
+
 struct ConnectionEnd {
     unexpected: Option<DisconnectReason>,
     terminal_reason: Option<ProtocolTerminalReason>,
@@ -380,13 +386,7 @@ impl Client {
     /// one way or the other. This is the condition `wait_for_session_ready` uses to
     /// resolve.
     fn is_fully_ready(&self) -> bool {
-        self.is_socket_connected()
-            && self.is_logged_in()
-            && self.session_ready_reached(Ordering::Relaxed)
-            // A pause publishes its flag before the read loop has cleared any
-            // of the three above, so without this the waiters hand a caller the
-            // very connection the application just asked to have closed.
-            && !self.is_paused()
+        self.session_state.ready()
     }
 
     /// Dispatch the Connected event and notify waiters for the originating connection.
@@ -889,7 +889,7 @@ impl Client {
                     return RunCompletionReason::Stopped;
                 }
             };
-        let _driver = scopeguard::guard(driver, |lease| self.release_driver(lease));
+        let _driver = scopeguard::guard(driver, |lease| self.cancel_driver(lease));
         if self.session_state.is_terminal() {
             self.stop_supervision_loop();
             return RunCompletionReason::AutoReconnectDisabled {
@@ -901,6 +901,11 @@ impl Client {
         if shutdown.is_fired() {
             self.stop_driver_state();
             return RunCompletionReason::ShutdownRequested;
+        }
+        if self.needs_orphan_cleanup() {
+            // Cancellation drops the reader's partial frame buffer. Retire its transport before redial.
+            let _ =
+                Box::pin(self.cleanup_connection_state_requested(CleanupRequest::Orphaned)).await;
         }
         // Count only at the attempt boundary, after admission: abandoned host
         // reservations are not reconnect attempts.
@@ -1165,6 +1170,7 @@ impl Client {
         #[cfg(feature = "client-lifecycle")]
         self.shutdown_lifecycle().await;
         client_log!(self, info, "Client run loop has shut down.");
+        self.release_driver(scopeguard::ScopeGuard::into_inner(_driver));
         if matches!(completion, RunCompletionReason::Stopped) && shutdown.is_fired() {
             RunCompletionReason::ShutdownRequested
         } else {
@@ -1328,6 +1334,7 @@ impl Client {
     /// single-connection [`Connection::read_until_disconnected`], so the two
     /// cannot drift on what a connection ending means.
     async fn drive_connection_with_outcome(self: &Arc<Self>) -> ConnectionEnd {
+        let owner = self.connection_owner();
         // Started here rather than at the end of connect: its ping goes through
         // `can_reach_server`, so a tick taken before anything reads is refused
         // as NotConnected, which the loop classifies as fatal and exits on,
@@ -1377,7 +1384,8 @@ impl Client {
             }
         };
 
-        self.cleanup_connection_state().await;
+        self.cleanup_connection_state_requested(CleanupRequest::Owner(owner))
+            .await;
 
         // Dispatch after cleanup so handlers see cleared connection state.
         if let Some(reason) = unexpected_disconnect.clone() {
@@ -1915,7 +1923,7 @@ impl Client {
         // "no connection" from an attempt that is a statement away from
         // publishing one. Everything in here is a flag or a slot read; the
         // flushes and the socket close are outside it.
-        let (had_connection, torn_down) = {
+        let (had_connection, torn_down, owner) = {
             let _publish = self.connection_publish.lock().await;
 
             // Before the teardown, so the run loop cannot reach its
@@ -1947,7 +1955,7 @@ impl Client {
             // replacement into this slot — a lookup made afterwards would close
             // the connection the resume just asked for.
             let torn_down = self.transport.lock().await.clone();
-            (had_connection, torn_down)
+            (had_connection, torn_down, self.connection_owner())
         };
         // Two audiences: `session_state_notifier` for work parked in
         // `await_connection`, which must re-read a reachability that this call
@@ -2009,7 +2017,8 @@ impl Client {
             && !self.driver_running(Ordering::Relaxed)
             && self.still_owns_connection(torn_down.as_ref()).await
         {
-            self.cleanup_connection_state().await;
+            self.cleanup_connection_state_requested(CleanupRequest::Owner(owner))
+                .await;
         }
     }
 
@@ -2082,72 +2091,85 @@ impl Client {
         }
     }
 
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(name = "wa.conn.cleanup", level = "debug", skip_all, fields(lid = tracing::field::Empty, pn = tracing::field::Empty))
-    )]
-    #[cfg(not(feature = "client-lifecycle"))]
     pub(crate) async fn cleanup_connection_state(self: &Arc<Self>) -> DrainOutcome {
-        #[cfg(feature = "tracing")]
-        self.record_identity_on_current_span("wa.conn.cleanup", module_path!());
-        // Keep cold teardown layout out of downstream operation futures.
-        let outcome = Box::pin(self.cleanup_connection_state_inner()).await;
-        self.clear_connection_scoped_pair_code().await;
-        outcome
+        self.cleanup_connection_state_requested(CleanupRequest::Owner(self.connection_owner()))
+            .await
     }
 
-    /// A pair-code flow belongs to the connection that carried it: the pairing
-    /// ref and any in-flight `companion_hello` die with the socket, and the
-    /// server routes no `primary_hello` to a session it has dropped. Left
-    /// standing, the outstanding-code guard would reject the very request that
-    /// reconnecting exists to make.
-    ///
-    /// Runs after the inner teardown, so the generation is already retired and
-    /// the transport already closed: a request that claims the slot from here
-    /// on is one the next connection will carry.
-    async fn clear_connection_scoped_pair_code(self: &Arc<Self>) {
+    #[cfg(not(feature = "client-lifecycle"))]
+    fn cleanup_connection_state_requested(
+        self: &Arc<Self>,
+        request: CleanupRequest,
+    ) -> wacore::runtime::BoxFuture<'_, DrainOutcome> {
+        Box::pin(self.run_connection_cleanup(request))
+    }
+
+    /// A pairing ref belongs to the connection that carried it.
+    async fn clear_connection_scoped_pair_code(&self) {
         *self.pair_code_state.lock().await = wacore::pair_code::PairCodeState::Idle;
     }
 
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(name = "wa.conn.cleanup", level = "debug", skip_all, fields(lid = tracing::field::Empty, pn = tracing::field::Empty))
-    )]
     #[cfg(feature = "client-lifecycle")]
-    pub(crate) async fn cleanup_connection_state(self: &Arc<Self>) -> DrainOutcome {
-        #[cfg(feature = "tracing")]
-        self.record_identity_on_current_span("wa.conn.cleanup", module_path!());
+    fn cleanup_connection_state_requested(
+        self: &Arc<Self>,
+        request: CleanupRequest,
+    ) -> impl Future<Output = DrainOutcome> + '_ {
+        use futures::future::Either;
         if self.lifecycle.is_none() {
-            // Keep cold teardown layout out of downstream operation futures.
-            let outcome = Box::pin(self.cleanup_connection_state_inner()).await;
-            self.clear_connection_scoped_pair_code().await;
-            return outcome;
+            return Either::Left(Box::pin(self.run_connection_cleanup(request))
+                as wacore::runtime::BoxFuture<'_, DrainOutcome>);
         }
-
-        // Scope closure must survive a caller dropping its cleanup waiter.
         let (completed, completion) = futures::channel::oneshot::channel();
         let client = Arc::clone(self);
         self.runtime
             .spawn(Box::pin(async move {
-                let result = std::panic::AssertUnwindSafe(client.cleanup_connection_state_inner())
+                let result = std::panic::AssertUnwindSafe(client.run_connection_cleanup(request))
                     .catch_unwind()
                     .await;
                 let _ = completed.send(result);
             }))
             .detach();
-        let outcome = match completion.await {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(panic)) => std::panic::resume_unwind(panic),
-            Err(_) => {
-                client_log!(
-                    self,
-                    error,
-                    "Detached connection cleanup stopped before completion"
-                );
-                DrainOutcome::Unobserved
+        Either::Right(async move {
+            match completion.await {
+                Ok(Ok(outcome)) => outcome,
+                Ok(Err(panic)) => std::panic::resume_unwind(panic),
+                Err(_) => {
+                    client_log!(
+                        self,
+                        error,
+                        "Detached connection cleanup stopped before completion"
+                    );
+                    DrainOutcome::Unobserved
+                }
+            }
+        })
+    }
+
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.conn.cleanup", level = "debug", skip_all, fields(lid = tracing::field::Empty, pn = tracing::field::Empty)))]
+    async fn run_connection_cleanup(&self, request: CleanupRequest) -> DrainOutcome {
+        #[cfg(feature = "tracing")]
+        self.record_identity_on_current_span("wa.conn.cleanup", module_path!());
+        let _serial = self.session_state.cleanup_serial.lock().await;
+        let owner = match request {
+            CleanupRequest::Owner(owner) => owner,
+            CleanupRequest::Orphaned => {
+                if !self.needs_orphan_cleanup() {
+                    return DrainOutcome::Completed;
+                }
+                self.connection_owner()
             }
         };
+        let ticket = match self.begin_connection_cleanup(owner) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                debug!("Connection cleanup no longer owns its target: {error}");
+                return DrainOutcome::Unobserved;
+            }
+        };
+        let _cancelled = scopeguard::guard(ticket, |ticket| self.cancel_connection_cleanup(ticket));
+        let outcome = self.cleanup_connection_state_inner().await;
         self.clear_connection_scoped_pair_code().await;
+        self.complete_connection_cleanup(scopeguard::ScopeGuard::into_inner(_cancelled));
         outcome
     }
 
@@ -2492,24 +2514,10 @@ impl Client {
     /// one step before the increment, and a caller that binds a scope in between
     /// binds a generation the next instruction retires.
     pub(crate) fn can_reach_server(&self) -> bool {
-        self.is_socket_connected()
-            && self.is_logged_in()
+        self.session_state.reachable()
             && self.authenticated_generation.load(Ordering::SeqCst)
                 == self.connection_generation.load(Ordering::SeqCst)
-            && self.driver_running(Ordering::Relaxed)
-            // A socket already marked for retirement will answer, and then the
-            // answer will be thrown away. `reconnect_immediately` sets this
-            // before its bounded flushes and closes the transport only after,
-            // so the window is wide enough to admit a whole sync that the
-            // replacement generation then retires — attempt charged, work lost.
-            && !self.expected_session_disconnect(Ordering::Relaxed)
-            // Same reasoning as the line above, for the other requested
-            // teardown: `pause()` publishes the flag and only then flushes and
-            // closes, so the socket answers for the whole of that window and
-            // the answer is thrown away with the connection. Asked here rather
-            // than at each waiter, so a send, an IQ and a retry all get the
-            // same verdict.
-            && !self.is_paused()
+            && self.session_state.reachable()
     }
 
     /// What the client's connection state means for work handed to it now.
@@ -2742,12 +2750,11 @@ impl Connection<'_> {
     /// expects another connection. No reconnect happens here either way, so a
     /// caller that wants one connects again.
     ///
-    /// Dropping this future stops the read without tearing the connection
-    /// down, exactly as dropping [`Client::run`] does: the socket stays open
-    /// and the client keeps reporting itself connected, so the next
-    /// [`Client::connect`] is refused until [`Client::shutdown`] releases
-    /// it. Only the reader flag is given back, so a later `run` is not refused
-    /// as already running.
+    /// Dropping this future releases the reader claim and leaves the socket
+    /// for cleanup. [`Client::run`] retires that unread connection before
+    /// dialing again, since the cancelled reader lost its partial frame buffer.
+    /// Direct callers can use [`Client::pause`] or [`Client::shutdown`] to
+    /// release it before another [`Client::connect`].
     pub async fn read_until_disconnected(self) -> Option<DisconnectReason> {
         self.read_until_disconnected_with_outcome().await.unexpected
     }
@@ -2764,11 +2771,13 @@ impl Connection<'_> {
         // Guarded, not a store after the await: a caller that drops this future
         // (a wrapping timeout, an aborted task) stops reading too, and a flag
         // left standing would advertise a reader that no longer exists.
-        let reader = match this
+        let release_reader = match this
             .client
             .claim_driver(wacore::session_engine::lifecycle::DriveKind::DirectReader)
         {
-            Ok(lease) => Some(lease),
+            Ok(lease) => Some(scopeguard::guard(lease, |lease| {
+                this.client.cancel_driver(lease)
+            })),
             Err(wacore::session_engine::lifecycle::LifecycleError::AlreadyDriving) => None,
             Err(error) => {
                 log::warn!("Direct reader claim failed: {error}");
@@ -2778,9 +2787,12 @@ impl Connection<'_> {
                 };
             }
         };
-        let _release_reader =
-            reader.map(|lease| scopeguard::guard(lease, |lease| this.client.release_driver(lease)));
-        this.client.drive_connection_with_outcome().await
+        let end = this.client.drive_connection_with_outcome().await;
+        if let Some(guard) = release_reader {
+            this.client
+                .release_driver(scopeguard::ScopeGuard::into_inner(guard));
+        }
+        end
     }
 }
 
@@ -3657,6 +3669,43 @@ mod tests {
             }))
             .await;
         (client, entered_rx, release_tx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_live_reader_can_start_a_new_supervisor() {
+        let (client, entered, _release) = client_parked_in_connect().await;
+        let transport = Arc::new(crate::transport::mock::StallingMockTransport::new());
+        let _socket = publish_transport_for_test(&client, transport).await;
+        let (_events, receiver) = async_channel::bounded(1);
+        *client.transport_events.lock().await = Some(receiver);
+        let reader = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.connection_for_test().read_until_disconnected().await }
+        });
+        loop {
+            if client.driver_running(Ordering::Acquire)
+                && client.transport_events.lock().await.is_none()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        reader.abort();
+        assert!(reader.await.unwrap_err().is_cancelled());
+        assert!(!client.driver_running(Ordering::Acquire));
+        assert!(client.is_socket_connected());
+
+        let run = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.run().await }
+        });
+        let redial = tokio::time::timeout(Duration::from_secs(5), entered.recv()).await;
+        run.abort();
+        let _ = run.await;
+        assert!(
+            redial.is_ok(),
+            "a restarted supervisor must retire the unread connection and reach the next dial"
+        );
     }
 
     #[tokio::test]

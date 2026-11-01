@@ -160,6 +160,10 @@ impl PersistenceManager {
             .clone()
     }
 
+    pub(crate) fn backend_ref(&self) -> &dyn Backend {
+        &*self.backend
+    }
+
     /// A host-owned handle to the original backend allocation. Such raw handles
     /// are outside [`StoreRelease`]'s crate-ownership boundary.
     pub fn backend(&self) -> Arc<dyn Backend> {
@@ -402,10 +406,9 @@ impl PersistenceManager {
         command: DeviceCommand,
         runtime: &Arc<dyn Runtime>,
     ) {
-        self.modify_device(|device| {
-            apply_command_to_device_at(device, command, runtime.wall_time_millis())
-        })
-        .await;
+        let now = runtime.wall_time_millis();
+        self.modify_device(|device| apply_command_to_device_at(device, command, now))
+            .await;
     }
 
     pub(crate) async fn persist_status_privacy(

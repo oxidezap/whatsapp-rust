@@ -3171,18 +3171,14 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let (second_entered, second_release) = failure_socket(&client);
-            client
-                .connection_generation
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            client.advance_generation_for_test(1, std::sync::atomic::Ordering::AcqRel);
             authenticate_recovery_fixture(&client);
             first_release.send(()).await.unwrap();
             tokio::time::timeout(std::time::Duration::from_secs(5), second_entered.recv())
                 .await
                 .unwrap()
                 .unwrap();
-            client
-                .connection_generation
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            client.advance_generation_for_test(1, std::sync::atomic::Ordering::AcqRel);
             authenticate_recovery_fixture(&client);
             second_release.send(()).await.unwrap();
             assert!(

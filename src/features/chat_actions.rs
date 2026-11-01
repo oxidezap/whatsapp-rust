@@ -147,7 +147,17 @@ const CHAT_ACTION_KINDS: &[&str] = &[
 /// `event_full_sync` is public event provenance (lands on
 /// `*.from_full_sync`); it is never a logging level (see
 /// `dispatch_app_state_mutation_inner`).
+#[cfg(test)]
 pub(crate) fn dispatch_chat_mutation_outcome(
+    event_bus: &wacore::types::events::CoreEventBus,
+    m: &mut Mutation,
+    event_full_sync: bool,
+) -> AppStateDispatchOutcome {
+    dispatch_chat_mutation_outcome_with_clock(wacore::time::now_utc, event_bus, m, event_full_sync)
+}
+
+pub(crate) fn dispatch_chat_mutation_outcome_with_clock(
+    now: impl FnOnce() -> chrono::DateTime<chrono::Utc>,
     event_bus: &wacore::types::events::CoreEventBus,
     m: &mut Mutation,
     event_full_sync: bool,
@@ -183,7 +193,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
     // consumers see no change. Neither is an instant the server sent, which
     // is why a consumer that must tell a replay from a live change reads
     // `action_timestamp` instead (#1551).
-    let time = wacore::time::from_millis_or_now(ts.unwrap_or(0));
+    let time = wacore::time::from_millis(ts.unwrap_or(0)).unwrap_or_else(now);
     let jid: Jid = if m.index.len() > 1 {
         match m.index[1].parse() {
             Ok(j) => j,

@@ -44,6 +44,14 @@ impl Client {
     }
 
     pub(super) fn release_driver(&self, lease: wacore::session_engine::lifecycle::DriveLease) {
+        self.finish_driver(lease, false);
+    }
+
+    pub(super) fn cancel_driver(&self, lease: wacore::session_engine::lifecycle::DriveLease) {
+        self.finish_driver(lease, true);
+    }
+
+    fn finish_driver(&self, lease: wacore::session_engine::lifecycle::DriveLease, cancelled: bool) {
         let released = {
             let mut state = self
                 .session_state
@@ -54,7 +62,12 @@ impl Client {
                 state.snapshot().drive(),
                 wacore::session_engine::lifecycle::DriveState::DirectReader(_)
             );
-            if state.release_drive(lease) {
+            let released = if cancelled {
+                state.cancel_drive(lease)
+            } else {
+                state.release_drive(lease)
+            };
+            if released {
                 if direct {
                     state.consume_pause_exit_pending();
                 }
@@ -67,6 +80,47 @@ impl Client {
         if released {
             self.notify_session_state();
         }
+    }
+
+    pub(super) fn needs_orphan_cleanup(&self) -> bool {
+        self.session_state.status.load(Ordering::Acquire) & SessionState::ORPHANED != 0
+    }
+
+    pub(super) fn connection_owner(
+        &self,
+    ) -> Option<wacore::session_engine::lifecycle::TransportTicket> {
+        self.session_state
+            .lifecycle_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .connection_owner()
+    }
+
+    pub(super) fn begin_connection_cleanup(
+        &self,
+        owner: Option<wacore::session_engine::lifecycle::TransportTicket>,
+    ) -> Result<
+        wacore::session_engine::lifecycle::CleanupTicket,
+        wacore::session_engine::lifecycle::LifecycleError,
+    > {
+        self.session_state
+            .transition(Ordering::SeqCst, |state| state.begin_cleanup(owner))
+    }
+
+    pub(super) fn cancel_connection_cleanup(
+        &self,
+        ticket: wacore::session_engine::lifecycle::CleanupTicket,
+    ) {
+        self.session_state
+            .transition(Ordering::SeqCst, |state| state.cancel_cleanup(ticket));
+    }
+
+    pub(super) fn complete_connection_cleanup(
+        &self,
+        ticket: wacore::session_engine::lifecycle::CleanupTicket,
+    ) {
+        self.session_state
+            .transition(Ordering::SeqCst, |state| state.complete_cleanup(ticket));
     }
 
     pub(super) fn stop_driver_state(&self) {

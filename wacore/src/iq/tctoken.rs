@@ -106,10 +106,18 @@ pub fn is_tc_token_expired_with_at(token_timestamp: i64, config: &TcTokenConfig,
 
 /// Check if a sender-side timestamp has expired using sender-specific timing.
 pub fn is_sender_tc_token_expired(sender_timestamp: i64, config: &TcTokenConfig) -> bool {
+    is_sender_tc_token_expired_at(sender_timestamp, config, unix_now())
+}
+
+pub fn is_sender_tc_token_expired_at(
+    sender_timestamp: i64,
+    config: &TcTokenConfig,
+    now: i64,
+) -> bool {
     let cfg = config.clamped();
     is_tc_token_expired_at(
         sender_timestamp,
-        unix_now(),
+        now,
         cfg.sender_bucket_duration,
         cfg.sender_num_buckets,
     )

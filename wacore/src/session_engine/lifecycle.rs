@@ -51,6 +51,12 @@ impl AuthenticationTicket {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CleanupTicket {
+    operation: NonZeroU64,
+    owner: Option<TransportTicket>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DriveLease(NonZeroU64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +142,12 @@ pub enum NextConnection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingBackoff {
+    serial: NonZeroU64,
+    attempt: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackoffRequest {
     serial: NonZeroU64,
     base_millis: u64,
@@ -164,6 +176,10 @@ pub enum LifecycleError {
     AlreadyConnecting,
     #[error("transport is already established")]
     AlreadyConnected,
+    #[error("cancelled reader requires connection cleanup")]
+    CleanupRequired,
+    #[error("connection cleanup is already in progress")]
+    AlreadyCleaning,
     #[error("completion belongs to a retired operation")]
     StaleCompletion,
     #[error("transition is invalid in the current phase")]
@@ -189,6 +205,7 @@ pub struct LifecycleSnapshot {
     backoff_attempt: u32,
     penalty: bool,
     ready_reached: bool,
+    orphaned: bool,
 }
 
 impl LifecycleSnapshot {
@@ -231,6 +248,10 @@ impl LifecycleSnapshot {
     pub fn penalty_pending(self) -> bool {
         self.penalty
     }
+    pub fn needs_cleanup(self) -> bool {
+        self.orphaned
+    }
+
     pub fn driving(self) -> bool {
         !matches!(self.drive, DriveState::Idle)
     }
@@ -256,7 +277,8 @@ impl LifecycleSnapshot {
         matches!(self.desired, DesiredConnection::Shutdown { .. })
     }
     pub fn can_reach_server(self) -> bool {
-        self.connected()
+        !self.orphaned
+            && self.connected()
             && self.driving()
             && !self.paused()
             && !self.shut_down()
@@ -275,7 +297,8 @@ pub struct Lifecycle {
     attempt: Option<AttemptTicket>,
     transport: Option<TransportTicket>,
     connected_at: Option<Instant>,
-    backoff: Option<BackoffRequest>,
+    backoff: Option<PendingBackoff>,
+    cleanup: Option<NonZeroU64>,
 }
 
 impl Default for Lifecycle {
@@ -301,12 +324,14 @@ impl Lifecycle {
                 backoff_attempt: 0,
                 penalty: false,
                 ready_reached: false,
+                orphaned: false,
             },
             next_operation: 0,
             attempt: None,
             transport: None,
             connected_at: None,
             backoff: None,
+            cleanup: None,
         }
     }
 
@@ -331,7 +356,14 @@ impl Lifecycle {
         if self.snapshot.driving() {
             return Err(LifecycleError::AlreadyDriving);
         }
+        if kind == DriveKind::DirectReader && self.snapshot.orphaned {
+            return Err(LifecycleError::CleanupRequired);
+        }
         let lease = DriveLease(self.operation()?);
+        if kind == DriveKind::Supervisor && self.snapshot.connected() {
+            self.snapshot.orphaned = true;
+            self.expect_disconnect();
+        }
         self.snapshot.drive = match kind {
             DriveKind::Supervisor => DriveState::Supervisor {
                 lease,
@@ -354,6 +386,69 @@ impl Lifecycle {
         owns
     }
 
+    pub fn cancel_drive(&mut self, lease: DriveLease) -> bool {
+        let needs_cleanup = self.snapshot.connected()
+            || matches!(
+                self.snapshot.drive,
+                DriveState::DirectReader(_)
+                    | DriveState::Supervisor {
+                        phase: SupervisorPhase::Reading,
+                        ..
+                    }
+            );
+        if !self.release_drive(lease) {
+            return false;
+        }
+        if needs_cleanup {
+            self.snapshot.orphaned = true;
+            self.expect_disconnect();
+        }
+        true
+    }
+
+    pub fn connection_owner(&self) -> Option<TransportTicket> {
+        self.transport
+            .or_else(|| self.attempt.map(AttemptTicket::transport))
+    }
+
+    pub fn begin_cleanup(
+        &mut self,
+        owner: Option<TransportTicket>,
+    ) -> Result<CleanupTicket, LifecycleError> {
+        if self.cleanup.is_some() {
+            return Err(LifecycleError::AlreadyCleaning);
+        }
+        if self.connection_owner() != owner {
+            return Err(LifecycleError::StaleCompletion);
+        }
+        let operation = self.operation()?;
+        self.cleanup = Some(operation);
+        Ok(CleanupTicket { operation, owner })
+    }
+
+    pub fn complete_cleanup(&mut self, ticket: CleanupTicket) -> bool {
+        if self.cleanup != Some(ticket.operation) {
+            return false;
+        }
+        self.cleanup = None;
+        if self.connection_owner().is_none() {
+            self.snapshot.orphaned = false;
+        }
+        true
+    }
+
+    pub fn cancel_cleanup(&mut self, ticket: CleanupTicket) -> bool {
+        if self.cleanup != Some(ticket.operation) {
+            return false;
+        }
+        self.cleanup = None;
+        if self.connection_owner().is_none() || self.connection_owner() == ticket.owner {
+            self.snapshot.orphaned = true;
+            self.expect_disconnect();
+        }
+        true
+    }
+
     fn connect_refusal(&self) -> Result<(), LifecycleError> {
         if self.snapshot.shut_down() || self.snapshot.policy == ReconnectPolicy::Forbidden {
             return Err(LifecycleError::Shutdown);
@@ -366,6 +461,9 @@ impl Lifecycle {
 
     pub fn begin_attempt(&mut self) -> Result<AttemptTicket, LifecycleError> {
         self.connect_refusal()?;
+        if self.snapshot.orphaned {
+            return Err(LifecycleError::CleanupRequired);
+        }
         if self.attempt.is_some() {
             return Err(LifecycleError::AlreadyConnecting);
         }
@@ -377,6 +475,7 @@ impl Lifecycle {
             pause_generation: self.snapshot.pause_generation,
         };
         self.attempt = Some(ticket);
+        self.backoff = None;
         self.snapshot.attempt_active = true;
         self.snapshot.transport = TransportPhase::Opening;
         self.snapshot.authentication = AuthenticationPhase::LoggedOut;
@@ -558,6 +657,7 @@ impl Lifecycle {
         self.transport = None;
         self.snapshot.transport = TransportPhase::Absent;
         self.snapshot.authentication = AuthenticationPhase::LoggedOut;
+        self.snapshot.ready_reached = false;
     }
 
     pub fn transport_lost(&mut self, ticket: TransportTicket) -> bool {
@@ -567,6 +667,7 @@ impl Lifecycle {
         self.transport = None;
         self.snapshot.transport = TransportPhase::Absent;
         self.snapshot.authentication = AuthenticationPhase::LoggedOut;
+        self.snapshot.ready_reached = false;
         true
     }
 
@@ -581,6 +682,7 @@ impl Lifecycle {
             .ok_or(LifecycleError::GenerationExhausted)?;
         self.snapshot.pause_generation = generation;
         self.snapshot.desired = DesiredConnection::Paused;
+        self.backoff = None;
         self.snapshot.pause_exit_pending = true;
         if self.snapshot.connected() {
             self.request_intentional_disconnect();
@@ -669,6 +771,7 @@ impl Lifecycle {
     pub const MANUAL_RECONNECT_ATTEMPT: u32 = 4;
 
     pub fn request_reconnect(&mut self, immediate: bool) {
+        self.backoff = None;
         if immediate {
             self.expect_disconnect();
         } else {
@@ -682,6 +785,7 @@ impl Lifecycle {
     }
 
     pub fn apply_backoff_penalty(&mut self, steps: u32) {
+        self.backoff = None;
         self.snapshot.backoff_attempt = self.snapshot.backoff_attempt.saturating_add(steps);
         self.snapshot.penalty = true;
     }
@@ -732,13 +836,6 @@ impl Lifecycle {
         if self.snapshot.policy != ReconnectPolicy::Enabled {
             return Ok(NextConnection::Stop(StopReason::ReconnectDisabled));
         }
-        if matches!(
-            self.snapshot.intent,
-            DisconnectIntent::Expected | DisconnectIntent::ExpectedAndIntentional
-        ) {
-            self.reset_backoff();
-            return Ok(NextConnection::Connect);
-        }
         if self.snapshot.pause_exit_pending || self.snapshot.paused() {
             self.snapshot.pause_exit_pending = false;
             self.reset_backoff();
@@ -754,19 +851,34 @@ impl Lifecycle {
                 NextConnection::Connect
             });
         }
+        if matches!(
+            self.snapshot.intent,
+            DisconnectIntent::Expected | DisconnectIntent::ExpectedAndIntentional
+        ) {
+            self.reset_backoff();
+            return Ok(NextConnection::Connect);
+        }
+        if let Some(pending) = self.backoff {
+            return Ok(NextConnection::SampleBackoff(self.backoff_request(pending)));
+        }
+        let serial = self.operation()?;
         if should_reset_backoff(self.connected_at.take(), now, self.snapshot.penalty) {
             self.snapshot.backoff_attempt = 0;
         }
         let attempt = self.snapshot.backoff_attempt;
         self.snapshot.backoff_attempt = next_backoff_attempt(attempt);
-        let request = BackoffRequest {
-            serial: self.operation()?,
-            base_millis: fibonacci_base_millis(attempt),
-            attempt,
+        let pending = PendingBackoff { serial, attempt };
+        self.backoff = Some(pending);
+        Ok(NextConnection::SampleBackoff(self.backoff_request(pending)))
+    }
+
+    fn backoff_request(&self, pending: PendingBackoff) -> BackoffRequest {
+        BackoffRequest {
+            serial: pending.serial,
+            attempt: pending.attempt,
+            base_millis: fibonacci_base_millis(pending.attempt),
             pause_generation: self.snapshot.pause_generation,
-        };
-        self.backoff = Some(request);
-        Ok(NextConnection::SampleBackoff(request))
+        }
     }
 
     pub fn sample_backoff(
@@ -775,7 +887,11 @@ impl Lifecycle {
         sample: u64,
     ) -> Result<Duration, LifecycleError> {
         self.connect_refusal()?;
-        if self.backoff != Some(request)
+        if self.backoff
+            != Some(PendingBackoff {
+                serial: request.serial,
+                attempt: request.attempt,
+            })
             || self.snapshot.pause_generation != request.pause_generation
         {
             return Err(LifecycleError::StaleCompletion);
@@ -901,6 +1017,97 @@ mod tests {
             state.sample_backoff(request, 0),
             Err(LifecycleError::StaleCompletion)
         );
+    }
+
+    #[test]
+    fn cancelled_reader_requires_matching_cleanup_before_redial() {
+        let (mut state, transport, _) = connected();
+        let DriveState::Supervisor { lease, .. } = state.snapshot().drive() else {
+            panic!("supervisor")
+        };
+        assert!(state.cancel_drive(lease));
+        assert!(state.snapshot().needs_cleanup());
+        assert!(!state.snapshot().can_reach_server());
+        assert_eq!(state.begin_attempt(), Err(LifecycleError::CleanupRequired));
+        let cleanup = state.begin_cleanup(Some(transport)).unwrap();
+        assert!(state.transport_lost(transport));
+        assert!(state.complete_cleanup(cleanup));
+        assert!(!state.snapshot().needs_cleanup());
+        assert!(state.begin_attempt().is_ok());
+    }
+
+    #[test]
+    fn cancelled_cleanup_can_be_retried_and_old_completion_cannot_release_it() {
+        let (mut state, transport, _) = connected();
+        let old = state.begin_cleanup(Some(transport)).unwrap();
+        assert!(state.cancel_cleanup(old));
+        let current = state.begin_cleanup(Some(transport)).unwrap();
+        assert!(!state.complete_cleanup(old));
+        assert!(state.transport_lost(transport));
+        assert!(state.complete_cleanup(current));
+        assert!(!state.snapshot().needs_cleanup());
+    }
+
+    #[test]
+    fn stale_cleanup_cannot_claim_a_replacement_transport() {
+        let (mut state, old, _) = connected();
+        assert!(state.transport_lost(old));
+        let attempt = state.begin_attempt().unwrap();
+        state.handshake_ready(attempt).unwrap();
+        state.finish_attempt(attempt);
+        assert_eq!(
+            state.begin_cleanup(Some(old)),
+            Err(LifecycleError::StaleCompletion)
+        );
+        assert!(state.snapshot().connected());
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn lifecycle_keeps_its_native_storage_budget() {
+        assert!(
+            size_of::<Lifecycle>() <= 160,
+            "lifecycle grew to {} bytes",
+            size_of::<Lifecycle>()
+        );
+    }
+
+    #[test]
+    fn pause_takes_priority_over_an_expected_reconnect() {
+        let (mut state, transport, _) = connected();
+        state.request_reconnect(true);
+        state.pause().unwrap();
+        state.transport_lost(transport);
+        assert_eq!(
+            state.next_connection(Instant::ZERO),
+            Ok(NextConnection::Park)
+        );
+    }
+
+    #[test]
+    fn transport_teardown_clears_readiness() {
+        let (mut state, transport, auth) = connected();
+        assert!(state.ready(auth));
+        assert!(state.transport_lost(transport));
+        assert!(!state.snapshot().ready());
+        let (mut state, _, auth) = connected();
+        assert!(state.ready(auth));
+        state.retire_transport();
+        assert!(!state.snapshot().ready());
+    }
+
+    #[test]
+    fn exhausted_backoff_identity_does_not_consume_the_stability_anchor() {
+        let (mut state, transport, _) = connected();
+        state.transport_lost(transport);
+        state.next_operation = u64::MAX;
+        let before = state.snapshot();
+        assert_eq!(
+            state.next_connection(Instant::ZERO + Duration::from_secs(31)),
+            Err(LifecycleError::GenerationExhausted)
+        );
+        assert_eq!(state.snapshot(), before);
+        assert_eq!(state.connected_at, Some(Instant::ZERO));
     }
 
     #[test]

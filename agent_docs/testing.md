@@ -92,3 +92,20 @@ Provenance lives beside `wacore/src/voip/mlow/testdata` and the capture locks.
 
 For binary debugging, use the parser and examples in `wacore/binary`. Use fictitious identities
 in fixtures and retain hashes when deriving vectors from captured artifacts.
+
+## Session replay and connected retention
+
+Exercise lifecycle races through the core simulator with explicit events,
+clock advancement and persistence completions. Exercise SDK clock wiring at
+its receive, upload and cache entry points as well. The boundary guards reject
+I/O in the extracted kernels and direct ambient SDK clock reads outside the
+legacy and native adapter boundaries.
+
+`cargo xt ci session-retention --help` describes the matched-executable probe.
+Build the base and head with the same compiler, features and allocator settings
+before running it. Its PR job uses three repeats for both storage backends and
+activity modes, with fresh processes and real connected idle time. Workload
+metadata, including lane counts, must match. The gate compares live requested
+Rust heap relative to each process's runtime baseline; peak heap and Linux RSS
+remain separate diagnostics. CPU and allocation work stays in CodSpeed, and
+shared-host walltime changes require matched native controls.
