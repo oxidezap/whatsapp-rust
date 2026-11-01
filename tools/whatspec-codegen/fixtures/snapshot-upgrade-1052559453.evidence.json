@@ -14,7 +14,7 @@
     "outputsWritten": false
   },
   "upstreamQualification": {
-    "command": "cargo run -p wa-notif --example group_envelope_contract -- /path/to/a018f64e2c88a44300ee70b669e4fbfdb09d2491aa0552b48bbad42d39614d42.js",
+    "command": "cargo run -p wa-notif --example group_envelope_contract -- ../bundles-new/a018f64e2c88a44300ee70b669e4fbfdb09d2491aa0552b48bbad42d39614d42.js",
     "result": "unqualified group provider initialization: WAWebEphemeralityTypes",
     "handler": {
       "module": "WAWebHandleGroupNotification",
@@ -23,7 +23,7 @@
       "endByte": 2387756,
       "moduleSha256": "d1641fad966fd3b32d6b9859e074f804526e67181584811364774047208c273d"
     },
-    "required": "Requalify exact new group suppliers, envelope/action/create/link/unlink contracts and independent oracle captures in whatspec before refreshing the corresponding consumer fixtures."
+    "required": "Requalify exact new group-notification suppliers, envelope/action/create/link/unlink contracts and independent notification oracle captures in whatspec before refreshing their consumer fixtures. This requirement concerns the notification parser, not the independently reviewed Create IQ request builder."
   },
   "limits": [
     "No authenticated client/server execution.",
@@ -63,5 +63,71 @@
         "scope": "Snapshot default only; effective account/group properties are resolved by group_history.rs."
       }
     }
+  },
+  "requiredExternalInputs": {
+    "whatspecCheckout": {
+      "directory": "../whatspec relative to the whatsapp-rust checkout",
+      "revision": "6cc5b0766eac00fc387a6a1f50d71a9ef6d5385a"
+    },
+    "bundles": {
+      "directory": "../bundles-new relative to the whatsapp-rust checkout",
+      "asset": "https://github.com/oxidezap/whatspec/releases/download/bundle-store/bundles-2.3000.1052559453-d6ab7ae601eda281cfac570a68de1d787adde8f4d778f0bb994416f661a21abf.tar.xz",
+      "archiveSha256": "2958d99a3d84141fa8479f1f991e06246e68c063ca8f618a8d5d361287387f62",
+      "preparation": "Download the exact asset, validate the archive digest and exact SHA-256/size multiset against generated/bundles.lock.json, then materialize each verified JavaScript input as <sha256>.js. These preserved external inputs are not committed to whatsapp-rust."
+    },
+    "generationWorkingDirectory": "whatsapp-rust checkout",
+    "upstreamQualificationWorkingDirectory": "../whatspec checkout"
+  },
+  "independentIqSourceReview": {
+    "method": "Static complete modules extracted with wa-transform module_spans after checked AST parsing. No JavaScript execution or server behavior claimed.",
+    "modules": [
+      {
+        "name": "WASmaxGroupsDeleteParentGroupRPC",
+        "bundleSha256": "a3a47d8a7764cc1c897e97776e3a8674e111a546ce86eaed5e610b71e725f7ef",
+        "startByte": 32529,
+        "endByte": 35726,
+        "moduleSha256": "81cedb9b0f4159946b5975a0e2bde292e10fe974804b758defe9249830dfda86"
+      },
+      {
+        "name": "WASmaxInGroupsIQErrorRateOverlimitMixin",
+        "bundleSha256": "a018f64e2c88a44300ee70b669e4fbfdb09d2491aa0552b48bbad42d39614d42",
+        "startByte": 658212,
+        "endByte": 658727,
+        "moduleSha256": "a666bf8ddc2626cd849602a37f8af94cd04aca4027d30a375cbbbd269c2cfe80"
+      },
+      {
+        "name": "WASmaxInGroupsIQErrorResponseMixin",
+        "bundleSha256": "a018f64e2c88a44300ee70b669e4fbfdb09d2491aa0552b48bbad42d39614d42",
+        "startByte": 647994,
+        "endByte": 648792,
+        "moduleSha256": "867cb414eafa8d1ddfec085c39696220e7fa07894dd27b8404a9c2ff7f3408e6"
+      },
+      {
+        "name": "WASmaxGroupsCreateRPC",
+        "bundleSha256": "a3a47d8a7764cc1c897e97776e3a8674e111a546ce86eaed5e610b71e725f7ef",
+        "startByte": 8205,
+        "endByte": 32527,
+        "moduleSha256": "7b2d1de78f51d566d8f70e49187fa246b0522b40b567203e352cf85b7560d160"
+      },
+      {
+        "name": "WASmaxMixins",
+        "bundleSha256": "a018f64e2c88a44300ee70b669e4fbfdb09d2491aa0552b48bbad42d39614d42",
+        "startByte": 68879,
+        "endByte": 70731,
+        "moduleSha256": "afb8df368a56b3b14e64284af85bd512f7c94a2af27d6ab615fb26f80171b5df"
+      },
+      {
+        "name": "WASmaxOutGroupsBaseSetServerMixin",
+        "bundleSha256": "a3a47d8a7764cc1c897e97776e3a8674e111a546ce86eaed5e610b71e725f7ef",
+        "startByte": 1155,
+        "endByte": 1554,
+        "moduleSha256": "c9e5c9fca0d697f4408c6e2703a3c63979709070add06d4713a44e442c332f31"
+      }
+    ],
+    "findings": [
+      "DeleteParentGroup tries success, client error, then server error. Its client error parser requires one error child and correlated id/from/type=error, then tries BadRequest, NotAuthorized, ItemNotFound and RateOverlimit in order. The RateOverlimit dependency requires tag error, text rate-overlimit and integer code 429.",
+      "Create IQ named-subject/parent-only projection remains supported: makeCreateRequest composes the create node with namedSubjectOrUnnamedSubjectFallbackMixinGroupArgs. Named subject is mandatory in that branch; parentArgs is an optional child; hasParentGroupDefaultMembershipApprovalMode invokes optionalMerge for any non-null value, including false, and writes default_membership_approval_mode=request_required.",
+      "Group notification CREATE parser qualification remains pending independently from the Create IQ builder."
+    ]
   }
 }
