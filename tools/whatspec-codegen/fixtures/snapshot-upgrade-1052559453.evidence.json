@@ -31,39 +31,6 @@
     "Only tooling dependencies were repinned. No server API support was removed.",
     "No bridge or Baileyrs checkouts changed."
   ],
-  "independentPreflight": {
-    "method": "Read the merged generated tree and invoke emitters in memory without writing outputs or disabling group qualification guards. Temporary diagnostic test removed afterward.",
-    "passed": [
-      "targets",
-      "join_shapes",
-      "pilots",
-      "iq_conformance",
-      "community_create",
-      "contextual",
-      "enums",
-      "proto"
-    ],
-    "appstateDelta": {
-      "added": [
-        "BBProPendingCustomerBaseAction",
-        "ContactManagerMetadata",
-        "GroupHistoryToggle"
-      ],
-      "existingActionVersionsAndCollectionsChanged": false
-    },
-    "abpropsDelta": {
-      "added": 564,
-      "removed": 82,
-      "changedCodeTypeOrDefault": 19,
-      "changedDefaultReferencedByCore": {
-        "name": "group_history_messages_time_limit_secs",
-        "code": 18406,
-        "before": 1209600,
-        "after": 2592000,
-        "scope": "Snapshot default only; effective account/group properties are resolved by group_history.rs."
-      }
-    }
-  },
   "requiredExternalInputs": {
     "whatspecCheckout": {
       "directory": "../whatspec relative to the whatsapp-rust checkout",
@@ -129,5 +96,75 @@
       "Create IQ named-subject/parent-only projection remains supported: makeCreateRequest composes the create node with namedSubjectOrUnnamedSubjectFallbackMixinGroupArgs. Named subject is mandatory in that branch; parentArgs is an optional child; hasParentGroupDefaultMembershipApprovalMode invokes optionalMerge for any non-null value, including false, and writes default_membership_approval_mode=request_required.",
       "Group notification CREATE parser qualification remains pending independently from the Create IQ builder."
     ]
+  },
+  "catalogDeltaReview": {
+    "appstateDelta": {
+      "added": [
+        "BBProPendingCustomerBaseAction",
+        "ContactManagerMetadata",
+        "GroupHistoryToggle"
+      ],
+      "existingActionVersionsAndCollectionsChanged": false
+    },
+    "abpropsDelta": {
+      "added": 564,
+      "removed": 82,
+      "changedCodeTypeOrDefault": 19,
+      "changedDefaultReferencedByCore": {
+        "name": "group_history_messages_time_limit_secs",
+        "code": 18406,
+        "before": 1209600,
+        "after": 2592000,
+        "scope": "The snapshot default changes from 14 to 30 days. The old consumer compared the account value against the registry default before selecting a group override, so the bump would change selection for explicit 14-day/30-day values. The exact new source instead uses the account value directly. See groupHistoryWindowReview and its regression."
+      }
+    }
+  },
+  "groupHistoryWindowReview": {
+    "scope": "Static Web sender retrieval and bundle construction path, not server behavior. No authenticated execution.",
+    "finding": "WAWebGroupHistoryGating.getGroupHistoryMessagesTimeLimitSecs returns the account AB prop directly. retrieveMessagesForBundle and generateGroupHistoryBundleMsgData subtract that account window from the selected current/join timestamp. Neither path compares the value to its registry default or reads the group-level window. The group-level window remains in the catalog.",
+    "consumerChange": "Resolve the account window directly; retain account/group sender gates. Do not replace 1209600 or 2592000 with a group window when they equal the generated default.",
+    "regression": "account_history_windows_do_not_fall_back_to_group_window checks explicit 14-day and 30-day account values with a 7200-second group window. It fails before the consumer correction with actual 7200 and expected 1209600.",
+    "modules": [
+      {
+        "name": "WAWebGroupHistoryGating",
+        "bundleSha256": "33f068d88cd48d1bc584bc03a3f68aa9a2332fa698616c0975d4aa84d69f04d8",
+        "startByte": 312745,
+        "endByte": 315152,
+        "moduleSha256": "e1a7ef6094ea7ed67fac0f428e26e0cd674f38fd6c35a18459f85bc984f1ea87"
+      },
+      {
+        "name": "WAWebRetrieveMessagesForBundle",
+        "bundleSha256": "44da2091a0b3af1d003f9555ac45343d3973180371b69521b7152a83d1231c88",
+        "startByte": 2892211,
+        "endByte": 2894221,
+        "moduleSha256": "8762484ae07823d6e1d5c07f7fcce5894f00c42f0cdbcb5fb2d55b2e166c0eb3"
+      },
+      {
+        "name": "WAWebRetrieveMessagesForBundle",
+        "bundleSha256": "c1c712b66f9dcfa8b41fcc6bda0506ba109f4fed5e1b423802bc6fd5855428ac",
+        "startByte": 136304,
+        "endByte": 138314,
+        "moduleSha256": "8762484ae07823d6e1d5c07f7fcce5894f00c42f0cdbcb5fb2d55b2e166c0eb3"
+      },
+      {
+        "name": "WAWebGenerateGroupHistoryBundleMsgData",
+        "bundleSha256": "44da2091a0b3af1d003f9555ac45343d3973180371b69521b7152a83d1231c88",
+        "startByte": 2913526,
+        "endByte": 2918618,
+        "moduleSha256": "4a88dbbbb9376f148690ff1edda33204e145fffa3e0a23e0932f0ff9a2036820"
+      },
+      {
+        "name": "WAWebGenerateGroupHistoryBundleMsgData",
+        "bundleSha256": "c1c712b66f9dcfa8b41fcc6bda0506ba109f4fed5e1b423802bc6fd5855428ac",
+        "startByte": 157619,
+        "endByte": 162711,
+        "moduleSha256": "4a88dbbbb9376f148690ff1edda33204e145fffa3e0a23e0932f0ff9a2036820"
+      }
+    ],
+    "duplicateDefinitions": "Both retrieval definitions are byte-identical; both bundle-construction definitions are byte-identical.",
+    "validation": {
+      "before": "The new regression failed with actual 7200 and expected 1209600.",
+      "after": "All 16 features::group_history::tests passed with cargo-nextest. cargo clippy -p whatsapp-rust --lib -- -D warnings passed. Workspace formatting and git diff whitespace checks passed."
+    }
   }
 }
