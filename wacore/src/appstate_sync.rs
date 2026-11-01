@@ -1760,22 +1760,25 @@ impl AppStateProcessor {
                 &db_prev,
                 validate_macs,
                 &coll,
-                final_page,
+                false,
             )
         })
         .await;
-        let prepared = match processed {
+        let mut prepared = match processed {
             Ok(prepared) => prepared,
             Err(error) => return Err(anyhow!("{}", error)),
         };
-        let result = prepared.result();
-        self.persist_mutation_effects(&result.mutations).await?;
+        if final_page {
+            prepared.mark_bootstrapped();
+        }
+        self.persist_mutation_effects(&prepared.result().mutations)
+            .await?;
         self.backend
             .commit_patch(
                 collection_name,
-                result.state.clone(),
-                &result.removed_index_macs,
-                &result.added_macs,
+                prepared.result().state.clone(),
+                &prepared.result().removed_index_macs,
+                &prepared.result().added_macs,
             )
             .await?;
         Ok(preparation::publish_patch(

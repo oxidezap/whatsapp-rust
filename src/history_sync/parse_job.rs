@@ -25,8 +25,8 @@ impl HistoryParseJob {
         }
     }
 
-    pub(super) fn runs_inline(&self) -> bool {
-        self.compressed.len() < 256 * 1024
+    pub(super) fn runs_inline(compressed_len: usize) -> bool {
+        compressed_len < 256 * 1024
     }
 
     pub(super) fn run(
@@ -65,8 +65,8 @@ mod tests {
 
     #[test]
     fn execution_threshold_is_exact() {
-        assert!(job(Bytes::from(vec![0; 256 * 1024 - 1])).runs_inline());
-        assert!(!job(Bytes::from(vec![0; 256 * 1024])).runs_inline());
+        assert!(HistoryParseJob::runs_inline(256 * 1024 - 1));
+        assert!(!HistoryParseJob::runs_inline(256 * 1024));
     }
 
     #[test]

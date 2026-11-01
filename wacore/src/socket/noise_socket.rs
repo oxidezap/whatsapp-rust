@@ -207,7 +207,6 @@ impl NoiseSocket {
         read_key: NoiseCipher,
         observers: SendObservers,
     ) -> Self {
-        let write_key = Arc::new(write_key);
         let read_key = Arc::new(read_key);
 
         // Small buffer matched to typical steady-state throughput; the sender
@@ -215,14 +214,13 @@ impl NoiseSocket {
         // WebSocket stall will backpressure producers here rather than queue.
         let (send_job_tx, send_job_rx) = async_channel::bounded::<ObservedSendJob>(8);
 
-        // Spawn the dedicated sender task
+        // Create the encoder first so the future reserves no extra space for the moved key.
         let transport_clone = transport.clone();
-        let write_key_clone = write_key.clone();
         let rt_clone = runtime.clone();
         let sender_task_handle = runtime.spawn(Box::pin(Self::sender_task(
             rt_clone,
             transport_clone,
-            write_key_clone,
+            FrameEncoder::new(write_key),
             send_job_rx,
             observers,
         )));
@@ -241,12 +239,11 @@ impl NoiseSocket {
     async fn sender_task(
         runtime: Arc<dyn Runtime>,
         transport: Arc<dyn Transport>,
-        write_key: Arc<NoiseCipher>,
+        mut encoder: FrameEncoder,
         send_job_rx: async_channel::Receiver<ObservedSendJob>,
         observers: SendObservers,
     ) {
         let SendObservers { stats, sent_frames } = observers;
-        let mut encoder = FrameEncoder::from_shared_key(write_key);
         // BytesMut: split().freeze() yields a zero-copy Bytes while retaining
         // the underlying allocation for the next frame.
         let mut out_buf = BytesMut::with_capacity(OUT_BUF_IDLE_CAPACITY);
@@ -639,4 +636,15 @@ mod tests {
             SocketError::Cipher(NoiseError::CounterExhausted)
         ));
     }
+}
+
+#[cfg(all(test, target_pointer_width = "64", not(target_arch = "wasm32")))]
+#[test]
+fn sender_future_stays_within_baseline_budget() {
+    use std::mem::size_of;
+    fn bytes<F, A, B, C, D, E>(_: impl FnOnce(A, B, C, D, E) -> F) -> usize {
+        size_of::<F>()
+    }
+    let bytes = bytes(NoiseSocket::sender_task);
+    assert!(bytes <= 736, "sender future grew to {bytes} bytes");
 }

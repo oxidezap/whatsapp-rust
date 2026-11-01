@@ -51,14 +51,6 @@ impl FrameEncoder {
         }
     }
 
-    pub(crate) fn from_shared_key(key: Arc<NoiseCipher>) -> Self {
-        Self {
-            key,
-            counter: 0,
-            poisoned: false,
-        }
-    }
-
     pub fn poison(&mut self) {
         self.poisoned = true;
     }

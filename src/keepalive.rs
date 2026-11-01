@@ -321,6 +321,7 @@ impl Client {
 
                     let receive_before_probe = self.stats.last_data_received();
                     let outcome = self.send_keepalive().await;
+                    let previous_failures = health.failures();
                     let action = health.probe_completed(
                         outcome,
                         wacore::time::Instant::now(),
@@ -1130,4 +1131,19 @@ mod identity_event_tests {
             client_log!(client(), debug, "filtered event");
         });
     }
+}
+
+#[cfg(all(
+    test,
+    target_pointer_width = "64",
+    not(target_arch = "wasm32"),
+    not(any(feature = "tracing", feature = "client-lifecycle"))
+))]
+#[test]
+fn keepalive_future_stays_within_baseline_budget() {
+    fn bytes<F, A, B, C>(_: impl FnOnce(A, B, C) -> F) -> usize {
+        size_of::<F>()
+    }
+    let bytes = bytes(Client::keepalive_loop);
+    assert!(bytes <= 3016, "keepalive future grew to {bytes} bytes");
 }

@@ -870,14 +870,15 @@ impl Client {
         // the event instead of racing a pre-parse snapshot.
         // Small blobs (PushName, Recent): decode inline to avoid spawn_blocking overhead.
         // Large blobs: use blocking thread to avoid stalling the async runtime.
-        let job = HistoryParseJob::new(compressed_data, own_user, secret_collector);
-        let parse_result = if job.runs_inline() {
-            Some(job.run())
+        let parse_result = if HistoryParseJob::runs_inline(compressed_data.len()) {
+            Some(HistoryParseJob::new(compressed_data, own_user, secret_collector).run())
         } else {
             let (result_tx, result_rx) = futures::channel::oneshot::channel();
             let lease = tracker.blocking_lease();
+            // Construct the job in the worker so the driver retains no moved input slots.
             let blocking_fut = self.runtime.spawn_blocking(Box::new(move || {
                 let _lease = lease;
+                let job = HistoryParseJob::new(compressed_data, own_user, secret_collector);
                 let _ = result_tx.send(job.run());
             }));
             self.runtime
@@ -3416,4 +3417,27 @@ mod tests {
         assert_eq!(stored.token, vec![0x01]);
         assert_eq!(stored.sender_timestamp, Some(1500));
     }
+}
+
+#[cfg(all(
+    test,
+    target_pointer_width = "64",
+    not(target_arch = "wasm32"),
+    not(any(feature = "tracing", feature = "client-lifecycle"))
+))]
+#[test]
+fn history_future_stays_within_baseline_budget() {
+    fn bytes<F>(
+        _: impl FnOnce(
+            &'static Arc<Client>,
+            String,
+            DetachedHistorySyncNotification,
+            &'static mut crate::sync_task::HistorySyncTaskTracker,
+            Option<&'static HistorySyncKey>,
+        ) -> F,
+    ) -> usize {
+        size_of::<F>()
+    }
+    let bytes = bytes(Client::process_history_sync_task_inner);
+    assert!(bytes <= 3656, "history future grew to {bytes} bytes");
 }
