@@ -10,7 +10,7 @@
 //! emitted, cannot read a connection and holds no state beyond the buffer it is
 //! building; that belongs to the plugin on top. Two crates rather than one so
 //! the catalog's compile cost is paid and measured once, independently of the
-//! runtime that uses a dozen of its 436 events.
+//! runtime that uses only a small part of the catalog.
 //!
 //! # What this does not guarantee
 //!

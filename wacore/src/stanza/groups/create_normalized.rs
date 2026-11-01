@@ -2,8 +2,8 @@
 //! and WAWebGroupsQueryApi.extractLinkedParent. Runtime telemetry, storage,
 //! cache mutation and ACK handling remain outside this parser.
 //!
-//! Qualified snapshot 2.3000.1052559453; exact module hashes and source review
-//! live in tools/whatspec-codegen/fixtures/group_qualification_review.json.
+//! Qualified snapshot 2.3000.1052559453. Source review:
+//! <https://github.com/oxidezap/whatspec/blob/ae3880925bacd23863cc30ec480c9f82bfd869f1/tests/conformance/groups/versions/2.3000.1052559453/semantic-review.json>.
 use super::identity::{self, IntegerReadError};
 use super::{GroupHistorySentState, GroupNotificationActionTag, GroupParticipantType};
 use crate::WireEnum;

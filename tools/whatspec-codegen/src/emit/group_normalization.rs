@@ -12,6 +12,64 @@ const UNLINK: &str = include_str!("../../fixtures/group_unlink.json");
 const ORACLE: &str = include_str!("../../fixtures/group_normalization_oracle.json");
 const EVIDENCE: &str = include_str!("../../fixtures/group_link_evidence.json");
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CompactOracle {
+    wa_version: String,
+    set_hash: String,
+    input_columns: Vec<String>,
+    outcomes: Vec<Value>,
+    cases: Vec<(String, String, Option<String>, bool, usize)>,
+}
+
+fn oracle(source: &str) -> Result<Value> {
+    let compact: CompactOracle = serde_json::from_str(source)?;
+    ensure!(
+        compact
+            .input_columns
+            .iter()
+            .map(String::as_str)
+            .eq(["family", "kind", "reason", "hidden", "outcome"]),
+        "normalization input columns changed"
+    );
+    let cases = compact
+        .cases
+        .into_iter()
+        .map(|(family, kind, reason, hidden, index)| {
+            let outcome = compact
+                .outcomes
+                .get(index)
+                .and_then(Value::as_object)
+                .context("invalid normalization outcome reference")?;
+            ensure!(
+                outcome.len() == 5
+                    && outcome.keys().all(|key| [
+                        "returnsNull",
+                        "actionType",
+                        "groupDatas",
+                        "reads",
+                        "calls"
+                    ]
+                    .contains(&key.as_str())),
+                "normalization outcome fields changed"
+            );
+            let mut case = json!({"family":family,"kind":kind,"reason":reason,"hidden":hidden});
+            case.as_object_mut()
+                .context("invalid normalization input")?
+                .extend(outcome.clone());
+            Ok(case)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let expanded = json!({"waVersion":compact.wa_version,"setHash":compact.set_hash,"cases":cases});
+    // This is the canonical digest of the complete, independently captured
+    // pre-compaction oracle. Sharing outcomes must preserve every observed value.
+    verify_pin(
+        &expanded.to_string(),
+        "5d114fc5756c40cbe15fd221c0f40896e02087aec2cdfb5a30dd39887a9c25d5",
+    )?;
+    Ok(expanded)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct NullResult {
@@ -94,11 +152,11 @@ fn contract(json: &str, family: &str, version: &str) -> Result<Contract> {
     );
     verify_pin(
         ORACLE,
-        "bc29dabb2069e9e33567acb09001ad94243c809ec72c2fdf6a679bee10db3459",
+        "c4ec274811aee86531c3761d06273cf8220130be64f73971d8233cc1cc58492d",
     )?;
     verify_pin(
         EVIDENCE,
-        "8f7551630e7ce7a6045c1bb3a5aa2173612a62cbe2ecbc7657acd7182588d2c0",
+        "3f59ccdb48ffa098ad588c203447a53ae951a47e6035d1841d3d33fc7633f304",
     )?;
     let c: Contract = serde_json::from_str(json)?;
     ensure!(
@@ -222,7 +280,7 @@ fn contract(json: &str, family: &str, version: &str) -> Result<Contract> {
     Ok(c)
 }
 fn verify_oracle(c: &Contract, family: &str) -> Result<()> {
-    let oracle: Value = serde_json::from_str(ORACLE)?;
+    let oracle = oracle(ORACLE)?;
     let evidence: Value = serde_json::from_str(EVIDENCE)?;
     ensure!(
         oracle["waVersion"] == VERSION
@@ -439,57 +497,105 @@ pub(super) fn generate_link(version: &str) -> Result<String> {
 pub fn conformance(version: &str) -> Result<String> {
     let _ = contract(LINK, "link", version)?;
     let _ = contract(UNLINK, "unlink", version)?;
-    let oracle: Value = serde_json::from_str(ORACLE)?;
-    let mut out = header("original LINK/UNLINK normalization conformance", version);
-    out.push_str("use super::{link_normalized::parse_link_with_warnings,normalized::{parse_unlink_with_warnings,GroupParseError},normalization_warning::GroupWarningSink};\nuse wacore_binary::builder::NodeBuilder;\nuse serde_json::{Value,json};\n#[derive(Default)] struct Recorder{calls:Vec<Value>}\nimpl GroupWarningSink for Recorder{fn warn(&mut self,template:&'static[&'static str],value:&str)->Result<(),GroupParseError>{self.calls.push(json!([\"WARN\",template,value]));Ok(())}fn send_logs(&mut self,event:&'static str)->Result<(),GroupParseError>{self.calls.push(json!([\"sendLogs\",event]));Ok(())}}\n#[test]fn original_normalization_matrix(){\n");
+    let oracle = oracle(ORACLE)?;
+    let mut outcomes = Vec::<String>::new();
+    let mut cases = Vec::new();
     for case in oracle["cases"].as_array().context("missing cases")? {
         let family = case["family"].as_str().context("missing family")?;
         let kind = case["kind"].as_str().context("missing kind")?;
         let hidden = case["hidden"].as_bool().context("missing hidden")?;
         let unsupported = case["actionType"].is_object();
         let null = case["returnsNull"].as_bool().context("missing null")?;
-        let expected = case["actionType"].as_str();
-        out.push_str("{let mut recorder=Recorder::default();let group=NodeBuilder::new(\"group\").attr(\"jid\",\"123456@g.us\").attr(\"subject\",\"synthetic\").attr(\"s_t\",\"123\")");
-        if hidden {
-            out.push_str(".children([NodeBuilder::new(\"hidden_group\").build()])");
-        }
-        out.push_str(&format!(
-            ".build();let node=NodeBuilder::new({}).attr({}, {})",
-            rust_str(family),
-            rust_str(&format!("{family}_type")),
-            rust_str(kind)
-        ));
-        if let Some(reason) = case["reason"].as_str() {
-            out.push_str(&format!(".attr(\"unlink_reason\",{})", rust_str(reason)));
-        }
-        out.push_str(".children([group]).build();");
-        out.push_str(&format!(
-            "let actual=parse_{family}_with_warnings(&node.as_node_ref(),&mut recorder);"
-        ));
-        if unsupported {
-            out.push_str(&format!(
-                "assert_eq!(actual.unwrap_err(),GroupParseError::UnsupportedActionType({}));",
-                rust_str(&format!("{family}_type"))
-            ));
+        let expected_hidden = if family == "link" && !null {
+            case["groupDatas"][0]
+                .get("hiddenSubgroup")
+                .map_or_else(|| "None".into(), |value| format!("Some({value})"))
         } else {
-            out.push_str(&format!("let actual=actual.unwrap();assert_eq!(actual.kind.map(|v|v.as_str()),{});assert_eq!(actual.groups.len(),{});",opt(expected),usize::from(!null)));
-            if family == "link" && !null {
-                out.push_str(&format!(
-                    "assert_eq!(actual.groups[0].hidden_subgroup,{});",
-                    case["groupDatas"][0]
-                        .get("hiddenSubgroup")
-                        .map_or_else(|| "None".into(), |value| format!("Some({value})"))
-                ));
-            }
-        }
-        out.push_str(&format!("assert_eq!(Value::Array(recorder.calls),serde_json::from_str::<Value>({}).unwrap());}}\n",rust_str(&case["calls"].to_string())));
+            "None".into()
+        };
+        let outcome = format!(
+            "Outcome{{kind:{},unsupported:{unsupported},groups:{},hidden:{expected_hidden},calls:{}}}",
+            opt(case["actionType"].as_str()),
+            usize::from(!null),
+            rust_str(&case["calls"].to_string())
+        );
+        let index = if let Some(index) = outcomes.iter().position(|value| value == &outcome) {
+            index
+        } else {
+            outcomes.push(outcome);
+            outcomes.len() - 1
+        };
+        cases.push(format!(
+            "Case({},{},{},{hidden},{index}),",
+            rust_str(family),
+            rust_str(kind),
+            opt(case["reason"].as_str())
+        ));
     }
-    out.push_str("}\n");
+    let mut out = header("original LINK/UNLINK normalization conformance", version);
+    out.push_str(r#"use super::{link_normalized::parse_link_with_warnings,normalized::{parse_unlink_with_warnings,GroupParseError},normalization_warning::GroupWarningSink};
+use wacore_binary::builder::NodeBuilder;
+use serde_json::{Value,json};
+#[derive(Default)] struct Recorder{calls:Vec<Value>}
+impl GroupWarningSink for Recorder{
+    fn warn(&mut self,template:&'static[&'static str],value:&str)->Result<(),GroupParseError>{self.calls.push(json!(["WARN",template,value]));Ok(())}
+    fn send_logs(&mut self,event:&'static str)->Result<(),GroupParseError>{self.calls.push(json!(["sendLogs",event]));Ok(())}
+}
+struct Case(&'static str,&'static str,Option<&'static str>,bool,usize);
+struct Outcome{kind:Option<&'static str>,unsupported:bool,groups:usize,hidden:Option<bool>,calls:&'static str}
+const OUTCOMES:&[Outcome]=&[
+"#);
+    for outcome in outcomes {
+        out.push_str(&outcome);
+        out.push_str(",\n");
+    }
+    out.push_str("];\nconst CASES:&[Case]=&[\n");
+    out.push_str(&cases.join("\n"));
+    out.push_str(r#"];
+#[test]
+fn original_normalization_matrix(){
+    assert_eq!(CASES.len(),204);
+    for &Case(family,kind,reason,hidden,index) in CASES {
+        let expected=&OUTCOMES[index];
+        let mut recorder=Recorder::default();
+        let mut group=NodeBuilder::new("group").attr("jid","123456@g.us").attr("subject","synthetic").attr("s_t","123");
+        if hidden {group=group.children([NodeBuilder::new("hidden_group").build()]);}
+        let mut node=NodeBuilder::new(family).attr(if family=="link"{"link_type"}else{"unlink_type"},kind);
+        if let Some(reason)=reason {node=node.attr("unlink_reason",reason);}
+        let node=node.children([group.build()]).build();
+        let actual=if family=="link"{
+            parse_link_with_warnings(&node.as_node_ref(),&mut recorder).map(|value|(value.kind.map(|kind|kind.as_str()),value.groups.len(),value.groups.first().and_then(|group|group.hidden_subgroup)))
+        }else{
+            parse_unlink_with_warnings(&node.as_node_ref(),&mut recorder).map(|value|(value.kind.map(|kind|kind.as_str()),value.groups.len(),None))
+        };
+        if expected.unsupported {
+            assert_eq!(actual.unwrap_err(),GroupParseError::UnsupportedActionType(if family=="link"{"link_type"}else{"unlink_type"}));
+        }else{
+            assert_eq!(actual.unwrap(),(expected.kind,expected.groups,expected.hidden),"{family}/{kind}/{reason:?}/{hidden}");
+        }
+        assert_eq!(Value::Array(recorder.calls),serde_json::from_str::<Value>(expected.calls).unwrap(),"{family}/{kind}/{reason:?}/{hidden}");
+    }
+}
+"#);
     Ok(out)
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compact_capture_preserves_every_observed_value_and_case() {
+        for mutation in 0..3 {
+            let mut capture: Value = serde_json::from_str(ORACLE).unwrap();
+            match mutation {
+                0 => capture["cases"][0][4] = json!(9999),
+                1 => capture["outcomes"][0]["reads"] = json!([]),
+                _ => {
+                    capture["cases"].as_array_mut().unwrap().pop();
+                }
+            }
+            assert!(oracle(&capture.to_string()).is_err());
+        }
+    }
     #[test]
     fn version_drift_requires_review() {
         assert!(generate("future").is_err());

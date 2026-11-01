@@ -1,6 +1,6 @@
 //! Complete owned normalization of the qualified group-notification action switch.
-//! Source: WAWebHandleGroupNotification, WA 2.3000.1052559453. Module hashes
-//! and semantic review are in the codegen group_qualification_review fixture.
+//! Source: WAWebHandleGroupNotification, WA 2.3000.1052559453.
+//! <https://github.com/oxidezap/whatspec/blob/ae3880925bacd23863cc30ec480c9f82bfd869f1/tests/conformance/groups/versions/2.3000.1052559453/semantic-review.json>.
 //! Runtime cache/session changes, storage and ACK handling stay outside.
 use super::create_normalized::{
     self, CreateParseError, CreateParticipant, GroupCreateContext, NormalizedGroupCreate,

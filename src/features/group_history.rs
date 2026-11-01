@@ -657,7 +657,7 @@ pub(crate) fn resolve_group_history_limits(
             "group_history_messages_time_limit_secs",
         ))?;
     // The current Web retrieval path reads the account window directly, even
-    // when it equals the registry default. See snapshot-upgrade-1052559453.evidence.json.
+    // when it equals the registry default (WAWebRetrieveMessagesForBundle).
     let time_window_seconds = u64::try_from(account_window)
         .ok()
         .filter(|v| *v > 0)

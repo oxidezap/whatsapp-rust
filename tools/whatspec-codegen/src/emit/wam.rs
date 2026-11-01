@@ -560,6 +560,13 @@ fn call_sites(ir: &WamIr, wa_version: &str) -> String {
          \n\
          use crate::{{CallSite, CallSiteField, CatalogField, EventCallSites, FieldWrite}};\n\n"
     ));
+    out.push_str(r#"
+const fn catalog_field(name: &'static str, id: u32) -> CatalogField { CatalogField { name, id } }
+const fn written_field(name: &'static str, write: FieldWrite) -> CallSiteField { CallSiteField { name, write } }
+const fn site(module: &'static str, partial: bool, fields: &'static [CallSiteField]) -> CallSite { CallSite { module, partial, fields } }
+const fn event(event: &'static str, code: u32, fields: &'static [CatalogField], sites: &'static [CallSite]) -> EventCallSites { EventCallSites { event, code, fields, sites } }
+
+"#);
     out.push_str(
         "/// Every event's declared fields and recovered call sites, sorted by\n\
          /// event name so a lookup is a binary search.\n\
@@ -568,23 +575,15 @@ fn call_sites(ir: &WamIr, wa_version: &str) -> String {
     let mut by_name: Vec<&WamEventDef> = ir.events.iter().collect();
     by_name.sort_by(|a, b| a.name.cmp(&b.name));
     for e in by_name {
-        out.push_str(&format!(
-            "    EventCallSites {{\n        event: {},\n        code: {},\n        fields: &[",
-            rust_lit(&e.name),
-            e.code
-        ));
+        out.push_str(&format!("    event({}, {}, &[", rust_lit(&e.name), e.code));
         for f in &e.fields {
-            out.push_str(&format!(
-                "CatalogField {{ name: {}, id: {} }}, ",
-                rust_lit(&f.name),
-                f.id
-            ));
+            out.push_str(&format!("catalog_field({}, {}), ", rust_lit(&f.name), f.id));
         }
-        out.push_str("],\n        sites: &[\n");
+        out.push_str("], &[\n");
         for s in &e.call_sites {
             out.push_str(&call_site(s));
         }
-        out.push_str("        ],\n    },\n");
+        out.push_str("        ]),\n");
     }
     out.push_str("];\n");
     out
@@ -593,7 +592,7 @@ fn call_sites(ir: &WamIr, wa_version: &str) -> String {
 fn call_site(s: &WamCallSite) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "            CallSite {{ module: {}, partial: {}, fields: &[",
+        "            site({}, {}, &[",
         rust_lit(&s.module),
         s.partial
     ));
@@ -602,12 +601,9 @@ fn call_site(s: &WamCallSite) -> String {
             WamFieldWrite::Constructor => "FieldWrite::Constructor",
             WamFieldWrite::Assigned => "FieldWrite::Assigned",
         };
-        out.push_str(&format!(
-            "CallSiteField {{ name: {}, write: {write} }}, ",
-            rust_lit(&f.name)
-        ));
+        out.push_str(&format!("written_field({}, {write}), ", rust_lit(&f.name)));
     }
-    out.push_str("] },\n");
+    out.push_str("]),\n");
     out
 }
 
@@ -717,20 +713,20 @@ mod tests {
     #[test]
     fn the_parity_table_keeps_each_site_module_and_partiality() {
         let out = generate(&ir(), "2.3000.1").expect("generate");
-        assert!(out.call_sites.contains("event: \"UnknownStanza\""));
+        assert!(out.call_sites.contains("event(\"UnknownStanza\","));
         assert!(
             out.call_sites
-                .contains("module: \"WAWebPostUnknownStanzaMetric\", partial: false")
+                .contains("site(\"WAWebPostUnknownStanzaMetric\", false")
         );
         assert!(
             out.call_sites
-                .contains("name: \"unknownStanzaTag\", write: FieldWrite::Constructor")
+                .contains("written_field(\"unknownStanzaTag\", FieldWrite::Constructor)")
         );
         // The declared fields travel with the sites, so a parity check can name
         // the ids it decodes out of a buffer.
         assert!(
             out.call_sites
-                .contains("CatalogField { name: \"unknownStanzaTag\", id: 1 }")
+                .contains("catalog_field(\"unknownStanzaTag\", 1)")
         );
     }
 

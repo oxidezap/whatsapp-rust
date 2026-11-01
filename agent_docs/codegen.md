@@ -119,7 +119,18 @@ produce a null result and ordered warning operations. The additive
 `*_with_warnings` parser APIs accept a `GroupWarningSink`; the existing pure
 parser entry points discard warnings. LINK returns before payload reads, while
 UNLINK validates its payload before warning. The complete notification parser
-omits null actions. Historical fixtures remain in their versioned directory.
+omits null actions. Keep only current inputs used by the generator or tests.
+Historical API behavior belongs in focused compatibility regressions; do not copy
+complete previous snapshots into a versioned fixture directory. Immutable source
+revisions and digests preserve provenance; task reports belong in the PR.
+
+The normalization capture adapter stores all original cases with shared observed
+outcomes. Run `node tools/whatspec-codegen/fixtures/capture-group-normalization.cjs
+PATH/TO/whatspec --check` against the pinned external checkout to reproduce it.
+The normal generator and tests remain offline-capable. The emitter verifies the
+expanded oracle's canonical digest and emits a table with one shared test runner,
+not one copy of the runner per case. Review any capture or digest change against
+the preserved original bundles, and keep assertion coverage when sharing data.
 
 Runtime adoption requires the nondefault `generated-group-notifications` feature
 and a `GroupNotificationFactsProvider` installed on the client. The provider
