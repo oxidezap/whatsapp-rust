@@ -60,7 +60,8 @@ fn oracle(source: &str) -> Result<Value> {
             Ok(case)
         })
         .collect::<Result<Vec<_>>>()?;
-    let expanded = json!({"waVersion":compact.wa_version,"setHash":compact.set_hash,"cases":cases});
+    let mut expanded = json!({"waVersion":compact.wa_version,"setHash":compact.set_hash,"cases":cases});
+    expanded.sort_all_objects();
     // This is the canonical digest of the complete, independently captured
     // pre-compaction oracle. Sharing outcomes must preserve every observed value.
     verify_pin(
@@ -584,6 +585,7 @@ mod tests {
     use super::*;
     #[test]
     fn compact_capture_preserves_every_observed_value_and_case() {
+        assert!(oracle(ORACLE).is_ok());
         for mutation in 0..3 {
             let mut capture: Value = serde_json::from_str(ORACLE).unwrap();
             match mutation {
