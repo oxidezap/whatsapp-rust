@@ -26,9 +26,23 @@ pub(crate) enum AnswerAuthorization {
     Ignore,
 }
 
+fn announced_mlow_bit(capability: Option<&NodeRef<'_>>) -> CapabilityBit {
+    capability.map_or(CapabilityBit::Unknown, |capability| {
+        let version = capability
+            .get_attr("ver")
+            .and_then(|version| version.as_str().parse::<u32>().ok());
+        capability_bit(
+            version,
+            capability.content_bytes().unwrap_or_default(),
+            CAPABILITY_INDEX_MLOW_V1,
+        )
+    })
+}
+
 pub(crate) async fn authorize_answer(
     client: &dyn DirectCallHost,
     call: &mut IncomingCall,
+    node: &NodeRef<'_>,
 ) -> AnswerAuthorization {
     let mut direct_accept_alias = None;
     let accepting = matches!(&call.action, CallAction::Accept { .. });
@@ -61,6 +75,15 @@ pub(crate) async fn authorize_answer(
                 {
                     return AnswerAuthorization::Ignore;
                 }
+                let Some(creator) = canonical_call_identity(
+                    client,
+                    call.action.call_creator(),
+                    &session.call_creator,
+                )
+                .await
+                else {
+                    return AnswerAuthorization::Ignore;
+                };
                 let observed = routed_call_sender(call);
                 // Preserve the native trusted-service authority model for terminal events.
                 // This narrow compatibility exception is not an observed direct wire fixture:
@@ -86,15 +109,32 @@ pub(crate) async fn authorize_answer(
                     }
                 };
                 let Some(sender) = sender else {
-                    return AnswerAuthorization::Ignore;
-                };
-                let Some(creator) = canonical_call_identity(
-                    client,
-                    call.action.call_creator(),
-                    &session.call_creator,
-                )
-                .await
-                else {
+                    if preaccepting
+                        && call.participant.is_none()
+                        && matches!(
+                            (observed.server, session.peer_jid.server),
+                            (Server::Pn, Server::Lid) | (Server::Lid, Server::Pn)
+                        )
+                    {
+                        // Retain only a device-local statement until a later authenticated
+                        // accept resolves its namespace. This cannot select media or tear down
+                        // the call; no identity is learned from this stanza.
+                        let capability = node
+                            .children()
+                            .and_then(|children| {
+                                children.iter().find(|action| {
+                                    CallActionTag::try_from(action.tag.as_ref()).is_ok()
+                                })
+                            })
+                            .and_then(|action| action.get_optional_child("capability"));
+                        let bit = announced_mlow_bit(capability);
+                        registry.note_peer_capability(
+                            call.action.call_id(),
+                            generation,
+                            &observed,
+                            bit,
+                        );
+                    }
                     return AnswerAuthorization::Ignore;
                 };
                 if accepting {
@@ -110,9 +150,8 @@ pub(crate) async fn authorize_answer(
                 }
                 Some((generation, creator, sender))
             }
-            None => {
-                return AnswerAuthorization::Observe;
-            }
+            None if accepting => return AnswerAuthorization::Observe,
+            None => None,
         }
     } else {
         None
@@ -211,13 +250,7 @@ pub(crate) async fn apply_answer(
             .and_then(|action| action.get_optional_child("capability"));
         // Only an ABSENT node is `Unknown`; a present one reads through
         // `capability_bit`, which owns what an unreadable `ver` means.
-        peer_mlow_bit = capability.map_or(CapabilityBit::Unknown, |capability| {
-            let version = capability
-                .get_attr("ver")
-                .and_then(|version| version.as_str().parse::<u32>().ok());
-            let bytes = capability.content_bytes().unwrap_or_default();
-            capability_bit(version, bytes, CAPABILITY_INDEX_MLOW_V1)
-        });
+        peer_mlow_bit = announced_mlow_bit(capability);
         let mut capability_sender = routed_call_sender(&call);
         if matches!(&call.action, CallAction::PreAccept { .. })
             && !client
@@ -755,7 +788,7 @@ pub async fn ingest_direct_call(
         ));
     }
     let terminal_generation = host.call_registry().generation_of(call.action.call_id());
-    let (answer, alias) = match authorize_answer(&*host, &mut call).await {
+    let (answer, alias) = match authorize_answer(&*host, &mut call, node).await {
         AnswerAuthorization::Continue { answer, alias } => (answer, alias),
         AnswerAuthorization::Observe => return Ok(Some(call)),
         AnswerAuthorization::Ignore => return Ok(None),
@@ -948,6 +981,52 @@ mod tests {
     fn register(host: &Host) -> u64 {
         host.call_registry()
             .insert(CallSession::new_outgoing("DIRECT-INGRESS", peer(), own()))
+    }
+
+    #[tokio::test]
+    async fn unknown_namespace_preaccept_caches_only_with_a_trusted_creator() {
+        for (valid_creator, opposite_namespace) in [(false, true), (true, true), (true, false)] {
+            let host = Host::new();
+            register(&host);
+            let phone = if opposite_namespace {
+                Jid::pn("15550000002")
+            } else {
+                Jid::new("100000000000099", Server::Lid)
+            }
+            .with_device(4);
+            let node = NodeBuilder::new("call")
+                .attr("id", "PENDING-CAPABILITY")
+                .attr("from", phone.clone())
+                .attr("t", "1766847151")
+                .children([NodeBuilder::new("preaccept")
+                    .attr("call-id", "DIRECT-INGRESS")
+                    .attr("call-creator", if valid_creator { own() } else { peer() })
+                    .children([NodeBuilder::new("capability")
+                        .attr("ver", "1")
+                        .bytes(wacore::stanza::call::CAPABILITY_STANDARD_OPUS_OFFER.to_vec())
+                        .build()])
+                    .build()])
+                .build();
+            assert!(
+                ingest_direct_call(host.clone(), &node.as_node_ref())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                host.call_registry().resolve_peer_capability(
+                    "DIRECT-INGRESS",
+                    &phone,
+                    CapabilityBit::Unknown
+                ),
+                if valid_creator && opposite_namespace {
+                    CapabilityBit::Clear
+                } else {
+                    CapabilityBit::Unknown
+                }
+            );
+            assert!(host.sent.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test]

@@ -103,8 +103,12 @@ impl StanzaHandler for CallHandler {
                 let direct_host: Arc<dyn crate::voip::direct::DirectCallHost> = client.clone();
                 #[cfg(feature = "voip-control")]
                 let (direct_accept, direct_accept_alias) =
-                    match crate::voip::direct_ingress::authorize_answer(&*direct_host, &mut call)
-                        .await
+                    match crate::voip::direct_ingress::authorize_answer(
+                        &*direct_host,
+                        &mut call,
+                        nr,
+                    )
+                    .await
                     {
                         crate::voip::direct_ingress::AnswerAuthorization::Continue {
                             answer,

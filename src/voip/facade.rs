@@ -299,6 +299,10 @@ async fn start_direct_accept(
     else {
         return Err(CallError::NotAnOffer);
     };
+    if incoming.group.is_none() && client.call_registry().is_group_call(call_id) {
+        // A retained direct offer cannot borrow a newer group generation with the same ID.
+        return Err(CallError::CallEndedDuringSetup);
+    }
     if incoming.group.is_some() {
         return Err(CallError::Media(
             "direct call control does not accept group offers",
@@ -349,9 +353,6 @@ async fn start_direct_accept(
         .video_orientation
         .map(|orientation| (incoming.from.clone(), orientation));
     let has_video = video.is_some();
-    if client.call_registry().is_group_call(call_id) {
-        return Err(CallError::CallEndedDuringSetup);
-    }
     let mut registration =
         RegisteredCall::new_direct(&*client, session, incoming.ringing_generation()).await?;
     client.call_state().ensure_epoch(epoch)?;
@@ -8909,6 +8910,9 @@ mod tests {
             "src/voip/facade.rs",
             "src/client/voip.rs",
             "src/handlers/call.rs",
+            "src/voip/direct_control.rs",
+            "src/voip/direct_ingress.rs",
+            "wacore/src/voip_control/signaling_plan.rs",
             "wacore/src/stanza/group_call.rs",
         ];
 
