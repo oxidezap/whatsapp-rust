@@ -364,7 +364,7 @@ libc = "0.2"
 metrics-exporter-prometheus = "0.18"
 # Parses the crate sources in tests/error_surface.rs. Text scanning silently
 # missed error enums whose doc comments carried unbalanced braces.
-syn = { version = "3.0", features = ["full"] }
+syn = { version = "3.0", features = ["full", "visit"] }
 tokio = { workspace = true, features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { workspace = true, features = ["v4"] }

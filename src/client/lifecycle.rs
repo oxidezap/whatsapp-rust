@@ -1070,7 +1070,7 @@ impl Client {
                     || !self.is_running.load(Ordering::Relaxed)
                     || (self.expected_disconnect.load(Ordering::Acquire)
                         && !self.is_running.load(Ordering::Relaxed)),
-                self.expected_disconnect.load(Ordering::Relaxed),
+                false,
             );
             if reconnect == wacore::protocol::reconnect::ReconnectAction::Stop {
                 self.clear_connection_backoff_state();
@@ -1095,7 +1095,11 @@ impl Client {
             }
 
             // If this was an expected disconnect (e.g., 515 after pairing), reconnect immediately
-            if reconnect == wacore::protocol::reconnect::ReconnectAction::Immediate {
+            if wacore::protocol::reconnect::reconnect_action(
+                false,
+                self.expected_disconnect.load(Ordering::Relaxed),
+            ) == wacore::protocol::reconnect::ReconnectAction::Immediate
+            {
                 self.clear_connection_backoff_state();
                 client_log!(
                     self,

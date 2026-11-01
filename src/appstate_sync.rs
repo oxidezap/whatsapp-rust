@@ -53,6 +53,13 @@ mod tests {
         fail_status_privacy: Arc<Mutex<bool>>,
         fail_lid_mappings: Arc<Mutex<bool>>,
         lid_mapping_versions: Arc<Mutex<Vec<Option<u64>>>>,
+        commit_gate: Arc<std::sync::Mutex<Option<Arc<CommitGate>>>>,
+    }
+
+    struct CommitGate {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+        fail: bool,
     }
 
     // Implement SignalStore - Signal protocol cryptographic operations
@@ -196,6 +203,16 @@ mod tests {
             removed_index_macs: &[Vec<u8>],
             added: &[AppStateMutationMAC],
         ) -> StoreResult<()> {
+            let gate = self.commit_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.acquire().await.unwrap().forget();
+                if gate.fail {
+                    return Err(wacore::store::error::StoreError::Io(std::io::Error::other(
+                        "injected patch commit failure",
+                    )));
+                }
+            }
             // Acquire both locks before any mutation; cancellation while acquiring
             // the second one still leaves the previous cursor and MACs intact.
             let mut versions = self.versions.lock().await;
@@ -921,6 +938,64 @@ mod tests {
         };
         *backend.fail_status_privacy.lock().await = true;
         (backend, processor, list)
+    }
+
+    #[tokio::test]
+    async fn patch_publication_waits_for_the_real_backend_commit() {
+        for fail in [false, true] {
+            let (backend, processor, mut list) =
+                committed_before_status_privacy_scenario(false).await;
+            list.patches.truncate(1);
+            let gate = Arc::new(CommitGate {
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+                fail,
+            });
+            *backend.commit_gate.lock().unwrap() = Some(gate.clone());
+            let task = tokio::spawn(async move { processor.process_patch_list(list, false).await });
+            tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.notified())
+                .await
+                .unwrap();
+            assert!(!task.is_finished());
+            assert!(
+                backend
+                    .get_version(WAPatchName::RegularHigh.as_str())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(backend.macs.lock().await.is_empty());
+            gate.release.add_permits(1);
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+            if fail {
+                assert!(result.is_err());
+                assert!(
+                    backend
+                        .get_version(WAPatchName::RegularHigh.as_str())
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(backend.macs.lock().await.is_empty());
+            } else {
+                let (mutations, state, _) = result.unwrap();
+                assert_eq!(mutations.len(), 1);
+                assert_eq!(state.version, 1);
+                assert_eq!(
+                    backend
+                        .get_version(WAPatchName::RegularHigh.as_str())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .version,
+                    state.version
+                );
+                assert_eq!(backend.macs.lock().await.len(), 1);
+            }
+        }
     }
 
     async fn assert_nct_commit_survives_later_status_failure(snapshot_first: bool) {

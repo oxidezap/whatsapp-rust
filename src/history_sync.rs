@@ -2214,6 +2214,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocking_history_parse_completes_through_the_client_and_releases_its_lease() {
+        use rand::{Rng, SeedableRng};
+        let (client, transport, _) = history_receipt_client(None).await;
+        let recorder = Arc::new(CallHistoryRecorder(std::sync::Mutex::new(Vec::new())));
+        let _subscription = client.core.event_bus.subscribe_handler(recorder.clone());
+        let salt = vec![17; 32];
+        let mut padding = vec![0; 512 * 1024];
+        rand::rngs::StdRng::seed_from_u64(0x484953544f5259).fill_bytes(&mut padding);
+        let mut history = wa::HistorySync::default();
+        history.sync_type = wa::history_sync::HistorySyncType::RECENT;
+        history.nct_salt = Some(salt.clone());
+        // An unknown length-delimited field supplies incompressible bytes
+        // without exceeding a known protocol field's semantic size.
+        let mut raw = history.encode_to_vec();
+        for mut value in [2000u64 * 8 + 2, padding.len() as u64] {
+            while value >= 128 {
+                raw.push((value as u8 & 0x7f) | 0x80);
+                value >>= 7;
+            }
+            raw.push(value as u8);
+        }
+        raw.extend_from_slice(&padding);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&raw).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(compressed.len() >= 256 * 1024);
+        let mut notification = HistorySyncNotification::default();
+        notification.sync_type = Some(wa::message::HistorySyncType::RECENT);
+        notification.initial_hist_bootstrap_inline_payload = Some(compressed);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.process_history_sync_task("HIST_BLOCKING".into(), notification.into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            client
+                .persistence_manager
+                .get_device_snapshot()
+                .nct_salt
+                .as_deref(),
+            Some(salt.as_slice())
+        );
+        assert_eq!(history_receipts(&transport, "HIST_BLOCKING").await, 1);
+        assert!(
+            recorder
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(&**event, Event::HistorySync(_)))
+        );
+        assert_eq!(client.history_sync_activity.snapshot().tasks, 0);
+        assert_eq!(client.history_sync_activity.snapshot().payload_bytes, 0);
+    }
+
+    #[tokio::test]
     async fn history_sync_receipt_is_sent_without_a_capture_hook() {
         let (client, transport, _) = history_receipt_client(None).await;
         let (_, notification) = recent_history_chunk();

@@ -29,7 +29,7 @@ without accessing storage. Publish patch state and mutations only after derived
 effects and the cursor/MAC commit succeed. History parse jobs own their compressed
 input and policy snapshot; their driver retains admission and blocking-work leases.
 
-`wacore/tests/sans_io_boundary.rs` guards these modules against executor, I/O,
+`tests/sans_io_boundary.rs` guards these modules against executor, I/O,
 randomness and global-clock dependencies. Use explicit timestamps in their tests
 so independent simulations can run without replacing process-wide providers.
 
