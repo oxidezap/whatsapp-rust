@@ -3854,6 +3854,15 @@ fn client_size_pins_runtime_cache_config_saving() {
     expected += size_of::<std::sync::Mutex<HashSet<Jid>>>()
         - size_of::<Arc<std::sync::Mutex<HashSet<Jid>>>>();
 
+    expected += size_of::<Mutex<HashMap<Vec<u8>, wacore::time::Instant>>>()
+        - size_of::<Arc<Mutex<HashMap<Vec<u8>, wacore::time::Instant>>>>();
+    expected += 2 * (size_of::<Mutex<()>>() - size_of::<Arc<Mutex<()>>>());
+    expected += 2
+        * (size_of::<Mutex<Option<async_channel::Sender<()>>>>()
+            - size_of::<Arc<Mutex<Option<async_channel::Sender<()>>>>>());
+    expected += size_of::<Mutex<wacore::pair_code::PairCodeState>>()
+        - size_of::<Arc<Mutex<wacore::pair_code::PairCodeState>>>();
+
     // The lifecycle model replaces ten flags, its timer/counter and the old Arc.
     // Keep the fixed base and total retained-memory budget independent of this inline move.
     let legacy_status = size_of::<Arc<AtomicU8>>()

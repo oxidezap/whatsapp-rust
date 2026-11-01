@@ -2141,7 +2141,7 @@ pub struct Client {
     /// Built on first app-state use and never replaced: reconnect clears the
     /// processor's key cache in place rather than swapping the processor.
     pub(crate) app_state_processor: std::sync::OnceLock<Arc<AppStateProcessor>>,
-    pub(crate) app_state_key_requests: Arc<Mutex<HashMap<Vec<u8>, wacore::time::Instant>>>,
+    pub(crate) app_state_key_requests: Mutex<HashMap<Vec<u8>, wacore::time::Instant>>,
     /// Tracks collections currently being synced to prevent duplicate sync tasks.
     /// Matches WA Web's in-flight tracking set in WAWebSyncdCollectionsStateMachine.
     pub(crate) app_state_syncing: Arc<app_state::SyncInFlight>,
@@ -2165,10 +2165,10 @@ pub struct Client {
     pub(crate) initial_app_state_keys_received: AtomicBool,
 
     /// Prevents concurrent prekey upload operations (matches WA Web's dedup set in `handlePreKeyLow`).
-    pub(crate) prekey_upload_lock: Arc<Mutex<()>>,
+    pub(crate) prekey_upload_lock: Mutex<()>,
     /// Single-flights signed pre-key rotation so overlapping post-login tasks
     /// (from reconnect churn) can't run the rotate/upload/prune flow concurrently.
-    pub(crate) signed_pre_key_rotation_lock: Arc<Mutex<()>>,
+    pub(crate) signed_pre_key_rotation_lock: Mutex<()>,
     /// Notifier for when offline sync (ib offline stanza) is received.
     /// WhatsApp Web waits for this before sending passive tasks (prekey upload, active IQ, presence).
     pub(crate) offline_sync_notifier: event_listener::Event,
@@ -2262,15 +2262,15 @@ pub struct Client {
     /// Every terminal transition must fire this. See [`Client::is_terminal`].
     pub(crate) session_state_notifier: event_listener::Event,
     pub(crate) major_sync_task_sender: async_channel::Sender<MajorSyncTask>,
-    pub(crate) pairing_cancellation_tx: Arc<Mutex<Option<async_channel::Sender<()>>>>,
+    pub(crate) pairing_cancellation_tx: Mutex<Option<async_channel::Sender<()>>>,
     /// Asks the QR rotation task to re-render the ref it is already showing.
     /// The payload embeds the adv secret, so a rotation has to reach the code
     /// on screen and not just the next one.
-    pub(crate) pairing_qr_refresh_tx: Arc<Mutex<Option<async_channel::Sender<()>>>>,
+    pub(crate) pairing_qr_refresh_tx: Mutex<Option<async_channel::Sender<()>>>,
 
     /// State machine for pair code authentication flow.
     /// Tracks the pending pair code request and ephemeral keys.
-    pub(crate) pair_code_state: Arc<Mutex<wacore::pair_code::PairCodeState>>,
+    pub(crate) pair_code_state: Mutex<wacore::pair_code::PairCodeState>,
 
     /// Per-client state of every optional subsystem attached to this build,
     /// each under its own type, in one field rather than one field per
