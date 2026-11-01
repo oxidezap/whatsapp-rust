@@ -318,6 +318,22 @@ pub(super) mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn integrated_rpc_projection_preserves_public_pilot_bindings() {
+        let source = include_str!("../../fixtures/contextual_iq.json");
+        let output = generate(source, "2.3000.1052559453").unwrap();
+        for binding in [
+            "pub(super) iq_to: &'a Jid",
+            "pub(super) subject_element_value: &'a str",
+            "pub(super) accept_code: &'a str",
+            "pub(super) accept_expiration: i64",
+            "pub(super) accept_admin: &'a Jid",
+        ] {
+            assert!(output.contains(binding), "missing {binding}");
+        }
+        assert_eq!(output, generate(source, "2.3000.1052559453").unwrap());
+    }
+
     pub(crate) fn fixture() -> Value {
         let ops: Vec<_> = PILOTS.iter().map(|pilot| {
             let assertions = json!([

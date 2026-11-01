@@ -30,5 +30,38 @@
     "Runtime version, stable catalog lock and generated outputs remain at the previous snapshot because all-domain generation has not passed.",
     "Only tooling dependencies were repinned. No server API support was removed.",
     "No bridge or Baileyrs checkouts changed."
-  ]
+  ],
+  "independentPreflight": {
+    "method": "Read the merged generated tree and invoke emitters in memory without writing outputs or disabling group qualification guards. Temporary diagnostic test removed afterward.",
+    "passed": [
+      "targets",
+      "join_shapes",
+      "pilots",
+      "iq_conformance",
+      "community_create",
+      "contextual",
+      "enums",
+      "proto"
+    ],
+    "appstateDelta": {
+      "added": [
+        "BBProPendingCustomerBaseAction",
+        "ContactManagerMetadata",
+        "GroupHistoryToggle"
+      ],
+      "existingActionVersionsAndCollectionsChanged": false
+    },
+    "abpropsDelta": {
+      "added": 564,
+      "removed": 82,
+      "changedCodeTypeOrDefault": 19,
+      "changedDefaultReferencedByCore": {
+        "name": "group_history_messages_time_limit_secs",
+        "code": 18406,
+        "before": 1209600,
+        "after": 2592000,
+        "scope": "Snapshot default only; effective account/group properties are resolved by group_history.rs."
+      }
+    }
+  }
 }
