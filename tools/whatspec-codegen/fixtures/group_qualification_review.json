@@ -150,7 +150,12 @@
     "envelope": "group_envelope_oracle.json",
     "create": "group_create_oracle.json",
     "normalization": "group_normalization_oracle.json",
-    "verification": "node tools/whatspec-codegen/fixtures/capture-group-normalization.cjs ../whatspec"
+    "capture": "node tools/whatspec-codegen/fixtures/capture-group-normalization.cjs ../whatspec",
+    "verification": [
+      "node tools/whatspec-codegen/fixtures/capture-group-normalization.cjs ../whatspec | diff - tools/whatspec-codegen/fixtures/group_normalization_oracle.json",
+      "cargo run -p whatspec-codegen -- --check",
+      "cargo nextest run -p wacore --lib stanza::groups"
+    ]
   },
   "contractChange": {
     "field": "rows[].nullResult",
