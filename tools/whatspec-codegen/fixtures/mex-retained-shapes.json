@@ -1,0 +1,154 @@
+{
+  "sourceRev": "c581c20a9d0605df49abf297f2e7cfc04ccf1ff7",
+  "waVersion": "2.3000.1047483476",
+  "fields": [
+    {
+      "operation": "BizQueryOrder",
+      "docId": "26593811266898374",
+      "root": "variablesShape",
+      "path": [
+        "request",
+        "order",
+        "direct_connection_encrypted_info"
+      ],
+      "retained": "string",
+      "observed": null
+    },
+    {
+      "operation": "ContactManagerCustomerProfile",
+      "docId": "29469025239347803",
+      "root": "response",
+      "path": [
+        "xfb_wa_customer_profile",
+        "last_order_date"
+      ],
+      "retained": "string",
+      "observed": null
+    },
+    {
+      "operation": "ContactManagerCustomerProfileUpsert",
+      "docId": "29102382062699337",
+      "root": "variablesShape",
+      "path": [
+        "input"
+      ],
+      "retained": [
+        "string"
+      ],
+      "observed": "string"
+    },
+    {
+      "operation": "ContactManagerCustomerProfileUpsert",
+      "docId": "29102382062699337",
+      "root": "response",
+      "path": [
+        "xfb_wa_upsert_customer_profiles",
+        "profiles",
+        "[]",
+        "lid"
+      ],
+      "retained": "string",
+      "observed": null
+    },
+    {
+      "operation": "ContactManagerCustomerProfiles",
+      "docId": "29693690733569730",
+      "root": "response",
+      "path": [
+        "xfb_wa_customer_profiles",
+        "profiles",
+        "[]",
+        "last_order_date"
+      ],
+      "retained": "string",
+      "observed": null
+    },
+    {
+      "operation": "ContactManagerCustomerProfiles",
+      "docId": "29693690733569730",
+      "root": "response",
+      "path": [
+        "xfb_wa_customer_profiles",
+        "profiles",
+        "[]",
+        "lid"
+      ],
+      "retained": "string",
+      "observed": null
+    },
+    {
+      "operation": "FetchNewsletterPendingInvites",
+      "docId": "28049623068067370",
+      "root": "response",
+      "path": [
+        "xwa2_newsletter_admin",
+        "pending_admin_invites",
+        "[]",
+        "user",
+        "pn"
+      ],
+      "retained": "string",
+      "observed": null
+    },
+    {
+      "operation": "QueryCatalog",
+      "docId": "30445081048424116",
+      "root": "variablesShape",
+      "path": [
+        "request",
+        "product_catalog",
+        "direct_connection_encrypted_info"
+      ],
+      "retained": "string",
+      "observed": null
+    },
+    {
+      "operation": "QueryCatalogHasCategories",
+      "docId": "9746549555457302",
+      "root": "variablesShape",
+      "path": [
+        "request",
+        "categories",
+        "direct_connection_encrypted_info"
+      ],
+      "retained": "string",
+      "observed": null
+    },
+    {
+      "operation": "QueryCatalogProduct",
+      "docId": "9660926520672123",
+      "root": "variablesShape",
+      "path": [
+        "request",
+        "product",
+        "direct_connection_encrypted_info"
+      ],
+      "retained": "string",
+      "observed": null
+    },
+    {
+      "operation": "QueryProductCollections",
+      "docId": "9430970660362540",
+      "root": "variablesShape",
+      "path": [
+        "request",
+        "collections",
+        "direct_connection_encrypted_info"
+      ],
+      "retained": "string",
+      "observed": null
+    },
+    {
+      "operation": "QueryProductSingleCollection",
+      "docId": "9546992575408789",
+      "root": "variablesShape",
+      "path": [
+        "request",
+        "collection",
+        "direct_connection_encrypted_info"
+      ],
+      "retained": "string",
+      "observed": null
+    }
+  ]
+}

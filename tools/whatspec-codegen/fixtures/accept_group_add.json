@@ -1,44 +1,30 @@
 {
   "schemaVersion": 1,
-  "whatspecRev": "c581c20a9d0605df49abf297f2e7cfc04ccf1ff7",
-  "waVersion": "2.3000.1047483476",
-  "setHash": "05609307e68b0f6ccfd2a121a573049999e38b752cfe7155ebbe5c661805751b",
-  "archiveSha256": "22243b9c2ff18a66cea8fd66551821fe0f9f09786d107e2be8284637db86c349",
-  "asset": "https://github.com/oxidezap/whatspec/releases/download/bundle-store/bundles-2.3000.1047483476-05609307e68b0f6ccfd2a121a573049999e38b752cfe7155ebbe5c661805751b.tar.xz",
+  "whatspecRev": "ae3880925bacd23863cc30ec480c9f82bfd869f1",
+  "waVersion": "2.3000.1052559453",
+  "setHash": "d6ab7ae601eda281cfac570a68de1d787adde8f4d778f0bb994416f661a21abf",
+  "archiveSha256": "2958d99a3d84141fa8479f1f991e06246e68c063ca8f618a8d5d361287387f62",
+  "asset": "https://github.com/oxidezap/whatspec/releases/download/bundle-store/bundles-2.3000.1052559453-d6ab7ae601eda281cfac570a68de1d787adde8f4d778f0bb994416f661a21abf.tar.xz",
   "modules": [
     {
       "name": "WASmaxParseUtils",
-      "bundleSha256": "09d91fdc4089c50ab1d35dd6c796ee82ef4c3296710316d20383c85738b871b8",
-      "startByte": 2256336,
-      "endByte": 2263058,
-      "moduleSha256": "a2bbd76df3740e48f0f5c979c5ecc94d30217e726c7b42f2b23490161bcc42e6"
-    },
-    {
-      "name": "WASmaxInGroupsAcceptGroupAddResponseGroupJoinRequestSuccess",
-      "bundleSha256": "34859849724a114869fd78e4479a6c412b4ab3ec36c3da2985d8ec4ecb75d5d2",
-      "startByte": 4229,
-      "endByte": 4728,
-      "moduleSha256": "3e137254ccda2e5b4b5d97fd512fe1ff74449cb360886195ecd46e098956718a"
-    },
-    {
-      "name": "WASmaxInGroupsAcceptGroupAddResponseSuccess",
-      "bundleSha256": "34859849724a114869fd78e4479a6c412b4ab3ec36c3da2985d8ec4ecb75d5d2",
-      "startByte": 5098,
-      "endByte": 5459,
-      "moduleSha256": "2881a4c961499317969ca0c9a4ddbbd41cc60f4c0ac6567467e4ffc9cce62354"
+      "bundleSha256": "a018f64e2c88a44300ee70b669e4fbfdb09d2491aa0552b48bbad42d39614d42",
+      "startByte": 27431,
+      "endByte": 34172,
+      "moduleSha256": "972c3f403bc0588e2060897999b16426511d058165bd7b602dc6869eb6718889"
     },
     {
       "name": "WASmaxGroupsAcceptGroupAddRPC",
-      "bundleSha256": "34859849724a114869fd78e4479a6c412b4ab3ec36c3da2985d8ec4ecb75d5d2",
-      "startByte": 5922,
-      "endByte": 7533,
-      "moduleSha256": "2167e222e0875e85276bd519e5bd86839ba1e92808af5a1320b424d84ca3d7ae"
+      "bundleSha256": "29bc9cdd1e375455ed50fd0505d66eae6d7635bbab9aeee94851139d0ac38b82",
+      "startByte": 19,
+      "endByte": 6075,
+      "moduleSha256": "de8a93c8f1a2460f967ff5ef44fff52dbd4f907d80cc56ee6b3c931ea12bdda2"
     }
   ],
   "successContracts": [
     {
       "tag": "AcceptGroupAddResponseGroupJoinRequestSuccess",
-      "moduleName": "WASmaxInGroupsAcceptGroupAddResponseGroupJoinRequestSuccess",
+      "moduleName": "WASmaxGroupsAcceptGroupAddRPC",
       "kind": "success",
       "assertions": [
         {
@@ -82,7 +68,7 @@
     },
     {
       "tag": "AcceptGroupAddResponseSuccess",
-      "moduleName": "WASmaxInGroupsAcceptGroupAddResponseSuccess",
+      "moduleName": "WASmaxGroupsAcceptGroupAddRPC",
       "kind": "success",
       "assertions": [
         {

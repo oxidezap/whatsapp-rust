@@ -283,6 +283,18 @@ fn stamped_version(ir: &Ir) -> Result<String> {
 }
 
 fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
+    ensure!(
+        ir.get("notif/group-envelope.json")? == include_bytes!("../fixtures/group_envelope.json"),
+        "qualified group envelope fixture differs from pinned IR"
+    );
+    ensure!(
+        ir.get("notif/group-link.json")? == include_bytes!("../fixtures/group_link.json"),
+        "qualified group link fixture differs from pinned IR"
+    );
+    ensure!(
+        ir.get("notif/group-unlink.json")? == include_bytes!("../fixtures/group_unlink.json"),
+        "qualified group unlink fixture differs from pinned IR"
+    );
     let abprops: ir::AbPropsIr =
         serde_json::from_str(&ir.text("abprops/index.json")?).context("parsing the abprops IR")?;
     let appstate: ir::AppstateIr = serde_json::from_str(&ir.text("appstate/index.json")?)
@@ -316,6 +328,11 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
     );
 
     Ok(vec![
+        Artifact {
+            path: "wacore/src/stanza/groups/normalization_conformance.rs",
+            content: emit::group_normalization::conformance(wa_version)?,
+            rust: true,
+        },
         Artifact {
             path: "wacore/src/stanza/groups/actions_conformance.rs",
             content: emit::group_actions_conformance::generate(wa_version)?,

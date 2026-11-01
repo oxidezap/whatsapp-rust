@@ -132,9 +132,10 @@ fn props_frame() -> (Vec<u8>, usize, usize) {
                 AbDefault::Int(_) => (next() % 1_000_000).to_string(),
                 AbDefault::Float(_) => format!("{:.3}", (next() % 10_000) as f64 / 100.0),
                 // Server-side strings are ids, JSON and lists. The catalog
-                // has 177 of them; an opaque 160-character token each is what
-                // brings the frame to the size the C3 saw.
-                AbDefault::Str(_) => (0..10).map(|_| format!("{:016x}", next())).collect(),
+                // contains more string props in the new capture; 112-character
+                // tokens keep this hardware regression near its original
+                // compressed frame size without raising the memory budget.
+                AbDefault::Str(_) => (0..7).map(|_| format!("{:016x}", next())).collect(),
             };
             children.push(
                 NodeBuilder::new("prop")

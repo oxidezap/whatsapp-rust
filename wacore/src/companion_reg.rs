@@ -114,7 +114,10 @@ pub const fn companion_web_client_type_for_platform(
         | P::SMARTGLASSES
         | P::WAIL
         | P::WASS
-        | P::BUSINESS_BACK_OFFICE => C::OtherWebClient,
+        | P::BUSINESS_BACK_OFFICE
+        | P::WAIL_WAI
+        | P::WAIL_ALEXA
+        | P::AUTOMOTIVE => C::OtherWebClient,
         _ => C::OtherWebClient,
     }
 }
@@ -334,6 +337,9 @@ mod tests {
             P::WAIL,
             P::WASS,
             P::BUSINESS_BACK_OFFICE,
+            P::WAIL_WAI,
+            P::WAIL_ALEXA,
+            P::AUTOMOTIVE,
         ] {
             assert_eq!(
                 companion_web_client_type_for_platform(pt),

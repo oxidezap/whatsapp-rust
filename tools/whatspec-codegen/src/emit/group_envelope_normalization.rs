@@ -6,8 +6,8 @@ mod ir;
 use super::{header, rust_str};
 use ir::*;
 
-const REV: &str = "adbe317bf0320bb0cb83824722f6eb60c2ac69da";
-const CONTRACT_SHA: &str = "657e610570e886784cdda871495912926ff2f8caf8369c7c8c086aa0c38aae99";
+const REV: &str = "ae3880925bacd23863cc30ec480c9f82bfd869f1";
+const CONTRACT_SHA: &str = "0c2fc8456a028c0d3cf253cb0d9cd142cf031bcc35d4b702a6cf329e6046effa";
 const CONTRACT: &str = include_str!("../../fixtures/group_envelope.json");
 struct Compiler {
     locals: u32,
@@ -181,7 +181,7 @@ impl Compiler {
 }
 fn generate_contract(contract: &GroupEnvelopeContract, wa_version: &str) -> Result<String> {
     ensure!(
-        wa_version == "2.3000.1047483476",
+        wa_version == "2.3000.1052559453",
         "envelope program needs version review"
     );
     ensure!(
@@ -311,7 +311,7 @@ mod tests {
     use super::*;
     #[test]
     fn current_program_has_lazy_context_and_actual_action_locals() {
-        let out = generate("2.3000.1047483476").unwrap();
+        let out = generate("2.3000.1052559453").unwrap();
         assert!(out.contains("Fact::MeDeviceLid"));
         assert!(out.contains("State::new(17,15,16)"));
         assert!(out.contains("finish_projection"));
@@ -320,7 +320,7 @@ mod tests {
     fn malformed_local_and_action_boundary_fail_closed() {
         let mut c: GroupEnvelopeContract = serde_json::from_str(CONTRACT).unwrap();
         c.actions.result_local = c.locals;
-        assert!(generate_contract(&c, "2.3000.1047483476").is_err());
+        assert!(generate_contract(&c, "2.3000.1052559453").is_err());
     }
     #[test]
     fn version_drift_requires_qualification() {
@@ -340,6 +340,6 @@ mod tests {
             method: GroupEnvelopeRead::AttrGroupJid,
             name: "from".into(),
         };
-        assert!(generate_contract(&contract, "2.3000.1047483476").is_err());
+        assert!(generate_contract(&contract, "2.3000.1052559453").is_err());
     }
 }

@@ -1,8 +1,9 @@
-//! Contextual validation and a qualified unlink projection. This is deliberately
-//! opt-in until create/link and effective account gates are qualified. Existing
+//! Contextual validation and source-qualified owned group projections. Existing
 //! public events and the legacy raw-node adapter keep their shape.
+use super::normalization_warning::{Decision, GroupWarningSink, IgnoreWarnings};
 pub use super::normalized_notification::{
     GroupNotificationDiagnostic, NormalizedGroupNotification, parse_normalized_group_notification,
+    parse_normalized_group_notification_with_warnings,
 };
 use super::{GroupNotification, GroupParticipantInfo};
 use crate::WireEnum;
@@ -15,6 +16,7 @@ pub struct GroupParseContext<'a> {
     pub me_device_lid: Option<&'a Jid>,
     pub me_device_pn: Option<&'a Jid>,
     pub username_displayed: bool,
+    /// Retained for caller compatibility; this snapshot reads participant history unconditionally.
     pub history_after_join: bool,
     pub opus_enabled: bool,
     pub is_me_account: &'a dyn Fn(&Jid) -> bool,
@@ -67,13 +69,20 @@ pub struct UnlinkedGroup {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedUnlink {
-    /// Upstream returns an undefined action for an unknown unlink type.
+    /// Unknown types warn and return null after payload validation.
     pub kind: Option<GroupUnlinkKind>,
     pub groups: Vec<UnlinkedGroup>,
 }
 
-/// Decode data first, then apply the generated decision table, matching I().
+/// Decode payload before the decision and its warnings, preserving source error order.
 pub fn parse_unlink(node: &NodeRef<'_>) -> Result<NormalizedUnlink, GroupParseError> {
+    parse_unlink_with_warnings(node, &mut IgnoreWarnings)
+}
+
+pub fn parse_unlink_with_warnings(
+    node: &NodeRef<'_>,
+    warnings: &mut dyn GroupWarningSink,
+) -> Result<NormalizedUnlink, GroupParseError> {
     let kind = node
         .get_attr("unlink_type")
         .ok_or(GroupParseError::Field("unlink_type"))?;
@@ -96,7 +105,16 @@ pub fn parse_unlink(node: &NodeRef<'_>) -> Result<NormalizedUnlink, GroupParseEr
         });
     }
     let action =
-        generated::normalize_unlink(&kind.as_str(), reason.map(|v| v.as_str()).as_deref())?;
+        match generated::decide_unlink(&kind.as_str(), reason.map(|v| v.as_str()).as_deref())? {
+            Decision::Action(value) => Some(value),
+            Decision::Null(warning) => {
+                warning.emit(&kind.as_str(), warnings)?;
+                return Ok(NormalizedUnlink {
+                    kind: None,
+                    groups: Vec::new(),
+                });
+            }
+        };
     let kind = action
         .map(|a| {
             GroupUnlinkKind::try_from(a)
@@ -144,12 +162,17 @@ impl GroupNotification {
         node: &NodeRef<'_>,
         context: &GroupParseContext<'_>,
     ) -> Result<Self, GroupParseError> {
-        let parsed = parse_normalized_group_notification(node, context)?;
-        let wire_actions = node.children().into_iter().flatten().filter(|child| {
-            child.tag.as_ref() != super::envelope_runtime::MISSING_IDENTIFICATION_TAG
-        });
+        let (parsed, source_indices) = super::normalized_notification::parse_with_source_indices(
+            node,
+            context,
+            &mut IgnoreWarnings,
+        )?;
+        let children = node.children().unwrap_or_default();
         let mut actions = vec![];
-        for (action, wire) in parsed.actions.iter().zip(wire_actions) {
+        for (action, index) in parsed.actions.iter().zip(source_indices) {
+            let wire = children
+                .get(index)
+                .ok_or(GroupParseError::Field("actions"))?;
             actions.push(super::legacy_adapter::action_to_legacy(action, wire)?);
         }
         if actions.len() != parsed.actions.len() {
@@ -191,6 +214,63 @@ mod tests {
             .attr("from", "123456@g.us")
             .attr("id", "synthetic")
             .attr("t", "123")
+    }
+    #[test]
+    fn null_actions_do_not_shift_legacy_raw_payloads() {
+        let node = base()
+            .children([
+                NodeBuilder::new("link").attr("link_type", "future").build(),
+                NodeBuilder::new("create")
+                    .attr("test_id", "create-source")
+                    .children([NodeBuilder::new("group")
+                        .attr("creation", "123")
+                        .attr("subject", "synthetic")
+                        .build()])
+                    .build(),
+                NodeBuilder::new("unlink")
+                    .attr("unlink_type", "future")
+                    .build(),
+                NodeBuilder::new("link")
+                    .attr("link_type", "parent_group")
+                    .attr("test_id", "link-source")
+                    .build(),
+                NodeBuilder::new("link").attr("link_type", "future").build(),
+                NodeBuilder::new("unlink")
+                    .attr("unlink_type", "parent_group")
+                    .attr("test_id", "unlink-source")
+                    .build(),
+            ])
+            .build();
+        let context = GroupParseContext {
+            me_device_lid: None,
+            me_device_pn: None,
+            username_displayed: false,
+            history_after_join: false,
+            opus_enabled: false,
+            is_me_account: &|_| false,
+            normalize_country_code: &|_| None,
+        };
+        let parsed =
+            GroupNotification::try_from_node_ref_with_context(&node.as_node_ref(), &context)
+                .unwrap();
+        assert_eq!(parsed.actions.len(), 3);
+        for (action, expected) in
+            parsed
+                .actions
+                .iter()
+                .zip(["create-source", "link-source", "unlink-source"])
+        {
+            let raw = match action {
+                GroupNotificationAction::Create { raw }
+                | GroupNotificationAction::Link { raw, .. }
+                | GroupNotificationAction::Unlink { raw, .. } => raw,
+                _ => panic!("expected raw action"),
+            };
+            assert_eq!(
+                raw.attrs.get("test_id").unwrap().as_str().as_ref(),
+                expected
+            );
+        }
     }
     #[test]
     fn identities_and_first_failure_use_real_context() {
@@ -280,7 +360,7 @@ mod tests {
         );
     }
     #[test]
-    fn participant_defaults_and_history_gate() {
+    fn participant_defaults_and_history_are_independent_of_old_gate() {
         let lid = Jid::lid_device("100001", 2);
         for enabled in [false, true] {
             let context = GroupParseContext {
@@ -316,7 +396,7 @@ mod tests {
                 participants[0].r#type,
                 Some(super::super::GroupParticipantType::Participant)
             );
-            assert_eq!(participants[0].join_time.is_some(), enabled);
+            assert_eq!(participants[0].join_time, Some(123));
             assert!(participants[1].is_admin());
             assert!(participants[1].is_super_admin());
         }

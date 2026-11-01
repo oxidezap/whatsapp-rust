@@ -1,6 +1,6 @@
 {
-  "waVersion": "2.3000.1047483476",
-  "setHash": "05609307e68b0f6ccfd2a121a573049999e38b752cfe7155ebbe5c661805751b",
+  "waVersion": "2.3000.1052559453",
+  "setHash": "d6ab7ae601eda281cfac570a68de1d787adde8f4d778f0bb994416f661a21abf",
   "cases": [
     {
       "name": "add-reason-normalizes-admin-key",
@@ -59,7 +59,9 @@
                 "isAdmin": true,
                 "lid": null,
                 "phoneNumber": null,
-                "username": "ungated"
+                "username": "ungated",
+                "joinTime": null,
+                "groupHistorySentState": null
               }
             ],
             "reason": "default_subgroup_admin_add",
@@ -362,7 +364,9 @@
                 "isAdmin": false,
                 "lid": null,
                 "phoneNumber": null,
-                "username": null
+                "username": null,
+                "joinTime": null,
+                "groupHistorySentState": null
               }
             ]
           }

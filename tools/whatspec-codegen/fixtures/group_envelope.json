@@ -1,7 +1,7 @@
 {
   "moduleName": "WAWebHandleGroupNotification",
-  "startByte": 10592,
-  "endByte": 22915,
+  "startByte": 10858,
+  "endByte": 23344,
   "locals": 17,
   "prefix": [
     {
@@ -433,8 +433,8 @@
     }
   ],
   "actions": {
-    "startByte": 11866,
-    "endByte": 22623,
+    "startByte": 12132,
+    "endByte": 23052,
     "resultLocal": 16,
     "missingIdentificationLocal": 15,
     "missingIdentificationTag": "missing_participant_identification",

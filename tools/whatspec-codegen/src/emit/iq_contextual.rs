@@ -56,18 +56,18 @@ pub fn revision() -> Result<String> {
 }
 
 const MODULES: &[&str] = &[
-    "WASmaxOutGroupsSetSubjectRequest",
-    "WASmaxOutGroupsAcceptGroupAddRequest",
-    "WASmaxOutGroupsJoinLinkedGroupRequest",
-    "WASmaxOutGroupsDeleteParentGroupRequest",
-    "WASmaxOutPassiveModeActiveIQRequest",
-    "WASmaxOutPassiveModePassiveIQRequest",
+    "WASmaxGroupsSetSubjectRPC",
+    "WASmaxGroupsAcceptGroupAddRPC",
+    "WASmaxGroupsJoinLinkedGroupRPC",
+    "WASmaxGroupsDeleteParentGroupRPC",
+    "WASmaxPassiveModeActiveIQRPC",
+    "WASmaxPassiveModePassiveIQRPC",
     "WASmaxOutMdGetCountryCodeRequest",
 ];
 
 pub fn generate(wa_version: &str) -> Result<String> {
-    // Dedicated input projection avoids repinning unrelated domains while the
-    // source IQ PR is still under review. See iq-contextual.lock.json.
+    // Keep the qualified contextual RPC subset independently hashed and reject
+    // source drift before code generation. See iq-contextual.lock.json.
     let json = include_str!("../../fixtures/contextual_iq.json");
     let lock = source_lock()?;
     ensure!(

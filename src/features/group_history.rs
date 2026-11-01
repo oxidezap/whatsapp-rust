@@ -439,6 +439,10 @@ history_field_whitelist!(
                 newsletter_scheduled_message => is_unset,
                 acp2_setting_message => is_unset,
                 audio_sticker_message => is_unset,
+                instant_image_message => is_unset,
+                request_location_message => is_unset,
+                bot_group_participant_message => is_unset,
+                request_location_update_message => is_unset,
             ]
 );
 
@@ -463,6 +467,7 @@ history_field_whitelist!(
                         associated_primary_identity_key => is_none,
                         tee_context_anchor_message_id => is_none,
                         acp2_setting => is_unset,
+                        light_e2_ee => is_none,
                     ]
 );
 
@@ -651,23 +656,13 @@ pub(crate) fn resolve_group_history_limits(
         .ok_or(GroupHistoryPolicyError::InvalidLimit(
             "group_history_messages_time_limit_secs",
         ))?;
-    let default_window = match abprops::web::GROUP_HISTORY_MESSAGES_TIME_LIMIT_SECS.default {
-        abprops::AbDefault::Int(value) => value,
-        _ => unreachable!("generated account history window has integer default"),
-    };
-    let effective_window = if account_window != default_window {
-        account_window
-    } else {
-        group_int(
-            &group_values,
-            abprops::group::GROUP_HISTORY_MESSAGES_TIME_LIMIT_SECS_GROUP_LEVEL,
-        )?
-    };
-    let time_window_seconds = u64::try_from(effective_window)
+    // The current Web retrieval path reads the account window directly, even
+    // when it equals the registry default (WAWebRetrieveMessagesForBundle).
+    let time_window_seconds = u64::try_from(account_window)
         .ok()
         .filter(|v| *v > 0)
         .ok_or(GroupHistoryPolicyError::InvalidLimit(
-            "group_history_messages_time_limit_secs_group_level",
+            "group_history_messages_time_limit_secs",
         ))?;
 
     let max_messages = account
@@ -699,21 +694,6 @@ fn group_bool(
         "0" | "false" | "disabled" => Ok(false),
         _ => Err(GroupHistoryPolicyError::InvalidGroupProp(prop.name)),
     }
-}
-
-fn group_int(
-    values: &HashMap<u32, &str>,
-    prop: abprops::AbProp,
-) -> Result<i64, GroupHistoryPolicyError> {
-    let default = match prop.default {
-        abprops::AbDefault::Int(value) => value,
-        _ => unreachable!("generated group history limit has integer default"),
-    };
-    values.get(&prop.code).map_or(Ok(default), |value| {
-        value
-            .parse()
-            .map_err(|_| GroupHistoryPolicyError::InvalidGroupProp(prop.name))
-    })
 }
 
 #[cfg(test)]
@@ -1149,10 +1129,17 @@ mod tests {
 
     #[test]
     fn new_capture_message_fields_are_not_forwarded_as_plain_history_text() {
-        // conversation="x" plus an empty field 132, 133 or 134. Presence of
+        // conversation="x" plus an empty field 132 through 138. Presence of
         // the new payload is enough to reject it from the text-only path.
-        for tag in [0xa2, 0xaa, 0xb2] {
+        for tag in [0xa2, 0xaa, 0xb2, 0xba, 0xc2, 0xca, 0xd2] {
             let content = waproto::codec::message_decode(&[0x0a, 1, b'x', tag, 8, 0]).unwrap();
+            assert!(!is_shareable_history_text(&content));
+        }
+        // Field 22 in context info is significant even when explicitly false.
+        for flag in [0, 1] {
+            let content =
+                waproto::codec::message_decode(&[0x0a, 1, b'x', 0x9a, 2, 3, 0xb0, 1, flag])
+                    .unwrap();
             assert!(!is_shareable_history_text(&content));
         }
     }
@@ -1327,7 +1314,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn group_sender_override_and_group_specific_window_are_used() {
+    async fn group_sender_override_preserves_account_window_default() {
         let account = account_snapshot(&[]).await;
         let group = group_props(&[
             (abprops::group::GROUP_HISTORY_SEND_GROUP_LEVEL.code, "true"),
@@ -1341,9 +1328,37 @@ mod tests {
             resolve_group_history_limits(&account, &group),
             Ok(GroupHistoryLimits {
                 max_messages: 100,
-                time_window_seconds: 86400,
+                time_window_seconds: u64::try_from(
+                    account
+                        .get_int(abprops::web::GROUP_HISTORY_MESSAGES_TIME_LIMIT_SECS)
+                        .unwrap(),
+                )
+                .unwrap(),
             })
         );
+    }
+
+    // WhatsApp 2.3000.1052559453: WAWebGroupHistoryGating and both identical
+    // WAWebRetrieveMessagesForBundle definitions read the account window directly.
+    // The group window remains catalogued but is not consulted on this path.
+    #[tokio::test]
+    async fn account_history_windows_do_not_fall_back_to_group_window() {
+        let group = group_props(&[
+            (abprops::group::GROUP_HISTORY_SEND_GROUP_LEVEL.code, "1"),
+            (
+                abprops::group::GROUP_HISTORY_MESSAGES_TIME_LIMIT_SECS_GROUP_LEVEL.code,
+                "7200",
+            ),
+        ]);
+        for window in ["1209600", "2592000"] {
+            let account = account_snapshot(&[(
+                abprops::web::GROUP_HISTORY_MESSAGES_TIME_LIMIT_SECS.code,
+                window,
+            )])
+            .await;
+            let limits = resolve_group_history_limits(&account, &group).unwrap();
+            assert_eq!(limits.time_window_seconds, window.parse::<u64>().unwrap());
+        }
     }
 
     #[tokio::test]

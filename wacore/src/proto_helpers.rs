@@ -4,7 +4,7 @@ use waproto::whatsapp as wa;
 
 /// Direct `Message` fields whose payload declares `ContextInfo` in the schema.
 /// The order preserves the helpers' first-carrier precedence; new carriers are
-/// appended. All 42 direct carriers are included, even non-renderable bodies:
+/// appended. All direct carriers are included, even non-renderable bodies:
 /// these helpers expose schema fields, not a promise that a body can be sent.
 /// `MessageContextInfo`, wrapper contents, and contexts nested inside payloads
 /// are distinct and are not direct carriers. Wire metadata lets history sync
@@ -54,6 +54,8 @@ macro_rules! with_context_info_fields {
             event_invite_message => EVENT_INVITE_MESSAGE / message::event_invite_message,
             split_payment_message => SPLIT_PAYMENT_MESSAGE / message::split_payment_message,
             music_message => MUSIC_MESSAGE / message::music_message,
+            instant_image_message => INSTANT_IMAGE_MESSAGE / message::image_message,
+            request_location_message => REQUEST_LOCATION_MESSAGE / message::request_location_message,
         }
     };
 }

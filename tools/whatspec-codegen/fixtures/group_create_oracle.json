@@ -1,6 +1,6 @@
 {
-  "waVersion": "2.3000.1047483476",
-  "setHash": "05609307e68b0f6ccfd2a121a573049999e38b752cfe7155ebbe5c661805751b",
+  "waVersion": "2.3000.1052559453",
+  "setHash": "d6ab7ae601eda281cfac570a68de1d787adde8f4d778f0bb994416f661a21abf",
   "cases": [
     {
       "name": "default-and-unconditional-participant-username",
@@ -61,7 +61,9 @@
               "isAdmin": false,
               "lid": null,
               "phoneNumber": null,
-              "username": "ungated"
+              "username": "ungated",
+              "joinTime": null,
+              "groupHistorySentState": null
             },
             {
               "displayName": null,
@@ -70,7 +72,9 @@
               "isAdmin": true,
               "lid": null,
               "phoneNumber": null,
-              "username": null
+              "username": null,
+              "joinTime": null,
+              "groupHistorySentState": null
             }
           ],
           "support": false,
@@ -85,7 +89,8 @@
           "groupSafetyCheck": false,
           "hasCapi": false,
           "limitSharingEnabled": false
-        }
+        },
+        "isNewGroup": false
       }
     },
     {
@@ -120,7 +125,7 @@
       "error": "XmppParsingFailure: synthetic: expected <participant> to have \"type\"={superadmin|admin|participant} but has value \"future_role\""
     },
     {
-      "name": "disabled-country-and-history-gates",
+      "name": "invalid-participant-join-time-error",
       "flags": {
         "history": false,
         "username": false,
@@ -151,44 +156,7 @@
           }
         ]
       },
-      "success": {
-        "actionType": "create",
-        "reason": null,
-        "contextGroupId": null,
-        "groupInfo": {
-          "subject": "synthetic group",
-          "restrict": false,
-          "announce": false,
-          "noFrequentlyForwarded": false,
-          "creatorPn": null,
-          "creatorCountryCode": null,
-          "creatorUsername": null,
-          "creation": 123,
-          "participants": [
-            {
-              "displayName": null,
-              "id": "100001@lid",
-              "isSuperAdmin": false,
-              "isAdmin": false,
-              "lid": null,
-              "phoneNumber": null,
-              "username": null
-            }
-          ],
-          "support": false,
-          "isParentGroup": false,
-          "isParentGroupClosed": false,
-          "defaultSubgroup": false,
-          "generalSubgroup": false,
-          "membershipApprovalMode": false,
-          "allowNonAdminSubGroupCreation": false,
-          "generalChatAutoAddDisabled": false,
-          "hiddenSubgroup": false,
-          "groupSafetyCheck": false,
-          "hasCapi": false,
-          "limitSharingEnabled": false
-        }
-      }
+      "error": "XmppParsingFailure: synthetic: expected <participant> to have \"join_time\"={integer} but has value \"invalid\""
     },
     {
       "name": "new-group-unknown-trigger",
@@ -249,7 +217,8 @@
           "groupSafetyCheck": false,
           "hasCapi": false,
           "limitSharingEnabled": false
-        }
+        },
+        "isNewGroup": true
       }
     },
     {
@@ -312,7 +281,8 @@
           "groupSafetyCheck": false,
           "hasCapi": false,
           "limitSharingEnabled": false
-        }
+        },
+        "isNewGroup": false
       }
     },
     {
@@ -424,7 +394,8 @@
           "hasCapi": false,
           "limitSharingEnabled": false,
           "memberAddMode": "all_member_add"
-        }
+        },
+        "isNewGroup": false
       }
     },
     {
@@ -494,7 +465,8 @@
           "groupSafetyCheck": false,
           "hasCapi": false,
           "limitSharingEnabled": false
-        }
+        },
+        "isNewGroup": false
       }
     },
     {
@@ -532,6 +504,366 @@
         ]
       },
       "error": "XmppParsingFailure: synthetic: expected <description> to have attribute \"id\""
+    },
+    {
+      "name": "history-share-mode-admin_share",
+      "flags": {
+        "history": false,
+        "username": false,
+        "opus": false
+      },
+      "input": {
+        "tag": "create",
+        "attrs": {},
+        "children": [
+          {
+            "tag": "group",
+            "attrs": {
+              "subject": "synthetic",
+              "creation": "123"
+            },
+            "children": [
+              {
+                "tag": "member_share_group_history_mode",
+                "attrs": {},
+                "bytes": [
+                  97,
+                  100,
+                  109,
+                  105,
+                  110,
+                  95,
+                  115,
+                  104,
+                  97,
+                  114,
+                  101
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "success": {
+        "actionType": "create",
+        "reason": null,
+        "contextGroupId": null,
+        "groupInfo": {
+          "subject": "synthetic",
+          "restrict": false,
+          "announce": false,
+          "noFrequentlyForwarded": false,
+          "creatorPn": null,
+          "creatorCountryCode": null,
+          "creatorUsername": null,
+          "creation": 123,
+          "participants": [],
+          "support": false,
+          "isParentGroup": false,
+          "isParentGroupClosed": false,
+          "defaultSubgroup": false,
+          "generalSubgroup": false,
+          "membershipApprovalMode": false,
+          "allowNonAdminSubGroupCreation": false,
+          "generalChatAutoAddDisabled": false,
+          "hiddenSubgroup": false,
+          "groupSafetyCheck": false,
+          "hasCapi": false,
+          "limitSharingEnabled": false,
+          "memberShareGroupHistoryMode": "admin_share"
+        },
+        "isNewGroup": false
+      }
+    },
+    {
+      "name": "history-share-mode-all_member_share",
+      "flags": {
+        "history": false,
+        "username": false,
+        "opus": false
+      },
+      "input": {
+        "tag": "create",
+        "attrs": {},
+        "children": [
+          {
+            "tag": "group",
+            "attrs": {
+              "subject": "synthetic",
+              "creation": "123"
+            },
+            "children": [
+              {
+                "tag": "member_share_group_history_mode",
+                "attrs": {},
+                "bytes": [
+                  97,
+                  108,
+                  108,
+                  95,
+                  109,
+                  101,
+                  109,
+                  98,
+                  101,
+                  114,
+                  95,
+                  115,
+                  104,
+                  97,
+                  114,
+                  101
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "success": {
+        "actionType": "create",
+        "reason": null,
+        "contextGroupId": null,
+        "groupInfo": {
+          "subject": "synthetic",
+          "restrict": false,
+          "announce": false,
+          "noFrequentlyForwarded": false,
+          "creatorPn": null,
+          "creatorCountryCode": null,
+          "creatorUsername": null,
+          "creation": 123,
+          "participants": [],
+          "support": false,
+          "isParentGroup": false,
+          "isParentGroupClosed": false,
+          "defaultSubgroup": false,
+          "generalSubgroup": false,
+          "membershipApprovalMode": false,
+          "allowNonAdminSubGroupCreation": false,
+          "generalChatAutoAddDisabled": false,
+          "hiddenSubgroup": false,
+          "groupSafetyCheck": false,
+          "hasCapi": false,
+          "limitSharingEnabled": false,
+          "memberShareGroupHistoryMode": "all_member_share"
+        },
+        "isNewGroup": false
+      }
+    },
+    {
+      "name": "history-share-mode-future_mode",
+      "flags": {
+        "history": false,
+        "username": false,
+        "opus": false
+      },
+      "input": {
+        "tag": "create",
+        "attrs": {},
+        "children": [
+          {
+            "tag": "group",
+            "attrs": {
+              "subject": "synthetic",
+              "creation": "123"
+            },
+            "children": [
+              {
+                "tag": "member_share_group_history_mode",
+                "attrs": {},
+                "bytes": [
+                  102,
+                  117,
+                  116,
+                  117,
+                  114,
+                  101,
+                  95,
+                  109,
+                  111,
+                  100,
+                  101
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "success": {
+        "actionType": "create",
+        "reason": null,
+        "contextGroupId": null,
+        "groupInfo": {
+          "subject": "synthetic",
+          "restrict": false,
+          "announce": false,
+          "noFrequentlyForwarded": false,
+          "creatorPn": null,
+          "creatorCountryCode": null,
+          "creatorUsername": null,
+          "creation": 123,
+          "participants": [],
+          "support": false,
+          "isParentGroup": false,
+          "isParentGroupClosed": false,
+          "defaultSubgroup": false,
+          "generalSubgroup": false,
+          "membershipApprovalMode": false,
+          "allowNonAdminSubGroupCreation": false,
+          "generalChatAutoAddDisabled": false,
+          "hiddenSubgroup": false,
+          "groupSafetyCheck": false,
+          "hasCapi": false,
+          "limitSharingEnabled": false
+        },
+        "isNewGroup": false
+      }
+    },
+    {
+      "name": "history-is-read-without-feature-gate",
+      "flags": {
+        "history": false,
+        "username": false,
+        "opus": false
+      },
+      "input": {
+        "tag": "create",
+        "attrs": {},
+        "children": [
+          {
+            "tag": "group",
+            "attrs": {
+              "subject": "synthetic",
+              "creation": "123"
+            },
+            "children": [
+              {
+                "tag": "participant",
+                "attrs": {
+                  "jid": "100001@lid",
+                  "join_time": "123",
+                  "group_history_sent_state": "HISTORY_SENT"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "success": {
+        "actionType": "create",
+        "reason": null,
+        "contextGroupId": null,
+        "groupInfo": {
+          "subject": "synthetic",
+          "restrict": false,
+          "announce": false,
+          "noFrequentlyForwarded": false,
+          "creatorPn": null,
+          "creatorCountryCode": null,
+          "creatorUsername": null,
+          "creation": 123,
+          "participants": [
+            {
+              "displayName": null,
+              "id": "100001@lid",
+              "isSuperAdmin": false,
+              "isAdmin": false,
+              "lid": null,
+              "phoneNumber": null,
+              "username": null,
+              "joinTime": 123,
+              "groupHistorySentState": 2
+            }
+          ],
+          "support": false,
+          "isParentGroup": false,
+          "isParentGroupClosed": false,
+          "defaultSubgroup": false,
+          "generalSubgroup": false,
+          "membershipApprovalMode": false,
+          "allowNonAdminSubGroupCreation": false,
+          "generalChatAutoAddDisabled": false,
+          "hiddenSubgroup": false,
+          "groupSafetyCheck": false,
+          "hasCapi": false,
+          "limitSharingEnabled": false
+        },
+        "isNewGroup": false
+      }
+    },
+    {
+      "name": "disabled-creator-country-and-username-success",
+      "flags": {
+        "history": false,
+        "username": false,
+        "opus": false
+      },
+      "input": {
+        "tag": "create",
+        "attrs": {},
+        "children": [
+          {
+            "tag": "group",
+            "attrs": {
+              "subject": "synthetic",
+              "creation": "123",
+              "creator_country_code": "future",
+              "creator_username": "gated",
+              "s_o_username": "gated"
+            },
+            "children": [
+              {
+                "tag": "participant",
+                "attrs": {
+                  "jid": "100001@lid",
+                  "join_time": "123"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "success": {
+        "actionType": "create",
+        "reason": null,
+        "contextGroupId": null,
+        "groupInfo": {
+          "subject": "synthetic",
+          "restrict": false,
+          "announce": false,
+          "noFrequentlyForwarded": false,
+          "creatorPn": null,
+          "creatorCountryCode": null,
+          "creatorUsername": null,
+          "creation": 123,
+          "participants": [
+            {
+              "displayName": null,
+              "id": "100001@lid",
+              "isSuperAdmin": false,
+              "isAdmin": false,
+              "lid": null,
+              "phoneNumber": null,
+              "username": null,
+              "joinTime": 123,
+              "groupHistorySentState": null
+            }
+          ],
+          "support": false,
+          "isParentGroup": false,
+          "isParentGroupClosed": false,
+          "defaultSubgroup": false,
+          "generalSubgroup": false,
+          "membershipApprovalMode": false,
+          "allowNonAdminSubGroupCreation": false,
+          "generalChatAutoAddDisabled": false,
+          "hiddenSubgroup": false,
+          "groupSafetyCheck": false,
+          "hasCapi": false,
+          "limitSharingEnabled": false
+        },
+        "isNewGroup": false
+      }
     }
   ]
 }

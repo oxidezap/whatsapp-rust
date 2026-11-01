@@ -13,12 +13,12 @@ fn maybe(map: &mut Map<String, Value>, name: &str, value: Option<Value>) {
 fn string<T: ToString>(value: &T) -> Value {
     Value::String(value.to_string())
 }
-fn participant(p: &CreateParticipant, history: bool) -> Value {
+fn participant(p: &CreateParticipant, _history: bool) -> Value {
     let mut value = json!({
         "displayName":p.display_name,"id":p.id.to_string(),"isSuperAdmin":p.is_super_admin,"isAdmin":p.is_admin,
         "lid":p.lid.as_ref().map(ToString::to_string),"phoneNumber":p.phone_number.as_ref().map(ToString::to_string),"username":p.username,
     });
-    if history {
+    {
         value["joinTime"] = json!(p.join_time);
         value["groupHistorySentState"] = json!(p.history_sent_state_code());
     }

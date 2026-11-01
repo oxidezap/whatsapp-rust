@@ -1,4 +1,4 @@
-//! Auto-generated AppState (syncd) action schemas (WhatsApp 2.3000.1047483476). DO NOT EDIT.
+//! Auto-generated AppState (syncd) action schemas (WhatsApp 2.3000.1052559453). DO NOT EDIT.
 //!
 //! Typed registry of syncd actions: collection, version, scope, value proto type,
 //! enum fields, and the mutation-index parts. `const`/`&'static`, no deps.
@@ -407,6 +407,26 @@ pub const AVATAR_UPDATED: Schema = Schema {
     }],
 };
 
+/// `BBProPendingCustomerBaseAction` — module `WAWebBizBroadcastProPendingActionSync`.
+pub const BB_PRO_PENDING_CUSTOMER_BASE_ACTION: Schema = Schema {
+    key: "BBProPendingCustomerBaseAction",
+    name: "bb_pro_pending_customer_base_action",
+    module: "WAWebBizBroadcastProPendingActionSync",
+    collection: Collection::RegularLow,
+    version: 7,
+    scope: Scope::Account,
+    value_field: Some("bbProPendingCustomerBaseAction"),
+    value_proto_type: Some("SyncActionValue.BBProPendingCustomerBaseAction"),
+    value_enum_fields: &[],
+    chat_jid_index: None,
+    index_parts: &[
+        IndexPart::Literal {
+            value: "bb_pro_pending_customer_base_action",
+        },
+        IndexPart::StringPart { name: "action" },
+    ],
+};
+
 /// `BizAiSettingsNudge` — module `WAWebBizAiSettingsNudgeSync`.
 pub const BIZ_AI_SETTINGS_NUDGE: Schema = Schema {
     key: "BizAiSettingsNudge",
@@ -463,7 +483,7 @@ pub const BUSINESS_BROADCAST_CAMPAIGN: Schema = Schema {
         IndexPart::Literal {
             value: "business_broadcast_campaign",
         },
-        IndexPart::StringPart { name: "campaign" },
+        IndexPart::StringPart { name: "campaignId" },
     ],
 };
 
@@ -628,6 +648,23 @@ pub const CONTACT: Schema = Schema {
         IndexPart::Literal { value: "contact" },
         IndexPart::StringPart { name: "id" },
     ],
+};
+
+/// `ContactManagerMetadata` — module `WAWebContactManagerMetadataSync`.
+pub const CONTACT_MANAGER_METADATA: Schema = Schema {
+    key: "ContactManagerMetadata",
+    name: "contact_manager_metadata",
+    module: "WAWebContactManagerMetadataSync",
+    collection: Collection::RegularLow,
+    version: 1,
+    scope: Scope::Account,
+    value_field: Some("contactManagerMetadataAction"),
+    value_proto_type: Some("SyncActionValue.ContactManagerMetadataAction"),
+    value_enum_fields: &[],
+    chat_jid_index: None,
+    index_parts: &[IndexPart::Literal {
+        value: "contact_manager_metadata",
+    }],
 };
 
 /// `CustomPaymentMethods` — module `WAWebCustomPaymentMethodsSync`.
@@ -799,6 +836,29 @@ pub const FAVORITES: Schema = Schema {
     value_enum_fields: &[],
     chat_jid_index: None,
     index_parts: &[IndexPart::Literal { value: "favorites" }],
+};
+
+/// `GroupHistoryToggle` — module `WAWebGroupHistoryToggleSync`.
+pub const GROUP_HISTORY_TOGGLE: Schema = Schema {
+    key: "GroupHistoryToggle",
+    name: "group_history_toggle",
+    module: "WAWebGroupHistoryToggleSync",
+    collection: Collection::RegularLow,
+    version: 1,
+    scope: Scope::Chat,
+    value_field: Some("groupHistoryToggleAction"),
+    value_proto_type: Some("SyncActionValue.GroupHistoryToggleAction"),
+    value_enum_fields: &[(
+        "groupHistoryToggleMode",
+        "GroupHistoryToggleAction.GroupHistoryToggleMode",
+    )],
+    chat_jid_index: Some(1),
+    index_parts: &[
+        IndexPart::Literal {
+            value: "group_history_toggle",
+        },
+        IndexPart::Jid { name: "chatJid" },
+    ],
 };
 
 /// `InteractiveMessageAction` — module `WAWebInteractiveMessageSync`.
@@ -1335,6 +1395,10 @@ pub const SETTINGS_SYNC: Schema = Schema {
             "SettingsSyncAction.DisplayMode",
         ),
         (
+            "mediaAutoDownloadQuality",
+            "SettingsSyncAction.MediaAutoDownloadQualitySetting",
+        ),
+        (
             "mediaUploadQuality",
             "SettingsSyncAction.MediaQualitySetting",
         ),
@@ -1561,6 +1625,7 @@ pub const ALL: &[Schema] = &[
     ANDROID_UNSUPPORTED_ACTIONS,
     ARCHIVE,
     AVATAR_UPDATED,
+    BB_PRO_PENDING_CUSTOMER_BASE_ACTION,
     BIZ_AI_SETTINGS_NUDGE,
     BOT_WELCOME_REQUEST,
     BUSINESS_BROADCAST_CAMPAIGN,
@@ -1572,6 +1637,7 @@ pub const ALL: &[Schema] = &[
     CHAT_LOCK_SETTINGS,
     CLEAR_CHAT,
     CONTACT,
+    CONTACT_MANAGER_METADATA,
     CUSTOM_PAYMENT_METHODS,
     CUSTOMER_DATA,
     DELETE_CHAT,
@@ -1581,6 +1647,7 @@ pub const ALL: &[Schema] = &[
     EXTERNAL_WEB_BETA,
     FAVORITE_STICKER,
     FAVORITES,
+    GROUP_HISTORY_TOGGLE,
     INTERACTIVE_MESSAGE_ACTION,
     LABEL_EDIT,
     LABEL_JID,
@@ -1633,6 +1700,7 @@ pub(crate) fn is_known_wire_name(name: &str) -> bool {
         "android_unsupported_actions" => true,
         "archive" => true,
         "avatar_updated_action" => true,
+        "bb_pro_pending_customer_base_action" => true,
         "biz_ai_settings_nudge" => true,
         "bot_welcome_request" => true,
         "business_broadcast_campaign" => true,
@@ -1641,6 +1709,7 @@ pub(crate) fn is_known_wire_name(name: &str) -> bool {
         "call_log" => true,
         "clearChat" => true,
         "contact" => true,
+        "contact_manager_metadata" => true,
         "ctwaPerCustomerDataSharing" => true,
         "custom_payment_methods" => true,
         "customer_data" => true,
@@ -1651,6 +1720,7 @@ pub(crate) fn is_known_wire_name(name: &str) -> bool {
         "external_web_beta" => true,
         "favoriteSticker" => true,
         "favorites" => true,
+        "group_history_toggle" => true,
         "interactive_message_action" => true,
         "label_edit" => true,
         "label_jid" => true,

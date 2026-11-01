@@ -5,7 +5,7 @@ use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 
 const ORACLE: &str = include_str!("../../fixtures/group_envelope_oracle.json");
-const CALLBACK_SHA: &str = "c795544e7e6f20cf484cbac4c40ccfe731b4460f31b7ae4863e6ab3bab1bb4d9";
+const CALLBACK_SHA: &str = "0c9b28f4c4ac5e27d2032dae378710cb9cc7dd17f9dcbf17769f8962f2ec4fb0";
 fn keys(value: &Value, allowed: &[&str]) -> Result<()> {
     for key in value
         .as_object()
@@ -142,20 +142,25 @@ fn expected_error(case: &Value) -> Result<String> {
 }
 
 pub fn generate(wa_version: &str) -> Result<String> {
+    ensure!(
+        crate::source::digest(ORACLE.as_bytes())
+            == "sha256:2492335fbd9e10446e0c832e15a45365d8e6649e4dcaa2a81e50ad0c69fd792f",
+        "envelope oracle differs from qualified capture"
+    );
     let oracle: Value = serde_json::from_str(ORACLE)?;
     keys(&oracle, &["waVersion", "setHash", "callback", "cases"])?;
     ensure!(
-        wa_version == "2.3000.1047483476" && oracle["waVersion"].as_str() == Some(wa_version),
+        wa_version == "2.3000.1052559453" && oracle["waVersion"].as_str() == Some(wa_version),
         "envelope oracle requires snapshot review"
     );
     ensure!(
-        oracle["setHash"] == "05609307e68b0f6ccfd2a121a573049999e38b752cfe7155ebbe5c661805751b",
+        oracle["setHash"] == "d6ab7ae601eda281cfac570a68de1d787adde8f4d778f0bb994416f661a21abf",
         "envelope oracle bundle set changed"
     );
     ensure!(
         oracle["callback"]["sha256"] == CALLBACK_SHA
-            && oracle["callback"]["startByte"] == 10592
-            && oracle["callback"]["endByte"] == 22915,
+            && oracle["callback"]["startByte"] == 10858
+            && oracle["callback"]["endByte"] == 23344,
         "envelope callback requires review"
     );
     let cases = oracle["cases"]
@@ -167,9 +172,9 @@ pub fn generate(wa_version: &str) -> Result<String> {
         wa_version,
     );
     out.push_str(&format!(
-        "//! Original callback SHA-256 {CALLBACK_SHA}, module-relative bytes 10592..22915.\n"
+        "//! Original callback SHA-256 {CALLBACK_SHA}, module-relative bytes 10858..23344.\n"
     ));
-    out.push_str("//! Original XML/Wap/JID/time methods run in the fixture harness. Account facts, country/Wid/binary bridges and telemetry are mocked.\n//! Only empty/marker/unknown/suspended actions are exercised here; complex actions have separate conformance cases.\n\nuse super::{parse_normalized_group_notification,GroupParseContext,GroupParseError};\nuse crate::stanza::groups::actions_normalized::NormalizedGroupAction;\nuse wacore_binary::{Jid,builder::NodeBuilder};\n\n#[test]\nfn original_group_envelope_callback_matches_rust_projection() {\n");
+    out.push_str("//! Source accessor traces are checked by the upstream capture verifier; Rust assertions below cover outputs and errors.\n//! Original XML/Wap/JID/time methods run in the fixture harness. Account facts, country/Wid/binary bridges and telemetry are mocked.\n//! Only empty/marker/unknown/suspended actions are exercised here; complex actions have separate conformance cases.\n\nuse super::{parse_normalized_group_notification,GroupParseContext,GroupParseError};\nuse crate::stanza::groups::actions_normalized::NormalizedGroupAction;\nuse wacore_binary::{Jid,builder::NodeBuilder};\n\n#[test]\nfn original_group_envelope_callback_matches_rust_projection() {\n");
     for case in cases {
         keys(
             case,
@@ -184,8 +189,17 @@ pub fn generate(wa_version: &str) -> Result<String> {
                 "errorReason",
                 "telemetryErrors",
                 "localLidReads",
+                "reads",
             ],
         )?;
+        ensure!(
+            case["reads"]
+                .as_array()
+                .is_some_and(|reads| reads.iter().all(|read| read
+                    .as_array()
+                    .is_some_and(|args| !args.is_empty() && args.iter().all(Value::is_string)))),
+            "invalid source accessor trace"
+        );
         let name = case["name"]
             .as_str()
             .context("missing envelope case name")?;
@@ -366,7 +380,7 @@ mod tests {
     }
     #[test]
     fn emits_source_order_and_recovery_cases() {
-        let rust = generate("2.3000.1047483476").unwrap();
+        let rust = generate("2.3000.1052559453").unwrap();
         assert!(rust.contains("GroupParseError::Destination"));
         assert!(rust.contains("GroupParseError::MissingContext(\"me_device_lid\")"));
         assert!(rust.contains("parsed.diagnostics.len()"));

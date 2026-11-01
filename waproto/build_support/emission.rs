@@ -9,6 +9,15 @@ use std::path::Path;
 use quote::ToTokens;
 use syn::visit_mut::{self, VisitMut};
 
+#[path = "wallpaper.rs"]
+mod wallpaper;
+
+pub fn retain_wallpaper_fields(
+    fds: &mut buffa_descriptor::generated::descriptor::FileDescriptorSet,
+) -> io::Result<()> {
+    wallpaper::retain_fields(fds)
+}
+
 struct Extensible {
     serde: bool,
 }
@@ -64,6 +73,7 @@ pub fn finish(
         let path = out.join(format!("{package}{suffix}.rs"));
         let mut file =
             syn::parse_file(&std::fs::read_to_string(&path)?).map_err(io::Error::other)?;
+        wallpaper::qualify(&mut file)?;
         Extensible { serde }.visit_file_mut(&mut file);
         let implementation = match suffix {
             ".__oneof" => "::__buffa::oneof",

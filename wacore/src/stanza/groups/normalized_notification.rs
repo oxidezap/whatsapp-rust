@@ -4,6 +4,7 @@ use super::actions_normalized::{
     self, ActionContext, GroupActionParseError, NormalizedGroupAction,
 };
 use super::envelope_runtime::{self, Value};
+use super::normalization_warning::{GroupWarningSink, IgnoreWarnings};
 use super::normalized::{GroupParseContext, GroupParseError};
 use wacore_binary::{Jid, NodeRef};
 
@@ -99,6 +100,24 @@ pub fn parse_normalized_group_notification(
     node: &NodeRef<'_>,
     context: &GroupParseContext<'_>,
 ) -> Result<NormalizedGroupNotification, GroupParseError> {
+    parse_normalized_group_notification_with_warnings(node, context, &mut IgnoreWarnings)
+}
+
+/// Like the pure parser, with an explicit ordered warning boundary. The sink
+/// can fail; such failures propagate before/after payload reads as in Web.
+pub fn parse_normalized_group_notification_with_warnings(
+    node: &NodeRef<'_>,
+    context: &GroupParseContext<'_>,
+    warnings: &mut dyn GroupWarningSink,
+) -> Result<NormalizedGroupNotification, GroupParseError> {
+    parse_with_source_indices(node, context, warnings).map(|(parsed, _)| parsed)
+}
+
+pub(super) fn parse_with_source_indices(
+    node: &NodeRef<'_>,
+    context: &GroupParseContext<'_>,
+    warnings: &mut dyn GroupWarningSink,
+) -> Result<(NormalizedGroupNotification, Vec<usize>), GroupParseError> {
     let mut state = envelope_runtime::parse_prefix(node, context).map_err(|error| match error {
         GroupParseError::Rejected(_) => GroupParseError::Destination,
         other => other,
@@ -121,40 +140,46 @@ pub fn parse_normalized_group_notification(
         return Err(GroupParseError::Field("children"));
     }
     let mut actions = vec![];
-    for child in node.children().into_iter().flatten() {
+    let mut source_indices = vec![];
+    for (index, child) in node.children().into_iter().flatten().enumerate() {
         if child.tag.as_ref() == envelope_runtime::MISSING_IDENTIFICATION_TAG {
             state.mark_missing()?;
         } else if let Some(action) =
-            actions_normalized::parse_action_result(child, &action_context).map_err(action_error)?
+            actions_normalized::parse_action_result_with_warnings(child, &action_context, warnings)
+                .map_err(action_error)?
         {
             actions.push(action);
+            source_indices.push(index);
         }
     }
     state.mark_actions()?;
     let result = envelope_runtime::finish_projection(node, context, &mut state)?;
-    Ok(NormalizedGroupNotification {
-        external_id: string(&result, "externalId")?,
-        chat_id: jid(&result, "chatId")?,
-        is_lid_addressing_mode: boolean(&result, "isLidAddressingMode")?,
-        author: optional_jid(&result, "author")?,
-        author_phone_number: optional_jid(&result, "authorPhoneNumber")?,
-        author_username: optional_string(&result, "authorUsername")?,
-        author_username_country_code: optional_string(&result, "authorUsernameCountryCode")?,
-        timestamp: integer(&result, "ts")?,
-        pushname: optional_string(&result, "pushname")?,
-        offline: optional_string(&result, "offline")?,
-        actions,
-        has_incomplete_participant_information: boolean(
-            &result,
-            "hasIncompleteParticipantInformation",
-        )?,
-        diagnostics: state
-            .diagnostics
-            .into_iter()
-            .map(|d| GroupNotificationDiagnostic {
-                message_parts: d.message_parts.to_vec(),
-                error: d.error,
-            })
-            .collect(),
-    })
+    Ok((
+        NormalizedGroupNotification {
+            external_id: string(&result, "externalId")?,
+            chat_id: jid(&result, "chatId")?,
+            is_lid_addressing_mode: boolean(&result, "isLidAddressingMode")?,
+            author: optional_jid(&result, "author")?,
+            author_phone_number: optional_jid(&result, "authorPhoneNumber")?,
+            author_username: optional_string(&result, "authorUsername")?,
+            author_username_country_code: optional_string(&result, "authorUsernameCountryCode")?,
+            timestamp: integer(&result, "ts")?,
+            pushname: optional_string(&result, "pushname")?,
+            offline: optional_string(&result, "offline")?,
+            actions,
+            has_incomplete_participant_information: boolean(
+                &result,
+                "hasIncompleteParticipantInformation",
+            )?,
+            diagnostics: state
+                .diagnostics
+                .into_iter()
+                .map(|d| GroupNotificationDiagnostic {
+                    message_parts: d.message_parts.to_vec(),
+                    error: d.error,
+                })
+                .collect(),
+        },
+        source_indices,
+    ))
 }

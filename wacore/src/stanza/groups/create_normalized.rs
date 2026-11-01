@@ -2,27 +2,20 @@
 //! and WAWebGroupsQueryApi.extractLinkedParent. Runtime telemetry, storage,
 //! cache mutation and ACK handling remain outside this parser.
 //!
-//! Qualified snapshot 2.3000.1047483476, bundle set
-//! 05609307e68b0f6ccfd2a121a573049999e38b752cfe7155ebbe5c661805751b.
-//! Handler bundle 09d91fdc4089c50ab1d35dd6c796ee82ef4c3296710316d20383c85738b871b8,
-//! module bytes 1693402..1716842, module SHA-256
-//! a65d861ba0dacdcec52d2df48712a80677ecf10021d7df63c84183f195db13a1.
-//! Linked-parent helper module bytes 524523..532908, SHA-256
-//! 0db1b65d79a6a1ad9648528c31359696af86feb8ea070edf476f1a9c4a02cf39.
-//! Trigger helper bundle 430cb8979511aada95178605faa35a8483446f677ce6d1fe0fd66333c7879eee,
-//! module bytes 792136..794820, SHA-256
-//! 3f6f783ec1f2044d44cb52693893c84bbc14b5708ea63eb64458aeec3f025986.
+//! Qualified snapshot 2.3000.1052559453. Source review:
+//! <https://github.com/oxidezap/whatspec/blob/ae3880925bacd23863cc30ec480c9f82bfd869f1/tests/conformance/groups/versions/2.3000.1052559453/semantic-review.json>.
 use super::identity::{self, IntegerReadError};
 use super::{GroupHistorySentState, GroupNotificationActionTag, GroupParticipantType};
 use crate::WireEnum;
 use crate::iq::groups::MemberLinkMode;
-use crate::types::wire_enums::MemberAddMode;
+use crate::types::wire_enums::{MemberAddMode, MemberShareHistoryMode};
 use wacore_binary::{Jid, NodeContentRef, NodeRef};
 
 /// Effective account facts and pure lookups supplied by the caller. The parser
 /// never guesses feature defaults or reads mutable account/runtime state.
 pub struct GroupCreateContext<'a> {
     pub username_displayed: bool,
+    /// Retained for caller compatibility; this snapshot reads participant history unconditionally.
     pub history_after_join: bool,
     pub opus_enabled: bool,
     pub envelope_author: Option<&'a Jid>,
@@ -154,9 +147,11 @@ pub struct CreatedGroupInfo {
     pub limit_sharing_enabled: bool,
     pub member_link_mode: Option<MemberLinkMode>,
     pub member_add_mode: Option<MemberAddMode>,
+    pub member_share_history_mode: Option<MemberShareHistoryMode>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedGroupCreate {
+    pub is_new_group: bool,
     pub reason: Option<GroupCreateReason>,
     pub context_group_id: Option<Jid>,
     pub group_info: CreatedGroupInfo,
@@ -236,7 +231,7 @@ fn content(node: &NodeRef<'_>, tag: &'static str) -> ParseResult<String> {
 }
 pub(super) fn parse_participants(
     group: &NodeRef<'_>,
-    context: &GroupCreateContext<'_>,
+    _context: &GroupCreateContext<'_>,
 ) -> ParseResult<Vec<CreateParticipant>> {
     if matches!(
         group.content.as_ref(),
@@ -259,17 +254,9 @@ pub(super) fn parse_participants(
             let display_name = maybe_text(p, "display_name");
             let id = user(p, "jid")?;
             let username = maybe_text(p, "username");
-            let join_time = if context.history_after_join {
-                maybe_time(p, "join_time")?
-            } else {
-                None
-            };
-            let group_history_sent_state = if context.history_after_join {
-                maybe_text(p, "group_history_sent_state")
-                    .and_then(|v| GroupHistorySentState::try_from(v.as_str()).ok())
-            } else {
-                None
-            };
+            let join_time = maybe_time(p, "join_time")?;
+            let group_history_sent_state = maybe_text(p, "group_history_sent_state")
+                .and_then(|v| GroupHistorySentState::try_from(v.as_str()).ok());
             Ok(CreateParticipant {
                 id,
                 display_name,
@@ -410,9 +397,15 @@ pub fn parse_group_create(
         .map(|c| content(c, "member_add_mode"))
         .transpose()?
         .and_then(|v| MemberAddMode::try_from(v.as_str()).ok());
+    let member_share_history_mode = group
+        .get_optional_child("member_share_group_history_mode")
+        .map(|c| content(c, "member_share_group_history_mode"))
+        .transpose()?
+        .and_then(|v| MemberShareHistoryMode::try_from(v.as_str()).ok());
     let reason = maybe_text(node, "reason").and_then(|v| parse_create_reason(v.as_str()));
     let context_group_id = maybe_jid(node, "context_group_jid", identity::parse_group)?;
     Ok(NormalizedGroupCreate {
+        is_new_group: is_new,
         reason,
         context_group_id,
         group_info: CreatedGroupInfo {
@@ -449,6 +442,7 @@ pub fn parse_group_create(
             limit_sharing_enabled,
             member_link_mode,
             member_add_mode,
+            member_share_history_mode,
         },
     })
 }
@@ -520,7 +514,7 @@ mod tests {
         );
     }
     #[test]
-    fn disabled_flags_skip_country_registry_and_history_accessors() {
+    fn disabled_history_flag_does_not_skip_history_validation() {
         let node = NodeBuilder::new("create")
             .children([group()
                 .attr("creator_country_code", "invalid")
@@ -532,14 +526,8 @@ mod tests {
                     .build()])
                 .build()])
             .build();
-        let parsed = parse_group_create(&node.as_node_ref(), &context()).unwrap();
-        assert!(parsed.group_info.creator_country_code.is_none());
-        assert!(parsed.group_info.creator_username.is_none());
-        assert!(parsed.group_info.subject_owner_username.is_none());
-        let mut enabled = context();
-        enabled.history_after_join = true;
         assert_eq!(
-            parse_group_create(&node.as_node_ref(), &enabled).unwrap_err(),
+            parse_group_create(&node.as_node_ref(), &context()).unwrap_err(),
             CreateParseError::Field("join_time")
         );
     }

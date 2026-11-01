@@ -284,3 +284,62 @@ fn platform_mapping_covers_every_generated_variant() {
         "an additive enum variant must require a mapping decision"
     );
 }
+
+#[test]
+fn wallpaper_compatibility_refuses_unreviewed_wire_type_changes() {
+    use buffa::Message as _;
+    use buffa_descriptor::generated::descriptor::{
+        FileDescriptorSet, field_descriptor_proto::Type,
+    };
+    #[allow(clippy::disallowed_methods)]
+    let original =
+        FileDescriptorSet::decode_from_slice(include_bytes!("../src/whatsapp.desc")).unwrap();
+    let mut qualified = original.clone();
+    emission::retain_wallpaper_fields(&mut qualified).unwrap();
+    let wire = names::wire_api(&qualified);
+    let legacy = wire
+        .iter()
+        .filter(|s| s.starts_with("wire .whatsapp.Message.ChatSolidColorWallpaper.color"))
+        .collect::<Vec<_>>();
+    assert_eq!(legacy.len(), 2);
+    assert!(legacy.iter().all(|s| s.contains("TYPE_STRING")));
+    assert!(emission::retain_wallpaper_fields(&mut qualified).is_err());
+    for mutation in 0..3 {
+        let mut candidate = original.clone();
+        let message = candidate
+            .file
+            .iter_mut()
+            .flat_map(|f| f.message_type.iter_mut())
+            .find(|m| m.name.as_deref() == Some("Message"))
+            .unwrap()
+            .nested_type
+            .iter_mut()
+            .find(|m| m.name.as_deref() == Some("ChatSolidColorWallpaper"))
+            .unwrap();
+        match mutation {
+            0 => {
+                message
+                    .field
+                    .iter_mut()
+                    .find(|f| f.number == Some(1))
+                    .unwrap()
+                    .r#type = Some(Type::TYPE_FIXED64)
+            }
+            1 => {
+                message
+                    .field
+                    .iter_mut()
+                    .find(|f| f.number == Some(2))
+                    .unwrap()
+                    .name = Some("unreviewedName".into())
+            }
+            _ => {
+                let mut field = message.field[0].clone();
+                field.name = Some("colorLight".into());
+                field.number = Some(100);
+                message.field.push(field);
+            }
+        }
+        assert!(emission::retain_wallpaper_fields(&mut candidate).is_err());
+    }
+}

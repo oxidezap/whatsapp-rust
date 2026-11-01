@@ -1,4 +1,4 @@
-//! Auto-generated AppState known verbs (log gating) (WhatsApp 2.3000.1047483476). DO NOT EDIT.
+//! Auto-generated AppState known verbs (log gating) (WhatsApp 2.3000.1052559453). DO NOT EDIT.
 //!
 
 //! Declared syncd action names for log gating. Shares its arms with
@@ -15,6 +15,7 @@ pub(crate) fn is_known_wire_name(name: &str) -> bool {
         "android_unsupported_actions" => true,
         "archive" => true,
         "avatar_updated_action" => true,
+        "bb_pro_pending_customer_base_action" => true,
         "biz_ai_settings_nudge" => true,
         "bot_welcome_request" => true,
         "business_broadcast_campaign" => true,
@@ -23,6 +24,7 @@ pub(crate) fn is_known_wire_name(name: &str) -> bool {
         "call_log" => true,
         "clearChat" => true,
         "contact" => true,
+        "contact_manager_metadata" => true,
         "ctwaPerCustomerDataSharing" => true,
         "custom_payment_methods" => true,
         "customer_data" => true,
@@ -33,6 +35,7 @@ pub(crate) fn is_known_wire_name(name: &str) -> bool {
         "external_web_beta" => true,
         "favoriteSticker" => true,
         "favorites" => true,
+        "group_history_toggle" => true,
         "interactive_message_action" => true,
         "label_edit" => true,
         "label_jid" => true,

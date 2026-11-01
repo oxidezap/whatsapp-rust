@@ -1,4 +1,4 @@
-//! Auto-generated stanza and notification vocabulary (WhatsApp 2.3000.1047483476). DO NOT EDIT.
+//! Auto-generated stanza and notification vocabulary (WhatsApp 2.3000.1052559453). DO NOT EDIT.
 //!
 //! The tag a stanza arrives under, and the type of a `<notification>`.
 //!
@@ -52,6 +52,10 @@ pub enum StanzaTag {
 pub enum NotificationType {
     #[wire = "account_sync"]
     AccountSync,
+    #[wire = "biz_thread_data"]
+    BizThreadData,
+    #[wire = "biz_thread_data_bulk"]
+    BizThreadDataBulk,
     #[wire = "business"]
     Business,
     #[wire = "companion_reg_refresh"]

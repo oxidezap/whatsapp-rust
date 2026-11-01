@@ -1,0 +1,186 @@
+{
+  "sourceRev": "c581c20a9d0605df49abf297f2e7cfc04ccf1ff7",
+  "events": [
+    {
+      "name": "Call",
+      "code": 462,
+      "module": "WAWebCallWamEvent",
+      "fields": [
+        {
+          "name": "jbAvgDelayFromDisorderDistanceHist",
+          "id": 1413,
+          "kind": "number"
+        },
+        {
+          "name": "jbAvgDelayFromPutHist",
+          "id": 1414,
+          "kind": "number"
+        },
+        {
+          "name": "jbAvgDelayUniform",
+          "id": 644,
+          "kind": "number"
+        },
+        {
+          "name": "jbAvgDisorderTargetSize",
+          "id": 1086,
+          "kind": "number"
+        },
+        {
+          "name": "jbAvgPutHistTargetSize",
+          "id": 1415,
+          "kind": "number"
+        },
+        {
+          "name": "jbAvgTargetSize",
+          "id": 1012,
+          "kind": "number"
+        },
+        {
+          "name": "jbAvgTargetSizeAddedFromDisorderDistanceHist",
+          "id": 1416,
+          "kind": "number"
+        },
+        {
+          "name": "jbAvgTargetSizeFromDisorderDistanceHist",
+          "id": 1417,
+          "kind": "number"
+        },
+        {
+          "name": "jbAvgTargetSizeFromPutHist",
+          "id": 1418,
+          "kind": "number"
+        },
+        {
+          "name": "jbEmptyPeriods1x",
+          "id": 997,
+          "kind": "number"
+        },
+        {
+          "name": "jbEmptyPeriods2x",
+          "id": 998,
+          "kind": "number"
+        },
+        {
+          "name": "jbEmptyPeriods4x",
+          "id": 999,
+          "kind": "number"
+        },
+        {
+          "name": "jbEmptyPeriods8x",
+          "id": 1000,
+          "kind": "number"
+        },
+        {
+          "name": "jbGetFromDisorderDistanceHist",
+          "id": 1419,
+          "kind": "number"
+        },
+        {
+          "name": "jbGetFromPutHist",
+          "id": 1420,
+          "kind": "number"
+        },
+        {
+          "name": "jbMaxDelay",
+          "id": 148,
+          "kind": "number"
+        },
+        {
+          "name": "jbMaxDelayFromDisorderDistanceHist",
+          "id": 1421,
+          "kind": "number"
+        },
+        {
+          "name": "jbMaxDelayFromPutHist",
+          "id": 1422,
+          "kind": "number"
+        },
+        {
+          "name": "jbMaxDisorderTargetSize",
+          "id": 1087,
+          "kind": "number"
+        },
+        {
+          "name": "jbMaxPutHistTargetSize",
+          "id": 1423,
+          "kind": "number"
+        },
+        {
+          "name": "jbMaxTargetSizeAddedFromDisorderDistanceHist",
+          "id": 1424,
+          "kind": "number"
+        },
+        {
+          "name": "jbMaxTargetSizeFromDisorderDistanceHist",
+          "id": 1425,
+          "kind": "number"
+        },
+        {
+          "name": "jbMaxTargetSizeFromPutHist",
+          "id": 1426,
+          "kind": "number"
+        },
+        {
+          "name": "jbMinDelay",
+          "id": 147,
+          "kind": "number"
+        },
+        {
+          "name": "jbNonSpeechDiscards",
+          "id": 846,
+          "kind": "number"
+        },
+        {
+          "name": "jbTotalEmptyPeriods",
+          "id": 996,
+          "kind": "number"
+        },
+        {
+          "name": "lastMinJbAvgDelay",
+          "id": 1607,
+          "kind": "number"
+        },
+        {
+          "name": "lastMinJbEmpties",
+          "id": 1608,
+          "kind": "number"
+        },
+        {
+          "name": "lastMinJbLost",
+          "id": 1610,
+          "kind": "number"
+        },
+        {
+          "name": "uwpVoipWindowIncomingOfferToLayoutTime",
+          "id": 1842,
+          "kind": "timer"
+        }
+      ]
+    },
+    {
+      "name": "Daily",
+      "code": 1158,
+      "module": "WAWebDailyWamEvent",
+      "fields": [
+        {
+          "name": "receivedExperienceIds",
+          "id": 262,
+          "kind": "string"
+        }
+      ]
+    },
+    {
+      "name": "ChannelMessageVisibilityTracking",
+      "code": 5998,
+      "module": "WAWebChannelMessageVisibilityTrackingWamEvent",
+      "fields": [
+        {
+          "name": "isVpvImpression",
+          "id": 7,
+          "kind": "boolean"
+        }
+      ]
+    }
+  ]
+}

@@ -12,6 +12,10 @@
 
 pub mod create_normalized;
 mod identity;
+#[cfg(test)]
+#[path = "groups/normalization_conformance.rs"]
+mod normalization_conformance;
+pub mod normalization_warning;
 pub mod normalized;
 
 use crate::WireEnum;

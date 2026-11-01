@@ -1,0 +1,844 @@
+{
+  "waVersion": "2.3000.1052559453",
+  "setHash": "d6ab7ae601eda281cfac570a68de1d787adde8f4d778f0bb994416f661a21abf",
+  "inputColumns": [
+    "family",
+    "kind",
+    "reason",
+    "hidden",
+    "outcome"
+  ],
+  "outcomes": [
+    {
+      "returnsNull": false,
+      "actionType": "parent_group_link",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic",
+          "subjectTime": 123
+        }
+      ],
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "returnsNull": false,
+      "actionType": "sub_group_link",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic",
+          "subjectTime": 123,
+          "hiddenSubgroup": false
+        }
+      ],
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "returnsNull": false,
+      "actionType": "sub_group_link",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic",
+          "subjectTime": 123,
+          "hiddenSubgroup": true
+        }
+      ],
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "returnsNull": false,
+      "actionType": "sibling_group_link",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic",
+          "subjectTime": 123,
+          "hiddenSubgroup": false
+        }
+      ],
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "returnsNull": false,
+      "actionType": "sibling_group_link",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic",
+          "subjectTime": 123,
+          "hiddenSubgroup": true
+        }
+      ],
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "returnsNull": true,
+      "actionType": null,
+      "groupDatas": null,
+      "reads": [
+        "link_type"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized link_type: ",
+            ""
+          ],
+          ""
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-link-type"
+        ]
+      ]
+    },
+    {
+      "returnsNull": true,
+      "actionType": null,
+      "groupDatas": null,
+      "reads": [
+        "link_type"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized link_type: ",
+            ""
+          ],
+          "future_type"
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-link-type"
+        ]
+      ]
+    },
+    {
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic",
+          "subjectTime": 123,
+          "hiddenSubgroup": false
+        }
+      ],
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic",
+          "subjectTime": 123,
+          "hiddenSubgroup": true
+        }
+      ],
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "object"
+      },
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic",
+          "subjectTime": 123,
+          "hiddenSubgroup": false
+        }
+      ],
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "object"
+      },
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic",
+          "subjectTime": 123,
+          "hiddenSubgroup": true
+        }
+      ],
+      "reads": [
+        "link_type",
+        "groups",
+        "jid",
+        "subject",
+        "s_t",
+        "hidden_group"
+      ],
+      "calls": []
+    },
+    {
+      "returnsNull": false,
+      "actionType": "parent_group_unlink",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic",
+          "subjectTime": 123
+        }
+      ],
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "returnsNull": false,
+      "actionType": "delete_parent_group_unlink",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic",
+          "subjectTime": 123
+        }
+      ],
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "returnsNull": false,
+      "actionType": "integrity_parent_group_unlink",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic",
+          "subjectTime": 123
+        }
+      ],
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "returnsNull": false,
+      "actionType": "parent_group_unlink",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic",
+          "subjectTime": 123
+        }
+      ],
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "returnsNull": false,
+      "actionType": "sub_group_unlink",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic",
+          "subjectTime": 123
+        }
+      ],
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "returnsNull": false,
+      "actionType": "integrity_sub_group_unlink",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic",
+          "subjectTime": 123
+        }
+      ],
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "returnsNull": false,
+      "actionType": "sub_group_unlink",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic",
+          "subjectTime": 123
+        }
+      ],
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "returnsNull": false,
+      "actionType": "sibling_group_unlink",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic",
+          "subjectTime": 123
+        }
+      ],
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "returnsNull": false,
+      "actionType": "sibling_group_unlink",
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic",
+          "subjectTime": 123
+        }
+      ],
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "returnsNull": true,
+      "actionType": null,
+      "groupDatas": null,
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized unlink_type: ",
+            ""
+          ],
+          ""
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-unlink-type"
+        ]
+      ]
+    },
+    {
+      "returnsNull": true,
+      "actionType": null,
+      "groupDatas": null,
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized unlink_type: ",
+            ""
+          ],
+          ""
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-unlink-type"
+        ]
+      ]
+    },
+    {
+      "returnsNull": true,
+      "actionType": null,
+      "groupDatas": null,
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized unlink_type: ",
+            ""
+          ],
+          "future_type"
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-unlink-type"
+        ]
+      ]
+    },
+    {
+      "returnsNull": true,
+      "actionType": null,
+      "groupDatas": null,
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": [
+        [
+          "WARN",
+          [
+            "Unrecognized unlink_type: ",
+            ""
+          ],
+          "future_type"
+        ],
+        [
+          "sendLogs",
+          "group-unrecognized-unlink-type"
+        ]
+      ]
+    },
+    {
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic",
+          "subjectTime": 123
+        }
+      ],
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "function"
+      },
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic",
+          "subjectTime": 123
+        }
+      ],
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "object"
+      },
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic",
+          "subjectTime": 123
+        }
+      ],
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    },
+    {
+      "returnsNull": false,
+      "actionType": {
+        "valueType": "object"
+      },
+      "groupDatas": [
+        {
+          "id": "123456@g.us",
+          "subject": "synthetic",
+          "subjectTime": 123
+        }
+      ],
+      "reads": [
+        "unlink_type",
+        "unlink_reason",
+        "unlink_reason",
+        "groups",
+        "jid",
+        "subject",
+        "s_t"
+      ],
+      "calls": []
+    }
+  ],
+  "cases": [
+    ["link","parent_group",null,false,0],
+    ["link","parent_group",null,true,0],
+    ["link","sub_group",null,false,1],
+    ["link","sub_group",null,true,2],
+    ["link","sibling_group",null,false,3],
+    ["link","sibling_group",null,true,4],
+    ["link","",null,false,5],
+    ["link","",null,true,5],
+    ["link","future_type",null,false,6],
+    ["link","future_type",null,true,6],
+    ["link","constructor",null,false,7],
+    ["link","constructor",null,true,8],
+    ["link","__defineGetter__",null,false,7],
+    ["link","__defineGetter__",null,true,8],
+    ["link","__defineSetter__",null,false,7],
+    ["link","__defineSetter__",null,true,8],
+    ["link","hasOwnProperty",null,false,7],
+    ["link","hasOwnProperty",null,true,8],
+    ["link","__lookupGetter__",null,false,7],
+    ["link","__lookupGetter__",null,true,8],
+    ["link","__lookupSetter__",null,false,7],
+    ["link","__lookupSetter__",null,true,8],
+    ["link","isPrototypeOf",null,false,7],
+    ["link","isPrototypeOf",null,true,8],
+    ["link","propertyIsEnumerable",null,false,7],
+    ["link","propertyIsEnumerable",null,true,8],
+    ["link","toString",null,false,7],
+    ["link","toString",null,true,8],
+    ["link","valueOf",null,false,7],
+    ["link","valueOf",null,true,8],
+    ["link","__proto__",null,false,9],
+    ["link","__proto__",null,true,10],
+    ["link","toLocaleString",null,false,7],
+    ["link","toLocaleString",null,true,8],
+    ["unlink","parent_group",null,false,11],
+    ["unlink","parent_group",null,true,11],
+    ["unlink","parent_group","delete_parent",false,12],
+    ["unlink","parent_group","delete_parent",true,12],
+    ["unlink","parent_group","integrity_delete_parent",false,13],
+    ["unlink","parent_group","integrity_delete_parent",true,13],
+    ["unlink","parent_group","",false,14],
+    ["unlink","parent_group","",true,14],
+    ["unlink","parent_group","future_reason",false,14],
+    ["unlink","parent_group","future_reason",true,14],
+    ["unlink","sub_group",null,false,15],
+    ["unlink","sub_group",null,true,15],
+    ["unlink","sub_group","delete_parent",false,12],
+    ["unlink","sub_group","delete_parent",true,12],
+    ["unlink","sub_group","integrity_delete_parent",false,16],
+    ["unlink","sub_group","integrity_delete_parent",true,16],
+    ["unlink","sub_group","",false,17],
+    ["unlink","sub_group","",true,17],
+    ["unlink","sub_group","future_reason",false,17],
+    ["unlink","sub_group","future_reason",true,17],
+    ["unlink","sibling_group",null,false,18],
+    ["unlink","sibling_group",null,true,18],
+    ["unlink","sibling_group","delete_parent",false,19],
+    ["unlink","sibling_group","delete_parent",true,19],
+    ["unlink","sibling_group","integrity_delete_parent",false,19],
+    ["unlink","sibling_group","integrity_delete_parent",true,19],
+    ["unlink","sibling_group","",false,19],
+    ["unlink","sibling_group","",true,19],
+    ["unlink","sibling_group","future_reason",false,19],
+    ["unlink","sibling_group","future_reason",true,19],
+    ["unlink","",null,false,20],
+    ["unlink","",null,true,20],
+    ["unlink","","delete_parent",false,21],
+    ["unlink","","delete_parent",true,21],
+    ["unlink","","integrity_delete_parent",false,21],
+    ["unlink","","integrity_delete_parent",true,21],
+    ["unlink","","",false,21],
+    ["unlink","","",true,21],
+    ["unlink","","future_reason",false,21],
+    ["unlink","","future_reason",true,21],
+    ["unlink","future_type",null,false,22],
+    ["unlink","future_type",null,true,22],
+    ["unlink","future_type","delete_parent",false,23],
+    ["unlink","future_type","delete_parent",true,23],
+    ["unlink","future_type","integrity_delete_parent",false,23],
+    ["unlink","future_type","integrity_delete_parent",true,23],
+    ["unlink","future_type","",false,23],
+    ["unlink","future_type","",true,23],
+    ["unlink","future_type","future_reason",false,23],
+    ["unlink","future_type","future_reason",true,23],
+    ["unlink","constructor",null,false,24],
+    ["unlink","constructor",null,true,24],
+    ["unlink","constructor","delete_parent",false,25],
+    ["unlink","constructor","delete_parent",true,25],
+    ["unlink","constructor","integrity_delete_parent",false,25],
+    ["unlink","constructor","integrity_delete_parent",true,25],
+    ["unlink","constructor","",false,25],
+    ["unlink","constructor","",true,25],
+    ["unlink","constructor","future_reason",false,25],
+    ["unlink","constructor","future_reason",true,25],
+    ["unlink","__defineGetter__",null,false,24],
+    ["unlink","__defineGetter__",null,true,24],
+    ["unlink","__defineGetter__","delete_parent",false,25],
+    ["unlink","__defineGetter__","delete_parent",true,25],
+    ["unlink","__defineGetter__","integrity_delete_parent",false,25],
+    ["unlink","__defineGetter__","integrity_delete_parent",true,25],
+    ["unlink","__defineGetter__","",false,25],
+    ["unlink","__defineGetter__","",true,25],
+    ["unlink","__defineGetter__","future_reason",false,25],
+    ["unlink","__defineGetter__","future_reason",true,25],
+    ["unlink","__defineSetter__",null,false,24],
+    ["unlink","__defineSetter__",null,true,24],
+    ["unlink","__defineSetter__","delete_parent",false,25],
+    ["unlink","__defineSetter__","delete_parent",true,25],
+    ["unlink","__defineSetter__","integrity_delete_parent",false,25],
+    ["unlink","__defineSetter__","integrity_delete_parent",true,25],
+    ["unlink","__defineSetter__","",false,25],
+    ["unlink","__defineSetter__","",true,25],
+    ["unlink","__defineSetter__","future_reason",false,25],
+    ["unlink","__defineSetter__","future_reason",true,25],
+    ["unlink","hasOwnProperty",null,false,24],
+    ["unlink","hasOwnProperty",null,true,24],
+    ["unlink","hasOwnProperty","delete_parent",false,25],
+    ["unlink","hasOwnProperty","delete_parent",true,25],
+    ["unlink","hasOwnProperty","integrity_delete_parent",false,25],
+    ["unlink","hasOwnProperty","integrity_delete_parent",true,25],
+    ["unlink","hasOwnProperty","",false,25],
+    ["unlink","hasOwnProperty","",true,25],
+    ["unlink","hasOwnProperty","future_reason",false,25],
+    ["unlink","hasOwnProperty","future_reason",true,25],
+    ["unlink","__lookupGetter__",null,false,24],
+    ["unlink","__lookupGetter__",null,true,24],
+    ["unlink","__lookupGetter__","delete_parent",false,25],
+    ["unlink","__lookupGetter__","delete_parent",true,25],
+    ["unlink","__lookupGetter__","integrity_delete_parent",false,25],
+    ["unlink","__lookupGetter__","integrity_delete_parent",true,25],
+    ["unlink","__lookupGetter__","",false,25],
+    ["unlink","__lookupGetter__","",true,25],
+    ["unlink","__lookupGetter__","future_reason",false,25],
+    ["unlink","__lookupGetter__","future_reason",true,25],
+    ["unlink","__lookupSetter__",null,false,24],
+    ["unlink","__lookupSetter__",null,true,24],
+    ["unlink","__lookupSetter__","delete_parent",false,25],
+    ["unlink","__lookupSetter__","delete_parent",true,25],
+    ["unlink","__lookupSetter__","integrity_delete_parent",false,25],
+    ["unlink","__lookupSetter__","integrity_delete_parent",true,25],
+    ["unlink","__lookupSetter__","",false,25],
+    ["unlink","__lookupSetter__","",true,25],
+    ["unlink","__lookupSetter__","future_reason",false,25],
+    ["unlink","__lookupSetter__","future_reason",true,25],
+    ["unlink","isPrototypeOf",null,false,24],
+    ["unlink","isPrototypeOf",null,true,24],
+    ["unlink","isPrototypeOf","delete_parent",false,25],
+    ["unlink","isPrototypeOf","delete_parent",true,25],
+    ["unlink","isPrototypeOf","integrity_delete_parent",false,25],
+    ["unlink","isPrototypeOf","integrity_delete_parent",true,25],
+    ["unlink","isPrototypeOf","",false,25],
+    ["unlink","isPrototypeOf","",true,25],
+    ["unlink","isPrototypeOf","future_reason",false,25],
+    ["unlink","isPrototypeOf","future_reason",true,25],
+    ["unlink","propertyIsEnumerable",null,false,24],
+    ["unlink","propertyIsEnumerable",null,true,24],
+    ["unlink","propertyIsEnumerable","delete_parent",false,25],
+    ["unlink","propertyIsEnumerable","delete_parent",true,25],
+    ["unlink","propertyIsEnumerable","integrity_delete_parent",false,25],
+    ["unlink","propertyIsEnumerable","integrity_delete_parent",true,25],
+    ["unlink","propertyIsEnumerable","",false,25],
+    ["unlink","propertyIsEnumerable","",true,25],
+    ["unlink","propertyIsEnumerable","future_reason",false,25],
+    ["unlink","propertyIsEnumerable","future_reason",true,25],
+    ["unlink","toString",null,false,24],
+    ["unlink","toString",null,true,24],
+    ["unlink","toString","delete_parent",false,25],
+    ["unlink","toString","delete_parent",true,25],
+    ["unlink","toString","integrity_delete_parent",false,25],
+    ["unlink","toString","integrity_delete_parent",true,25],
+    ["unlink","toString","",false,25],
+    ["unlink","toString","",true,25],
+    ["unlink","toString","future_reason",false,25],
+    ["unlink","toString","future_reason",true,25],
+    ["unlink","valueOf",null,false,24],
+    ["unlink","valueOf",null,true,24],
+    ["unlink","valueOf","delete_parent",false,25],
+    ["unlink","valueOf","delete_parent",true,25],
+    ["unlink","valueOf","integrity_delete_parent",false,25],
+    ["unlink","valueOf","integrity_delete_parent",true,25],
+    ["unlink","valueOf","",false,25],
+    ["unlink","valueOf","",true,25],
+    ["unlink","valueOf","future_reason",false,25],
+    ["unlink","valueOf","future_reason",true,25],
+    ["unlink","__proto__",null,false,26],
+    ["unlink","__proto__",null,true,26],
+    ["unlink","__proto__","delete_parent",false,27],
+    ["unlink","__proto__","delete_parent",true,27],
+    ["unlink","__proto__","integrity_delete_parent",false,27],
+    ["unlink","__proto__","integrity_delete_parent",true,27],
+    ["unlink","__proto__","",false,27],
+    ["unlink","__proto__","",true,27],
+    ["unlink","__proto__","future_reason",false,27],
+    ["unlink","__proto__","future_reason",true,27],
+    ["unlink","toLocaleString",null,false,24],
+    ["unlink","toLocaleString",null,true,24],
+    ["unlink","toLocaleString","delete_parent",false,25],
+    ["unlink","toLocaleString","delete_parent",true,25],
+    ["unlink","toLocaleString","integrity_delete_parent",false,25],
+    ["unlink","toLocaleString","integrity_delete_parent",true,25],
+    ["unlink","toLocaleString","",false,25],
+    ["unlink","toLocaleString","",true,25],
+    ["unlink","toLocaleString","future_reason",false,25],
+    ["unlink","toLocaleString","future_reason",true,25]
+  ]
+}

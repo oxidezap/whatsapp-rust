@@ -52,6 +52,13 @@ wire enums by the owning module, not just an identical variant set. IQ targets
 are generated only where the namespace does not already imply the target.
 Incoming wire tags include notification, server-request and stanza domains.
 
+The reviewed wallpaper migration is the exceptional same-number, different-wire
+case: `build_support/wallpaper.rs` retains historical string fields alongside the
+upstream fixed32 ARGB fields. Its descriptor and AST guards require the reviewed
+shape, and both owned and view decoders dispatch on number and wire type. Keep
+the frozen API snapshot unchanged; do not generalize this exception to unrelated
+field collisions.
+
 `waproto` uses buffa/buffa-build. Use `cargo xt proto-desc`, `tables-desc` and
 `wire-desc` for descriptors and hash sidecars; `cargo xt --help` lists tooling.
 Host tooling must not become a published runtime dependency. Task implementations
@@ -101,11 +108,29 @@ metadata before inlining, so conflicting sources cannot disappear. It retains
 synchronous validation/decoding; owned runtime callers use the prepared API above.
 
 Group normalization consumes separately pinned whatspec envelope, LINK and UNLINK
-contracts, with checked digests. The normal generator emits static Rust guards,
-ordered projections and decision tables without changing the main IR pin.
+contracts, with checked digests. The normal generator checks them against the
+main IR pin and emits static Rust guards, ordered projections and decision tables.
 Independent original-JS oracle fixtures qualify the handwritten owned CREATE and
 other action parsers as well. Update fixtures, digests, revisions and oracles
 together; regenerate and run the group conformance tests.
+
+For the qualified 2.3000.1052559453 capture, ordinary unknown LINK/UNLINK types
+produce a null result and ordered warning operations. The additive
+`*_with_warnings` parser APIs accept a `GroupWarningSink`; the existing pure
+parser entry points discard warnings. LINK returns before payload reads, while
+UNLINK validates its payload before warning. The complete notification parser
+omits null actions. Keep only current inputs used by the generator or tests.
+Historical API behavior belongs in focused compatibility regressions; do not copy
+complete previous snapshots into a versioned fixture directory. Immutable source
+revisions and digests preserve provenance; task reports belong in the PR.
+
+The normalization capture adapter stores all original cases with shared observed
+outcomes. Run `node tools/whatspec-codegen/fixtures/capture-group-normalization.cjs
+PATH/TO/whatspec --check` against the pinned external checkout to reproduce it.
+The normal generator and tests remain offline-capable. The emitter verifies the
+expanded oracle's canonical digest and emits a table with one shared test runner,
+not one copy of the runner per case. Review any capture or digest change against
+the preserved original bundles, and keep assertion coverage when sharing data.
 
 Runtime adoption requires the nondefault `generated-group-notifications` feature
 and a `GroupNotificationFactsProvider` installed on the client. The provider

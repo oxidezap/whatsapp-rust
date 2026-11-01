@@ -1,31 +1,10 @@
 {
   "stanzas": [
     {
-      "moduleName": "WASmaxOutGroupsCreateRequest",
+      "moduleName": "WASmaxGroupsCreateRPC",
       "namespace": "w:g2",
       "iqType": "set",
       "target": "g.us",
-      "parserName": "WASmaxGroupsCreateRPC",
-      "exportedFunction": "makeCreateRequestCreateParticipant",
-      "allExports": [
-        "makeCreateRequestCreateParticipant",
-        "makeCreateRequestCreateDescription",
-        "makeCreateRequestCreateLocked",
-        "makeCreateRequestCreateAnnouncement",
-        "makeCreateRequestCreateParent",
-        "makeCreateRequestCreateNoFrequentlyForwarded",
-        "makeCreateRequestCreateEphemeral",
-        "makeCreateRequestCreateMembershipApprovalMode",
-        "makeCreateRequestCreateBreakout",
-        "makeCreateRequestCreateCreatedAsLid",
-        "makeCreateRequestCreateAddressingModeOverride",
-        "makeCreateRequestCreateLinkedParent",
-        "makeCreateRequestCreateHiddenGroup",
-        "makeCreateRequestCreateAllowNonAdminSubGroupCreation",
-        "makeCreateRequestCreateCreateGeneralChat",
-        "makeCreateRequestCreateCapi",
-        "makeCreateRequest"
-      ],
       "request": {
         "namespace": "w:g2",
         "iqType": "set",
@@ -473,6 +452,18 @@
                 "argPath": [
                   {
                     "key": "hasCapi"
+                  }
+                ]
+              },
+              {
+                "tag": "light_e2ee",
+                "attrs": [],
+                "children": [],
+                "repeats": false,
+                "presence": "presence_flag",
+                "argPath": [
+                  {
+                    "key": "hasLightE2ee"
                   }
                 ]
               },

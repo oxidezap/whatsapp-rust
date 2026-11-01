@@ -68,7 +68,7 @@ pub fn generate(json: &str, wa_version: &str) -> Result<String> {
     let mut out = header("private IQ pilot builders and result payloads", wa_version);
     out.push_str("//! Envelope correlation and error conversion stay in the request layer.\n\nuse crate::request::InfoQuery;\nuse wacore_binary::{Jid, NodeContent, NodeRef, builder::NodeBuilder};\n\n");
     for pilot in PILOTS {
-        let module = format!("WASmaxOutGroups{pilot}Request");
+        let module = format!("WASmaxGroups{pilot}RPC");
         let matches: Vec<_> = stanzas
             .iter()
             .filter(|s| s["moduleName"] == module)
@@ -318,6 +318,22 @@ pub(super) mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn integrated_rpc_projection_preserves_public_pilot_bindings() {
+        let source = include_str!("../../fixtures/contextual_iq.json");
+        let output = generate(source, "2.3000.1052559453").unwrap();
+        for binding in [
+            "pub(super) iq_to: &'a Jid",
+            "pub(super) subject_element_value: &'a str",
+            "pub(super) accept_code: &'a str",
+            "pub(super) accept_expiration: i64",
+            "pub(super) accept_admin: &'a Jid",
+        ] {
+            assert!(output.contains(binding), "missing {binding}");
+        }
+        assert_eq!(output, generate(source, "2.3000.1052559453").unwrap());
+    }
+
     pub(crate) fn fixture() -> Value {
         let ops: Vec<_> = PILOTS.iter().map(|pilot| {
             let assertions = json!([
@@ -332,7 +348,7 @@ pub(super) mod tests {
             gated["tag"] = json!(format!("{pilot}ResponseConditionalSuccess"));
             gated["assertions"].as_array_mut().unwrap().push(json!({"kind":"child","name":"source_gate"}));
             json!({
-                "moduleName":format!("WASmaxOutGroups{pilot}Request"),
+                "moduleName":format!("WASmaxGroups{pilot}RPC"),
                 "namespace":"test:wire", "iqType":"set", "target":"group_jid",
                 "request": {"namespace":"test:wire", "iqType":"set", "target":"group_jid",
                     "targetArgPath":[{"key":"destination"}],
@@ -393,6 +409,15 @@ pub(super) mod tests {
             .unwrap()
             .reverse();
         assert!(emit(&v).is_err());
+    }
+
+    #[test]
+    fn pilot_root_alternatives_cannot_be_silently_flattened() {
+        let mut value = fixture();
+        value["stanzas"][0]["request"]["variantGroups"] = json!([{ "variants": [
+            {"children":[{"tag":"one"}]}, {"children":[{"tag":"other"}]}
+        ] }]);
+        assert!(emit(&value).is_err());
     }
 
     #[test]

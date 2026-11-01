@@ -69,3 +69,38 @@ fn message_clone_preserves_retained_and_new_fields_without_aliasing() {
     cloned.clone_from(&original);
     assert_eq!(cloned, original);
 }
+
+#[test]
+fn wallpaper_string_and_argb_encodings_keep_their_distinct_wire_types() {
+    use buffa::{MessageView as _, ViewEncode as _};
+    use wa::message::{
+        ChatSolidColorWallpaper, ChatSolidColorWallpaperOwnedView, ChatSolidColorWallpaperView,
+    };
+    // Historical strings use length-delimited fields 1 and 2. The new source
+    // uses fixed32 at the same numbers, without converting old string values.
+    let legacy = [0x0a, 3, b'r', b'e', b'd', 0x12, 4, b'b', b'l', b'u', b'e'];
+    let argb = [0x0d, 0x33, 0x22, 0x11, 0xff, 0x15, 0x66, 0x55, 0x44, 0xff];
+    for bytes in [&legacy[..], &argb[..]] {
+        let owned = ChatSolidColorWallpaper::decode_from_slice(bytes).unwrap();
+        let view = ChatSolidColorWallpaperView::decode_view(bytes).unwrap();
+        let owned_view =
+            ChatSolidColorWallpaperOwnedView::decode(bytes::Bytes::copy_from_slice(bytes)).unwrap();
+        assert_eq!(owned.encode_to_vec(), bytes);
+        assert_eq!(view.encode_to_vec(), bytes);
+        assert_eq!(view.to_owned_message().unwrap(), owned);
+        if bytes == legacy {
+            assert_eq!(owned.color_light.as_deref(), Some("red"));
+            assert_eq!(owned_view.color_dark(), Some("blue"));
+            assert_eq!(owned.background_light_argb, None);
+        } else {
+            assert_eq!(owned.background_light_argb, Some(0xff112233));
+            assert_eq!(owned_view.background_dark_argb(), Some(0xff445566));
+            assert_eq!(owned.color_light, None);
+        }
+    }
+    // Neither decoder may accept unrelated wire types for these known fields.
+    assert!(ChatSolidColorWallpaper::decode_from_slice(&[0x08, 1]).is_err());
+    assert!(ChatSolidColorWallpaperView::decode_view(&[0x08, 1]).is_err());
+    assert!(ChatSolidColorWallpaper::decode_from_slice(&[0x0d, 1, 2]).is_err());
+    assert!(ChatSolidColorWallpaperView::decode_view(&[0x0d, 1, 2]).is_err());
+}
