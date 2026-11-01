@@ -75,6 +75,26 @@ pub struct Artifacts {
 }
 
 pub fn generate(ir: &WamIr, wa_version: &str) -> Result<Artifacts> {
+    for (name, code) in [("ChannelsVideoPlay", 6556), ("MediaStreamPlayback", 1584)] {
+        ensure!(
+            !ir.events.iter().any(|e| e.name == name || e.code == code),
+            "reconcile retained WAM event {name}"
+        );
+    }
+    for name in [
+        "PlaybackOriginType",
+        "PlaybackStateType",
+        "VideoPlayOrigin",
+        "VideoPlayResult",
+        "VideoPlayType",
+    ] {
+        ensure!(
+            !ir.enums
+                .iter()
+                .any(|e| e.module == format!("WAWebWamEnum{name}")),
+            "reconcile retained WAM enum {name}"
+        );
+    }
     ensure!(
         !ir.events.iter().any(|event| event.name == "RingtoneScreen")
             && !ir
@@ -127,7 +147,7 @@ fn catalog(ir: &WamIr, wa_version: &str, enums: &BTreeMap<String, String>) -> Re
 
     out.push_str(&constants(ir)?);
     out.push_str(&private_stats_ids(ir));
-    out.push_str(&enum_module(ir, enums));
+    out.push_str(&enum_module(ir, enums)?);
     out.push_str(&globals_module(ir, enums)?);
     out.push_str(&events_module(ir, enums)?);
     Ok(out)
@@ -206,15 +226,15 @@ fn private_stats_ids(ir: &WamIr) -> String {
     out
 }
 
-fn enum_module(ir: &WamIr, names: &BTreeMap<String, String>) -> String {
+fn enum_module(ir: &WamIr, names: &BTreeMap<String, String>) -> Result<String> {
     let mut out = String::new();
     out.push_str(
         "/// Every enum a WAM field or global is typed by.\n\
          ///\n\
-         /// Each is closed: WA Web validates a field against the frozen member set\n\
-         /// and throws otherwise, so a value outside it is not representable here\n\
-         /// either. `wire()` is the integer that reaches the buffer.\n\
-         pub mod enums {\n    pub use crate::unlisted::RingtoneEntryType;\n",
+         /// Historical SDK members are explicitly marked; their retention does not\n\
+         /// claim current Web validation or emission. `wire()` is the integer\n\
+         /// that reaches the buffer. Consult current call-site evidence before sending.\n\
+         pub mod enums {\n    pub use crate::unlisted::{RingtoneEntryType, PlaybackOriginType, PlaybackStateType, VideoPlayOrigin, VideoPlayResult, VideoPlayType};\n",
     );
     for e in &ir.enums {
         let rust = &names[&e.module];
@@ -224,8 +244,13 @@ fn enum_module(ir: &WamIr, names: &BTreeMap<String, String>) -> String {
         ));
         let mut used = std::collections::HashSet::new();
         let mut variants = Vec::with_capacity(e.variants.len());
-        for v in &e.variants {
+        for v in compatible_variants(e)? {
             let ident = unique_type_ident(&type_ident(&v.key), &mut used, "Variant");
+            if !e.variants.iter().any(|current| current.key == v.key) {
+                out.push_str(
+                    "        /// Historical SDK member; absent from the current Web capture.\n",
+                );
+            }
             out.push_str(&format!(
                 "        /// `{}` = {}.\n        {ident},\n",
                 v.key, v.value
@@ -242,7 +267,49 @@ fn enum_module(ir: &WamIr, names: &BTreeMap<String, String>) -> String {
         out.push_str("            }\n        }\n    }\n\n");
     }
     out.push_str("}\n\n");
-    out
+    Ok(out)
+}
+
+fn compatible_variants(value: &crate::ir::WamEnum) -> Result<Vec<crate::ir::WamEnumVariant>> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Retained {
+        source_rev: String,
+        enums: Vec<crate::ir::WamEnum>,
+    }
+    let fixture = include_str!("../../fixtures/wam-retained-variants.json");
+    ensure!(
+        crate::source::digest(fixture.as_bytes())
+            == "sha256:588518fad39e13aae35b9af87d07eb9bb1bc2daa22071b36cbd74f67c7b5b568",
+        "historical WAM variants require source review"
+    );
+    let retained: Retained = serde_json::from_str(fixture)?;
+    ensure!(
+        retained.source_rev == "c581c20a9d0605df49abf297f2e7cfc04ccf1ff7",
+        "historical WAM enum provenance changed"
+    );
+    let mut variants = value.variants.clone();
+    for entry in retained
+        .enums
+        .into_iter()
+        .filter(|e| e.module == value.module)
+    {
+        ensure!(
+            entry.name == value.name,
+            "retained WAM enum identity changed"
+        );
+        for variant in entry.variants {
+            ensure!(
+                !variants
+                    .iter()
+                    .any(|v| v.key == variant.key || v.value == variant.value),
+                "reconcile historical WAM variant {}",
+                variant.key
+            );
+            variants.push(variant);
+        }
+    }
+    Ok(variants)
 }
 
 fn kind_expr(kind: &WamValueKind) -> &'static str {
@@ -329,15 +396,67 @@ fn events_module(ir: &WamIr, enums: &BTreeMap<String, String>) -> Result<String>
          /// Absence is the only way to say \"this client does not know\": there is no\n\
          /// zero or empty-string sentinel, because the buffer distinguishes a field\n\
          /// that was written from one that was not and so does the server.\n\
-         pub mod events {\n    pub use crate::unlisted::RingtoneScreen;\n\
+         pub mod events {\n    pub use crate::unlisted::{RingtoneScreen, ChannelsVideoPlay, MediaStreamPlayback};\n\
          \x20   use super::enums;\n\
          \x20   use crate::{Channel, EventFields, WamEvent};\n\n",
     );
     for e in &ir.events {
-        out.push_str(&event_struct(e, enums)?);
+        let mut compatible = e.clone();
+        retain_historical_fields(&mut compatible)?;
+        if compatible.fields.len() != e.fields.len() {
+            out.push_str("    /// Includes historical optional fields retained for SDK compatibility;\n    /// their provenance is recorded in `wam-retained-fields.json`, not the current capture.\n");
+        }
+        out.push_str(&event_struct(&compatible, enums)?);
     }
     out.push_str("}\n");
     Ok(out)
+}
+
+fn retain_historical_fields(event: &mut WamEventDef) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Retained {
+        source_rev: String,
+        events: Vec<Fields>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Fields {
+        name: String,
+        code: u32,
+        module: String,
+        fields: Vec<crate::ir::WamField>,
+    }
+    let fixture = include_str!("../../fixtures/wam-retained-fields.json");
+    ensure!(
+        crate::source::digest(fixture.as_bytes())
+            == "sha256:21781912b84d7c11ce7ab536e80eee47bccd9b248f0ce4ce12800af46f045644",
+        "historical WAM field projection requires source review"
+    );
+    let retained: Retained = serde_json::from_str(fixture)?;
+    ensure!(
+        retained.source_rev == "c581c20a9d0605df49abf297f2e7cfc04ccf1ff7",
+        "WAM retention provenance changed"
+    );
+    for entry in retained.events.into_iter().filter(|e| e.name == event.name) {
+        ensure!(
+            event.code == entry.code && event.module == entry.module,
+            "review retained WAM event identity"
+        );
+        for field in entry.fields {
+            ensure!(
+                !event
+                    .fields
+                    .iter()
+                    .any(|f| f.name == field.name || f.id == field.id),
+                "reconcile retained WAM field {}",
+                field.name
+            );
+            event.fields.push(field);
+        }
+        event.fields.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+    Ok(())
 }
 
 fn event_struct(e: &WamEventDef, enums: &BTreeMap<String, String>) -> Result<String> {
@@ -495,6 +614,53 @@ fn call_site(s: &WamCallSite) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn historical_variants_refuse_reused_wire_values() {
+        let mut value: crate::ir::WamEnum = serde_json::from_str(
+            r#"{"name":"PLATFORM_TYPE","module":"WAWebWamEnumPlatformType","variants":[]}"#,
+        )
+        .unwrap();
+        let variants = compatible_variants(&value).unwrap();
+        assert_eq!(variants.len(), 26);
+        assert!(variants.iter().any(|v| v.key == "BB" && v.value == 3));
+        value.variants.push(crate::ir::WamEnumVariant {
+            key: "NEW_MEANING".into(),
+            value: 3,
+        });
+        assert!(compatible_variants(&value).is_err());
+    }
+
+    #[test]
+    fn historical_fields_reject_identity_and_id_reuse() {
+        let mut event = ir().events.remove(0);
+        event.name = "Call".into();
+        event.code = 462;
+        event.module = "WAWebCallWamEvent".into();
+        let mut changed = event.clone();
+        changed.module = "changed".into();
+        assert!(retain_historical_fields(&mut changed).is_err());
+        retain_historical_fields(&mut event).unwrap();
+        assert!(
+            event
+                .fields
+                .iter()
+                .any(|f| f.name == "jbAvgDelayFromDisorderDistanceHist" && f.id == 1413)
+        );
+        let field = event.fields.iter_mut().find(|f| f.id == 1413).unwrap();
+        field.name = "newMeaning".into();
+        assert!(retain_historical_fields(&mut event).is_err());
+    }
+
+    #[test]
+    fn historical_events_cannot_silently_reappear() {
+        let mut value = ir();
+        value.events[0].name = "MediaStreamPlayback".into();
+        assert!(generate(&value, "2.3000.1052559453").is_err());
+        value.events[0].name = "differentMeaning".into();
+        value.events[0].code = 6556;
+        assert!(generate(&value, "2.3000.1052559453").is_err());
+    }
 
     fn ir() -> WamIr {
         serde_json::from_str(

@@ -494,3 +494,46 @@ fn the_private_stats_id_is_rewritten_before_every_event_and_another_global_is_no
          (psId cost {ps_id}, an ordinary private global cost {country})"
     );
 }
+
+#[test]
+fn historical_video_types_and_optional_fields_keep_public_wire_contracts() {
+    assert_eq!(enums::PlatformType::Bb.wire(), 3);
+    assert_eq!(enums::PlaybackOriginType::Channels.wire(), 3);
+    assert_eq!(enums::PlaybackStateType::ReadyPlay.wire(), 2);
+    assert_eq!(enums::VideoPlayOrigin::Channels.wire(), 6);
+    assert_eq!(enums::VideoPlayResult::Ok.wire(), 1);
+    assert_eq!(enums::VideoPlayType::Stream.wire(), 2);
+    assert_eq!(events::ChannelsVideoPlay::CODE, 6556);
+    assert_eq!(events::MediaStreamPlayback::CODE, 1584);
+    let _: Option<f64> = events::Call::default().jb_avg_delay_from_disorder_distance_hist;
+    let _: Option<String> = events::Daily::default().received_experience_ids;
+    let _: Option<bool> = events::ChannelMessageVisibilityTracking::default().is_vpv_impression;
+
+    // The old Call field was numeric field 1413 in event 462, independently of
+    // the new capture's current field table.
+    struct ExpectedCall;
+    impl WamEvent for ExpectedCall {
+        const NAME: &'static str = "Call";
+        const CODE: u32 = 462;
+        const CHANNEL: Channel = Channel::Regular;
+        const WEIGHTS: [u32; 3] = [1, 1, 1];
+        const PRIVATE_STATS_ID: Option<i64> = None;
+        fn encode(&self, fields: &mut EventFields<'_>) {
+            fields.number(1413, Some(1.5));
+        }
+    }
+    let mut actual = buffer(1);
+    actual
+        .write_event(
+            &events::Call {
+                jb_avg_delay_from_disorder_distance_hist: Some(1.5),
+                ..Default::default()
+            },
+            TS,
+            1,
+        )
+        .unwrap();
+    let mut expected = buffer(1);
+    expected.write_event(&ExpectedCall, TS, 1).unwrap();
+    assert_eq!(actual.as_bytes(), expected.as_bytes());
+}

@@ -1,0 +1,115 @@
+{
+  "sourceRev": "c581c20a9d0605df49abf297f2e7cfc04ccf1ff7",
+  "enums": [
+    {
+      "name": "PLATFORM_TYPE",
+      "module": "WAWebWamEnumPlatformType",
+      "variants": [
+        {
+          "key": "BB",
+          "value": 3
+        },
+        {
+          "key": "BBX",
+          "value": 7
+        },
+        {
+          "key": "S40",
+          "value": 4
+        },
+        {
+          "key": "SYMBIAN",
+          "value": 5
+        },
+        {
+          "key": "WP",
+          "value": 6
+        },
+        {
+          "key": "OSMETA",
+          "value": 11
+        },
+        {
+          "key": "ENT",
+          "value": 12
+        },
+        {
+          "key": "KAIOS",
+          "value": 14
+        },
+        {
+          "key": "GREENA",
+          "value": 23
+        },
+        {
+          "key": "GREENI",
+          "value": 24
+        },
+        {
+          "key": "IGDA",
+          "value": 25
+        },
+        {
+          "key": "IGDI",
+          "value": 26
+        },
+        {
+          "key": "IGLITEA",
+          "value": 27
+        },
+        {
+          "key": "MLITEA",
+          "value": 28
+        },
+        {
+          "key": "IGDW",
+          "value": 33
+        },
+        {
+          "key": "PAGE",
+          "value": 34
+        },
+        {
+          "key": "MSGRDM",
+          "value": 35
+        },
+        {
+          "key": "MSGRDW",
+          "value": 36
+        },
+        {
+          "key": "IGDM",
+          "value": 44
+        },
+        {
+          "key": "WEARM",
+          "value": 45
+        },
+        {
+          "key": "ARDEV",
+          "value": 50
+        },
+        {
+          "key": "MSGRAR",
+          "value": 57
+        },
+        {
+          "key": "MSGRT",
+          "value": 60
+        },
+        {
+          "key": "IGDT",
+          "value": 61
+        },
+        {
+          "key": "IGDSG",
+          "value": 64
+        },
+        {
+          "key": "IGDVR",
+          "value": 67
+        }
+      ]
+    }
+  ]
+}

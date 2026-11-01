@@ -80,11 +80,14 @@ pub const PRIVATE_STATS_IDS: &[PrivateStatsId] = &[
 
 /// Every enum a WAM field or global is typed by.
 ///
-/// Each is closed: WA Web validates a field against the frozen member set
-/// and throws otherwise, so a value outside it is not representable here
-/// either. `wire()` is the integer that reaches the buffer.
+/// Historical SDK members are explicitly marked; their retention does not
+/// claim current Web validation or emission. `wire()` is the integer
+/// that reaches the buffer. Consult current call-site evidence before sending.
 pub mod enums {
-    pub use crate::unlisted::RingtoneEntryType;
+    pub use crate::unlisted::{
+        PlaybackOriginType, PlaybackStateType, RingtoneEntryType, VideoPlayOrigin, VideoPlayResult,
+        VideoPlayType,
+    };
     /// `ABOUT_CONSUMPTION_SURFACE_TYPE` (`WAWebWamEnumAboutConsumptionSurfaceType`).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum AboutConsumptionSurfaceType {
@@ -32612,6 +32615,84 @@ pub mod enums {
         Test,
         /// `UNKNOWN` = 10.
         Unknown,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `BB` = 3.
+        Bb,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `BBX` = 7.
+        Bbx,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `S40` = 4.
+        S40,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `SYMBIAN` = 5.
+        Symbian,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `WP` = 6.
+        Wp,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `OSMETA` = 11.
+        Osmeta,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `ENT` = 12.
+        Ent,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `KAIOS` = 14.
+        Kaios,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `GREENA` = 23.
+        Greena,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `GREENI` = 24.
+        Greeni,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `IGDA` = 25.
+        Igda,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `IGDI` = 26.
+        Igdi,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `IGLITEA` = 27.
+        Iglitea,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `MLITEA` = 28.
+        Mlitea,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `IGDW` = 33.
+        Igdw,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `PAGE` = 34.
+        Page,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `MSGRDM` = 35.
+        Msgrdm,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `MSGRDW` = 36.
+        Msgrdw,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `IGDM` = 44.
+        Igdm,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `WEARM` = 45.
+        Wearm,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `ARDEV` = 50.
+        Ardev,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `MSGRAR` = 57.
+        Msgrar,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `MSGRT` = 60.
+        Msgrt,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `IGDT` = 61.
+        Igdt,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `IGDSG` = 64.
+        Igdsg,
+        /// Historical SDK member; absent from the current Web capture.
+        /// `IGDVR` = 67.
+        Igdvr,
     }
 
     impl PlatformType {
@@ -32659,6 +32740,32 @@ pub mod enums {
                 Self::Wauto => 73,
                 Self::Test => 9,
                 Self::Unknown => 10,
+                Self::Bb => 3,
+                Self::Bbx => 7,
+                Self::S40 => 4,
+                Self::Symbian => 5,
+                Self::Wp => 6,
+                Self::Osmeta => 11,
+                Self::Ent => 12,
+                Self::Kaios => 14,
+                Self::Greena => 23,
+                Self::Greeni => 24,
+                Self::Igda => 25,
+                Self::Igdi => 26,
+                Self::Iglitea => 27,
+                Self::Mlitea => 28,
+                Self::Igdw => 33,
+                Self::Page => 34,
+                Self::Msgrdm => 35,
+                Self::Msgrdw => 36,
+                Self::Igdm => 44,
+                Self::Wearm => 45,
+                Self::Ardev => 50,
+                Self::Msgrar => 57,
+                Self::Msgrt => 60,
+                Self::Igdt => 61,
+                Self::Igdsg => 64,
+                Self::Igdvr => 67,
             }
         }
     }
@@ -50127,7 +50234,7 @@ pub mod globals {
 /// that was written from one that was not and so does the server.
 pub mod events {
     use super::enums;
-    pub use crate::unlisted::RingtoneScreen;
+    pub use crate::unlisted::{ChannelsVideoPlay, MediaStreamPlayback, RingtoneScreen};
     use crate::{Channel, EventFields, WamEvent};
 
     /// `GroupCreateC`: WAM event 156 on the `regular` channel.
@@ -50696,6 +50803,8 @@ pub mod events {
         }
     }
 
+    /// Includes historical optional fields retained for SDK compatibility;
+    /// their provenance is recorded in `wam-retained-fields.json`, not the current capture.
     /// `Call`: WAM event 462 on the `regular` channel.
     ///
     /// Declared in `WAWebCallWamEvent`. Sampling weights `[1, 1, 1]` as the catalog lists them;
@@ -52904,12 +53013,42 @@ pub mod events {
         pub is_waiting_room_enabled: Option<bool>,
         /// `jbAvgDelay` (id 146).
         pub jb_avg_delay: Option<f64>,
+        /// `jbAvgDelayFromDisorderDistanceHist` (id 1413).
+        pub jb_avg_delay_from_disorder_distance_hist: Option<f64>,
+        /// `jbAvgDelayFromPutHist` (id 1414).
+        pub jb_avg_delay_from_put_hist: Option<f64>,
+        /// `jbAvgDelayUniform` (id 644).
+        pub jb_avg_delay_uniform: Option<f64>,
+        /// `jbAvgDisorderTargetSize` (id 1086).
+        pub jb_avg_disorder_target_size: Option<f64>,
+        /// `jbAvgPutHistTargetSize` (id 1415).
+        pub jb_avg_put_hist_target_size: Option<f64>,
+        /// `jbAvgTargetSize` (id 1012).
+        pub jb_avg_target_size: Option<f64>,
+        /// `jbAvgTargetSizeAddedFromDisorderDistanceHist` (id 1416).
+        pub jb_avg_target_size_added_from_disorder_distance_hist: Option<f64>,
+        /// `jbAvgTargetSizeFromDisorderDistanceHist` (id 1417).
+        pub jb_avg_target_size_from_disorder_distance_hist: Option<f64>,
+        /// `jbAvgTargetSizeFromPutHist` (id 1418).
+        pub jb_avg_target_size_from_put_hist: Option<f64>,
         /// `jbCng` (id 1718).
         pub jb_cng: Option<f64>,
         /// `jbDiscards` (id 150).
         pub jb_discards: Option<f64>,
         /// `jbEmpties` (id 151).
         pub jb_empties: Option<f64>,
+        /// `jbEmptyPeriods1x` (id 997).
+        pub jb_empty_periods1x: Option<f64>,
+        /// `jbEmptyPeriods2x` (id 998).
+        pub jb_empty_periods2x: Option<f64>,
+        /// `jbEmptyPeriods4x` (id 999).
+        pub jb_empty_periods4x: Option<f64>,
+        /// `jbEmptyPeriods8x` (id 1000).
+        pub jb_empty_periods8x: Option<f64>,
+        /// `jbGetFromDisorderDistanceHist` (id 1419).
+        pub jb_get_from_disorder_distance_hist: Option<f64>,
+        /// `jbGetFromPutHist` (id 1420).
+        pub jb_get_from_put_hist: Option<f64>,
         /// `jbGets` (id 152).
         pub jb_gets: Option<f64>,
         /// `jbGetsDominantSpeaker` (id 2217).
@@ -52926,10 +53065,30 @@ pub mod events {
         pub jb_lost_empty_low_peer_bwe_per_sec: Option<f64>,
         /// `jbLostEmptyLowToHighPeerBwePerSec` (id 776).
         pub jb_lost_empty_low_to_high_peer_bwe_per_sec: Option<f64>,
+        /// `jbMaxDelay` (id 148).
+        pub jb_max_delay: Option<f64>,
+        /// `jbMaxDelayFromDisorderDistanceHist` (id 1421).
+        pub jb_max_delay_from_disorder_distance_hist: Option<f64>,
+        /// `jbMaxDelayFromPutHist` (id 1422).
+        pub jb_max_delay_from_put_hist: Option<f64>,
+        /// `jbMaxDisorderTargetSize` (id 1087).
+        pub jb_max_disorder_target_size: Option<f64>,
+        /// `jbMaxPutHistTargetSize` (id 1423).
+        pub jb_max_put_hist_target_size: Option<f64>,
+        /// `jbMaxTargetSizeAddedFromDisorderDistanceHist` (id 1424).
+        pub jb_max_target_size_added_from_disorder_distance_hist: Option<f64>,
+        /// `jbMaxTargetSizeFromDisorderDistanceHist` (id 1425).
+        pub jb_max_target_size_from_disorder_distance_hist: Option<f64>,
+        /// `jbMaxTargetSizeFromPutHist` (id 1426).
+        pub jb_max_target_size_from_put_hist: Option<f64>,
         /// `jbMeanWaitTime` (id 1656).
         pub jb_mean_wait_time: Option<f64>,
         /// `jbMeanWaitTimeDominantSpeaker` (id 2218).
         pub jb_mean_wait_time_dominant_speaker: Option<f64>,
+        /// `jbMinDelay` (id 147).
+        pub jb_min_delay: Option<f64>,
+        /// `jbNonSpeechDiscards` (id 846).
+        pub jb_non_speech_discards: Option<f64>,
         /// `jbPlc` (id 1719).
         pub jb_plc: Option<f64>,
         /// `jbPlcCng` (id 1720).
@@ -52946,6 +53105,8 @@ pub mod events {
         pub jb_puts: Option<f64>,
         /// `jbPutsDominantSpeaker` (id 2221).
         pub jb_puts_dominant_speaker: Option<i64>,
+        /// `jbTotalEmptyPeriods` (id 996).
+        pub jb_total_empty_periods: Option<f64>,
         /// `jbTotalPlc1xMs` (id 2373).
         pub jb_total_plc1x_ms: Option<i64>,
         /// `jbTotalPlc2xMs` (id 2374).
@@ -52992,8 +53153,14 @@ pub mod events {
         pub last_min_aux_video_render_freeze8x_t: Option<i64>,
         /// `lastMinAuxVideoRenderFreezeT` (id 3109). A duration in milliseconds.
         pub last_min_aux_video_render_freeze_t: Option<i64>,
+        /// `lastMinJbAvgDelay` (id 1607).
+        pub last_min_jb_avg_delay: Option<f64>,
+        /// `lastMinJbEmpties` (id 1608).
+        pub last_min_jb_empties: Option<f64>,
         /// `lastMinJbGets` (id 1609).
         pub last_min_jb_gets: Option<f64>,
+        /// `lastMinJbLost` (id 1610).
+        pub last_min_jb_lost: Option<f64>,
         /// `lastMinJbMeanWaitTime` (id 1864).
         pub last_min_jb_mean_wait_time: Option<f64>,
         /// `lastMinJbPlc` (id 1865).
@@ -55186,6 +55353,8 @@ pub mod events {
         pub uwp_voip_total_mic_devices: Option<i64>,
         /// `uwpVoipWindowIncomingAcceptToCallLayoutTime` (id 1841). A duration in milliseconds.
         pub uwp_voip_window_incoming_accept_to_call_layout_time: Option<i64>,
+        /// `uwpVoipWindowIncomingOfferToLayoutTime` (id 1842). A duration in milliseconds.
+        pub uwp_voip_window_incoming_offer_to_layout_time: Option<i64>,
         /// `uwpVoipWindowOutgoingLaunchTime` (id 1843). A duration in milliseconds.
         pub uwp_voip_window_outgoing_launch_time: Option<i64>,
         /// `v2vAudioFrameLoss2xMs` (id 1144). A duration in milliseconds.
@@ -57545,9 +57714,27 @@ pub mod events {
             fields.boolean(1577, self.is_voice_chat);
             fields.boolean(2632, self.is_waiting_room_enabled);
             fields.number(146, self.jb_avg_delay);
+            fields.number(1413, self.jb_avg_delay_from_disorder_distance_hist);
+            fields.number(1414, self.jb_avg_delay_from_put_hist);
+            fields.number(644, self.jb_avg_delay_uniform);
+            fields.number(1086, self.jb_avg_disorder_target_size);
+            fields.number(1415, self.jb_avg_put_hist_target_size);
+            fields.number(1012, self.jb_avg_target_size);
+            fields.number(
+                1416,
+                self.jb_avg_target_size_added_from_disorder_distance_hist,
+            );
+            fields.number(1417, self.jb_avg_target_size_from_disorder_distance_hist);
+            fields.number(1418, self.jb_avg_target_size_from_put_hist);
             fields.number(1718, self.jb_cng);
             fields.number(150, self.jb_discards);
             fields.number(151, self.jb_empties);
+            fields.number(997, self.jb_empty_periods1x);
+            fields.number(998, self.jb_empty_periods2x);
+            fields.number(999, self.jb_empty_periods4x);
+            fields.number(1000, self.jb_empty_periods8x);
+            fields.number(1419, self.jb_get_from_disorder_distance_hist);
+            fields.number(1420, self.jb_get_from_put_hist);
             fields.number(152, self.jb_gets);
             fields.integer(2217, self.jb_gets_dominant_speaker);
             fields.number(149, self.jb_last_delay);
@@ -57556,8 +57743,21 @@ pub mod events {
             fields.number(777, self.jb_lost_empty_high_peer_bwe_per_sec);
             fields.number(775, self.jb_lost_empty_low_peer_bwe_per_sec);
             fields.number(776, self.jb_lost_empty_low_to_high_peer_bwe_per_sec);
+            fields.number(148, self.jb_max_delay);
+            fields.number(1421, self.jb_max_delay_from_disorder_distance_hist);
+            fields.number(1422, self.jb_max_delay_from_put_hist);
+            fields.number(1087, self.jb_max_disorder_target_size);
+            fields.number(1423, self.jb_max_put_hist_target_size);
+            fields.number(
+                1424,
+                self.jb_max_target_size_added_from_disorder_distance_hist,
+            );
+            fields.number(1425, self.jb_max_target_size_from_disorder_distance_hist);
+            fields.number(1426, self.jb_max_target_size_from_put_hist);
             fields.number(1656, self.jb_mean_wait_time);
             fields.number(2218, self.jb_mean_wait_time_dominant_speaker);
+            fields.number(147, self.jb_min_delay);
+            fields.number(846, self.jb_non_speech_discards);
             fields.number(1719, self.jb_plc);
             fields.number(1720, self.jb_plc_cng);
             fields.number(2478, self.jb_plc_cng_before_first_decode);
@@ -57566,6 +57766,7 @@ pub mod events {
             fields.integer(2220, self.jb_plc_dominant_speaker);
             fields.number(153, self.jb_puts);
             fields.integer(2221, self.jb_puts_dominant_speaker);
+            fields.number(996, self.jb_total_empty_periods);
             fields.integer(2373, self.jb_total_plc1x_ms);
             fields.integer(2374, self.jb_total_plc2x_ms);
             fields.integer(2375, self.jb_total_plc4x_ms);
@@ -57589,7 +57790,10 @@ pub mod events {
             fields.integer(3107, self.last_min_aux_video_render_freeze4x_t);
             fields.integer(3108, self.last_min_aux_video_render_freeze8x_t);
             fields.integer(3109, self.last_min_aux_video_render_freeze_t);
+            fields.number(1607, self.last_min_jb_avg_delay);
+            fields.number(1608, self.last_min_jb_empties);
             fields.number(1609, self.last_min_jb_gets);
+            fields.number(1610, self.last_min_jb_lost);
             fields.number(1864, self.last_min_jb_mean_wait_time);
             fields.integer(1865, self.last_min_jb_plc);
             fields.integer(1866, self.last_min_jb_plc_cng);
@@ -58781,6 +58985,7 @@ pub mod events {
                 1841,
                 self.uwp_voip_window_incoming_accept_to_call_layout_time,
             );
+            fields.integer(1842, self.uwp_voip_window_incoming_offer_to_layout_time);
             fields.integer(1843, self.uwp_voip_window_outgoing_launch_time);
             fields.integer(1144, self.v2v_audio_frame_loss2x_ms);
             fields.integer(1146, self.v2v_audio_frame_loss8x_ms);
@@ -61340,6 +61545,8 @@ pub mod events {
         }
     }
 
+    /// Includes historical optional fields retained for SDK compatibility;
+    /// their provenance is recorded in `wam-retained-fields.json`, not the current capture.
     /// `Daily`: WAM event 1158 on the `regular` channel.
     ///
     /// Declared in `WAWebDailyWamEvent`. Sampling weights `[1, 1, 1]` as the catalog lists them;
@@ -61625,6 +61832,8 @@ pub mod events {
         pub profile_links_count: Option<i64>,
         /// `receiptsEnabled` (id 8).
         pub receipts_enabled: Option<bool>,
+        /// `receivedExperienceIds` (id 262).
+        pub received_experience_ids: Option<String>,
         /// `secretCodeActive` (id 172).
         pub secret_code_active: Option<bool>,
         /// `showMetaAiButtonSetting` (id 173).
@@ -61870,6 +62079,7 @@ pub mod events {
             );
             fields.integer(211, self.profile_links_count);
             fields.boolean(8, self.receipts_enabled);
+            fields.string(262, self.received_experience_ids.as_deref());
             fields.boolean(172, self.secret_code_active);
             fields.boolean(173, self.show_meta_ai_button_setting);
             fields.integer(2, self.sim_mcc);
@@ -79264,6 +79474,8 @@ pub mod events {
         }
     }
 
+    /// Includes historical optional fields retained for SDK compatibility;
+    /// their provenance is recorded in `wam-retained-fields.json`, not the current capture.
     /// `ChannelMessageVisibilityTracking`: WAM event 5998 on the `regular` channel.
     ///
     /// Declared in `WAWebChannelMessageVisibilityTrackingWamEvent`. Sampling weights `[1, 1, 1]` as the catalog lists them;
@@ -79286,6 +79498,8 @@ pub mod events {
         pub is_original_author: Option<bool>,
         /// `isStarredPost` (id 8).
         pub is_starred_post: Option<bool>,
+        /// `isVpvImpression` (id 7).
+        pub is_vpv_impression: Option<bool>,
         /// `postId` (id 4).
         pub post_id: Option<String>,
         /// `traceIdInt` (id 11).
@@ -79310,6 +79524,7 @@ pub mod events {
             fields.integer(15, self.dedup_key);
             fields.boolean(12, self.is_original_author);
             fields.boolean(8, self.is_starred_post);
+            fields.boolean(7, self.is_vpv_impression);
             fields.string(4, self.post_id.as_deref());
             fields.integer(11, self.trace_id_int);
             fields.string(6, self.unified_session_id.as_deref());

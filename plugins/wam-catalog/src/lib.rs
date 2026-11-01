@@ -16,7 +16,8 @@
 //!
 //! - **That an event is correct to send.** The catalog says a field exists and
 //!   what its id is. Whether this client can honestly fill it is a separate
-//!   question, answered in the plugin and checked against [`call_sites`].
+//!   question, answered in the plugin and checked against `call_sites` when
+//!   the `parity` feature is enabled.
 //! - **That the catalog matches today's WhatsApp.** It matches the pinned
 //!   whatspec commit, which is a static reading of one bundle. Regenerating is
 //!   how it moves; nothing here detects drift at runtime.

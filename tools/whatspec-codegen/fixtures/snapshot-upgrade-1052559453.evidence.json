@@ -281,5 +281,75 @@
     "groupsTestsPassed": 86,
     "generatorTestsPassed": 146,
     "evidenceProvenance": "group_qualification_review.json distinguishes consumer filenames from upstream source URLs, script/crate locations, and the diagnostic-cache Identifier binding."
+  },
+  "wamPublicCompatibility": {
+    "sourceRev": "c581c20a9d0605df49abf297f2e7cfc04ccf1ff7",
+    "retainedEvents": [
+      "ChannelsVideoPlay",
+      "MediaStreamPlayback"
+    ],
+    "retainedEnums": [
+      "PlaybackOriginType",
+      "PlaybackStateType",
+      "VideoPlayOrigin",
+      "VideoPlayResult",
+      "VideoPlayType"
+    ],
+    "retainedOptionalFields": 32,
+    "fieldFixture": "wam-retained-fields.json",
+    "method": "Keep historical public exports in the existing unlisted module, retain SDK enum members with explicit historical documentation, and augment only SDK struct/encoder fields. Current call-site evidence and active event counts remain derived from the locked current IR. Hash-pin the historical field/variant projections; reject reused event identities/codes, enum identities/values, field names and field IDs.",
+    "limits": "Retention preserves the previous public encoding API without asserting current Web emission or server acceptance.",
+    "validation": "170 generator/catalog tests passed, including public paths, historical variant codes, field encoding and collision guards; all-target Clippy, Rustdoc without parity, and deterministic generation passed.",
+    "retainedPlatformVariants": 26,
+    "variantFixture": "wam-retained-variants.json",
+    "historicalIrSha256": "d899388bb0ea4137687c7b13a54014bab24e887ac6d231b9c90971742152b260"
+  },
+  "performanceQualification": {
+    "metric": "CodSpeed CPU Simulation estimated CPU time; not wall-clock connection latency.",
+    "benchmark": "tests/bench-integration/benches/integration.rs::connect_to_ready",
+    "baseline": {
+      "revision": "0d1373a8f06e0dfa72f3ea1c4c33abae9fd21d61",
+      "run": "6ae659e37f20a18c1205a21e",
+      "seconds": 0.17563320721512823,
+      "syscalls": 598
+    },
+    "upgradedFastSample": {
+      "revision": "aaf8c4fad5355fe14fdf0ae023654a3834b3b33a",
+      "run": "6ae6cb44bac2485a0288f2a5",
+      "seconds": 0.17756792784994244,
+      "syscalls": 540
+    },
+    "qualifiedHeadSample": {
+      "revision": "7376aab793efaa778957c51fac408d4c052da9e4",
+      "run": "6ae6cf4bca03bd8aeca0e690",
+      "seconds": 0.20783380425711542,
+      "syscalls": 1208
+    },
+    "sameHeadIntegrationJobReplica": {
+      "workflowRun": 41276892622,
+      "attempt": 2,
+      "seconds": 0.20788854545955546,
+      "syscalls": 1234
+    },
+    "sourceControls": {
+      "testVersionOverride": "2.3000.0",
+      "mockImage": "ghcr.io/whiskeysockets-devtools/bartender@sha256:9f3a49dd9f944414fbda50571bba5f66f2ab6fdc48001e6803d4c09a1042c78e",
+      "unchangedSources": [
+        "tests/bench-integration/benches/integration.rs",
+        "tests/e2e/src/lib.rs",
+        "wacore/libsignal",
+        "src/prekeys.rs"
+      ]
+    },
+    "profileFinding": "Slow head includes ~21.4 ms of process_classified_message -> message_decrypt_prekey_input -> initialize_bob_session. Plaintext then decodes AppStateSyncKeyShare. The fast upgraded sample has no matching process_classified_message node. Dominant prekey generation was ~158.1 ms in baseline and ~153.5 ms in head; it did not explain the aggregate increase.",
+    "interpretation": "A material difference in work included in the asynchronous connect/teardown window is demonstrated. Causality to the snapshot update, history default or a per-operation slowdown is not established; no performance claim or acknowledgment was made.",
+    "remainingQualification": "Isolate a fixed connection/key-share workload and compare paired walltime through CodSpeed. The exact pinned mock image pull was denied by GHCR; the existing GitHub CLI credential lacks read:packages. No denied image-pull retry, alternate-image substitution, raw benchmark fallback, credential extraction or scope expansion was performed. CI/MCP measurements remain accessible.",
+    "localAuthentication": "CodSpeed CLI default profile successfully renewed through the official OAuth flow for the existing jlucaso1 account.",
+    "localMockAccess": {
+      "action": "docker pull ghcr.io/whiskeysockets-devtools/bartender@sha256:9f3a49dd9f944414fbda50571bba5f66f2ab6fdc48001e6803d4c09a1042c78e",
+      "state": "denied",
+      "reason": "Registry requires package-read credentials; CI config uses BARTENDER_GHCR_TOKEN. No image was obtained locally.",
+      "needed": "Authorized read access to the exact package, or a paired walltime qualification in the existing authorized CI environment."
+    }
   }
 }
