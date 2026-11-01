@@ -15,6 +15,8 @@ use wacore_binary::{Jid, Node};
 
 use crate::client::CallError;
 
+const ANSWER_TRANSITION_LANES: usize = 16;
+
 /// Encryption results retain the full rung device set even when some devices cannot be encrypted.
 pub struct DirectCallKeys {
     pub device_keys: Vec<OfferDeviceKey>,
@@ -69,7 +71,7 @@ pub struct DirectCallState {
     epoch: portable_atomic::AtomicU64,
     pub(crate) call_registry: Arc<CallRegistry>,
     pub(crate) pending_outgoing_calls: Arc<Mutex<HashMap<String, super::facade::PendingOutgoing>>>,
-    pub(crate) answer_transition_locks: OnceLock<[Arc<AsyncMutex<()>>; 16]>,
+    pub(crate) answer_transition_locks: OnceLock<[Arc<AsyncMutex<()>>; ANSWER_TRANSITION_LANES]>,
 }
 
 impl DirectCallState {
@@ -104,10 +106,10 @@ impl DirectCallState {
         use std::hash::{Hash, Hasher};
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         id.hash(&mut hash);
-        self.answer_transition_locks
-            .get_or_init(|| std::array::from_fn(|_| Arc::new(AsyncMutex::new(()))))
-            [hash.finish() as usize % 16]
-            .clone()
+        let locks = self
+            .answer_transition_locks
+            .get_or_init(|| std::array::from_fn(|_| Arc::new(AsyncMutex::new(()))));
+        locks[hash.finish() as usize % locks.len()].clone()
     }
 }
 

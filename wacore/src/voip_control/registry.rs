@@ -1619,9 +1619,6 @@ impl CallRegistry {
         let generation = {
             let mut ringing = self.ringing_calls();
             let mut map = self.active_calls();
-            if !Self::ringing_admits(&ringing, &call_id) {
-                return Err(GroupStateApply::InvalidSnapshot);
-            }
             if let Some(entry) = map.get(&call_id) {
                 if entry.session.phase() != CallPhase::Ringing {
                     return Ok(None);
@@ -1673,6 +1670,9 @@ impl CallRegistry {
                 ringing.insert(call_id, entry.generation);
                 entry.generation
             } else {
+                if !Self::ringing_admits(&ringing, &call_id) {
+                    return Err(GroupStateApply::InvalidSnapshot);
+                }
                 // Only a brand-new registration is charged against the aggregate, so the walk over
                 // every ringing group call belongs here rather than ahead of the update branch.
                 let (ringing_group_entries, ringing_group_bytes) = map
@@ -3311,7 +3311,9 @@ impl CallRegistry {
     /// Record an incoming offer as ringing (not yet answered) so a later `<terminate>` for it can be
     /// surfaced as a missed call. Idempotent; the flag is consumed by [`take_ringing`](Self::take_ringing)
     /// on answer or terminate. Do not call for an offline-queued offer: that one is already surfaced
-    /// as missed-offline and must not double-fire.
+    /// as missed-offline and must not double-fire. This compatibility helper is bounded best-effort:
+    /// a new marker is ignored at 256 retained calls or 64 KiB of call IDs. Production dispatchers
+    /// use [`admit_incoming_offer`](Self::admit_incoming_offer) and refuse an unadmitted offer.
     pub fn mark_incoming_ringing(&self, call_id: &str) {
         self.try_mark_incoming_ringing(call_id);
     }
@@ -4108,6 +4110,9 @@ mod tests {
         assert!(reg.transition("GROUP-CALL", CallPhase::Connecting));
         assert!(reg.take_ringing("GROUP-CALL"));
 
+        for index in 0..256 {
+            assert!(reg.try_mark_incoming_ringing(&format!("SATURATED-{index}")));
+        }
         assert_eq!(reg.insert_ringing_group_if_inactive(incoming()), Ok(None));
         assert_eq!(reg.generation_of("GROUP-CALL"), Some(generation));
         assert!(

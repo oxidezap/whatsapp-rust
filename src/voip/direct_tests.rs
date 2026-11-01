@@ -104,6 +104,7 @@ struct Host {
     gate_offer: AtomicBool,
     disconnect_during_keys: AtomicBool,
     disconnect_during_token: AtomicBool,
+    disconnect_during_watch: AtomicBool,
     ack: AckMap,
     released_tx: async_channel::Sender<String>,
     released_rx: async_channel::Receiver<String>,
@@ -133,6 +134,7 @@ impl Host {
             gate_offer: AtomicBool::new(false),
             disconnect_during_keys: AtomicBool::new(false),
             disconnect_during_token: AtomicBool::new(false),
+            disconnect_during_watch: AtomicBool::new(false),
             ack: Arc::new(Mutex::new(HashMap::new())),
             released_tx,
             released_rx,
@@ -266,6 +268,11 @@ impl DirectCallHost for Host {
         Ok(())
     }
     fn watch_ack(&self, id: &str) -> Result<CallAckFuture, CallError> {
+        if self.disconnect_during_watch.swap(false, Ordering::AcqRel) {
+            self.connected.store(false, Ordering::Release);
+            direct::disconnect(self);
+            self.connected.store(true, Ordering::Release);
+        }
         let (sender, receiver) = oneshot::channel();
         let generation = self.next.fetch_add(1, Ordering::Relaxed);
         let mut map = self.ack.lock().unwrap();
@@ -848,4 +855,36 @@ async fn missing_or_invalid_own_lid_is_rejected_before_resolving_or_encrypting()
         assert!(host.backend.sessions.sessions().is_empty());
         host.assert_empty();
     }
+}
+
+#[tokio::test]
+async fn a_synchronous_disconnect_in_ack_registration_cannot_publish_a_stale_offer() {
+    let host = Host::new();
+    host.disconnect_during_watch.store(true, Ordering::Relaxed);
+    let (source, sink) = ports();
+    assert!(
+        direct::call_pcm(host.clone(), &peer(), source, sink)
+            .await
+            .is_err()
+    );
+    assert!(
+        !host.disconnect_during_watch.load(Ordering::Acquire),
+        "the synchronous watch callback was exercised"
+    );
+    assert!(
+        host.is_connected(),
+        "the socket already reports a new connection"
+    );
+    assert_eq!(host.plaintexts.lock().unwrap().len(), 1);
+    assert!(
+        host.sent.lock().unwrap().is_empty(),
+        "an observer installation must not let an old offer reach the new transport"
+    );
+    for session in host.backend.sessions.sessions() {
+        assert!(
+            session.record().closed.is_some(),
+            "any session published after the reentrant disconnect is retired"
+        );
+    }
+    host.assert_empty();
 }

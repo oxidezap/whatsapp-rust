@@ -258,6 +258,8 @@ impl StanzaHandler for CallHandler {
                     // ringing flag (else its missed-call is lost and we'd set a stale flag
                     // after the call already ended).
                     #[cfg(feature = "voip-control")]
+                    let mut pending_direct_offer = None;
+                    #[cfg(feature = "voip-control")]
                     let mut duplicate_active_group_offer = false;
                     #[cfg(feature = "voip-control")]
                     let mut buffered_initial_group_controls = Vec::new();
@@ -305,6 +307,12 @@ impl StanzaHandler for CallHandler {
                                 return true;
                             };
                             call.set_ringing_generation(token);
+                            pending_direct_offer =
+                                Some(crate::voip::direct_ingress::PendingOffer::new(
+                                    client.call_registry(),
+                                    call.action.call_id(),
+                                    token,
+                                ));
                         }
                     }
                     if is_offer && let Err(e) = send_offer_ack_receipt(&client, &call).await {
@@ -897,8 +905,20 @@ impl StanzaHandler for CallHandler {
                     if is_offer && !client.call_registry().is_ringing(call.action.call_id()) {
                         dispatch_call = false;
                     }
-                    if dispatch_call && pending_offer.as_ref().is_none_or(|offer| offer.is_alive())
+                    #[cfg(feature = "voip-control")]
+                    let current_direct_offer = pending_direct_offer
+                        .as_ref()
+                        .is_none_or(|offer| offer.is_current());
+                    #[cfg(not(feature = "voip-control"))]
+                    let current_direct_offer = true;
+                    if dispatch_call
+                        && current_direct_offer
+                        && pending_offer.as_ref().is_none_or(|offer| offer.is_alive())
                     {
+                        #[cfg(feature = "voip-control")]
+                        if let Some(offer) = &mut pending_direct_offer {
+                            offer.retain();
+                        }
                         client
                             .core
                             .event_bus
@@ -955,7 +975,6 @@ async fn apply_current_group_control(client: &Client, call: &IncomingCall) -> bo
     apply_group_control(client, call, generation).await
 }
 
-#[cfg(feature = "voip-control")]
 #[cfg(feature = "voip-control")]
 async fn apply_current_decrypted_group_epoch(
     client: &Client,
@@ -4704,6 +4723,32 @@ mod tests {
 
         drop(guard);
         assert!(handling.await.unwrap());
+    }
+
+    #[cfg(feature = "voip-control")]
+    #[tokio::test]
+    async fn cancelled_native_offer_releases_its_exact_ringing_marker() {
+        let client = make_client().await;
+        let guard = client.lid_pn_cache.lock_mutation().await;
+        let node = node_to_owned_ref(
+            &NodeBuilder::new("call")
+                .attr("from", fake_caller_lid())
+                .attr("id", "OFFER-CANCELLED")
+                .attr("t", "1766847151")
+                .children([NodeBuilder::new("offer")
+                    .attr("call-id", "CALL-CANCELLED")
+                    .attr("call-creator", fake_caller_lid())
+                    .attr("caller_pn", Jid::pn("15550000001"))
+                    .build()])
+                .build(),
+        );
+        let mut cancelled = false;
+        let mut handling = Box::pin(CallHandler.handle(client.clone(), node, &mut cancelled));
+        assert!(futures::poll!(handling.as_mut()).is_pending());
+        assert!(client.call_registry().is_ringing("CALL-CANCELLED"));
+        drop(handling);
+        assert!(!client.call_registry().is_ringing("CALL-CANCELLED"));
+        drop(guard);
     }
 
     #[cfg(feature = "voip-control")]

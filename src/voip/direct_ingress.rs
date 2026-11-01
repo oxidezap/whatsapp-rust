@@ -31,7 +31,11 @@ pub(crate) async fn authorize_answer(
     call: &mut IncomingCall,
 ) -> AnswerAuthorization {
     let mut direct_accept_alias = None;
-    let answer = if matches!(&call.action, CallAction::Accept { .. }) {
+    let accepting = matches!(&call.action, CallAction::Accept { .. });
+    let rejecting = matches!(&call.action, CallAction::Reject { .. });
+    let terminating = matches!(&call.action, CallAction::Terminate { .. });
+    let preaccepting = matches!(&call.action, CallAction::PreAccept { .. });
+    let answer = if accepting || rejecting || terminating || preaccepting {
         let registry = client.call_registry();
         match registry.generation_of(call.action.call_id()) {
             Some(generation)
@@ -44,8 +48,9 @@ pub(crate) async fn authorize_answer(
                 else {
                     return AnswerAuthorization::Ignore;
                 };
-                if session.direction != wacore::voip_control::CallDirection::Outgoing
-                    || session.answering_device.is_some()
+                if accepting
+                    && (session.direction != wacore::voip_control::CallDirection::Outgoing
+                        || session.answering_device.is_some())
                 {
                     return AnswerAuthorization::Ignore;
                 }
@@ -56,10 +61,31 @@ pub(crate) async fn authorize_answer(
                 {
                     return AnswerAuthorization::Ignore;
                 }
-                let Some(sender) =
-                    canonical_call_identity(client, &routed_call_sender(&call), &session.peer_jid)
-                        .await
-                else {
+                let observed = routed_call_sender(call);
+                // Preserve the native trusted-service authority model for terminal events.
+                // This narrow compatibility exception is not an observed direct wire fixture:
+                // peer-authored and participant-routed traffic still requires peer identity.
+                let service_termination = terminating
+                    && call.participant.is_none()
+                    && is_call_service_sender(&call.from, call.action.call_id());
+                let sender = if service_termination {
+                    Some(observed.clone())
+                } else {
+                    match canonical_call_identity(client, &observed, &session.peer_jid).await {
+                        Some(peer) => Some(peer),
+                        // A linked sibling may decline the same call for our account. Its identity
+                        // must still be a trusted alias of ours, never the stanza's caller_pn hint.
+                        None if rejecting || terminating => {
+                            if let Some(own) = client.own_lid() {
+                                canonical_call_identity(client, &observed, &own).await
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    }
+                };
+                let Some(sender) = sender else {
                     return AnswerAuthorization::Ignore;
                 };
                 let Some(creator) = canonical_call_identity(
@@ -71,7 +97,9 @@ pub(crate) async fn authorize_answer(
                 else {
                     return AnswerAuthorization::Ignore;
                 };
-                direct_accept_alias = client.namespace_alias(&sender).await;
+                if accepting {
+                    direct_accept_alias = client.namespace_alias(&sender).await;
+                }
                 if !registry.is_current(call.action.call_id(), generation) {
                     return AnswerAuthorization::Ignore;
                 }
@@ -150,7 +178,7 @@ pub(crate) async fn apply_answer(
             let delivery = super::direct::terminate_for_generation(
                 &**client,
                 call.action.call_id(),
-                std::slice::from_ref(&call.from),
+                std::slice::from_ref(&routed_call_sender(call)),
                 call.action.call_creator(),
                 generation,
             )
@@ -653,11 +681,34 @@ pub(crate) async fn learn_offer_identity(
         .await
 }
 
-struct PendingOffer {
+pub(crate) struct PendingOffer {
     registry: Arc<wacore::voip_control::registry::CallRegistry>,
     id: String,
     token: u64,
     retained: bool,
+}
+
+impl PendingOffer {
+    pub(crate) fn new(
+        registry: Arc<wacore::voip_control::registry::CallRegistry>,
+        id: &str,
+        token: u64,
+    ) -> Self {
+        Self {
+            registry,
+            id: id.to_owned(),
+            token,
+            retained: false,
+        }
+    }
+
+    pub(crate) fn is_current(&self) -> bool {
+        self.registry.is_current_ringing_offer(&self.id, self.token)
+    }
+
+    pub(crate) fn retain(&mut self) {
+        self.retained = true;
+    }
 }
 
 impl Drop for PendingOffer {
@@ -723,12 +774,7 @@ pub async fn ingest_direct_call(
             return Ok(None);
         };
         call.set_ringing_generation(token);
-        let pending = PendingOffer {
-            registry: host.call_registry(),
-            id: call.action.call_id().to_owned(),
-            token,
-            retained: false,
-        };
+        let pending = PendingOffer::new(host.call_registry(), call.action.call_id(), token);
         if let Err(error) = send_offer_receipt(&*host, &call).await {
             warn!("call: failed to send offer ack receipt: {error}");
         }
@@ -754,15 +800,11 @@ pub async fn ingest_direct_call(
     {
         super::direct::terminate_local_if_current(&*host, call.action.call_id(), generation);
     }
-    if offer.as_ref().is_some_and(|pending| {
-        !pending
-            .registry
-            .is_current_ringing_offer(&pending.id, pending.token)
-    }) {
+    if offer.as_ref().is_some_and(|pending| !pending.is_current()) {
         return Ok(None);
     }
     if let Some(pending) = &mut offer {
-        pending.retained = true;
+        pending.retain();
     }
     Ok(Some(call))
 }
@@ -906,6 +948,135 @@ mod tests {
     fn register(host: &Host) -> u64 {
         host.call_registry()
             .insert(CallSession::new_outgoing("DIRECT-INGRESS", peer(), own()))
+    }
+
+    #[tokio::test]
+    async fn service_authority_is_limited_to_matching_unrouted_termination() {
+        for (tag, service_id, creator, participant, accepted) in [
+            ("terminate", "DIRECT-INGRESS", own(), None, true),
+            ("terminate", "FOREIGN", own(), None, false),
+            ("terminate", "DIRECT-INGRESS", peer(), None, false),
+            (
+                "terminate",
+                "DIRECT-INGRESS",
+                own(),
+                Some(Jid::new("100000000000099", Server::Lid)),
+                false,
+            ),
+            ("reject", "DIRECT-INGRESS", own(), None, false),
+            ("preaccept", "DIRECT-INGRESS", own(), None, false),
+        ] {
+            let host = Host::new();
+            let generation = register(&host);
+            let mut node = stanza(tag, Jid::new(service_id, Server::Call), creator, &[]);
+            if let Some(participant) = participant {
+                node.attrs.insert("participant", participant);
+            }
+            let result = ingest_direct_call(host.clone(), &node.as_node_ref())
+                .await
+                .unwrap();
+            assert_eq!(result.is_some(), accepted, "{tag}/{service_id}");
+            assert_eq!(
+                host.call_registry()
+                    .is_current("DIRECT-INGRESS", generation),
+                !accepted
+            );
+            assert!(host.sent.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn forged_terminal_and_preaccept_stanzas_cannot_publish_or_mutate() {
+        for tag in ["reject", "terminate", "preaccept"] {
+            for forged_creator in [false, true] {
+                let host = Host::new();
+                let generation = register(&host);
+                let stranger = Jid::new("100000000000099", Server::Lid);
+                let node = stanza(
+                    tag,
+                    if forged_creator {
+                        peer().with_device(2)
+                    } else {
+                        stranger.clone()
+                    },
+                    if forged_creator { stranger } else { own() },
+                    &[],
+                );
+                assert!(
+                    ingest_direct_call(host.clone(), &node.as_node_ref())
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    host.call_registry()
+                        .is_current("DIRECT-INGRESS", generation)
+                );
+                assert!(host.sent.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn codec_mismatch_termination_targets_the_service_envelope_participant() {
+        let host = Host::new();
+        let mut session = CallSession::new_outgoing("DIRECT-INGRESS", peer(), own());
+        session.audio_format = Some(wacore::voip_control::MediaAudioFormat::OPUS_16KHZ_60MS);
+        host.call_registry().insert(session);
+        let participant = peer().with_device(2);
+        let node = NodeBuilder::new("call")
+            .attr("id", "ROUTED-MISMATCH")
+            .attr("from", Jid::new("DIRECT-INGRESS", Server::Call))
+            .attr("participant", participant.clone())
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("preaccept")
+                .attr("call-id", "DIRECT-INGRESS")
+                .attr("call-creator", own())
+                .children([NodeBuilder::new("audio")
+                    .attr("enc", "opus")
+                    .attr("rate", "48000")
+                    .build()])
+                .build()])
+            .build();
+        assert!(
+            ingest_direct_call(host.clone(), &node.as_node_ref())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let sent = host.sent.lock().unwrap();
+        assert!(sent.iter().any(|node| {
+            node.as_node_ref().get_optional_child("terminate").is_some()
+                && node
+                    .as_node_ref()
+                    .get_attr("to")
+                    .map(|value| value.as_str().into_owned())
+                    == Some(participant.to_string())
+        }));
+    }
+
+    #[tokio::test]
+    async fn rejects_accept_trusted_peer_aliases_and_our_linked_siblings() {
+        for sibling in [false, true] {
+            let host = Host::new();
+            register(&host);
+            let phone = Jid::pn(if sibling {
+                "15550000001"
+            } else {
+                "15550000002"
+            })
+            .with_device(2);
+            let expected = if sibling { own() } else { peer() }.with_device(2);
+            host.aliases.lock().unwrap().insert(phone.clone(), expected);
+            let node = stanza("reject", phone, own(), &[("reason", "decline")]);
+            assert!(
+                ingest_direct_call(host.clone(), &node.as_node_ref())
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(host.call_registry().snapshot("DIRECT-INGRESS").is_none());
+        }
     }
 
     #[tokio::test]

@@ -16,7 +16,7 @@ use wacore::messages::MessageUtils;
 #[cfg(all(test, feature = "voip-engine-wacore", not(target_arch = "wasm32")))]
 use wacore::stanza::call::{
     CAPABILITY_OFFER, CAPABILITY_PREACCEPT, CAPABILITY_STANDARD_OPUS_OFFER,
-    CAPABILITY_STANDARD_OPUS_VIDEO_OFFER, CAPABILITY_VIDEO_OFFER,
+    CAPABILITY_STANDARD_OPUS_VIDEO_OFFER, CAPABILITY_VIDEO_OFFER, standard_opus_voip_settings,
 };
 use wacore::stanza::call::{
     OfferDeviceKey, OfferParams, TerminateParams, VideoStateParams, build_offer, build_terminate,
@@ -2102,6 +2102,13 @@ async fn place_call_prepared(
             },
         );
 
+    // Cleanup may have run during the host's synchronous ACK registration or backend reservation.
+    // Both entries are now published, so check before the first write can suspend.
+    client.call_state().ensure_epoch(epoch)?;
+    if !registry.is_current(&call_id, generation) {
+        return Err(CallError::CallEndedDuringSetup);
+    }
+
     // If the send fails, undo the registration: drop the (generation-guarded) pending entry, reap our
     // registry generation, drop the dangling ack-waiter, and wake any wait_ended() waiter, then
     // propagate. Guarded so a same-call-id replacement that already superseded us isn't evicted.
@@ -3871,9 +3878,6 @@ impl CallTermination {
     }
 }
 
-/// Opaque handle to a live call. Drop does NOT end the call (the driver task owns its own lifetime);
-/// call [`terminate`](Self::terminate) to end it. No public fields, so the surface can grow without
-/// breaking callers. `Clone` is cheap (shared `Arc` state); every clone controls the SAME live call.
 struct DirectHandleTeardown<'a> {
     host: &'a dyn DirectCallHost,
     call_id: &'a str,
@@ -3885,6 +3889,9 @@ impl Drop for DirectHandleTeardown<'_> {
     }
 }
 
+/// Opaque handle to a live call. Drop does NOT end the call (the driver task owns its own lifetime);
+/// call [`terminate`](Self::terminate) to end it. No public fields, so the surface can grow without
+/// breaking callers. `Clone` is cheap (shared `Arc` state); every clone controls the SAME live call.
 #[derive(Clone)]
 pub struct CallHandle {
     call_id: String,
@@ -7251,7 +7258,7 @@ mod tests {
         };
 
         let answer = send_preaccept_then_prepare(
-            &client,
+            client.as_ref(),
             &registration,
             &mut teardown,
             Some(preaccept),
@@ -7293,7 +7300,7 @@ mod tests {
 
         let answer = async {
             send_preaccept_then_prepare(
-                &client,
+                client.as_ref(),
                 &registration,
                 &mut teardown,
                 Some(preaccept),
@@ -7304,7 +7311,7 @@ mod tests {
             )
             .await?;
             registration.ensure_current()?;
-            send_answer_node(&client, &registration, &mut teardown, accept).await
+            send_answer_node(client.as_ref(), &registration, &mut teardown, accept).await
         };
         let end_peer = async {
             preaccept_waiter.await.expect("preaccept waiter");
@@ -11496,7 +11503,7 @@ mod tests {
         let mut teardown = AnswerTeardown::new(&client, &registration);
         teardown.arm();
 
-        let terminate = teardown.terminate(&client);
+        let terminate = teardown.terminate(client.as_ref());
         let replace = async {
             entered_rx
                 .recv()
@@ -11802,9 +11809,14 @@ mod tests {
                 "CANCEL-ACCEPT",
             )
             .expect("answer signaling");
-            send_answer_node(&starting_client, &registration, &mut teardown, accept)
-                .await
-                .expect("accept committed");
+            send_answer_node(
+                starting_client.as_ref(),
+                &registration,
+                &mut teardown,
+                accept,
+            )
+            .await
+            .expect("accept committed");
             ready_tx.send(events).await.expect("observer");
             // These guards are owned inside the cancelled future, matching actual Accept.start.
             std::future::pending::<()>().await;
