@@ -1558,6 +1558,7 @@ fn build_answer_signaling(
 }
 
 #[cfg(test)]
+#[cfg(all(feature = "voip-engine-wacore", not(target_arch = "wasm32")))]
 async fn send_answer_signaling_with_ids(
     client: &Client,
     incoming: &IncomingCall,
@@ -1870,6 +1871,7 @@ pub(super) fn drain_direct_pending(client: &dyn DirectCallHost) {
 /// park the relay-attach material. Split from device resolution (usync) so it is offline testable
 /// with a seeded device list. The relay attach is the only live-only piece.
 #[cfg(test)]
+#[cfg(all(feature = "voip-engine-wacore", not(target_arch = "wasm32")))]
 #[allow(clippy::too_many_arguments)]
 async fn place_call(
     client: &Client,
@@ -2182,6 +2184,7 @@ const ERR_DISCONNECTED_DURING_SETUP: &str = "connection dropped during call setu
 /// (reusing its for_outgoing + generation handling). On timeout / no relay / closed channel the call
 /// failed to connect, so drain its pending entry and notify `ended` to resolve wait_ended().
 #[cfg(test)]
+#[cfg(all(feature = "voip-engine-wacore", not(target_arch = "wasm32")))]
 fn spawn_outgoing_relay_waiter(
     client: &Client,
     call_id: String,
@@ -14393,7 +14396,7 @@ mod control_only_tests {
             video: None,
             video_shared: video_shared.clone(),
             video_teardown: video_teardown_hook(&video_shared),
-            muted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            muted: Arc::new(AtomicBool::new(false)),
             ended: Arc::new(EndedFlag::default()),
             media,
         };
