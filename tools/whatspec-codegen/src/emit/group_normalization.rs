@@ -60,7 +60,8 @@ fn oracle(source: &str) -> Result<Value> {
             Ok(case)
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut expanded = json!({"waVersion":compact.wa_version,"setHash":compact.set_hash,"cases":cases});
+    let mut expanded =
+        json!({"waVersion":compact.wa_version,"setHash":compact.set_hash,"cases":cases});
     expanded.sort_all_objects();
     // This is the canonical digest of the complete, independently captured
     // pre-compaction oracle. Sharing outcomes must preserve every observed value.
