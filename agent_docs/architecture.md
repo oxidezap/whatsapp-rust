@@ -9,6 +9,30 @@ Find the behavior in WhatsApp Web before changing protocol logic. Follow
 [wa_web_reference.md](wa_web_reference.md), change the owning layer, and add a
 regression at the boundary that can observe the behavior.
 
+## State and I/O
+
+Keep protocol decisions synchronous and pass time as data. Connection health
+and maintenance cadence live in `wacore::protocol::health`; reconnect timing
+and retry session policy live in their sibling modules. The SDK owns timers,
+random jitter, task cancellation and execution of the resulting actions.
+
+`wacore::socket::frame_encoder` owns write nonces and retirement after a failed
+write. The socket driver owns batching, backpressure, CPU offloading and transport
+completion. A failed write may have reached the peer and must retire its key.
+
+`wacore::request::pending` owns request registration generations. SDK guards
+translate future cancellation into guarded removal. Disconnect clears entries
+without resetting their generation sequence.
+
+App-state preparation consumes owned wire data and produces uncommitted results
+without accessing storage. Publish patch state and mutations only after derived
+effects and the cursor/MAC commit succeed. History parse jobs own their compressed
+input and policy snapshot; their driver retains admission and blocking-work leases.
+
+`wacore/tests/sans_io_boundary.rs` guards these modules against executor, I/O,
+randomness and global-clock dependencies. Use explicit timestamps in their tests
+so independent simulations can run without replacing process-wide providers.
+
 ## Protocol types
 
 Use `ProtocolNode::try_from_node_ref` as the parser and `IqSpec` to pair a

@@ -1506,19 +1506,13 @@ pub(crate) struct PhashWaiter {
     pub(crate) registered_epoch: u64,
 }
 
-struct ResponseWaiterEntry {
-    generation: NonZeroU64,
-    waiter: ResponseWaiter,
-}
-
 /// Map of pending IQ/ack response waiters, keyed by request id.
 ///
 /// Every registration carries a unique generation so guarded IQ cleanup cannot
 /// remove a newer waiter that reused the same explicit ID.
 #[derive(Default)]
 pub(crate) struct ResponseWaiterMap {
-    entries: HashMap<String, ResponseWaiterEntry>,
-    last_generation: u64,
+    entries: wacore::request::pending::PendingRequests<ResponseWaiter>,
     /// Advanced once per sweep. Registration reads it under the lock it already
     /// takes, so a waiter records its age without touching a clock.
     sweep_epoch: u64,
@@ -1554,7 +1548,7 @@ impl ResponseWaiterMap {
     /// other kind of waiter where it is.
     pub(crate) fn take_stream(&mut self, request_id: &str) -> Option<StreamSink> {
         if !matches!(
-            self.entries.get(request_id).map(|entry| &entry.waiter),
+            self.entries.get(request_id),
             Some(ResponseWaiter::Stream(_))
         ) {
             return None;
@@ -1564,27 +1558,16 @@ impl ResponseWaiterMap {
             _ => None,
         }
     }
-    fn next_generation(&mut self) -> NonZeroU64 {
-        loop {
-            self.last_generation = self.last_generation.wrapping_add(1);
-            if let Some(generation) = NonZeroU64::new(self.last_generation) {
-                return generation;
-            }
-        }
-    }
-
     pub(crate) fn try_insert_guarded(
         &mut self,
         request_id: String,
         waiter: ResponseWaiter,
     ) -> Option<NonZeroU64> {
-        if self.entries.contains_key(&request_id) {
-            return None;
+        let is_stream = matches!(waiter, ResponseWaiter::Stream(_));
+        let generation = self.entries.try_insert(request_id, waiter)?;
+        if is_stream {
+            self.stream_waiters.fetch_add(1, Ordering::AcqRel);
         }
-        let generation = self.next_generation();
-        self.note_added(&waiter);
-        self.entries
-            .insert(request_id, ResponseWaiterEntry { generation, waiter });
         Some(generation)
     }
 
@@ -1593,12 +1576,8 @@ impl ResponseWaiterMap {
         request_id: String,
         waiter: ResponseWaiter,
     ) -> Option<ResponseWaiter> {
-        let generation = self.next_generation();
         self.note_added(&waiter);
-        let replaced = self
-            .entries
-            .insert(request_id, ResponseWaiterEntry { generation, waiter })
-            .map(|entry| entry.waiter);
+        let replaced = self.entries.insert(request_id, waiter);
         if let Some(replaced) = &replaced {
             self.note_removed(replaced);
         }
@@ -1606,7 +1585,7 @@ impl ResponseWaiterMap {
     }
 
     pub(crate) fn remove(&mut self, request_id: &str) -> Option<ResponseWaiter> {
-        let removed = self.entries.remove(request_id).map(|entry| entry.waiter);
+        let removed = self.entries.remove(request_id);
         if let Some(removed) = &removed {
             self.note_removed(removed);
         }
@@ -1627,7 +1606,7 @@ impl ResponseWaiterMap {
     /// connection as "IQs pending", so a stranded waiter silences pings.
     pub(crate) fn drop_expired_phash(&mut self) {
         let epoch = self.sweep_epoch;
-        self.entries.retain(|_, entry| match &entry.waiter {
+        self.entries.retain(|_, waiter| match waiter {
             ResponseWaiter::Phash(waiter) | ResponseWaiter::GroupPhash(waiter, _) => {
                 waiter.registered_epoch >= epoch
             }
@@ -1637,12 +1616,8 @@ impl ResponseWaiterMap {
     }
 
     pub(crate) fn remove_guarded(&mut self, request_id: &str, cleanup_generation: NonZeroU64) {
-        if self
-            .entries
-            .get(request_id)
-            .is_some_and(|entry| entry.generation == cleanup_generation)
-        {
-            self.remove(request_id);
+        if let Some(removed) = self.entries.remove_guarded(request_id, cleanup_generation) {
+            self.note_removed(&removed);
         }
     }
 
@@ -1650,13 +1625,13 @@ impl ResponseWaiterMap {
     /// resetting the generation sequence. Guards owned by the drained requests
     /// may outlive a disconnect and must never match a later registration.
     pub(crate) fn clear(&mut self) {
-        self.entries = HashMap::new();
+        self.entries.clear();
         self.stream_waiters.store(0, Ordering::Release);
     }
 
     #[cfg(test)]
     pub(crate) fn contains_key(&self, request_id: &str) -> bool {
-        self.entries.contains_key(request_id)
+        self.entries.get(request_id).is_some()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -2758,77 +2733,15 @@ fn is_encrypt_notification(node: &wacore_binary::NodeRef<'_>) -> bool {
             .is_some_and(|value| value == NotificationType::Encrypt.as_str())
 }
 
-/// Whether the reconnect backoff counter should snap back to its 1s base after
-/// a disconnect — WA Web's `resetDelay` (30s) semantics. `penalty_pending`
-/// mirrors WA Web's `cancelReset()`: an explicit penalty applied this cycle
-/// (429 rate-limit, or a manual `reconnect()` step) must survive, so a
-/// long-lived-then-rate-limited connection keeps its deliberate backoff instead
-/// of snapping to 1s.
-pub(crate) fn should_reset_backoff(
-    connected_at: Option<wacore::time::Instant>,
-    now: wacore::time::Instant,
-    penalty_pending: bool,
-) -> bool {
-    !penalty_pending
-        && connected_at.is_some_and(|connected_at| {
-            now.saturating_duration_since(connected_at) >= Client::STABLE_CONNECTION_RESET
-        })
-}
+#[cfg(test)]
+pub(crate) use wacore::protocol::reconnect::MAX_BACKOFF_ATTEMPTS;
+pub(crate) use wacore::protocol::reconnect::{next_backoff_attempt, should_reset_backoff};
 
-/// Ceiling on the consecutive-failure count that drives the reconnect backoff.
-///
-/// The delay is already pinned at the 900 s cap from attempt 17 on, so every
-/// value past that names the same wait — what would keep growing is only the
-/// number itself, which `stats().reconnect_errors` reports and which a 429 adds
-/// five to at a time. A link that flaps for weeks would run it up without
-/// bound, so it saturates here instead: far enough beyond the cap that the
-/// schedule is untouched, close enough that the counter stays a number a
-/// consumer can read.
-pub(crate) const MAX_BACKOFF_ATTEMPTS: u32 = 64;
-
-/// The consecutive-failure count that follows `previous`, saturating at
-/// [`MAX_BACKOFF_ATTEMPTS`].
-pub(crate) fn next_backoff_attempt(previous: u32) -> u32 {
-    previous.saturating_add(1).min(MAX_BACKOFF_ATTEMPTS)
-}
-
-/// Computes a reconnect delay matching WhatsApp Web's Fibonacci backoff:
-/// `{ algo: { type: "fibonacci", first: 1000, second: 1000 }, jitter: 0.1, max: 9e5 }`
-///
-/// Sequence: 1s, 1s, 2s, 3s, 5s, 8s, 13s, 21s, 34s, 55s, 89s, 144s, ... capped at 900s.
-/// Each value gets ±10% random jitter.
 fn fibonacci_backoff(attempt: u32) -> Duration {
-    const MAX_MS: u64 = 900_000; // WA Web: 9e5
-
-    let mut a: u64 = 1000;
-    let mut b: u64 = 1000;
-    for _ in 0..attempt {
-        // Every step past the cap yields the cap again, so the loop stops at
-        // the first one instead of counting out an attempt number nothing else
-        // bounds. Same clamp `prekeys.rs` applies to its own retry exponent,
-        // and the same reason.
-        if a >= MAX_MS {
-            break;
-        }
-        let next = a.saturating_add(b).min(MAX_MS);
-        a = b;
-        b = next;
-    }
-    let base = a.min(MAX_MS);
-
-    // ±10% jitter (WA Web: jitter: 0.1)
-    let jitter_range = base / 10;
-    let jitter = if jitter_range > 0 {
-        // The thread-local generator, not a fresh `StdRng`: seeding one runs a
-        // full ChaCha key schedule off OS entropy to draw a single number
-        // (measured at 14.8 us against 808 ns for the draw, which is why
-        // `keepalive_loop` hoists its own out of the loop).
-        rand::rng().random_range(0..=(jitter_range * 2)) as i64 - jitter_range as i64
-    } else {
-        0
-    };
-    let ms = (base as i64 + jitter).max(0) as u64;
-    Duration::from_millis(ms)
+    use wacore::protocol::reconnect::{backoff_delay, fibonacci_base_millis};
+    let base = fibonacci_base_millis(attempt);
+    let sample = rand::rng().random_range(0..=base / 5);
+    backoff_delay(base, sample).expect("jitter drawn inside backoff window")
 }
 
 /// Release the table a reservation set grew during a burst.

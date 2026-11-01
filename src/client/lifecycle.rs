@@ -177,7 +177,9 @@ impl Client {
     }
     /// WA Web `resetDelay: 30000` — only after a connection has stayed up this
     /// long is the reconnect backoff counter reset to its base.
-    pub(crate) const STABLE_CONNECTION_RESET: Duration = Duration::from_secs(30);
+    #[cfg(test)]
+    pub(crate) const STABLE_CONNECTION_RESET: Duration =
+        wacore::protocol::reconnect::STABLE_CONNECTION_RESET;
 
     /// How long a teardown waits for the socket to close before walking away
     /// from it.
@@ -1063,11 +1065,14 @@ impl Client {
             // `while` condition, and the shutdown the backoff races, both see
             // it — so the cost is one already-stale line, not a session that
             // fails to end.
-            if shutdown.is_fired()
-                || !self.is_running.load(Ordering::Relaxed)
-                || (self.expected_disconnect.load(Ordering::Acquire)
-                    && !self.is_running.load(Ordering::Relaxed))
-            {
+            let reconnect = wacore::protocol::reconnect::reconnect_action(
+                shutdown.is_fired()
+                    || !self.is_running.load(Ordering::Relaxed)
+                    || (self.expected_disconnect.load(Ordering::Acquire)
+                        && !self.is_running.load(Ordering::Relaxed)),
+                self.expected_disconnect.load(Ordering::Relaxed),
+            );
+            if reconnect == wacore::protocol::reconnect::ReconnectAction::Stop {
                 self.clear_connection_backoff_state();
                 client_log!(
                     self,
@@ -1090,7 +1095,7 @@ impl Client {
             }
 
             // If this was an expected disconnect (e.g., 515 after pairing), reconnect immediately
-            if self.expected_disconnect.load(Ordering::Relaxed) {
+            if reconnect == wacore::protocol::reconnect::ReconnectAction::Immediate {
                 self.clear_connection_backoff_state();
                 client_log!(
                     self,

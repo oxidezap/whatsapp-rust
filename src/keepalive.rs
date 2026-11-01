@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use wacore::iq::spec::IqSpec;
 use wacore::protocol::keepalive::{
-    KEEP_ALIVE_INTERVAL_MAX, KEEP_ALIVE_INTERVAL_MIN, KEEP_ALIVE_RESPONSE_DEADLINE, elapsed_since,
+    KEEP_ALIVE_INTERVAL_MAX, KEEP_ALIVE_INTERVAL_MIN, KEEP_ALIVE_RESPONSE_DEADLINE,
     elapsed_since_at, is_dead_socket_at,
 };
 
@@ -78,17 +78,10 @@ const fn ticks_for(period_secs: u64) -> u32 {
     (period_secs / midpoint) as u32
 }
 
-#[derive(Debug, PartialEq)]
-enum KeepaliveResult {
-    /// Server responded to the ping.
-    Ok,
-    /// Pending responses postponed the ping; no liveness evidence was obtained.
-    Skipped,
-    /// Ping failed but the connection may recover (e.g. timeout, server error).
-    TransientFailure,
-    /// Connection is dead — loop should exit immediately.
-    FatalFailure,
-}
+use wacore::protocol::health::{
+    ConnectionHealth, HealthAction, MaintenanceSchedule, ProbeOutcome as KeepaliveResult,
+    failures_are_terminal as keepalive_failures_are_terminal,
+};
 
 /// Classifies an IQ error into a keepalive result.
 ///
@@ -121,31 +114,6 @@ fn classify_keepalive_error(e: &IqError) -> KeepaliveResult {
         }
     }
 }
-
-/// Consecutive unanswered pings after which the connection is torn down rather
-/// than pinged again.
-///
-/// Three, because a ping is only sent when the link has been *idle* for at
-/// least `KEEP_ALIVE_INTERVAL_MIN` (the recent-activity early return skips it
-/// otherwise), so three of them in a row is roughly a minute in which nothing
-/// arrived AND nothing we sent was answered. A busy connection cannot reach
-/// this count: every inbound frame resets it on the activity path, and most
-/// ticks on such a connection never ping at all.
-///
-/// The hole this closes is the half-open socket the dead-socket watchdog is
-/// blind to by design: `is_dead_socket_at` is cancelled by any receive, so a
-/// link that still delivers inbound frames while our writes go nowhere looks
-/// alive to it forever — and every send, ack and receipt is silently lost for
-/// the rest of the session. Reconnect-looping against a merely slow server is
-/// bounded by the two resets (`Ok` and recent activity) and by
-/// `should_reset_backoff`, which keeps escalating the Fibonacci delay until a
-/// connection stays up 30 s.
-fn keepalive_failures_are_terminal(error_count: u32) -> bool {
-    error_count >= KEEPALIVE_MAX_CONSECUTIVE_FAILURES
-}
-
-/// See [`keepalive_failures_are_terminal`].
-const KEEPALIVE_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
 /// Whether a keepalive ping error is just collateral of a teardown already
 /// being handled elsewhere (the connection is gone, so the ping had nowhere to
@@ -267,11 +235,8 @@ impl Client {
         shutdown_signal: wacore::runtime::ShutdownSignal,
         generation: u64,
     ) {
-        let mut error_count = 0u32;
-        let mut failed_probe_deadline = None;
-        let mut cleanup_counter = 0u32;
-        let mut maintenance_counter = 0u32;
-        let mut engine_maintenance_counter = 0u32;
+        let mut health = ConnectionHealth::default();
+        let mut maintenance = MaintenanceSchedule::default();
         let sent_msg_ttl = self.cache_config.sent_message_ttl_secs;
         // Seeded once, not per tick: a fresh `StdRng` costs OS entropy and a
         // 320-byte state to draw one number, and this loop wakes every 15-30 s
@@ -312,27 +277,15 @@ impl Client {
                         return;
                     }
 
-                    // Periodic DB retention (~every 12 ticks ≈ 5 min). Driven by
-                    // the interval tick itself, BEFORE the idle-ping early-return,
-                    // so busy connections (which skip the ping) still prune.
-                    cleanup_counter += 1;
-                    if cleanup_counter >= 12 {
-                        cleanup_counter = 0;
+                    let due = maintenance.tick(MAINTENANCE_TICKS, ENGINE_MAINTENANCE_TICKS);
+                    if due.retention {
                         self.spawn_retention_cleanup(sent_msg_ttl);
                         self.spawn_cache_maintenance();
                     }
-
-                    // Same placement and the same reason, on a much coarser
-                    // counter: see MAINTENANCE_TICKS.
-                    maintenance_counter += 1;
-                    if maintenance_counter >= MAINTENANCE_TICKS {
-                        maintenance_counter = 0;
+                    if due.session {
                         self.spawn_session_maintenance();
                     }
-
-                    engine_maintenance_counter += 1;
-                    if engine_maintenance_counter >= ENGINE_MAINTENANCE_TICKS {
-                        engine_maintenance_counter = 0;
+                    if due.engine {
                         self.spawn_engine_maintenance();
                     }
 
@@ -344,77 +297,53 @@ impl Client {
                     // outstanding IQ.
                     self.response_waiters_guard().drop_expired_phash();
 
-                    let last_recv = self.stats.last_data_received();
-
-                    // WA Web: maybeScheduleHealthCheck — only send ping when idle.
-                    // If we recently received data, the connection is proven alive;
-                    // skip the ping and reschedule (same as WA Web rescheduling the
-                    // healthCheckTimer after activity).
-                    if let Some(since_recv) = elapsed_since(last_recv)
-                        && since_recv < KEEP_ALIVE_INTERVAL_MIN
-                    {
-                        // Connection alive — reset error state, skip ping.
-                        if error_count > 0 {
-                            client_log!(self, debug, target: "Client/Keepalive", "Keepalive restored (recent activity).");
-                            error_count = 0;
+                    let previous_failures = health.failures();
+                    let action = health.before_probe(
+                        wacore::time::Instant::now(),
+                        self.stats.last_data_received(),
+                        self.stats.first_send_since_recv(),
+                    );
+                    match action {
+                        HealthAction::Skip => {
+                            if previous_failures > 0 {
+                                client_log!(self, debug, target: "Client/Keepalive", "Keepalive restored (recent activity).");
+                            }
+                            continue;
                         }
-                        failed_probe_deadline = None;
-                        continue;
+                        HealthAction::Reconnect => {
+                            client_log!(self, warn, target: "Client/Keepalive", "Watchdog expired after a failed keepalive attempt, forcing reconnect.");
+                            self.reconnect_immediately().await;
+                            return;
+                        }
+                        HealthAction::Probe => {}
+                        HealthAction::Stop => return,
                     }
 
-                    // A failed bounded probe already gave the peer a chance to
-                    // respond. WA Web's independent watchdog does not wait for
-                    // another ping once that first-send deadline has expired.
-                    let first_send = self.stats.first_send_since_recv();
-                    if error_count > 0
-                        && first_send == failed_probe_deadline
-                        && is_dead_socket_at(
-                            first_send,
-                            self.stats.last_data_received(),
-                            wacore::time::Instant::now(),
-                        )
-                    {
-                        client_log!(self, warn, target: "Client/Keepalive", "Watchdog expired after a failed keepalive attempt, forcing reconnect.");
-                        self.reconnect_immediately().await;
-                        return;
-                    }
-
-                    // Probe the connection BEFORE checking dead-socket so that a
-                    // successful pong updates last_received_ms and prevents a
-                    // false-positive dead-socket trigger on an idle-but-healthy
-                    // connection.  WA Web uses a separate 20 s timer that is
-                    // cancelled on any receive; our periodic loop needs to send the
-                    // ping first to give the server a chance to prove it is alive.
                     let receive_before_probe = self.stats.last_data_received();
-                    match self.send_keepalive().await {
-                        // A skipped ping neither restores health nor authorizes
-                        // a teardown if the deadline crosses during this tick.
-                        // The next tick must run the bounded probe first.
+                    let outcome = self.send_keepalive().await;
+                    let action = health.probe_completed(
+                        outcome,
+                        wacore::time::Instant::now(),
+                        receive_before_probe,
+                        self.stats.last_data_received(),
+                        self.stats.first_send_since_recv(),
+                    );
+                    let error_count = health.failures();
+                    match outcome {
                         KeepaliveResult::Skipped => continue,
                         KeepaliveResult::Ok => {
-                            if error_count > 0 {
-                                client_log!(self, debug, target: "Client/Keepalive", "Keepalive restored after {error_count} failure(s).");
+                            if previous_failures > 0 {
+                                client_log!(self, debug, target: "Client/Keepalive", "Keepalive restored after {previous_failures} failure(s).");
                             }
-                            error_count = 0;
-                            failed_probe_deadline = None;
                         }
                         KeepaliveResult::FatalFailure => {
                             client_log!(self, debug, target: "Client/Keepalive", "Fatal keepalive failure, exiting loop.");
                             return;
                         }
                         KeepaliveResult::TransientFailure => {
-                            // An IQ error is inbound activity too: a failure may
-                            // only authorize skipping a later probe for the
-                            // same deadline, with no intervening receive.
-                            failed_probe_deadline = (self.stats.last_data_received() == receive_before_probe)
-                                .then(|| self.stats.first_send_since_recv()).flatten();
-                            error_count += 1;
                             client_log!(self, warn, target: "Client/Keepalive", "Keepalive timeout, error count: {error_count}");
                             if keepalive_failures_are_terminal(error_count) {
-                                client_log!(self, warn,
-                                    target: "Client/Keepalive",
-                                    "{error_count} consecutive unanswered pings, forcing reconnect.",
-                                );
+                                client_log!(self, warn, target: "Client/Keepalive", "{error_count} consecutive unanswered pings, forcing reconnect.");
                                 self.reconnect_immediately().await;
                                 return;
                             }
@@ -428,10 +357,9 @@ impl Client {
                     // connection one bounded ping attempt before tearing it down,
                     // including when an application IQ is still pending. Re-read
                     // activity after that attempt: any receive cancels the watchdog.
-                    let first_send = self.stats.first_send_since_recv();
-                    let last_recv = self.stats.last_data_received();
-                    let now = wacore::time::Instant::now();
-                    if is_dead_socket_at(first_send, last_recv, now) {
+                    if action == HealthAction::Reconnect {
+                        let first_send = self.stats.first_send_since_recv();
+                        let now = wacore::time::Instant::now();
                         let elapsed = elapsed_since_at(first_send, now).unwrap_or_default();
                         let pending = self.response_waiters_guard().len();
                         client_log!(self, warn,

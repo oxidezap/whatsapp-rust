@@ -1,3 +1,5 @@
+pub mod preparation;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -11,9 +13,7 @@ use crate::appstate::hash::generate_index_mac;
 use crate::appstate::keys::ExpandedAppStateKeys;
 use crate::appstate::patch_decode::{CollectionSyncError, PatchList, WAPatchName};
 use crate::appstate::processor::AppStateMutationMAC;
-use crate::appstate::{
-    collect_key_id_refs_from_patch_list, expand_app_state_keys, process_patch, process_snapshot,
-};
+use crate::appstate::{collect_key_id_refs_from_patch_list, expand_app_state_keys};
 use crate::store::traits::Backend;
 use waproto::whatsapp as wa;
 
@@ -229,18 +229,6 @@ pub fn collect_unique_index_macs(mutations: &[wa::SyncdMutation]) -> Vec<IndexMa
 /// linear scan instead of a sort; above it the sort wins despite allocating
 /// every MAC before deduping.
 const MAC_DEDUP_SCAN_LIMIT: usize = 64;
-
-fn lookup_app_state_key(
-    keys_map: &HashMap<Vec<u8>, Arc<ExpandedAppStateKeys>>,
-    key_id: &[u8],
-) -> Result<Arc<ExpandedAppStateKeys>, crate::appstate::AppStateError> {
-    // Return the Arc (refcount bump) instead of deep-cloning the 160-byte
-    // ExpandedAppStateKeys; the callback runs once per mutation (up to ~1000/patch).
-    keys_map
-        .get(key_id)
-        .map(Arc::clone)
-        .ok_or(crate::appstate::AppStateError::KeyNotFound)
-}
 
 // Only one owner holds the collection state across snapshot and patch phases.
 // Their futures borrow this small state instead of embedding each other's locals.
@@ -1684,15 +1672,12 @@ impl AppStateProcessor {
         // multi-MB deep clone on bootstrap) and comes back via the return tuple
         // because the caller still reads pl.snapshot (get_missing_key_ids).
         let result = crate::runtime::blocking(&*self.runtime, move || {
-            let mut snapshot_state = HashState::default();
-            let result = process_snapshot(
-                &snapshot,
-                &mut snapshot_state,
-                |key_id| lookup_app_state_key(&keys_map, key_id),
+            preparation::prepare_snapshot(
+                snapshot,
+                &keys_map,
                 validate_macs,
                 &collection_name_owned,
-            )?;
-            Ok::<_, crate::appstate::AppStateError>((result, snapshot_state, snapshot))
+            )
         })
         .await
         // Carried as itself rather than flattened to a string: a snapshot MAC
@@ -1701,7 +1686,7 @@ impl AppStateProcessor {
         // from a missing key or a bad decode by downcasting to it.
         .map_err(anyhow::Error::new)?;
 
-        let (snapshot_result, snapshot_state, snapshot) = result;
+        let (snapshot, snapshot_state, snapshot_result) = result.into_parts();
         pl.snapshot = Some(snapshot);
         progress.state = snapshot_state;
 
@@ -1768,50 +1753,37 @@ impl AppStateProcessor {
 
         // Offload CPU-intensive patch processing to a blocking thread
         let processed = crate::runtime::blocking(&*self.runtime, move || {
-            let get_prev_value_mac =
-                |index_mac: &[u8]| -> Result<Option<Vec<u8>>, crate::appstate::AppStateError> {
-                    Ok(<&IndexMac>::try_from(index_mac)
-                        .ok()
-                        .and_then(|k| db_prev.get(k))
-                        .cloned())
-                };
-
-            let mut state = state_clone;
-            let result = process_patch(
-                &patch,
-                &mut state,
-                |key_id| lookup_app_state_key(&keys, key_id),
-                get_prev_value_mac,
+            preparation::prepare_patch(
+                patch,
+                state_clone,
+                &keys,
+                &db_prev,
                 validate_macs,
                 &coll,
-            )?;
-            Ok::<_, crate::appstate::AppStateError>((result, patch))
+                final_page,
+            )
         })
         .await;
-        let (result, patch) = match processed {
-            Ok(processed) => processed,
+        let prepared = match processed {
+            Ok(prepared) => prepared,
             Err(error) => return Err(anyhow!("{}", error)),
         };
-
-        // Update local state with the result from the blocking task
-        progress.state = result.state;
-
-        // Persist state and MACs: one backend call per patch, so a
-        // transactional backend commits the version with the MACs it
-        // pairs with instead of paying three round trips.
-        progress.state.bootstrapped |= final_page;
+        let result = prepared.result();
         self.persist_mutation_effects(&result.mutations).await?;
         self.backend
             .commit_patch(
                 collection_name,
-                progress.state.clone(),
+                result.state.clone(),
                 &result.removed_index_macs,
                 &result.added_macs,
             )
             .await?;
-        progress.new_mutations.extend(result.mutations);
-        progress.committed_state = progress.state.clone();
-        Ok(patch)
+        Ok(preparation::publish_patch(
+            prepared,
+            &mut progress.state,
+            &mut progress.committed_state,
+            &mut progress.new_mutations,
+        ))
     }
 
     /// Inline the patch list's external blobs, then report which referenced decode keys

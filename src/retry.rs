@@ -37,9 +37,11 @@ fn get_bytes_content_ref<'a>(node: &'a NodeRef<'_>) -> Option<&'a [u8]> {
     }
 }
 
-/// Throttle for the "no-keys + retry≥2" forced-recreate fallback. Mirrors
-/// whatsmeow's `recreateSessionTimeout` (`retry.go:156`).
-const RECREATE_SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+#[cfg(test)]
+use wacore::protocol::retry::RECREATE_SESSION_TIMEOUT;
+use wacore::protocol::retry::{
+    BaseKeyAction, base_key_action, registration_mismatch, session_recreation,
+};
 
 #[derive(Clone, Copy)]
 pub(crate) enum RetransmissionRoute {
@@ -1469,8 +1471,7 @@ impl Client {
 
             if let Some(session) = session
                 && let Ok(stored_reg_id) = session.remote_registration_id()
-                && stored_reg_id != 0
-                && stored_reg_id != received_reg_id
+                && registration_mismatch(stored_reg_id, received_reg_id)
             {
                 info!(
                     "Registration ID mismatch for {} (stored: {}, received: {}). \
@@ -1499,7 +1500,7 @@ impl Client {
         };
 
         let addr_str = signal_address.as_str();
-        if retry_count == MIN_RETRY_FOR_BASE_KEY_CHECK {
+        if base_key_action(retry_count) == BaseKeyAction::Save {
             // retry == 2: save base key, do NOT delete (WA Web L66-67).
             match device_snapshot
                 .backend
@@ -1520,7 +1521,7 @@ impl Client {
             return None;
         }
 
-        if retry_count > MIN_RETRY_FOR_BASE_KEY_CHECK {
+        if base_key_action(retry_count) == BaseKeyAction::Check {
             match device_snapshot
                 .backend
                 .has_same_base_key(addr_str, message_id, current_base_key)
@@ -1615,30 +1616,14 @@ impl Client {
         };
 
         let history = &self.session_recreate_history;
-
-        if !has_session {
-            history.insert(jid.clone(), now).await;
-            return Some("we don't have a Signal session with them");
-        }
-
-        if retry_count < MIN_RETRY_FOR_BASE_KEY_CHECK {
-            return None;
-        }
-
-        // Throttle: skip if this peer was recreated within the timeout. This
-        // explicit age check against the injectable `now` is the authoritative,
-        // deterministic gate. The cache's 1h TTL on `session_recreate_history`
-        // is only a memory backstop (lazy eviction independent of the stored
-        // `now`, so it can't drive the throttle decision).
-        // Do NOT drop this check as "redundant with the TTL".
-        if let Some(prev) = history.get(jid).await
-            && now.saturating_duration_since(prev) < RECREATE_SESSION_TIMEOUT
-        {
-            return None;
-        }
-
+        let previous = if has_session && retry_count >= MIN_RETRY_FOR_BASE_KEY_CHECK {
+            history.get(jid).await
+        } else {
+            None
+        };
+        let decision = session_recreation(retry_count, has_session, previous, now)?;
         history.insert(jid.clone(), now).await;
-        Some("retry count > 1 and over an hour since last recreation")
+        Some(decision.reason())
     }
 
     /// Extracts and processes the key bundle from a retry receipt.

@@ -1,9 +1,11 @@
+mod parse_job;
+use parse_job::HistoryParseJob;
+
 use crate::types::events::{CallLogHistory, Event, LazyHistorySync};
 use bytes::Bytes;
 use std::sync::Arc;
 use wacore::history_sync::{
     HistoryMsgSecretRecordRef, HistoryMsgSecretRecordVisitor, TcTokenCandidate,
-    process_history_sync_bytes_with_record_sink,
 };
 use wacore::messages::DetachedHistorySyncNotification;
 use wacore::msg_secret::{MsgSecretPolicy, MsgSecretRetention, RetentionClass};
@@ -107,11 +109,15 @@ struct HistorySecretSeedConfig {
 
 impl HistorySecretSeedConfig {
     fn snapshot(config: &crate::cache_config::RuntimeCacheConfig) -> Self {
+        Self::at(config, wacore::time::now_secs())
+    }
+
+    fn at(config: &crate::cache_config::RuntimeCacheConfig, now: i64) -> Self {
         Self {
             enabled: config.seed_msg_secrets_from_history,
             policy: config.msg_secret_policy,
             retention: config.msg_secret_retention,
-            now: wacore::time::now_secs(),
+            now,
         }
     }
 
@@ -856,8 +862,7 @@ impl Client {
         let own_lid = device_snapshot.lid.as_ref().map(|jid| jid.to_non_ad());
         let own_user = own_pn.as_ref().map(|jid| jid.user.clone());
         let secret_seed_config = HistorySecretSeedConfig::snapshot(&self.cache_config);
-        let mut secret_collector =
-            HistorySecretSeedCollector::new(secret_seed_config, own_pn, own_lid);
+        let secret_collector = HistorySecretSeedCollector::new(secret_seed_config, own_pn, own_lid);
 
         // Always carry the compressed input through (a move, no copy or extra
         // inflate); handler interest is evaluated at dispatch time below, so a
@@ -865,27 +870,15 @@ impl Client {
         // the event instead of racing a pre-parse snapshot.
         // Small blobs (PushName, Recent): decode inline to avoid spawn_blocking overhead.
         // Large blobs: use blocking thread to avoid stalling the async runtime.
-        const INLINE_THRESHOLD: usize = 256 * 1024;
-        let parse_result = if compressed_data.len() < INLINE_THRESHOLD {
-            let result = process_history_sync_bytes_with_record_sink(
-                compressed_data,
-                own_user.as_deref(),
-                true,
-                &mut secret_collector,
-            );
-            Some((result, secret_collector.into_entries()))
+        let job = HistoryParseJob::new(compressed_data, own_user, secret_collector);
+        let parse_result = if job.runs_inline() {
+            Some(job.run())
         } else {
             let (result_tx, result_rx) = futures::channel::oneshot::channel();
             let lease = tracker.blocking_lease();
             let blocking_fut = self.runtime.spawn_blocking(Box::new(move || {
                 let _lease = lease;
-                let result = process_history_sync_bytes_with_record_sink(
-                    compressed_data,
-                    own_user.as_deref(),
-                    true,
-                    &mut secret_collector,
-                );
-                let _ = result_tx.send((result, secret_collector.into_entries()));
+                let _ = result_tx.send(job.run());
             }));
             self.runtime
                 .spawn(Box::pin(async move {

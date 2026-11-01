@@ -1,5 +1,4 @@
 use crate::handshake::{NoiseCipher, NoiseError};
-use crate::libsignal::crypto::GcmInPlaceBuffer;
 use crate::net::Transport;
 use crate::runtime::{AbortHandle, Runtime};
 use crate::socket::error::{EncryptSendError, Result, SocketError};
@@ -10,38 +9,8 @@ use std::sync::{Arc, Mutex};
 
 pub const INLINE_ENCRYPT_THRESHOLD: usize = 16 * 1024;
 
-/// AES-GCM tag length. A frame's wire size is a fixed function of its plaintext
-/// length, which is what lets the length prefix be written before the ciphertext
-/// exists.
-pub const TAG_LEN: usize = 16;
-
-/// The region of the batch buffer one frame's ciphertext occupies, exposed to
-/// AES-GCM as if it were a buffer of its own.
-pub struct FrameBody<'a> {
-    pub out: &'a mut BytesMut,
-    /// Offset in `out` where this frame's ciphertext starts, i.e. just past its
-    /// length prefix. Held as an offset rather than a slice so the AEAD can grow
-    /// the buffer by the tag through the same view.
-    pub base: usize,
-}
-
-impl GcmInPlaceBuffer for FrameBody<'_> {
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.out[self.base..]
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        &self.out[self.base..]
-    }
-
-    fn resize(&mut self, new_len: usize, value: u8) {
-        self.out.resize(self.base + new_len, value);
-    }
-
-    fn truncate(&mut self, len: usize) {
-        self.out.truncate(self.base + len);
-    }
-}
+use super::frame_encoder::{self, FrameEncoder};
+pub use super::frame_encoder::{FrameBody, TAG_LEN};
 
 /// Ceilings on one batched write. They bound how much is buffered before the
 /// first frame reaches the socket; the batch never waits for work, so these
@@ -277,7 +246,7 @@ impl NoiseSocket {
         observers: SendObservers,
     ) {
         let SendObservers { stats, sent_frames } = observers;
-        let mut write_counter: u32 = 0;
+        let mut encoder = FrameEncoder::from_shared_key(write_key);
         // BytesMut: split().freeze() yields a zero-copy Bytes while retaining
         // the underlying allocation for the next frame.
         let mut out_buf = BytesMut::with_capacity(OUT_BUF_IDLE_CAPACITY);
@@ -291,7 +260,6 @@ impl NoiseSocket {
         // (the peer's read counter would desync). Both outcomes are unrecoverable
         // in-band, so the whole sender goes out of service and the connection
         // must be re-established with a fresh handshake key.
-        let mut poisoned = false;
         // Reused across batches: one allocation for the life of the connection
         // instead of one per batch.
         let mut waiters: Vec<SendWaiter> = Vec::new();
@@ -316,7 +284,7 @@ impl NoiseSocket {
             };
 
             // Poison check before touching any frame in this batch.
-            if poisoned {
+            if encoder.is_poisoned() {
                 let _ = first_job
                     .job
                     .response_tx
@@ -347,14 +315,8 @@ impl NoiseSocket {
                     Some(tap) if tap.enabled() => Some(plaintext.clone()),
                     _ => None,
                 };
-                match Self::encrypt_frame_into(
-                    &runtime,
-                    &write_key,
-                    &mut write_counter,
-                    plaintext,
-                    &mut out_buf,
-                )
-                .await
+                match Self::encrypt_next_frame(&runtime, &mut encoder, plaintext, &mut out_buf)
+                    .await
                 {
                     Ok(wire_len) => {
                         batch_wire_len += wire_len;
@@ -445,7 +407,7 @@ impl NoiseSocket {
                     // One write failed; mark the sender poisoned so later
                     // jobs on this connection are rejected promptly without
                     // risking nonce reuse or counter desync.
-                    poisoned = true;
+                    encoder.poison();
                     transport.disconnect().await;
                     let err = EncryptSendError::transport(e);
                     if waiters.len() == 1 {
@@ -492,45 +454,36 @@ impl NoiseSocket {
         if counter == u32::MAX {
             return Err(EncryptSendError::crypto(NoiseError::CounterExhausted));
         }
-        let before = out_buf.len();
-
         if plaintext.len() <= INLINE_ENCRYPT_THRESHOLD {
-            let body_len = plaintext.len() + TAG_LEN;
-            if let Err(e) = crate::framing::append_frame_header_into(body_len, None, out_buf) {
-                return Err(EncryptSendError::framing(e));
-            }
-            let base = out_buf.len();
-            out_buf.extend_from_slice(&plaintext);
-            if let Err(e) = write_key
-                .encrypt_in_place_with_counter(counter, &mut FrameBody { out: out_buf, base })
-            {
-                out_buf.truncate(before);
-                return Err(EncryptSendError::crypto(e));
-            }
-            if out_buf.len() - base != body_len {
-                out_buf.truncate(before);
-                return Err(EncryptSendError::crypto(NoiseError::Encrypt(
-                    crate::libsignal::crypto::CryptoProviderError::BackendFailed,
-                )));
-            }
-            *write_counter = counter + 1;
-            Ok(out_buf.len() - before)
+            frame_encoder::encode_inline(write_key, write_counter, &plaintext, out_buf)
         } else {
             let write_key = write_key.clone();
-            let encrypt_result = crate::runtime::blocking(&**runtime, move || {
+            let ciphertext = crate::runtime::blocking(&**runtime, move || {
                 write_key.encrypt_with_counter(counter, &plaintext)
             })
-            .await;
-            let ciphertext = match encrypt_result {
-                Ok(c) => c,
-                Err(e) => return Err(EncryptSendError::crypto(e)),
-            };
+            .await
+            .map_err(EncryptSendError::crypto)?;
+            frame_encoder::append_ciphertext(write_counter, &ciphertext, out_buf)
+        }
+    }
 
-            if let Err(e) = crate::framing::append_frame_into(&ciphertext, None, out_buf) {
-                return Err(EncryptSendError::framing(e));
-            }
-            *write_counter = counter + 1;
-            Ok(out_buf.len() - before)
+    async fn encrypt_next_frame(
+        runtime: &Arc<dyn Runtime>,
+        encoder: &mut FrameEncoder,
+        plaintext: bytes::Bytes,
+        out: &mut BytesMut,
+    ) -> std::result::Result<usize, EncryptSendError> {
+        if plaintext.len() <= INLINE_ENCRYPT_THRESHOLD {
+            encoder.encode_into(&plaintext, out)
+        } else {
+            encoder.check_ready()?;
+            let (key, counter) = encoder.encryption_inputs();
+            let ciphertext = crate::runtime::blocking(&**runtime, move || {
+                key.encrypt_with_counter(counter, &plaintext)
+            })
+            .await
+            .map_err(EncryptSendError::crypto)?;
+            encoder.append_ciphertext(&ciphertext, out)
         }
     }
 
