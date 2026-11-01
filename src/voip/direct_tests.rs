@@ -242,8 +242,9 @@ impl DirectCallHost for Host {
     }
     async fn issue_token(&self, _peer: &Jid) {}
     async fn send_node(&self, node: Node) -> Result<(), CallError> {
-        let is_offer = node.as_node_ref().get_optional_child("offer").is_some();
-        if is_offer {
+        let is_outgoing_offer =
+            node.tag == "call" && node.as_node_ref().get_optional_child("offer").is_some();
+        if is_outgoing_offer {
             let id = node
                 .attrs
                 .get("id")
@@ -259,7 +260,7 @@ impl DirectCallHost for Host {
         if self.fail_send.load(Ordering::Relaxed) {
             return Err(CallError::Setup("synthetic transport failure".into()));
         }
-        if is_offer && self.gate_offer.load(Ordering::Relaxed) {
+        if is_outgoing_offer && self.gate_offer.load(Ordering::Relaxed) {
             futures::future::pending::<()>().await;
         }
         Ok(())
@@ -717,6 +718,10 @@ async fn ingress_sends_only_the_distinct_offer_receipt_and_retains_an_acceptable
             "the existing host dispatcher remains the generic ACK owner"
         );
     }
+    assert!(
+        host.ack.lock().unwrap().is_empty(),
+        "offer receipts do not reserve an outgoing-offer ACK observer"
+    );
     let (source, sink) = ports();
     let handle = direct::accept_pcm(host.clone(), &offer, source, sink)
         .await
