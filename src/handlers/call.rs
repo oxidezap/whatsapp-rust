@@ -6,21 +6,24 @@ use log::{debug, warn};
 use wacore::message_processing::EncType;
 #[cfg(feature = "voip-control")]
 use wacore::messages::MessageUtils;
+#[cfg(not(feature = "voip-control"))]
+use wacore::stanza::call::build_offer_ack_receipt;
+use wacore::stanza::call::parse_call_stanza;
 #[cfg(feature = "voip-control")]
 use wacore::stanza::call::{
-    CAPABILITY_INDEX_MLOW_V1, CapabilityBit, REJECT_REASON_BUSY, REJECT_REASON_ENC,
     TERMINATE_REASON_ACCEPTED_ELSEWHERE, TERMINATE_REASON_GROUP_CALL_ENDED,
-    TERMINATE_REASON_REJECTED_ELSEWHERE, TERMINATE_REASON_TIMEOUT, TerminateParams,
-    VideoStateParams, build_call_video_ack, build_terminate, build_video_state, capability_bit,
+    TERMINATE_REASON_REJECTED_ELSEWHERE, TERMINATE_REASON_TIMEOUT, VideoStateParams,
+    build_call_video_ack, build_video_state,
 };
-use wacore::stanza::call::{build_offer_ack_receipt, parse_call_stanza};
 use wacore::stanza::group_call::build_call_control_ack;
 use wacore::types::call::{CallAction, CallActionTag, IncomingCall, MissedCall, MissedReason};
 #[cfg(feature = "voip-control")]
 use wacore::types::call::{CallEndedElsewhere, ElsewhereOutcome, VideoState};
 use wacore::types::events::Event;
+#[cfg(all(test, feature = "voip-control"))]
+use wacore::types::group_call::GroupCallDevice;
 #[cfg(feature = "voip-control")]
-use wacore::types::group_call::{GroupCallDevice, GroupCallEncRekey, ScreenShareState};
+use wacore::types::group_call::{GroupCallEncRekey, ScreenShareState};
 #[cfg(feature = "voip-control")]
 use wacore::voip_control::CallEvent;
 #[cfg(feature = "voip-control")]
@@ -31,7 +34,9 @@ use wacore::voip_control::group::GroupStateApply;
 use wacore::voip_control::registry::PeerVideoTransition;
 #[cfg(feature = "voip-control")]
 use wacore_binary::Jid;
-use wacore_binary::{OwnedNodeRef, Server};
+use wacore_binary::OwnedNodeRef;
+#[cfg(any(test, not(feature = "voip-control")))]
+use wacore_binary::Server;
 #[cfg(feature = "voip-control")]
 use zeroize::Zeroizing;
 
@@ -95,79 +100,25 @@ impl StanzaHandler for CallHandler {
                 #[cfg(feature = "voip-control")]
                 let mut call = call;
                 #[cfg(feature = "voip-control")]
-                let mut direct_accept_alias = None;
-                // Bind direct answers before any await. A trusted namespace lookup may suspend;
-                // the captured generation must still own the call when its answer is committed.
+                let direct_host: Arc<dyn crate::voip::direct::DirectCallHost> = client.clone();
                 #[cfg(feature = "voip-control")]
-                let direct_accept = if matches!(&call.action, CallAction::Accept { .. }) {
-                    let registry = client.call_registry();
-                    match registry.generation_of(call.action.call_id()) {
-                        Some(generation)
-                            if registry
-                                .is_group_call_if_current(call.action.call_id(), generation) =>
-                        {
-                            None
-                        }
-                        Some(generation) => {
-                            let Some(session) =
-                                registry.snapshot_if_current(call.action.call_id(), generation)
-                            else {
-                                return true;
-                            };
-                            if session.direction != wacore::voip_control::CallDirection::Outgoing
-                                || session.answering_device.is_some()
-                            {
-                                return true;
-                            }
-                            // Participant metadata is authoritative only inside this call's
-                            // service envelope, never on a peer-authored or foreign-call stanza.
-                            if call.participant.is_some()
-                                && !is_call_service_sender(&call.from, call.action.call_id())
-                            {
-                                return true;
-                            }
-                            let Some(sender) = canonical_call_identity(
-                                &client,
-                                &routed_call_sender(&call),
-                                &session.peer_jid,
-                            )
-                            .await
-                            else {
-                                return true;
-                            };
-                            let Some(creator) = canonical_call_identity(
-                                &client,
-                                call.action.call_creator(),
-                                &session.call_creator,
-                            )
-                            .await
-                            else {
-                                return true;
-                            };
-                            direct_accept_alias = client.swap_pn_lid_namespace(&sender).await;
-                            if !registry.is_current(call.action.call_id(), generation) {
-                                return true;
-                            }
-                            if call.participant.is_some() {
-                                call.participant = Some(sender.clone());
-                            } else {
-                                call.from = sender.clone();
-                            }
-                            Some((generation, creator, sender))
-                        }
-                        None => {
-                            // An unmanaged call has no owned state to authorize. Preserve the
-                            // signaling observation without letting it mutate a later registration.
+                let (direct_accept, direct_accept_alias) =
+                    match crate::voip::direct_ingress::authorize_answer(&*direct_host, &mut call)
+                        .await
+                    {
+                        crate::voip::direct_ingress::AnswerAuthorization::Continue {
+                            answer,
+                            alias,
+                        } => (answer, alias),
+                        crate::voip::direct_ingress::AnswerAuthorization::Observe => {
                             client
                                 .core
                                 .event_bus
                                 .dispatch(Event::IncomingCall(Box::new(call)));
                             return true;
                         }
-                    }
-                } else {
-                    None
-                };
+                        crate::voip::direct_ingress::AnswerAuthorization::Ignore => return true,
+                    };
                 #[cfg(feature = "voip-control")]
                 if matches!(
                     &call.action,
@@ -347,9 +298,13 @@ impl StanzaHandler for CallHandler {
                                 }
                             };
                         } else {
-                            client
+                            let Some(token) = client
                                 .call_registry()
-                                .mark_incoming_ringing(call.action.call_id());
+                                .admit_incoming_offer(call.action.call_id())
+                            else {
+                                return true;
+                            };
+                            call.set_ringing_generation(token);
                         }
                     }
                     if is_offer && let Err(e) = send_offer_ack_receipt(&client, &call).await {
@@ -357,292 +312,16 @@ impl StanzaHandler for CallHandler {
                     }
                     learn_offer_identity(&client, &call).await;
                     #[cfg(feature = "voip-control")]
-                    if let CallAction::PreAccept { audio, .. } | CallAction::Accept { audio, .. } =
-                        &call.action
-                        && !audio.is_empty()
-                        && let Some(expected) = client
-                            .call_registry()
-                            .snapshot(call.action.call_id())
-                            .and_then(|session| session.audio_format)
-                        && !audio.iter().any(|codec| {
-                            codec.enc.eq_ignore_ascii_case("opus")
-                                && codec.rate == expected.signaling_rate
-                        })
+                    if !crate::voip::direct_ingress::apply_answer(
+                        &direct_host,
+                        &call,
+                        nr,
+                        direct_accept.as_ref(),
+                        direct_accept_alias.as_ref(),
+                    )
+                    .await
                     {
-                        let received_rates =
-                            audio.iter().map(|codec| codec.rate).collect::<Vec<_>>();
-                        warn!(
-                            "call: peer selected audio rates {received_rates:?}, expected {}",
-                            expected.signaling_rate
-                        );
-                        dismiss_outgoing_siblings(&client, &call).await;
-                        client.call_registry().send_call_event(
-                            call.action.call_id(),
-                            CallEvent::AudioFormatMismatch {
-                                expected_rate: expected.signaling_rate,
-                                received_rates,
-                            },
-                        );
-                        let registry = client.call_registry();
-                        let is_group = registry.generation_of(call.action.call_id()).is_some_and(
-                            |generation| {
-                                registry.is_group_call_if_current(call.action.call_id(), generation)
-                            },
-                        );
-                        if is_group {
-                            dismiss_incompatible_group_invitee(&client, &call).await;
-                        } else if let Err(e) = client
-                            .voip()
-                            .terminate(
-                                call.action.call_id(),
-                                &call.from,
-                                call.action.call_creator(),
-                            )
-                            .await
-                        {
-                            warn!("call: failed to terminate incompatible audio profile: {e}");
-                        }
                         return true;
-                    }
-                    // Defaults to Unknown, which is "the peer said nothing" and resets nothing:
-                    // a `<preaccept>`/`<accept>` we never parsed must not look like a refusal.
-                    #[cfg(feature = "voip-control")]
-                    let mut peer_mlow_bit = CapabilityBit::Unknown;
-                    #[cfg(feature = "voip-control")]
-                    let mut accepting_device_capability = None;
-                    #[cfg(feature = "voip-control")]
-                    let mut caller_transport: Option<(Jid, Jid)> = None;
-                    #[cfg(feature = "voip-control")]
-                    if matches!(
-                        &call.action,
-                        CallAction::PreAccept { .. } | CallAction::Accept { .. }
-                    ) && let Some(generation) = direct_accept
-                        .as_ref()
-                        .map(|(generation, _, _)| *generation)
-                        .or_else(|| client.call_registry().generation_of(call.action.call_id()))
-                    {
-                        let capability = nr
-                            .children()
-                            .and_then(|children| {
-                                children.iter().find(|action| {
-                                    CallActionTag::try_from(action.tag.as_ref()).is_ok()
-                                })
-                            })
-                            .and_then(|action| action.get_optional_child("capability"));
-                        // Only an ABSENT node is `Unknown`; a present one reads through
-                        // `capability_bit`, which owns what an unreadable `ver` means.
-                        peer_mlow_bit = capability.map_or(CapabilityBit::Unknown, |capability| {
-                            let version = capability
-                                .get_attr("ver")
-                                .and_then(|version| version.as_str().parse::<u32>().ok());
-                            let bytes = capability.content_bytes().unwrap_or_default();
-                            capability_bit(version, bytes, CAPABILITY_INDEX_MLOW_V1)
-                        });
-                        let mut capability_sender = routed_call_sender(&call);
-                        if matches!(&call.action, CallAction::PreAccept { .. })
-                            && !client
-                                .call_registry()
-                                .is_group_call_if_current(call.action.call_id(), generation)
-                            && let Some(session) = client
-                                .call_registry()
-                                .snapshot_if_current(call.action.call_id(), generation)
-                            && let Some(canonical) = canonical_call_identity(
-                                &client,
-                                &capability_sender,
-                                &session.peer_jid,
-                            )
-                            .await
-                        {
-                            // The accept authenticates in the session's namespace. Retain earlier
-                            // codec statements under that same trusted device identity.
-                            capability_sender = canonical;
-                        }
-                        // A device states its codec capability in the `<preaccept>` and its
-                        // `<accept>` need not repeat it -- a video answer omits the child by
-                        // construction. Retained per device so the accept below reads what THIS
-                        // device said rather than treating the omission as "the peer said nothing",
-                        // which would leave MLow on against a peer outside the rollout.
-                        client.call_registry().note_peer_capability(
-                            call.action.call_id(),
-                            generation,
-                            &capability_sender,
-                            peer_mlow_bit,
-                        );
-                        let device = if let Some(capability) = capability
-                            && let Some(bytes) =
-                                capability.content_bytes().filter(|bytes| !bytes.is_empty())
-                        {
-                            let version = match capability.get_attr("ver") {
-                                None => Some(1),
-                                Some(version) => version.as_str().parse::<u32>().ok(),
-                            };
-                            if let Some(version) = version {
-                                Some(
-                                    GroupCallDevice::new(capability_sender)
-                                        .with_capability(version, bytes.to_vec()),
-                                )
-                            } else {
-                                warn!(
-                                    "call: ignored invalid peer capability version for {}",
-                                    call.action.call_id()
-                                );
-                                None
-                            }
-                        } else {
-                            None
-                        };
-                        if matches!(&call.action, CallAction::Accept { .. }) {
-                            accepting_device_capability = device;
-                        } else if let Some(device) = device {
-                            client.call_registry().set_group_invite_peer_device(
-                                call.action.call_id(),
-                                generation,
-                                device,
-                            );
-                        }
-                    }
-                    // Caller-side: key our recv path to the device that actually answered. We dial the
-                    // base callee LID, but a companion answers from `:N` and encrypts under its own
-                    // device id; without this every inbound frame decrypts to garbage. One-shot, and a
-                    // no-op for an incoming call or a call we aren't the caller of (no sender registered).
-                    #[cfg(feature = "voip-control")]
-                    if let CallAction::Accept { .. } = &call.action {
-                        let sender = routed_call_sender(&call);
-                        // Record the device that answered so a later <terminate> targets it (call
-                        // signaling is addressed per device, not to the bare peer the offer rang).
-                        if direct_accept.is_none() {
-                            client
-                                .call_registry()
-                                .set_answering_device(call.action.call_id(), sender.clone());
-                        }
-                        // The peer's capability and the answering device land in the same stanza
-                        // and both have to be applied before the first inbound packet, so they
-                        // travel as one message rather than racing.
-                        let mut peer_mlow_bit = client.call_registry().resolve_peer_capability(
-                            call.action.call_id(),
-                            &sender,
-                            peer_mlow_bit,
-                        );
-                        if peer_mlow_bit == CapabilityBit::Unknown
-                            && let Some(alias) = direct_accept_alias.as_ref()
-                        {
-                            // The mapping may have arrived after preaccept. Never borrow another
-                            // device's rollout bit: this trusted alias preserves the device id.
-                            peer_mlow_bit = client.call_registry().resolve_peer_capability(
-                                call.action.call_id(),
-                                alias,
-                                CapabilityBit::Unknown,
-                            );
-                        }
-                        let audio_codec = client
-                            .call_registry()
-                            .peer_selected_audio_codec(call.action.call_id(), peer_mlow_bit);
-                        let answer = wacore::voip_control::control::PeerAnswer::builder()
-                            .answering_lid(sender.to_string())
-                            .maybe_audio_codec(audio_codec)
-                            .build();
-                        if let Some((generation, creator, device)) = direct_accept.as_ref() {
-                            if !client
-                                .call_registry()
-                                .accept_direct_if_current(
-                                    call.action.call_id(),
-                                    *generation,
-                                    creator,
-                                    device.clone(),
-                                    answer,
-                                )
-                                .await
-                            {
-                                return true;
-                            }
-                            // #1098: answer the callee's `<accept>` with our `<transport>`, as the
-                            // phone does when it is the caller. Sent after the accept's own
-                            // stanzas (rotation, sibling dismiss) below.
-                            caller_transport = Some((sender.clone(), creator.clone()));
-                        } else {
-                            client
-                                .call_registry()
-                                .send_rekey(call.action.call_id(), answer);
-                        }
-                        // Only the answer that reached media may select promotion capabilities.
-                        // A refused or concurrent sibling answer must not latch a different device.
-                        if let Some(generation) = direct_accept
-                            .as_ref()
-                            .map(|(generation, _, _)| *generation)
-                            .or_else(|| client.call_registry().generation_of(call.action.call_id()))
-                        {
-                            if let Some(device) = accepting_device_capability {
-                                client.call_registry().select_group_invite_peer_device(
-                                    call.action.call_id(),
-                                    generation,
-                                    Some(device),
-                                );
-                            } else {
-                                client
-                                    .call_registry()
-                                    .select_group_invite_peer_without_capability(
-                                        call.action.call_id(),
-                                        generation,
-                                        &sender,
-                                    );
-                            }
-                        }
-                        // The answering device's camera rotation, announced on
-                        // the `<accept>`'s `<video>` and nowhere else until it
-                        // turns. After `set_answering_device`, so the registry
-                        // can tell a winning answer from a late sibling's.
-                        if let Some(orientation) = call.video_orientation
-                            && let Some(generation) = direct_accept
-                                .as_ref()
-                                .map(|(generation, _, _)| *generation)
-                                .or_else(|| {
-                                    client.call_registry().generation_of(call.action.call_id())
-                                })
-                        {
-                            client.call_registry().set_peer_video_orientation(
-                                call.action.call_id(),
-                                generation,
-                                &sender,
-                                orientation,
-                            );
-                        }
-                        if let Some(generation) = direct_accept
-                            .as_ref()
-                            .map(|(generation, _, _)| *generation)
-                            .or_else(|| client.call_registry().generation_of(call.action.call_id()))
-                        {
-                            announce_orientation_on_accept(
-                                &client,
-                                call.action.call_id(),
-                                generation,
-                                &sender,
-                            )
-                            .await;
-                        }
-                    }
-                    // Caller-side multi-device dismiss: when one of the callee's devices accepts or
-                    // rejects an outbound call of ours, tell the rest to stop ringing.
-                    #[cfg(feature = "voip-control")]
-                    dismiss_outgoing_siblings(&client, &call).await;
-                    #[cfg(feature = "voip-control")]
-                    if let Some((to, creator)) = caller_transport.take() {
-                        let transport = wacore::stanza::call::build_transport(
-                            &wacore::stanza::call::TransportParams {
-                                call_id: call.action.call_id(),
-                                to: &to,
-                                call_creator: &creator,
-                                p2p_cand_round: Some("1"),
-                                transport_message_type: Some("1"),
-                                relay_te: None,
-                            },
-                        );
-                        crate::voip::facade::send_caller_call_signal(
-                            &client,
-                            transport,
-                            "transport",
-                            call.action.call_id(),
-                        )
-                        .await;
                     }
                     // A <terminate> for a call that was still ringing (an incoming offer we never
                     // answered) gets a terminal outcome. We mirror WA Web's
@@ -1277,52 +956,6 @@ async fn apply_current_group_control(client: &Client, call: &IncomingCall) -> bo
 }
 
 #[cfg(feature = "voip-control")]
-/// Announce a rotation the app set while the call was still ringing.
-///
-/// A video-from-start offer carries `device_orientation="0"`, and its caller
-/// sends no further `<video>` of its own, so a rotation set between `start()`
-/// and the answer would never reach the peer: while ringing there is no call
-/// entry on their side to apply one against. Upright needs no stanza — that is
-/// what the offer already said.
-#[cfg(feature = "voip-control")]
-async fn announce_orientation_on_accept(
-    client: &Arc<Client>,
-    call_id: &str,
-    generation: u64,
-    to: &Jid,
-) {
-    let registry = client.call_registry();
-    let orientation = registry
-        .local_video_orientation(call_id, generation)
-        .unwrap_or(0);
-    if orientation == 0 {
-        return;
-    }
-    let sending_video = registry
-        .video_states(call_id, generation)
-        .is_some_and(|(self_state, _)| self_state == VideoState::Enabled);
-    if !sending_video {
-        return;
-    }
-    let Some(session) = registry.snapshot_if_current(call_id, generation) else {
-        return;
-    };
-    let stanza = build_video_state(&VideoStateParams {
-        call_id,
-        // The device that answered, not `call_creator`: on an outgoing call that
-        // is our own LID, and the stanza would come straight back to us.
-        to,
-        id: &client.generate_request_id(),
-        call_creator: &session.call_creator,
-        state: VideoState::Enabled,
-        dec: Some("H264"),
-        device_orientation: Some(orientation),
-    });
-    if let Err(e) = client.send_node(stanza).await {
-        warn!("call: failed to announce video orientation after accept: {e}");
-    }
-}
-
 #[cfg(feature = "voip-control")]
 async fn apply_current_decrypted_group_epoch(
     client: &Client,
@@ -1648,168 +1281,48 @@ fn validate_group_epoch_key(raw_epoch: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The call service's own address for this call, `<call_id>@call`. Live group calls deliver the
-/// authoritative `group_update` snapshots (including the relay an invited device needs to join)
-/// and the final `terminate` from it rather than from the creator's device.
 #[cfg(feature = "voip-control")]
-fn is_call_service_sender(sender: &Jid, call_id: &str) -> bool {
-    sender.server == Server::Call
-        && sender.device == 0
-        && sender.agent == 0
-        && sender.integrator == 0
-        && sender.user.as_str() == call_id
-}
+use crate::voip::direct_ingress::{
+    is_call_service_sender, reject_is_device_busy, routed_call_sender,
+};
 
-#[cfg(feature = "voip-control")]
-fn routed_call_sender(call: &IncomingCall) -> Jid {
-    call.participant.as_ref().unwrap_or(&call.from).clone()
-}
-
-/// Reads existing trusted PN/LID identity mappings; a call stanza never teaches this lookup.
-/// Unknown or ambiguous aliases cannot authorize an answer to the current direct call.
-#[cfg(feature = "voip-control")]
+#[cfg(all(test, feature = "voip-control"))]
 async fn canonical_call_identity(client: &Client, observed: &Jid, expected: &Jid) -> Option<Jid> {
-    let canonical = if observed.server == expected.server {
-        observed.clone()
-    } else {
-        client.swap_pn_lid_namespace(observed).await?
-    };
-    (canonical.to_non_ad() == expected.to_non_ad()).then_some(canonical)
+    crate::voip::direct_ingress::canonical_call_identity(client, observed, expected).await
 }
 
+#[cfg(feature = "voip-control")]
+#[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.call_offer_ack", level = "debug", skip_all, fields(peer = %call.from.observe()), err(Debug)))]
+async fn send_offer_ack_receipt(client: &Client, call: &IncomingCall) -> anyhow::Result<()> {
+    crate::voip::direct_ingress::send_offer_receipt(client, call)
+        .await
+        .map_err(anyhow::Error::from)
+}
+
+#[cfg(not(feature = "voip-control"))]
 #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.call_offer_ack", level = "debug", skip_all, fields(peer = %call.from.observe()), err(Debug)))]
 async fn send_offer_ack_receipt(client: &Client, call: &IncomingCall) -> anyhow::Result<()> {
     let own_from = match call.from.server {
         Server::Lid => client.lid(),
         _ => client.pn(),
     };
-
-    let Some(receipt) = build_offer_ack_receipt(call, own_from.as_ref()) else {
-        return Ok(());
-    };
-
-    client.send_node(receipt).await.map_err(anyhow::Error::from)
-}
-
-/// Caller-side sibling dismiss. When a callee device accepts/rejects one of OUR outbound calls, the
-/// caller (us) tells the callee's OTHER devices to stop ringing via `<terminate reason=...>` -- the
-/// dismiss is caller-driven (the callee never dismisses its own siblings; verified vs WA Web + APK).
-/// The rung device set lives on the registry session (`take_dismiss_targets`), consumed one-shot so a
-/// duplicate accept/reject can't re-dismiss. No-op for any other action, or a call we aren't the
-/// caller of (inbound call, single-device callee, or one already dismissed). A `Terminate` needs no
-/// handling here: the call ends, its registry entry (and the device set with it) goes away.
-/// Whether a `<reject>` says the DEVICE is unavailable rather than that the callee declined.
-///
-/// `busy` is a per-device statement (already in a call, or a companion with no voice support); the
-/// callee's other devices go on ringing and may still answer. `enc` is the same shape: the device
-/// could not decrypt the offer (its registration changed device-side, observed with registration
-/// bytes on the reject), so it decided nothing for the callee either. Any other reason - including
-/// none - is the callee's own decision and ends the call.
-#[cfg(feature = "voip-control")]
-fn reject_is_device_busy(action: &CallAction) -> bool {
-    matches!(
-        action,
-        CallAction::Reject { reason, .. }
-            if reason.as_deref() == Some(REJECT_REASON_BUSY)
-                || reason.as_deref() == Some(REJECT_REASON_ENC)
-    )
-}
-
-#[cfg(feature = "voip-control")]
-async fn dismiss_outgoing_siblings(client: &Client, call: &IncomingCall) {
-    let reason = match &call.action {
-        CallAction::Accept { .. } => TERMINATE_REASON_ACCEPTED_ELSEWHERE,
-        // A `busy`/`enc` device has not decided anything for the callee, so its siblings must keep
-        // ringing. Returning BEFORE take_dismiss_targets matters: that take is one-shot, and
-        // consuming the rung set here would leave a later genuine accept with nothing to dismiss.
-        CallAction::Reject { .. } if reject_is_device_busy(&call.action) => return,
-        CallAction::Reject { .. } => TERMINATE_REASON_REJECTED_ELSEWHERE,
-        _ => return,
-    };
-    let call_id = call.action.call_id();
-
-    let Some((call_creator, devices)) = client.call_registry().take_dismiss_targets(call_id) else {
-        // Either not our outgoing call, the call already deregistered, the rung set was already
-        // consumed (a duplicate accept), or it rang a single device. If a multi-device callee's
-        // sibling is still ringing and we land here, the rung set wasn't there to dismiss from.
-        debug!("call: {reason} for {call_id}: no sibling-dismiss targets tracked");
-        return;
-    };
-
-    // Send ONE <terminate> per sibling device, addressed to that DEVICE JID with a generated wrapper
-    // id -- the WA Web/APK form. (A single stanza with a <destination> block to the bare peer is NOT
-    // it: WA Web gates the destination fan-out to offer/enc_rekey, and the server routes call
-    // signaling per device.) Skip the device that accepted/rejected: compare on device identity
-    // (user + server + device), not full Jid equality, since the usync device-list and the accept's
-    // `from` can carry a different `agent` for the same physical device.
-    let answerer = routed_call_sender(call);
-    let others: Vec<Jid> = devices
-        .into_iter()
-        .filter(|device| !same_device(device, &answerer))
-        .collect();
-    debug!(
-        "call: {reason} from {} for {call_id}: dismissing {} sibling device(s)",
-        answerer.observe(),
-        others.len()
-    );
-    for dev in &others {
-        let id = client.generate_request_id();
-        let node = build_terminate(&TerminateParams {
-            call_id,
-            to: dev,
-            id: Some(&id),
-            call_creator: &call_creator,
-            reason: Some(reason),
-        });
-        match client.send_node(node).await {
-            Ok(()) => debug!(
-                "call: dismissed sibling device {} ({reason}) for {call_id}",
-                dev.observe()
-            ),
-            Err(e) => warn!(
-                "call: failed to dismiss sibling device {}: {e}",
-                dev.observe()
-            ),
-        }
+    if let Some(receipt) = build_offer_ack_receipt(call, own_from.as_ref()) {
+        client.send_node(receipt).await?;
     }
-}
-
-#[cfg(feature = "voip-control")]
-async fn dismiss_incompatible_group_invitee(client: &Client, call: &IncomingCall) {
-    let target = routed_call_sender(call);
-    if target.server == Server::Call {
-        warn!(
-            "call: ignored codec mismatch without a routed group invitee for {}",
-            call.action.call_id()
-        );
-        return;
-    }
-    let id = client.generate_request_id();
-    let node = build_terminate(&TerminateParams {
-        call_id: call.action.call_id(),
-        to: &target,
-        id: Some(&id),
-        call_creator: call.action.call_creator(),
-        reason: None,
-    });
-    if let Err(error) = client.send_node(node).await {
-        warn!(
-            "call: failed to dismiss codec-incompatible group invitee {}: {error}",
-            target.observe()
-        );
-    }
-}
-
-/// Whether two JIDs name the same device: user + server + device id. Excludes `agent`/`integrator`,
-/// representation details that can differ between the usync device-list and a stanza's `from`.
-#[cfg(feature = "voip-control")]
-fn same_device(a: &Jid, b: &Jid) -> bool {
-    a.user == b.user && a.server == b.server && a.device == b.device
+    Ok(())
 }
 
 /// WAWebVoipLidUtils associates caller_pn with peer_jid (the outer `from`),
 /// independently of call-creator. Learn before online/offline event dispatch;
 /// the shared fast path owns persistence, migration, and conflict reconciliation.
+#[cfg(feature = "voip-control")]
+async fn learn_offer_identity(client: &Arc<Client>, call: &IncomingCall) {
+    if let Err(error) = crate::voip::direct_ingress::learn_offer_identity(&**client, call).await {
+        warn!("call: failed to persist/migrate caller LID-PN mapping: {error}");
+    }
+}
+
+#[cfg(not(feature = "voip-control"))]
 async fn learn_offer_identity(client: &Arc<Client>, call: &IncomingCall) {
     use crate::lid_pn_cache::LearningSource;
     use wacore::iq::abprops::web;

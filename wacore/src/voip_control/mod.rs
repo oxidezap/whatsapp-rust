@@ -42,6 +42,7 @@ pub mod fake_backend;
 // Signaling/control call state -- identity, direction, lifecycle -- that carries no engine type, so
 // the call flow can name a session with the engine off. `crate::voip::session` re-exports these.
 pub mod signaling;
+pub mod signaling_plan;
 
 // The public, ordered call event stream. Moved out of the engine so the public API no longer names
 // an engine enum; the engine re-exports it as `crate::voip::CallEvent`.

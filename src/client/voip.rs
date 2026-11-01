@@ -10,9 +10,9 @@ use std::time::Duration;
 
 #[cfg(feature = "voip-control")]
 use log::warn;
-#[cfg(feature = "voip-control")]
-use wacore::stanza::call::build_mute_v2;
-use wacore::stanza::call::{TerminateParams, build_reject, build_terminate};
+use wacore::stanza::call::build_reject;
+#[cfg(not(feature = "voip-control"))]
+use wacore::stanza::call::{TerminateParams, build_terminate};
 #[cfg(feature = "voip-control")]
 use wacore::stanza::group_call::{
     build_active_group_accept, build_active_group_preaccept, build_call_link_create,
@@ -391,7 +391,7 @@ impl Drop for CallLinkRegistrationGuard {
                 }
                 let target = Jid::new(&call_id, Server::Call);
                 crate::voip::facade::send_answer_terminate(
-                    &client,
+                    client.as_ref(),
                     &call_id,
                     &target,
                     &call_creator,
@@ -993,16 +993,7 @@ impl Client {
     /// after the old one is claimed but before its terminal stanza reaches the wire.
     #[cfg(feature = "voip-control")]
     pub(crate) fn answer_transition_lock(&self, call_id: &str) -> Arc<async_lock::Mutex<()>> {
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        call_id.hash(&mut hasher);
-        let locks = self
-            .voip_state()
-            .answer_transition_locks
-            .get_or_init(|| std::array::from_fn(|_| Arc::new(async_lock::Mutex::new(()))));
-        let lane = hasher.finish() as usize % locks.len();
-        locks[lane].clone()
+        self.voip_state().direct.transition(call_id)
     }
 
     #[cfg(feature = "voip-control")]
@@ -1103,6 +1094,7 @@ impl Voip<'_> {
             &incoming.from,
             incoming.action.call_creator(),
             incoming.ringing_generation(),
+            incoming.group.is_none(),
         )
         .await
     }
@@ -1118,7 +1110,7 @@ impl Voip<'_> {
         peer: &Jid,
         call_creator: &Jid,
     ) -> Result<(), CallError> {
-        self.reject_call_inner(call_id, peer, call_creator, None)
+        self.reject_call_inner(call_id, peer, call_creator, None, false)
             .await
     }
 
@@ -1128,10 +1120,20 @@ impl Voip<'_> {
         peer: &Jid,
         call_creator: &Jid,
         _ringing_generation: Option<u64>,
+        _direct_offer: bool,
     ) -> Result<(), CallError> {
         if call_id.is_empty() {
             return Err(CallError::EmptyCallId);
         }
+        #[cfg(feature = "voip-control")]
+        let _transition = if _direct_offer && _ringing_generation.is_some() {
+            let epoch = self.client.voip_state().direct.epoch();
+            let lane = self.client.lock_answer_transition(call_id).await;
+            self.client.voip_state().direct.ensure_epoch(epoch)?;
+            Some(lane)
+        } else {
+            None
+        };
         let id = self.client.generate_request_id();
         let stanza = build_reject(call_id, peer, call_creator, &id);
         // Consume the ringing flag BEFORE the async send: a caller <terminate> processed while we await
@@ -1141,7 +1143,12 @@ impl Voip<'_> {
         {
             let registry = self.client.call_registry();
             if let Some(generation) = _ringing_generation {
-                if !registry.reject_ringing_if_current(call_id, generation) {
+                let removed = if _direct_offer {
+                    registry.take_current_ringing_offer(call_id, generation)
+                } else {
+                    registry.reject_ringing_if_current(call_id, generation)
+                };
+                if !removed {
                     return Err(CallError::CallEndedDuringSetup);
                 }
             } else {
@@ -1753,20 +1760,13 @@ impl Voip<'_> {
         generation: u64,
         muted: bool,
     ) -> Result<(), CallError> {
-        // A handle superseded while it waited must not announce a state for the replacement that now
-        // owns this call-id.
-        if self.client.call_registry().generation_of(call_id) != Some(generation) {
-            return Err(CallError::Media("call is no longer active"));
-        }
-        self.send_group_control(
+        crate::voip::direct::announce_muted_locked(
+            self.client,
             call_id,
-            build_mute_v2(
-                call_id,
-                peer,
-                call_creator,
-                &self.client.generate_request_id(),
-                muted,
-            ),
+            peer,
+            call_creator,
+            generation,
+            muted,
         )
         .await
     }
@@ -2051,80 +2051,31 @@ impl Voip<'_> {
     ) -> Result<(), CallError> {
         #[cfg(feature = "voip-control")]
         {
-            let pinned = self.client.call_registry().generation_of(call_id);
-            // Armed before the lane, since waiting for it is cancellable too, and pinned so it can
-            // only ever end the call this terminate started on. Nothing registered under this call-id
-            // means there is no local call of ours to end, so this path stays teardown-free.
-            let _teardown = pinned.map(|generation| LocalTeardown {
-                client: self.client,
+            return crate::voip::direct_control::terminate(
+                self.client,
                 call_id,
-                generation,
-            });
-            // Held across the send: a replacement installed in that window would be ended by a
-            // `<terminate>` the peer cannot tell apart from ours, since both carry the same call-id.
-            let _transition = self.client.lock_answer_transition(call_id).await;
-            // Any change since entry -- a replacement, a removal, or a first registration under a
-            // call-id that had none -- belongs to a different call than the one asked to end.
-            if self.client.call_registry().generation_of(call_id) != pinned {
-                return Err(CallError::Media("call is no longer active"));
-            }
-            return self
-                .terminate_inner(call_id, std::slice::from_ref(peer), call_creator, pinned)
-                .await
-                .1;
+                peer,
+                call_creator,
+            )
+            .await;
         }
         // Without the control plane there is no registry to pin against: terminate blind.
         #[cfg(not(feature = "voip-control"))]
-        self.terminate_inner(call_id, std::slice::from_ref(peer), call_creator, None)
+        self.terminate_inner(call_id, std::slice::from_ref(peer), call_creator)
             .await
             .1
     }
 
-    /// [`terminate`](Self::terminate) restricted to one registry generation and addressed at every
-    /// device that must be told, so a handle superseded by a same-call-id replacement tears down its
-    /// own call instead of the replacement's.
-    #[cfg(feature = "voip-control")]
-    pub(crate) async fn terminate_for_generation(
-        &self,
-        call_id: &str,
-        peers: &[Jid],
-        call_creator: &Jid,
-        generation: u64,
-    ) -> TerminateDelivery {
-        let (notified, result) = self
-            .terminate_inner(call_id, peers, call_creator, Some(generation))
-            .await;
-        TerminateDelivery {
-            notified,
-            failure: result.err(),
-        }
-    }
-
+    #[cfg(not(feature = "voip-control"))]
     async fn terminate_inner(
         &self,
         call_id: &str,
         peers: &[Jid],
         call_creator: &Jid,
-        _generation: Option<u64>,
     ) -> (usize, Result<(), CallError>) {
         if call_id.is_empty() {
             return (0, Err(CallError::EmptyCallId));
         }
-        // Tear the local call down whatever happens to the stanzas: the app asked to hang up, and
-        // neither a failed send nor a caller that drops this future mid-send (a timeout, a `select!`)
-        // may leave the media task capturing or a dormant outgoing call free to attach on a late
-        // relay ack. A drop guard is what survives the cancellation; it reuses the same teardown the
-        // peer's `<terminate>` triggers.
-        // Pinned by the caller, never resolved here: a teardown that read the registry at drop time
-        // would find a same-call-id replacement and end that instead of the call the caller asked to
-        // hang up. `None` is a call-id with nothing of ours registered under it, which has no local
-        // side to tear down.
-        #[cfg(feature = "voip-control")]
-        let _teardown = _generation.map(|generation| LocalTeardown {
-            client: self.client,
-            call_id,
-            generation,
-        });
         let mut notified = 0usize;
         let mut result = Ok(());
         for peer in peers {
@@ -2154,23 +2105,6 @@ impl Voip<'_> {
 pub(crate) struct TerminateDelivery {
     pub(crate) notified: usize,
     pub(crate) failure: Option<CallError>,
-}
-
-/// Local call teardown that runs even when the terminate future is cancelled mid-send.
-#[cfg(feature = "voip-control")]
-pub(crate) struct LocalTeardown<'a> {
-    pub(crate) client: &'a Client,
-    pub(crate) call_id: &'a str,
-    /// The generation this teardown owns, pinned when the terminate started, so it can only ever end
-    /// that call and never a replacement registered under the same call-id afterwards.
-    pub(crate) generation: u64,
-}
-
-#[cfg(feature = "voip-control")]
-impl Drop for LocalTeardown<'_> {
-    fn drop(&mut self) {
-        crate::voip::facade::terminate_call_if_current(self.client, self.call_id, self.generation);
-    }
 }
 
 #[cfg(feature = "voip-control")]
@@ -2464,6 +2398,53 @@ mod tests {
             .await
             .expect("reject should send");
         assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "voip-control")]
+    #[tokio::test]
+    async fn direct_reject_consumes_only_the_retained_offer_token() {
+        let (client, count) = make_client_with_count().await;
+        let mut incoming = incoming_reject();
+        let call_id = incoming.action.call_id().to_owned();
+        let token = client
+            .call_registry()
+            .admit_incoming_offer(&call_id)
+            .expect("admit direct offer");
+        incoming.set_ringing_generation(token);
+        client
+            .voip()
+            .reject(&incoming)
+            .await
+            .expect("reject current direct offer");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert!(!client.call_registry().is_ringing(&call_id));
+    }
+
+    #[cfg(feature = "voip-control")]
+    #[tokio::test]
+    async fn stale_direct_reject_never_sends_to_the_replacement_offer() {
+        let (client, count) = make_client_with_count().await;
+        let mut incoming = incoming_reject();
+        let call_id = incoming.action.call_id().to_owned();
+        let stale = client
+            .call_registry()
+            .admit_incoming_offer(&call_id)
+            .expect("first offer");
+        incoming.set_ringing_generation(stale);
+        let current = client
+            .call_registry()
+            .admit_incoming_offer(&call_id)
+            .expect("replacement offer");
+        assert!(matches!(
+            client.voip().reject(&incoming).await,
+            Err(CallError::CallEndedDuringSetup)
+        ));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert!(
+            client
+                .call_registry()
+                .is_current_ringing_offer(&call_id, current)
+        );
     }
 
     #[tokio::test]

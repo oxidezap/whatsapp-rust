@@ -2,7 +2,11 @@
 //! runtime so the call orchestration itself stays in the sans-IO core. This is the whole "native
 //! driver" -- the engine does the work; this only supplies a runtime for the timer.
 
-#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
+#[cfg(all(
+    feature = "voip-engine-wacore",
+    feature = "tokio-runtime",
+    not(target_arch = "wasm32")
+))]
 use std::sync::Arc;
 
 #[cfg(all(
