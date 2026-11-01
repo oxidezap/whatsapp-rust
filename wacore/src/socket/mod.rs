@@ -1,4 +1,5 @@
 pub mod error;
+pub mod frame_encoder;
 pub mod noise_socket;
 
 pub use error::{EncryptSendError, EncryptSendErrorKind, EncryptSendResult, Result, SocketError};

@@ -1,9 +1,11 @@
+mod parse_job;
+use parse_job::HistoryParseJob;
+
 use crate::types::events::{CallLogHistory, Event, LazyHistorySync};
 use bytes::Bytes;
 use std::sync::Arc;
 use wacore::history_sync::{
     HistoryMsgSecretRecordRef, HistoryMsgSecretRecordVisitor, TcTokenCandidate,
-    process_history_sync_bytes_with_record_sink,
 };
 use wacore::messages::DetachedHistorySyncNotification;
 use wacore::msg_secret::{MsgSecretPolicy, MsgSecretRetention, RetentionClass};
@@ -107,11 +109,15 @@ struct HistorySecretSeedConfig {
 
 impl HistorySecretSeedConfig {
     fn snapshot(config: &crate::cache_config::RuntimeCacheConfig) -> Self {
+        Self::at(config, wacore::time::now_secs())
+    }
+
+    fn at(config: &crate::cache_config::RuntimeCacheConfig, now: i64) -> Self {
         Self {
             enabled: config.seed_msg_secrets_from_history,
             policy: config.msg_secret_policy,
             retention: config.msg_secret_retention,
-            now: wacore::time::now_secs(),
+            now,
         }
     }
 
@@ -856,8 +862,7 @@ impl Client {
         let own_lid = device_snapshot.lid.as_ref().map(|jid| jid.to_non_ad());
         let own_user = own_pn.as_ref().map(|jid| jid.user.clone());
         let secret_seed_config = HistorySecretSeedConfig::snapshot(&self.cache_config);
-        let mut secret_collector =
-            HistorySecretSeedCollector::new(secret_seed_config, own_pn, own_lid);
+        let secret_collector = HistorySecretSeedCollector::new(secret_seed_config, own_pn, own_lid);
 
         // Always carry the compressed input through (a move, no copy or extra
         // inflate); handler interest is evaluated at dispatch time below, so a
@@ -865,27 +870,15 @@ impl Client {
         // the event instead of racing a pre-parse snapshot.
         // Small blobs (PushName, Recent): decode inline to avoid spawn_blocking overhead.
         // Large blobs: use blocking thread to avoid stalling the async runtime.
-        const INLINE_THRESHOLD: usize = 256 * 1024;
-        let parse_result = if compressed_data.len() < INLINE_THRESHOLD {
-            let result = process_history_sync_bytes_with_record_sink(
-                compressed_data,
-                own_user.as_deref(),
-                true,
-                &mut secret_collector,
-            );
-            Some((result, secret_collector.into_entries()))
+        let job = HistoryParseJob::new(compressed_data, own_user, secret_collector);
+        let parse_result = if job.runs_inline() {
+            Some(job.run())
         } else {
             let (result_tx, result_rx) = futures::channel::oneshot::channel();
             let lease = tracker.blocking_lease();
             let blocking_fut = self.runtime.spawn_blocking(Box::new(move || {
                 let _lease = lease;
-                let result = process_history_sync_bytes_with_record_sink(
-                    compressed_data,
-                    own_user.as_deref(),
-                    true,
-                    &mut secret_collector,
-                );
-                let _ = result_tx.send((result, secret_collector.into_entries()));
+                let _ = result_tx.send(job.run());
             }));
             self.runtime
                 .spawn(Box::pin(async move {
@@ -2218,6 +2211,74 @@ mod tests {
             }
         }
         receipts
+    }
+
+    #[tokio::test]
+    async fn blocking_history_parse_completes_through_the_client_and_releases_its_lease() {
+        use rand::{Rng, SeedableRng};
+        let (client, transport, _) = history_receipt_client(None).await;
+        let recorder = Arc::new(CallHistoryRecorder(std::sync::Mutex::new(Vec::new())));
+        let _subscription = client.core.event_bus.subscribe_handler(recorder.clone());
+        let salt = vec![17; 32];
+        let mut padding = vec![0; 512 * 1024];
+        rand::rngs::StdRng::seed_from_u64(0x484953544f5259).fill_bytes(&mut padding);
+        let mut history = wa::HistorySync::default();
+        history.sync_type = wa::history_sync::HistorySyncType::RECENT;
+        history.nct_salt = Some(salt.clone());
+        // An unknown length-delimited field supplies incompressible bytes
+        // without exceeding a known protocol field's semantic size.
+        let mut raw = history.encode_to_vec();
+        for mut value in [2000u64 * 8 + 2, padding.len() as u64] {
+            while value >= 128 {
+                raw.push((value as u8 & 0x7f) | 0x80);
+                value >>= 7;
+            }
+            raw.push(value as u8);
+        }
+        raw.extend_from_slice(&padding);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&raw).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(compressed.len() >= 256 * 1024);
+        let mut notification = HistorySyncNotification::default();
+        notification.sync_type = Some(wa::message::HistorySyncType::RECENT);
+        notification.initial_hist_bootstrap_inline_payload = Some(compressed);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.process_history_sync_task("HIST_BLOCKING".into(), notification.into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            client
+                .persistence_manager
+                .get_device_snapshot()
+                .nct_salt
+                .as_deref(),
+            Some(salt.as_slice())
+        );
+        assert_eq!(history_receipts(&transport, "HIST_BLOCKING").await, 1);
+        assert!(
+            recorder
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(&**event, Event::HistorySync(_)))
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let idle = client.history_sync_activity.listen();
+                if client.history_sync_activity.tasks() == 0 {
+                    break;
+                }
+                idle.await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(client.history_sync_activity.snapshot().tasks, 0);
+        assert_eq!(client.history_sync_activity.snapshot().payload_bytes, 0);
     }
 
     #[tokio::test]

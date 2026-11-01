@@ -1,3 +1,5 @@
+pub mod pending;
+
 use crate::WireEnum;
 use rand::Rng;
 use sha2::{Digest, Sha256};

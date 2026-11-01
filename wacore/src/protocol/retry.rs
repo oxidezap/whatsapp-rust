@@ -24,6 +24,60 @@ pub const MIN_RETRY_COUNT_FOR_KEYS: u8 = 2;
 /// WhatsApp Web saves base key on retry 2, checks on retry > 2.
 pub const MIN_RETRY_FOR_BASE_KEY_CHECK: u8 = 2;
 
+pub const RECREATE_SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRecreation {
+    Missing,
+    Expired,
+}
+
+impl SessionRecreation {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Missing => "we don't have a Signal session with them",
+            Self::Expired => "retry count > 1 and over an hour since last recreation",
+        }
+    }
+}
+
+pub fn session_recreation(
+    retry_count: u8,
+    has_session: bool,
+    last_recreated: Option<crate::time::Instant>,
+    now: crate::time::Instant,
+) -> Option<SessionRecreation> {
+    if !has_session {
+        return Some(SessionRecreation::Missing);
+    }
+    if retry_count < MIN_RETRY_FOR_BASE_KEY_CHECK
+        || last_recreated
+            .is_some_and(|at| now.saturating_duration_since(at) < RECREATE_SESSION_TIMEOUT)
+    {
+        return None;
+    }
+    Some(SessionRecreation::Expired)
+}
+
+pub fn registration_mismatch(stored: u32, received: u32) -> bool {
+    stored != 0 && stored != received
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaseKeyAction {
+    Keep,
+    Save,
+    Check,
+}
+
+pub fn base_key_action(retry_count: u8) -> BaseKeyAction {
+    match retry_count.cmp(&MIN_RETRY_FOR_BASE_KEY_CHECK) {
+        std::cmp::Ordering::Less => BaseKeyAction::Keep,
+        std::cmp::Ordering::Equal => BaseKeyAction::Save,
+        std::cmp::Ordering::Greater => BaseKeyAction::Check,
+    }
+}
+
 /// Retry reason codes matching WhatsApp Web's RetryReason enum.
 /// These are included in the retry receipt to help the sender understand
 /// why the message couldn't be decrypted.
@@ -506,5 +560,62 @@ mod tests {
         for (reason, expected) in cases {
             assert_eq!(reason.as_str(), expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod session_policy_tests {
+    use super::*;
+    use crate::time::Instant;
+    use std::time::Duration;
+
+    #[test]
+    fn recreation_matrix_includes_the_exact_expiry_boundary() {
+        let previous = Instant::ZERO + Duration::from_secs(100);
+        for count in 0..=u8::MAX {
+            assert_eq!(
+                session_recreation(count, false, Some(previous), previous),
+                Some(SessionRecreation::Missing)
+            );
+            assert_eq!(
+                session_recreation(count, true, Some(previous), previous),
+                None
+            );
+            let expected = (count >= 2).then_some(SessionRecreation::Expired);
+            assert_eq!(session_recreation(count, true, None, previous), expected);
+            assert_eq!(
+                session_recreation(
+                    count,
+                    true,
+                    Some(previous),
+                    previous + RECREATE_SESSION_TIMEOUT
+                ),
+                expected
+            );
+            assert_eq!(
+                session_recreation(
+                    count,
+                    true,
+                    Some(previous),
+                    previous + RECREATE_SESSION_TIMEOUT - Duration::from_nanos(1)
+                ),
+                None
+            );
+            assert_eq!(
+                session_recreation(count, true, Some(previous), Instant::ZERO),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn zero_registration_is_unknown_and_base_keys_start_at_retry_two() {
+        assert!(!registration_mismatch(0, 42));
+        assert!(!registration_mismatch(42, 42));
+        assert!(registration_mismatch(42, 43));
+        assert_eq!(base_key_action(1), BaseKeyAction::Keep);
+        assert_eq!(base_key_action(2), BaseKeyAction::Save);
+        assert_eq!(base_key_action(3), BaseKeyAction::Check);
+        assert_eq!(base_key_action(u8::MAX), BaseKeyAction::Check);
     }
 }
