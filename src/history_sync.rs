@@ -2266,6 +2266,17 @@ mod tests {
                 .iter()
                 .any(|event| matches!(&**event, Event::HistorySync(_)))
         );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let idle = client.history_sync_activity.listen();
+                if client.history_sync_activity.tasks() == 0 {
+                    break;
+                }
+                idle.await;
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(client.history_sync_activity.snapshot().tasks, 0);
         assert_eq!(client.history_sync_activity.snapshot().payload_bytes, 0);
     }

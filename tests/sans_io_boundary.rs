@@ -18,6 +18,10 @@ impl Boundary {
                     | "Transport"
                     | "tokio"
                     | "rand"
+                    | "rand_core"
+                    | "getrandom"
+                    | "OsRng"
+                    | "io"
                     | "chrono"
                     | "async_channel"
                     | "fs"
@@ -42,9 +46,94 @@ impl Boundary {
             && joined != "std::time::Duration"
             && !joined.starts_with("std::time::Duration::");
         let reads_now = parts.len() > 1 && parts.last().is_some_and(|part| part == "now");
-        if forbidden || time_import || std_time || reads_now {
+        let unreviewed_root = parts.len() > 1
+            && parts.first().is_some_and(|root| {
+                root.starts_with(char::is_lowercase)
+                    && ![
+                        "crate",
+                        "super",
+                        "self",
+                        "std",
+                        "core",
+                        "alloc",
+                        "wacore",
+                        "wacore_binary",
+                        "waproto",
+                        "wa",
+                        "bytes",
+                        "u8",
+                        "u16",
+                        "u32",
+                        "u64",
+                        "u128",
+                        "usize",
+                        "i8",
+                        "i16",
+                        "i32",
+                        "i64",
+                        "i128",
+                        "isize",
+                        "f32",
+                        "f64",
+                        "str",
+                        "bool",
+                        "char",
+                    ]
+                    .contains(&root.as_str())
+            });
+        if forbidden || time_import || std_time || reads_now || unreviewed_root {
             self.violations.push(joined);
         }
+    }
+
+    fn check_import(&mut self, path: impl IntoIterator<Item = String>) {
+        let parts: Vec<_> = path.into_iter().collect();
+        let joined = parts.join("::");
+        const ALLOWED: &[&str] = &[
+            "std::collections::HashMap",
+            "std::sync::Arc",
+            "std::num::NonZeroU64",
+            "std::time::Duration",
+            "bytes::Bytes",
+            "bytes::BytesMut",
+            "waproto::whatsapp",
+            "wacore_binary::CompactString",
+            "wacore_binary::Node",
+            "wacore_binary::NodeContent",
+            "wacore_binary::NodeRef",
+            "wacore_binary::builder::NodeBuilder",
+            "super::IndexMac",
+            "super::HistorySecretSeedCollector",
+            "super::error::EncryptSendError",
+            "super::keepalive::KEEP_ALIVE_INTERVAL_MIN",
+            "super::keepalive::elapsed_since_at",
+            "super::keepalive::is_dead_socket_at",
+            "crate::time::Instant",
+            "crate::appstate::hash::HashState",
+            "crate::appstate::keys::ExpandedAppStateKeys",
+            "crate::appstate::processor::PatchProcessingResult",
+            "crate::appstate::processor::ProcessedSnapshot",
+            "crate::appstate::AppStateError",
+            "crate::appstate::Mutation",
+            "crate::appstate::process_patch",
+            "crate::appstate::process_snapshot",
+            "crate::handshake::NoiseCipher",
+            "crate::handshake::NoiseError",
+            "crate::libsignal::crypto::GcmInPlaceBuffer",
+            "crate::iq::prekeys::OneTimePreKeyNode",
+            "crate::iq::prekeys::SignedPreKeyNode",
+            "crate::libsignal::protocol::PublicKey",
+            "crate::protocol::ProtocolNode",
+            "crate::types::wire_enums::RECEIPT_MODE_HID_FAILED_DECRYPT",
+            "wacore::history_sync::HistorySyncError",
+            "wacore::history_sync::HistorySyncResult",
+            "wacore::history_sync::process_history_sync_bytes_with_record_sink",
+            "wacore::store::traits::MsgSecretEntry",
+        ];
+        if !ALLOWED.contains(&joined.as_str()) {
+            self.violations.push(format!("unreviewed import {joined}"));
+        }
+        self.check_path(parts);
     }
 
     fn check_use(&mut self, prefix: &mut Vec<String>, tree: &syn::UseTree) {
@@ -55,10 +144,10 @@ impl Boundary {
                 prefix.pop();
             }
             syn::UseTree::Name(name) => {
-                self.check_path(prefix.iter().cloned().chain([name.ident.to_string()]));
+                self.check_import(prefix.iter().cloned().chain([name.ident.to_string()]));
             }
             syn::UseTree::Rename(rename) => {
-                self.check_path(prefix.iter().cloned().chain([rename.ident.to_string()]));
+                self.check_import(prefix.iter().cloned().chain([rename.ident.to_string()]));
             }
             syn::UseTree::Group(group) => {
                 for item in &group.items {
@@ -149,6 +238,15 @@ fn guard_detects_aliased_clocks_and_runtime_dependencies() {
         "fn read() { crate::time::now_secs(); }",
         "use tokio::task as jobs; fn start() { jobs::spawn(async {}); }",
         "async fn read() {}",
+        "use std::io::Read;",
+        "fn read() { std::io::stdin(); }",
+        "use getrandom::fill as entropy;",
+        "fn read() { getrandom::fill(&mut []); }",
+        "use rand_core::OsRng;",
+        "fn read() { rand_core::OsRng; }",
+        "use unknown_io::read as dependency;",
+        "fn read() { unknown_io::read(); }",
+        "#[cfg(test)] mod tests {} fn read() { crate::time::now_millis(); }",
     ] {
         assert!(!violations(source).is_empty(), "{source}");
     }
