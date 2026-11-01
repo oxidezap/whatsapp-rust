@@ -319,12 +319,6 @@
       "seconds": 0.17756792784994244,
       "syscalls": 540
     },
-    "qualifiedHeadSample": {
-      "revision": "7376aab793efaa778957c51fac408d4c052da9e4",
-      "run": "6ae6cf4bca03bd8aeca0e690",
-      "seconds": 0.20783380425711542,
-      "syscalls": 1208
-    },
     "sameHeadIntegrationJobReplica": {
       "workflowRun": 41276892622,
       "attempt": 2,
@@ -350,6 +344,23 @@
       "state": "denied",
       "reason": "Registry requires package-read credentials; CI config uses BARTENDER_GHCR_TOKEN. No image was obtained locally.",
       "needed": "Authorized read access to the exact package, or a paired walltime qualification in the existing authorized CI environment."
+    },
+    "preWamHeadSample": {
+      "revision": "7376aab793efaa778957c51fac408d4c052da9e4",
+      "run": "6ae6cf4bca03bd8aeca0e690",
+      "seconds": 0.20783380425711542,
+      "syscalls": 1208
+    },
+    "changedRuntimeCandidate": {
+      "commit": "0e57791d4d1568b56b8ce13f133bdc2513c1d471",
+      "bracket": "aaf8c4f fast sample to 7376aab pre-WAM slow sample; 7376aab itself changes evidence only.",
+      "scope": "Runtime group-normalization/source-index changes. This identifies a candidate commit, not a demonstrated causal mechanism in connect_to_ready; the default benchmark feature graph and measured key-share path require isolated comparison."
     }
+  },
+  "abpropsPublicCompatibility": {
+    "sourceRev": "c581c20a9d0605df49abf297f2e7cfc04ccf1ff7",
+    "webConstants": 81,
+    "hybridConstants": 1,
+    "method": "Preserve exact historical AbProp descriptors in props::stale; generate re-exports at their original registry paths and keep them outside the current ALL slices. Hybrid group_call_max_participants remains distinct from the current web registry entry."
   }
 }

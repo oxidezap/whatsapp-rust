@@ -37,11 +37,92 @@ pub mod web {
 
     // Retained API constants, deliberately outside the current catalog's ALL.
     pub use crate::iq::props::stale::AI_3P_AGENT_LINK_ENABLED;
+    pub use crate::iq::props::stale::AI_CHAT_THREADS_INFRA_WEB_ENABLED;
+    pub use crate::iq::props::stale::AI_CHAT_THREADS_WEB_KILLSWITCH_ENABLED;
+    pub use crate::iq::props::stale::AI_CHAT_THREADS_WEB_MSGS_LOAD_LIMIT;
+    pub use crate::iq::props::stale::AI_META_AI_THREAD_CREATION_ENABLED;
+    pub use crate::iq::props::stale::AUTH_AGENT_SOFT_OFFBOARDING_ENABLED;
+    pub use crate::iq::props::stale::BUG_REPORTING_NOT_SHIPPED_YET_ENABLED;
+    pub use crate::iq::props::stale::CHANNELS_PULSE_ON_UNREAD_BADGE_ENABLED;
+    pub use crate::iq::props::stale::CHANNELS_STICKERS_QP_ENABLED;
+    pub use crate::iq::props::stale::CTWA_LEAD_TAXONOMY;
+    pub use crate::iq::props::stale::CTWA_NATIVE_WEB_DRAFT_AD_ENABLED;
+    pub use crate::iq::props::stale::ENABLE_FMX_REDESIGNED_BCC_FOR_METAVERIFIED_BIZ;
+    pub use crate::iq::props::stale::ENABLE_FMX_REDESIGNED_BCC_FOR_SUSPICIOUS_BIZ;
+    pub use crate::iq::props::stale::ENABLE_FMX_REDESIGNED_BCC_FOR_TIER0_BIZ;
+    pub use crate::iq::props::stale::ENABLE_FMX_REDESIGNED_BCC_FOR_TIER1_BIZ;
+    pub use crate::iq::props::stale::ENABLE_FMX_REDESIGNED_BCC_FOR_TIER2_BIZ;
+    pub use crate::iq::props::stale::ENABLE_FMX_REDESIGNED_BCC_FOR_TIER3_BIZ;
+    pub use crate::iq::props::stale::ENABLE_FMX_REDESIGNED_BCC_FOR_UNKNOWN_TIERED_BIZ;
+    pub use crate::iq::props::stale::ENABLE_FMX_REDESIGNED_BCC_FOR_UNTIERED_BIZ;
+    pub use crate::iq::props::stale::ENABLE_WEB_VOIP_VIDEO_RESOLUTION_CAP;
+    pub use crate::iq::props::stale::ENABLE_WEB_VOIP_VIRTUAL_AUDIO_CAPTURE_DRIVER;
+    pub use crate::iq::props::stale::EXPAND_FMX_MEX_SHOULD_USE_FMX_USE_CASE;
+    pub use crate::iq::props::stale::GROUP_FROM_GROUP_MAX_MISSING_PRIVACY_TOKENS;
+    pub use crate::iq::props::stale::INFO_DRAWER_REFRESH;
+    pub use crate::iq::props::stale::INTEGRITY_CHECKPOINTS_DEFAULT_ENABLED;
+    pub use crate::iq::props::stale::INTERACTIVE_BLOKS_WIDGET_WEB_ENABLED;
+    pub use crate::iq::props::stale::INTERACTIVE_RESPONSE_MESSAGE_NATIVE_FLOW_KILLSWITCH;
+    pub use crate::iq::props::stale::KMP_SYNCD_ENGINE_CRYPTO_ENABLED;
+    pub use crate::iq::props::stale::KMP_SYNCD_ENGINE_OUTGOING_PROCESSOR_ENABLED;
+    pub use crate::iq::props::stale::LARGE_SCREENS_NEW_CHAT_BUTTON_VARIANTS;
     pub use crate::iq::props::stale::LISTS_SMB_WEB_ENABLED;
+    pub use crate::iq::props::stale::NEWSLETTER_STATUS_CREATION_ENABLED;
+    pub use crate::iq::props::stale::RNR_MIN_DAYS_USER_ACTIVE;
+    pub use crate::iq::props::stale::RT_RECEIVER_V3_VALIDATION_ENABLED;
     pub use crate::iq::props::stale::SCHEDULED_COMPANION_CONTACT_REFRESH_DAYS;
     pub use crate::iq::props::stale::SCHEDULED_COMPANION_CONTACT_REFRESH_HOURS;
+    pub use crate::iq::props::stale::SMB_BIZ_AI_SUGGESTED_REPLY_PREFETCH;
+    pub use crate::iq::props::stale::SMB_WEB_ENABLE_FB_LINKING;
     pub use crate::iq::props::stale::SMOOTHIE_PERFORMANCE_MSG_SEND;
+    pub use crate::iq::props::stale::STATUS_WEB_RANKING;
     pub use crate::iq::props::stale::UPDATED_HARMFUL_DOCUMENT_DIALOG;
+    pub use crate::iq::props::stale::WA_SMB_WEB_LISTS_QUICK_REPLIES_ENABLED;
+    pub use crate::iq::props::stale::WA_WEB_ATTACH_ICON_VARIANT;
+    pub use crate::iq::props::stale::WA_WEB_BIZ_PROFILE_GRAPHQL_MIGRATION_BYPASS_LID_CHECK_DOGFOODING;
+    pub use crate::iq::props::stale::WA_WEB_BLOCKED_PARTICIPANT_CALL_WARNING;
+    pub use crate::iq::props::stale::WA_WEB_BROADCAST_DISAPPEARING_MESSAGES_FIX;
+    pub use crate::iq::props::stale::WA_WEB_CANONICAL_REG_RELOAD_ENABLED;
+    pub use crate::iq::props::stale::WA_WEB_CHANGE_LIST_WDS_SUBMENU;
+    pub use crate::iq::props::stale::WA_WEB_CONTEXT_CARD_VERTICAL_BUTTONS;
+    pub use crate::iq::props::stale::WA_WEB_FAVICON_BADGING_ENABLED;
+    pub use crate::iq::props::stale::WA_WEB_FOCUS_MANAGEMENT_FOR_STATUS_AUDIENCE;
+    pub use crate::iq::props::stale::WA_WEB_FREQUENT_REACTIONS_STORE_ENABLED;
+    pub use crate::iq::props::stale::WA_WEB_FREQUENT_REACTIONS_WEIGHT_REDUCER;
+    pub use crate::iq::props::stale::WA_WEB_INVITE_LINK_PAGE_ENHANCEMENTS;
+    pub use crate::iq::props::stale::WA_WEB_NOTIFY_FOR;
+    pub use crate::iq::props::stale::WA_WEB_SCROLLABLE_REACTION_TRAY_ENABLED;
+    pub use crate::iq::props::stale::WA_WEB_SEARCH_EMOJI_PICKER;
+    pub use crate::iq::props::stale::WA_WEB_SELECT_ALL_CHATS_ENABLED;
+    pub use crate::iq::props::stale::WA_WEB_STARRED_MSGS_SEARCH;
+    pub use crate::iq::props::stale::WA_WEB_STATUS_REACTION_STICKER_REPLY_ENABLED;
+    pub use crate::iq::props::stale::WA_WEB_STATUS_RESHARE_ATTRIBUTION_ENABLED;
+    pub use crate::iq::props::stale::WA_WEBTP_PRELOAD_THUMBNAIL_RENDERER_NO_EXPOSURE;
+    pub use crate::iq::props::stale::WA_WEBTP_THUMBNAIL_RENDERER_MODE;
+    pub use crate::iq::props::stale::WAMO_AGM_ENABLED;
+    pub use crate::iq::props::stale::WAMO_PRIVACY_TOS_SHOW_CHANNELS_NUX_ENABLED;
+    pub use crate::iq::props::stale::WDS_WEB_BADGE;
+    pub use crate::iq::props::stale::WDS_WEB_MENU_REACTION_DETAIL_PANEL_V2;
+    pub use crate::iq::props::stale::WEB_ATTACH_MENU_ADD_DRAWING_ENABLED;
+    pub use crate::iq::props::stale::WEB_BIZ_SIMPLE_SIGNAL_GROUP_ENABLED;
+    pub use crate::iq::props::stale::WEB_BOT_PROFILE_PIC_GQL_MIGRATION_ENABLED;
+    pub use crate::iq::props::stale::WEB_BULK_ADD_CONTACTS_ENABLED;
+    pub use crate::iq::props::stale::WEB_CALLING_ENABLE_ON_WINDOWS;
+    pub use crate::iq::props::stale::WEB_CALLING_FULL_SCREEN_TOGGLE_ENABLED;
+    pub use crate::iq::props::stale::WEB_CHAT_THEME_DRAWER_TITLE;
+    pub use crate::iq::props::stale::WEB_ENABLE_CAMERA_CAPTURE_REFRESH;
+    pub use crate::iq::props::stale::WEB_LOGOUT_UNMIGRATED_COMPANION;
+    pub use crate::iq::props::stale::WEB_MEDIA_WORKER_SPLIT_ENABLED;
+    pub use crate::iq::props::stale::WEB_MEMORY_REDUCTION;
+    pub use crate::iq::props::stale::WEB_MENU_SHARE_GROUP;
+    pub use crate::iq::props::stale::WEB_MSG_INFRA_REMOVE_DEVICES_ON_406_ERROR_ENABLED;
+    pub use crate::iq::props::stale::WEB_NAVIGATION_BAR_UPDATES_TAB;
+    pub use crate::iq::props::stale::WEB_NEW_CHAT_FLOW_REFRESH_VARIANT;
+    pub use crate::iq::props::stale::WEB_OTP_COPY_CODE_DISABLED;
+    pub use crate::iq::props::stale::WEB_READ_SELF_WATERMARK_PROCESSING;
+    pub use crate::iq::props::stale::WEB_TEST_ABPROP_DELETE_ME;
+    pub use crate::iq::props::stale::WEB_WAM_MAX_BUFFER_UPLOAD_SIZE_BYTES;
+    pub use crate::iq::props::stale::WEB_WHATS_NEW_BANNER_SHORT_COOLDOWN;
     pub const A2UI_FALLBACK_SHOW_TIMESTAMP: AbProp = AbProp {
         name: "a2ui_fallback_show_timestamp",
         code: 40437,
@@ -20427,6 +20508,8 @@ pub mod group {
 pub mod hybrid {
     use super::{AbDefault, AbProp, AbPropType};
 
+    // Retained API constants, deliberately outside the current catalog's ALL.
+    pub use crate::iq::props::stale::GROUP_CALL_MAX_PARTICIPANTS;
     pub const ACTIVE_INTEGRITY_HOLDOUT_ENABLED: AbProp = AbProp {
         name: "active_integrity_holdout_enabled",
         code: 39648,
