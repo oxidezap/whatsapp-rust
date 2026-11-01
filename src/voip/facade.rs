@@ -1463,6 +1463,7 @@ fn negotiated_audio_plan(
             configured,
             selected,
         },
+        _ => CallError::Media("unsupported audio negotiation plan"),
     })
 }
 

@@ -72,7 +72,7 @@ impl Subsystem for Voip {
             ),
             (
                 collections::ACTIVE_CALLS.collection,
-                state.call_registry.memory_stats(),
+                state.direct.call_registry.memory_stats(),
             ),
             // Entry count only: each parked call retains engine material this
             // side cannot size without walking it.

@@ -14,6 +14,7 @@ use crate::types::call::{CallAction, IncomingCall};
 use wacore_binary::{Jid, Server};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AudioPlanError {
     #[error("encoded audio codec {configured:?} cannot satisfy negotiated codec {selected:?}")]
     EncodedAudioCodecNotNegotiated {
