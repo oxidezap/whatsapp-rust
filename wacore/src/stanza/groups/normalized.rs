@@ -162,12 +162,17 @@ impl GroupNotification {
         node: &NodeRef<'_>,
         context: &GroupParseContext<'_>,
     ) -> Result<Self, GroupParseError> {
-        let parsed = parse_normalized_group_notification(node, context)?;
-        let wire_actions = node.children().into_iter().flatten().filter(|child| {
-            child.tag.as_ref() != super::envelope_runtime::MISSING_IDENTIFICATION_TAG
-        });
+        let (parsed, source_indices) = super::normalized_notification::parse_with_source_indices(
+            node,
+            context,
+            &mut IgnoreWarnings,
+        )?;
+        let children = node.children().unwrap_or_default();
         let mut actions = vec![];
-        for (action, wire) in parsed.actions.iter().zip(wire_actions) {
+        for (action, index) in parsed.actions.iter().zip(source_indices) {
+            let wire = children
+                .get(index)
+                .ok_or(GroupParseError::Field("actions"))?;
             actions.push(super::legacy_adapter::action_to_legacy(action, wire)?);
         }
         if actions.len() != parsed.actions.len() {
@@ -209,6 +214,63 @@ mod tests {
             .attr("from", "123456@g.us")
             .attr("id", "synthetic")
             .attr("t", "123")
+    }
+    #[test]
+    fn null_actions_do_not_shift_legacy_raw_payloads() {
+        let node = base()
+            .children([
+                NodeBuilder::new("link").attr("link_type", "future").build(),
+                NodeBuilder::new("create")
+                    .attr("test_id", "create-source")
+                    .children([NodeBuilder::new("group")
+                        .attr("creation", "123")
+                        .attr("subject", "synthetic")
+                        .build()])
+                    .build(),
+                NodeBuilder::new("unlink")
+                    .attr("unlink_type", "future")
+                    .build(),
+                NodeBuilder::new("link")
+                    .attr("link_type", "parent_group")
+                    .attr("test_id", "link-source")
+                    .build(),
+                NodeBuilder::new("link").attr("link_type", "future").build(),
+                NodeBuilder::new("unlink")
+                    .attr("unlink_type", "parent_group")
+                    .attr("test_id", "unlink-source")
+                    .build(),
+            ])
+            .build();
+        let context = GroupParseContext {
+            me_device_lid: None,
+            me_device_pn: None,
+            username_displayed: false,
+            history_after_join: false,
+            opus_enabled: false,
+            is_me_account: &|_| false,
+            normalize_country_code: &|_| None,
+        };
+        let parsed =
+            GroupNotification::try_from_node_ref_with_context(&node.as_node_ref(), &context)
+                .unwrap();
+        assert_eq!(parsed.actions.len(), 3);
+        for (action, expected) in
+            parsed
+                .actions
+                .iter()
+                .zip(["create-source", "link-source", "unlink-source"])
+        {
+            let raw = match action {
+                GroupNotificationAction::Create { raw }
+                | GroupNotificationAction::Link { raw, .. }
+                | GroupNotificationAction::Unlink { raw, .. } => raw,
+                _ => panic!("expected raw action"),
+            };
+            assert_eq!(
+                raw.attrs.get("test_id").unwrap().as_str().as_ref(),
+                expected
+            );
+        }
     }
     #[test]
     fn identities_and_first_failure_use_real_context() {

@@ -94,7 +94,7 @@ fn contract(json: &str, family: &str, version: &str) -> Result<Contract> {
     );
     verify_pin(
         ORACLE,
-        "92294a64a030d9207ca46dae499d7701cb94deaa9450df51a629174804a2b67b",
+        "bc29dabb2069e9e33567acb09001ad94243c809ec72c2fdf6a679bee10db3459",
     )?;
     verify_pin(
         EVIDENCE,
@@ -268,6 +268,20 @@ fn verify_oracle(c: &Contract, family: &str) -> Result<()> {
             case["returnsNull"].as_bool() == Some(row.null_result.is_some()),
             "null-result differs from original source"
         );
+        if row.null_result.is_some() {
+            ensure!(case["groupDatas"].is_null(), "null action retained payload");
+        } else if family == "link" {
+            let groups = case["groupDatas"]
+                .as_array()
+                .context("missing original group payload")?;
+            ensure!(groups.len() == 1, "unexpected original group payload count");
+            let actual_hidden = groups[0].get("hiddenSubgroup");
+            let expected_hidden = row.hidden_subgroup_child.as_ref().map(|_| &case["hidden"]);
+            ensure!(
+                actual_hidden == expected_hidden,
+                "hidden-subgroup value differs from original source"
+            );
+        }
         if row.unsupported_action {
             ensure!(
                 matches!(
@@ -423,7 +437,7 @@ pub(super) fn generate_link(version: &str) -> Result<String> {
 }
 
 pub fn conformance(version: &str) -> Result<String> {
-    let link = contract(LINK, "link", version)?;
+    let _ = contract(LINK, "link", version)?;
     let _ = contract(UNLINK, "unlink", version)?;
     let oracle: Value = serde_json::from_str(ORACLE)?;
     let mut out = header("original LINK/UNLINK normalization conformance", version);
@@ -460,18 +474,11 @@ pub fn conformance(version: &str) -> Result<String> {
         } else {
             out.push_str(&format!("let actual=actual.unwrap();assert_eq!(actual.kind.map(|v|v.as_str()),{});assert_eq!(actual.groups.len(),{});",opt(expected),usize::from(!null)));
             if family == "link" && !null {
-                let row = link
-                    .rows
-                    .iter()
-                    .find(|r| r.link_type.as_deref() == Some(kind))
-                    .context("missing LINK case")?;
                 out.push_str(&format!(
                     "assert_eq!(actual.groups[0].hidden_subgroup,{});",
-                    if row.hidden_subgroup_child.is_some() {
-                        format!("Some({hidden})")
-                    } else {
-                        "None".into()
-                    }
+                    case["groupDatas"][0]
+                        .get("hiddenSubgroup")
+                        .map_or_else(|| "None".into(), |value| format!("Some({value})"))
                 ));
             }
         }
@@ -494,6 +501,24 @@ mod tests {
             conformance(VERSION)
                 .unwrap()
                 .contains("original_normalization_matrix")
+        );
+    }
+    #[test]
+    fn hidden_values_are_checked_against_original_group_payloads() {
+        let mut value: Value = serde_json::from_str(LINK).unwrap();
+        let row = value["rows"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|r| r["hiddenSubgroupChild"] == "hidden_group")
+            .unwrap();
+        row["hiddenSubgroupChild"] = Value::Null;
+        let contract: Contract = serde_json::from_value(value).unwrap();
+        assert!(
+            verify_oracle(&contract, "link")
+                .unwrap_err()
+                .to_string()
+                .contains("hidden-subgroup value")
         );
     }
     #[test]

@@ -267,5 +267,19 @@
       "finding": "Complete module maps batch inputs and passes their array to commitMutation as input; preserve the prior Vec input rather than the scalar fallback inference."
     },
     "limits": "Historical optional fields and document are retained for source/serialization compatibility; no claim that the server currently accepts absent catalog operations or fields."
+  },
+  "normalizationPayloadCapture": {
+    "command": "node tools/whatspec-codegen/fixtures/capture-group-normalization.cjs ../whatspec",
+    "upstreamRevision": "afa3e343f37b0b64f03cffcacf2448ef883a2d8b",
+    "upstreamHarnessSha256": "8629e44df910c573a28c5552ecd87c97efa22c004a040b42d214bbda528a70a0",
+    "instrumentation": "Adds actual groupDatas to the existing outcomes object only; exact harness hash and unique anchor checked, all original assertions retained, upstream checkout unmodified.",
+    "result": "204 outcomes including actual group payloads; hiddenSubgroup verified in codegen and generated Rust against original output."
+  },
+  "groupReviewFollowup": {
+    "sourceAlignment": "Private per-action source indices retain the original child association when null results and identification markers are omitted; public normalized payload shape is unchanged.",
+    "regression": "Mixed unknown LINK/UNLINK plus CREATE and raw LINK/UNLINK preserve each original test_id payload.",
+    "groupsTestsPassed": 86,
+    "generatorTestsPassed": 146,
+    "evidenceProvenance": "group_qualification_review.json distinguishes consumer filenames from upstream source URLs, script/crate locations, and the diagnostic-cache Identifier binding."
   }
 }
