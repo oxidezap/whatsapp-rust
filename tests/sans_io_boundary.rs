@@ -81,7 +81,25 @@ impl Boundary {
                     ]
                     .contains(&root.as_str())
             });
-        if forbidden || time_import || std_time || reads_now || unreviewed_root {
+        let unreviewed_standard_path = parts
+            .first()
+            .is_some_and(|root| ["std", "core", "alloc"].contains(&root.as_str()))
+            && ![
+                "std::collections::HashMap",
+                "std::sync::Arc",
+                "std::num::NonZeroU64",
+                "std::time::Duration",
+                "std::cmp::Ordering",
+            ]
+            .iter()
+            .any(|prefix| joined == *prefix || joined.starts_with(&format!("{prefix}::")));
+        if forbidden
+            || time_import
+            || std_time
+            || reads_now
+            || unreviewed_root
+            || unreviewed_standard_path
+        {
             self.violations.push(joined);
         }
     }
@@ -167,6 +185,16 @@ impl<'ast> Visit<'ast> for Boundary {
                 .iter()
                 .map(|segment| segment.ident.to_string()),
         );
+        if !mac.path.is_ident("vec")
+            && !mac.path.is_ident("format_args")
+            && !mac.path.is_ident("format")
+            && !mac.path.is_ident("matches")
+            && !mac.path.is_ident("assert")
+            && !mac.path.is_ident("assert_eq")
+            && !mac.path.is_ident("assert_ne")
+        {
+            self.violations.push("unreviewed macro".into());
+        }
         let parser = Punctuated::<Expr, syn::Token![,]>::parse_terminated;
         match parser.parse2(mac.tokens.clone()) {
             Ok(arguments) => {
@@ -262,6 +290,10 @@ fn guard_detects_aliased_clocks_and_runtime_dependencies() {
         "fn read() { opaque_macro!(not => expressions); }",
         "use std::io::Read;",
         "fn read() { std::io::stdin(); }",
+        "fn read() { std::process::Command::new(\"sh\").output(); }",
+        "fn read() { std::env::var(\"HOME\"); }",
+        "fn read() { println!(\"hello\"); }",
+        "fn read() { unknown_macro!(1); }",
         "use getrandom::fill as entropy;",
         "fn read() { getrandom::fill(&mut []); }",
         "use rand_core::OsRng;",
