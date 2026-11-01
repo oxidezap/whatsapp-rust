@@ -625,8 +625,12 @@ impl MessageInfo {
     /// WA Web: expired status messages (>24h) are silently dropped — no retry receipts,
     /// no undecryptable events. Matches `WAWebMsgProcessingDecryptionHandler.E()`.
     pub fn is_expired_status(&self) -> bool {
+        self.is_expired_status_with(crate::time::now_utc)
+    }
+
+    pub fn is_expired_status_with(&self, now: impl FnOnce() -> DateTime<Utc>) -> bool {
         self.source.chat.is_status_broadcast()
-            && (crate::time::now_utc() - self.timestamp) > chrono::Duration::hours(24)
+            && (now() - self.timestamp) > chrono::Duration::hours(24)
     }
 }
 

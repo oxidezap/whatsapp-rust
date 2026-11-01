@@ -186,7 +186,7 @@ async fn retirement_while_waiting_for_group_metadata_preserves_current_state() {
         if shutdown_only {
             client.notify_connection_shutdown();
         } else {
-            client.connection_generation.fetch_add(1, Ordering::AcqRel);
+            client.advance_generation_for_test(1, Ordering::AcqRel);
         }
         drop(metadata);
         tokio::time::timeout(Duration::from_secs(5), task)
@@ -749,7 +749,7 @@ async fn retirement_during_group_capture_withholds_stale_effects_interceptors_an
                 generation
             );
         } else {
-            client.connection_generation.fetch_add(1, Ordering::AcqRel);
+            client.advance_generation_for_test(1, Ordering::AcqRel);
         }
         hook.release.notify_one();
         tokio::time::timeout(Duration::from_secs(5), task)
@@ -1034,7 +1034,7 @@ async fn captured_generation_is_preserved_when_success_retires_it_without_shutdo
     .await
     .unwrap();
     assert!(captured.is_some());
-    client.connection_generation.fetch_add(1, Ordering::AcqRel);
+    client.advance_generation_for_test(1, Ordering::AcqRel);
     assert!(
         !shutdown.is_fired(),
         "success can advance generation on the same socket"
@@ -1172,7 +1172,7 @@ async fn capture_rejects_enqueue_generation_retired_before_shutdown_fires() {
     );
     let generation = client.connection_generation.load(Ordering::Acquire);
     let shutdown = client.connection_shutdown_signal();
-    client.connection_generation.fetch_add(1, Ordering::AcqRel);
+    client.advance_generation_for_test(1, Ordering::AcqRel);
     assert!(
         !shutdown.is_fired(),
         "cleanup can advance generation before firing shutdown"

@@ -1,3 +1,5 @@
+use wacore::session_engine::exchange::{AwaitingExchange, RegisteredExchange};
+
 use crate::client::Client;
 use crate::client::ClientError;
 use crate::client::{ResponseWaiter, StreamSink, StreamedResponse};
@@ -272,7 +274,7 @@ impl Client {
     /// pass it to [`crate::SendOptions::with_message_id`]. An edit or revoke
     /// retains its target's content ID and uses a separate [`crate::StanzaId`].
     pub fn generate_message_id(&self) -> crate::MessageId {
-        crate::MessageId::try_from(self.generate_message_id_at(wacore::time::now_secs_u64()))
+        crate::MessageId::try_from(self.generate_message_id_at(self.runtime.wall_time_secs_u64()))
             .expect("generated message IDs are nonempty")
     }
 
@@ -753,10 +755,11 @@ impl Client {
         // registration and response wait in one small allocation instead of
         // embedding both copies in every IQ caller's coroutine.
         let exchange = Box::pin(async move {
-            let _waiter_guard = self
+            let exchange = self
                 .register_and_send(req_id, send_fn, on_sent, waiter)
                 .await?;
-            rx.await.map_err(|_| IqError::InternalChannelClosed)
+            let response = rx.await.map_err(|_| IqError::InternalChannelClosed)?;
+            Ok(exchange.response(response).into_response())
         });
 
         futures::select! {
@@ -775,8 +778,8 @@ impl Client {
         send_fn: IqSendFuture<'_>,
         on_sent: Option<IqOnSent<'_>>,
         waiter: ResponseWaiter,
-    ) -> Result<ResponseWaiterGuard, IqError> {
-        if !self.is_running.load(Ordering::Relaxed) {
+    ) -> Result<AwaitingExchange<ResponseWaiterGuard>, IqError> {
+        if !self.driver_running(Ordering::Relaxed) {
             return Err(IqError::NotConnected);
         }
 
@@ -795,10 +798,14 @@ impl Client {
         // being dropped mid-await (cancellation), which the explicit paths
         // can't catch. So the send-fail / timeout / shutdown arms never remove
         // the waiter by hand; the guard does it on drop.
-        let waiter_guard =
-            ResponseWaiterGuard::new(self.response_waiters.clone(), req_id, cleanup_generation);
+        let exchange = RegisteredExchange::new(ResponseWaiterGuard::new(
+            self.response_waiters.clone(),
+            req_id,
+            cleanup_generation,
+        ))
+        .begin_send();
 
-        if !self.is_running.load(Ordering::Acquire) {
+        if !self.driver_running(Ordering::Acquire) {
             return Err(IqError::NotConnected);
         }
 
@@ -818,7 +825,7 @@ impl Client {
             on_sent();
         }
 
-        Ok(waiter_guard)
+        Ok(exchange.sent())
     }
 }
 
@@ -887,7 +894,7 @@ mod tests {
     #[tokio::test]
     async fn send_iq_node_rejects_duplicate_in_flight_id() {
         let client = crate::test_utils::create_test_client_with_name("duplicate_iq_id").await;
-        client.is_running.store(true, Ordering::Release);
+        client.set_driver_running_for_test(true, Ordering::Release);
         let request_id = "duplicate-request";
         let (tx, _rx) = futures::channel::oneshot::channel();
         client
@@ -907,7 +914,7 @@ mod tests {
         assert!(client.response_waiters_guard().contains_key(request_id));
 
         client.response_waiters_guard().remove(request_id);
-        client.is_running.store(false, Ordering::Release);
+        client.set_driver_running_for_test(false, Ordering::Release);
     }
 
     #[test]

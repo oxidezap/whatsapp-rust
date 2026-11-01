@@ -248,38 +248,6 @@ impl Client {
         self.notify_connection_shutdown();
     }
 
-    /// Publish "the session is over, and no reconnect follows" as one
-    /// transition.
-    ///
-    /// The order and the `Release` are the whole point, and pair with the
-    /// `Acquire` load in [`run`](Self::run)'s expected-disconnect branch: that
-    /// branch reads `expected_disconnect` first and `is_running` second, so the
-    /// reader flag has to be cleared *before* the verdict is published. Stored
-    /// the other way round — or both `Relaxed`, as they were — the branch can
-    /// read a torn pair, see a planned end with a reader still live, and
-    /// announce a reconnect that this call has already ruled out.
-    fn publish_terminal_verdict(&self) {
-        self.is_running.store(false, Ordering::Relaxed);
-        self.expected_disconnect.store(true, Ordering::Release);
-    }
-
-    /// Forget what the connection that just ended owed the reconnect backoff.
-    ///
-    /// A planned end is not a failure, whether the application asked for it or a
-    /// protocol step like the post-pairing 515 did, so the consecutive-failure
-    /// count driving the Fibonacci delay goes back to zero. Both planned exits
-    /// call this because `stats().reconnect_errors` reports that count, and a
-    /// number that depended on which exit was taken would make a change of
-    /// branch a change of public behaviour.
-    ///
-    /// The auth timestamp is consumed for a separate reason: left standing, a
-    /// later failed connect reads this cycle's value as a "stable" connection
-    /// and resets the backoff on the strength of it.
-    fn clear_connection_backoff_state(&self) {
-        self.auto_reconnect_errors.store(0, Ordering::Relaxed);
-        self.connected_at.clear();
-    }
-
     pub(crate) fn connection_shutdown_signal(&self) -> wacore::runtime::ShutdownSignal {
         self.connection_shutdown
             .lock()
@@ -296,7 +264,7 @@ impl Client {
             .notify();
         // Also the session signal, because this is the one point every
         // connection ends through — planned or fatal. `handle_stream_error`
-        // makes a client terminal by setting `enable_auto_reconnect` and
+        // makes a client terminal by setting `session_state` and
         // `expected_disconnect` and then calling only this; work parked in
         // `await_connection` would otherwise wait for the run loop to unwind far
         // enough to announce it, and the invariant on `is_terminal` promises
@@ -326,13 +294,14 @@ impl Client {
     }
 
     pub(crate) fn is_shutting_down(&self) -> bool {
-        self.expected_disconnect.load(Ordering::Relaxed) || !self.is_running.load(Ordering::Relaxed)
+        self.expected_session_disconnect(Ordering::Relaxed)
+            || !self.driver_running(Ordering::Relaxed)
     }
 
     /// A permanent verdict, independent of whether the host has started a run
     /// loop or enabled reconnects. Local durable replay also works before run.
     pub(crate) fn is_permanently_stopped(&self) -> bool {
-        self.shutdown_signal().is_fired() || self.enable_auto_reconnect.is_terminal()
+        self.shutdown_signal().is_fired() || self.session_state.is_terminal()
     }
 
     /// Whether the client is finished for good, as opposed to being between
@@ -377,9 +346,9 @@ impl Client {
         // of those with a live connection is not finished, it just never had a
         // loop to end. By the time the run loop breaks, `cleanup_connection_state`
         // has already cleared `is_connected`, so the real exit still reads as one.
-        !self.enable_auto_reconnect.load(Ordering::Relaxed)
-            && (self.expected_disconnect.load(Ordering::Relaxed)
-                || (!self.is_running.load(Ordering::Relaxed) && !self.is_socket_connected()))
+        !self.session_state.load(Ordering::Relaxed)
+            && (self.expected_session_disconnect(Ordering::Relaxed)
+                || (!self.driver_running(Ordering::Relaxed) && !self.is_socket_connected()))
     }
 
     /// Wake everything waiting on whether this client can still do work.
@@ -402,7 +371,7 @@ impl Client {
     /// alone — and announces no socket, ever again. Work parked waiting for a
     /// connection finds out here or not at all.
     pub(crate) fn stop_supervision_loop(&self) {
-        self.is_running.store(false, Ordering::Relaxed);
+        self.stop_driver_state();
         self.notify_session_state();
     }
 
@@ -413,7 +382,7 @@ impl Client {
     fn is_fully_ready(&self) -> bool {
         self.is_socket_connected()
             && self.is_logged_in()
-            && self.is_ready.load(Ordering::Relaxed)
+            && self.session_ready_reached(Ordering::Relaxed)
             // A pause publishes its flag before the read loop has cleared any
             // of the three above, so without this the waiters hand a caller the
             // very connection the application just asked to have closed.
@@ -487,13 +456,15 @@ impl Client {
     /// consumer can observe.
     fn still_announceable(&self, expected_generation: u64) -> bool {
         self.connection_generation.load(Ordering::SeqCst) == expected_generation
-            && !self.expected_disconnect.load(Ordering::Acquire)
+            && !self.expected_session_disconnect(Ordering::Acquire)
             && !self.is_paused()
             && self.is_logged_in()
     }
 
     fn publish_connected(&self) {
-        self.is_ready.store(true, Ordering::Relaxed);
+        if !self.mark_session_ready() {
+            return;
+        }
         wacore::telemetry::set_connected(true);
         let app_version_fallback = self
             .app_version_fallback
@@ -584,12 +555,8 @@ impl Client {
             media_conn_test_block_store: AtomicBool::new(false),
             #[cfg(test)]
             media_conn_test_in_store: AtomicU32::new(0),
-            is_logged_in: AtomicBool::new(false),
             #[cfg(feature = "client-lifecycle")]
             login_transition: std::sync::Mutex::new(()),
-            is_connecting: AtomicBool::new(false),
-            is_running: AtomicBool::new(false),
-            is_connected: AtomicBool::new(false),
             send_active_receipts: AtomicU32::new(0),
             ik_handshake_failures: AtomicU32::new(0),
             noise_cert_policy,
@@ -641,24 +608,24 @@ impl Client {
                 .max_capacity(cache_config.chat_lanes_capacity.max(1))
                 .evict_guard(|lane: &ChatLane| Arc::strong_count(&lane.enqueue_lock) <= 1)
                 .build(),
-            lid_pn_cache: Arc::new(LidPnCache::with_config(
+            lid_pn_cache: Arc::new(LidPnCache::with_config_on(
                 &cache_config.lid_pn_cache,
                 cache_config.cache_stores.lid_pn_cache.clone(),
+                &runtime,
             )),
             pending_call_offers: crate::handlers::call::pending_offers::PendingOffers::default(),
             ab_props: Arc::new(wacore::store::ab_props::AbPropsCache::new()),
             group_cache: std::sync::OnceLock::new(),
 
-            expected_disconnect: AtomicBool::new(false),
-            intentional_reconnect: AtomicBool::new(false),
             connection_generation: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "bench-harness")]
             bench_startup: Arc::default(),
 
-            recent_messages: cache_config.recent_messages.build_with_ttl(),
+            recent_messages: cache_config.recent_messages.build_with_ttl_on(&runtime),
 
-            sender_key_device_cache: crate::sender_key_device_cache::SenderKeyDeviceCache::new(
+            sender_key_device_cache: crate::sender_key_device_cache::SenderKeyDeviceCache::new_on(
                 &cache_config.sender_key_devices_cache,
+                &runtime,
             ),
 
             pending_device_sync: crate::pending_device_sync::PendingDeviceSync::new(),
@@ -676,9 +643,13 @@ impl Client {
 
             pending_lid_refreshes: Arc::new(std::sync::Mutex::new(HashSet::new())),
 
-            message_retry_counts: cache_config.message_retry_counts.build_with_ttl(),
+            message_retry_counts: cache_config
+                .message_retry_counts
+                .build_with_ttl_on(&runtime),
 
-            session_recreate_history: cache_config.session_recreate_history.build_with_ttl(),
+            session_recreate_history: cache_config
+                .session_recreate_history
+                .build_with_ttl_on(&runtime),
 
             resend_rate_limiter: crate::resend_rate_limiter::ResendRateLimiter::new(
                 cache_config.resend_rate_limiter_capacity,
@@ -686,12 +657,15 @@ impl Client {
                 crate::resend_rate_limiter::DEFAULT_RESEND_REFILL_PER_MIN,
             ),
 
-            undecryptable_dispatched: cache_config.undecryptable_dispatched.build_with_ttl(),
+            undecryptable_dispatched: cache_config
+                .undecryptable_dispatched
+                .build_with_ttl_on(&runtime),
 
             dispatched_messages: crate::portable_cache::SyncTtlCache::new(
                 cache_config.dispatched_messages.capacity,
                 cache_config.dispatched_messages.timeout,
-            ),
+            )
+            .on_runtime(&runtime),
             duplicate_dispatch_suppressed: AtomicU64::new(0),
 
             offline_sync_metrics: Arc::new(OfflineSyncMetrics {
@@ -702,15 +676,10 @@ impl Client {
             }),
             offline_batch: Arc::new(offline_resume::OfflineBatchCoordinator::new()),
 
-            enable_auto_reconnect: Arc::new(AutoReconnect::new(true)),
-            paused: AtomicBool::new(false),
+            session_state: SessionState::new(true),
             pause_state_notifier: event_listener::Event::new(),
-            pause_teardown_pending: AtomicBool::new(false),
             pause_generation: AtomicU64::new(0),
             connection_publish: Mutex::new(()),
-            auto_reconnect_errors: AtomicU32::new(0),
-            connected_at: wacore::time::AtomicInstant::unset(),
-            backoff_reset_suppressed: AtomicBool::new(false),
 
             needs_initial_full_sync: Arc::new(app_state::BootstrapGate::new(false)),
 
@@ -735,7 +704,6 @@ impl Client {
             inbound_queues: std::sync::OnceLock::new(),
             presence_subscriptions: std::sync::Mutex::new(HashSet::new()),
             socket_ready_notifier: event_listener::Event::new(),
-            is_ready: AtomicBool::new(false),
             connected_notifier: event_listener::Event::new(),
             authenticated_generation: AtomicU64::new(NO_AUTHENTICATED_GENERATION),
             session_state_notifier: event_listener::Event::new(),
@@ -779,13 +747,16 @@ impl Client {
             history_sync_admission,
             connect_admission,
             chatstate_handler_count: Arc::new(AtomicUsize::new(0)),
-            pdo_pending_requests: cache_config.pdo_pending_requests.build_with_ttl(),
-            pdo_requested: cache_config.pdo_requested.build_with_ttl(),
+            pdo_pending_requests: cache_config
+                .pdo_pending_requests
+                .build_with_ttl_on(&runtime),
+            pdo_requested: cache_config.pdo_requested.build_with_ttl_on(&runtime),
             pdo_explicit_published: AtomicBool::new(false),
             device_registry_cache: device_topology::DeviceRegistryCache::new(
-                cache_config.device_registry_cache.build_typed_ttl(
+                cache_config.device_registry_cache.build_typed_ttl_on(
                     cache_config.cache_stores.device_registry_cache.clone(),
                     "device_registry",
+                    &runtime,
                 ),
                 Arc::clone(&device_topology),
             ),
@@ -902,15 +873,24 @@ impl Client {
             client_log!(self, warn, "Client `run` called after shutdown.");
             return RunCompletionReason::ShutdownRequested;
         }
-        if self.is_running.swap(true, Ordering::SeqCst) {
-            client_log!(
-                self,
-                warn,
-                "Client `run` method called while already running."
-            );
-            return RunCompletionReason::AlreadyRunning;
-        }
-        if self.enable_auto_reconnect.is_terminal() {
+        let driver =
+            match self.claim_driver(wacore::session_engine::lifecycle::DriveKind::Supervisor) {
+                Ok(lease) => lease,
+                Err(wacore::session_engine::lifecycle::LifecycleError::AlreadyDriving) => {
+                    client_log!(
+                        self,
+                        warn,
+                        "Client `run` method called while already running."
+                    );
+                    return RunCompletionReason::AlreadyRunning;
+                }
+                Err(error) => {
+                    client_log!(self, error, "Client driver claim failed: {error}");
+                    return RunCompletionReason::Stopped;
+                }
+            };
+        let _driver = scopeguard::guard(driver, |lease| self.release_driver(lease));
+        if self.session_state.is_terminal() {
             self.stop_supervision_loop();
             return RunCompletionReason::AutoReconnectDisabled {
                 connection: None,
@@ -919,7 +899,7 @@ impl Client {
             };
         }
         if shutdown.is_fired() {
-            self.is_running.store(false, Ordering::SeqCst);
+            self.stop_driver_state();
             return RunCompletionReason::ShutdownRequested;
         }
         // Count only at the attempt boundary, after admission: abandoned host
@@ -929,7 +909,7 @@ impl Client {
         let mut last_disconnect_reason: Option<DisconnectReason> = None;
         let mut last_protocol_reason: Option<ProtocolTerminalReason> = None;
         let mut completion = RunCompletionReason::Stopped;
-        while self.is_running.load(Ordering::Relaxed) {
+        while self.driver_running(Ordering::Relaxed) {
             // The one place a pause is honoured, and it is before the attempt
             // rather than after one fails: a `pause()` can land during a
             // reconnect backoff as easily as during a live connection, and
@@ -937,7 +917,7 @@ impl Client {
             // Parking here rather than where the connection ended is what makes
             // that true for both. `continue` re-tests `is_running`, so a
             // `shutdown()` during the pause ends the session from here.
-            if self.paused.load(Ordering::Relaxed) {
+            if self.is_paused() {
                 client_log!(self, info, "Session paused; not connecting until resumed.");
                 self.wait_while_paused().await;
                 continue;
@@ -961,7 +941,7 @@ impl Client {
                     {
                         // No attempt consumed this pause's teardown fact. Do
                         // not let it waive backoff for a later real failure.
-                        self.pause_teardown_pending.store(false, Ordering::Relaxed);
+                        self.consume_pause_exit_pending();
                         self.clear_connection_backoff_state();
                     }
                     continue;
@@ -986,7 +966,7 @@ impl Client {
                 .protocol_terminal_reason
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-            self.expected_disconnect.store(false, Ordering::Relaxed);
+            self.clear_expected_session_disconnect();
 
             match self.connect().await {
                 Err(connect_err) => {
@@ -1009,7 +989,7 @@ impl Client {
                             // Retracted by a pause, so no backoff is owed even
                             // if a resume has already cleared the flag this
                             // branch cannot see any more.
-                            self.pause_teardown_pending.store(true, Ordering::Relaxed);
+                            self.mark_pause_exit_pending();
                         }
                         ConnectError::Handshake(e) if e.is_transient() => {
                             client_log!(
@@ -1067,9 +1047,9 @@ impl Client {
             // fails to end.
             let reconnect = wacore::protocol::reconnect::reconnect_action(
                 shutdown.is_fired()
-                    || !self.is_running.load(Ordering::Relaxed)
-                    || (self.expected_disconnect.load(Ordering::Acquire)
-                        && !self.is_running.load(Ordering::Relaxed)),
+                    || !self.driver_running(Ordering::Relaxed)
+                    || (self.expected_session_disconnect(Ordering::Acquire)
+                        && !self.driver_running(Ordering::Relaxed)),
                 false,
             );
             if reconnect == wacore::protocol::reconnect::ReconnectAction::Stop {
@@ -1083,7 +1063,7 @@ impl Client {
                 break;
             }
 
-            if !self.enable_auto_reconnect.load(Ordering::Relaxed) {
+            if !self.session_state.load(Ordering::Relaxed) {
                 client_log!(self, info, "Auto-reconnect disabled, shutting down.");
                 self.stop_supervision_loop();
                 completion = RunCompletionReason::AutoReconnectDisabled {
@@ -1097,7 +1077,7 @@ impl Client {
             // If this was an expected disconnect (e.g., 515 after pairing), reconnect immediately
             if wacore::protocol::reconnect::reconnect_action(
                 false,
-                self.expected_disconnect.load(Ordering::Relaxed),
+                self.expected_session_disconnect(Ordering::Relaxed),
             ) == wacore::protocol::reconnect::ReconnectAction::Immediate
             {
                 self.clear_connection_backoff_state();
@@ -1127,37 +1107,14 @@ impl Client {
             // in that window would otherwise leave this reading `paused` as
             // false and charging the ordinary backoff for a teardown the
             // application requested.
-            if self.pause_teardown_pending.swap(false, Ordering::Relaxed)
-                || self.paused.load(Ordering::Relaxed)
-            {
+            if self.consume_pause_exit_pending() || self.is_paused() {
                 self.clear_connection_backoff_state();
                 continue;
             }
 
-            // Reset the backoff only after a stable connection, unless an
-            // explicit penalty (429 / manual reconnect) must survive — WA Web
-            // `resetDelay` + `cancelReset`.
-            let connected_at = self.connected_at.take();
-            let penalty = self.backoff_reset_suppressed.load(Ordering::Relaxed);
-            if should_reset_backoff(connected_at, wacore::time::Instant::now(), penalty) {
-                self.auto_reconnect_errors.store(0, Ordering::Relaxed);
-            }
-
-            // Saturating, not a bare increment: this counter is only ever reset
-            // by a connection that stayed up 30 s, so a link that flaps for a
-            // month climbs it forever. See `MAX_BACKOFF_ATTEMPTS` — the delay
-            // stopped changing long before the ceiling, so nothing about the
-            // schedule moves.
-            let error_count = self
-                .auto_reconnect_errors
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |previous| {
-                    Some(next_backoff_attempt(previous))
-                })
-                .unwrap_or_else(|previous| previous);
-            // WA Web: Fibonacci backoff with 10% jitter, max 900s.
-            // algo: { type: "fibonacci", first: 1000, second: 1000 }
-            // jitter: 0.1, max: 9e5
-            let delay = fibonacci_backoff(error_count);
+            let Some((delay, error_count)) = self.next_reconnect_delay() else {
+                continue;
+            };
             client_log!(
                 self,
                 info,
@@ -1241,7 +1198,7 @@ impl Client {
     ) -> bool {
         let can_dial = || {
             !shutdown.is_fired()
-                && self.is_running.load(Ordering::Relaxed)
+                && self.driver_running(Ordering::Relaxed)
                 && !self.is_paused()
                 && self.pause_generation.load(Ordering::SeqCst) == pause_generation
         };
@@ -1318,7 +1275,7 @@ impl Client {
         // Same refusal `run` makes: a shutdown is published once and for good,
         // and a connection established after it would be one the application
         // has already been told does not exist. A new client is the way back.
-        if self.shutdown_signal().is_fired() || self.enable_auto_reconnect.is_terminal() {
+        if self.shutdown_signal().is_fired() || self.session_state.is_terminal() {
             return Err(ConnectError::Shutdown);
         }
         // A pause is a standing instruction that no connection exists, and it
@@ -1340,7 +1297,7 @@ impl Client {
     /// awaited — a window as wide as the 20s connect timeout. Checked once at
     /// the start, either one would be published straight over.
     fn connect_refusal(&self, attempt_pause_generation: u64) -> Option<ConnectError> {
-        if self.shutdown_signal().is_fired() || self.enable_auto_reconnect.is_terminal() {
+        if self.shutdown_signal().is_fired() || self.session_state.is_terminal() {
             return Some(ConnectError::Shutdown);
         }
         // The generation, not just the flag: a `pause()` and `resume()` that
@@ -1387,7 +1344,7 @@ impl Client {
         // shutdown signal — the Expected path). Consuming it only on some paths
         // left it stale for the next connection, misclassifying the next genuine
         // disconnect as intentional and swallowing its Disconnected event.
-        let intentional = self.intentional_reconnect.swap(false, Ordering::Relaxed);
+        let intentional = self.consume_intentional_session_disconnect();
         // Some(reason) = unexpected disconnect worth a `Disconnected` event; the
         // reason distinguishes a routine server recycle from a real failure so
         // consumers don't have to.
@@ -1398,7 +1355,7 @@ impl Client {
                 None
             }
             Ok(node_io::ReadLoopExit::ServerRecycle(reason)) => {
-                if self.expected_disconnect.load(Ordering::Relaxed) || intentional {
+                if self.expected_session_disconnect(Ordering::Relaxed) || intentional {
                     debug!("Message loop exited during expected disconnect.");
                     None
                 } else {
@@ -1408,7 +1365,7 @@ impl Client {
                 }
             }
             Err(e) => {
-                if self.expected_disconnect.load(Ordering::Relaxed) || intentional {
+                if self.expected_session_disconnect(Ordering::Relaxed) || intentional {
                     debug!("Message loop exited during expected disconnect.");
                     None
                 } else {
@@ -1461,17 +1418,9 @@ impl Client {
         #[cfg(feature = "tracing")]
         self.record_identity_on_current_span("wa.conn.connect", module_path!());
 
-        if self.is_connecting.swap(true, Ordering::SeqCst) {
-            return Err(ConnectError::AlreadyConnected);
-        }
+        let attempt = self.begin_connection_attempt()?;
+        let _guard = scopeguard::guard(attempt, |ticket| self.finish_connection_attempt(ticket));
 
-        let _guard = scopeguard::guard((), |_| {
-            self.is_connecting.store(false, Ordering::Relaxed);
-        });
-
-        if self.is_socket_connected() {
-            return Err(ConnectError::AlreadyConnected);
-        }
         self.clear_protocol_terminal_reason();
         let _t = wacore::telemetry::timer(wacore::telemetry::CONNECT_DURATION);
         // Read once, compared at every checkpoint below: this is the attempt's
@@ -1481,14 +1430,13 @@ impl Client {
         // Reset login state for new connection attempt. This ensures that
         // handle_success will properly process the <success> stanza even if
         // a previous connection's post-login task bailed out early.
-        self.is_logged_in.store(false, Ordering::Relaxed);
-        self.is_ready.store(false, Ordering::Relaxed);
-        self.is_connected.store(false, Ordering::Relaxed);
+        self.invalidate_session_authentication();
+        self.clear_session_readiness();
         // The retired connection's verdict, not this one's. Inherited, it makes
         // the read loop exit on the first frame it decodes and `handle_success`
         // refuse the login. `run` already clears it before each attempt; a
         // caller driving connections itself has nowhere else to learn of it.
-        self.expected_disconnect.store(false, Ordering::Relaxed);
+        self.clear_expected_session_disconnect();
         // Under the same lock as the teardown's resets: the previous
         // connection's finisher is detached and can still be publishing, and
         // its writes must not interleave with the state this attempt is
@@ -1530,10 +1478,11 @@ impl Client {
         let version_future = rt_timeout(
             &*self.runtime,
             TRANSPORT_CONNECT_TIMEOUT,
-            crate::version::resolve_and_update_version(
+            crate::version::resolve_and_update_version_on(
                 &self.persistence_manager,
                 &self.http_client,
                 self.override_version,
+                &self.runtime,
             ),
         );
         let transport_future = rt_timeout(
@@ -1643,10 +1592,15 @@ impl Client {
                     *self.noise_socket.lock().unwrap_or_else(|p| p.into_inner()) = None;
                     Some((orphan, refusal))
                 }
-                None => {
-                    self.is_connected.store(true, Ordering::Release);
-                    None
-                }
+                None => match self.publish_connection(attempt) {
+                    Ok(()) => None,
+                    Err(refusal) => {
+                        let orphan = self.transport.lock().await.take();
+                        *self.transport_events.lock().await = None;
+                        *self.noise_socket.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                        Some((orphan, refusal))
+                    }
+                },
             }
         };
         // Closed outside the section: this one does write to the network.
@@ -1693,7 +1647,7 @@ impl Client {
         self.record_identity_on_current_span("wa.conn.logout", module_path!());
         use wacore::iq::devices::RemoveCompanionDeviceSpec;
 
-        self.enable_auto_reconnect.store(false, Ordering::Relaxed);
+        self.session_state.store(false, Ordering::Relaxed);
 
         // Preserve the existing socket/identity gate, not a new authentication
         // or reachability policy. An attempt can still fail before a frame is
@@ -1830,10 +1784,6 @@ impl Client {
         }
     }
 
-    // A deliberate reconnect starts at five seconds to avoid a rapid reconnect
-    // loop on an unchanged network. Immediate reconnect explicitly skips it.
-    const RECONNECT_BACKOFF_STEP: u32 = 4;
-
     /// Drop the current connection and trigger the auto-reconnect loop.
     ///
     /// Unlike [`shutdown`](Self::shutdown), this does **not** stop the run loop. The client
@@ -1858,11 +1808,7 @@ impl Client {
             lifecycle.cancel_active_scope();
         }
         wacore::telemetry::reconnect();
-        self.intentional_reconnect.store(true, Ordering::Relaxed);
-        self.auto_reconnect_errors
-            .store(Self::RECONNECT_BACKOFF_STEP, Ordering::Relaxed);
-        // Deliberate step: the stability reset must not erase it.
-        self.backoff_reset_suppressed.store(true, Ordering::Relaxed);
+        self.request_manual_reconnect();
 
         self.teardown_for_reconnect().await;
     }
@@ -1885,7 +1831,7 @@ impl Client {
         if let Some(lifecycle) = &self.lifecycle {
             lifecycle.cancel_active_scope();
         }
-        self.expected_disconnect.store(true, Ordering::Relaxed);
+        self.expect_session_disconnect();
 
         self.teardown_for_reconnect().await;
     }
@@ -1937,7 +1883,7 @@ impl Client {
     /// ended this connection, so the teardown is not news, the same reasoning
     /// `reconnect()` applies. It is not a protocol-level presence change: the
     /// account stays registered and other devices see nothing. And it does not
-    /// override `enable_auto_reconnect`: a client whose application has already
+    /// override `session_state`: a client whose application has already
     /// asked it not to come back still stops when its connection ends, pause or
     /// no pause, because that is the same preference the stream errors that end
     /// a session for good are read through.
@@ -1977,8 +1923,7 @@ impl Client {
             // is not coming back on its own. Bumped with it, so an attempt
             // already in flight is refused at its next checkpoint whether or not
             // a resume has landed by then.
-            self.paused.store(true, Ordering::SeqCst);
-            self.pause_generation.fetch_add(1, Ordering::SeqCst);
+            self.pause_session_state();
 
             let had_connection = self.is_socket_connected();
             // `intentional_reconnect` keeps a requested drop out of
@@ -1987,14 +1932,14 @@ impl Client {
             // connection *after* the resume, whose first genuine drop would then
             // go unreported.
             if had_connection {
-                self.intentional_reconnect.store(true, Ordering::Relaxed);
+                self.request_intentional_session_disconnect();
             }
             // Not conditional on that, though. It says "the end of this attempt
             // owes no backoff", and an attempt refused before it ever published
             // a connection owes one just as little — otherwise a pause and
             // resume that both land mid-connect leave the loop serving a delay
             // of up to the 900s cap for a retraction the application asked for.
-            self.pause_teardown_pending.store(true, Ordering::Relaxed);
+            self.mark_pause_exit_pending();
 
             // Bound to the connection this call is ending, before the first
             // await. The flushes below are bounded but not instant, and a
@@ -2061,7 +2006,7 @@ impl Client {
         // cleanup after an overlapping resume, leaving a direct caller flagged
         // connected for good, and it would have run it for a replacement.
         if had_connection
-            && !self.is_running.load(Ordering::Relaxed)
+            && !self.driver_running(Ordering::Relaxed)
             && self.still_owns_connection(torn_down.as_ref()).await
         {
             self.cleanup_connection_state().await;
@@ -2101,7 +2046,7 @@ impl Client {
     /// does not depend on the two being ordered — the run loop reads that from
     /// the connection that ended, not from whichever call landed first.
     pub fn resume(&self) {
-        if !self.paused.swap(false, Ordering::SeqCst) {
+        if !self.resume_session_state() {
             return;
         }
         info!("Resuming the session.");
@@ -2112,7 +2057,7 @@ impl Client {
     /// Whether [`pause`](Self::pause) is in effect and no connection will be
     /// opened by [`run`](Self::run) until [`resume`](Self::resume).
     pub fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::Relaxed)
+        self.session_state.status.load(Ordering::Relaxed) & SessionState::PAUSED != 0
     }
 
     /// Park the supervision loop for the length of a pause.
@@ -2130,7 +2075,7 @@ impl Client {
             // Registered before the re-check, so a resume landing in the gap
             // between the two is not missed and parked-for-good.
             let changed = self.session_state_notifier.listen();
-            if !self.paused.load(Ordering::Relaxed) || !self.is_running.load(Ordering::Relaxed) {
+            if !self.is_paused() || !self.driver_running(Ordering::Relaxed) {
                 return;
             }
             changed.await;
@@ -2220,7 +2165,7 @@ impl Client {
         // process_classified_message — no decrypt can START after the
         // permit-held cache settle below, so no rowless ratchet advances can
         // dirty the cache behind teardown's back.
-        let closed_generation = self.connection_generation.fetch_add(1, Ordering::SeqCst);
+        let closed_generation = self.advance_session_generation();
         self.pending_group_device_resync.clear();
         #[cfg(feature = "client-lifecycle")]
         let scope_close = self.lifecycle.as_ref().map(|lifecycle| {
@@ -2249,15 +2194,15 @@ impl Client {
         // sent_node_waiters ARE cleared because they match pre-encryption
         // outgoing stanzas, which are transport-scoped.
         self.clear_sent_node_waiters();
-        self.is_logged_in.store(false, Ordering::Relaxed);
+        self.invalidate_session_authentication();
         #[cfg(feature = "client-lifecycle")]
         drop(login_transition);
-        self.is_ready.store(false, Ordering::Relaxed);
+        self.clear_session_readiness();
         // Publish the disconnected state BEFORE draining VoIP calls (it used to be cleared only after
         // the socket teardown below): a concurrent accept()/call() setup that finishes its async work
         // in this window must see `!is_socket_connected()` and bail instead of registering/connecting a call
         // after this sweep.
-        self.is_connected.store(false, Ordering::Release);
+        self.retire_connection();
         // Let each attached subsystem release what this connection owned.
         subsystem::on_connection_cleanup(self).await;
         // Close the socket as part of cleanup so this path is authoritative
@@ -2507,7 +2452,7 @@ impl Client {
     /// Whether the Noise socket is connected. This does not imply login or
     /// critical sync readiness; use [`Self::is_session_ready`] for that.
     pub fn is_socket_connected(&self) -> bool {
-        self.is_connected.load(Ordering::Acquire)
+        self.session_state.status.load(Ordering::Acquire) & SessionState::CONNECTED != 0
     }
 
     /// Force the connected flag for tests that exercise connected-only
@@ -2515,11 +2460,21 @@ impl Client {
     /// the same connected-only send path with no socket behind it.
     #[cfg(any(test, feature = "bench-harness"))]
     pub(crate) fn set_connected_for_test(&self, connected: bool) {
-        self.is_connected.store(connected, Ordering::Release);
+        if connected {
+            if !self.is_socket_connected() {
+                let attempt = self
+                    .begin_connection_attempt()
+                    .expect("fixture connection attempt");
+                self.publish_connection(attempt).expect("fixture handshake");
+                self.finish_connection_attempt(attempt);
+            }
+        } else {
+            self.retire_connection();
+        }
     }
 
     pub fn is_logged_in(&self) -> bool {
-        self.is_logged_in.load(Ordering::Relaxed)
+        self.session_state.status.load(Ordering::Relaxed) & SessionState::LOGGED_IN != 0
     }
 
     /// Whether an IQ sent right now could actually be answered.
@@ -2541,13 +2496,13 @@ impl Client {
             && self.is_logged_in()
             && self.authenticated_generation.load(Ordering::SeqCst)
                 == self.connection_generation.load(Ordering::SeqCst)
-            && self.is_running.load(Ordering::Relaxed)
+            && self.driver_running(Ordering::Relaxed)
             // A socket already marked for retirement will answer, and then the
             // answer will be thrown away. `reconnect_immediately` sets this
             // before its bounded flushes and closes the transport only after,
             // so the window is wide enough to admit a whole sync that the
             // replacement generation then retires — attempt charged, work lost.
-            && !self.expected_disconnect.load(Ordering::Relaxed)
+            && !self.expected_session_disconnect(Ordering::Relaxed)
             // Same reasoning as the line above, for the other requested
             // teardown: `pause()` publishes the flag and only then flushes and
             // closes, so the socket answers for the whole of that window and
@@ -2581,7 +2536,7 @@ impl Client {
         // answer an IQ and no `<success>` will ever arrive. Not terminal — the
         // connection is fine and the application may still use it — but nothing
         // is going to change it either.
-        if !self.is_running.load(Ordering::Relaxed) {
+        if !self.driver_running(Ordering::Relaxed) {
             return Reachability::Unsupervised;
         }
         if self.is_paused() {
@@ -2809,20 +2764,22 @@ impl Connection<'_> {
         // Guarded, not a store after the await: a caller that drops this future
         // (a wrapping timeout, an aborted task) stops reading too, and a flag
         // left standing would advertise a reader that no longer exists.
-        let owns_reader = !this.client.is_running.swap(true, Ordering::SeqCst);
-        let _release_reader = owns_reader.then(|| {
-            scopeguard::guard((), |_| {
-                // Only the run loop consumes the pause marker, and this path is
-                // not it. Left standing, a later `resume(); run()` would carry
-                // it into the new session and let its first genuine failure pass
-                // as a planned pause — clearing the counter and retrying at once
-                // instead of honouring the backoff, rate-limit penalty included.
-                this.client
-                    .pause_teardown_pending
-                    .store(false, Ordering::Relaxed);
-                this.client.stop_supervision_loop();
-            })
-        });
+        let reader = match this
+            .client
+            .claim_driver(wacore::session_engine::lifecycle::DriveKind::DirectReader)
+        {
+            Ok(lease) => Some(lease),
+            Err(wacore::session_engine::lifecycle::LifecycleError::AlreadyDriving) => None,
+            Err(error) => {
+                log::warn!("Direct reader claim failed: {error}");
+                return ConnectionEnd {
+                    unexpected: None,
+                    terminal_reason: None,
+                };
+            }
+        };
+        let _release_reader =
+            reader.map(|lease| scopeguard::guard(lease, |lease| this.client.release_driver(lease)));
         this.client.drive_connection_with_outcome().await
     }
 }
@@ -3221,7 +3178,7 @@ mod tests {
                 .event_bus
                 .subscribe_handler(collector.clone())
                 .detach();
-            client.is_logged_in.store(true, Ordering::Relaxed);
+            client.set_logged_in_for_test(true, Ordering::Relaxed);
             client
                 .send_node(
                     NodeBuilder::new("stream:error")
@@ -3258,9 +3215,9 @@ mod tests {
             );
             assert!(end.unexpected.is_none());
             assert!(!client.is_socket_connected());
-            assert!(!client.is_logged_in.load(Ordering::Relaxed));
-            assert!(!client.enable_auto_reconnect.load(Ordering::Relaxed));
-            assert!(client.expected_disconnect.load(Ordering::Relaxed));
+            assert!(!client.is_logged_in());
+            assert!(!client.session_state.load(Ordering::Relaxed));
+            assert!(client.expected_session_disconnect(Ordering::Relaxed));
             let events = collector.events();
             let terminal_events: Vec<_> = events
                 .iter()
@@ -3334,13 +3291,13 @@ mod tests {
     #[tokio::test]
     async fn connecting_clears_the_retired_connection_expected_disconnect() {
         let client = crate::test_utils::create_test_client().await;
-        client.expected_disconnect.store(true, Ordering::Relaxed);
+        client.expect_session_disconnect();
 
         // The reset runs before any I/O, so the attempt itself need not finish.
         let _ = tokio::time::timeout(Duration::from_millis(500), client.connect()).await;
 
         assert!(
-            !client.expected_disconnect.load(Ordering::Relaxed),
+            !client.expected_session_disconnect(Ordering::Relaxed),
             "a new connection must not inherit the previous one's disconnect verdict"
         );
     }
@@ -3352,7 +3309,9 @@ mod tests {
     async fn a_cancelled_read_gives_the_reader_flag_back() {
         let fixture = PendingFrame::new().await;
         // The fixture client is pre-marked as driven; this one does the driving.
-        fixture.client.is_running.store(false, Ordering::SeqCst);
+        fixture
+            .client
+            .set_driver_running_for_test(false, Ordering::SeqCst);
 
         let cancelled = tokio::time::timeout(
             Duration::from_millis(200),
@@ -3368,7 +3327,7 @@ mod tests {
             "the read must still be waiting for frames when the timeout cancels it"
         );
         assert!(
-            !fixture.client.is_running.load(Ordering::SeqCst),
+            !fixture.client.driver_running(Ordering::SeqCst),
             "a cancelled read must not leave the client advertising a reader"
         );
     }
@@ -3418,8 +3377,8 @@ mod tests {
     async fn wait_for_session_ready_resolves_immediately_once_fully_ready() {
         let client = crate::test_utils::create_test_client().await;
         client.set_connected_for_test(true);
-        client.is_logged_in.store(true, Ordering::Relaxed);
-        client.is_ready.store(true, Ordering::Relaxed);
+        client.set_logged_in_for_test(true, Ordering::Relaxed);
+        client.set_ready_for_test(true, Ordering::Relaxed);
 
         client
             .wait_for_session_ready(Duration::from_millis(50))
@@ -3448,7 +3407,7 @@ mod tests {
     }
 
     fn assert_logout_shutdown(client: &Client, report: &LogoutReport) {
-        assert!(!client.enable_auto_reconnect.load(Ordering::Relaxed));
+        assert!(!client.session_state.load(Ordering::Relaxed));
         assert!(!client.is_socket_connected());
         assert!(client.shutdown_signal().is_fired());
         assert_eq!(report.shutdown.inbound, DrainOutcome::Completed);
@@ -3700,6 +3659,25 @@ mod tests {
         (client, entered_rx, release_tx)
     }
 
+    #[tokio::test]
+    async fn cancelling_run_releases_its_driver_claim() {
+        let (client, entered, _release) = client_parked_in_connect().await;
+        let run = tokio::spawn({
+            let client = client.clone();
+            async move { client.run().await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        run.abort();
+        assert!(run.await.unwrap_err().is_cancelled());
+        assert!(
+            !client.driver_running(Ordering::SeqCst),
+            "cancelled supervision retained the driver claim"
+        );
+    }
+
     /// A successful dial held behind a barrier, with a close that never
     /// acknowledges cancellation. No connection is opened outside the mock.
     struct AbandonedDial {
@@ -3785,7 +3763,7 @@ mod tests {
     }
 
     async fn assert_abandoned_attempt_cleared(client: &Client) {
-        assert!(!client.is_connecting.load(Ordering::SeqCst));
+        assert!(!client.connection_attempt_active(Ordering::SeqCst));
         assert!(!client.is_socket_connected());
         assert!(client.transport.lock().await.is_none());
         assert!(client.transport_events.lock().await.is_none());
@@ -4223,8 +4201,8 @@ mod tests {
     async fn socket_pairing_and_session_ready_are_distinct() {
         let client = crate::test_utils::create_test_client().await;
         client.set_connected_for_test(true);
-        client.is_logged_in.store(false, Ordering::Relaxed);
-        client.is_ready.store(false, Ordering::Relaxed);
+        client.set_logged_in_for_test(false, Ordering::Relaxed);
+        client.set_ready_for_test(false, Ordering::Relaxed);
         client
             .wait_for_socket_ready(Duration::from_secs(1))
             .await
@@ -4236,7 +4214,7 @@ mod tests {
             async move { client.wait_for_session_ready(Duration::from_secs(5)).await }
         });
         crate::test_utils::wait_for_notifier_listeners(&client.connected_notifier, 1).await;
-        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.set_logged_in_for_test(true, Ordering::Relaxed);
         // Authentication and even a spurious notification are not critical-sync completion.
         client.connected_notifier.notify(usize::MAX);
         tokio::task::yield_now().await;
@@ -4296,7 +4274,7 @@ mod tests {
     #[tokio::test]
     async fn disabling_reconnect_after_a_connect_failure_preserves_the_error() {
         let (client, entered, release) = client_parked_in_connect().await;
-        client.enable_auto_reconnect.store(false, Ordering::Relaxed);
+        client.session_state.store(false, Ordering::Relaxed);
         client.record_protocol_terminal_reason(ProtocolTerminalReason::StreamErrorCode(401));
         let runner = Arc::clone(&client);
         let run = tokio::spawn(async move { runner.run().await });
@@ -4387,7 +4365,7 @@ mod tests {
             Some(NodeBuilder::new("conflict").attr("type", "").build()),
         ] {
             let client = crate::test_utils::create_test_client().await;
-            client.is_logged_in.store(true, Ordering::Relaxed);
+            client.set_logged_in_for_test(true, Ordering::Relaxed);
             let collector = Arc::new(crate::test_utils::TestEventCollector::default());
             client
                 .core
@@ -4397,9 +4375,9 @@ mod tests {
             let node = NodeBuilder::new("stream:error").children(conflict).build();
             client.handle_stream_error(&node.as_node_ref()).await;
             assert_eq!(client.take_protocol_terminal_reason(), None);
-            assert!(client.enable_auto_reconnect.load(Ordering::Relaxed));
-            assert!(client.is_logged_in.load(Ordering::Relaxed));
-            assert!(!client.expected_disconnect.load(Ordering::Relaxed));
+            assert!(client.session_state.load(Ordering::Relaxed));
+            assert!(client.is_logged_in());
+            assert!(!client.expected_session_disconnect(Ordering::Relaxed));
             assert!(
                 !collector
                     .events()
@@ -4412,11 +4390,11 @@ mod tests {
     #[tokio::test]
     async fn expected_disconnect_during_failed_connect_has_no_connection_cause() {
         let (client, entered, release) = client_parked_in_connect().await;
-        client.enable_auto_reconnect.store(false, Ordering::Relaxed);
+        client.session_state.store(false, Ordering::Relaxed);
         let runner = Arc::clone(&client);
         let run = tokio::spawn(async move { runner.run().await });
         next_connect_attempt(&entered).await;
-        client.expected_disconnect.store(true, Ordering::Relaxed);
+        client.expect_session_disconnect();
         release.send(()).await.unwrap();
 
         let reason = run.await.unwrap();
@@ -4499,7 +4477,7 @@ mod tests {
         // What a 515 leaves behind: the end was planned, and nobody asked the
         // client to stop. Set from inside the attempt, so it survives the reset
         // `connect` performs on entry.
-        client.expected_disconnect.store(true, Ordering::Relaxed);
+        client.expect_session_disconnect();
         release
             .send(())
             .await
@@ -4545,7 +4523,7 @@ mod tests {
         next_connect_attempt(&entered).await;
 
         let _ = client.shutdown().await;
-        client.expected_disconnect.store(false, Ordering::Relaxed);
+        client.clear_expected_session_disconnect();
         drop(release);
 
         let reason = tokio::time::timeout(Duration::from_secs(10), run)
@@ -4576,8 +4554,8 @@ mod tests {
     async fn a_requested_disconnect_still_clears_the_connection_counters() {
         let (client, entered, release) = client_parked_in_connect().await;
         // What a session that struggled and then settled leaves behind.
-        client.auto_reconnect_errors.store(7, Ordering::Relaxed);
-        client.connected_at.store(wacore::time::Instant::now());
+        client.set_reconnect_errors_for_test(7, Ordering::Relaxed);
+        client.set_authenticated_at_for_test(wacore::time::Instant::now());
 
         let runner = Arc::clone(&client);
         let run = tokio::spawn(async move { runner.run().await });
@@ -4596,7 +4574,7 @@ mod tests {
             "a planned end owes no backoff, so its counter is cleared on both exits"
         );
         assert!(
-            client.connected_at.load().is_none(),
+            client.authenticated_at_for_test().is_none(),
             "and the auth timestamp is consumed, so no later connect reads it as stable"
         );
     }
@@ -4663,7 +4641,7 @@ mod tests {
         let (client, entered, release) = client_parked_in_connect().await;
         // A session that already struggled: without the skip, this is the
         // counter the post-connection branch would build a delay from.
-        client.auto_reconnect_errors.store(6, Ordering::Relaxed);
+        client.set_reconnect_errors_for_test(6, Ordering::Relaxed);
 
         let runner = Arc::clone(&client);
         let run = tokio::spawn(async move { runner.run().await });
@@ -4801,7 +4779,7 @@ mod tests {
         *client.transport.lock().await = Some(transport);
         // What `connect()` leaves behind for a `Connection` nobody drives.
         client.set_connected_for_test(true);
-        assert!(!client.is_running.load(Ordering::Relaxed), "and no reader");
+        assert!(!client.driver_running(Ordering::Relaxed), "and no reader");
 
         tokio::time::timeout(Duration::from_secs(10), client.pause())
             .await
@@ -4841,7 +4819,7 @@ mod tests {
         *client.transport.lock().await = Some(transport);
         // What `connect()` leaves for a `Connection` nobody drives.
         client.set_connected_for_test(true);
-        assert!(!client.is_running.load(Ordering::Relaxed), "and no reader");
+        assert!(!client.driver_running(Ordering::Relaxed), "and no reader");
 
         let in_flight = client
             .outbound_flush
@@ -5014,7 +4992,7 @@ mod tests {
             "resuming must take effect while the socket close is still hanging"
         );
         assert!(
-            client.pause_teardown_pending.load(Ordering::Relaxed),
+            client.pause_exit_pending(Ordering::Relaxed),
             "and the teardown still owes the run loop its no-backoff answer, \
              which is what makes waiting unnecessary"
         );
@@ -5066,7 +5044,7 @@ mod tests {
             .await
             .expect("run() must refuse at once after a disconnect, not start a session");
         assert!(
-            !client.is_running.load(Ordering::SeqCst),
+            !client.driver_running(Ordering::SeqCst),
             "a refused run() must not leave the client advertising a reader"
         );
     }
@@ -5084,15 +5062,13 @@ mod tests {
     async fn run_until_parked_in_backoff(
         client: &Arc<Client>,
     ) -> tokio::task::JoinHandle<RunCompletionReason> {
-        client
-            .auto_reconnect_errors
-            .store(CAPPED_BACKOFF_ATTEMPTS, Ordering::Relaxed);
+        client.set_reconnect_errors_for_test(CAPPED_BACKOFF_ATTEMPTS, Ordering::Relaxed);
 
         let runner = client.clone();
         let run = tokio::spawn(async move { runner.run().await });
 
         crate::test_utils::poll_until("the run loop to reach its reconnect backoff", || {
-            client.auto_reconnect_errors.load(Ordering::Relaxed) > CAPPED_BACKOFF_ATTEMPTS
+            client.reconnect_errors(Ordering::Relaxed) > CAPPED_BACKOFF_ATTEMPTS
         })
         .await;
 
@@ -5127,7 +5103,7 @@ mod tests {
                 .build();
             client.handle_connect_failure(&failure.as_node_ref()).await;
             assert!(client.auto_reconnect_enabled());
-            assert!(!client.enable_auto_reconnect.is_terminal());
+            assert!(!client.session_state.is_terminal());
             client.set_auto_reconnect(false);
             client.set_auto_reconnect(true);
             assert!(client.auto_reconnect_enabled());
@@ -5203,7 +5179,7 @@ mod tests {
     #[test]
     fn terminal_verdict_wins_concurrent_host_reenable() {
         for _ in 0..32 {
-            let policy = Arc::new(AutoReconnect::new(true));
+            let policy = Arc::new(SessionState::new(true));
             let host = Arc::clone(&policy);
             std::thread::scope(|scope| {
                 scope.spawn(move || {
@@ -5262,7 +5238,7 @@ mod tests {
         // counter for another attempt.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
-            client.auto_reconnect_errors.load(Ordering::Relaxed),
+            client.reconnect_errors(Ordering::Relaxed),
             CAPPED_BACKOFF_ATTEMPTS + 1,
             "a per-connection shutdown must not release the reconnect backoff"
         );

@@ -563,6 +563,11 @@ pub mod runtime_impl;
 #[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
 pub use runtime_impl::TokioRuntime;
 pub use wacore::runtime::Runtime;
+#[cfg(feature = "instance-clock")]
+pub use wacore::{
+    runtime::ClockedRuntime,
+    time::{Clock, ClockError, ClockReading, VirtualClock},
+};
 pub mod send;
 pub use send::{
     EditOptions, EditRequest, PinDuration, RevokeType, SendError, SendOptions, SendRequest,

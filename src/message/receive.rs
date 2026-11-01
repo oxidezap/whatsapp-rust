@@ -841,7 +841,7 @@ impl Client {
                 }
                 // Only show warning if session messages actually FAILED (not duplicates)
                 if !session_had_duplicates {
-                    if info.is_expired_status() {
+                    if info.is_expired_status_with(|| self.runtime.wall_time_utc()) {
                         log::debug!(
                             "[msg:{}] Silently dropping expired status from {}",
                             info.id,
@@ -1945,7 +1945,7 @@ impl Client {
                         enc_type,
                         EncDecryptFailureReason::NoSenderKey,
                     );
-                    if info.is_expired_status() {
+                    if info.is_expired_status_with(|| self.runtime.wall_time_utc()) {
                         log::debug!(
                             "[msg:{}] Skipping retry for expired status from {}",
                             info.id,
@@ -1998,7 +1998,7 @@ impl Client {
                             reason => reason,
                         },
                     );
-                    if info.is_expired_status() {
+                    if info.is_expired_status_with(|| self.runtime.wall_time_utc()) {
                         log::debug!(
                             "[msg:{}] Ignoring decrypt error for expired status from {}: {:?}",
                             info.id,

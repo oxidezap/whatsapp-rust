@@ -160,9 +160,10 @@ impl Client {
         // any, is not the one we attach (that comes from the privacy_token
         // notification). Only the sender-side timestamp is recorded on success.
         if let Err(e) = self
-            .execute(IssuePrivacyTokensSpec::new(std::slice::from_ref(
-                &issuance_jid,
-            )))
+            .execute(IssuePrivacyTokensSpec::with_timestamp(
+                std::slice::from_ref(&issuance_jid),
+                self.runtime.wall_time_secs(),
+            ))
             .await
         {
             log::debug!(target: "Client/TcToken", "Failed to issue tc_token for {}: {e}", issuance_jid.observe());
@@ -177,7 +178,7 @@ impl Client {
     /// whether a token was attached to the outgoing stanza.
     #[cfg(feature = "voip-control")]
     pub(crate) async fn should_issue_tc_token(&self, to: &Jid) -> bool {
-        use wacore::iq::tctoken::should_send_new_tc_token_with;
+        use wacore::iq::tctoken::should_send_new_tc_token_with_at;
 
         // A self-call must never issue or record a token for our own account.
         if self.is_own_jid(to) {
@@ -197,7 +198,11 @@ impl Client {
             }
         };
 
-        should_send_new_tc_token_with(sender_ts, &self.tc_token_config().await)
+        should_send_new_tc_token_with_at(
+            sender_ts,
+            &self.tc_token_config().await,
+            self.runtime.wall_time_secs(),
+        )
     }
 
     /// Persist tokens returned by the explicit `tc_token().issue_tokens()` API.
@@ -206,7 +211,7 @@ impl Client {
         tokens: &[wacore::iq::tctoken::ReceivedTcToken],
     ) {
         let backend = self.persistence_manager.backend();
-        let now = wacore::time::now_secs();
+        let now = self.runtime.wall_time_secs();
         for received in tokens {
             if received.token.is_empty() {
                 log::warn!(target: "Client/TcToken", "Server returned empty tc_token for {}, skipping", received.jid.observe());
@@ -246,7 +251,7 @@ impl Client {
     /// every 1:1 message — hence the byte-less placeholder when no entry exists.
     async fn record_tc_token_sender_timestamp(&self, to: &Jid) {
         let key = self.resolve_tc_token_key(to).await;
-        let now = wacore::time::now_secs();
+        let now = self.runtime.wall_time_secs();
         // Atomic merge so a concurrent privacy_token notification writing the real
         // token isn't clobbered by this placeholder's read-modify-write.
         if let Err(e) = self
@@ -324,7 +329,7 @@ impl Client {
     ///
     /// Used by profile picture, presence subscribe, and other features that need tctoken gating.
     pub(crate) async fn lookup_tc_token_for_jid(&self, jid: &Jid) -> Option<Vec<u8>> {
-        use wacore::iq::tctoken::is_tc_token_expired_with;
+        use wacore::iq::tctoken::is_tc_token_expired_with_at;
 
         let token_key = self.resolve_tc_token_key(jid).await;
         let tc_config = self.tc_token_config().await;
@@ -332,7 +337,11 @@ impl Client {
         match backend.get_tc_token(&token_key).await {
             Ok(Some(entry))
                 if !entry.token.is_empty()
-                    && !is_tc_token_expired_with(entry.token_timestamp, &tc_config) =>
+                    && !is_tc_token_expired_with_at(
+                        entry.token_timestamp,
+                        &tc_config,
+                        self.runtime.wall_time_secs(),
+                    ) =>
             {
                 Some(entry.token)
             }
@@ -351,7 +360,7 @@ impl Client {
     /// JID. The reconnect presence re-subscribe walks the entire tracked
     /// contact set, so per-JID is a query per contact against one store.
     pub(crate) async fn lookup_tc_tokens_for_jids(&self, jids: &[Jid]) -> Vec<Option<Vec<u8>>> {
-        use wacore::iq::tctoken::is_tc_token_expired_with;
+        use wacore::iq::tctoken::is_tc_token_expired_with_at;
 
         if jids.is_empty() {
             return Vec::new();
@@ -380,7 +389,11 @@ impl Client {
             .map(|entry| {
                 entry.filter(|entry| {
                     !entry.token.is_empty()
-                        && !is_tc_token_expired_with(entry.token_timestamp, &tc_config)
+                        && !is_tc_token_expired_with_at(
+                            entry.token_timestamp,
+                            &tc_config,
+                            self.runtime.wall_time_secs(),
+                        )
                 })
             })
             .map(|entry| entry.map(|entry| entry.token))

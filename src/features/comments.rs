@@ -153,7 +153,7 @@ impl<'a> Comments<'a> {
                 result.message_id.as_str(),
                 &comment_secret,
                 wacore::msg_secret::RetentionClass::Text,
-                crate::send::SendInstant::now(),
+                crate::send::SendInstant::from_runtime(&client.runtime),
             )
             .await;
         Ok(result)

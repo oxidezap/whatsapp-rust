@@ -174,8 +174,12 @@ pub fn tc_token_expiration_cutoff() -> i64 {
 
 /// Compute the receiver-side expiration cutoff using configurable timing.
 pub fn tc_token_expiration_cutoff_with(config: &TcTokenConfig) -> i64 {
+    tc_token_expiration_cutoff_with_at(config, unix_now())
+}
+
+pub fn tc_token_expiration_cutoff_with_at(config: &TcTokenConfig, now: i64) -> i64 {
     let cfg = config.clamped();
-    expiration_cutoff_at(unix_now(), cfg.bucket_duration, cfg.num_buckets)
+    expiration_cutoff_at(now, cfg.bucket_duration, cfg.num_buckets)
 }
 
 /// Compute the sender-side expiration cutoff using configurable timing.
@@ -184,12 +188,12 @@ pub fn tc_token_expiration_cutoff_with(config: &TcTokenConfig) -> i64 {
 /// received token, so pruning must evaluate it against this cutoff rather than
 /// the receiver one.
 pub fn sender_tc_token_expiration_cutoff_with(config: &TcTokenConfig) -> i64 {
+    sender_tc_token_expiration_cutoff_with_at(config, unix_now())
+}
+
+pub fn sender_tc_token_expiration_cutoff_with_at(config: &TcTokenConfig, now: i64) -> i64 {
     let cfg = config.clamped();
-    expiration_cutoff_at(
-        unix_now(),
-        cfg.sender_bucket_duration,
-        cfg.sender_num_buckets,
-    )
+    expiration_cutoff_at(now, cfg.sender_bucket_duration, cfg.sender_num_buckets)
 }
 
 /// A token received from the server in an IQ response or notification.

@@ -160,3 +160,20 @@ threshold masquerading as a deterministic CI guard.
 pages/arenas for reuse. A lower peak alone does not prove lower retention, and a
 flat RSS alone does not prove that Rust objects stayed live. Report all three
 readings and the control/noise range; never upload RssAnon as a CodSpeed metric.
+
+## Comparison in pull requests
+
+The CodSpeed workflow builds the PR base and head with the same release
+features on one host. `cargo xt ci session-retention` runs three process-isolated
+repeats of each backend and mode, alternating base/head order in four streams.
+It compares median live requested Rust heap relative to each process runtime
+baseline at 61 seconds and after maintenance. Any positive delta fails the gate.
+Raw samples and errors remain in the `connected-retention` artifact.
+
+Peak requested heap and Linux RSS remain separate diagnostics. CPU and activity
+allocation comparisons run through the existing CodSpeed benchmarks. The native
+idle gate does not establish CPU equivalence or WhatsApp network behavior.
+
+For local comparisons, build and preserve both release executables first, then
+pass their paths and full source SHAs to `cargo xt ci session-retention --help`.
+The command does not build, switch checkouts, or change Cargo target directories.

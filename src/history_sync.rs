@@ -108,10 +108,6 @@ struct HistorySecretSeedConfig {
 }
 
 impl HistorySecretSeedConfig {
-    fn snapshot(config: &crate::cache_config::RuntimeCacheConfig) -> Self {
-        Self::at(config, wacore::time::now_secs())
-    }
-
     fn at(config: &crate::cache_config::RuntimeCacheConfig, now: i64) -> Self {
         Self {
             enabled: config.seed_msg_secrets_from_history,
@@ -861,7 +857,8 @@ impl Client {
         let own_pn = device_snapshot.pn.as_ref().map(|jid| jid.to_non_ad());
         let own_lid = device_snapshot.lid.as_ref().map(|jid| jid.to_non_ad());
         let own_user = own_pn.as_ref().map(|jid| jid.user.clone());
-        let secret_seed_config = HistorySecretSeedConfig::snapshot(&self.cache_config);
+        let secret_seed_config =
+            HistorySecretSeedConfig::at(&self.cache_config, self.runtime.wall_time_secs());
         let secret_collector = HistorySecretSeedCollector::new(secret_seed_config, own_pn, own_lid);
 
         // Always carry the compressed input through (a move, no copy or extra
@@ -1294,7 +1291,7 @@ mod tests {
     ) -> (Arc<Client>, crate::NodeWaiter<wacore_binary::Node>) {
         let (client, _receiver) =
             crate::test_utils::create_test_client_with_sync_receiver_and_admission(admission).await;
-        client.is_running.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
         client
             .persistence_manager
             .process_command(wacore::store::commands::DeviceCommand::SetId(Some(
@@ -1376,7 +1373,7 @@ mod tests {
                 admission.clone(),
             )
             .await;
-        client.is_running.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
 
         client
             .handle_history_sync("HISTORY-ACCEPT".to_string(), admission_notification())
@@ -1472,7 +1469,7 @@ mod tests {
     #[tokio::test]
     async fn compressed_history_emits_placed_and_received_calls_after_harvest() {
         let client = crate::test_utils::create_test_client_with_name("call_history").await;
-        client.is_running.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
         for command in [
             wacore::store::commands::DeviceCommand::SetId(Some(
                 "15550000001:3@s.whatsapp.net".parse().unwrap(),
@@ -1584,7 +1581,7 @@ mod tests {
     #[tokio::test]
     async fn call_history_aliases_unknown_fields_and_replayed_chunk_boundaries() {
         let client = crate::test_utils::create_test_client_with_name("call_history_aliases").await;
-        client.is_running.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
         client
             .persistence_manager
             .process_command(wacore::store::commands::DeviceCommand::SetId(Some(
@@ -1659,7 +1656,7 @@ mod tests {
     #[tokio::test]
     async fn corrupt_history_chunk_never_emits_partial_calls() {
         let client = crate::test_utils::create_test_client_with_name("call_history_corrupt").await;
-        client.is_running.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
         let recorder = Arc::new(CallHistoryRecorder(std::sync::Mutex::new(Vec::new())));
         client
             .core
@@ -1720,7 +1717,7 @@ mod tests {
         use wacore::types::events::ChannelEventHandler;
         let client =
             crate::test_utils::create_test_client_with_name("call_history_backpressure").await;
-        client.is_running.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
         let (handler, receiver) = ChannelEventHandler::new();
         client
             .core
@@ -1766,7 +1763,7 @@ mod tests {
     #[tokio::test]
     async fn call_history_budget_emits_only_raw_chunk_and_preserves_harvest() {
         let client = crate::test_utils::create_test_client_with_name("call_history_budget").await;
-        client.is_running.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
         let recorder = Arc::new(CallHistoryRecorder(std::sync::Mutex::new(Vec::new())));
         client
             .core
@@ -1795,7 +1792,7 @@ mod tests {
     async fn call_history_direction_is_unknown_without_account_identities() {
         let client =
             crate::test_utils::create_test_client_with_name("call_history_no_identity").await;
-        client.is_running.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
         for command in [
             wacore::store::commands::DeviceCommand::SetId(None),
             wacore::store::commands::DeviceCommand::SetLid(None),
@@ -1856,7 +1853,7 @@ mod tests {
         }
         let client =
             crate::test_utils::create_test_client_with_name("call_history_identity_update").await;
-        client.is_running.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
         client
             .persistence_manager
             .process_command(wacore::store::commands::DeviceCommand::SetId(Some(
@@ -2151,7 +2148,7 @@ mod tests {
                     .with_sent_frames(client.sent_frame_tap.clone()),
             )));
         client.set_connected_for_test(true);
-        client.is_running.store(true, Ordering::Release);
+        client.set_driver_running_for_test(true, Ordering::Release);
         client.enter_live_mode_for_tests();
         client
             .persistence_manager
@@ -2679,7 +2676,7 @@ mod tests {
                 "5511000000001:0@s.whatsapp.net".parse().unwrap(),
             )))
             .await;
-        client.is_running.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
 
         let chat = "5511777776666@s.whatsapp.net";
         let parent_id = "HIST_PARENT";
@@ -2742,7 +2739,7 @@ mod tests {
     #[tokio::test]
     async fn process_history_sync_task_learns_lid_mappings() {
         let client = crate::test_utils::create_test_client_with_name("history_lid_mappings").await;
-        client.is_running.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
 
         let history_sync = {
             let mut proto_value = wa::HistorySync::default();
@@ -2782,7 +2779,7 @@ mod tests {
     #[tokio::test]
     async fn process_history_sync_task_dispatches_compressed_lazy_event() {
         let client = crate::test_utils::create_test_client_with_name("history_lazy_event").await;
-        client.is_running.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
 
         let chat = "5511777776666@s.whatsapp.net";
         let history_sync = {
@@ -2843,7 +2840,7 @@ mod tests {
                 "999888777666555:0@lid".parse().unwrap(),
             )))
             .await;
-        client.is_running.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
 
         let chat = "867051314767696@bot";
         let parent_id = "HIST_BOT_PARENT";
@@ -2992,7 +2989,7 @@ mod tests {
                 "5511000000001:0@s.whatsapp.net".parse().unwrap(),
             )))
             .await;
-        client.is_running.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
         client
     }
 
@@ -3182,7 +3179,7 @@ mod tests {
                 "5511000000001:0@s.whatsapp.net".parse().unwrap(),
             )))
             .await;
-        client.is_running.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
 
         let chat = "5511777776666@s.whatsapp.net";
         let now = wacore::time::now_secs() as u64;

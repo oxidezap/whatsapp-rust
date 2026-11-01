@@ -97,7 +97,16 @@ impl ResendRateLimiter {
     /// Try to consume one resend token for `chat`. `true` allows the resend,
     /// `false` drops it. A `burst` of 0 disables the limiter (always allows) and
     /// skips all bucket work.
+    #[cfg(test)]
     pub(crate) async fn try_acquire(&self, chat: &Jid) -> bool {
+        self.try_acquire_with_clock(chat, Instant::now).await
+    }
+
+    pub(crate) async fn try_acquire_with_clock(
+        &self,
+        chat: &Jid,
+        now: impl Fn() -> Instant + wacore::sync_marker::MaybeSendSync,
+    ) -> bool {
         let burst = self.burst.load(Ordering::Relaxed);
         if burst == 0 {
             return true;
@@ -109,17 +118,15 @@ impl ResendRateLimiter {
         // (each dispatched as a detached task) share one bucket; the per-bucket
         // mutex then serializes the read-modify-write so the rate cannot be
         // bypassed by interleaving.
+        let now = &now;
         let bucket = self
             .buckets
             .get_with_by_ref(chat, async move {
-                Arc::new(Mutex::new(TokenBucket::new(burst, Instant::now())))
+                Arc::new(Mutex::new(TokenBucket::new(burst, now())))
             })
             .await;
 
-        let allowed = bucket
-            .lock()
-            .await
-            .try_take(Instant::now(), burst, refill_per_sec);
+        let allowed = bucket.lock().await.try_take(now(), burst, refill_per_sec);
         if !allowed {
             self.throttled_total.fetch_add(1, Ordering::Relaxed);
         }

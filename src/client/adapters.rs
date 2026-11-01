@@ -170,15 +170,16 @@ impl Client {
     /// took before leases existed, now limited to the window where some lease
     /// is actually unpersisted. So "a lease-covered send needs no flush" is a
     /// statement about what this send REQUIRES, not a promise it never flushes.
-    pub(crate) async fn persist_signal_state_pre_wire(&self) -> Result<(), anyhow::Error> {
+    pub(crate) async fn confirm_signal_state_pre_wire(
+        &self,
+    ) -> Result<wacore::session_engine::publication::SignalDurability, anyhow::Error> {
+        use wacore::session_engine::publication::SignalDurability;
         if self.signal_cache.needs_pre_wire_flush().await {
-            return self
-                .flush_signal_cache_batch_safe()
-                .await
-                .map_err(Into::into);
+            self.flush_signal_cache_batch_safe().await?;
+            return Ok(SignalDurability::CommittedWrite);
         }
         self.schedule_signal_flush(self.connection_generation.load(Ordering::Acquire));
-        Ok(())
+        Ok(SignalDurability::DurableLease)
     }
 
     /// [`flush_signal_cache_batch_safe`](Self::flush_signal_cache_batch_safe)

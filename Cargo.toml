@@ -170,6 +170,7 @@ zerocopy = { version = "0.8.55", default-features = false, features = ["derive"]
 zlib-rs = { version = "0.6.6", default-features = false, features = ["std", "rust-allocator"] }
 
 [features]
+instance-clock = ["wacore/instance-clock", "whatsapp-rust-sqlite-storage?/instance-clock"]
 # Source-qualified group parsing requires explicit effective account facts.
 # Kept opt-in to preserve the default runtime footprint.
 generated-group-notifications = []

@@ -229,11 +229,12 @@ pub(crate) async fn encrypt_known_call_keys(
             .stats
             .record_unkeyable_devices(UnkeyableDevice::Encrypt, raw.unkeyed_at_encrypt);
         drop(guards);
-        client
-            .persist_signal_state_pre_wire()
+        let raw = wacore::session_engine::publication::PreparedSignal::new(raw).begin_commit();
+        let confirmation = client
+            .confirm_signal_state_pre_wire()
             .await
             .map_err(|error| CallError::Setup(error.to_string()))?;
-        raw
+        raw.confirm(confirmation).into_payload()
     };
     let device_keys: Vec<OfferDeviceKey> = devices
         .iter()

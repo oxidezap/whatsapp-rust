@@ -34,7 +34,7 @@ pub(crate) fn handle_picture_notification(client: &Arc<Client>, node: &NodeRef<'
         "picture notification"
     );
 
-    let timestamp = notification_timestamp(node);
+    let timestamp = notification_timestamp(node, || client.runtime.wall_time_utc());
 
     // Look for <set>, <delete>, or <request> child to determine the action.
     // WhatsApp Web has two formats:
@@ -124,7 +124,7 @@ pub(crate) fn handle_status_notification(client: &Arc<Client>, node: &NodeRef<'_
         "status notification"
     );
 
-    let timestamp = notification_timestamp(node);
+    let timestamp = notification_timestamp(node, || client.runtime.wall_time_utc());
 
     if let Some(set_node) = node.get_optional_child("set") {
         let status_text = match set_node.content.as_ref() {
@@ -154,12 +154,15 @@ pub(crate) fn handle_status_notification(client: &Arc<Client>, node: &NodeRef<'_
     }
 }
 
-pub(crate) fn notification_timestamp(node: &NodeRef<'_>) -> chrono::DateTime<chrono::Utc> {
+pub(crate) fn notification_timestamp(
+    node: &NodeRef<'_>,
+    now: impl FnOnce() -> chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
     node.attrs()
         .optional_u64("t")
         .and_then(|t| i64::try_from(t).ok())
         .and_then(wacore::time::from_secs)
-        .unwrap_or_else(wacore::time::now_utc)
+        .unwrap_or_else(now)
 }
 
 /// Learn LID-PN mappings from a contacts modify notification.
@@ -214,7 +217,7 @@ pub(crate) async fn learn_contact_modify_mappings(
 /// - `<sync after="..."/>` — server requests full contact re-sync.
 /// - `<add .../>` or `<remove .../>` — lightweight roster changes (ACK only).
 pub(crate) async fn handle_contacts_notification(client: &Arc<Client>, node: &NodeRef<'_>) {
-    let timestamp = notification_timestamp(node);
+    let timestamp = notification_timestamp(node, || client.runtime.wall_time_utc());
 
     let Some(child) = node.children().and_then(|children| children.first()) else {
         debug!(

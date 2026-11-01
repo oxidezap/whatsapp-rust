@@ -47,6 +47,7 @@ impl Boundary {
             && !joined.starts_with("std::time::Duration::");
         let reads_now = parts.len() > 1 && parts.last().is_some_and(|part| part == "now");
         let unreviewed_root = parts.len() > 1
+            && joined != "thiserror::Error"
             && parts.first().is_some_and(|root| {
                 root.starts_with(char::is_lowercase)
                     && ![
@@ -90,6 +91,7 @@ impl Boundary {
                 "std::num::NonZeroU64",
                 "std::time::Duration",
                 "std::cmp::Ordering",
+                "std::mem::take",
             ]
             .iter()
             .any(|prefix| joined == *prefix || joined.starts_with(&format!("{prefix}::")));
@@ -127,6 +129,21 @@ impl Boundary {
             "super::keepalive::elapsed_since_at",
             "super::keepalive::is_dead_socket_at",
             "crate::time::Instant",
+            "crate::protocol::reconnect::backoff_delay",
+            "crate::protocol::reconnect::fibonacci_base_millis",
+            "crate::protocol::reconnect::next_backoff_attempt",
+            "crate::protocol::reconnect::should_reset_backoff",
+            "crate::protocol::retry::should_drop_unknown_device_retry",
+            "crate::request::pending::PendingRequests",
+            "super::lifecycle::AttemptTicket",
+            "super::lifecycle::AuthenticationTicket",
+            "super::lifecycle::DriveKind",
+            "super::lifecycle::DriveLease",
+            "super::lifecycle::Lifecycle",
+            "super::lifecycle::LifecycleError",
+            "super::lifecycle::LifecycleSnapshot",
+            "super::lifecycle::NextConnection",
+            "super::lifecycle::TransportTicket",
             "crate::appstate::hash::HashState",
             "crate::appstate::keys::ExpandedAppStateKeys",
             "crate::appstate::processor::PatchProcessingResult",
@@ -271,6 +288,26 @@ fn protocol_state_does_not_execute_io_or_read_global_time() {
             include_str!("../wacore/src/appstate_sync/preparation.rs"),
         ),
         ("history", include_str!("../src/history_sync/parse_job.rs")),
+        (
+            "session lifecycle",
+            include_str!("../wacore/src/session_engine/lifecycle.rs"),
+        ),
+        (
+            "session exchanges",
+            include_str!("../wacore/src/session_engine/exchange.rs"),
+        ),
+        (
+            "session retries",
+            include_str!("../wacore/src/session_engine/retry.rs"),
+        ),
+        (
+            "Signal publication",
+            include_str!("../wacore/src/session_engine/publication.rs"),
+        ),
+        (
+            "session simulator",
+            include_str!("../wacore/src/session_engine/simulator.rs"),
+        ),
     ] {
         assert_eq!(violations(source), Vec::<String>::new(), "{name}");
     }

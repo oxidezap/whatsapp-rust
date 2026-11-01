@@ -536,9 +536,7 @@ pub(crate) async fn create_iq_test_client_with_backend(
     );
     *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
     client.set_connected_for_test(true);
-    client
-        .is_running
-        .store(true, std::sync::atomic::Ordering::Release);
+    client.set_driver_running_for_test(true, std::sync::atomic::Ordering::Release);
     client.enter_live_mode_for_tests();
 
     (client, transport)

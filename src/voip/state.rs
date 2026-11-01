@@ -54,7 +54,10 @@ impl Subsystem for Voip {
         client.bind_pending_call_link_join_ack(node);
     }
 
-    fn memory(state: &VoipState) -> Vec<(&'static str, CollectionStats)> {
+    fn memory(
+        state: &VoipState,
+        now: impl FnOnce() -> wacore::time::Instant,
+    ) -> Vec<(&'static str, CollectionStats)> {
         let pending_link_updates = state
             .pending_call_link_joins
             .lock()
@@ -72,7 +75,7 @@ impl Subsystem for Voip {
             ),
             (
                 collections::ACTIVE_CALLS.collection,
-                state.direct.call_registry.memory_stats(),
+                state.direct.call_registry.memory_stats_with_now(now),
             ),
             // Entry count only: each parked call retains engine material this
             // side cannot size without walking it.

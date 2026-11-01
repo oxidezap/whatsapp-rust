@@ -1438,9 +1438,7 @@ mod tests {
             .expect("client build");
         let client = build.into_client();
         const GENERATION: u64 = 9;
-        client
-            .connection_generation
-            .store(GENERATION, Ordering::SeqCst);
+        client.set_generation_for_test(GENERATION, Ordering::SeqCst);
         let registration = client.lifecycle.as_ref().expect("lifecycle registration");
         assert!(registration.begin_scope_if_current(GENERATION, || true));
         client.dispatch_connected(GENERATION).await;
@@ -1594,9 +1592,7 @@ mod tests {
             .expect("client build")
             .into_client();
         const GENERATION: u64 = 13;
-        client
-            .connection_generation
-            .store(GENERATION, Ordering::SeqCst);
+        client.set_generation_for_test(GENERATION, Ordering::SeqCst);
         assert!(
             client
                 .lifecycle
@@ -1669,9 +1665,7 @@ mod tests {
             .expect("client build")
             .into_client();
         const GENERATION: u64 = 17;
-        client
-            .connection_generation
-            .store(GENERATION, Ordering::SeqCst);
+        client.set_generation_for_test(GENERATION, Ordering::SeqCst);
         assert!(
             client
                 .lifecycle
@@ -1696,7 +1690,7 @@ mod tests {
             vec!["ready-started", "ready-finished", "closed", "shutdown"]
         );
         assert!(!client.is_logged_in());
-        assert!(!client.is_ready.load(Ordering::Relaxed));
+        assert!(!client.session_ready_reached(Ordering::Relaxed));
     }
 
     #[tokio::test]
@@ -1723,9 +1717,7 @@ mod tests {
                 .expect("client build")
                 .into_client();
             const GENERATION: u64 = 18;
-            client
-                .connection_generation
-                .store(GENERATION, Ordering::SeqCst);
+            client.set_generation_for_test(GENERATION, Ordering::SeqCst);
             let registration = client.lifecycle.as_ref().expect("lifecycle registration");
             assert!(registration.begin_scope_if_current(GENERATION, || true));
 
@@ -1739,7 +1731,7 @@ mod tests {
                 .scope_for(GENERATION)
                 .expect("cancelled connection scope");
             assert_eq!(scope.state(), ConnectionScopeState::Cancelled);
-            assert!(!client.is_ready.load(Ordering::Relaxed));
+            assert!(!client.session_ready_reached(Ordering::Relaxed));
 
             registration.close_scope(GENERATION);
             let _ = registration.shutdown().await;
@@ -2087,9 +2079,7 @@ mod tests {
             .expect("client build")
             .into_client();
         const GENERATION: u64 = 37;
-        client
-            .connection_generation
-            .store(GENERATION, Ordering::SeqCst);
+        client.set_generation_for_test(GENERATION, Ordering::SeqCst);
         let registration = client.lifecycle.as_ref().expect("lifecycle registration");
         assert!(registration.begin_scope_if_current(GENERATION, || true));
         client.dispatch_connected(GENERATION).await;
@@ -2150,9 +2140,7 @@ mod tests {
             .expect("client build")
             .into_client();
         const GENERATION: u64 = 41;
-        client
-            .connection_generation
-            .store(GENERATION, Ordering::SeqCst);
+        client.set_generation_for_test(GENERATION, Ordering::SeqCst);
         let registration = client.lifecycle.as_ref().expect("lifecycle registration");
         assert!(registration.begin_scope_if_current(GENERATION, || true));
         client.dispatch_connected(GENERATION).await;
@@ -2224,12 +2212,10 @@ mod tests {
             .into_client();
         const STALE_GENERATION: u64 = 60;
         const CURRENT_GENERATION: u64 = 62;
-        client
-            .connection_generation
-            .store(CURRENT_GENERATION, Ordering::SeqCst);
+        client.set_generation_for_test(CURRENT_GENERATION, Ordering::SeqCst);
         // Announcing now requires an authenticated session, so the fixture has to
         // be one; this test is about which generation wins, not about login.
-        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.set_logged_in_for_test(true, Ordering::Relaxed);
         let registration = client.lifecycle.as_ref().expect("lifecycle registration");
         assert!(registration.begin_scope_if_current(CURRENT_GENERATION, || true));
 
@@ -2239,12 +2225,12 @@ mod tests {
             .scope_for(CURRENT_GENERATION)
             .expect("current scope");
         assert_eq!(scope.state(), ConnectionScopeState::Open);
-        assert!(!client.is_ready.load(Ordering::Relaxed));
+        assert!(!client.session_ready_reached(Ordering::Relaxed));
         assert_eq!(lifecycle.events(), vec!["install"]);
 
         client.dispatch_connected(CURRENT_GENERATION).await;
         assert_eq!(scope.state(), ConnectionScopeState::Ready);
-        assert!(client.is_ready.load(Ordering::Relaxed));
+        assert!(client.session_ready_reached(Ordering::Relaxed));
         assert_eq!(lifecycle.events(), vec!["install", "ready:62"]);
 
         registration.cancel_scope(CURRENT_GENERATION);
@@ -2278,6 +2264,7 @@ mod tests {
             .signal_shutdown_sync();
 
         let success = wacore_binary::builder::NodeBuilder::new("success").build();
+        client.set_connected_for_test(true);
         client.handle_success(&success.as_node_ref()).await;
 
         assert!(!client.is_logged_in());

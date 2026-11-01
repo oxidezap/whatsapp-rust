@@ -118,6 +118,18 @@ impl std::fmt::Debug for DeviceCommand {
 }
 
 pub fn apply_command_to_device(device: &mut Device, command: DeviceCommand) {
+    apply_command_with_clock(device, command, crate::time::now_millis);
+}
+
+pub fn apply_command_to_device_at(device: &mut Device, command: DeviceCommand, now_millis: i64) {
+    apply_command_with_clock(device, command, || now_millis);
+}
+
+fn apply_command_with_clock(
+    device: &mut Device,
+    command: DeviceCommand,
+    now: impl FnOnce() -> i64,
+) {
     match command {
         DeviceCommand::SetId(id) => {
             device.pn = id;
@@ -135,7 +147,7 @@ pub fn apply_command_to_device(device: &mut Device, command: DeviceCommand) {
             device.app_version_primary = p;
             device.app_version_secondary = s;
             device.app_version_tertiary = t;
-            device.app_version_last_fetched_ms = crate::time::now_millis();
+            device.app_version_last_fetched_ms = now();
         }
         DeviceCommand::SetDeviceProps(override_) => {
             device.set_device_props(override_);

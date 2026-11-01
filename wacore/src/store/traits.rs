@@ -889,6 +889,12 @@ fn unsupported_pending_inbound() -> crate::store::error::StoreError {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait ProtocolStore: Send + Sync {
+    /// The clock used for locally generated storage timestamps.
+    #[cfg(feature = "instance-clock")]
+    fn clock(&self) -> Option<&Arc<dyn crate::time::Clock>> {
+        None
+    }
+
     // --- Per-Device Sender Key Tracking (matches WA Web's participant.senderKey Map) ---
 
     /// Get the sender key distribution status for all known devices in a group.

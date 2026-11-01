@@ -358,7 +358,7 @@ async fn seed_registry(client: &Arc<Client>, user: &str, devices: &[u16]) {
 
 /// Let the coalesced flush worker the warm-up sends armed fire and stand down.
 ///
-/// `persist_signal_state_pre_wire` arms a 25 ms worker on a lease-covered send
+/// `confirm_signal_state_pre_wire` arms a 25 ms worker on a lease-covered send
 /// instead of writing through. This fixture drives everything from `block_on`
 /// on a single-threaded runtime, so that worker can only ever run *inside* a
 /// later `block_on` — which, once sampling starts, means inside a measured
@@ -580,7 +580,7 @@ async fn install_offline_socket(client: &Arc<Client>) {
     );
     *client.noise_socket.lock().expect("noise socket mutex") = Some(Arc::new(noise_socket));
     client.set_connected_for_test(true);
-    client.is_running.store(true, Ordering::Release);
+    client.set_driver_running_for_test(true, Ordering::Release);
     client.enter_live_mode_for_tests();
 }
 

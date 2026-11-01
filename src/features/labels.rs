@@ -253,7 +253,7 @@ impl<'a> Labels<'a> {
                 proto.deleted = Some(false);
                 proto
             });
-            proto.timestamp = Some(wacore::time::now_millis());
+            proto.timestamp = Some(self.client.runtime.wall_time_millis());
             proto
         };
         self.client
@@ -277,7 +277,7 @@ impl<'a> Labels<'a> {
                 proto.deleted = Some(true);
                 proto
             });
-            proto.timestamp = Some(wacore::time::now_millis());
+            proto.timestamp = Some(self.client.runtime.wall_time_millis());
             proto
         };
         self.client
@@ -360,7 +360,7 @@ impl<'a> Labels<'a> {
             .send_app_state_action(
                 &schemas::LABEL_JID,
                 &[label_id, chat.as_str()],
-                &association_value(labeled),
+                &association_value(labeled, self.client.runtime.wall_time_millis()),
             )
             .await
     }
@@ -395,13 +395,13 @@ impl<'a> Labels<'a> {
                 // guessing one would key the association off a row the server
                 // does not have.
                 &[label_id, chat.as_str(), message_id.as_str(), "0", "0"],
-                &association_value(labeled),
+                &association_value(labeled, self.client.runtime.wall_time_millis()),
             )
             .await
     }
 }
 
-fn association_value(labeled: bool) -> wa::SyncActionValue {
+fn association_value(labeled: bool, timestamp_ms: i64) -> wa::SyncActionValue {
     {
         let mut proto = wa::SyncActionValue::default();
         proto.label_association_action = buffa::MessageField::some({
@@ -409,7 +409,7 @@ fn association_value(labeled: bool) -> wa::SyncActionValue {
             proto.labeled = Some(labeled);
             proto
         });
-        proto.timestamp = Some(wacore::time::now_millis());
+        proto.timestamp = Some(timestamp_ms);
         proto
     }
 }

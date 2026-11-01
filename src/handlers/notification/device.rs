@@ -117,10 +117,7 @@ pub(crate) async fn handle_prekey_low(client: &Arc<Client>) {
             // Wait for offline delivery first (matches WA Web's waitForOfflineDeliveryEnd)
             client_clone.wait_for_offline_delivery_end().await;
 
-            if !client_clone
-                .is_logged_in
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
+            if !client_clone.is_logged_in() {
                 debug!("Pre-key upload skipped: disconnected during offline delivery wait");
                 return;
             }

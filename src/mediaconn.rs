@@ -58,8 +58,12 @@ impl MediaConn {
     /// Check if this connection info has expired.
     /// Uses the earlier of route TTL and auth TTL (auth may expire before routes).
     pub fn is_expired(&self) -> bool {
+        self.is_expired_at(Instant::now())
+    }
+
+    pub fn is_expired_at(&self, now: Instant) -> bool {
         let effective_ttl = self.auth_ttl.map_or(self.ttl, |at| self.ttl.min(at));
-        self.fetched_at.elapsed() > Duration::from_secs(effective_ttl)
+        now.saturating_duration_since(self.fetched_at) > Duration::from_secs(effective_ttl)
     }
 }
 
@@ -127,7 +131,7 @@ impl Client {
             ttl: response.ttl,
             auth_ttl: response.auth_ttl,
             hosts: response.hosts,
-            fetched_at: Instant::now(),
+            fetched_at: self.runtime.monotonic_time(),
         };
 
         // No fetch or auth invalidation followed this query: it can publish.
@@ -163,7 +167,7 @@ impl Client {
     async fn cached_media_conn(&self) -> Option<MediaConn> {
         let guard = self.media_conn.read().await;
         match &*guard {
-            Some(conn) if !conn.is_expired() => Some(conn.clone()),
+            Some(conn) if !conn.is_expired_at(self.runtime.monotonic_time()) => Some(conn.clone()),
             _ => None,
         }
     }
@@ -179,7 +183,7 @@ impl Client {
             .read()
             .await
             .as_ref()
-            .filter(|conn| !conn.is_expired())
+            .filter(|conn| !conn.is_expired_at(self.runtime.monotonic_time()))
             .map(crate::download::MediaRoute::from);
         self.check_media_conn_generation(generation)?;
         Ok(route)
@@ -500,7 +504,7 @@ mod tests {
         let held = client.media_conn.write().await;
         let mut pending = Box::pin(client.cached_download_route());
         assert!(futures::poll!(&mut pending).is_pending());
-        client.connection_generation.fetch_add(1, Ordering::AcqRel);
+        client.advance_generation_for_test(1, Ordering::AcqRel);
         drop(held);
         assert!(matches!(pending.await, Err(IqError::NotConnected)));
         assert!(client.media_conn_flight.lock().unwrap().is_none());
@@ -969,7 +973,7 @@ mod tests {
         drive_pending_until(old.as_mut(), || transport.sent().len() == 1).await;
         let mut old_waiter = Box::pin(client.refresh_media_conn(true));
         assert!(futures::poll!(&mut old_waiter).is_pending());
-        client.connection_generation.fetch_add(1, Ordering::AcqRel);
+        client.advance_generation_for_test(1, Ordering::AcqRel);
         let mut current = Box::pin(client.refresh_media_conn(true));
         drive_pending_until(current.as_mut(), || transport.sent().len() == 2).await;
         answer_frame(&client, &transport, 0, "retired-auth", 3600).await;

@@ -119,7 +119,7 @@ impl<'a> AppStateSettings<'a> {
                 proto.is_previews_disabled = Some(disabled);
                 proto
             });
-            proto.timestamp = Some(wacore::time::now_millis());
+            proto.timestamp = Some(self.client.runtime.wall_time_millis());
             proto
         };
         self.client

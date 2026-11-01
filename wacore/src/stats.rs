@@ -248,10 +248,15 @@ impl SessionStats {
     /// One encrypted frame written to the transport.
     #[inline]
     pub fn record_frame_sent(&self, wire_bytes: usize) {
+        self.record_frame_sent_with(wire_bytes, Self::now);
+    }
+
+    #[inline]
+    pub fn record_frame_sent_with(&self, wire_bytes: usize, now: impl FnOnce() -> Instant) {
         self.bytes_sent
             .fetch_add(wire_bytes as u64, Ordering::Relaxed);
         self.frames_sent.fetch_add(1, Ordering::Relaxed);
-        self.arm_dead_socket_deadline();
+        self.arm_dead_socket_deadline_with(now);
     }
 
     /// Arm the dead-socket deadline for a write that is starting, before it
@@ -265,6 +270,11 @@ impl SessionStats {
     /// Idempotent with the arm in [`Self::record_frame_sent`].
     #[inline]
     pub fn arm_dead_socket_deadline(&self) {
+        self.arm_dead_socket_deadline_with(Self::now);
+    }
+
+    #[inline]
+    pub fn arm_dead_socket_deadline_with(&self, now: impl FnOnce() -> Instant) {
         // Arm the dead-socket deadline on the FIRST send after a receive (WA Web
         // `onOrBefore` keeps the earliest deadline; later sends must not push it out).
         // Re-arm when the anchor is unset OR stale, i.e. a receive landed after it was
@@ -282,7 +292,7 @@ impl SessionStats {
             // under a CAS, so once an anchor is set a later send cannot overwrite
             // it. Two senders that both see it unarmed still resolve by whichever
             // CAS lands first, which the serial sender task makes unreachable.
-            self.first_send_since_recv.store_if(Self::now(), is_stale);
+            self.first_send_since_recv.store_if(now(), is_stale);
         }
     }
 
@@ -295,12 +305,22 @@ impl SessionStats {
     /// drains — not to pay a second clock read per frame.
     #[inline]
     pub fn record_recv_batch(&self, wire_bytes: usize, frames: u32) {
+        self.record_recv_batch_with(wire_bytes, frames, Self::now);
+    }
+
+    #[inline]
+    pub fn record_recv_batch_with(
+        &self,
+        wire_bytes: usize,
+        frames: u32,
+        now: impl FnOnce() -> Instant,
+    ) {
         self.bytes_received
             .fetch_add(wire_bytes as u64, Ordering::Relaxed);
         self.frames_received
             .fetch_add(frames as u64, Ordering::Relaxed);
         if frames > 1 {
-            self.last_data_received.store(Self::now());
+            self.last_data_received.store(now());
             // A receive cancels the dead-socket deadline; the next send re-arms it.
             self.first_send_since_recv.clear();
         }
@@ -311,7 +331,12 @@ impl SessionStats {
     /// [`Self::record_recv_batch`].
     #[inline]
     pub fn mark_recv_activity(&self) {
-        self.last_data_received.store(Self::now());
+        self.mark_recv_activity_at(Self::now());
+    }
+
+    #[inline]
+    pub fn mark_recv_activity_at(&self, now: Instant) {
+        self.last_data_received.store(now);
         // A receive cancels the dead-socket deadline; the next send re-arms it.
         self.first_send_since_recv.clear();
     }
@@ -405,6 +430,14 @@ impl SessionStats {
     /// (`reconnect_errors`, `resends_throttled`,
     /// `messages_suppressed_duplicate`) are left zero for the owner to fill.
     pub fn snapshot(&self) -> StatsSnapshot {
+        self.snapshot_with_clock(crate::time::now_millis, Self::now)
+    }
+
+    pub fn snapshot_with_clock(
+        &self,
+        wall: impl FnOnce() -> i64,
+        monotonic: impl FnOnce() -> Instant,
+    ) -> StatsSnapshot {
         StatsSnapshot {
             bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
             bytes_received: self.bytes_received.load(Ordering::Relaxed),
@@ -432,8 +465,8 @@ impl SessionStats {
                 .last_data_received
                 .load()
                 .map(|at| {
-                    let now = crate::time::now_millis().max(0) as u64;
-                    now.saturating_sub(at.elapsed().as_millis() as u64)
+                    let now = wall().max(0) as u64;
+                    now.saturating_sub(monotonic().saturating_duration_since(at).as_millis() as u64)
                 })
                 .unwrap_or(0),
         }

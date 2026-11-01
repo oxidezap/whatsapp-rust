@@ -270,7 +270,7 @@ impl Client {
         self.pair_code_state
             .lock()
             .await
-            .is_outstanding(wacore::time::Instant::now())
+            .is_outstanding(self.runtime.monotonic_time())
     }
 
     async fn pair_with_code_inner(
@@ -321,7 +321,7 @@ impl Client {
         // WA Web also starts before the request (`startAltLinkingFlow` sets
         // `codeGenerationTs` before sending), so the ~180s window covers the
         // round trip rather than starting after it.
-        let requested_at = wacore::time::Instant::now();
+        let requested_at = self.runtime.monotonic_time();
         let code_expires_at = requested_at + PairCodeUtils::code_validity();
         let claim = wacore::pair_code::PairCodeClaim::next();
         {
@@ -498,7 +498,7 @@ impl Client {
         // started before stage 1, so advertise the *remaining* window — otherwise
         // a consumer's countdown would outlast the server's (and our own
         // `handle_primary_hello`) expiry by the stage-1 elapsed time.
-        let remaining = code_expires_at.saturating_duration_since(wacore::time::Instant::now());
+        let remaining = code_expires_at.saturating_duration_since(self.runtime.monotonic_time());
         self.core.event_bus.dispatch(Event::PairingCode(
             crate::types::events::PairingCode::builder()
                 .code(code.clone())
@@ -716,7 +716,7 @@ async fn handle_primary_hello(
                 );
                 return false;
             }
-            let now = wacore::time::Instant::now();
+            let now = client.runtime.monotonic_time();
             if now > *code_expires_at {
                 warn!(
                     target: "Client/PairCode",

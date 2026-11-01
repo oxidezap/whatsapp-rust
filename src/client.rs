@@ -32,6 +32,7 @@ mod notification_scope;
 pub(crate) use notification_scope::NotificationScope;
 pub(crate) mod offline_resume;
 mod sender_keys;
+mod session_state;
 mod sessions;
 pub(crate) mod subsystem;
 pub(crate) mod voip;
@@ -87,7 +88,7 @@ use wacore_binary::Jid;
 
 use portable_atomic::AtomicU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use wacore::stanza::wire_tags::{NotificationType, StanzaTag};
 
 /// Lease that keeps decrypted-payload events enabled for one consumer.
@@ -1643,35 +1644,126 @@ impl ResponseWaiterMap {
     }
 }
 
-/// Preference and irreversible protocol verdict share one atomic word so a
-/// concurrent host re-enable cannot erase the verdict. The Arc stays the same
-/// size as the former raw atomic handle; no extra Client attachment is needed.
-struct AutoReconnect(AtomicU8);
+/// Transitions own the core model; hot reads use one coherent atomic snapshot.
+/// Stored inline because no owner outlives Client independently.
+struct SessionState {
+    status: AtomicU16,
+    reconnect_errors: AtomicU32,
+    lifecycle_state: std::sync::Mutex<wacore::session_engine::lifecycle::Lifecycle>,
+}
 
-impl AutoReconnect {
-    const ENABLED: u8 = 1;
-    const TERMINAL: u8 = 2;
+impl SessionState {
+    const ENABLED: u16 = 1;
+    const TERMINAL: u16 = 2;
+    const DRIVING: u16 = 4;
+    const CONNECTING: u16 = 8;
+    const CONNECTED: u16 = 16;
+    const LOGGED_IN: u16 = 32;
+    const READY: u16 = 64;
+    const PAUSED: u16 = 128;
+    const EXPECTED: u16 = 256;
+    const INTENTIONAL: u16 = 512;
+    const PAUSE_EXIT: u16 = 1024;
+    const PENALTY: u16 = 2048;
 
     fn new(enabled: bool) -> Self {
-        Self(AtomicU8::new(u8::from(enabled)))
+        use wacore::session_engine::lifecycle::{Lifecycle, ReconnectPolicy};
+        Self {
+            status: AtomicU16::new(u16::from(enabled)),
+            reconnect_errors: AtomicU32::new(0),
+            lifecycle_state: std::sync::Mutex::new(Lifecycle::new(if enabled {
+                ReconnectPolicy::Enabled
+            } else {
+                ReconnectPolicy::Disabled
+            })),
+        }
+    }
+
+    fn status_bits(state: &wacore::session_engine::lifecycle::Lifecycle) -> u16 {
+        use wacore::session_engine::lifecycle::ReconnectPolicy;
+        let snapshot = state.snapshot();
+        let mut bits = match snapshot.policy() {
+            ReconnectPolicy::Enabled => Self::ENABLED,
+            ReconnectPolicy::Disabled => 0,
+            ReconnectPolicy::Forbidden => Self::TERMINAL,
+        };
+        if snapshot.driving() {
+            bits |= Self::DRIVING;
+        }
+        if snapshot.attempt_active() {
+            bits |= Self::CONNECTING;
+        }
+        if snapshot.connected() {
+            bits |= Self::CONNECTED;
+        }
+        if snapshot.logged_in() {
+            bits |= Self::LOGGED_IN;
+        }
+        if snapshot.ready() {
+            bits |= Self::READY;
+        }
+        if snapshot.paused() {
+            bits |= Self::PAUSED;
+        }
+        if matches!(
+            snapshot.intent(),
+            wacore::session_engine::lifecycle::DisconnectIntent::Expected
+                | wacore::session_engine::lifecycle::DisconnectIntent::ExpectedAndIntentional
+        ) {
+            bits |= Self::EXPECTED;
+        }
+        if matches!(
+            snapshot.intent(),
+            wacore::session_engine::lifecycle::DisconnectIntent::Intentional
+                | wacore::session_engine::lifecycle::DisconnectIntent::ExpectedAndIntentional
+        ) {
+            bits |= Self::INTENTIONAL;
+        }
+        if snapshot.pause_exit_pending() {
+            bits |= Self::PAUSE_EXIT;
+        }
+        if snapshot.penalty_pending() {
+            bits |= Self::PENALTY;
+        }
+        bits
+    }
+
+    fn publish(&self, state: &wacore::session_engine::lifecycle::Lifecycle, ordering: Ordering) {
+        self.reconnect_errors
+            .store(state.snapshot().backoff_attempt(), Ordering::Relaxed);
+        self.status.store(Self::status_bits(state), ordering);
+    }
+
+    fn transition<R>(
+        &self,
+        ordering: Ordering,
+        apply: impl FnOnce(&mut wacore::session_engine::lifecycle::Lifecycle) -> R,
+    ) -> R {
+        let mut state = self
+            .lifecycle_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = apply(&mut state);
+        self.publish(&state, ordering);
+        result
+    }
+
+    fn driving(&self, ordering: Ordering) -> bool {
+        self.status.load(ordering) & Self::DRIVING != 0
     }
 
     fn load(&self, ordering: Ordering) -> bool {
-        self.0.load(ordering) & Self::ENABLED != 0
+        self.status.load(ordering) & Self::ENABLED != 0
     }
 
     fn swap(&self, enabled: bool, ordering: Ordering) -> bool {
-        let previous = self
-            .0
-            .fetch_update(ordering, Ordering::Relaxed, |state| {
-                Some(if enabled && state & Self::TERMINAL == 0 {
-                    state | Self::ENABLED
-                } else {
-                    state & !Self::ENABLED
-                })
-            })
-            .unwrap_or_else(|state| state);
-        previous & Self::ENABLED != 0
+        let mut state = self
+            .lifecycle_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = state.set_reconnect(enabled);
+        self.status.swap(Self::status_bits(&state), ordering);
+        previous
     }
 
     fn store(&self, enabled: bool, ordering: Ordering) {
@@ -1679,15 +1771,16 @@ impl AutoReconnect {
     }
 
     fn stop_permanently(&self) {
-        let _ = self
-            .0
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                Some((state | Self::TERMINAL) & !Self::ENABLED)
-            });
+        let mut state = self
+            .lifecycle_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.forbid_reconnect();
+        self.publish(&state, Ordering::Release);
     }
 
     fn is_terminal(&self) -> bool {
-        self.0.load(Ordering::Acquire) & Self::TERMINAL != 0
+        self.status.load(Ordering::Acquire) & Self::TERMINAL != 0
     }
 }
 
@@ -1740,7 +1833,7 @@ impl AutoReconnect {
 /// fn raw_cache(client: &whatsapp_rust::Client) { let _ = &client.group_cache; }
 /// ```
 /// ```compile_fail,E0616
-/// fn raw_policy(client: &whatsapp_rust::Client) { let _ = &client.enable_auto_reconnect; }
+/// fn raw_policy(client: &whatsapp_rust::Client) { let _ = &client.session_state; }
 /// ```
 /// ```compile_fail,E0616
 /// fn raw_handlers(client: &whatsapp_rust::Client) { let _ = &client.custom_enc_handlers; }
@@ -1777,16 +1870,8 @@ pub struct Client {
     #[cfg(test)]
     pub(crate) media_conn_test_in_store: AtomicU32,
 
-    pub(crate) is_logged_in: AtomicBool,
     #[cfg(feature = "client-lifecycle")]
     pub(crate) login_transition: std::sync::Mutex<()>,
-    pub(crate) is_connecting: AtomicBool,
-    pub(crate) is_running: AtomicBool,
-    /// Whether the noise socket is established (connected to WhatsApp servers).
-    /// Uses an AtomicBool instead of probing the noise_socket mutex to avoid
-    /// TOCTOU races where `try_lock()` fails due to contention, not disconnection.
-    is_connected: AtomicBool,
-
     /// whatsmeow's `sendActiveReceipts`: 0 = inactive (default), 1 = active
     /// (presence available), 2 = forced. When 0, delivery receipts use `type="inactive"`.
     send_active_receipts: AtomicU32,
@@ -1926,11 +2011,6 @@ pub struct Client {
     /// `OnceLock` keeps the read on that path down to an atomic load.
     pub(crate) group_cache: std::sync::OnceLock<Arc<GroupCache>>,
 
-    pub(crate) expected_disconnect: AtomicBool,
-    /// Set by `reconnect()` to suppress the "Message loop exited with an error" warning.
-    /// Unlike `expected_disconnect`, this does NOT skip the reconnect backoff.
-    pub(crate) intentional_reconnect: AtomicBool,
-
     /// Connection generation counter - incremented on each new connection.
     /// Used to detect stale post-login tasks from previous connections.
     pub(crate) connection_generation: Arc<AtomicU64>,
@@ -2018,22 +2098,11 @@ pub struct Client {
     /// window does not end because our socket did.
     pub(crate) duplicate_dispatch_suppressed: AtomicU64,
 
-    enable_auto_reconnect: Arc<AutoReconnect>,
-    /// Set by [`Client::pause`] and cleared by [`Client::resume`]: the run loop
-    /// parks instead of connecting for as long as it holds.
-    ///
-    /// Deliberately not part of `is_terminal`: a paused client is between
-    /// connections, not finished, and the application means to come back.
-    pub(crate) paused: AtomicBool,
+    session_state: SessionState,
     /// Fired by [`Client::pause`] and [`Client::resume`], and by nothing else,
     /// so the run loop's reconnect backoff can watch it without the spurious
     /// wakes that would collapse the delay it exists to serve.
     pub(crate) pause_state_notifier: event_listener::Event,
-    /// Set by [`Client::pause`] for the connection it tears down, consumed by
-    /// the run loop's post-connection branch. A one-shot fact rather than a
-    /// re-read of `paused`, because a [`Client::resume`] can land between the
-    /// two and the backoff a pause does not owe must not turn on that timing.
-    pub(crate) pause_teardown_pending: AtomicBool,
     /// Bumped by every [`Client::pause`]. A connection attempt reads it once at
     /// the start and is refused if it has moved, so an attempt that spanned a
     /// pause is never published — even when a [`Client::resume`] landed while it
@@ -2046,20 +2115,6 @@ pub struct Client {
     /// network I/O — so it cannot become the kind of wait that parks a caller
     /// behind an unresponsive socket.
     pub(crate) connection_publish: Mutex<()>,
-    /// Consecutive reconnect failures, drives the Fibonacci backoff. Exposed
-    /// read-only via [`StatsSnapshot::reconnect_errors`](wacore::stats::StatsSnapshot).
-    pub(crate) auto_reconnect_errors: AtomicU32,
-    /// When the last successful authentication (`<success>`) landed, or unset.
-    /// Gates the WA Web `resetDelay` backoff reset (see [`should_reset_backoff`]).
-    /// Monotonic: it only ever answers how long the connection has been up, and
-    /// a wall clock would let a resumed laptop declare a seconds-old connection
-    /// stable, or a backwards adjustment withhold the reset indefinitely.
-    pub(crate) connected_at: wacore::time::AtomicInstant,
-    /// Set when an explicit backoff penalty was applied this connection (429
-    /// rate-limit, manual `reconnect()`); cleared on the next `<success>`. Keeps
-    /// the stability reset from erasing a deliberate penalty (WA Web `cancelReset`).
-    pub(crate) backoff_reset_suppressed: AtomicBool,
-
     pub(crate) needs_initial_full_sync: Arc<app_state::BootstrapGate>,
 
     /// Built on first app-state use and never replaced: reconnect clears the
@@ -2158,11 +2213,6 @@ pub struct Client {
     /// Notifier for when the noise socket is established (before login).
     /// Use this to wait for the socket to be ready for sending messages.
     pub(crate) socket_ready_notifier: event_listener::Event,
-    /// Set to `true` only when `dispatch_connected()` fires (once the critical
-    /// sync has an answer, clean or not). Reset on each new connection attempt.
-    /// Used by `wait_for_session_ready()` to avoid a false-positive fast path when
-    /// the client is logged in but critical app state hasn't been asked for yet.
-    pub(crate) is_ready: AtomicBool,
     /// Notifier for when the client is fully connected and logged in.
     /// Triggered after Event::Connected is dispatched.
     pub(crate) connected_notifier: event_listener::Event,
@@ -2735,8 +2785,10 @@ fn is_encrypt_notification(node: &wacore_binary::NodeRef<'_>) -> bool {
 
 #[cfg(test)]
 pub(crate) use wacore::protocol::reconnect::MAX_BACKOFF_ATTEMPTS;
+#[cfg(test)]
 pub(crate) use wacore::protocol::reconnect::{next_backoff_attempt, should_reset_backoff};
 
+#[cfg(test)]
 fn fibonacci_backoff(attempt: u32) -> Duration {
     use wacore::protocol::reconnect::{backoff_delay, fibonacci_base_millis};
     let base = fibonacci_base_millis(attempt);

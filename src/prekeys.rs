@@ -776,7 +776,7 @@ impl Client {
                         .await;
 
                     // Bail if disconnected during retry wait
-                    if !self.is_logged_in.load(Ordering::Relaxed) {
+                    if !self.is_logged_in() {
                         wacore::telemetry::prekey_upload("fail");
                         return Err(anyhow::anyhow!(
                             "Connection lost during pre-key upload retry"

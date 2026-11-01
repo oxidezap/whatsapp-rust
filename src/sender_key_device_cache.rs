@@ -218,6 +218,16 @@ impl SenderKeyDeviceCache {
         }
     }
 
+    pub(crate) fn new_on(
+        config: &CacheEntryConfig,
+        runtime: &Arc<dyn wacore::runtime::Runtime>,
+    ) -> Self {
+        let Self { inner } = Self::new(config);
+        Self {
+            inner: inner.on_runtime(runtime),
+        }
+    }
+
     /// Atomically get-or-init: returns cached value or runs `init` once per key.
     /// Concurrent callers for the same key share the single init result.
     pub(crate) async fn get_or_init<F>(&self, group_jid: &str, init: F) -> Arc<SenderKeyDeviceMap>

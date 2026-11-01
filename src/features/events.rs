@@ -101,7 +101,7 @@ impl<'a> Events<'a> {
         let response_msg = {
             let mut proto = wa::message::EventResponseMessage::default();
             proto.response = Some(response);
-            proto.timestamp_ms = Some(wacore::time::now_millis());
+            proto.timestamp_ms = Some(self.client.runtime.wall_time_millis());
             proto.extra_guest_count = extra_guest_count;
             proto
         };

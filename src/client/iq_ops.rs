@@ -171,7 +171,8 @@ impl Client {
                     .into(),
             ));
         }
-        let msg = build_ephemeral_setting_message(duration, wacore::time::now_secs_u64() as i64);
+        let msg =
+            build_ephemeral_setting_message(duration, self.runtime.wall_time_secs_u64() as i64);
         self.send_message(chat, msg).await
     }
 

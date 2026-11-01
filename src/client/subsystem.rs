@@ -70,7 +70,10 @@ pub(crate) trait Subsystem: 'static {
     /// Retained collections, named as `MemoryReport` prints them under
     /// [`Self::NAME`]. Takes the state rather than the client, so reporting
     /// cannot quietly become a second way for a subsystem to read the core.
-    fn memory(_state: &Self::State) -> Vec<(&'static str, CollectionStats)> {
+    fn memory(
+        _state: &Self::State,
+        _now: impl FnOnce() -> wacore::time::Instant,
+    ) -> Vec<(&'static str, CollectionStats)> {
         Vec::new()
     }
 }
@@ -160,12 +163,12 @@ macro_rules! subsystems {
 
         /// Collects what the attached subsystems retain, for the memory report.
         #[allow(unused_variables, unused_mut)]
-        pub(crate) fn memory(subsystems: &Subsystems) -> Vec<SubsystemMemory> {
+        pub(crate) fn memory(subsystems: &Subsystems, now: impl Fn() -> wacore::time::Instant) -> Vec<SubsystemMemory> {
             let mut retained = Vec::new();
             $(
                 $(#[$attr])*
                 retained.extend(
-                    <$subsystem as Subsystem>::memory(&subsystems.$field)
+                    <$subsystem as Subsystem>::memory(&subsystems.$field, &now)
                         .into_iter()
                         .map(|(collection, stats)| SubsystemMemory {
                             subsystem: <$subsystem as Subsystem>::NAME,

@@ -153,7 +153,7 @@ impl Client {
         // must not tear down a connection that still answers keepalives.
         let has_pending = !self.response_waiters_guard().is_empty();
         if has_pending {
-            let now = wacore::time::Instant::now();
+            let now = self.runtime.monotonic_time();
             let last_recv = self.stats.last_data_received();
             let watchdog_expired =
                 is_dead_socket_at(self.stats.first_send_since_recv(), last_recv, now);
@@ -171,14 +171,21 @@ impl Client {
         // wall_rtt_ms feeds the WA Web onClockSkewUpdate formula, which
         // mixes start_ms with serverTime — both halves must be wall-clock.
         // rtt_monotonic is for the log only.
-        let start_ms = wacore::time::now_millis();
-        let rtt_start = wacore::time::Instant::now();
+        let start_ms = self.runtime.wall_time_millis();
+        let rtt_start = self.runtime.monotonic_time();
         let iq = wacore::iq::keepalive::KeepaliveSpec::with_timeout(KEEP_ALIVE_RESPONSE_DEADLINE)
             .build_iq();
         match self.send_iq(iq).await {
             Ok(response_node) => {
-                let rtt_monotonic = rtt_start.elapsed();
-                let wall_rtt_ms = wacore::time::now_millis().saturating_sub(start_ms).max(0);
+                let rtt_monotonic = self
+                    .runtime
+                    .monotonic_time()
+                    .saturating_duration_since(rtt_start);
+                let wall_rtt_ms = self
+                    .runtime
+                    .wall_time_millis()
+                    .saturating_sub(start_ms)
+                    .max(0);
                 client_log!(self, debug, target: "Client/Keepalive", "Received keepalive pong (RTT: {rtt_monotonic:.2?})");
                 self.unified_session.update_server_time_offset_with_rtt(
                     response_node.get(),
@@ -299,7 +306,7 @@ impl Client {
 
                     let previous_failures = health.failures();
                     let action = health.before_probe(
-                        wacore::time::Instant::now(),
+                        self.runtime.monotonic_time(),
                         self.stats.last_data_received(),
                         self.stats.first_send_since_recv(),
                     );
@@ -324,7 +331,7 @@ impl Client {
                     let previous_failures = health.failures();
                     let action = health.probe_completed(
                         outcome,
-                        wacore::time::Instant::now(),
+                        self.runtime.monotonic_time(),
                         receive_before_probe,
                         self.stats.last_data_received(),
                         self.stats.first_send_since_recv(),
@@ -360,7 +367,7 @@ impl Client {
                     // activity after that attempt: any receive cancels the watchdog.
                     if action == HealthAction::Reconnect {
                         let first_send = self.stats.first_send_since_recv();
-                        let now = wacore::time::Instant::now();
+                        let now = self.runtime.monotonic_time();
                         let elapsed = elapsed_since_at(first_send, now).unwrap_or_default();
                         let pending = self.response_waiters_guard().len();
                         client_log!(self, warn,
@@ -474,7 +481,7 @@ impl Client {
     /// buffer is pruned. See [`Self::run_startup_retention_cleanup`] for why
     /// the startup caller passes `false`.
     async fn run_retention_cleanup_scope(&self, sent_msg_ttl: u64, sweep_pending_inbound: bool) {
-        let now = wacore::time::now_secs();
+        let now = self.runtime.wall_time_secs();
         let cutoff_for = |ttl: u64| now.saturating_sub(i64::try_from(ttl).unwrap_or(i64::MAX));
 
         let backend = self.persistence_manager.backend();
@@ -726,7 +733,7 @@ mod tests {
         let stale_generation = client.connection_generation.load(Ordering::Acquire);
         // The connection this loop was started for is retired, and (as after a
         // reconnect) the client is connected again on a newer one.
-        client.connection_generation.fetch_add(1, Ordering::SeqCst);
+        client.advance_generation_for_test(1, Ordering::SeqCst);
 
         tokio::time::timeout(
             Duration::from_secs(600),

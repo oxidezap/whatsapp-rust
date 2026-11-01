@@ -259,7 +259,7 @@ impl Client {
                         match event_result {
                             Ok(crate::transport::TransportEvent::DataReceived(data)) => {
                                 // Update dead-socket timer (WA Web: deadSocketTimer reset)
-                                self.stats.mark_recv_activity();
+                                self.stats.mark_recv_activity_at(self.runtime.monotonic_time());
                                 let wire_bytes = data.len();
 
                                 // Consumed here, before any await below: a read
@@ -290,12 +290,12 @@ impl Client {
                                     }
 
                                     // Check if we should exit after processing (e.g., after 515 stream error)
-                                    if shutdown.is_fired() || self.expected_disconnect.load(Ordering::Relaxed) {
+                                    if shutdown.is_fired() || self.expected_session_disconnect(Ordering::Relaxed) {
                                         debug!("Expected disconnect signaled during frame processing. Exiting message loop.");
                                         // The batch (this frame included — its counter
                                         // increment is below) must not vanish from the
                                         // wire counters on this exit path.
-                                        self.stats.record_recv_batch(wire_bytes, frames_in_batch + 1);
+                                        self.stats.record_recv_batch_with(wire_bytes, frames_in_batch + 1, || self.runtime.monotonic_time());
                                         return Ok(ReadLoopExit::Expected);
                                     }
 
@@ -313,10 +313,10 @@ impl Client {
                                 // completion time, not just the arrival time. Prevents
                                 // stale reads when a large batch (e.g. offline sync)
                                 // takes seconds to drain.
-                                self.stats.record_recv_batch(wire_bytes, frames_in_batch);
+                                self.stats.record_recv_batch_with(wire_bytes, frames_in_batch, || self.runtime.monotonic_time());
                             },
                             Ok(crate::transport::TransportEvent::Disconnected(reason)) => {
-                                if !self.expected_disconnect.load(Ordering::Relaxed) {
+                                if !self.expected_session_disconnect(Ordering::Relaxed) {
                                     // A routine server recycle (clean EOF / normal close) is not
                                     // an error — quiet log, Ok exit. A real transport error stays
                                     // WARN + Err so it's never hidden behind reconnect noise.
@@ -336,7 +336,7 @@ impl Client {
                             // can't prove it was a clean recycle, so it stays loud (WARN),
                             // matching the conservative `Unknown` rule in is_clean_shutdown.
                             Err(_) => {
-                                if !self.expected_disconnect.load(Ordering::Relaxed) {
+                                if !self.expected_session_disconnect(Ordering::Relaxed) {
                                     warn!("Transport event channel closed; reconnecting.");
                                     return Err(ReadLoopError::ChannelClosed);
                                 } else {
@@ -571,8 +571,8 @@ impl Client {
                         .active
                         .store(true, Ordering::Release);
                     match self.offline_sync_metrics.start_time.lock() {
-                        Ok(mut guard) => *guard = Some(wacore::time::Instant::now()),
-                        Err(poison) => *poison.into_inner() = Some(wacore::time::Instant::now()),
+                        Ok(mut guard) => *guard = Some(self.runtime.monotonic_time()),
+                        Err(poison) => *poison.into_inner() = Some(self.runtime.monotonic_time()),
                     }
                     debug!(target: "Client/OfflineSync", "Sync STARTED: Expecting {} items.", count);
                 }
@@ -587,8 +587,13 @@ impl Client {
                     .processed_messages
                     .load(Ordering::Acquire);
                 let elapsed = match self.offline_sync_metrics.start_time.lock() {
-                    Ok(guard) => guard.map(|t| t.elapsed()).unwrap_or_default(),
-                    Err(poison) => poison.into_inner().map(|t| t.elapsed()).unwrap_or_default(),
+                    Ok(guard) => guard
+                        .map(|t| self.runtime.monotonic_time().saturating_duration_since(t))
+                        .unwrap_or_default(),
+                    Err(poison) => poison
+                        .into_inner()
+                        .map(|t| self.runtime.monotonic_time().saturating_duration_since(t))
+                        .unwrap_or_default(),
                 };
                 debug!(target: "Client/OfflineSync", "Sync COMPLETED: End marker received. Processed {} items in {:.2?}.", processed, elapsed);
                 self.offline_sync_metrics
@@ -629,8 +634,13 @@ impl Client {
 
                 if processed >= total {
                     let elapsed = match self.offline_sync_metrics.start_time.lock() {
-                        Ok(guard) => guard.map(|t| t.elapsed()).unwrap_or_default(),
-                        Err(poison) => poison.into_inner().map(|t| t.elapsed()).unwrap_or_default(),
+                        Ok(guard) => guard
+                            .map(|t| self.runtime.monotonic_time().saturating_duration_since(t))
+                            .unwrap_or_default(),
+                        Err(poison) => poison
+                            .into_inner()
+                            .map(|t| self.runtime.monotonic_time().saturating_duration_since(t))
+                            .unwrap_or_default(),
                     };
                     debug!(target: "Client/OfflineSync", "Sync COMPLETED: Processed {} items in {:.2?}.", processed, elapsed);
                     self.offline_sync_metrics
@@ -661,7 +671,7 @@ impl Client {
         }
 
         if tag == Some(StanzaTag::XmlStreamEnd) {
-            if self.expected_disconnect.load(Ordering::Relaxed) {
+            if self.expected_session_disconnect(Ordering::Relaxed) {
                 debug!("Received <xmlstreamend/>, expected disconnect.");
             } else {
                 // A bare <xmlstreamend/> is the server cleanly ending the stream
@@ -1079,7 +1089,7 @@ impl Client {
     /// rather than raced against the disconnect, and sending them anyway would
     /// also hold the outbound flush open until its timeout.
     pub(crate) fn outbound_teardown_in_progress(&self) -> bool {
-        self.expected_disconnect.load(Ordering::Relaxed) || !self.is_socket_connected()
+        self.expected_session_disconnect(Ordering::Relaxed) || !self.is_socket_connected()
     }
 
     /// How many queued acks one burst may take.
@@ -1228,7 +1238,7 @@ impl Client {
         node: &wacore_binary::NodeRef<'_>,
         shutdown: Option<&wacore::runtime::ShutdownSignal>,
     ) -> Result<(), ClientError> {
-        if self.expected_disconnect.load(Ordering::Relaxed) {
+        if self.expected_session_disconnect(Ordering::Relaxed) {
             return Ok(());
         }
         if !self.is_socket_connected() {
@@ -1345,29 +1355,26 @@ impl Client {
         // Skip processing if an expected disconnect is pending (e.g., 515 received).
         // This prevents race conditions where a spawned success handler runs after
         // cleanup_connection_state has already reset is_logged_in.
-        if self.expected_disconnect.load(Ordering::Relaxed) {
+        if self.expected_session_disconnect(Ordering::Relaxed) {
             debug!("Ignoring <success> stanza: expected disconnect pending");
             return;
         }
 
         // Guard against multiple <success> stanzas (WhatsApp may send more than one during
         // routing/reconnection). Only process the first one per connection.
-        if self.is_logged_in.swap(true, Ordering::SeqCst) {
-            debug!("Ignoring duplicate <success> stanza (already logged in)");
+        let Some(authentication) = self.claim_session_authentication() else {
+            debug!("Ignoring <success> stanza outside an unauthenticated connection");
             return;
-        }
-
-        // Increment connection generation to invalidate any stale post-login tasks
-        // from previous connections (e.g., during 515 reconnect cycles).
-        let current_generation = self.connection_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        };
+        let current_generation = authentication.generation().get();
         #[cfg(feature = "client-lifecycle")]
         if let Some(lifecycle) = &self.lifecycle {
             let opened = lifecycle.begin_scope_if_current(current_generation, || {
                 self.connection_generation.load(Ordering::SeqCst) == current_generation
-                    && !self.expected_disconnect.load(Ordering::Acquire)
+                    && !self.expected_session_disconnect(Ordering::Acquire)
             });
             if !opened {
-                self.is_logged_in.store(false, Ordering::SeqCst);
+                self.abort_session_authentication(authentication);
                 debug!("Ignoring <success> stanza retired during lifecycle publication");
                 return;
             }
@@ -1389,8 +1396,10 @@ impl Client {
         // which leaves a window where the client looks authenticated on a
         // generation that is about to change. Work binding a scope in that
         // window had every attempt rejected as retired.
-        self.authenticated_generation
-            .store(current_generation, Ordering::SeqCst);
+        if !self.admit_session_authentication(authentication) {
+            debug!("Ignoring retired authentication completion");
+            return;
+        }
         // The keepalive `drive_connection_with_outcome` started is bound to the
         // pre-login generation the increment above retired, so it exits at its
         // next tick without pinging and this one takes over. Started once the
@@ -1401,16 +1410,6 @@ impl Client {
         // `socket_ready_notifier`, which fires before login, so an IQ sent in
         // that gap is answered by nobody.
         self.notify_session_state();
-        // Record the auth time but DON'T reset the backoff counter yet: WA Web
-        // resets only after the connection has been stable for ~30s
-        // (`resetDelay`). Resetting on <success> alone lets a server that
-        // authenticates then immediately drops keep us in a 1s reconnect storm.
-        // The run loop does the stability-gated reset on the next disconnect.
-        self.connected_at.store(wacore::time::Instant::now());
-        // Fresh connection starts un-penalized (see backoff_reset_suppressed).
-        self.backoff_reset_suppressed
-            .store(false, Ordering::Relaxed);
-
         self.update_server_time_offset(node);
 
         // Extract LID from the node before spawning (node isn't Send).
@@ -1793,7 +1792,7 @@ impl Client {
         // is bounded by the same clock.
         const CRITICAL_SYNC_TIMEOUT_SECS: u64 = 180;
         let critical_deadline =
-            wacore::time::Instant::now() + Duration::from_secs(CRITICAL_SYNC_TIMEOUT_SECS);
+            self.runtime.monotonic_time() + Duration::from_secs(CRITICAL_SYNC_TIMEOUT_SECS);
         // Claimed by whichever of the sync and the watchdog gets there
         // first, and never by both. A plain "the sync finished" flag is not
         // enough: `reconnect_immediately` sets `expected_disconnect` and
@@ -2116,7 +2115,7 @@ impl Client {
         if self.connection_generation.load(Ordering::Acquire) != generation {
             return;
         }
-        let ack_at = wacore::time::Instant::now();
+        let ack_at = self.runtime.monotonic_time();
         let client = Arc::clone(self);
         let server = server.as_str().to_string();
         // Read off the ack rather than stored on the waiter: the id is only
@@ -2155,7 +2154,7 @@ impl Client {
                         .get_int(wacore::iq::abprops::web::WEB_E2E_BACKFILL_EXPIRE_TIME)
                         .await;
                     let remaining =
-                        group_repair_time_left(ack_at, wacore::time::Instant::now(), minutes);
+                        group_repair_time_left(ack_at, client.runtime.monotonic_time(), minutes);
                     if remaining.is_zero() {
                         return;
                     }
@@ -2320,7 +2319,7 @@ impl Client {
                 "Got stream error indicating client was removed or replaced (conflict={}). Logging out.",
                 conflict_type
             );
-            self.expected_disconnect.store(true, Ordering::Relaxed);
+            self.expect_session_disconnect();
             self.stop_auto_reconnect_permanently();
 
             let event = if conflict_type == "replaced" {
@@ -2342,7 +2341,7 @@ impl Client {
                     info!(
                         "Got 515 stream error, server is closing stream (expected after pairing). Will auto-reconnect."
                     );
-                    self.expected_disconnect.store(true, Ordering::Relaxed);
+                    self.expect_session_disconnect();
                     should_disconnect = true;
                 }
                 "516" => {
@@ -2352,7 +2351,7 @@ impl Client {
                             ProtocolTerminalReason::StreamErrorCode(code),
                         );
                     }
-                    self.expected_disconnect.store(true, Ordering::Relaxed);
+                    self.expect_session_disconnect();
                     self.stop_auto_reconnect_permanently();
                     self.core.event_bus.dispatch(Event::LoggedOut(Box::new(
                         crate::types::events::LoggedOut::builder()
@@ -2370,7 +2369,7 @@ impl Client {
                             ProtocolTerminalReason::StreamErrorCode(code),
                         );
                     }
-                    self.expected_disconnect.store(true, Ordering::Relaxed);
+                    self.expect_session_disconnect();
                     self.stop_auto_reconnect_permanently();
                     self.core.event_bus.dispatch(Event::LoggedOut(Box::new(
                         crate::types::events::LoggedOut::builder()
@@ -2388,7 +2387,7 @@ impl Client {
                             ProtocolTerminalReason::StreamErrorCode(code),
                         );
                     }
-                    self.expected_disconnect.store(true, Ordering::Relaxed);
+                    self.expect_session_disconnect();
                     self.stop_auto_reconnect_permanently();
                     self.core.event_bus.dispatch(Event::StreamReplaced(
                         crate::types::events::StreamReplaced::builder().build(),
@@ -2402,11 +2401,8 @@ impl Client {
                     warn!(
                         "Got 429 stream error (rate limited). Will auto-reconnect with extended backoff."
                     );
-                    self.is_logged_in.store(false, Ordering::Relaxed);
-                    self.auto_reconnect_errors.fetch_add(5, Ordering::Relaxed);
-                    // Deliberate rate-limit backoff: the stability reset must
-                    // not erase it even if the connection had been up >= 30s.
-                    self.backoff_reset_suppressed.store(true, Ordering::Relaxed);
+                    self.invalidate_session_authentication();
+                    self.apply_reconnect_penalty(5);
                     // Not fidelity: WA Web (Handle/StreamError.js) special-cases
                     // only 500..600, so 429 is indistinguishable from any other
                     // reconnect there — survivable because a human watches the UI.
@@ -2424,7 +2420,7 @@ impl Client {
                     // Server is going down/restarting: mark logged-out so sends fail
                     // fast against the soon-to-die socket. Auto-reconnect handles recovery.
                     info!("Got 503 service unavailable, will auto-reconnect.");
-                    self.is_logged_in.store(false, Ordering::Relaxed);
+                    self.invalidate_session_authentication();
                 }
                 _ => {
                     // Server wraps per-stanza routing failures in <stream:error> without a
@@ -2446,7 +2442,7 @@ impl Client {
                         warn!(
                             "Stream error <xml-not-well-formed>: closing socket to recycle the stream"
                         );
-                        self.is_logged_in.store(false, Ordering::Relaxed);
+                        self.invalidate_session_authentication();
                         should_disconnect = true;
                     } else if let Some(ack) = node.get_optional_child("ack") {
                         let id = ack
@@ -2479,7 +2475,7 @@ impl Client {
         // (515/516/401/409 and conflict). 429/503/unknown fall through so the
         // socket layer notices a real teardown without us forcing one.
         if should_disconnect {
-            self.is_logged_in.store(false, Ordering::Relaxed);
+            self.invalidate_session_authentication();
             let transport_opt = self.transport.lock().await.clone();
             if let Some(transport) = transport_opt {
                 self.runtime.spawn_detached(Box::pin(async move {
@@ -2496,7 +2492,7 @@ impl Client {
         tracing::instrument(name = "wa.conn.connect_failure", level = "debug", skip_all)
     )]
     pub(crate) async fn handle_connect_failure(&self, node: &wacore_binary::NodeRef<'_>) {
-        self.expected_disconnect.store(true, Ordering::Relaxed);
+        self.expect_session_disconnect();
 
         let failure = wacore::stanza::connect_failure::ConnectFailureStanza::parse(node);
         // A `<failure>` with no usable `reason` is not a failure we can classify:
@@ -2507,7 +2503,7 @@ impl Client {
         self.record_protocol_terminal_reason(ProtocolTerminalReason::ConnectFailure(reason));
 
         if reason.should_reconnect() {
-            self.expected_disconnect.store(false, Ordering::Relaxed);
+            self.clear_expected_session_disconnect();
         } else {
             self.stop_auto_reconnect_permanently();
         }
@@ -2620,7 +2616,8 @@ impl Client {
     }
 
     pub(crate) fn update_server_time_offset(&self, node: &wacore_binary::NodeRef<'_>) {
-        self.unified_session.update_server_time_offset(node);
+        self.unified_session
+            .update_server_time_offset_at(node, self.runtime.wall_time_secs());
     }
 }
 
@@ -2882,7 +2879,7 @@ mod tests {
             message_secret: None,
             addressing_mode: wacore::types::message::AddressingMode::Pn,
         };
-        client.connection_generation.store(2, Ordering::Release);
+        client.set_generation_for_test(2, Ordering::Release);
         let ack = NodeBuilder::new("ack")
             .attr("id", "OLDGROUPACK")
             .attr("phash", "2:new")
@@ -2991,6 +2988,7 @@ mod tests {
         // already recorded theirs.
         let before = sizes.lock().expect("sizes mutex").len();
         let success = NodeBuilder::new("success").build();
+        client.set_connected_for_test(true);
         client.handle_success(&success.as_node_ref()).await;
 
         let mut spawned = sizes.lock().expect("sizes mutex")[before..].to_vec();

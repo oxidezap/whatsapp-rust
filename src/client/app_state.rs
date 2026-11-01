@@ -244,9 +244,11 @@ impl SyncScope {
     }
 
     /// How long the work has left, or `None` when it is not on a clock.
-    pub(crate) fn remaining(self) -> Option<Duration> {
-        self.deadline
-            .map(|d| d.saturating_duration_since(wacore::time::Instant::now()))
+    pub(crate) fn remaining_with(
+        self,
+        now: impl FnOnce() -> wacore::time::Instant,
+    ) -> Option<Duration> {
+        self.deadline.map(|d| d.saturating_duration_since(now()))
     }
 
     /// Whether this scope is bound to a deadline at all, which is what
@@ -1362,7 +1364,7 @@ impl Client {
                 );
                 self.dispatch_app_state_sync_failed(
                     &outcome,
-                    self.is_ready.load(Ordering::Relaxed),
+                    self.session_ready_reached(Ordering::Relaxed),
                 );
                 // Seeded with what this outcome already stranded. A fatal or
                 // skipped collection here is not in the retryable list the
@@ -1431,7 +1433,7 @@ impl Client {
             return Err(ScopeLost::Retired);
         }
         if let Some(deadline) = scope.deadline
-            && wacore::time::Instant::now() >= deadline
+            && self.runtime.monotonic_time() >= deadline
         {
             return Err(ScopeLost::Expired);
         }
@@ -1549,7 +1551,10 @@ impl Client {
             return false;
         }
         if plan.outstanding() {
-            self.dispatch_app_state_sync_failed(outcome, self.is_ready.load(Ordering::Relaxed));
+            self.dispatch_app_state_sync_failed(
+                outcome,
+                self.session_ready_reached(Ordering::Relaxed),
+            );
         }
         true
     }
@@ -1841,7 +1846,7 @@ impl Client {
                         if !outcome.all_synced() {
                             client.dispatch_app_state_sync_failed(
                                 &outcome,
-                                client.is_ready.load(Ordering::Relaxed),
+                                client.session_ready_reached(Ordering::Relaxed),
                             );
                         }
                         if !outcome.fatal.is_empty() || !outcome.skipped.is_empty() {
@@ -1881,7 +1886,7 @@ impl Client {
                 };
                 client.dispatch_app_state_sync_failed(
                     &exhausted,
-                    client.is_ready.load(Ordering::Relaxed),
+                    client.session_ready_reached(Ordering::Relaxed),
                 );
             }
         }));
@@ -1919,7 +1924,7 @@ impl Client {
                 debug!(target: "Client/AppState", "Waiting for the {holder:?} holding {name:?}");
             }
         }
-        let bound = match scope.remaining() {
+        let bound = match scope.remaining_with(|| self.runtime.monotonic_time()) {
             Some(remaining) => APP_STATE_RESERVATION_WAIT.min(remaining),
             None => APP_STATE_RESERVATION_WAIT,
         };
@@ -2426,7 +2431,9 @@ impl Client {
             // Bound the key wait by the critical-sync deadline when one was given
             // (initial bootstrap), so a late/never-auto-shared key still recovers via
             // the explicit request on this connection; otherwise a fixed short wait.
-            let key_wait = scope.remaining().unwrap_or(APP_STATE_KEY_REQUEST_TIMEOUT);
+            let key_wait = scope
+                .remaining_with(|| self.runtime.monotonic_time())
+                .unwrap_or(APP_STATE_KEY_REQUEST_TIMEOUT);
             if !missing_all.is_empty()
                 && !Box::pin(self.request_keys_and_wait(missing_all, key_wait)).await
             {
@@ -2791,7 +2798,7 @@ impl Client {
             }
             debug!(target: "Client/AppState", "Received IQ response for {:?}; decoding patches", name);
 
-            let _decode_start = wacore::time::Instant::now();
+            let _decode_start = self.runtime.monotonic_time();
 
             // Parse the response once here; the same parsed list is handed to the
             // processor below (no second parse).
@@ -2849,7 +2856,10 @@ impl Client {
                         return Err(error);
                     }
                 };
-            let decode_elapsed = _decode_start.elapsed();
+            let decode_elapsed = self
+                .runtime
+                .monotonic_time()
+                .saturating_duration_since(_decode_start);
             if decode_elapsed.as_millis() > 500 {
                 debug!(target: "Client/AppState", "Patch decode for {:?} took {:?}", name, decode_elapsed);
             }
@@ -2956,7 +2966,7 @@ impl Client {
         if missing.is_empty() {
             return true;
         }
-        let deadline = wacore::time::Instant::now() + timeout;
+        let deadline = self.runtime.monotonic_time() + timeout;
         let backend = self.persistence_manager.backend();
         let mut retry_after = initial_app_state_key_retry(timeout);
         loop {
@@ -2995,14 +3005,14 @@ impl Client {
                 return true;
             }
 
-            let remaining = deadline.saturating_duration_since(wacore::time::Instant::now());
+            let remaining = deadline.saturating_duration_since(self.runtime.monotonic_time());
             if remaining.is_zero() {
                 return false;
             }
 
             let retry_wait = schedule
                 .retry_at
-                .saturating_duration_since(wacore::time::Instant::now());
+                .saturating_duration_since(self.runtime.monotonic_time());
             let wait = remaining.min(retry_wait);
             if !wait.is_zero() {
                 let _ = rt_timeout(&*self.runtime, wait, listener).await;
@@ -3023,7 +3033,7 @@ impl Client {
     {
         futures::pin_mut!(request);
         loop {
-            let remaining = deadline.saturating_duration_since(wacore::time::Instant::now());
+            let remaining = deadline.saturating_duration_since(self.runtime.monotonic_time());
             if remaining.is_zero() {
                 return if app_state_keys_available(backend, missing).await {
                     AppStateKeyRequestProgress::KeysReady
@@ -3061,12 +3071,12 @@ impl Client {
     ) -> AppStateKeyRequestSchedule {
         if missing.is_empty() {
             return AppStateKeyRequestSchedule {
-                retry_at: wacore::time::Instant::now() + retry_after,
+                retry_at: self.runtime.monotonic_time() + retry_after,
                 sent: false,
             };
         }
         let mut guard = self.app_state_key_requests.lock().await;
-        let now = wacore::time::Instant::now();
+        let now = self.runtime.monotonic_time();
         let requested_retry_at = now + retry_after;
         guard.retain(|_, retry_at| now < *retry_at);
 
@@ -3103,7 +3113,7 @@ impl Client {
                 sent: true,
             },
             Ok(AppStateKeyRequestDelivery::SomePeers) => {
-                let retry_at = wacore::time::Instant::now() + APP_STATE_KEY_PARTIAL_RETRY;
+                let retry_at = self.runtime.monotonic_time() + APP_STATE_KEY_PARTIAL_RETRY;
                 let mut guard = self.app_state_key_requests.lock().await;
                 for key_id in &to_request {
                     if let Some(deadline) = guard.get_mut(*key_id) {
@@ -3197,7 +3207,7 @@ impl Client {
                 let result = async {
                     self.ensure_e2e_sessions(std::slice::from_ref(&peer))
                         .await?;
-                    let request_id = self.generate_message_id_at(wacore::time::now_secs_u64());
+                    let request_id = self.generate_message_id_at(self.runtime.wall_time_secs_u64());
                     self.send_message_impl(
                         peer,
                         msg,
@@ -5045,9 +5055,7 @@ mod tests {
         );
         proc.note_recovery_request_id("regular_low", "old-request")
             .await;
-        client
-            .connection_generation
-            .store(generation + 1, Ordering::Release);
+        client.set_generation_for_test(generation + 1, Ordering::Release);
         assert!(
             proc.claim_recovery_request_by_id("old-request")
                 .await
@@ -6337,7 +6345,7 @@ mod send_patch_response_tests {
         // Reachable, so the re-sync between attempts actually runs: an
         // unreachable client defers it and reports Ok, which hides whether the
         // collection was recovered at all.
-        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.set_logged_in_for_test(true, Ordering::Relaxed);
         client.authenticated_generation.store(
             client.connection_generation.load(Ordering::SeqCst),
             Ordering::SeqCst,
@@ -6488,7 +6496,7 @@ mod send_patch_response_tests {
         version: Option<wacore::appstate::hash::HashState>,
     ) -> (Result<()>, bool, usize) {
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
-        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.set_logged_in_for_test(true, Ordering::Relaxed);
         client.authenticated_generation.store(
             client.connection_generation.load(Ordering::SeqCst),
             Ordering::SeqCst,
@@ -7404,9 +7412,7 @@ mod background_report_tests {
         outcome.fatal.push(WAPatchName::CriticalBlock);
 
         // The connection this sync belonged to is gone.
-        client
-            .connection_generation
-            .store(retired_scope.generation() + 1, Ordering::SeqCst);
+        client.set_generation_for_test(retired_scope.generation() + 1, Ordering::SeqCst);
         client.report_background_sync(
             "test",
             retired_scope,
@@ -7729,9 +7735,7 @@ mod sync_scope_tests {
         ));
         assert_eq!(client.admits(generous), Ok(()));
 
-        client
-            .connection_generation
-            .store(live.generation() + 1, Ordering::SeqCst);
+        client.set_generation_for_test(live.generation() + 1, Ordering::SeqCst);
         assert_eq!(client.admits(live), Err(ScopeLost::Retired));
         assert_eq!(
             client.admits(generous),
@@ -7750,9 +7754,7 @@ mod sync_scope_tests {
     async fn a_retired_scope_cannot_move_the_bootstrap_gate() {
         let client = crate::test_utils::create_test_client_with_name("scope-gate").await;
         let retired = client.sync_scope(None);
-        client
-            .connection_generation
-            .store(retired.generation() + 1, Ordering::SeqCst);
+        client.set_generation_for_test(retired.generation() + 1, Ordering::SeqCst);
 
         for armed in [true, false] {
             // Seeded as the connection that is live at seeding time, so the
@@ -7843,10 +7845,10 @@ mod task_retry_tests {
         // and only `expected_disconnect` is set. This is the state
         // `reconnect_immediately()` leaves behind, and the one the retry loop
         // used to walk straight through.
-        client.is_running.store(true, Ordering::Relaxed);
-        client.expected_disconnect.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
+        client.expect_session_disconnect();
         assert!(
-            client.is_running.load(Ordering::Relaxed),
+            client.driver_running(Ordering::Relaxed),
             "the retry loop's own guard still admits this state"
         );
         assert!(
@@ -7861,7 +7863,7 @@ mod task_retry_tests {
             "the callee reports Ok without doing anything, which is the trap"
         );
 
-        client.expected_disconnect.store(false, Ordering::Relaxed);
+        client.clear_expected_session_disconnect();
         assert!(
             !client.is_shutting_down(),
             "and the hold lifts once the reconnect settles"
@@ -8029,27 +8031,27 @@ mod lifecycle_signal_tests {
         // A direct-connect client never runs the supervision loop. Reading
         // `is_running` here would call a perfectly healthy client stopped.
         assert!(
-            !client.is_running.load(Ordering::Relaxed),
+            !client.driver_running(Ordering::Relaxed),
             "the fixture models a client that never called run()"
         );
         assert!(!client.is_terminal(), "which is not the same as finished");
 
         // A planned reconnect is not the end either.
-        client.expected_disconnect.store(true, Ordering::Relaxed);
+        client.expect_session_disconnect();
         assert!(
             client.is_shutting_down(),
             "the old predicate cannot tell this apart"
         );
         assert!(!client.is_terminal(), "the new one can");
-        client.expected_disconnect.store(false, Ordering::Relaxed);
+        client.clear_expected_session_disconnect();
 
         // Turning auto-reconnect off is a preference an application may express
         // on a healthy connection — "do not come back after this one ends" — and
         // the run loop does not act on it until the socket exits. On its own it
         // says nothing about the session being over, so the supervision loop has
         // to be up for the scenario to be the one described.
-        client.is_running.store(true, Ordering::Relaxed);
-        client.enable_auto_reconnect.store(false, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
+        client.session_state.store(false, Ordering::Relaxed);
         assert!(
             !client.is_terminal(),
             "a reconnect preference is not a verdict on the current session"
@@ -8058,16 +8060,16 @@ mod lifecycle_signal_tests {
         // The stream errors that really do end one — conflict, 516, an
         // unrecoverable connect failure — set both, and the pair is what
         // separates them from the preference above.
-        client.expected_disconnect.store(true, Ordering::Relaxed);
+        client.expect_session_disconnect();
         assert!(client.is_terminal());
-        client.expected_disconnect.store(false, Ordering::Relaxed);
+        client.clear_expected_session_disconnect();
 
         // And the run loop's own exit: it stops by clearing `is_running` alone,
         // without firing the notifier or setting `expected_disconnect`, so that
         // pairing has to count too or retries wait for a connection that is
         // never coming. `cleanup_connection_state` has already run by then, which
         // is why the socket is down here.
-        client.is_running.store(false, Ordering::Relaxed);
+        client.set_driver_running_for_test(false, Ordering::Relaxed);
         client.set_connected_for_test(false);
         assert!(
             client.is_terminal(),
@@ -8084,8 +8086,8 @@ mod lifecycle_signal_tests {
         );
         client.set_connected_for_test(false);
 
-        client.enable_auto_reconnect.store(true, Ordering::Relaxed);
-        client.is_running.store(true, Ordering::Relaxed);
+        client.session_state.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
         assert!(!client.is_terminal());
 
         // And an explicit shutdown, which reconnects deliberately leave alone.
@@ -8113,13 +8115,13 @@ mod connection_guard_tests {
     #[tokio::test]
     async fn a_planned_reconnect_does_not_look_like_a_stop() {
         let client = crate::test_utils::create_test_client_with_name("conn-guard").await;
-        client.is_running.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
         client.set_connected_for_test(true);
 
         assert!(!client.is_terminal() && client.is_socket_connected());
 
         // The state `reconnect_immediately()` leaves behind.
-        client.expected_disconnect.store(true, Ordering::Relaxed);
+        client.expect_session_disconnect();
         assert!(
             client.is_shutting_down(),
             "which the old guard could not tell from a stop"
@@ -8142,7 +8144,7 @@ mod await_connection_tests {
     #[tokio::test]
     async fn a_stale_notification_does_not_end_the_wait() {
         let client = crate::test_utils::create_test_client_with_name("await-stale").await;
-        client.is_running.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
 
         let waiter = {
             let client = Arc::clone(&client);
@@ -8181,7 +8183,7 @@ mod await_connection_tests {
         // then the generation it is authenticated under. Only the pair is an
         // answer — the marker alone would leave the wait on a socket that has
         // not authenticated, which is the state above.
-        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.set_logged_in_for_test(true, Ordering::Relaxed);
         client.authenticated_generation.store(
             client.connection_generation.load(Ordering::SeqCst),
             Ordering::SeqCst,
@@ -8208,7 +8210,7 @@ mod await_connection_tests {
     #[tokio::test]
     async fn a_finished_client_ends_the_wait() {
         let client = crate::test_utils::create_test_client_with_name("await-terminal").await;
-        client.is_running.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
 
         let waiter = {
             let client = Arc::clone(&client);
@@ -8238,11 +8240,11 @@ mod await_connection_tests {
     #[tokio::test]
     async fn a_paused_client_keeps_the_wait_but_is_not_reachable() {
         let client = crate::test_utils::create_test_client_with_name("await-paused").await;
-        client.is_running.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
         // Everything a reachable connection needs, so only the pause can be
         // what makes the answer no.
         client.set_connected_for_test(true);
-        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.set_logged_in_for_test(true, Ordering::Relaxed);
         client.authenticated_generation.store(
             client.connection_generation.load(Ordering::SeqCst),
             Ordering::SeqCst,
@@ -8281,7 +8283,7 @@ mod await_connection_tests {
     #[tokio::test]
     async fn the_run_loop_giving_up_ends_the_wait() {
         let client = crate::test_utils::create_test_client_with_name("await-runloop").await;
-        client.is_running.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
 
         let waiter = {
             let client = Arc::clone(&client);
@@ -8296,7 +8298,7 @@ mod await_connection_tests {
         // The branch itself, not a re-enactment of it: `run()` reads this flag
         // and calls exactly this, and a version of the transition that forgets
         // to announce itself fails here.
-        client.enable_auto_reconnect.store(false, Ordering::Relaxed);
+        client.session_state.store(false, Ordering::Relaxed);
         client.stop_supervision_loop();
 
         assert!(
@@ -8337,9 +8339,9 @@ mod sync_outcome_tests {
     /// signal away and see what the guard makes of it.
     async fn reachable_client(name: &str) -> Arc<Client> {
         let client = crate::test_utils::create_test_client_with_name(name).await;
-        client.is_running.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
         client.set_connected_for_test(true);
-        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.set_logged_in_for_test(true, Ordering::Relaxed);
         client.authenticated_generation.store(
             client.connection_generation.load(Ordering::SeqCst),
             Ordering::SeqCst,
@@ -8359,7 +8361,7 @@ mod sync_outcome_tests {
         let client = reachable_client("outcome-429").await;
 
         // Exactly what `handle_stream_error` does for 429 and 503.
-        client.is_logged_in.store(false, Ordering::Relaxed);
+        client.set_logged_in_for_test(false, Ordering::Relaxed);
 
         assert!(
             !client.is_terminal(),
@@ -8406,8 +8408,8 @@ mod sync_outcome_tests {
         // torn down. This used to be a window where `is_terminal()` and
         // `can_reach_server()` were both true, which is why the verdict checks
         // terminal first.
-        client.enable_auto_reconnect.store(false, Ordering::Relaxed);
-        client.expected_disconnect.store(true, Ordering::Relaxed);
+        client.session_state.store(false, Ordering::Relaxed);
+        client.expect_session_disconnect();
 
         assert!(client.is_terminal());
         assert_eq!(client.reachability(), Reachability::Finished);
@@ -8423,7 +8425,7 @@ mod sync_outcome_tests {
             "a finished client is never a reachable one"
         );
 
-        client.expected_disconnect.store(false, Ordering::Relaxed);
+        client.clear_expected_session_disconnect();
         client.signal_shutdown_sync();
         assert!(client.is_terminal() && !client.can_reach_server());
     }
@@ -8435,7 +8437,7 @@ mod sync_outcome_tests {
     #[tokio::test]
     async fn the_gap_inside_success_is_not_an_authenticated_connection() {
         let client = crate::test_utils::create_test_client_with_name("auth-window").await;
-        client.is_running.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
 
         client.set_connected_for_test(true);
 
@@ -8444,7 +8446,7 @@ mod sync_outcome_tests {
         // the constructor left, unretouched — and a marker that starts at a real
         // generation equals the one a fresh client is on, so equality alone
         // admits the window on the very first connection.
-        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.set_logged_in_for_test(true, Ordering::Relaxed);
         assert!(
             client.is_logged_in() && client.is_socket_connected(),
             "which is why the flags alone said yes"
@@ -8455,7 +8457,7 @@ mod sync_outcome_tests {
         );
 
         // Second half: generation incremented, marker not yet stored.
-        let current = client.connection_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let current = client.advance_generation_for_test(1, Ordering::SeqCst) + 1;
         assert!(!client.can_reach_server());
         assert_eq!(
             client.reachability(),
@@ -8508,7 +8510,7 @@ mod terminal_wake_tests {
     #[tokio::test]
     async fn a_fatal_stream_error_ends_the_wait() {
         let client = crate::test_utils::create_test_client_with_name("await-fatal").await;
-        client.is_running.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
 
         let waiter = {
             let client = Arc::clone(&client);
@@ -8521,8 +8523,8 @@ mod terminal_wake_tests {
         .await;
 
         // Exactly what `handle_stream_error` does, in its order.
-        client.expected_disconnect.store(true, Ordering::Relaxed);
-        client.enable_auto_reconnect.store(false, Ordering::Relaxed);
+        client.expect_session_disconnect();
+        client.session_state.store(false, Ordering::Relaxed);
         client.notify_connection_shutdown();
 
         assert!(
@@ -8553,7 +8555,7 @@ mod reconnect_wake_tests {
     #[tokio::test]
     async fn a_planned_reconnect_teardown_does_not_end_the_wait() {
         let client = crate::test_utils::create_test_client_with_name("await-replan").await;
-        client.is_running.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
 
         let waiter = {
             let client = Arc::clone(&client);
@@ -8567,7 +8569,7 @@ mod reconnect_wake_tests {
 
         // What `reconnect_immediately()` does: a planned teardown, auto-reconnect
         // still on, so the client is not finished and a socket is coming back.
-        client.expected_disconnect.store(true, Ordering::Relaxed);
+        client.expect_session_disconnect();
         client.notify_connection_shutdown();
         for _ in 0..8 {
             tokio::task::yield_now().await;
@@ -8578,9 +8580,9 @@ mod reconnect_wake_tests {
         );
 
         // And the replacement still ends it.
-        client.expected_disconnect.store(false, Ordering::Relaxed);
+        client.clear_expected_session_disconnect();
         client.set_connected_for_test(true);
-        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.set_logged_in_for_test(true, Ordering::Relaxed);
         client.authenticated_generation.store(
             client.connection_generation.load(Ordering::SeqCst),
             Ordering::SeqCst,
@@ -8611,9 +8613,9 @@ mod retiring_socket_tests {
     #[tokio::test]
     async fn a_socket_marked_for_reconnect_cannot_carry_work() {
         let client = crate::test_utils::create_test_client_with_name("retiring").await;
-        client.is_running.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
         client.set_connected_for_test(true);
-        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.set_logged_in_for_test(true, Ordering::Relaxed);
         client.authenticated_generation.store(
             client.connection_generation.load(Ordering::SeqCst),
             Ordering::SeqCst,
@@ -8621,7 +8623,7 @@ mod retiring_socket_tests {
         assert!(client.can_reach_server(), "healthy to begin with");
 
         // The first thing `reconnect_immediately()` does, before any teardown.
-        client.expected_disconnect.store(true, Ordering::Relaxed);
+        client.expect_session_disconnect();
 
         assert!(
             client.is_socket_connected() && client.is_logged_in(),
@@ -8762,9 +8764,9 @@ mod critical_bootstrap_tests {
         crate::types::events::Subscription,
     ) {
         let client = crate::test_utils::create_test_client_with_name(name).await;
-        client.is_running.store(true, Ordering::Relaxed);
+        client.set_driver_running_for_test(true, Ordering::Relaxed);
         client.set_connected_for_test(true);
-        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.set_logged_in_for_test(true, Ordering::Relaxed);
         client.authenticated_generation.store(
             client.connection_generation.load(Ordering::SeqCst),
             Ordering::SeqCst,
@@ -8959,7 +8961,7 @@ mod critical_bootstrap_tests {
     #[tokio::test]
     async fn a_retryable_critical_sync_still_announces_the_connection() {
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
-        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.set_logged_in_for_test(true, Ordering::Relaxed);
         client.authenticated_generation.store(
             client.connection_generation.load(Ordering::SeqCst),
             Ordering::SeqCst,
@@ -9049,9 +9051,7 @@ mod critical_bootstrap_tests {
         let stranded = outcome(&[], &[], &[WAPatchName::CriticalBlock], &[], true);
         let plan = CriticalSyncPlan::from_outcome(&stranded);
 
-        client
-            .connection_generation
-            .store(scope.generation() + 1, Ordering::SeqCst);
+        client.set_generation_for_test(scope.generation() + 1, Ordering::SeqCst);
 
         assert!(
             !client
@@ -9115,7 +9115,7 @@ mod critical_bootstrap_tests {
         let plan = CriticalSyncPlan::from_outcome(&stalled);
 
         // Exactly what `handle_stream_error` does for 429 and 503.
-        client.is_logged_in.store(false, Ordering::Relaxed);
+        client.set_logged_in_for_test(false, Ordering::Relaxed);
 
         assert!(
             client

@@ -364,6 +364,9 @@ impl NoiseSocket {
                 // capacity intact for the next batch.
                 let payload = out_buf.split().freeze();
                 if let Some(stats) = &stats {
+                    #[cfg(feature = "instance-clock")]
+                    stats.arm_dead_socket_deadline_with(|| runtime.monotonic_time());
+                    #[cfg(not(feature = "instance-clock"))]
                     stats.arm_dead_socket_deadline();
                 }
                 for (_, _, observer) in &waiters {
@@ -380,6 +383,9 @@ impl NoiseSocket {
                 Ok(()) => {
                     if let Some(stats) = &stats {
                         for (_, wire_len, _) in &waiters {
+                            #[cfg(feature = "instance-clock")]
+                            stats.record_frame_sent_with(*wire_len, || runtime.monotonic_time());
+                            #[cfg(not(feature = "instance-clock"))]
                             stats.record_frame_sent(*wire_len);
                         }
                     }
