@@ -1,5 +1,5 @@
 {
-  "whatspecRev": "afa3e343f37b0b64f03cffcacf2448ef883a2d8b",
+  "whatspecRev": "ae3880925bacd23863cc30ec480c9f82bfd869f1",
   "coreBase": "0d1373a8f06e0dfa72f3ea1c4c33abae9fd21d61",
   "fromWaVersion": "2.3000.1047483476",
   "toWaVersion": "2.3000.1052559453",
@@ -10,14 +10,14 @@
   "integrity": "Archive digest and exact bundle multiset of SHA-256 and size verified locally.",
   "limits": [
     "No authenticated client/server execution.",
-    "The exact qualification commit is pinned from whatspec PR 65, which is not yet merged.",
+    "The qualification from whatspec PR 65 is integrated; the exact merge commit is pinned. Controlled performance qualification remains separate.",
     "No server API support removed. Historical experimental fixtures remain separate from current qualification.",
     "Only required generator Git dependencies were updated. No bridge or Baileyrs checkouts changed."
   ],
   "requiredExternalInputs": {
     "whatspecCheckout": {
       "directory": "../whatspec relative to the whatsapp-rust checkout",
-      "revision": "afa3e343f37b0b64f03cffcacf2448ef883a2d8b"
+      "revision": "ae3880925bacd23863cc30ec480c9f82bfd869f1"
     },
     "bundles": {
       "directory": "../bundles-new relative to the whatsapp-rust checkout",
@@ -170,15 +170,15 @@
     "supersededBy": "whatspec PR 65 qualification at afa3e343f37b0b64f03cffcacf2448ef883a2d8b"
   },
   "generation": {
-    "command": "cargo run -p whatspec-codegen -- --update-lock --rev afa3e343f37b0b64f03cffcacf2448ef883a2d8b --verify-iq-bundles ../bundles-new",
+    "command": "cargo run -p whatspec-codegen -- --update-lock --rev ae3880925bacd23863cc30ec480c9f82bfd869f1 --verify-iq-bundles ../bundles-new",
     "result": "24 artifacts generated atomically; offline --check matches the pinned IR.",
     "outputsWritten": true,
     "groupContractsIncludedInMainLock": true
   },
   "qualificationDependency": {
     "pullRequest": "https://github.com/oxidezap/whatspec/pull/65",
-    "revision": "afa3e343f37b0b64f03cffcacf2448ef883a2d8b",
-    "merged": false,
+    "revision": "ae3880925bacd23863cc30ec480c9f82bfd869f1",
+    "merged": true,
     "completeModulesVerifiedAgainstLockedBundles": 18,
     "currentCaptureCommand": "node tests/conformance/groups/versions/2.3000.1052559453/verify.cjs",
     "reproduced": {
@@ -189,12 +189,23 @@
       "rejectedMutations": 8
     },
     "historicalConsumerFixtures": "tools/whatspec-codegen/fixtures/groups/versions/2.3000.1047483476",
-    "reviewStatus": "Qualified upstream handoff afa3e343; PR 65 remains open and is an explicit dependency.",
+    "reviewStatus": "Qualified upstream PR 65 merged. The integrated commit has the identical complete Git tree as the qualified head.",
     "lateReviewRegressionProof": {
       "baselineFailed": 3,
       "baselinePassed": 5,
       "qualifiedPassed": 8,
       "source": "tests/conformance/groups/versions/2.3000.1052559453/semantic-review.json"
+    },
+    "qualifiedHead": "afa3e343f37b0b64f03cffcacf2448ef883a2d8b",
+    "mergedAt": "2026-11-01T10:54:42Z",
+    "tree": "5b375d5d0bfa1fafe7bbf8ff87a313816fcf8be4",
+    "treeComparison": "git diff --exit-code afa3e343f37b0b64f03cffcacf2448ef883a2d8b ae3880925bacd23863cc30ec480c9f82bfd869f1; both commits have the same tree object.",
+    "integratedValidation": {
+      "generatorTestsPassed": 150,
+      "groupTestsPassed": 86,
+      "normalizationRecapture": "Byte-identical to group_normalization_oracle.json at the integrated revision.",
+      "deterministicGeneration": "All 24 artifacts match the integrated pin; the five changed generated files differ only in provenance comments.",
+      "scope": "Reference and provenance update only. Qualified protocol data, historical APIs and performance qualification are unchanged."
     }
   },
   "wallpaperWireCompatibility": {
@@ -250,7 +261,7 @@
       },
       "contextAndPropsBudget": "New carrier integration tests and unchanged C3 allocation budgets passed."
     },
-    "publication": "Qualified afa3e343 integration prepared for publication; upstream PR 65 remains open. No merge or release performed."
+    "publication": "Qualified integration published; whatspec PR 65 is merged and the core now pins its integrated commit. No core merge or release performed."
   },
   "mexPublicCompatibility": {
     "historicalSourceRev": "c581c20a9d0605df49abf297f2e7cfc04ccf1ff7",
@@ -270,7 +281,7 @@
   },
   "normalizationPayloadCapture": {
     "command": "node tools/whatspec-codegen/fixtures/capture-group-normalization.cjs ../whatspec",
-    "upstreamRevision": "afa3e343f37b0b64f03cffcacf2448ef883a2d8b",
+    "upstreamRevision": "ae3880925bacd23863cc30ec480c9f82bfd869f1",
     "upstreamHarnessSha256": "8629e44df910c573a28c5552ecd87c97efa22c004a040b42d214bbda528a70a0",
     "instrumentation": "Adds actual groupDatas to the existing outcomes object only; exact harness hash and unique anchor checked, all original assertions retained, upstream checkout unmodified.",
     "result": "204 outcomes including actual group payloads; hiddenSubgroup verified in codegen and generated Rust against original output."

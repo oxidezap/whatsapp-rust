@@ -1,6 +1,6 @@
 //! Auto-generated group unlink decisions (WhatsApp 2.3000.1052559453). DO NOT EDIT.
 //!
-//! Qualified source: <https://github.com/oxidezap/whatspec/blob/afa3e343f37b0b64f03cffcacf2448ef883a2d8b/generated/notif/group-unlink.json>
+//! Qualified source: <https://github.com/oxidezap/whatspec/blob/ae3880925bacd23863cc30ec480c9f82bfd869f1/generated/notif/group-unlink.json>
 //! Module-relative source bytes 5939..7296. Null results preserve ordered warnings.
 use super::super::normalization_warning::{Decision, WarningSpec};
 use super::super::normalized::GroupParseError;

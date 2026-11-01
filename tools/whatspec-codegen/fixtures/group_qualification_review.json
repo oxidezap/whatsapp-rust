@@ -142,8 +142,8 @@
   ],
   "historicalPreservation": {
     "consumerFixtures": "groups/versions/2.3000.1047483476",
-    "upstreamSources": "https://github.com/oxidezap/whatspec/blob/afa3e343f37b0b64f03cffcacf2448ef883a2d8b/tests/conformance/groups/sources",
-    "upstreamContracts": "https://github.com/oxidezap/whatspec/blob/afa3e343f37b0b64f03cffcacf2448ef883a2d8b/tests/conformance/groups/versions/2.3000.1047483476"
+    "upstreamSources": "https://github.com/oxidezap/whatspec/blob/ae3880925bacd23863cc30ec480c9f82bfd869f1/tests/conformance/groups/sources",
+    "upstreamContracts": "https://github.com/oxidezap/whatspec/blob/ae3880925bacd23863cc30ec480c9f82bfd869f1/tests/conformance/groups/versions/2.3000.1047483476"
   },
   "currentOracles": {
     "actions": "group_actions_oracle.json",
@@ -312,15 +312,15 @@
   },
   "provenance": {
     "repository": "https://github.com/oxidezap/whatspec",
-    "revision": "afa3e343f37b0b64f03cffcacf2448ef883a2d8b",
-    "source": "https://github.com/oxidezap/whatspec/blob/afa3e343f37b0b64f03cffcacf2448ef883a2d8b/tests/conformance/groups/versions/2.3000.1052559453/semantic-review.json",
-    "upstreamRelativePathsBase": "https://github.com/oxidezap/whatspec/blob/afa3e343f37b0b64f03cffcacf2448ef883a2d8b/tests/conformance/groups/versions/2.3000.1052559453/",
-    "crateTests": "https://github.com/oxidezap/whatspec/blob/afa3e343f37b0b64f03cffcacf2448ef883a2d8b/crates/wa-notif/src/group_qualification.rs",
-    "sourceRegressionScript": "https://github.com/oxidezap/whatspec/blob/afa3e343f37b0b64f03cffcacf2448ef883a2d8b/tests/conformance/groups/versions/2.3000.1052559453/qualification-regressions.cjs",
-    "verificationScript": "https://github.com/oxidezap/whatspec/blob/afa3e343f37b0b64f03cffcacf2448ef883a2d8b/tests/conformance/groups/versions/2.3000.1052559453/verify.cjs",
+    "revision": "ae3880925bacd23863cc30ec480c9f82bfd869f1",
+    "source": "https://github.com/oxidezap/whatspec/blob/ae3880925bacd23863cc30ec480c9f82bfd869f1/tests/conformance/groups/versions/2.3000.1052559453/semantic-review.json",
+    "upstreamRelativePathsBase": "https://github.com/oxidezap/whatspec/blob/ae3880925bacd23863cc30ec480c9f82bfd869f1/tests/conformance/groups/versions/2.3000.1052559453/",
+    "crateTests": "https://github.com/oxidezap/whatspec/blob/ae3880925bacd23863cc30ec480c9f82bfd869f1/crates/wa-notif/src/group_qualification.rs",
+    "sourceRegressionScript": "https://github.com/oxidezap/whatspec/blob/ae3880925bacd23863cc30ec480c9f82bfd869f1/tests/conformance/groups/versions/2.3000.1052559453/qualification-regressions.cjs",
+    "verificationScript": "https://github.com/oxidezap/whatspec/blob/ae3880925bacd23863cc30ec480c9f82bfd869f1/tests/conformance/groups/versions/2.3000.1052559453/verify.cjs",
     "reproduction": "In an external whatspec checkout at the exact revision: node tests/conformance/groups/versions/2.3000.1052559453/verify.cjs; cargo test -p wa-notif --lib group_qualification::current_tests -- --nocapture. These scripts and crates belong to upstream, not this repository.",
     "diagnosticCache": "pins.diagnosticCache is the AST Identifier name p of the diagnostic template cache, not a SHA-256. capture-1052559453.cjs reads arg.left.name; qualified-group-1052559453.json checks that exact binding. Other pin members are source fingerprints.",
-    "diagnosticCacheCapture": "https://github.com/oxidezap/whatspec/blob/afa3e343f37b0b64f03cffcacf2448ef883a2d8b/tests/conformance/groups/capture-1052559453.cjs#L52",
-    "diagnosticCacheQualification": "https://github.com/oxidezap/whatspec/blob/afa3e343f37b0b64f03cffcacf2448ef883a2d8b/crates/wa-notif/src/qualified-group-1052559453.json"
+    "diagnosticCacheCapture": "https://github.com/oxidezap/whatspec/blob/ae3880925bacd23863cc30ec480c9f82bfd869f1/tests/conformance/groups/capture-1052559453.cjs#L52",
+    "diagnosticCacheQualification": "https://github.com/oxidezap/whatspec/blob/ae3880925bacd23863cc30ec480c9f82bfd869f1/crates/wa-notif/src/qualified-group-1052559453.json"
   }
 }

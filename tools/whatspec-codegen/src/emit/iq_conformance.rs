@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn provenance_cannot_follow_a_new_pin_without_review() {
-        assert!(validate_revision("afa3e343f37b0b64f03cffcacf2448ef883a2d8b").is_ok());
+        assert!(validate_revision("ae3880925bacd23863cc30ec480c9f82bfd869f1").is_ok());
         assert!(validate_revision("0000000000000000000000000000000000000000").is_err());
     }
 
