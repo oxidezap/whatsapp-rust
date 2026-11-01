@@ -50,7 +50,6 @@ mod tests {
     use super::*;
     use crate::cache_config::{CacheConfig, RuntimeCacheConfig};
     use crate::history_sync::HistorySecretSeedConfig;
-    use buffa::Message;
     use std::io::Write;
     use waproto::whatsapp as wa;
 
@@ -75,7 +74,9 @@ mod tests {
         let mut compressor =
             flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
         let history = wa::HistorySync::default();
-        compressor.write_all(&history.encode_to_vec()).unwrap();
+        compressor
+            .write_all(&waproto::codec::history_sync_to_vec(&history))
+            .unwrap();
         let bytes = Bytes::from(compressor.finish().unwrap());
         let pointer = bytes.as_ptr();
         let (result, entries) = job(bytes).run();
