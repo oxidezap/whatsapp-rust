@@ -1,4 +1,4 @@
-use syn::visit::Visit;
+use syn::{Expr, parse::Parser, punctuated::Punctuated, visit::Visit};
 
 #[derive(Default)]
 struct Boundary {
@@ -160,6 +160,26 @@ impl Boundary {
 }
 
 impl<'ast> Visit<'ast> for Boundary {
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        self.check_path(
+            mac.path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string()),
+        );
+        let parser = Punctuated::<Expr, syn::Token![,]>::parse_terminated;
+        match parser.parse2(mac.tokens.clone()) {
+            Ok(arguments) => {
+                let mut nested = Boundary::default();
+                for argument in &arguments {
+                    nested.visit_expr(argument);
+                }
+                self.violations.extend(nested.violations);
+            }
+            Err(_) => self.violations.push("uninspectable macro arguments".into()),
+        }
+    }
+
     fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
         if module.attrs.iter().any(|attr| {
             attr.path().is_ident("cfg")
@@ -238,6 +258,8 @@ fn guard_detects_aliased_clocks_and_runtime_dependencies() {
         "fn read() { crate::time::now_secs(); }",
         "use tokio::task as jobs; fn start() { jobs::spawn(async {}); }",
         "async fn read() {}",
+        "fn read() { let _ = format_args!(\"{:?}\", std::time::SystemTime::now()); }",
+        "fn read() { opaque_macro!(not => expressions); }",
         "use std::io::Read;",
         "fn read() { std::io::stdin(); }",
         "use getrandom::fill as entropy;",

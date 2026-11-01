@@ -971,7 +971,14 @@ mod tests {
                 .unwrap()
                 .unwrap();
             if fail {
-                assert!(result.is_err());
+                let error = result.expect_err("injected commit failure");
+                assert!(
+                    error
+                        .downcast_ref::<wacore::appstate_sync::CommittedMutationsError>()
+                        .is_none(),
+                    "an uncommitted patch must not publish mutations"
+                );
+                assert!(format!("{error:#}").contains("injected patch commit failure"));
                 assert!(
                     backend
                         .get_version(WAPatchName::RegularHigh.as_str())
