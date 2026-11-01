@@ -766,8 +766,8 @@ impl CallRegistry {
         let (ringing_entries, ringing_bytes) = {
             let ringing = self.ringing_calls();
             let bytes = ringing
-                .iter()
-                .map(|(call_id, _)| size_of::<(String, u64)>() + call_id.heap_bytes())
+                .keys()
+                .map(|call_id| size_of::<(String, u64)>() + call_id.heap_bytes())
                 .sum::<usize>();
             (ringing.len(), bytes)
         };

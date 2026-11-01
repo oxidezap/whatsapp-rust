@@ -251,7 +251,7 @@ pub(crate) async fn apply_answer(
         // Only an ABSENT node is `Unknown`; a present one reads through
         // `capability_bit`, which owns what an unreadable `ver` means.
         peer_mlow_bit = announced_mlow_bit(capability);
-        let mut capability_sender = routed_call_sender(&call);
+        let mut capability_sender = routed_call_sender(call);
         if matches!(&call.action, CallAction::PreAccept { .. })
             && !client
                 .call_registry()
@@ -317,7 +317,7 @@ pub(crate) async fn apply_answer(
     // device id; without this every inbound frame decrypts to garbage. One-shot, and a
     // no-op for an incoming call or a call we aren't the caller of (no sender registered).
     if let CallAction::Accept { .. } = &call.action {
-        let sender = routed_call_sender(&call);
+        let sender = routed_call_sender(call);
         // Record the device that answered so a later <terminate> targets it (call
         // signaling is addressed per device, not to the bare peer the offer rang).
         if direct_accept.is_none() {
@@ -968,7 +968,7 @@ mod tests {
             .attr("call-id", "DIRECT-INGRESS")
             .attr("call-creator", creator);
         for (key, value) in extra {
-            action = action.attr(*key, *value);
+            action = action.attr(key, *value);
         }
         NodeBuilder::new("call")
             .attr("id", "DIRECT-IN")

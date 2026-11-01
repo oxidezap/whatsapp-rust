@@ -1593,7 +1593,7 @@ async fn send_answer_node(
     teardown.arm();
     if let Err(error) = client.send_node(node).await {
         teardown.terminate(client).await;
-        return Err(error.into());
+        return Err(error);
     }
     registration.ensure_current()?;
     Ok(())
@@ -1853,7 +1853,6 @@ async fn publish_group_epoch_ciphertexts(
 /// outgoing call can't survive a disconnect; the registry's `abort_all` already covers attached calls,
 /// but those have no media-task drop-guard yet, so this is their only end-notify path. Called from the
 /// client's connection teardown.
-
 pub(super) fn drain_direct_pending(client: &dyn DirectCallHost) {
     let drained: Vec<PendingOutgoing> = {
         let mut map = client
@@ -2125,7 +2124,7 @@ async fn place_call_prepared(
         if removed.is_some() {
             ended.notify();
         }
-        return Err(e.into());
+        return Err(e);
     }
 
     client.call_state().ensure_epoch(epoch)?;
