@@ -47,13 +47,13 @@ pub fn preserve_compatibility(ir: &mut MexIr) -> anyhow::Result<()> {
         );
     }
     if let Some(op) = ir.operations.get_mut("ContactManagerCustomerProfiles") {
-        // WAWebContactManagerCustomerProfilesQuery, bundle 36dc1290c51b0250,
-        // bytes 254574..257662 in set 05609307e68b: candidateLids is passed
+        // WAWebContactManagerCustomerProfilesQuery, bundle 0544c41fc2699b34,
+        // bytes 353258..357878 in set d6ab7ae601ed: candidateLids is passed
         // through with [] as the nullish fallback, not converted to a string.
         // Keep the previous array API instead of propagating the IR's fallback
         // inference. A new document must be reviewed against its own source.
         anyhow::ensure!(
-            op.doc_id == "27796221486653417",
+            op.doc_id == "29693690733569730",
             "review ContactManagerCustomerProfiles before changing its retained input shape"
         );
         let Some(TypeNode::Object(input)) = op.variables_shape.get_mut("input") else {
@@ -288,7 +288,7 @@ mod tests {
             &[("input", obj(&[("candidate_lids", leaf("string"))]))],
             &[],
         );
-        operation.doc_id = "27796221486653417".into();
+        operation.doc_id = "29693690733569730".into();
         let mut ir = ir("ContactManagerCustomerProfiles", operation);
         preserve_compatibility(&mut ir).unwrap();
         assert!(generate(&ir).contains("pub candidate_lids: Option<Vec<String>>"));

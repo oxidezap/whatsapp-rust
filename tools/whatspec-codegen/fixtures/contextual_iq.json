@@ -1,6 +1,6 @@
 {
-  "schemaVersion": "4.4.0",
-  "waVersion": "2.3000.1047483476",
+  "schemaVersion": "4.5.0",
+  "waVersion": "2.3000.1052559453",
   "stanzas": [
     {
       "moduleName": "WASmaxOutMdGetCountryCodeRequest",
@@ -247,13 +247,15 @@
       }
     },
     {
-      "moduleName": "WASmaxOutPassiveModeActiveIQRequest",
+      "moduleName": "WASmaxPassiveModeActiveIQRPC",
       "namespace": "passive",
       "iqType": "set",
       "target": "s.whatsapp.net",
       "parserName": "WASmaxPassiveModeActiveIQRPC",
       "exportedFunction": "makeActiveIQRequest",
       "allExports": [
+        "sendActiveIQRPC",
+        "parseActiveIQResponseSuccess",
         "makeActiveIQRequest"
       ],
       "request": {
@@ -293,7 +295,7 @@
         "variants": [
           {
             "tag": "ActiveIQResponseSuccess",
-            "moduleName": "WASmaxInPassiveModeActiveIQResponseSuccess",
+            "moduleName": "WASmaxPassiveModeActiveIQRPC",
             "kind": "success",
             "assertions": [
               {
@@ -345,13 +347,15 @@
       }
     },
     {
-      "moduleName": "WASmaxOutPassiveModePassiveIQRequest",
+      "moduleName": "WASmaxPassiveModePassiveIQRPC",
       "namespace": "passive",
       "iqType": "set",
       "target": "s.whatsapp.net",
       "parserName": "WASmaxPassiveModePassiveIQRPC",
       "exportedFunction": "makePassiveIQRequest",
       "allExports": [
+        "sendPassiveIQRPC",
+        "parsePassiveIQResponseSuccess",
         "makePassiveIQRequest"
       ],
       "request": {
@@ -391,7 +395,7 @@
         "variants": [
           {
             "tag": "PassiveIQResponseSuccess",
-            "moduleName": "WASmaxInPassiveModePassiveIQResponseSuccess",
+            "moduleName": "WASmaxPassiveModePassiveIQRPC",
             "kind": "success",
             "assertions": [
               {
@@ -443,14 +447,20 @@
       }
     },
     {
-      "moduleName": "WASmaxOutGroupsAcceptGroupAddRequest",
+      "moduleName": "WASmaxGroupsAcceptGroupAddRPC",
       "namespace": "w:g2",
       "iqType": "set",
       "target": "group_jid",
       "parserName": "WASmaxGroupsAcceptGroupAddRPC",
       "exportedFunction": "makeAcceptGroupAddRequest",
       "allExports": [
-        "makeAcceptGroupAddRequest"
+        "sendAcceptGroupAddRPC",
+        "parseAcceptGroupAddResponseClientError",
+        "parseAcceptGroupAddResponseGroupJoinRequestSuccess",
+        "parseAcceptGroupAddResponseServerError",
+        "parseAcceptGroupAddResponseSuccess",
+        "makeAcceptGroupAddRequest",
+        "parseAcceptGroupAddClientErrors"
       ],
       "request": {
         "namespace": "w:g2",
@@ -517,7 +527,7 @@
         "variants": [
           {
             "tag": "AcceptGroupAddResponseGroupJoinRequestSuccess",
-            "moduleName": "WASmaxInGroupsAcceptGroupAddResponseGroupJoinRequestSuccess",
+            "moduleName": "WASmaxGroupsAcceptGroupAddRPC",
             "kind": "success",
             "assertions": [
               {
@@ -561,7 +571,7 @@
           },
           {
             "tag": "AcceptGroupAddResponseSuccess",
-            "moduleName": "WASmaxInGroupsAcceptGroupAddResponseSuccess",
+            "moduleName": "WASmaxGroupsAcceptGroupAddRPC",
             "kind": "success",
             "assertions": [
               {
@@ -601,7 +611,7 @@
           },
           {
             "tag": "AcceptGroupAddResponseClientError",
-            "moduleName": "WASmaxInGroupsAcceptGroupAddResponseClientError",
+            "moduleName": "WASmaxGroupsAcceptGroupAddRPC",
             "kind": "error",
             "errorArms": [
               {
@@ -1190,7 +1200,7 @@
           },
           {
             "tag": "AcceptGroupAddResponseServerError",
-            "moduleName": "WASmaxInGroupsAcceptGroupAddResponseServerError",
+            "moduleName": "WASmaxGroupsAcceptGroupAddRPC",
             "kind": "server_error",
             "errorArms": [
               {
@@ -1403,14 +1413,19 @@
       }
     },
     {
-      "moduleName": "WASmaxOutGroupsDeleteParentGroupRequest",
+      "moduleName": "WASmaxGroupsDeleteParentGroupRPC",
       "namespace": "w:g2",
       "iqType": "set",
       "target": "group_jid",
       "parserName": "WASmaxGroupsDeleteParentGroupRPC",
       "exportedFunction": "makeDeleteParentGroupRequest",
       "allExports": [
-        "makeDeleteParentGroupRequest"
+        "sendDeleteParentGroupRPC",
+        "parseDeleteParentGroupResponseClientError",
+        "parseDeleteParentGroupResponseServerError",
+        "parseDeleteParentGroupResponseSuccess",
+        "makeDeleteParentGroupRequest",
+        "parseDeleteParentGroupClientError"
       ],
       "request": {
         "namespace": "w:g2",
@@ -1446,7 +1461,7 @@
         "variants": [
           {
             "tag": "DeleteParentGroupResponseSuccess",
-            "moduleName": "WASmaxInGroupsDeleteParentGroupResponseSuccess",
+            "moduleName": "WASmaxGroupsDeleteParentGroupRPC",
             "kind": "success",
             "assertions": [
               {
@@ -1486,7 +1501,7 @@
           },
           {
             "tag": "DeleteParentGroupResponseClientError",
-            "moduleName": "WASmaxInGroupsDeleteParentGroupResponseClientError",
+            "moduleName": "WASmaxGroupsDeleteParentGroupRPC",
             "kind": "client_error",
             "errorArms": [
               {
@@ -1503,6 +1518,11 @@
                 "name": "IQErrorItemNotFound",
                 "code": 404,
                 "text": "item-not-found"
+              },
+              {
+                "name": "IQErrorRateOverlimit",
+                "code": 429,
+                "text": "rate-overlimit"
               }
             ],
             "assertions": [
@@ -1655,6 +1675,43 @@
                         "value": "404"
                       }
                     ]
+                  },
+                  {
+                    "name": "IQErrorRateOverlimit",
+                    "fields": [
+                      {
+                        "method": "attrString",
+                        "name": "text",
+                        "wireName": "text",
+                        "type": "string",
+                        "parserRequired": true,
+                        "literalValue": "rate-overlimit"
+                      },
+                      {
+                        "method": "attrInt",
+                        "name": "code",
+                        "wireName": "code",
+                        "type": "integer",
+                        "parserRequired": true,
+                        "literalValue": "429"
+                      }
+                    ],
+                    "assertions": [
+                      {
+                        "kind": "tag",
+                        "name": "error"
+                      },
+                      {
+                        "kind": "attr",
+                        "name": "text",
+                        "value": "rate-overlimit"
+                      },
+                      {
+                        "kind": "attr",
+                        "name": "code",
+                        "value": "429"
+                      }
+                    ]
                   }
                 ],
                 "sourcePath": [
@@ -1665,7 +1722,7 @@
           },
           {
             "tag": "DeleteParentGroupResponseServerError",
-            "moduleName": "WASmaxInGroupsDeleteParentGroupResponseServerError",
+            "moduleName": "WASmaxGroupsDeleteParentGroupRPC",
             "kind": "server_error",
             "errorArms": [
               {
@@ -1878,14 +1935,20 @@
       }
     },
     {
-      "moduleName": "WASmaxOutGroupsJoinLinkedGroupRequest",
+      "moduleName": "WASmaxGroupsJoinLinkedGroupRPC",
       "namespace": "w:g2",
       "iqType": "set",
       "target": "group_jid",
       "parserName": "WASmaxGroupsJoinLinkedGroupRPC",
       "exportedFunction": "makeJoinLinkedGroupRequest",
       "allExports": [
-        "makeJoinLinkedGroupRequest"
+        "sendJoinLinkedGroupRPC",
+        "parseJoinLinkedGroupResponseClientError",
+        "parseJoinLinkedGroupResponseGroupJoinRequestSuccess",
+        "parseJoinLinkedGroupResponseServerError",
+        "parseJoinLinkedGroupResponseSuccess",
+        "makeJoinLinkedGroupRequest",
+        "parseJoinLinkedGroupClientErrors"
       ],
       "request": {
         "namespace": "w:g2",
@@ -1942,7 +2005,7 @@
         "variants": [
           {
             "tag": "JoinLinkedGroupResponseGroupJoinRequestSuccess",
-            "moduleName": "WASmaxInGroupsJoinLinkedGroupResponseGroupJoinRequestSuccess",
+            "moduleName": "WASmaxGroupsJoinLinkedGroupRPC",
             "kind": "success",
             "assertions": [
               {
@@ -1986,7 +2049,7 @@
           },
           {
             "tag": "JoinLinkedGroupResponseSuccess",
-            "moduleName": "WASmaxInGroupsJoinLinkedGroupResponseSuccess",
+            "moduleName": "WASmaxGroupsJoinLinkedGroupRPC",
             "kind": "success",
             "assertions": [
               {
@@ -2026,7 +2089,7 @@
           },
           {
             "tag": "JoinLinkedGroupResponseClientError",
-            "moduleName": "WASmaxInGroupsJoinLinkedGroupResponseClientError",
+            "moduleName": "WASmaxGroupsJoinLinkedGroupRPC",
             "kind": "error",
             "errorArms": [
               {
@@ -2555,7 +2618,7 @@
           },
           {
             "tag": "JoinLinkedGroupResponseServerError",
-            "moduleName": "WASmaxInGroupsJoinLinkedGroupResponseServerError",
+            "moduleName": "WASmaxGroupsJoinLinkedGroupRPC",
             "kind": "server_error",
             "errorArms": [
               {
@@ -2768,14 +2831,20 @@
       }
     },
     {
-      "moduleName": "WASmaxOutGroupsSetSubjectRequest",
+      "moduleName": "WASmaxGroupsSetSubjectRPC",
       "namespace": "w:g2",
       "iqType": "set",
       "target": "group_jid",
       "parserName": "WASmaxGroupsSetSubjectRPC",
       "exportedFunction": "makeSetSubjectRequest",
       "allExports": [
-        "makeSetSubjectRequest"
+        "sendSetSubjectRPC",
+        "parseSetSubjectResponseClientError",
+        "parseSetSubjectResponseServerError",
+        "parseSetSubjectResponseSuccess",
+        "makeSetSubjectRequest",
+        "parseSetSubjectClientErrors",
+        "mergeSetSubjectChangeSubjectMixin"
       ],
       "request": {
         "namespace": "w:g2",
@@ -2819,7 +2888,7 @@
         "variants": [
           {
             "tag": "SetSubjectResponseSuccess",
-            "moduleName": "WASmaxInGroupsSetSubjectResponseSuccess",
+            "moduleName": "WASmaxGroupsSetSubjectRPC",
             "kind": "success",
             "assertions": [
               {
@@ -2859,7 +2928,7 @@
           },
           {
             "tag": "SetSubjectResponseClientError",
-            "moduleName": "WASmaxInGroupsSetSubjectResponseClientError",
+            "moduleName": "WASmaxGroupsSetSubjectRPC",
             "kind": "client_error",
             "errorArms": [
               {
@@ -3262,7 +3331,7 @@
           },
           {
             "tag": "SetSubjectResponseServerError",
-            "moduleName": "WASmaxInGroupsSetSubjectResponseServerError",
+            "moduleName": "WASmaxGroupsSetSubjectRPC",
             "kind": "server_error",
             "errorArms": [
               {

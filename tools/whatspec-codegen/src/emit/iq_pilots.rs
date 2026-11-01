@@ -68,7 +68,7 @@ pub fn generate(json: &str, wa_version: &str) -> Result<String> {
     let mut out = header("private IQ pilot builders and result payloads", wa_version);
     out.push_str("//! Envelope correlation and error conversion stay in the request layer.\n\nuse crate::request::InfoQuery;\nuse wacore_binary::{Jid, NodeContent, NodeRef, builder::NodeBuilder};\n\n");
     for pilot in PILOTS {
-        let module = format!("WASmaxOutGroups{pilot}Request");
+        let module = format!("WASmaxGroups{pilot}RPC");
         let matches: Vec<_> = stanzas
             .iter()
             .filter(|s| s["moduleName"] == module)
@@ -332,7 +332,7 @@ pub(super) mod tests {
             gated["tag"] = json!(format!("{pilot}ResponseConditionalSuccess"));
             gated["assertions"].as_array_mut().unwrap().push(json!({"kind":"child","name":"source_gate"}));
             json!({
-                "moduleName":format!("WASmaxOutGroups{pilot}Request"),
+                "moduleName":format!("WASmaxGroups{pilot}RPC"),
                 "namespace":"test:wire", "iqType":"set", "target":"group_jid",
                 "request": {"namespace":"test:wire", "iqType":"set", "target":"group_jid",
                     "targetArgPath":[{"key":"destination"}],

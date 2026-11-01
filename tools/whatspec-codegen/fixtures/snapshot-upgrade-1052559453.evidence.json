@@ -1,0 +1,34 @@
+{
+  "whatspecRev": "6cc5b0766eac00fc387a6a1f50d71a9ef6d5385a",
+  "coreBase": "0d1373a8f",
+  "fromWaVersion": "2.3000.1047483476",
+  "toWaVersion": "2.3000.1052559453",
+  "schemaVersion": "4.5.0",
+  "bundleCount": 676,
+  "setHash": "d6ab7ae601eda281cfac570a68de1d787adde8f4d778f0bb994416f661a21abf",
+  "archiveSha256": "2958d99a3d84141fa8479f1f991e06246e68c063ca8f618a8d5d361287387f62",
+  "integrity": "Archive digest and exact bundle multiset of SHA-256 and size verified locally.",
+  "generation": {
+    "command": "cargo run -p whatspec-codegen -- --update-lock --rev 6cc5b0766eac00fc387a6a1f50d71a9ef6d5385a --verify-iq-bundles ../bundles-new",
+    "result": "action oracle snapshot requires qualification",
+    "outputsWritten": false
+  },
+  "upstreamQualification": {
+    "command": "cargo run -p wa-notif --example group_envelope_contract -- /path/to/a018f64e2c88a44300ee70b669e4fbfdb09d2491aa0552b48bbad42d39614d42.js",
+    "result": "unqualified group provider initialization: WAWebEphemeralityTypes",
+    "handler": {
+      "module": "WAWebHandleGroupNotification",
+      "bundleSha256": "a018f64e2c88a44300ee70b669e4fbfdb09d2491aa0552b48bbad42d39614d42",
+      "startByte": 2363888,
+      "endByte": 2387756,
+      "moduleSha256": "d1641fad966fd3b32d6b9859e074f804526e67181584811364774047208c273d"
+    },
+    "required": "Requalify exact new group suppliers, envelope/action/create/link/unlink contracts and independent oracle captures in whatspec before refreshing the corresponding consumer fixtures."
+  },
+  "limits": [
+    "No authenticated client/server execution.",
+    "Runtime version, stable catalog lock and generated outputs remain at the previous snapshot because all-domain generation has not passed.",
+    "Only tooling dependencies were repinned. No server API support was removed.",
+    "No bridge or Baileyrs checkouts changed."
+  ]
+}

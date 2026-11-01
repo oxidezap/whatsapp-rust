@@ -96,7 +96,7 @@ pub fn generate(json: &str, wa_version: &str) -> Result<String> {
         .as_array()
         .context("missing stanzas")?
         .iter()
-        .filter(|op| op["moduleName"] == "WASmaxOutGroupsAcceptGroupAddRequest")
+        .filter(|op| op["moduleName"] == "WASmaxGroupsAcceptGroupAddRPC")
         .collect();
     let [op] = ops.as_slice() else {
         anyhow::bail!("expected one AcceptGroupAdd contract")
@@ -193,16 +193,16 @@ mod tests {
 
     #[test]
     fn provenance_cannot_follow_a_new_pin_without_review() {
-        assert!(validate_revision("c581c20a9d0605df49abf297f2e7cfc04ccf1ff7").is_ok());
+        assert!(validate_revision("6cc5b0766eac00fc387a6a1f50d71a9ef6d5385a").is_ok());
         assert!(validate_revision("0000000000000000000000000000000000000000").is_err());
     }
 
     #[test]
     fn deterministic_cases_have_independently_recorded_expectations() {
-        let output = generate(&ir().to_string(), "2.3000.1047483476").unwrap();
+        let output = generate(&ir().to_string(), "2.3000.1052559453").unwrap();
         assert_eq!(
             output,
-            generate(&ir().to_string(), "2.3000.1047483476").unwrap()
+            generate(&ir().to_string(), "2.3000.1052559453").unwrap()
         );
         assert!(output.contains("unknown_between_duplicates"));
         assert!(output.contains("AcceptGroupAddSuccess::Success, \"duplicate\""));
@@ -224,7 +224,7 @@ mod tests {
                     variants.as_array_mut().unwrap().push(extra);
                 }
             }
-            assert!(generate(&ir.to_string(), "2.3000.1047483476").is_err());
+            assert!(generate(&ir.to_string(), "2.3000.1052559453").is_err());
         }
         assert!(generate(&original.to_string(), "future").is_err());
     }

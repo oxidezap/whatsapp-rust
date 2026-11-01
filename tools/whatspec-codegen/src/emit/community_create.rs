@@ -56,7 +56,7 @@ pub fn generate(json: &str, version: &str) -> Result<String> {
     let ir: Value = serde_json::from_str(json)?;
     let stanza = unique(
         ir["stanzas"].as_array().context("missing IQ stanzas")?,
-        |s| s["moduleName"] == "WASmaxOutGroupsCreateRequest",
+        |s| s["moduleName"] == "WASmaxGroupsCreateRPC",
     )?;
     let request = &stanza["request"];
     keys(request, &["namespace", "iqType", "target", "children"])?;
