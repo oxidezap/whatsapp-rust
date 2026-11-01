@@ -1,4 +1,5 @@
-//! Historical public MEX contracts from whatspec 1a441f0329c941fcdb238490a6c604550d8a9939.
+//! Historical public MEX contracts. The original set is from whatspec
+//! 1a441f0329c941fcdb238490a6c604550d8a9939; later retentions name their source below.
 //! Their GraphQL definitions are absent from the next locked Web capture.
 //! Retention preserves payload shapes, not a claim of current server support.
 //! Construction follows [`super::mex_operations`].
@@ -488,5 +489,58 @@ pub mod upload_labyrinth_messages {
     pub struct Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub wa_labyrinth_upload_messages: Option<WaLabyrinthUploadMessages>,
+    }
+}
+
+/// Historical WAWebBizCustomUrlGetUserGraphqlQuery from whatspec
+/// c581c20a9d0605df49abf297f2e7cfc04ccf1ff7 (2.3000.1047483476).
+/// Absent from the new capture; retained without claiming server support.
+pub mod biz_custom_url_get_user_graphql {
+    use super::{Deserialize, Serialize};
+
+    pub const NAME: &str = "WAWebBizCustomUrlGetUserGraphqlQuery";
+    pub const DOC_ID: &str = "26867176859566677";
+    pub const OPERATION_KIND: &str = "query";
+    pub const VARIABLE_KEYS: &[&str] = &["data"];
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct CustomUrl {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub path: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Data {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub custom_url: Option<CustomUrl>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Variables {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub data: Option<Data>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct XwaCustomUrlGetUser {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error_code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error_text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub success: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[non_exhaustive]
+    pub struct Response {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub xwa_custom_url_get_user: Option<XwaCustomUrlGetUser>,
     }
 }

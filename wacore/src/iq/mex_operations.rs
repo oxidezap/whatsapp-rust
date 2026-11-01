@@ -13,9 +13,10 @@ use serde::{Deserialize, Serialize};
 
 // Historical contracts retained at their public paths; see the sibling's provenance.
 pub use super::mex_operations_unlisted::{
-    create_labyrinth_backup, debug_labyrinth_inbox_snapshot, debug_labyrinth_range,
-    eb_message_metadata_query, rotate_labyrinth_epoch, team_link_create_invitation,
-    team_link_list_invitations, team_link_remove_invitation, upload_labyrinth_messages,
+    biz_custom_url_get_user_graphql, create_labyrinth_backup, debug_labyrinth_inbox_snapshot,
+    debug_labyrinth_range, eb_message_metadata_query, rotate_labyrinth_epoch,
+    team_link_create_invitation, team_link_list_invitations, team_link_remove_invitation,
+    upload_labyrinth_messages,
 };
 
 /// `WAWebACSServerProviderConfigQuery` (query).
@@ -1217,6 +1218,8 @@ pub mod biz_query_order {
     #[non_exhaustive]
     pub struct Order {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub direct_connection_encrypted_info: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub image_dimensions: Option<ImageDimensions>,
@@ -1989,6 +1992,8 @@ pub mod contact_manager_customer_profile {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub last_order: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub last_order_date: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub last_updates: Option<Vec<LastUpdates>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub lead_stage: Option<String>,
@@ -2050,7 +2055,7 @@ pub mod contact_manager_customer_profile_upsert {
     #[non_exhaustive]
     pub struct Variables {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub input: Option<String>,
+        pub input: Option<Vec<String>>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2063,6 +2068,8 @@ pub mod contact_manager_customer_profile_upsert {
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
     #[non_exhaustive]
     pub struct Profiles {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lid: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub lid_jid: Option<String>,
     }
@@ -2192,9 +2199,13 @@ pub mod contact_manager_customer_profiles {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub last_order: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub last_order_date: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub last_updates: Option<Vec<LastUpdates>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub lead_stage: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub lid: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub lid_jid: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5989,6 +6000,8 @@ pub mod fetch_newsletter_pending_invites {
     pub struct User {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub pn: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -10145,6 +10158,8 @@ pub mod query_catalog {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub catalog_session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub direct_connection_encrypted_info: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub height: Option<i64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub jid: Option<String>,
@@ -10449,6 +10464,8 @@ pub mod query_catalog_has_categories {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub catalog_session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub direct_connection_encrypted_info: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub image_dimensions: Option<String>,
     }
 
@@ -10501,6 +10518,8 @@ pub mod query_catalog_product {
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
     #[non_exhaustive]
     pub struct Product {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub direct_connection_encrypted_info: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub fetch_compliance_info: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -10795,6 +10814,8 @@ pub mod query_product_collections {
         pub biz_jid: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub collection_limit: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub direct_connection_encrypted_info: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub height: Option<i64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -11406,6 +11427,8 @@ pub mod query_product_single_collection {
         pub after: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub biz_jid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub direct_connection_encrypted_info: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub height: Option<i64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

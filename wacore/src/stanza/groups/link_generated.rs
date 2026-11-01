@@ -1,6 +1,6 @@
 //! Auto-generated group link decisions (WhatsApp 2.3000.1052559453). DO NOT EDIT.
 //!
-//! Qualified source: https://github.com/oxidezap/whatspec/blob/afa3e343f37b0b64f03cffcacf2448ef883a2d8b/generated/notif/group-link.json
+//! Qualified source: <https://github.com/oxidezap/whatspec/blob/afa3e343f37b0b64f03cffcacf2448ef883a2d8b/generated/notif/group-link.json>
 //! Module-relative source bytes 17403..18068. Null results preserve ordered warnings.
 use super::super::normalization_warning::{Decision, WarningSpec};
 use super::super::normalized::GroupParseError;

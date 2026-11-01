@@ -251,5 +251,21 @@
       "contextAndPropsBudget": "New carrier integration tests and unchanged C3 allocation budgets passed."
     },
     "publication": "Qualified afa3e343 integration prepared for publication; upstream PR 65 remains open. No merge or release performed."
+  },
+  "mexPublicCompatibility": {
+    "historicalSourceRev": "c581c20a9d0605df49abf297f2e7cfc04ccf1ff7",
+    "retainedModule": "biz_custom_url_get_user_graphql",
+    "retainedShapeChanges": 12,
+    "guardFixture": "mex-retained-shapes.json",
+    "audit": "Existing generated public struct names, field names and field types compared to core base; no remaining removals/type changes after retention. This is an SDK compatibility check, not server qualification.",
+    "upsertListSource": {
+      "module": "WAWebContactManagerCustomerProfileUpsertMutation",
+      "bundleSha256": "0544c41fc2699b3460cc80aa95472fed4f6af4eb3899d0d949816b8431429f20",
+      "startByte": 357880,
+      "endByte": 363731,
+      "sha256": "32480344692d1cc0fb0e4ef3ed1c401f8a58818b3e9bb88d591f8dda37de7e43",
+      "finding": "Complete module maps batch inputs and passes their array to commitMutation as input; preserve the prior Vec input rather than the scalar fallback inference."
+    },
+    "limits": "Historical optional fields and document are retained for source/serialization compatibility; no claim that the server currently accepts absent catalog operations or fields."
   }
 }

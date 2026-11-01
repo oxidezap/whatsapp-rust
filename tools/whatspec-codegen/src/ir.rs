@@ -327,7 +327,7 @@ impl MexOperationKind {
 /// A node in a `variablesShape` / `response` type tree: an object, a
 /// single-element array standing for a plural field, or a scalar type tag
 /// (`"string"`, `"number"`, `"boolean"`, `"enum:A|B"`, `"unknown"`).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(untagged)]
 pub enum TypeNode {
     Object(BTreeMap<String, TypeNode>),

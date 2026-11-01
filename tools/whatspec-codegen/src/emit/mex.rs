@@ -23,14 +23,16 @@ use serde::{Deserialize, Serialize};
 
 // Historical contracts retained at their public paths; see the sibling's provenance.
 pub use super::mex_operations_unlisted::{
-    create_labyrinth_backup, debug_labyrinth_inbox_snapshot, debug_labyrinth_range,
+    biz_custom_url_get_user_graphql, create_labyrinth_backup, debug_labyrinth_inbox_snapshot, debug_labyrinth_range,
     eb_message_metadata_query, rotate_labyrinth_epoch, team_link_create_invitation,
     team_link_list_invitations, team_link_remove_invitation, upload_labyrinth_messages,
 };
 ";
 
 pub fn preserve_compatibility(ir: &mut MexIr) -> anyhow::Result<()> {
+    retain_historical_fields(ir)?;
     for name in [
+        "BizCustomUrlGetUserGraphql",
         "CreateLabyrinthBackup",
         "DebugLabyrinthInboxSnapshot",
         "DebugLabyrinthRange",
@@ -78,6 +80,83 @@ pub fn preserve_compatibility(ir: &mut MexIr) -> anyhow::Result<()> {
                 {}
             _ => anyhow::bail!("review ContactManagerCustomerProfiles candidate_lids type"),
         }
+    }
+    Ok(())
+}
+
+// Retaining an optional SDK field does not assert its current server support.
+// Bound each exception to the reviewed operation document and parent shape.
+fn retain_historical_fields(ir: &mut MexIr) -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Retained {
+        operation: String,
+        doc_id: String,
+        root: String,
+        path: Vec<String>,
+        retained: TypeNode,
+        observed: Option<TypeNode>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Fixture {
+        source_rev: String,
+        wa_version: String,
+        fields: Vec<Retained>,
+    }
+    let fixture: Fixture =
+        serde_json::from_str(include_str!("../../fixtures/mex-retained-shapes.json"))?;
+    ensure!(
+        fixture.source_rev == "c581c20a9d0605df49abf297f2e7cfc04ccf1ff7"
+            && fixture.wa_version == "2.3000.1047483476",
+        "historical MEX provenance changed"
+    );
+    for entry in fixture.fields {
+        let Some(op) = ir.operations.get_mut(&entry.operation) else {
+            continue;
+        };
+        ensure!(
+            op.doc_id == entry.doc_id,
+            "review retained MEX fields for {}",
+            entry.operation
+        );
+        let root = match entry.root.as_str() {
+            "variablesShape" => &mut op.variables_shape,
+            "response" => &mut op.response,
+            _ => anyhow::bail!("unsupported retained MEX root"),
+        };
+        let (last, parents) = entry.path.split_last().context("empty retained MEX path")?;
+        let mut fields = root;
+        let mut index = 0;
+        while index < parents.len() {
+            let node = fields
+                .get_mut(&parents[index])
+                .context("retained MEX parent missing")?;
+            index += 1;
+            let node = if parents.get(index).is_some_and(|p| p == "[]") {
+                index += 1;
+                let TypeNode::Array(items) = node else {
+                    anyhow::bail!("retained MEX array changed");
+                };
+                ensure!(items.len() == 1, "retained MEX array shape changed");
+                &mut items[0]
+            } else {
+                node
+            };
+            let TypeNode::Object(object) = node else {
+                anyhow::bail!("retained MEX object changed");
+            };
+            fields = object;
+        }
+        let current = fields.get(last);
+        ensure!(
+            current == entry.observed.as_ref() || current == Some(&entry.retained),
+            "retained MEX field requires review: {} {:?}",
+            entry.operation,
+            entry.path
+        );
+        fields.insert(last.clone(), entry.retained);
     }
     Ok(())
 }
@@ -291,13 +370,38 @@ mod tests {
     }
 
     #[test]
+    fn retained_fields_are_idempotent_and_reject_new_document_or_shape() {
+        let mut operation = op(&[("request", obj(&[("order", obj(&[]))]))], &[]);
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../fixtures/mex-retained-shapes.json")).unwrap();
+        operation.doc_id = fixture["fields"][0]["docId"].as_str().unwrap().into();
+        let mut value = ir("BizQueryOrder", operation);
+        retain_historical_fields(&mut value).unwrap();
+        retain_historical_fields(&mut value).unwrap();
+        value.operations.get_mut("BizQueryOrder").unwrap().doc_id = "changed".into();
+        assert!(retain_historical_fields(&mut value).is_err());
+        value.operations.get_mut("BizQueryOrder").unwrap().doc_id =
+            fixture["fields"][0]["docId"].as_str().unwrap().into();
+        value
+            .operations
+            .get_mut("BizQueryOrder")
+            .unwrap()
+            .variables_shape
+            .insert("request".into(), leaf("string"));
+        assert!(retain_historical_fields(&mut value).is_err());
+    }
+
+    #[test]
     fn candidate_array_override_is_bound_to_the_reviewed_document() {
         let mut operation = op(
             &[
                 ("input", obj(&[("candidate_lids", leaf("string"))])),
                 ("includeCustomFields", leaf("string")),
             ],
-            &[],
+            &[(
+                "xfb_wa_customer_profiles",
+                obj(&[("profiles", TypeNode::Array(vec![obj(&[])]))]),
+            )],
         );
         operation.doc_id = "29693690733569730".into();
         let mut ir = ir("ContactManagerCustomerProfiles", operation);

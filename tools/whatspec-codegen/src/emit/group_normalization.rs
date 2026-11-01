@@ -314,7 +314,7 @@ fn verify_oracle(c: &Contract, family: &str) -> Result<()> {
 }
 fn preamble(family: &str, version: &str, c: &Contract) -> String {
     format!(
-        "{}//! Qualified source: https://github.com/oxidezap/whatspec/blob/{REV}/generated/notif/group-{family}.json\n//! Module-relative source bytes {}..{}. Null results preserve ordered warnings.\nuse super::super::normalization_warning::{{Decision,WarningSpec}};\nuse super::super::normalized::GroupParseError;\n",
+        "{}//! Qualified source: <https://github.com/oxidezap/whatspec/blob/{REV}/generated/notif/group-{family}.json>\n//! Module-relative source bytes {}..{}. Null results preserve ordered warnings.\nuse super::super::normalization_warning::{{Decision,WarningSpec}};\nuse super::super::normalized::GroupParseError;\n",
         header(&format!("group {family} decisions"), version),
         c.start_byte,
         c.end_byte
