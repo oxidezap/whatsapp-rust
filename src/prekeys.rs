@@ -141,6 +141,23 @@ fn clamp_wanted_pre_key_count(n: usize) -> usize {
     n.clamp(MIN_PRE_KEY_COUNT, MAX_PRE_KEY_UPLOAD_BATCH)
 }
 
+fn authenticated_primary_identity(
+    bundle: &wacore::libsignal::protocol::PreKeyBundle,
+) -> anyhow::Result<wacore::libsignal::protocol::IdentityKey> {
+    let identity = *bundle.identity_key()?;
+    let signature: &[u8; 64] = bundle
+        .signed_pre_key_signature()?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid primary signed prekey signature length"))?;
+    if !identity
+        .public_key()
+        .verify_signature(&bundle.signed_pre_key_public()?.serialize(), signature)
+    {
+        anyhow::bail!("invalid primary signed prekey signature");
+    }
+    Ok(identity)
+}
+
 impl Client {
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.fetch_pre_keys", level = "debug", skip_all, fields(count = jids.len()), err(Debug)))]
     pub(crate) async fn fetch_pre_keys(
@@ -179,7 +196,7 @@ impl Client {
         for (jid, bundle) in &outcome.bundles {
             if jid.device == 0 && !jids.contains(jid) {
                 use wacore::types::jid::JidExt;
-                let identity = bundle.identity_key()?;
+                let identity = authenticated_primary_identity(bundle)?;
                 if !self
                     .signal_cache
                     .put_identity_if_absent_or_equal(
@@ -257,7 +274,6 @@ impl Client {
         jid: &Jid,
         processing_permit_held: bool,
     ) -> anyhow::Result<[u8; 32]> {
-        use wacore::libsignal::protocol::IdentityKeyStore;
         use wacore::types::jid::JidExt;
         let primary = jid.with_device(0);
         let address = primary.to_protocol_address();
@@ -273,25 +289,17 @@ impl Client {
             let bundle = response.bundles.get(&primary).ok_or_else(|| {
                 anyhow::anyhow!("primary identity unavailable for ADV verification")
             })?;
-            let identity = *bundle.identity_key()?;
-            let signature: &[u8; 64] = bundle
-                .signed_pre_key_signature()?
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("invalid primary signed prekey signature length"))?;
-            if !identity
-                .public_key()
-                .verify_signature(&bundle.signed_pre_key_public()?.serialize(), signature)
-            {
-                anyhow::bail!("invalid primary signed prekey signature");
-            }
-            identity
+            authenticated_primary_identity(bundle)?
         };
         let key: [u8; 32] = identity.public_key().public_key_bytes().try_into()?;
-        let mut adapter = self.signal_adapter();
-        adapter
-            .identity_store
-            .save_identity(&address, &identity)
-            .await?;
+        let backend = self.persistence_manager.backend();
+        if !self
+            .signal_cache
+            .put_identity_if_absent_or_equal(&address, &key, &*backend)
+            .await?
+        {
+            anyhow::bail!("primary identity changed during ADV bootstrap");
+        }
         // Never wait for the processing permit while holding a primary session
         // lock: a message holding that permit may need the same primary.
         drop(_guard);
