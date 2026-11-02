@@ -4,7 +4,7 @@
 
 mod implementation;
 
-pub(crate) use implementation::SyncTtlCache;
+pub(crate) use implementation::{SyncTtlCache, SyncTtlGuard};
 
 #[cfg(feature = "bench-harness")]
 #[doc(hidden)]

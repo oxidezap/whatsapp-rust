@@ -283,12 +283,41 @@ const PUBLICATION_INTERRUPTED: u8 = 2;
 pub(crate) type DispatchFingerprint = [u8; 16];
 
 #[derive(Clone)]
+enum CachedPublication {
+    Complete,
+    Tracked(Arc<AtomicU8>),
+}
+
+impl CachedPublication {
+    fn state(&self) -> u8 {
+        match self {
+            Self::Complete => PUBLICATION_COMPLETE,
+            Self::Tracked(owner) => owner.load(Ordering::Acquire),
+        }
+    }
+
+    fn compact(&mut self) -> bool {
+        let state = self.state();
+        if state == PUBLICATION_COMPLETE {
+            // Completion is terminal. The cache needs the result, not the
+            // per-batch owner whose allocation depends on receive scheduling.
+            *self = Self::Complete;
+        }
+        state != PUBLICATION_INTERRUPTED
+    }
+
+    fn owns_token(&self) -> bool {
+        matches!(self, Self::Tracked(_))
+    }
+}
+
+#[derive(Clone)]
 struct DispatchPayload {
     fingerprint: DispatchFingerprint,
     state: MessageDispatch,
     hook_committed: bool,
     producer: Option<DispatchKey>,
-    publication: Arc<AtomicU8>,
+    publication: CachedPublication,
 }
 
 /// The identity this claim's message carries under the alternate PN/LID
@@ -348,21 +377,20 @@ impl Drop for PublicationGuard {
 
 impl DispatchClaim {
     fn prune(&mut self) {
-        self.payloads.retain(|payload| {
-            payload.publication.load(Ordering::Acquire) != PUBLICATION_INTERRUPTED
-        });
+        self.payloads
+            .retain(|payload| payload.publication.compact());
     }
 
     fn has_deliveries(&self) -> bool {
         self.payloads
             .iter()
-            .any(|payload| payload.publication.load(Ordering::Acquire) != PUBLICATION_INTERRUPTED)
+            .any(|payload| payload.publication.state() != PUBLICATION_INTERRUPTED)
     }
 
     fn has_recovery(&self) -> bool {
         self.payloads.iter().any(|payload| {
             payload.state != MessageDispatch::Decrypted
-                && payload.publication.load(Ordering::Acquire) != PUBLICATION_INTERRUPTED
+                && payload.publication.state() != PUBLICATION_INTERRUPTED
         })
     }
 
@@ -371,7 +399,7 @@ impl DispatchClaim {
             .iter()
             .find(|payload| {
                 &payload.fingerprint == fingerprint
-                    && payload.publication.load(Ordering::Acquire) != PUBLICATION_INTERRUPTED
+                    && payload.publication.state() != PUBLICATION_INTERRUPTED
             })
             .map(|payload| payload.state)
     }
@@ -386,7 +414,7 @@ impl DispatchClaim {
     ) -> bool {
         if let Some(payload) = self.payloads.iter_mut().find(|payload| {
             payload.fingerprint == fingerprint
-                && payload.publication.load(Ordering::Acquire) != PUBLICATION_INTERRUPTED
+                && payload.publication.state() != PUBLICATION_INTERRUPTED
         }) {
             // Suppress on a live match, including an in-flight one. The only
             // way it can still roll back is a concurrent panic: this region
@@ -412,8 +440,8 @@ impl DispatchClaim {
             // Ordinary multipart dispatches still fan out. Retained-row cleanup
             // replay separately checks completed hook publication before admission.
             // Keep a completed claim, but let a new publisher own a pending one.
-            if payload.publication.load(Ordering::Acquire) != PUBLICATION_COMPLETE {
-                payload.publication = publication.owner();
+            if payload.publication.state() != PUBLICATION_COMPLETE {
+                payload.publication = CachedPublication::Tracked(publication.owner());
             }
             return false;
         }
@@ -427,7 +455,7 @@ impl DispatchClaim {
                 } else {
                     MessageDispatch::Decrypted
                 },
-                publication: publication.owner(),
+                publication: CachedPublication::Tracked(publication.owner()),
             });
         }
         // Overflow stays unclaimed, never silently discards another payload.
@@ -454,7 +482,8 @@ const TOKEN_ALLOC_BYTES: usize = 2 * size_of::<usize>() + size_of::<AtomicU8>();
 
 impl wacore::stats::HeapSize for DispatchClaim {
     /// Heap retained beside the table slot: spilled payloads at their
-    /// allocated capacity and one token allocation per payload. The inline
+    /// allocated capacity and tracked publication tokens. Completed payloads
+    /// have no token allocation. The inline
     /// SmallVec slot and the alias identity live in the slot itself and are
     /// charged with the table.
     fn heap_bytes(&self) -> usize {
@@ -462,7 +491,12 @@ impl wacore::stats::HeapSize for DispatchClaim {
         if self.payloads.spilled() {
             bytes += self.payloads.capacity() * size_of::<DispatchPayload>();
         }
-        bytes += self.payloads.len() * TOKEN_ALLOC_BYTES;
+        bytes += self
+            .payloads
+            .iter()
+            .filter(|payload| payload.publication.owns_token())
+            .count()
+            * TOKEN_ALLOC_BYTES;
         bytes
     }
 }
@@ -771,3 +805,95 @@ mod tests;
 
 #[cfg(test)]
 mod history_durability_tests;
+
+#[cfg(test)]
+mod publication_retention_tests {
+    use super::*;
+
+    #[test]
+    fn completed_publication_releases_owner_without_losing_deduplication() {
+        let mut claim = DispatchClaim::default();
+        let mut publication = PublicationGuard::default();
+        let fingerprint = [0x41; 16];
+        assert!(!claim.admit(fingerprint, false, true, None, &mut publication));
+        let owner = Arc::downgrade(&publication.owner());
+        publication.complete();
+        claim.prune();
+        assert!(
+            owner.upgrade().is_none(),
+            "completed claim retained its publication owner"
+        );
+        assert!(claim.has_deliveries());
+        assert!(matches!(
+            claim.state(&fingerprint),
+            Some(MessageDispatch::Decrypted)
+        ));
+        assert!(claim.payloads[0].hook_committed);
+        let mut replay = PublicationGuard::default();
+        assert!(claim.admit(fingerprint, true, true, None, &mut replay));
+        assert!(replay.owner.is_none());
+        assert_eq!(wacore::stats::HeapSize::heap_bytes(&claim), 0);
+    }
+}
+
+#[cfg(test)]
+mod publication_transition_tests {
+    use super::*;
+
+    #[test]
+    fn pending_and_interrupted_publications_keep_their_rollback_contract() {
+        let mut claim = DispatchClaim::default();
+        let mut publication = PublicationGuard::default();
+        let fingerprint = [0x42; 16];
+        claim.admit(fingerprint, false, false, None, &mut publication);
+        let owner = Arc::downgrade(&publication.owner());
+        claim.prune();
+        assert!(owner.upgrade().is_some());
+        assert!(claim.has_deliveries());
+        drop(publication);
+        claim.prune();
+        assert!(!claim.has_deliveries());
+        assert!(owner.upgrade().is_none());
+    }
+
+    #[test]
+    fn completed_cohort_members_release_the_shared_owner_independently() {
+        let mut first = DispatchClaim::default();
+        let mut second = DispatchClaim::default();
+        let mut publication = PublicationGuard::default();
+        first.admit([0x43; 16], false, false, None, &mut publication);
+        second.admit([0x44; 16], false, false, None, &mut publication);
+        let owner = Arc::downgrade(&publication.owner());
+        publication.complete();
+        first.prune();
+        assert!(owner.upgrade().is_some());
+        second.prune();
+        assert!(owner.upgrade().is_none());
+        assert!(first.has_deliveries() && second.has_deliveries());
+    }
+
+    #[test]
+    fn an_old_guard_cannot_interrupt_its_replacement() {
+        let mut claim = DispatchClaim::default();
+        let mut old = PublicationGuard::default();
+        let mut replacement = PublicationGuard::default();
+        let fingerprint = [0x45; 16];
+        claim.admit(fingerprint, false, false, None, &mut old);
+        claim.admit(fingerprint, false, false, None, &mut replacement);
+        let owner = Arc::downgrade(&replacement.owner());
+        drop(old);
+        claim.prune();
+        assert!(claim.has_deliveries());
+        assert!(owner.upgrade().is_some());
+        replacement.complete();
+        claim.prune();
+        assert!(claim.has_deliveries());
+        assert!(owner.upgrade().is_none());
+    }
+
+    #[test]
+    fn terminal_publication_keeps_the_original_slot_layout() {
+        assert_eq!(size_of::<CachedPublication>(), size_of::<Arc<AtomicU8>>());
+        assert_eq!(size_of::<PublicationGuard>(), size_of::<Arc<AtomicU8>>());
+    }
+}

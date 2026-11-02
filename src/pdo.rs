@@ -1695,13 +1695,13 @@ impl Client {
                     .messages(Arc::from([wacore::types::events::InboundMessage::builder(
                     )
                     .message(Arc::from(message))
-                    .info(message_info)
+                    .info(Arc::clone(&message_info))
                     .maybe_ephemeral_expiration(ephemeral_expiration)
                     .build()]))
                     .origin(wacore::types::events::BatchOrigin::Live)
                     .build(),
             ));
-        publication.complete();
+        self.complete_dispatch_publication(publication, [&message_info], true);
     }
 
     async fn obsolete_pdo_response(

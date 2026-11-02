@@ -1915,7 +1915,11 @@ impl Client {
             if let Some(items) = unpublished.take() {
                 self.publish_pending_messages(items, origin, hook_committed);
             }
-            std::mem::take(&mut publication).complete();
+            self.complete_dispatch_publication(
+                std::mem::take(&mut publication),
+                pending.iter().map(|item| &item.info),
+                false,
+            );
             self.inbound_commit_batch.live_retention.published(&pending);
             if let Err(error) = self.cleanup_pending_group(rows, Arc::clone(&pending)).await {
                 log::warn!("Pending occurrence cleanup conflict; suppressing ACK: {error:?}");
@@ -1942,7 +1946,11 @@ impl Client {
         if let Some(items) = unpublished {
             self.publish_pending_messages(items, origin, hook_committed);
         }
-        publication.complete();
+        self.complete_dispatch_publication(
+            publication,
+            pending.iter().map(|item| &item.info),
+            false,
+        );
         PendingCommitOutcome::DELIVERED
     }
 
