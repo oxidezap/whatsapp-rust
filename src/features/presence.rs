@@ -134,7 +134,7 @@ impl<'a> Presence<'a> {
     /// ```
     pub async fn subscribe(&self, jid: impl Into<Jid>) -> Result<(), PresenceError> {
         let jid = &jid.into();
-        debug!("presence subscribe: subscribing to {}", jid);
+        debug!("presence subscribe: subscribing to {}", jid.observe());
         let node = self.build_subscription_node(jid).await;
         self.client.send_node(node).await?;
         self.client.track_presence_subscription(jid.clone());
@@ -174,7 +174,7 @@ impl<'a> Presence<'a> {
     /// <presence type="unsubscribe" to="user@s.whatsapp.net"/>
     /// ```
     pub async fn unsubscribe(&self, jid: &Jid) -> Result<(), PresenceError> {
-        debug!("presence unsubscribe: unsubscribing from {}", jid);
+        debug!("presence unsubscribe: unsubscribing from {}", jid.observe());
         let node = self.build_unsubscription_node(jid);
         self.client.send_node(node).await?;
         self.client.untrack_presence_subscription(jid);
@@ -277,7 +277,10 @@ impl Client {
                     let node = Presence::subscription_node_with_token(jid, token);
                     async move {
                         if let Err(err) = self.send_node(node).await {
-                            warn!("Failed to re-subscribe to presence for {jid}: {err:?}");
+                            warn!(
+                                "Failed to re-subscribe to presence for {}: {err:?}",
+                                jid.observe()
+                            );
                         }
                     }
                 })

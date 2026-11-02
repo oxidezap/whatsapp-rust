@@ -1,10 +1,10 @@
 use super::traits::StanzaHandler;
 use crate::client::Client;
+use crate::logging::StanzaSummary;
 use async_trait::async_trait;
 use log::{debug, warn};
 use std::sync::Arc;
 use wacore::stanza::wire_tags::StanzaTag;
-use wacore::xml::DisplayableNodeRef;
 
 /// Handler for `<iq>` (Info/Query) stanzas.
 ///
@@ -50,10 +50,10 @@ impl IqHandler {
             if nr.get_attr("type").is_some_and(|s| s.as_str() == "result") {
                 debug!(
                     "Received late IQ response (waiter already removed): {}",
-                    DisplayableNodeRef(nr)
+                    StanzaSummary::from(nr)
                 );
             } else {
-                warn!("Received unhandled IQ: {}", DisplayableNodeRef(nr));
+                warn!("Received unhandled IQ: {}", StanzaSummary::from(nr));
             }
         }
     }

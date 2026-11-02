@@ -569,6 +569,13 @@ pub mod log_capture {
     /// asserting on it.
     const CAPTURED_TARGETS: &[&str] = &[
         "MessageQueue",
+        "Client/PairCode",
+        "Client/Send",
+        "Client/Recv",
+        "whatsapp_rust::logging",
+        "whatsapp_rust::handlers::iq",
+        "whatsapp_rust::client::node_io",
+        "whatsapp_rust::client::lid_pn",
         "Client/Keepalive",
         "whatsapp_rust::client::lifecycle",
         "whatsapp_rust::history_sync",

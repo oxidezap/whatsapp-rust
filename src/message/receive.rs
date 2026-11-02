@@ -259,10 +259,13 @@ impl Client {
                 info.media_type = media_type;
                 Arc::new(info)
             }
-            Err(e) => {
+            Err(_) => {
                 let id = nr.get_attr("id").map(|v| v.as_str());
-                let from = nr.get_attr("from").map(|v| v.as_str());
-                log::warn!("Failed to parse message info (id={id:?}, from={from:?}): {e:?}");
+                let from = nr
+                    .get_attr("from")
+                    .map(|v| wacore_binary::jid::observe_str(&v.as_str()));
+                // Parser errors can quote rejected attributes or payloads.
+                log::warn!("Failed to parse message info (id={id:?}, from={from:?})");
                 self.spawn_stanza_nack(nr, NackReason::ParsingError, None);
                 return None;
             }

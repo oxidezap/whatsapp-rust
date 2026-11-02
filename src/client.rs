@@ -66,7 +66,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
 
-use wacore::xml::{DisplayableNode, DisplayableNodeRef};
+use crate::logging::StanzaSummary;
 use wacore_binary::JidExt;
 use wacore_binary::Node;
 use wacore_binary::builder::NodeBuilder;

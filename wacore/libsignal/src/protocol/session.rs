@@ -104,7 +104,8 @@ async fn process_prekey_impl(
 
     let our_one_time_pre_key_pair = if let Some(pre_key_id) = message.pre_key_id() {
         log::debug!(
-            "processing PreKey message from {remote_address} with one-time prekey {pre_key_id}"
+            "processing PreKey message from {} with one-time prekey {pre_key_id}",
+            remote_address.observe()
         );
         Some(pre_key_store.get_pre_key(pre_key_id).await?.key_pair()?)
     } else {
@@ -116,7 +117,8 @@ async fn process_prekey_impl(
         // Security: Session still provides strong guarantees via signed prekey.
         // Perfect forward secrecy begins after first reply exchange.
         log::debug!(
-            "processing PreKey message from {remote_address} without one-time prekey (using signed prekey only)"
+            "processing PreKey message from {} without one-time prekey (using signed prekey only)",
+            remote_address.observe()
         );
         None
     };
@@ -228,7 +230,7 @@ async fn process_prekey_bundle_inner<R: Rng + CryptoRng>(
 
     log::debug!(
         "set_unacknowledged_pre_key_message for: {} with preKeyId: {}",
-        remote_address,
+        remote_address.observe(),
         their_one_time_prekey_id.map_or_else(|| "<none>".to_string(), |id| id.to_string())
     );
 

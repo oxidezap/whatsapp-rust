@@ -4887,6 +4887,7 @@ dependencies = [
  "sha2 0.11.1",
  "subtle",
  "thiserror 2.0.21",
+ "wacore-binary",
  "wacore-derive",
  "waproto",
  "x25519-dalek",

@@ -500,8 +500,8 @@ impl Client {
             && self.node_waiter_count.load(Ordering::Acquire) == 0
             && !self.offline_sync_metrics.active.load(Ordering::Acquire)
         {
-            use wacore::xml::DisplayableNodeRef;
-            debug!(target: "Client/Recv", "{}", DisplayableNodeRef(node.get()));
+            use crate::logging::StanzaSummary;
+            debug!(target: "Client/Recv", "{}", StanzaSummary::from(node.get()));
             self.handle_ack_response_owned(node);
             return;
         }
@@ -556,7 +556,7 @@ impl Client {
         enqueue_group: bool,
     ) {
         let generation = self.connection_generation.load(Ordering::Acquire);
-        use wacore::xml::DisplayableNodeRef;
+        use crate::logging::StanzaSummary;
         let nr = node.get();
         // Classified once; every gate below dispatches on the enum instead of
         // re-comparing the tag string.
@@ -679,7 +679,7 @@ impl Client {
             let name = name.as_deref().unwrap_or("<unknown>");
             debug!(target: "Client/Recv", "Received app state sync response for '{name}' (hiding content).");
         } else {
-            debug!(target: "Client/Recv","{}", DisplayableNodeRef(nr));
+            debug!(target: "Client/Recv","{}", StanzaSummary::from(nr));
         }
 
         // Emit raw node before any early returns so all decoded stanzas
@@ -767,7 +767,7 @@ impl Client {
         tag: Option<StanzaTag>,
         generation: u64,
     ) {
-        use wacore::xml::DisplayableNodeRef;
+        use crate::logging::StanzaSummary;
         let nr = node.get();
         let mut cancelled = false;
 
@@ -898,7 +898,7 @@ impl Client {
                 if !handled {
                     warn!(
                         "Received unknown top-level node: {}",
-                        DisplayableNodeRef(node.get())
+                        StanzaSummary::from(node.get())
                     );
                     // The nack is this stanza's acknowledgement.
                     cancelled |= self.nack_unrecognized_stanza(node.get());
@@ -2475,7 +2475,7 @@ impl Client {
                              until it arrives; reconnect follows on stream end"
                         );
                     } else {
-                        warn!("Unknown stream error: {}", DisplayableNodeRef(node));
+                        warn!("Unknown stream error: {}", StanzaSummary::from(node));
                     }
                     self.core.event_bus.dispatch(Event::StreamError(
                         crate::types::events::StreamError::builder()
@@ -2538,7 +2538,7 @@ impl Client {
             // `location` (e.g. "rva") is a routing token, not the cause.
             warn!(
                 "Got {reason:?} connect failure, logging out: {}",
-                DisplayableNodeRef(node)
+                StanzaSummary::from(node)
             );
             self.core.event_bus.dispatch(Event::LoggedOut(Box::new(
                 crate::types::events::LoggedOut::builder()
@@ -2556,7 +2556,7 @@ impl Client {
         {
             warn!(
                 "Temporary ban connect failure: {}",
-                DisplayableNodeRef(node)
+                StanzaSummary::from(node)
             );
             self.core.event_bus.dispatch(Event::TemporaryBan(Box::new(
                 crate::types::events::TemporaryBan::builder()
@@ -2579,7 +2579,7 @@ impl Client {
             // or does not fit a `Duration`: WA Web errors out there instead of
             // reporting a zero-length ban, so the raw stanza is all we can
             // honestly hand over.
-            warn!("Unknown connect failure: {}", DisplayableNodeRef(node));
+            warn!("Unknown connect failure: {}", StanzaSummary::from(node));
             self.core.event_bus.dispatch(Event::ConnectFailure(
                 crate::types::events::ConnectFailure::builder()
                     .reason(reason)

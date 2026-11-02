@@ -187,6 +187,22 @@ pub struct ProtocolAddress {
 }
 
 impl ProtocolAddress {
+    /// Correlate low-level diagnostics without formatting a phone-number name.
+    pub(crate) fn observe(&self) -> impl fmt::Display + '_ {
+        struct Observed<'a>(&'a ProtocolAddress);
+        impl fmt::Display for Observed<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(
+                    f,
+                    "peer#{:016x}.{}",
+                    wacore_binary::jid::observe_token(self.0.name()),
+                    self.0.device_id()
+                )
+            }
+        }
+        Observed(self)
+    }
+
     pub fn new(name: &str, device_id: DeviceId) -> Self {
         let mut address = Self::empty(device_id);
         address.reset_with(|buf| buf.push_str(name));

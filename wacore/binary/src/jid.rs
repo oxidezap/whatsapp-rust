@@ -1253,7 +1253,7 @@ impl fmt::Display for Jid {
     }
 }
 
-/// Privacy-aware [`Display`](fmt::Display) wrapper for a [`Jid`], for use in tracing fields.
+/// Privacy-aware [`Display`](fmt::Display) wrapper for a [`Jid`], for use in logs and tracing fields.
 ///
 /// Pseudonymous (LID) and non-personal (newsletter/bot/call, modern group ids)
 /// JIDs render in full, so the same peer/chat correlates across spans. JIDs whose
@@ -1269,11 +1269,11 @@ impl fmt::Display for Jid {
 /// It is stable within a process run (correlation works) but not across restarts
 /// (a fresh key each start). Enable the `tracing-pii` feature to render raw
 /// numbers (local debugging only). The token is computed only while formatting an
-/// already-enabled span, so it costs nothing on disabled call sites.
+/// already-enabled log or span, so it costs nothing on disabled call sites.
 pub struct ObservedJid<'a>(&'a Jid);
 
 impl Jid {
-    /// Privacy-aware display for tracing spans/fields. See [`ObservedJid`].
+    /// Privacy-aware display for logs and tracing spans/fields. See [`ObservedJid`].
     #[inline]
     pub fn observe(&self) -> ObservedJid<'_> {
         ObservedJid(self)

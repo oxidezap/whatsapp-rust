@@ -291,8 +291,8 @@ pub async fn group_decrypt_shared(
             DecryptionErrorCrypto::BadKeyOrIv => {
                 log::error!(
                     "incoming sender key state corrupt for group {} sender {} (chain ID {chain_id})",
-                    sender_key_name.group_id(),
-                    sender_key_name.sender_id()
+                    wacore_binary::jid::observe_str(sender_key_name.group_id()),
+                    wacore_binary::jid::observe_str(sender_key_name.sender_id())
                 );
                 return Err(SignalProtocolError::InvalidSenderKeySession);
             }
@@ -322,8 +322,8 @@ pub async fn process_sender_key_distribution_message(
 ) -> Result<()> {
     log::debug!(
         "Processing SenderKey distribution for group {} from sender {} with chain ID {}",
-        sender_key_name.group_id(),
-        sender_key_name.sender_id(),
+        wacore_binary::jid::observe_str(sender_key_name.group_id()),
+        wacore_binary::jid::observe_str(sender_key_name.sender_id()),
         skdm.chain_id()
     );
 

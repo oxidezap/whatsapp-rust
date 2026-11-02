@@ -48,3 +48,11 @@ Use `.github/workflows/codspeed.yml` for CPU/allocation regressions and
 `benches/connected_idle.md` for connected retention. A numerical result belongs
 to the measured commit, flags and workload; do not turn it into a permanent
 claim about current memory or performance.
+
+Logs must never include linking codes, QR payloads or cryptographic key bytes,
+including public identity/ratchet keys and short fingerprints. Use `Jid::observe()`
+for JIDs and `observe_str()` for string identifiers; `tracing-pii` deliberately
+opts into raw identifiers, never secrets. Low-level Signal address diagnostics
+use process-keyed tokens. Stanza logs use `StanzaSummary` at every level because
+unrecognized attributes and nested content can carry secrets. Full payloads
+remain available through the existing application events and return values.

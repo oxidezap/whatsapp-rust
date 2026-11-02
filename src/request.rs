@@ -144,7 +144,7 @@ impl std::fmt::Debug for RejectionStanza {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum IqError {
     #[error("IQ request timed out")]
@@ -159,7 +159,7 @@ pub enum IqError {
     // type cycle (both would otherwise be infinitely sized).
     #[error("client state prevented send")]
     ClientState(#[source] Box<ClientError>),
-    #[error("received disconnect node during IQ wait: {0:?}")]
+    #[error("received disconnect node during IQ wait (payload omitted)")]
     Disconnected(Box<Node>),
     #[error("received a server error response: code={code}, text='{text}'")]
     ServerError {
@@ -191,6 +191,49 @@ pub enum IqError {
     EncodeError(#[source] anyhow::Error),
     #[error("failed to parse IQ response")]
     ParseError(#[from] anyhow::Error),
+}
+
+// The disconnect stanza stays on the public error for programmatic handling,
+// but IQ failures are routinely formatted by callers' warning/error logs.
+impl std::fmt::Debug for IqError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout => f.write_str("Timeout"),
+            Self::NotConnected => f.write_str("NotConnected"),
+            Self::InternalChannelClosed => f.write_str("InternalChannelClosed"),
+            Self::Disconnected(_) => f
+                .debug_tuple("Disconnected")
+                .field(&"<payload omitted>")
+                .finish(),
+            Self::UnexpectedResponseType { got } => f
+                .debug_struct("UnexpectedResponseType")
+                .field("got", got)
+                .finish(),
+            Self::Socket(value) => f.debug_tuple("Socket").field(value).finish(),
+            Self::EncryptSend(value) => f.debug_tuple("EncryptSend").field(value).finish(),
+            Self::ClientState(value) => f.debug_tuple("ClientState").field(value).finish(),
+            Self::Unclassified(value) => f.debug_tuple("Unclassified").field(value).finish(),
+            Self::DuplicateRequestId(value) => {
+                f.debug_tuple("DuplicateRequestId").field(value).finish()
+            }
+            Self::EncodeError(value) => f.debug_tuple("EncodeError").field(value).finish(),
+            Self::ParseError(value) => f.debug_tuple("ParseError").field(value).finish(),
+            Self::ServerError {
+                code,
+                text,
+                error_type,
+                backoff,
+                response,
+            } => f
+                .debug_struct("ServerError")
+                .field("code", code)
+                .field("text", text)
+                .field("error_type", error_type)
+                .field("backoff", backoff)
+                .field("response", response)
+                .finish(),
+        }
+    }
 }
 
 impl IqError {

@@ -720,7 +720,10 @@ impl Client {
                 }
                 Ok(None) => continue,
                 Err(e) => {
-                    warn!("Failed to check device registry for {}: {e}", key);
+                    warn!(
+                        "Failed to check device registry for {}: {e}",
+                        wacore_binary::jid::observe_str(key)
+                    );
                 }
             }
         }
@@ -794,7 +797,7 @@ impl Client {
             if let Err(e) = backend.delete_devices(&original_user).await {
                 warn!(
                     "Failed to delete stale device row under {} after canonical flip: {e}",
-                    original_user
+                    wacore_binary::jid::observe_str(&original_user)
                 );
             }
             self.device_registry_cache
@@ -802,7 +805,8 @@ impl Client {
                 .await;
             debug!(
                 "Device registry: stored under LID {} (resolved from {})",
-                canonical_key, original_user
+                wacore_binary::jid::observe_str(&canonical_key),
+                wacore_binary::jid::observe_str(&original_user)
             );
         }
 
@@ -895,7 +899,7 @@ impl Client {
             if let Err(e) = backend.delete_devices(&original_user).await {
                 warn!(
                     "Failed to delete stale device row under {} after canonical flip: {e}",
-                    original_user
+                    wacore_binary::jid::observe_str(&original_user)
                 );
             }
             self.device_registry_cache
@@ -958,7 +962,10 @@ impl Client {
             // Also delete from DB so get_devices_from_registry doesn't
             // fall back to stale persisted data — forces a network re-fetch
             if let Err(e) = self.persistence_manager.backend().delete_devices(key).await {
-                warn!("Failed to delete device registry from DB for {key}: {e}");
+                warn!(
+                    "Failed to delete device registry from DB for {}: {e}",
+                    wacore_binary::jid::observe_str(key)
+                );
             }
             // Invalidate again after the delete: a concurrent reader that read
             // the doomed DB row can promote() it back between the first
@@ -967,7 +974,10 @@ impl Client {
             self.device_registry_cache.invalidate(guard, key).await;
         }
 
-        debug!("Invalidated device cache for user: {} ({:?})", user, lookup);
+        debug!(
+            "Invalidated device cache for user: {}",
+            wacore_binary::jid::observe_str(user)
+        );
     }
 
     /// Patch device registry after a device add notification.
@@ -1025,7 +1035,10 @@ impl Client {
                             .delete_sender_key_rows_for_device(user, previous.device_id())
                             .await
                     {
-                        warn!("patch_device_add: sender-key cleanup failed for {user}: {error}");
+                        warn!(
+                            "patch_device_add: sender-key cleanup failed for {}: {error}",
+                            wacore_binary::jid::observe_str(user)
+                        );
                         return;
                     }
                 }
@@ -1037,7 +1050,8 @@ impl Client {
                     && stored_raw_id != decoded.raw_id
                 {
                     info!(
-                        "raw_id mismatch for user {user}: stored={stored_raw_id}, received={}. Resetting companion devices.",
+                        "raw_id mismatch for user {}: stored={stored_raw_id}, received={}. Resetting companion devices.",
+                        wacore_binary::jid::observe_str(user),
                         decoded.raw_id
                     );
                     self.clear_device_record(user, device.jid.server.as_str(), &record)
@@ -1062,7 +1076,10 @@ impl Client {
                     );
                 }
             } else {
-                warn!("patch_device_add: failed to decode key-index-list for user {user}");
+                warn!(
+                    "patch_device_add: failed to decode key-index-list for user {}",
+                    wacore_binary::jid::observe_str(user)
+                );
                 self.append_or_refresh_device(&mut record, device_id, device.key_index, is_hosted);
             }
         } else {
@@ -1211,7 +1228,8 @@ impl Client {
                 {
                     warn!(
                         "patch_device_remove: sender-key cleanup failed for {user}:{device_id}: {e} \
-                         — aborting registry update"
+                         — aborting registry update",
+                        user = wacore_binary::jid::observe_str(user)
                     );
                     return;
                 }
@@ -1342,7 +1360,10 @@ impl Client {
                 }
                 Ok(None) => continue,
                 Err(e) => {
-                    warn!("load_device_record: DB lookup failed for {key}: {e}");
+                    warn!(
+                        "load_device_record: DB lookup failed for {}: {e}",
+                        wacore_binary::jid::observe_str(key)
+                    );
                 }
             }
         }
@@ -1532,7 +1553,10 @@ impl Client {
                 }
                 Ok(None) => continue,
                 Err(e) => {
-                    warn!("get_devices_from_registry: DB lookup failed for {key}: {e}");
+                    warn!(
+                        "get_devices_from_registry: DB lookup failed for {}: {e}",
+                        wacore_binary::jid::observe_str(key)
+                    );
                 }
             }
         }
@@ -1574,8 +1598,8 @@ impl Client {
             Ok(Some(mut record)) => {
                 info!(
                     "Migrating device registry entry from PN {} to LID {} ({} devices)",
-                    pn,
-                    lid,
+                    wacore_binary::jid::observe_str(pn),
+                    wacore_binary::jid::observe_str(lid),
                     record.devices.len()
                 );
 

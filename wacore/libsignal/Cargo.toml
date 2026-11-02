@@ -36,6 +36,7 @@ sha2 = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
 wacore-derive = { workspace = true }
+wacore-binary = { workspace = true }
 waproto = { workspace = true }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
 

@@ -537,7 +537,7 @@ pub(crate) fn handle_mex_notification(client: &Arc<Client>, node: &NodeRef<'_>) 
         warn!(
             target: "Client/Mex",
             "mex notification missing <update> child: {}",
-            wacore::xml::DisplayableNodeRef(node)
+            crate::logging::StanzaSummary::from(node)
         );
         return;
     };
@@ -546,7 +546,7 @@ pub(crate) fn handle_mex_notification(client: &Arc<Client>, node: &NodeRef<'_>) 
         warn!(
             target: "Client/Mex",
             "mex notification <update> missing op_name attribute: {}",
-            wacore::xml::DisplayableNodeRef(node)
+            crate::logging::StanzaSummary::from(node)
         );
         return;
     };
@@ -644,7 +644,7 @@ pub(crate) fn handle_disappearing_mode_notification(client: &Arc<Client>, node: 
     let Some(dm_node) = node.get_optional_child("disappearing_mode") else {
         warn!(
             "disappearing_mode notification missing <disappearing_mode> child: {}",
-            wacore::xml::DisplayableNodeRef(node)
+            crate::logging::StanzaSummary::from(node)
         );
         return;
     };
@@ -665,7 +665,7 @@ pub(crate) fn handle_disappearing_mode_notification(client: &Arc<Client>, node: 
     else {
         warn!(
             "disappearing_mode notification missing or invalid 't' attribute: {}",
-            wacore::xml::DisplayableNodeRef(node)
+            crate::logging::StanzaSummary::from(node)
         );
         return;
     };

@@ -141,7 +141,8 @@ impl Client {
             log::warn!(
                 "reset_sender_key_device_tracking: clear failed for {group_jid}; \
                  marked {} existing rows cold: {clear_error}",
-                rows.len()
+                rows.len(),
+                group_jid = wacore_binary::jid::observe_str(group_jid)
             );
         }
         if scope.is_none_or(|scope| scope.is_current(self)) {
@@ -194,7 +195,10 @@ impl Client {
             .rotate_sender_key_on_participant_remove_locked(group_jid, removed_user_ids)
             .await
         {
-            log::warn!("Failed to retire group sender keys for {group_jid}: {error}");
+            log::warn!(
+                "Failed to retire group sender keys for {}: {error}",
+                group_jid.observe()
+            );
         }
         drop(distribution_guard);
     }
@@ -221,7 +225,8 @@ impl Client {
             Err(e) => {
                 log::warn!(
                     "rotate_sender_key_on_participant_remove: read failed for {group_jid}: {e} \
-                     — rotating conservatively"
+                     — rotating conservatively",
+                    group_jid = group_jid.observe()
                 );
                 (Vec::new(), true)
             }
@@ -281,7 +286,10 @@ impl Client {
             return;
         }
         if let Err(error) = self.force_rotate_own_sender_key_locked(group_jid).await {
-            log::warn!("Failed to retire group sender keys for {group_jid}: {error}");
+            log::warn!(
+                "Failed to retire group sender keys for {}: {error}",
+                group_jid.observe()
+            );
         }
         drop(distribution_guard);
     }
@@ -381,7 +389,10 @@ impl Client {
                 self.runtime
                     .spawn(Box::pin(async move {
                         if let Err(e) = backend.take_sent_message(&chat_str, &mid).await {
-                            log::warn!("Failed to clean up sent message {chat_str}:{mid}: {e}");
+                            log::warn!(
+                                "Failed to clean up sent message {}:{mid}: {e}",
+                                wacore_binary::jid::observe_str(&chat_str)
+                            );
                         }
                     }))
                     .detach();

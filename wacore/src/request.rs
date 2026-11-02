@@ -81,14 +81,14 @@ impl<'a> InfoQuery<'a> {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum IqError {
     #[error("IQ request timed out")]
     Timeout,
     #[error("client is not connected")]
     NotConnected,
-    #[error("received disconnect node during IQ wait: {0:?}")]
+    #[error("received disconnect node during IQ wait (payload omitted)")]
     Disconnected(Box<Node>),
     #[error("received a server error response: code={code}, text='{text}'")]
     ServerError {
@@ -104,6 +104,38 @@ pub enum IqError {
     UnexpectedResponseType { got: Option<String> },
     #[error("internal channel closed unexpectedly")]
     InternalChannelClosed,
+}
+
+// The disconnect stanza stays on the public error for programmatic handling,
+// but IQ failures are routinely formatted by callers' warning/error logs.
+impl std::fmt::Debug for IqError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout => f.write_str("Timeout"),
+            Self::NotConnected => f.write_str("NotConnected"),
+            Self::InternalChannelClosed => f.write_str("InternalChannelClosed"),
+            Self::Disconnected(_) => f
+                .debug_tuple("Disconnected")
+                .field(&"<payload omitted>")
+                .finish(),
+            Self::UnexpectedResponseType { got } => f
+                .debug_struct("UnexpectedResponseType")
+                .field("got", got)
+                .finish(),
+            Self::ServerError {
+                code,
+                text,
+                error_type,
+                backoff,
+            } => f
+                .debug_struct("ServerError")
+                .field("code", code)
+                .field("text", text)
+                .field("error_type", error_type)
+                .field("backoff", backoff)
+                .finish(),
+        }
+    }
 }
 
 impl IqError {
