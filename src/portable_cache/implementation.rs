@@ -3892,7 +3892,7 @@ mod sync_hash_budget {
         }
     }
     impl Eq for Key {}
-    impl std::hash::Hash for Key {
+    impl Hash for Key {
         fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
             self.hashes
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
