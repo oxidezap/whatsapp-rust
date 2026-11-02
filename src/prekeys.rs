@@ -166,6 +166,11 @@ impl Client {
         reason: Option<PreKeyFetchReason>,
     ) -> Result<wacore::prekeys::PreKeyFetchOutcome, anyhow::Error> {
         let account_identities = self.collect_account_identities(jids).await?;
+        let cold_companions: Vec<_> = jids
+            .iter()
+            .filter(|jid| jid.device != 0 && !account_identities.contains_key(*jid))
+            .cloned()
+            .collect();
         let mut requested = jids.to_vec();
         for jid in jids.iter().filter(|jid| jid.device != 0) {
             let primary = jid.with_device(0);
@@ -187,6 +192,17 @@ impl Client {
         let spec = spec.with_account_identities(account_identities);
 
         let mut outcome = self.execute(spec).await?;
+        // A self-contained companion certificate does not replace the requested
+        // primary trust anchor. An omitted primary must not leave a session
+        // authenticated only by a sender-selected account key.
+        for companion in &cold_companions {
+            let primary = companion.with_device(0);
+            if let Some(bundle) = outcome.bundles.get(&primary) {
+                authenticated_primary_identity(bundle)?;
+            } else {
+                outcome.bundles.remove(companion);
+            }
+        }
         // Remember authenticated bootstrap primaries before discarding their
         // bundles. No session lock is acquired here: the session engine already
         // holds companion locks, and taking the primary lock could invert its

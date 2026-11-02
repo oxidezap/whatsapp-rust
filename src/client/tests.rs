@@ -7358,6 +7358,33 @@ mod ensure_sessions_concurrency {
     }
 
     #[tokio::test]
+    async fn cold_companion_cannot_omit_requested_primary_even_with_embedded_account_key() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let peer = Jid::pn("12025550129").with_device(2);
+        let running = client.clone();
+        let requested = peer.clone();
+        let task = tokio::spawn(async move { running.fetch_pre_keys(&[requested], None).await });
+        let request = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let id = request
+            .get()
+            .attrs()
+            .optional_string("id")
+            .unwrap()
+            .into_owned();
+        let keys = PeerKeys::generate();
+        crate::test_utils::answer_iq(&client, &id, &keys.bundle_response(&peer, &id, 1)).await;
+        assert!(task.await.unwrap().unwrap().bundles.is_empty());
+        assert!(
+            client
+                .cached_adv_account_identity(&peer)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
     async fn cold_companion_only_fetch_authenticates_trimmed_certificate() {
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
         let primary = Jid::pn("12025550128");
