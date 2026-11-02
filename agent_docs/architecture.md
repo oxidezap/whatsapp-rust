@@ -94,6 +94,19 @@ plugin dependencies disabled. Do not expand core state for a single plugin or
 claim protocol parity from an application hook. SDK integration guides belong
 in https://github.com/oxidezap/whatsapp-rust-docs.
 
+## Synchronization and recovery
+
+`wacore::sync_engine` owns app-state scope admission, bootstrap ownership,
+reservation equivalence, retry budgets and partial-result reconciliation. It
+also owns history-sync admission, receipt timing and generation accounting.
+Keep these decisions executor-free. SDK adapters own atomic publication,
+locks, queue capacity, host callbacks and storage operations.
+
+Check app-state scope admission before starting a write. Once an apply has
+committed its cursor, publish its mutations even if that scope retired during
+the write. History-sync receipt timing differs for ordinary delivery, capture
+and durable replay. Preserve those boundaries when adding adapter effects.
+
 ## Public contract changes
 
 Public modules, re-exports, generated models, macro output and dependency types

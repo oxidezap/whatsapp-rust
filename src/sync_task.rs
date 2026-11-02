@@ -2,6 +2,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use wacore::appstate::patch_decode::WAPatchName;
 use wacore::messages::DetachedHistorySyncNotification;
+pub(crate) use wacore::sync_engine::history::HistoryActivitySnapshot as HistorySyncActivitySnapshot;
+use wacore::sync_engine::history::{
+    HistoryActivity as HistorySyncActivityState, HistoryGeneration as HistorySyncGeneration,
+};
 
 /// Shared accounting for queued/running history-sync work. Payload bytes are
 /// logical compressed lengths: this keeps owned downloads comparable with
@@ -13,26 +17,6 @@ pub(crate) struct HistorySyncActivity {
     pub(crate) processing_permits: Arc<async_lock::Semaphore>,
     /// Replays take this first, leaving global capacity for the sync worker.
     pub(crate) replay_permits: Arc<async_lock::Semaphore>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct HistorySyncGeneration(usize);
-
-#[derive(Debug, Default)]
-struct HistorySyncActivityState {
-    generation: HistorySyncGeneration,
-    tasks: usize,
-    tasks_peak: usize,
-    payload_bytes: usize,
-    payload_bytes_peak: usize,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct HistorySyncActivitySnapshot {
-    pub(crate) tasks: usize,
-    pub(crate) tasks_peak: usize,
-    pub(crate) payload_bytes: usize,
-    pub(crate) payload_bytes_peak: usize,
 }
 
 impl HistorySyncActivity {
@@ -47,11 +31,7 @@ impl HistorySyncActivity {
 
     pub(crate) fn begin(self: &Arc<Self>, payload_bytes: usize) -> HistorySyncTaskTracker {
         let mut state = self.state_guard();
-        let generation = state.generation;
-        state.tasks = state.tasks.saturating_add(1);
-        state.tasks_peak = state.tasks_peak.max(state.tasks);
-        state.payload_bytes = state.payload_bytes.saturating_add(payload_bytes);
-        state.payload_bytes_peak = state.payload_bytes_peak.max(state.payload_bytes);
+        let generation = state.begin(payload_bytes);
         drop(state);
         HistorySyncTaskTracker {
             inner: Arc::new(HistorySyncTaskTrackerInner {
@@ -68,9 +48,7 @@ impl HistorySyncActivity {
 
     pub(crate) fn reset(&self) {
         let mut state = self.state_guard();
-        state.generation.0 = state.generation.0.wrapping_add(1);
-        state.tasks = 0;
-        state.payload_bytes = 0;
+        state.reset();
         drop(state);
         self.idle_notifier.notify(usize::MAX);
     }
@@ -85,27 +63,16 @@ impl HistorySyncActivity {
     }
 
     pub(crate) fn tasks(&self) -> usize {
-        self.state_guard().tasks
+        self.state_guard().snapshot().tasks
     }
 
     pub(crate) fn snapshot(&self) -> HistorySyncActivitySnapshot {
-        let state = self.state_guard();
-        HistorySyncActivitySnapshot {
-            tasks: state.tasks,
-            tasks_peak: state.tasks_peak,
-            payload_bytes: state.payload_bytes,
-            payload_bytes_peak: state.payload_bytes_peak,
-        }
+        self.state_guard().snapshot()
     }
 
     fn release(&self, generation: HistorySyncGeneration, payload_bytes: usize) {
         let mut state = self.state_guard();
-        if state.generation != generation {
-            return;
-        }
-        state.payload_bytes = state.payload_bytes.saturating_sub(payload_bytes);
-        state.tasks = state.tasks.saturating_sub(1);
-        let is_idle = state.tasks == 0;
+        let is_idle = state.release(generation, payload_bytes);
         drop(state);
         if is_idle {
             self.idle_notifier.notify(usize::MAX);
@@ -194,13 +161,7 @@ impl HistorySyncTaskTracker {
     pub(crate) fn set_payload_bytes(&mut self, payload_bytes: usize) {
         let mut task = self.state();
         let mut state = self.inner.activity.state_guard();
-        if state.generation == self.inner.generation {
-            state.payload_bytes = state
-                .payload_bytes
-                .saturating_sub(task.payload_bytes)
-                .saturating_add(payload_bytes);
-            state.payload_bytes_peak = state.payload_bytes_peak.max(state.payload_bytes);
-        }
+        state.resize(self.inner.generation, task.payload_bytes, payload_bytes);
         task.payload_bytes = payload_bytes;
     }
 }

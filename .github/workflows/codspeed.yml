@@ -131,12 +131,9 @@ jobs:
   benchmarks:
     name: Run CodSpeed benchmarks (${{ matrix.shard.name }})
     runs-on: ubuntu-24.04
-    # The slowest shard finishes in ~13min. The cap exists because the CodSpeed
-    # runner shells out to apt with no timeout of its own, so a stalled archive
-    # leaves the job producing no output until the GitHub default of 6h -- which
-    # is what happened on 2026-08-18, when shards ran for two hours without
-    # executing a single benchmark.
-    timeout-minutes: 25
+    # The SDK shard needs headroom for a full build, measurement and result
+    # upload. Keep bounded jobs so infrastructure stalls cannot run indefinitely.
+    timeout-minutes: ${{ matrix.shard.name == 'client' && 35 || 25 }}
     strategy:
       # One shard failing must not cancel the other: CodSpeed merges shards
       # into a single run, and a cancelled shard leaves it incomplete.

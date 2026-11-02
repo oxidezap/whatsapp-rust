@@ -150,6 +150,8 @@ impl Boundary {
             "super::lifecycle::LifecycleSnapshot",
             "super::lifecycle::NextConnection",
             "super::lifecycle::TransportTicket",
+            "crate::appstate::patch_decode::WAPatchName",
+            "crate::appstate::patch_decode::CollectionSyncError",
             "crate::appstate::hash::HashState",
             "crate::appstate::keys::ExpandedAppStateKeys",
             "crate::appstate::processor::PatchProcessingResult",
@@ -336,6 +338,14 @@ fn protocol_state_does_not_execute_io_or_read_global_time() {
         ),
         ("history", include_str!("../src/history_sync/parse_job.rs")),
         (
+            "sync admission and recovery",
+            include_str!("../wacore/src/sync_engine/app_state.rs"),
+        ),
+        (
+            "history publication",
+            include_str!("../wacore/src/sync_engine/history.rs"),
+        ),
+        (
             "session lifecycle",
             include_str!("../wacore/src/session_engine/lifecycle.rs"),
         ),
@@ -396,4 +406,19 @@ fn match_guards_are_parsed_without_hiding_clock_reads() {
     assert!(violations("fn f(value: Option<u32>, limit: u32) { let _ = matches!(value, Some(n) if n < limit); }").is_empty());
     assert!(!violations("fn f(value: Option<u32>) { let _ = matches!(value, Some(_) if std::time::Instant::now().elapsed().is_zero()); }").is_empty());
     assert!(!violations("fn f() { let _ = matches!(crate::time::now_secs(), 0); }").is_empty());
+}
+
+#[test]
+fn sync_policy_imports_allow_only_the_reviewed_data_types() {
+    assert!(
+        violations("use crate::appstate::patch_decode::{WAPatchName, CollectionSyncError};")
+            .is_empty()
+    );
+    for source in [
+        "use crate::appstate::patch_decode::*;",
+        "use crate::appstate_sync::AppStateProcessor;",
+        "use crate::appstate::patch_decode::decode_patch_list;",
+    ] {
+        assert!(!violations(source).is_empty(), "{source}");
+    }
 }

@@ -22,8 +22,6 @@ impl Client {
         self.with_message_dispatch_inner(info, pdo, &mut update)
     }
 
-    // All callers return a claim decision. Erase only their stack callback,
-    // sharing the locked lookup without allocating or extending the guard.
     #[inline(never)]
     fn with_message_dispatch_inner(
         &self,
@@ -32,59 +30,100 @@ impl Client {
         update: &mut dyn FnMut(&mut DispatchClaim) -> bool,
     ) -> bool {
         let key = Self::dispatch_key(info);
-        self.dispatched_messages.with(|cache| {
-            if cache.get(&key).is_some_and(|claim| {
+        self.dispatched_messages
+            .with(|cache| Self::update_dispatch_claim(cache, key, info, pdo, update))
+    }
+
+    // All callers return a claim decision. Erase only their stack callback,
+    // sharing the locked lookup without allocating or extending the guard.
+    #[inline(never)]
+    fn update_dispatch_claim(
+        cache: &mut crate::portable_cache::SyncTtlGuard<'_, DispatchKey, DispatchClaim>,
+        key: DispatchKey,
+        info: &Arc<MessageInfo>,
+        pdo: bool,
+        update: &mut dyn FnMut(&mut DispatchClaim) -> bool,
+    ) -> bool {
+        let empty = match cache.get(&key) {
+            Some(claim) => {
                 claim.prune();
-                claim.payloads.is_empty()
-            }) {
-                // A claim left with no live payloads is absent: every owner
-                // rolled back. Drop the stale key so the alternate-spelling
-                // lookup below still runs instead of treating the empty claim
-                // as authoritative.
-                cache.remove(&key);
-            }
-            if let Some(claim) = cache.get(&key) {
-                claim.prune();
-                if !pdo && claim.alias.is_none() {
-                    claim.alias = Self::dispatch_alias(info);
-                }
-                return update(claim);
-            }
-            let mut alias = None;
-            let recovery_key = if pdo {
-                // Only PDO misses scan. A claim's alias is the identity its
-                // message carries under the alternate spelling, so naming this
-                // recovery is the whole match. Two claims naming it are
-                // ambiguous, so neither may suppress the recovered event.
-                cache.find_unique_key(|_, claim| claim.has_deliveries() && claim.alias == Some(key))
-            } else {
-                alias = Self::dispatch_alias(info);
-                alias.and_then(|alternate| {
-                    let claim = cache.get(&alternate)?;
-                    claim.prune();
-                    if !claim.has_recovery() || claim.alias.is_some_and(|bound| bound != key) {
-                        return None;
+                if !claim.payloads.is_empty() {
+                    if !pdo && claim.alias.is_none() {
+                        claim.alias = Self::dispatch_alias(info);
                     }
-                    // Bind only the direct evidence in this stanza. A later
-                    // conflicting primary cannot reuse the PDO claim.
-                    claim.alias.get_or_insert(key);
-                    Some(alternate)
-                })
-            };
-            if let Some(claim) = recovery_key.as_ref().and_then(|key| cache.get(key)) {
+                    return update(claim);
+                }
+                true
+            }
+            None => false,
+        };
+        if empty {
+            cache.remove(&key);
+        }
+        let mut alias = None;
+        let recovery_key = if pdo {
+            // Only PDO misses scan. A claim's alias is the identity its
+            // message carries under the alternate spelling, so naming this
+            // recovery is the whole match. Two claims naming it are
+            // ambiguous, so neither may suppress the recovered event.
+            cache.find_unique_key(|_, claim| claim.has_deliveries() && claim.alias == Some(key))
+        } else {
+            alias = Self::dispatch_alias(info);
+            alias.and_then(|alternate| {
+                let claim = cache.get(&alternate)?;
                 claim.prune();
-                return update(claim);
-            }
-            let mut claim = DispatchClaim {
-                alias: alias.or_else(|| Self::dispatch_alias(info)),
-                ..Default::default()
-            };
-            let result = update(&mut claim);
-            if !claim.payloads.is_empty() {
-                cache.insert(key, claim);
-            }
-            result
-        })
+                if !claim.has_recovery() || claim.alias.is_some_and(|bound| bound != key) {
+                    return None;
+                }
+                // Bind only the direct evidence in this stanza. A later
+                // conflicting primary cannot reuse the PDO claim.
+                claim.alias.get_or_insert(key);
+                Some(alternate)
+            })
+        };
+        if let Some(claim) = recovery_key.as_ref().and_then(|key| cache.get(key)) {
+            claim.prune();
+            return update(claim);
+        }
+        let mut claim = DispatchClaim {
+            alias: alias.or_else(|| Self::dispatch_alias(info)),
+            ..Default::default()
+        };
+        let result = update(&mut claim);
+        if !claim.payloads.is_empty() {
+            cache.insert_absent(key, claim);
+        }
+        result
+    }
+
+    pub(crate) fn complete_dispatch_publication<'a>(
+        &self,
+        publication: PublicationGuard,
+        messages: impl IntoIterator<Item = &'a Arc<MessageInfo>>,
+        pdo: bool,
+    ) {
+        let tracked = publication.owner.is_some();
+        publication.complete();
+        if tracked && self.dispatch_gate_enabled() {
+            self.dispatched_messages.with_metadata(|cache| {
+                for info in messages {
+                    let key = Self::dispatch_key(info);
+                    if let Some(claim) = cache.get_mut(&key) {
+                        claim.prune();
+                    } else if pdo {
+                        cache.for_each_mut(|_, claim| {
+                            if claim.alias == Some(key) {
+                                claim.prune();
+                            }
+                        });
+                    } else if let Some(alias) = Self::dispatch_alias(info)
+                        && let Some(claim) = cache.get_mut(&alias)
+                    {
+                        claim.prune();
+                    }
+                }
+            });
+        }
     }
 
     pub(crate) fn admit_message_dispatch(
@@ -124,7 +163,7 @@ impl Client {
             claim.payloads.iter().any(|payload| {
                 payload.fingerprint == *fingerprint
                     && payload.hook_committed
-                    && payload.publication.load(Ordering::Acquire) == PUBLICATION_COMPLETE
+                    && payload.publication.state() == PUBLICATION_COMPLETE
             })
         })
     }
@@ -139,7 +178,7 @@ impl Client {
             claim.payloads.iter().any(|payload| {
                 payload.producer == producer
                     && payload.hook_committed
-                    && payload.publication.load(Ordering::Acquire) == PUBLICATION_COMPLETE
+                    && payload.publication.state() == PUBLICATION_COMPLETE
             })
         })
     }
@@ -178,7 +217,7 @@ impl Client {
                     payload.fingerprint == fingerprint
                         && payload.producer == producer
                         && payload.state == MessageDispatch::Decrypted
-                        && payload.publication.load(Ordering::Acquire) == PUBLICATION_COMPLETE
+                        && payload.publication.state() == PUBLICATION_COMPLETE
                 });
             !sibling
                 && claim.state(&fingerprint).is_some_and(|state| {
@@ -219,7 +258,7 @@ impl Client {
             false,
             &mut publication,
         );
-        publication.complete();
+        self.complete_dispatch_publication(publication, [info], false);
     }
 
     /// The message's identity includes direction and, outside DMs, its author.
