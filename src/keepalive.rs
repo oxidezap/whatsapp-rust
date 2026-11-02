@@ -402,7 +402,6 @@ impl Client {
     /// never on the receive path: each sweep takes its cache's write lock for
     /// a full walk of the table.
     pub async fn run_cache_maintenance(&self) {
-        self.reclaim_idle_delivery_capacity();
         self.recent_messages.run_pending_tasks().await;
         self.message_retry_counts.run_pending_tasks().await;
         self.session_recreate_history.run_pending_tasks().await;

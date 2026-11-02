@@ -130,7 +130,7 @@ gate before exposing prepared output. Keep the durable-lease fast path and
 per-address Signal locks intact.
 
 Empty live-delivery bookkeeping releases burst capacity when a lane retires
-after its idle timeout or cache maintenance runs. Active and replayable
+after its idle timeout. Active and replayable
 reservations keep their data. The receive host samples its instance clock
 once per read and starts a cold decoder burst after a ten-second gap. That
 boundary releases an empty accumulator's old backing; partial frames keep
