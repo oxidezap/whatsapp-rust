@@ -1193,6 +1193,7 @@ mod tests {
                 let key: [u8; 32] = account.public_key.public_key_bytes().try_into().unwrap();
                 assert_eq!(result.unwrap(), key);
                 assert_eq!(persisted, Some(key));
+                let sent_before_warm_lookup = transport.sent_count();
                 assert_eq!(
                     client
                         .ensure_adv_account_identity(&primary.with_device(9))
@@ -1202,7 +1203,7 @@ mod tests {
                 );
                 assert_eq!(
                     transport.sent_count(),
-                    1,
+                    sent_before_warm_lookup,
                     "warm trust must not fetch another primary bundle"
                 );
             } else {

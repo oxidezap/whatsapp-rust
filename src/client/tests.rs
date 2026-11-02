@@ -7720,6 +7720,15 @@ mod ensure_sessions_concurrency {
         let shared = Jid::lid_device("444444444444444".to_string(), 0);
         let extra = Jid::lid_device("444444444444444".to_string(), 3);
         let keys = PeerKeys::generate();
+        // This test isolates session-fetch coalescing with existing account
+        // trust. The cold trimmed-certificate test covers primary bootstrap.
+        client
+            .signal_cache
+            .put_identity(
+                &shared.to_protocol_address(),
+                keys.identity.public_key().public_key_bytes(),
+            )
+            .await;
 
         let leader = {
             let client = client.clone();
