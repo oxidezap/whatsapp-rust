@@ -186,19 +186,29 @@ pub fn retry_backoff(attempts: u32) -> Duration {
 }
 
 /// Waiting for a writer consumes a round but does not consume a server attempt.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryBudget {
     attempts: u32,
-    rounds: u32,
+    rounds_remaining: u32,
+}
+
+impl Default for RetryBudget {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            attempts: 0,
+            rounds_remaining: RETRY_MAX_ROUNDS,
+        }
+    }
 }
 
 impl RetryBudget {
     #[inline]
     pub fn next_delay(&mut self) -> Option<Duration> {
-        if self.attempts >= RETRY_MAX_ATTEMPTS || self.rounds >= RETRY_MAX_ROUNDS {
+        if self.attempts >= RETRY_MAX_ATTEMPTS || self.rounds_remaining == 0 {
             return None;
         }
-        self.rounds += 1;
+        self.rounds_remaining -= 1;
         Some(retry_backoff(self.attempts))
     }
 
@@ -331,5 +341,70 @@ impl CollectionRetryState {
         } else {
             RetryProgress::Pending
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CollectionDisposition {
+    Synced,
+    Refetch,
+    Retryable,
+    Fatal,
+}
+
+impl CollectionDisposition {
+    /// A conflict without more pages succeeds only if a baseline was actually persisted.
+    #[inline]
+    pub fn from_error(
+        error: &crate::appstate::patch_decode::CollectionSyncError,
+        has_baseline: bool,
+    ) -> Self {
+        use crate::appstate::patch_decode::CollectionSyncError;
+        match error {
+            CollectionSyncError::Conflict { has_more: true } => Self::Refetch,
+            CollectionSyncError::Conflict { has_more: false } if has_baseline => Self::Synced,
+            CollectionSyncError::Conflict { has_more: false }
+            | CollectionSyncError::Retry { .. } => Self::Retryable,
+            CollectionSyncError::Fatal { .. } => Self::Fatal,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotRecoveryRefusal {
+    UnknownCollection,
+    BlockList,
+    TooManyRecords,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoveryCollection(WAPatchName);
+
+impl RecoveryCollection {
+    #[inline]
+    pub fn admit(name: WAPatchName) -> Result<Self, SnapshotRecoveryRefusal> {
+        match name {
+            WAPatchName::Unknown => Err(SnapshotRecoveryRefusal::UnknownCollection),
+            WAPatchName::CriticalBlock => Err(SnapshotRecoveryRefusal::BlockList),
+            _ => Ok(Self(name)),
+        }
+    }
+
+    #[inline]
+    pub fn admit_records(
+        self,
+        count: usize,
+        allowed: i64,
+    ) -> Result<Self, SnapshotRecoveryRefusal> {
+        if allowed > 0 && count as u64 > allowed as u64 {
+            Err(SnapshotRecoveryRefusal::TooManyRecords)
+        } else {
+            Ok(self)
+        }
+    }
+
+    #[inline]
+    pub fn name(self) -> WAPatchName {
+        self.0
     }
 }

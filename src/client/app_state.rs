@@ -5,10 +5,10 @@ pub(crate) mod prefetch_bench;
 
 use super::*;
 pub(crate) use wacore::sync_engine::app_state::{
-    BatchedSyncOutcome, BatchedSyncRequest, BootstrapState, CollectionRetryState, CriticalSyncPlan,
-    ReservationSkip, ReservationWait, RetryBudget, RetryProgress, ScopeLost, StandDown, SyncHolder,
-    SyncOutcome, SyncScope, SyncSettles, Unaccounted,
-    initial_key_retry as initial_app_state_key_retry, next_key_retry,
+    BatchedSyncOutcome, BatchedSyncRequest, BootstrapState, CollectionDisposition,
+    CollectionRetryState, CriticalSyncPlan, RecoveryCollection, ReservationSkip, ReservationWait,
+    RetryBudget, RetryProgress, ScopeLost, StandDown, SyncHolder, SyncOutcome, SyncScope,
+    SyncSettles, Unaccounted, initial_key_retry as initial_app_state_key_retry, next_key_retry,
 };
 
 use crate::features::{AppStateError, AppStateResyncMode, AppStateResyncReport};
@@ -2156,56 +2156,35 @@ impl Client {
                 // moment a collection can still be declined; after it,
                 // dispatching is not optional.
 
-                // Handle per-collection errors
-                if let Some(ref err) = list.error {
-                    match err {
-                        CollectionSyncError::Conflict { has_more } => {
-                            if *has_more {
-                                // ConflictHasMore: server has more patches, must refetch.
-                                warn!(target: "Client/AppState", "Collection {:?} conflict (has_more=true), will refetch", name);
-                                needs_refetch.push(name);
-                            } else if backend
+                if let Some(ref error) = list.error {
+                    let has_baseline =
+                        if matches!(error, CollectionSyncError::Conflict { has_more: false }) {
+                            backend
                                 .get_version(name.as_str())
                                 .await?
-                                .is_some_and(|s| s.has_baseline())
-                            {
-                                // Conflict without has_more: WA Web reads this as
-                                // success once it has nothing left to push.
-                                debug!(target: "Client/AppState", "Collection {:?} conflict (has_more=false), treating as success", name);
-                                outcome.synced.push(name);
-                            } else {
-                                // Except when the collection has no record at all.
-                                // `process_parsed_patch_list` returns early for a list
-                                // carrying an error, so nothing was persisted -- calling
-                                // that synced closes the bootstrap gate over a collection
-                                // that will bootstrap again on the next connection, and
-                                // again after that.
-                                warn!(
-                                    target: "Client/AppState",
-                                    "Collection {name:?} conflict (has_more=false) while it has \
-                                     no version record; nothing was persisted, so it is not synced"
-                                );
-                                outcome.retryable.push(name);
-                            }
-                            continue;
+                                .is_some_and(|state| state.has_baseline())
+                        } else {
+                            false
+                        };
+                    match CollectionDisposition::from_error(error, has_baseline) {
+                        CollectionDisposition::Refetch => {
+                            warn!(target: "Client/AppState", "Collection {name:?} conflict has more pages; refetching");
+                            needs_refetch.push(name);
                         }
-                        CollectionSyncError::Fatal { code, text } => {
-                            warn!(target: "Client/AppState", "Collection {:?} fatal error {}: {}", name, code, text);
-                            outcome.fatal.push(name);
-                            continue;
+                        CollectionDisposition::Synced => {
+                            debug!(target: "Client/AppState", "Collection {name:?} conflict is current with a persisted baseline");
+                            outcome.synced.push(name);
                         }
-                        CollectionSyncError::Retry { code, text } => {
-                            // Done for this run, not refetched inside it. WA Web
-                            // routes ErrorRetry to `doneCollections` and leaves
-                            // the next attempt to its retry state machine, which
-                            // spaces them; refetching here would instead hammer
-                            // the same failing collection for every iteration
-                            // the cap allows.
-                            warn!(target: "Client/AppState", "Collection {:?} retryable error {}: {}", name, code, text);
+                        CollectionDisposition::Retryable => {
+                            warn!(target: "Client/AppState", "Collection {name:?} remains retryable: {error:?}");
                             outcome.retryable.push(name);
-                            continue;
+                        }
+                        CollectionDisposition::Fatal => {
+                            warn!(target: "Client/AppState", "Collection {name:?} was refused: {error:?}");
+                            outcome.fatal.push(name);
                         }
                     }
+                    continue;
                 }
 
                 // Handle missing keys
@@ -3231,30 +3210,14 @@ impl Client {
         name: &str,
         recovery: waproto::whatsapp::SyncdSnapshotRecovery,
     ) {
-        // `WAPatchName::from_str` is infallible: every unrecognised name maps to
-        // `Unknown`, which is one shared reservation slot and one collection
-        // this side has no rules for. Rejecting it explicitly is the difference
-        // between ignoring a name we do not know and applying it under a
-        // reservation that means nothing.
         let patch_name = name.parse::<WAPatchName>().unwrap_or(WAPatchName::Unknown);
-        if patch_name == WAPatchName::Unknown {
-            warn!(
-                target: "Client/AppState",
-                "Snapshot recovery names an unknown collection {name}; ignoring"
-            );
-            return;
-        }
-        // Never asked for, so never applied either. Refusing it at the ask used
-        // to be enough, because a reply had to match an ask; now that one need
-        // not, the block list needs its own refusal here, for the reason the
-        // ask gives.
-        if patch_name == WAPatchName::CriticalBlock {
-            warn!(
-                target: "Client/AppState",
-                "Discarding a snapshot recovery for {name}: the block list is not recovered from the primary"
-            );
-            return;
-        }
+        let admitted = match RecoveryCollection::admit(patch_name) {
+            Ok(admitted) => admitted,
+            Err(reason) => {
+                warn!(target: "Client/AppState", "Refusing snapshot recovery for {name}: {reason:?}");
+                return;
+            }
+        };
 
         // The record count WA Web allows a recovery to carry. The byte ceiling
         // bounds the payload, but small records encode in a few bytes each, so
@@ -3266,7 +3229,10 @@ impl Client {
             .ab_props()
             .get_int(wacore::iq::abprops::web::SNAPSHOT_RECOVERY_MAX_MUTATIONS_COUNT_ALLOWED)
             .await;
-        if allowed > 0 && recovery.mutation_records.len() as i64 > allowed {
+        if admitted
+            .admit_records(recovery.mutation_records.len(), allowed)
+            .is_err()
+        {
             warn!(
                 target: "Client/AppState",
                 "Snapshot recovery for {name} carries {} records, over the {allowed} allowed; refusing it",

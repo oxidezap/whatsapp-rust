@@ -368,3 +368,85 @@ fn extracted_control_state_keeps_fixed_storage_bounded() {
     assert!(size_of::<HistoryPublication>() <= 2);
     assert!(size_of::<CollectionRetryState>() <= 2);
 }
+
+#[test]
+fn conflict_without_more_requires_a_persisted_baseline() {
+    use crate::appstate::patch_decode::CollectionSyncError;
+    for baseline in [false, true] {
+        assert_eq!(
+            CollectionDisposition::from_error(
+                &CollectionSyncError::Conflict { has_more: true },
+                baseline
+            ),
+            CollectionDisposition::Refetch
+        );
+        assert_eq!(
+            CollectionDisposition::from_error(
+                &CollectionSyncError::Conflict { has_more: false },
+                baseline
+            ),
+            if baseline {
+                CollectionDisposition::Synced
+            } else {
+                CollectionDisposition::Retryable
+            }
+        );
+    }
+}
+
+#[test]
+fn server_refusal_is_never_an_immediate_refetch() {
+    use crate::appstate::patch_decode::CollectionSyncError;
+    let retry = CollectionSyncError::Retry {
+        code: 503,
+        text: "unavailable".into(),
+    };
+    let fatal = CollectionSyncError::Fatal {
+        code: 404,
+        text: "unknown".into(),
+    };
+    for baseline in [false, true] {
+        assert_eq!(
+            CollectionDisposition::from_error(&retry, baseline),
+            CollectionDisposition::Retryable
+        );
+        assert_eq!(
+            CollectionDisposition::from_error(&fatal, baseline),
+            CollectionDisposition::Fatal
+        );
+    }
+}
+
+#[test]
+fn snapshot_recovery_refuses_unknown_names_and_block_list() {
+    assert_eq!(
+        RecoveryCollection::admit(WAPatchName::Unknown),
+        Err(SnapshotRecoveryRefusal::UnknownCollection)
+    );
+    assert_eq!(
+        RecoveryCollection::admit(WAPatchName::CriticalBlock),
+        Err(SnapshotRecoveryRefusal::BlockList)
+    );
+    for name in [
+        WAPatchName::CriticalUnblockLow,
+        WAPatchName::Regular,
+        WAPatchName::RegularHigh,
+        WAPatchName::RegularLow,
+    ] {
+        assert_eq!(RecoveryCollection::admit(name).unwrap().name(), name);
+    }
+}
+
+#[test]
+fn recovery_record_limit_is_inclusive_and_nonpositive_means_unbounded() {
+    let collection = RecoveryCollection::admit(WAPatchName::Regular).unwrap();
+    assert!(collection.admit_records(0, 2000).is_ok());
+    assert!(collection.admit_records(2000, 2000).is_ok());
+    assert_eq!(
+        collection.admit_records(2001, 2000),
+        Err(SnapshotRecoveryRefusal::TooManyRecords)
+    );
+    for allowed in [0, -1, i64::MIN] {
+        assert!(collection.admit_records(usize::MAX, allowed).is_ok());
+    }
+}
