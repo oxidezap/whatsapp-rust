@@ -19,9 +19,9 @@ pub type Result<T> = std::result::Result<T, SignalProtocolError>;
 
 #[derive(Error)]
 pub enum SignalProtocolError {
-    #[error("invalid argument: {0}")]
+    #[error("invalid argument (detail bytes={})", .0.len())]
     InvalidArgument(String),
-    #[error("invalid state for call to {0} to succeed: {1}")]
+    #[error("invalid state for call to {method} to succeed (detail bytes={bytes})", method = .0, bytes = .1.len())]
     InvalidState(&'static str, String),
 
     #[error("backend store error in {0}")]
@@ -71,7 +71,7 @@ pub enum SignalProtocolError {
     #[error("invalid MAC key length <{0}>")]
     InvalidMacKeyLength(usize),
 
-    #[error("no sender key state: {0}")]
+    #[error("no sender key state (detail bytes={})", .0.len())]
     NoSenderKeyState(String),
 
     #[error("session with {} not found", .0.observe())]
@@ -213,6 +213,12 @@ mod tests {
             }
         }
         for error in [
+            SignalProtocolError::InvalidArgument("synthetic-private-key-bytes".into()),
+            SignalProtocolError::InvalidState(
+                "message_encrypt",
+                "synthetic-private-key-bytes".into(),
+            ),
+            SignalProtocolError::NoSenderKeyState("synthetic-private-key-bytes".into()),
             SignalProtocolError::FfiBindingError("synthetic-private-key-bytes".into()),
             SignalProtocolError::InvalidSealedSenderMessage("synthetic-private-key-bytes".into()),
         ] {
@@ -221,7 +227,10 @@ mod tests {
                 assert!(output.contains("detail bytes="));
             }
             match error {
-                SignalProtocolError::FfiBindingError(text)
+                SignalProtocolError::InvalidArgument(text)
+                | SignalProtocolError::InvalidState(_, text)
+                | SignalProtocolError::NoSenderKeyState(text)
+                | SignalProtocolError::FfiBindingError(text)
                 | SignalProtocolError::InvalidSealedSenderMessage(text) => {
                     assert_eq!(text, "synthetic-private-key-bytes");
                 }

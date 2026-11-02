@@ -657,7 +657,12 @@ impl Client {
             .unwrap_or_else(|p| p.into_inner())
             .insert(processing_key.clone())
         {
-            log::debug!("Ignoring retry for {processing_key}: a retry is already in progress.");
+            log::debug!(
+                "Ignoring retry for message {} in {} from {}: a retry is already in progress.",
+                ObservedId::new(&message_id),
+                info.chat.observe(),
+                info.requester.observe()
+            );
             return Ok(());
         }
         // processing_key isn't needed by name after this point — move it into
@@ -846,7 +851,7 @@ impl Client {
                     "Unknown device {} in group {} — forcing full sender key rotation \
                      (matches WA Web's rotateKey behavior)",
                     info.requester.observe(),
-                    group_jid
+                    info.chat.observe()
                 );
                 let _distribution_guard = self.group_distribution_lock(&info.chat).await;
 
@@ -1344,13 +1349,13 @@ impl Client {
                     "Marked {} for fresh SKDM in {} {} due to retry receipt",
                     resolved_jid.observe(),
                     chat_type,
-                    group_jid
+                    info.chat.observe()
                 );
             }
             Err(e) => log::warn!(
                 "Failed to mark sender key forget for {} in {}: {}",
                 info.requester.observe(),
-                group_jid,
+                info.chat.observe(),
                 e
             ),
         }
@@ -2005,6 +2010,80 @@ mod tests {
     use wacore::types::jid::JidExt as _;
     use wacore_binary::{Jid, JidExt};
     use waproto::whatsapp as wa;
+
+    #[tokio::test]
+    async fn retry_logs_keep_context_without_dedup_keys_or_legacy_phones() {
+        use crate::test_utils::log_capture;
+        use wacore_binary::builder::NodeBuilder;
+
+        if log_capture::delegated_to_child(
+            "retry::tests::retry_logs_keep_context_without_dedup_keys_or_legacy_phones",
+        ) {
+            return;
+        }
+        let client = crate::test_utils::create_test_client_with_name("retry_log_privacy").await;
+        let group: Jid = "19990000051-1700000000@g.us".parse().unwrap();
+        let requester: Jid = "19990000052:2@s.whatsapp.net".parse().unwrap();
+        let id = "synthetic-private-retry-id";
+        let info = RetryChatInfo {
+            chat: group.clone(),
+            requester: requester.clone(),
+            original_from: group.clone(),
+            recipient: None,
+            is_bot: false,
+            is_fbid_bot_retry: false,
+        };
+        let capture = log_capture::session();
+        client
+            .mark_requester_for_fresh_skdm(&info, &requester)
+            .await;
+        let key = build_retry_processing_key(&group, id, &requester);
+        client.pending_retries.lock().unwrap().insert(key.clone());
+        let node = NodeBuilder::new("receipt")
+            .attr("participant", &requester)
+            .children([NodeBuilder::new("retry")
+                .attr("id", id)
+                .attr("count", "1")
+                .build()])
+            .build();
+        let receipt = Receipt::builder()
+            .source(crate::types::message::MessageSource {
+                chat: group,
+                sender: requester,
+                is_group: true,
+                ..Default::default()
+            })
+            .message_ids(vec![id.into()])
+            .timestamp(wacore::time::now_utc())
+            .r#type(crate::types::presence::ReceiptType::Retry)
+            .offline(false)
+            .build();
+        client
+            .handle_retry_receipt(&receipt, &crate::test_utils::node_to_owned_ref(&node))
+            .await
+            .unwrap();
+        assert!(client.pending_retries.lock().unwrap().remove(&key));
+        let records = capture.records_for("whatsapp_rust::retry");
+        assert!(
+            records
+                .iter()
+                .any(|(_, text)| text.contains("Marked") && text.contains("fresh SKDM"))
+        );
+        assert!(
+            records
+                .iter()
+                .any(|(_, text)| text.contains("already in progress")
+                    && text.contains(&ObservedId::new(id).to_string()))
+        );
+        for (_, text) in records {
+            assert!(!text.contains(id));
+            assert!(text.contains("-1700000000@g.us"));
+            if !cfg!(feature = "tracing-pii") {
+                assert!(!text.contains("19990000051"));
+                assert!(!text.contains("19990000052"));
+            }
+        }
+    }
 
     fn resolve_retry_chat_info(
         receipt: &Receipt,
