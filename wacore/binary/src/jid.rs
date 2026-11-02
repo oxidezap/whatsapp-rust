@@ -1285,13 +1285,37 @@ impl Jid {
 /// across spans) but not precomputable from the input, so exported traces cannot
 /// be brute-forced back to the original (e.g. an E.164 phone number). Public so
 /// other layers can redact non-`Jid` identifiers (e.g. a Signal `ProtocolAddress`
-/// name, which embeds a phone number) with the same keyed scheme.
+/// name, which embeds a phone number) with the same keyed scheme. On browser WASM,
+/// unavailable entropy yields the opaque token zero for every input, disabling
+/// correlation without falling back to a guessable key.
 pub fn observe_token(s: &str) -> u64 {
-    use std::hash::BuildHasher;
-    static KEY: std::sync::OnceLock<std::collections::hash_map::RandomState> =
-        std::sync::OnceLock::new();
-    KEY.get_or_init(std::collections::hash_map::RandomState::new)
-        .hash_one(s)
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        // std's RandomState uses allocation addresses on this target, not entropy.
+        static KEY: std::sync::OnceLock<Option<[u8; 16]>> = std::sync::OnceLock::new();
+        let key = KEY.get_or_init(|| {
+            let mut key = [0; 16];
+            getrandom::fill(&mut key).ok()?;
+            Some(key)
+        });
+        observe_with_key(s, key.as_ref())
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        use std::hash::BuildHasher;
+        static KEY: std::sync::OnceLock<std::collections::hash_map::RandomState> =
+            std::sync::OnceLock::new();
+        KEY.get_or_init(std::collections::hash_map::RandomState::new)
+            .hash_one(s)
+    }
+}
+
+#[cfg(any(test, all(target_arch = "wasm32", target_os = "unknown")))]
+fn observe_with_key(s: &str, key: Option<&[u8; 16]>) -> u64 {
+    // Missing entropy disables correlation instead of using a guessable key.
+    key.map_or(0, |key| {
+        siphasher::sip::SipHasher24::new_with_key(key).hash(s.as_bytes())
+    })
 }
 
 /// Privacy-aware redaction of a JID supplied as a string (e.g. a group jid `&str`
@@ -1403,6 +1427,22 @@ mod tests {
     /// non-zero, which is rare enough to pass CI and show up only on odd input
     /// off the wire. Collapsing at the parser instead means there is no second
     /// classification to get wrong.
+    #[test]
+    fn observation_hash_requires_a_secret_key_and_fails_closed_without_entropy() {
+        let a = [0x17; 16];
+        let b = [0x29; 16];
+        assert_eq!(
+            observe_with_key("19990000006", Some(&a)),
+            observe_with_key("19990000006", Some(&a))
+        );
+        assert_ne!(
+            observe_with_key("19990000006", Some(&a)),
+            observe_with_key("19990000006", Some(&b))
+        );
+        assert_eq!(observe_with_key("19990000006", None), 0);
+        assert_eq!(observe_with_key("19990000007", None), 0);
+    }
+
     #[test]
     fn the_two_spellings_agree_when_the_agent_is_not_zero() {
         let legacy: Jid = "12345678901.6@c.us".parse().unwrap();

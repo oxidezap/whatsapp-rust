@@ -2460,17 +2460,9 @@ impl Client {
                         );
                         self.invalidate_session_authentication();
                         should_disconnect = true;
-                    } else if let Some(ack) = node.get_optional_child("ack") {
-                        let id = ack
-                            .get_attr("id")
-                            .map(|v| v.as_str().to_string())
-                            .unwrap_or_default();
-                        let class = ack
-                            .get_attr("class")
-                            .map(|v| v.as_str().to_string())
-                            .unwrap_or_default();
+                    } else if node.get_optional_child("ack").is_some() {
                         warn!(
-                            "Stream error carrying <ack> (class={class:?}, id={id}): the server is \
+                            "Stream error carrying <ack>: the server is \
                              still owed a transport ack for that stanza and recycles the stream \
                              until it arrives; reconnect follows on stream end"
                         );

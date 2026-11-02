@@ -576,6 +576,7 @@ pub mod log_capture {
         "whatsapp_rust::handlers::iq",
         "whatsapp_rust::client::node_io",
         "whatsapp_rust::client::lid_pn",
+        "whatsapp_rust::client::device_registry",
         "Client/Keepalive",
         "whatsapp_rust::client::lifecycle",
         "whatsapp_rust::history_sync",

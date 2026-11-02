@@ -76,9 +76,8 @@ pub async fn group_encrypt<S: SenderKeyStore + ?Sized, R: Rng + CryptoRng>(
         .await?
         .ok_or_else(|| {
             SignalProtocolError::NoSenderKeyState(format!(
-                "no sender key record for group {} sender {}",
-                sender_key_name.group_id(),
-                sender_key_name.sender_id()
+                "no sender key record for group {}",
+                wacore_binary::jid::observe_str(sender_key_name.group_id())
             ))
         })?;
 
@@ -229,9 +228,8 @@ pub async fn group_decrypt_shared(
         .await?
         .ok_or_else(|| {
             SignalProtocolError::NoSenderKeyState(format!(
-                "no sender key record for group {} sender {}",
-                sender_key_name.group_id(),
-                sender_key_name.sender_id()
+                "no sender key record for group {}",
+                wacore_binary::jid::observe_str(sender_key_name.group_id())
             ))
         })?;
 
@@ -455,6 +453,33 @@ mod tests {
         async fn load_sender_key(&self, name: &SenderKeyName) -> Result<Option<SenderKeyRecord>> {
             Ok(self.keys.get(name).cloned())
         }
+    }
+
+    #[test]
+    fn missing_sender_key_error_keeps_group_context_without_sender_identity() {
+        let mut rng = rand::rng();
+        let group = "120363099999999999@g.us";
+        let sender = "19990000008.0";
+        let name = SenderKeyName::new(group.to_owned(), sender.to_owned());
+        let signing_key = IdentityKeyPair::generate(&mut rng);
+        let message = SenderKeyMessage::new(
+            SENDERKEY_MESSAGE_CURRENT_VERSION,
+            7,
+            0,
+            vec![0; 32].into_boxed_slice(),
+            &mut rng,
+            signing_key.private_key(),
+        )
+        .expect("build synthetic sender-key message");
+        let mut store = InMemorySenderKeyStore {
+            keys: HashMap::new(),
+        };
+        let error = block_on(group_decrypt(message.serialized(), &mut store, &name))
+            .expect_err("missing sender-key record must preserve its typed error");
+        assert!(matches!(error, SignalProtocolError::NoSenderKeyState(_)));
+        let diagnostic = format!("{error} {error:?}");
+        assert!(diagnostic.contains(group));
+        assert!(!diagnostic.contains(sender));
     }
 
     /// Unknown chain IDs must return `NoSenderKeyState` (typed error) so the

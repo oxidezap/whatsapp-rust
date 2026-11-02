@@ -1,5 +1,6 @@
 //! Logging must not become a second delivery channel for protocol payloads.
 use std::fmt;
+use wacore::stanza::wire_tags::StanzaTag;
 use wacore_binary::{Node, NodeRef};
 
 /// Only closed stanza categories and numeric error codes belong in diagnostics.
@@ -30,11 +31,7 @@ impl<'a> From<&'a NodeRef<'_>> for StanzaSummary<'a> {
 
 impl fmt::Display for StanzaSummary<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let tag = match self.tag {
-            "iq" | "message" | "receipt" | "ack" | "notification" | "presence" | "stream:error"
-            | "failure" | "success" | "ib" | "call" => self.tag,
-            _ => "unknown",
-        };
+        let tag = StanzaTag::try_from(self.tag).map_or("unknown", |tag| tag.as_str());
         write!(f, "<{tag}")?;
         if let Some(code) = self.code {
             write!(f, " code={code}")?;
@@ -90,6 +87,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn device_reset_logs_follow_the_identifier_privacy_policy() {
+        if log_capture::delegated_to_child(
+            "logging::tests::device_reset_logs_follow_the_identifier_privacy_policy",
+        ) {
+            return;
+        }
+        let capture = log_capture::session();
+        let client = crate::test_utils::create_test_client().await;
+        let user = "19990000008";
+        let record = wacore::store::traits::DeviceListRecord {
+            user: user.into(),
+            devices: Box::new([]),
+            timestamp: 0,
+            phash: None,
+            raw_id: Some(1),
+        };
+        client
+            .clear_device_record(user, "s.whatsapp.net", &record)
+            .await;
+        let records = capture.records_for("whatsapp_rust::client::device_registry");
+        assert!(
+            records
+                .iter()
+                .any(|(_, message)| message.contains("Clearing device record"))
+        );
+        if !cfg!(feature = "tracing-pii") {
+            assert!(records.iter().all(|(_, message)| !message.contains(user)));
+        }
+    }
+
+    #[tokio::test]
     async fn error_handlers_log_diagnostics_without_raw_stanzas() {
         if log_capture::delegated_to_child(
             "logging::tests::error_handlers_log_diagnostics_without_raw_stanzas",
@@ -121,6 +149,13 @@ mod tests {
                 _ => client.handle_connect_failure(&node.as_node_ref()).await,
             }
         }
+        let ack = NodeBuilder::new("stream:error")
+            .children([NodeBuilder::new("ack")
+                .attr("id", "synthetic-ack-secret")
+                .attr("class", "19990000009@s.whatsapp.net")
+                .build()])
+            .build();
+        client.handle_stream_error(&ack.as_node_ref()).await;
         let records: Vec<_> = [
             "whatsapp_rust::handlers::iq",
             "whatsapp_rust::client::node_io",
@@ -132,6 +167,7 @@ mod tests {
             "Received unhandled IQ",
             "Unknown stream error",
             "Unknown connect failure",
+            "Stream error carrying <ack>",
         ] {
             assert!(
                 records
@@ -145,6 +181,8 @@ mod tests {
                 "19990000003",
                 "synthetic-handler-secret",
                 "synthetic-handler-key",
+                "synthetic-ack-secret",
+                "19990000009",
             ] {
                 assert!(!message.contains(marker), "sensitive stanza value logged");
             }
@@ -181,6 +219,13 @@ mod tests {
         assert_eq!(records.len(), 10);
         for (_, message) in records {
             assert_eq!(message, "<stream:error code=599 payload=omitted>");
+        }
+        for tag in ["chatstate", "xmlstreamend"] {
+            let node = NodeBuilder::new(tag).build();
+            assert_eq!(
+                StanzaSummary::from(&node).to_string(),
+                format!("<{tag} payload=omitted>")
+            );
         }
         let unknown = NodeBuilder::new("synthetic-secret-tag")
             .attr("code", "synthetic-secret-code")

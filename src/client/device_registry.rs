@@ -1174,7 +1174,8 @@ impl Client {
             .filter(|id| *id != 0)
             .collect();
         info!(
-            "Clearing device record for user {user}: removing {} non-primary device(s) due to raw_id change",
+            "Clearing device record for user {}: removing {} non-primary device(s) due to raw_id change",
+            wacore_binary::jid::observe_str(user),
             non_primary_ids.len()
         );
 
