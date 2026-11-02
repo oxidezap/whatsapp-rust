@@ -1942,7 +1942,7 @@ impl Client {
                         self.ack_or_replay_to_hook(info).await;
                     }
                 }
-                Err(error @ SignalProtocolError::NoSenderKeyState(_)) => {
+                Err(SignalProtocolError::NoSenderKeyState(msg)) => {
                     // Reported before the expired-status early return: the enc
                     // failed either way, and only what happens next differs.
                     self.report_enc_decrypt_failure(
@@ -1971,7 +1971,7 @@ impl Client {
                         "No sender key state for group message [msg:{}] from {}: {}. Sending retry receipt.",
                         ObservedId::new(info.id.as_str()),
                         info.source.sender.observe(),
-                        error
+                        msg
                     );
 
                     if is_unknown_device {

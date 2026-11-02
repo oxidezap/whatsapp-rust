@@ -71,7 +71,7 @@ pub enum SignalProtocolError {
     #[error("invalid MAC key length <{0}>")]
     InvalidMacKeyLength(usize),
 
-    #[error("no sender key state (detail bytes={})", .0.len())]
+    #[error("no sender key state: {0}")]
     NoSenderKeyState(String),
 
     #[error("session with {} not found", .0.observe())]
@@ -218,7 +218,6 @@ mod tests {
                 "message_encrypt",
                 "synthetic-private-key-bytes".into(),
             ),
-            SignalProtocolError::NoSenderKeyState("synthetic-private-key-bytes".into()),
             SignalProtocolError::FfiBindingError("synthetic-private-key-bytes".into()),
             SignalProtocolError::InvalidSealedSenderMessage("synthetic-private-key-bytes".into()),
         ] {
@@ -229,7 +228,6 @@ mod tests {
             match error {
                 SignalProtocolError::InvalidArgument(text)
                 | SignalProtocolError::InvalidState(_, text)
-                | SignalProtocolError::NoSenderKeyState(text)
                 | SignalProtocolError::FfiBindingError(text)
                 | SignalProtocolError::InvalidSealedSenderMessage(text) => {
                     assert_eq!(text, "synthetic-private-key-bytes");
