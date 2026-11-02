@@ -29,9 +29,9 @@ fn captured_web_key_inclusion_gate_matches_manual_core_helper() {
 }
 
 #[test]
-fn verified_key_bundle_remains_an_explicit_unknown_device_exception() {
+fn keys_cannot_exempt_an_unknown_device_from_retry_admission() {
     assert!(should_drop_unknown_device_retry(false, false));
-    assert!(!should_drop_unknown_device_retry(true, false));
+    assert!(should_drop_unknown_device_retry(true, false));
     assert!(!should_drop_unknown_device_retry(false, true));
     assert!(!should_drop_unknown_device_retry(true, true));
 }
