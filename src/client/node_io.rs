@@ -126,6 +126,29 @@ fn group_repair_time_left(
 }
 
 impl Client {
+    pub(super) fn feed_received_data(
+        &self,
+        decoder: &mut wacore::framing::FrameDecoder,
+        data: bytes::Bytes,
+    ) -> usize {
+        // A ten-second gap separates bursts before the next keepalive reply.
+        // Active traffic keeps its amortized accumulator and reads the clock once.
+        const IDLE_BUFFER_GAP: Duration = Duration::from_secs(10);
+        let now = self.runtime.monotonic_time();
+        let idle = self
+            .stats
+            .last_data_received()
+            .is_some_and(|last| now.saturating_duration_since(last) >= IDLE_BUFFER_GAP);
+        self.stats.mark_recv_activity_at(now);
+        let bytes = data.len();
+        if idle {
+            decoder.feed_owned_after_idle(data);
+        } else {
+            decoder.feed_owned(data);
+        }
+        bytes
+    }
+
     /// Read the current semaphore generation and Arc atomically under the mutex.
     pub(crate) fn read_message_semaphore(&self) -> (u64, Arc<async_lock::Semaphore>) {
         let guard = match self.message_processing_semaphore.lock() {
@@ -259,16 +282,13 @@ impl Client {
                         match event_result {
                             Ok(crate::transport::TransportEvent::DataReceived(data)) => {
                                 // Update dead-socket timer (WA Web: deadSocketTimer reset)
-                                self.stats.mark_recv_activity_at(self.runtime.monotonic_time());
-                                let wire_bytes = data.len();
-
                                 // Consumed here, before any await below: a read
                                 // the transport still shares is copied and
                                 // released, so the node processed further down
                                 // never keeps a second copy of its bytes alive;
                                 // a read the transport handed over outright is
                                 // adopted without either.
-                                frame_decoder.feed_owned(data);
+                                let wire_bytes = self.feed_received_data(&mut frame_decoder, data);
 
                                 // Process all complete frames.
                                 // Frame decryption must be sequential (noise protocol counter),

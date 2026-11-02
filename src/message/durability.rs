@@ -13,6 +13,14 @@ use crate::types::durability_hook::InboundDurabilityHook;
 use wacore::types::events::InboundMessage;
 
 impl Client {
+    pub(crate) fn reclaim_idle_delivery_capacity(&self) {
+        if self.inbound_journal_enabled() {
+            self.inbound_commit_batch
+                .live_retention
+                .reclaim_idle_capacity();
+        }
+    }
+
     /// History notifications reuse the bounded carrier journal and its Signal
     /// ordering, including when no live-message consumer hook is installed.
     pub(crate) fn inbound_journal_enabled(&self) -> bool {

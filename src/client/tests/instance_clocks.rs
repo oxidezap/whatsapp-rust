@@ -29,6 +29,31 @@ async fn client(clock: Arc<dyn Clock>) -> Arc<Client> {
     client_with_http(clock, Arc::new(MockHttpClient)).await
 }
 
+#[tokio::test]
+async fn receive_burst_compaction_uses_the_instance_clock() {
+    let clock = Arc::new(VirtualClock::new(1000, Instant::ZERO).unwrap());
+    let client = client(clock.clone()).await;
+    let mut decoder = wacore::framing::FrameDecoder::new();
+    let large = wacore::framing::encode_frame(&vec![7; 16 * 1024], None).unwrap();
+    client.feed_received_data(&mut decoder, large.into());
+    drop(decoder.decode_frame().unwrap());
+
+    let active = bytes::Bytes::from(wacore::framing::encode_frame(b"active", None).unwrap());
+    let active_pointer = active.as_ptr();
+    client.feed_received_data(&mut decoder, active);
+    let frame = decoder.decode_frame().unwrap();
+    assert_ne!(frame.as_ptr(), active_pointer.wrapping_add(3));
+    drop(frame);
+
+    clock.advance(Duration::from_secs(11)).unwrap();
+    let idle = bytes::Bytes::from(wacore::framing::encode_frame(b"idle", None).unwrap());
+    let idle_pointer = idle.as_ptr();
+    client.feed_received_data(&mut decoder, idle);
+    let frame = decoder.decode_frame().unwrap();
+    assert_eq!(frame.as_ref(), b"idle");
+    assert_eq!(frame.as_ptr(), idle_pointer.wrapping_add(3));
+}
+
 async fn client_with_http(
     clock: Arc<dyn Clock>,
     http: Arc<dyn crate::http::HttpClient>,

@@ -261,6 +261,7 @@ fn create_chat_lane(
                                         break;
                                     }
                                 }
+                                client_for_worker.reclaim_idle_delivery_capacity();
                                 break;
                             }
                         }

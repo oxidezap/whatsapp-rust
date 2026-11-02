@@ -129,6 +129,13 @@ I/O. The SDK must obtain the outcome from the global, batch-safe persistence
 gate before exposing prepared output. Keep the durable-lease fast path and
 per-address Signal locks intact.
 
+Empty live-delivery bookkeeping releases burst capacity when a lane retires
+after its idle timeout or cache maintenance runs. Active and replayable
+reservations keep their data. The receive host samples its instance clock
+once per read and starts a cold decoder burst after a ten-second gap. That
+boundary releases an empty accumulator's old backing; partial frames keep
+their bytes and normal reassembly behavior.
+
 Instance-clock clients bind the same clock allocation to runtime and storage.
 Validate alignment after wrapping runtimes, and forward clock ports through
 runtime decorators. Built-in virtual clocks drive their own sleeps and wake
