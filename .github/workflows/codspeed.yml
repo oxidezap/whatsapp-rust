@@ -299,7 +299,7 @@ jobs:
         # pollutes the CodSpeed baseline. Same freeze rationale as the malloc
         # thresholds above. Generated from .github/bartender-image.txt by
         # cargo xt ci sync-bartender-image.
-        image: ghcr.io/whiskeysockets-devtools/bartender@sha256:9f3a49dd9f944414fbda50571bba5f66f2ab6fdc48001e6803d4c09a1042c78e
+        image: ghcr.io/whiskeysockets-devtools/bartender@sha256:56cbabbc2bba22a3306bfdf7bf02f0fbd6041483a7cac8b0c6217ac4cfa58f75
         credentials:
           username: ${{ github.actor }}
           password: ${{ secrets.BARTENDER_GHCR_TOKEN }}
