@@ -163,8 +163,12 @@ readings and the control/noise range; never upload RssAnon as a CodSpeed metric.
 
 ## Comparison in pull requests
 
-The CodSpeed workflow builds the PR base and head with the same release
-features on one host. `cargo xt ci session-retention` runs three process-isolated
+The CodSpeed workflow builds the PR base and head libraries with the same release
+features and measurement source on one host. It overlays the current probe and
+its native-only `parking_lot` development dependency onto the base checkout.
+The artifact preserves that patch and all probe sources; library implementation
+files and dependency versions remain at their respective revisions.
+`cargo xt ci session-retention` runs three process-isolated
 repeats of each backend and mode, alternating base/head order in four streams.
 It compares median live requested Rust heap relative to each process runtime
 baseline at 61 seconds and after maintenance. Any positive delta fails the gate.
@@ -174,6 +178,13 @@ Peak requested heap and Linux RSS remain separate diagnostics. CPU and activity
 allocation comparisons run through the existing CodSpeed benchmarks. The native
 idle gate does not establish CPU equivalence or WhatsApp network behavior.
 
+Before the runtime baseline, the probe enrolls 32 concurrent lock waiters in
+order, then joins them. The locked `parking_lot_core` retains its grown global
+hash tables even after all runtime threads exit. Cold startup can select
+different table chains and add 2,080 retained bytes without a client change.
+Warming this shared process metadata makes the gate measure a steady process
+with 128 lock buckets; it does not measure cold-start process overhead.
+
 For local comparisons, build and preserve both release executables first.
 Run `cargo xt ci session-retention` with `--base-executable`, `--head-executable`,
 `--base-revision` and `--head-revision`. Use full source SHAs. The command does not
@@ -182,3 +193,5 @@ build, switch checkouts, or change Cargo target directories.
 The comparison report records medians as byte-valued rational numbers with a
 numerator and denominator. This preserves exact half-byte medians for even
 repeat counts without rounding the regression decision through floating point.
+Schema version 3 also records and checks the shared probe's SHA-256. The digest
+covers the driver, allocation counter and lock warmup; mismatched sources fail.

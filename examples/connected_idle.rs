@@ -6,6 +6,10 @@
 #[path = "connected_idle/allocator.rs"]
 mod allocator;
 
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "connected_idle/process_locks.rs"]
+mod process_locks;
+
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
@@ -31,6 +35,7 @@ struct Sample {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Run {
+    harness_sha256: String,
     backend: String,
     mode: String,
     pid: u32,
@@ -109,6 +114,8 @@ fn child(backend: &str, mode: &str) -> Result<Run> {
         matches!(mode, "activity" | "control"),
         "mode must be activity or control"
     );
+    #[cfg(not(target_arch = "wasm32"))]
+    process_locks::warm();
     let start = Instant::now();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -157,6 +164,7 @@ fn child(backend: &str, mode: &str) -> Result<Run> {
         store.cleanup()?;
         samples.push(sample("after_shutdown", start, None).await?);
         Ok::<_, anyhow::Error>(Run {
+            harness_sha256: harness_sha256(),
             backend: backend.into(),
             mode: mode.into(),
             pid: std::process::id(),
@@ -177,6 +185,20 @@ fn child(backend: &str, mode: &str) -> Result<Run> {
     run.samples
         .push(memory_sample("after_runtime_drop", start, None, 0)?);
     Ok(run)
+}
+
+fn harness_sha256() -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for source in [
+        include_bytes!("connected_idle.rs").as_slice(),
+        include_bytes!("connected_idle/allocator.rs").as_slice(),
+        include_bytes!("connected_idle/process_locks.rs").as_slice(),
+    ] {
+        hash.update((source.len() as u64).to_le_bytes());
+        hash.update(source);
+    }
+    hex::encode(hash.finalize())
 }
 
 fn range(values: &mut [i64]) -> (i64, i64, i64) {

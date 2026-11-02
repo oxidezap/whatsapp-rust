@@ -13,6 +13,7 @@ struct Sample {
 
 #[derive(Debug, Deserialize)]
 struct Run {
+    harness_sha256: String,
     backend: String,
     mode: String,
     lanes: usize,
@@ -64,6 +65,7 @@ struct Comparison {
 
 #[derive(Serialize)]
 struct StreamReport {
+    harness_sha256: String,
     backend: &'static str,
     mode: &'static str,
     checkpoints: Vec<Comparison>,
@@ -118,6 +120,7 @@ fn measure(
         output.status
     );
     let run: Run = serde_json::from_slice(&output.stdout).context("connected_idle output")?;
+    validate_harness(&run.harness_sha256)?;
     ensure!(
         run.backend == backend && run.mode == mode && run.idle_seconds >= 61,
         "unexpected workload metadata for {name}"
@@ -157,7 +160,13 @@ fn compare(base: &[Run], head: &[Run], checkpoint: &str) -> Result<Comparison> {
         !base.is_empty() && base.len() == head.len(),
         "matched nonempty repeats required"
     );
+    let harness = &base[0].harness_sha256;
+    validate_harness(harness)?;
     for (base, head) in base.iter().zip(head) {
+        ensure!(
+            base.harness_sha256 == *harness && head.harness_sha256 == *harness,
+            "baseline and head measurement harnesses differ"
+        );
         ensure!(
             (
                 base.lanes,
@@ -208,6 +217,14 @@ fn compare(base: &[Run], head: &[Run], checkpoint: &str) -> Result<Comparison> {
         base_samples: metrics(base)?,
         head_samples: metrics(head)?,
     })
+}
+
+fn validate_harness(harness: &str) -> Result<()> {
+    ensure!(
+        harness.len() == 64 && harness.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "measurement harness must carry its SHA-256"
+    );
+    Ok(())
 }
 
 pub struct Options {
@@ -261,6 +278,7 @@ pub fn run(root: &Path, options: Options) -> Result<()> {
                         }
                     }
                     Ok(StreamReport {
+                        harness_sha256: base[0].harness_sha256.clone(),
                         backend,
                         mode,
                         checkpoints: vec![
@@ -281,7 +299,7 @@ pub fn run(root: &Path, options: Options) -> Result<()> {
             .collect::<Result<Vec<_>>>()
     })?;
     let report = Report {
-        schema_version: 2,
+        schema_version: 3,
         base_revision: options.base_revision,
         head_revision: options.head_revision,
         base_executable_sha256: xtask_support::sha256(&std::fs::read(&base_executable)?),
@@ -328,6 +346,7 @@ mod tests {
     use super::*;
     fn run_with(live: u64, baseline: u64, messages: usize) -> Run {
         Run {
+            harness_sha256: "a".repeat(64),
             backend: "memory".into(),
             mode: "control".into(),
             lanes: if messages == 0 { 0 } else { 32 },
@@ -400,6 +419,32 @@ mod tests {
         let mut head = run_with(50, 10, 0);
         head.lanes = 32;
         assert!(compare(&[base], &[head], "after_61s").is_err());
+    }
+
+    #[test]
+    fn different_harnesses_cannot_pass_as_an_improvement() {
+        let base = run_with(100, 10, 0);
+        let mut head = run_with(50, 10, 0);
+        head.harness_sha256 = "b".repeat(64);
+        assert!(compare(&[base], &[head], "after_61s").is_err());
+    }
+
+    #[test]
+    fn every_repeat_must_use_the_same_harness() {
+        let first = run_with(100, 10, 0);
+        let mut second = run_with(100, 10, 0);
+        second.harness_sha256 = "b".repeat(64);
+        let base = [first, second];
+        let mut head = [run_with(50, 10, 0), run_with(50, 10, 0)];
+        head[1].harness_sha256 = "b".repeat(64);
+        assert!(compare(&base, &head, "after_61s").is_err());
+    }
+
+    #[test]
+    fn invalid_harness_hashes_are_rejected() {
+        assert!(validate_harness("").is_err());
+        assert!(validate_harness(&"g".repeat(64)).is_err());
+        assert!(validate_harness(&"a".repeat(64)).is_ok());
     }
 
     #[test]
