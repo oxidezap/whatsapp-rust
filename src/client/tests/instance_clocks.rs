@@ -35,6 +35,8 @@ async fn receive_burst_compaction_uses_the_instance_clock() {
     let client = client(clock.clone()).await;
     let mut decoder = wacore::framing::FrameDecoder::new();
     let large = wacore::framing::encode_frame(&vec![7; 16 * 1024], None).unwrap();
+    let large_start = large.as_ptr() as usize;
+    let large_range = large_start..large_start + large.capacity();
     client.feed_received_data(&mut decoder, large.into());
     drop(decoder.decode_frame().unwrap());
 
@@ -43,15 +45,15 @@ async fn receive_burst_compaction_uses_the_instance_clock() {
     client.feed_received_data(&mut decoder, active);
     let frame = decoder.decode_frame().unwrap();
     assert_ne!(frame.as_ptr(), active_pointer.wrapping_add(3));
-    drop(frame);
+    assert!(large_range.contains(&(frame.as_ptr() as usize)));
 
     clock.advance(Duration::from_secs(11)).unwrap();
     let idle = bytes::Bytes::from(wacore::framing::encode_frame(b"idle", None).unwrap());
-    let idle_pointer = idle.as_ptr();
     client.feed_received_data(&mut decoder, idle);
-    let frame = decoder.decode_frame().unwrap();
-    assert_eq!(frame.as_ref(), b"idle");
-    assert_eq!(frame.as_ptr(), idle_pointer.wrapping_add(3));
+    let idle_frame = decoder.decode_frame().unwrap();
+    assert_eq!(idle_frame.as_ref(), b"idle");
+    assert!(!large_range.contains(&(idle_frame.as_ptr() as usize)));
+    assert_eq!(frame.as_ref(), b"active");
 }
 
 async fn client_with_http(
