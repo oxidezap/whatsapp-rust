@@ -7420,9 +7420,14 @@ mod ensure_sessions_concurrency {
                 .backend()
                 .load_identity(primary.to_protocol_address().as_str())
                 .await
-                .unwrap()
-                .as_deref(),
-            Some(keys.identity.public_key().public_key_bytes())
+                .unwrap(),
+            Some(
+                keys.identity
+                    .public_key()
+                    .public_key_bytes()
+                    .try_into()
+                    .unwrap()
+            )
         );
         let next = primary.with_device(3);
         let running = client.clone();
