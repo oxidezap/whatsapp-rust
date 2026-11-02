@@ -158,6 +158,10 @@ pub struct ClientOptions {
     pub presence_policy: PresencePolicy,
     /// Server certificate verification for every Noise handshake.
     pub noise_cert_policy: NoiseCertPolicy,
+    /// Additional exact HTTPS authorities for static media, including an optional port.
+    /// Intended for an application's CDN or local TLS fixtures. No redirects are allowed.
+    /// TLS trust remains the responsibility of the injected HTTP client.
+    pub additional_static_media_hosts: Vec<wacore::download::MediaHost>,
     /// `None` keeps the client's default prekey batch size.
     pub wanted_pre_key_count: Option<usize>,
     /// Optional `(burst, refill_per_minute)` override for outbound retry resends.
@@ -176,6 +180,7 @@ impl Default for ClientOptions {
             watched_ab_props: Vec::new(),
             presence_policy: PresencePolicy::default(),
             noise_cert_policy: NoiseCertPolicy::default(),
+            additional_static_media_hosts: Vec::new(),
             wanted_pre_key_count: None,
             resend_rate_limit: None,
             background_saver_interval: None,
@@ -803,6 +808,7 @@ impl ClientBuilder {
                 #[cfg(feature = "plugins")]
                 plugin_host,
                 noise_cert_policy: options.noise_cert_policy,
+                additional_static_media_hosts: options.additional_static_media_hosts,
                 ..self
                     .extensions
                     .map(|extensions| *extensions)
@@ -1102,6 +1108,7 @@ pub(super) struct ClientExtensions {
     #[cfg(feature = "plugins")]
     pub(super) plugin_host: Option<Arc<PluginHost>>,
     pub(super) noise_cert_policy: NoiseCertPolicy,
+    pub(super) additional_static_media_hosts: Vec<wacore::download::MediaHost>,
     pub(super) history_sync_admission: Option<Arc<dyn HistorySyncAdmission>>,
     pub(super) connect_admission: Option<Arc<dyn ConnectAdmission>>,
 }

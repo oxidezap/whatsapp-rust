@@ -439,6 +439,8 @@ pub type UploadBody = Box<dyn std::io::Read + Send>;
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait HttpClient: crate::sync_marker::MaybeSendSync {
     /// Executes a given HTTP request and returns the response, non-2xx included.
+    /// Do not follow redirects: the core validates the initial media origin and
+    /// cannot authorize an unseen redirect target. Return the 3xx response or an error.
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse>;
 
     /// Whether this client supports synchronous streaming downloads.

@@ -1171,7 +1171,7 @@ impl Client {
             source,
         };
         let route = if downloadable.static_url().is_some() {
-            MediaRoute::new(Vec::new())
+            MediaRoute::new(self.additional_static_media_hosts.clone())
         } else if !force_refresh
             && let Some(route) = self.cached_download_route().await.map_err(session_error)?
         {
@@ -2845,6 +2845,48 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn static_media_configuration_is_per_client_and_rejects_before_http() {
+        let mut image = wa::message::ImageMessage::default();
+        image.static_url = Some("https://127.0.0.1:8443/fixture".into());
+        image.file_sha256 = Some(vec![0; 32]);
+        let http = RoutedHttpClient::new(Vec::new(), (200, Vec::new()));
+        let strict =
+            crate::test_utils::create_test_client_with_http("strict-origin", http.clone()).await;
+        assert!(strict.prepare_requests(&image, false).await.is_err());
+        assert!(http.urls().is_empty());
+
+        let options = crate::ClientOptions {
+            additional_static_media_hosts: vec![MediaHost::new("127.0.0.1:8443")],
+            ..Default::default()
+        };
+        let configured = crate::client::ClientBuilder::new()
+            .with_runtime(crate::TokioRuntime)
+            .with_persistence_manager(Arc::new(
+                crate::store::persistence_manager::PersistenceManager::new(
+                    crate::test_utils::create_test_backend().await,
+                )
+                .await
+                .unwrap(),
+            ))
+            .with_transport_factory(crate::transport::mock::MockTransportFactory::new())
+            .with_http_client_arc(http.clone())
+            .with_options(options)
+            .build()
+            .await
+            .unwrap()
+            .into_client();
+        let requests = configured.prepare_requests(&image, false).await.unwrap();
+        assert_eq!(requests[0].url, image.static_url.as_deref().unwrap());
+        image.static_url = Some("https://127.0.0.1:8444/fixture".into());
+        assert!(configured.prepare_requests(&image, false).await.is_err());
+        image.static_url = Some("http://127.0.0.1:8443/fixture".into());
+        assert!(configured.prepare_requests(&image, false).await.is_err());
+        assert!(http.urls().is_empty());
+        strict.signal_shutdown_sync();
+        configured.signal_shutdown_sync();
+    }
+
     fn encrypted_params(data: &[u8]) -> (DownloadParams, Vec<u8>) {
         let enc = wacore::upload::encrypt_media(data, MediaType::Image)
             .expect("encryption should succeed");
@@ -3849,7 +3891,7 @@ mod tests {
                         proto_fixture.file_enc_sha256 = Some(enc.file_enc_sha256.to_vec());
                         proto_fixture.file_sha256 = Some(enc.file_sha256.to_vec());
                         proto_fixture.static_url =
-                            Some("https://cdn.example.com/p1-fixture".to_owned());
+                            Some("https://mmg.whatsapp.net/p1-fixture".to_owned());
                         proto_fixture
                     };
                     if corrupt_encrypted_hash {
@@ -4412,7 +4454,7 @@ mod tests {
         let optional = {
             let mut proto_fixture = wa::message::ImageMessage::default();
             proto_fixture.static_url =
-                Some("https://cdn.example/static?signature=unchanged#part".into());
+                Some("https://mmg.whatsapp.net/static?signature=unchanged#part".into());
             proto_fixture.media_key = Some(vec![1; 16]);
             proto_fixture
         };
@@ -4429,8 +4471,7 @@ mod tests {
 
         let with_static_url = {
             let mut proto_fixture = wa::message::ImageMessage::default();
-            proto_fixture.static_url =
-                Some("https://static.cdn.example.com/media/abc123".to_string());
+            proto_fixture.static_url = Some("https://static.whatsapp.net/media/abc123".to_string());
             proto_fixture.direct_path = Some("/v/t62.7118-24/unused".to_string());
             proto_fixture.file_sha256 = Some(vec![7u8; 32]);
             proto_fixture
@@ -4440,10 +4481,7 @@ mod tests {
             .await
             .expect("a static URL needs no hosts, so it must not need a session");
         assert_eq!(requests.len(), 1);
-        assert_eq!(
-            requests[0].url,
-            "https://static.cdn.example.com/media/abc123"
-        );
+        assert_eq!(requests[0].url, "https://static.whatsapp.net/media/abc123");
 
         // The same client still asks the server for hosts when there is no
         // static URL, which is what makes the assertion above meaningful.
@@ -4524,7 +4562,7 @@ mod tests {
     async fn client_static_rejection_is_final_without_invalidating_a_session() {
         let message = {
             let mut proto_fixture = wa::message::ImageMessage::default();
-            proto_fixture.static_url = Some("https://cdn.example.com/static".into());
+            proto_fixture.static_url = Some("https://mmg.whatsapp.net/static".into());
             proto_fixture.file_sha256 = Some(vec![0; 32]);
             proto_fixture
         };
