@@ -908,6 +908,15 @@ pub struct DeviceListUpdate {
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct IdentityChange {
+    /// Previous raw Curve25519 public identity key, without the Signal type byte.
+    /// Absent when a custom store reports a change without retaining the keys,
+    /// or a storage error prevented reading the prior key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_identity_key: Option<[u8; 32]>,
+    /// Replacement raw public key. Server identity notifications contain no new
+    /// key, so this is absent until a subsequent key fetch or local replacement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_identity_key: Option<[u8; 32]>,
     /// The user whose identity changed
     pub user: Jid,
     /// Optional LID for the user

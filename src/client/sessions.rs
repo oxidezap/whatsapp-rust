@@ -283,8 +283,8 @@ impl Client {
         .await?;
 
         drop(session_guard);
-        if identity_change == IdentityChange::ReplacedExisting {
-            self.react_to_local_identity_change(jid);
+        if identity_change.is_changed() {
+            self.react_to_local_identity_change(jid, identity_change);
         }
         Ok(identity_change)
     }

@@ -9,9 +9,8 @@ use wacore::libsignal::crypto::DecryptionError;
 use wacore::libsignal::protocol::SenderKeyStore;
 use wacore::libsignal::protocol::group_decrypt_shared;
 use wacore::libsignal::protocol::{
-    CiphertextMessage, DecryptionResult, IdentityChange, OwnedCiphertextMessage,
-    PreKeySignalMessage, SignalMessage, SignalProtocolError, UsePQRatchet, message_decrypt,
-    message_decrypt_owned,
+    CiphertextMessage, DecryptionResult, OwnedCiphertextMessage, PreKeySignalMessage,
+    SignalMessage, SignalProtocolError, UsePQRatchet, message_decrypt, message_decrypt_owned,
 };
 use wacore::message_processing::EncType;
 use wacore::protocol::nack::NackReason;

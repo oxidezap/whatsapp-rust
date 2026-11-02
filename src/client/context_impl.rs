@@ -62,7 +62,18 @@ impl SendContextResolver for Client {
     }
 
     fn on_local_identity_change(&self, jid: &Jid) {
-        self.react_to_local_identity_change(jid);
+        self.react_to_local_identity_change(
+            jid,
+            wacore::libsignal::protocol::IdentityChange::ReplacedExisting,
+        );
+    }
+
+    fn on_local_identity_change_with_keys(
+        &self,
+        jid: &Jid,
+        change: wacore::libsignal::protocol::IdentityChange,
+    ) {
+        self.react_to_local_identity_change(jid, change);
     }
 
     fn on_unkeyable_devices(&self, reason: wacore::stats::UnkeyableDevice, count: u64) {

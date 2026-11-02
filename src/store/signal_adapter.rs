@@ -282,7 +282,10 @@ impl IdentityAdapter {
         let change = match parse_cached_identity(prev) {
             Ok(None) => IdentityChange::NewOrUnchanged,
             Ok(Some(existing)) if &existing == identity => IdentityChange::NewOrUnchanged,
-            Ok(Some(_)) => IdentityChange::ReplacedExisting,
+            Ok(Some(previous)) => IdentityChange::ReplacedExistingWithKeys {
+                previous,
+                current: *identity,
+            },
             Err(e) => return Some(Err(e)),
         };
         self.0
@@ -341,7 +344,10 @@ impl IdentityKeyStore for IdentityAdapter {
             match existing_identity {
                 None => Ok(IdentityChange::NewOrUnchanged),
                 Some(existing) if &existing == identity => Ok(IdentityChange::NewOrUnchanged),
-                Some(_) => Ok(IdentityChange::ReplacedExisting),
+                Some(previous) => Ok(IdentityChange::ReplacedExistingWithKeys {
+                    previous,
+                    current: *identity,
+                }),
             }
         })
     }
@@ -1113,7 +1119,10 @@ mod tests {
                 .save_identity(&addr, &second)
                 .await
                 .unwrap(),
-            IdentityChange::ReplacedExisting,
+            IdentityChange::ReplacedExistingWithKeys {
+                previous: first,
+                current: second
+            },
             "a different key must be ReplacedExisting"
         );
         assert_eq!(
@@ -1126,6 +1135,67 @@ mod tests {
             second,
             "get_identity must observe the fast-path write"
         );
+    }
+    #[tokio::test]
+    async fn cold_identity_replacement_retains_keys_and_corruption_is_not_overwritten() {
+        let mut adapter = test_adapter().await;
+        let addr = ProtocolAddress::new("15551234567", 0.into());
+        let previous = IdentityKey::new(
+            wacore::libsignal::protocol::PublicKey::from_djb_public_key_bytes(&[11; 32]).unwrap(),
+        );
+        let current = IdentityKey::new(
+            wacore::libsignal::protocol::PublicKey::from_djb_public_key_bytes(&[22; 32]).unwrap(),
+        );
+        adapter
+            .identity_store
+            .0
+            .device()
+            .backend
+            .put_identity(addr.as_str(), [11; 32])
+            .await
+            .unwrap();
+        assert!(
+            adapter
+                .identity_store
+                .0
+                .cache
+                .try_get_identity(&addr)
+                .is_none()
+        );
+        let change = adapter
+            .identity_store
+            .save_identity(&addr, &current)
+            .await
+            .unwrap();
+        assert!(change.is_changed());
+        assert_eq!(change.keys(), Some((previous, current)));
+        adapter
+            .identity_store
+            .0
+            .cache
+            .put_identity(&addr, &[11; 31])
+            .await;
+        assert!(
+            adapter
+                .identity_store
+                .save_identity(&addr, &current)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            adapter
+                .identity_store
+                .0
+                .cache
+                .try_get_identity(&addr)
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            &[11; 31]
+        );
+        assert!(IdentityChange::ReplacedExisting.is_changed());
+        assert_eq!(IdentityChange::ReplacedExisting.keys(), None);
+        assert!(!IdentityChange::NewOrUnchanged.is_changed());
     }
 }
 
@@ -1223,7 +1293,7 @@ mod hook_alloc_tests {
         assert!(
             matches!(
                 adapter.identity_store.try_save_identity(&address, &second),
-                Some(Ok(IdentityChange::ReplacedExisting))
+                Some(Ok(IdentityChange::ReplacedExistingWithKeys { previous, current })) if previous == first && current == second
             ),
             "a different key must report ReplacedExisting, or an identity change goes unnoticed"
         );

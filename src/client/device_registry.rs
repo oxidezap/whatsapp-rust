@@ -917,14 +917,23 @@ impl Client {
     /// (primary-device, skip-self) lives in [`handle_local_identity_change`].
     ///
     /// [`handle_local_identity_change`]: crate::handlers::notification::handle_local_identity_change
-    pub(crate) fn react_to_local_identity_change(&self, sender: &Jid) {
+    pub(crate) fn react_to_local_identity_change(
+        &self,
+        sender: &Jid,
+        change: wacore::libsignal::protocol::IdentityChange,
+    ) {
         let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) else {
             return;
         };
         let sender = sender.clone();
         self.runtime
             .spawn(Box::pin(async move {
-                crate::handlers::notification::handle_local_identity_change(&client, sender).await;
+                crate::handlers::notification::handle_local_identity_change(
+                    &client,
+                    sender,
+                    change.keys(),
+                )
+                .await;
             }))
             .detach();
     }

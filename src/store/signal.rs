@@ -246,7 +246,10 @@ impl IdentityKeyStore for Device {
         match existing_identity_opt {
             None => Ok(IdentityChange::NewOrUnchanged),
             Some(existing) if &existing == identity_key => Ok(IdentityChange::NewOrUnchanged),
-            Some(_) => Ok(IdentityChange::ReplacedExisting),
+            Some(previous) => Ok(IdentityChange::ReplacedExistingWithKeys {
+                previous,
+                current: *identity_key,
+            }),
         }
     }
 

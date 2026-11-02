@@ -636,12 +636,12 @@ pub use features::{
     ProductVideo, Profile, ProfileError, ProfilePicture, ProfilePictureLookup, QuickReplies,
     ReachoutTimelock, ReportedGroupMessage, ReportedGroupMessages, RetryReason, RetryRequestError,
     RetryRequestOptions, RetryRequestOutcome, SalePrice, SecretEncKind, SecretEncrypted,
-    SetProfilePictureResponse, Signal, SignalError, SignalSessionInfo, SignalSessionMigration,
-    StanzaRejection, StanzaResponseError, StarredMessages, Status, StatusPrivacySetting,
-    StatusSendOptions, SubgroupFailure, SubgroupKind, SubgroupVisibility, SyncActionMessageRange,
-    TcToken, TcTokenError, TextStatusExpiry, USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH,
-    UnlinkSubgroupsResult, UserInfo, UsernameLookup, UsernameLookupError, UsernameLookupUser,
-    UsyncSubprotocolError, VariantProperty, VerifiedName, message_range,
+    SecurityCodeVersion, SetProfilePictureResponse, Signal, SignalError, SignalSessionInfo,
+    SignalSessionMigration, StanzaRejection, StanzaResponseError, StarredMessages, Status,
+    StatusPrivacySetting, StatusSendOptions, SubgroupFailure, SubgroupKind, SubgroupVisibility,
+    SyncActionMessageRange, TcToken, TcTokenError, TextStatusExpiry, USERNAME_MAX_LENGTH,
+    USERNAME_MIN_LENGTH, UnlinkSubgroupsResult, UserInfo, UsernameLookup, UsernameLookupError,
+    UsernameLookupUser, UsyncSubprotocolError, VariantProperty, VerifiedName, message_range,
 };
 pub use features::{CreatedEvent, CreatedPoll, EventRef, MexDoc, MexOperation, PollRef};
 

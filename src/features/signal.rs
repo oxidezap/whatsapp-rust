@@ -12,8 +12,8 @@ use wacore::libsignal::protocol::{
 use wacore::message_processing::EncType;
 use wacore::messages::MessageUtils;
 use wacore::types::jid::{JidExt, make_sender_key_name};
-use wacore_binary::Jid;
 use wacore_binary::Node;
+use wacore_binary::{Jid, JidExt as _};
 
 use crate::client::Client;
 
@@ -739,6 +739,188 @@ impl Client {
     }
 }
 
+/// Identifier convention for a WhatsApp numeric security code.
+pub use wacore::identity_verification::SecurityCodeVersion;
+
+impl Signal<'_> {
+    /// Fetch a complete device list and return the chat's 60-digit security code.
+    ///
+    /// V3 is PN-based and V4 is LID-based. Compare the same version on both
+    /// devices. This performs usync and may establish missing E2E sessions; it
+    /// never marks a contact verified. Missing keys, incomplete device lists,
+    /// hosted accounts and concurrent identity/device changes return an error
+    /// instead of producing a partial code. The result is a point-in-time
+    /// snapshot and must be refreshed after an identity or device-list change.
+    pub async fn security_code(
+        &self,
+        peer: &Jid,
+        version: SecurityCodeVersion,
+    ) -> Result<String, SignalError> {
+        use wacore::identity_verification::numeric_security_code;
+        use wacore::libsignal::protocol::IdentityKey;
+        if !(peer.is_pn() || peer.is_lid()) || peer.is_bot() {
+            return Err(SignalError::InvalidInput(
+                "security codes require a PN or LID contact".into(),
+            ));
+        }
+        let device = self.client.persistence_manager.get_device_snapshot();
+        let own = device
+            .lid
+            .as_ref()
+            .or(device.pn.as_ref())
+            .ok_or_else(|| SignalError::InvalidInput("own account identity is unavailable".into()))?
+            .to_non_ad();
+        let peer = peer.to_non_ad();
+        self.client
+            .refresh_user_devices(vec![own.clone(), peer.clone()])
+            .await?;
+        let topology = self.client.device_topology.current();
+        let own_address = self.client.resolve_encryption_jid(&own).await;
+        let peer_address = self.client.resolve_encryption_jid(&peer).await;
+        let own_devices = self
+            .client
+            .get_devices_from_registry(&own_address)
+            .await
+            .ok_or_else(|| SignalError::InvalidInput("own device list is unavailable".into()))?;
+        let peer_devices = self
+            .client
+            .get_devices_from_registry(&peer_address)
+            .await
+            .ok_or_else(|| SignalError::InvalidInput("peer device list is unavailable".into()))?;
+        if own_devices.iter().chain(&peer_devices).any(Jid::is_hosted) {
+            return Err(SignalError::Unsupported(
+                "hosted account verification".into(),
+            ));
+        }
+        if !own_devices.iter().any(|j| j.device == 0) || !peer_devices.iter().any(|j| j.device == 0)
+        {
+            return Err(SignalError::InvalidInput(
+                "primary device is missing".into(),
+            ));
+        }
+        let is_own_device = |j: &Jid| {
+            device
+                .pn
+                .iter()
+                .chain(device.lid.iter())
+                .any(|own| own.device == j.device && own.is_same_user_as(j))
+        };
+        let mut session_devices: Vec<_> = own_devices
+            .iter()
+            .chain(&peer_devices)
+            .filter(|j| !is_own_device(j))
+            .cloned()
+            .collect();
+        wacore::types::jid::sort_dedup_by_device(&mut session_devices);
+        self.client.ensure_e2e_sessions(&session_devices).await?;
+        let continuity = self.client.signal_cache.identity_continuity.snapshot();
+        let mut own_keys = vec![IdentityKey::new(device.identity_key.public_key)];
+        let mut peer_keys = Vec::with_capacity(peer_devices.len());
+        for (devices, keys, local) in [
+            (&own_devices, &mut own_keys, true),
+            (&peer_devices, &mut peer_keys, false),
+        ] {
+            for jid in devices {
+                if is_own_device(jid) {
+                    if local {
+                        continue;
+                    }
+                    keys.push(IdentityKey::new(device.identity_key.public_key));
+                } else {
+                    let resolved = self.client.resolve_encryption_jid(jid).await;
+                    let address = resolved.to_protocol_address();
+                    let bytes = self
+                        .client
+                        .signal_cache
+                        .get_identity(&address, device.backend.as_ref())
+                        .await?
+                        .ok_or_else(|| {
+                            SignalError::InvalidInput("a device identity key is unavailable".into())
+                        })?;
+                    keys.push(IdentityKey::new(
+                        PublicKey::from_djb_public_key_bytes(&bytes)
+                            .map_err(SignalProtocolError::from)?,
+                    ));
+                }
+            }
+        }
+        if peer_address.is_same_user_as(&own_address) {
+            peer_keys.clone_from(&own_keys);
+        }
+        let local_identifier;
+        let remote_identifier;
+        match version {
+            SecurityCodeVersion::V3 => {
+                local_identifier = device.pn.clone().ok_or_else(|| {
+                    SignalError::InvalidInput("own phone number is unavailable".into())
+                })?;
+                remote_identifier = if peer.is_pn() {
+                    peer.clone()
+                } else {
+                    let phone = self
+                        .client
+                        .lid_pn_cache
+                        .get_phone_number(&peer.user)
+                        .await
+                        .ok_or_else(|| {
+                            SignalError::InvalidInput("peer phone number is unavailable".into())
+                        })?;
+                    if self
+                        .client
+                        .lid_pn_cache
+                        .get_current_lid(&phone)
+                        .await
+                        .as_deref()
+                        != Some(peer.user.as_str())
+                    {
+                        return Err(SignalError::InvalidInput(
+                            "peer phone-number mapping is no longer current".into(),
+                        ));
+                    }
+                    Jid::pn(phone)
+                };
+            }
+            SecurityCodeVersion::V4 => {
+                local_identifier = device
+                    .lid
+                    .clone()
+                    .ok_or_else(|| SignalError::InvalidInput("own LID is unavailable".into()))?;
+                remote_identifier = peer_address.clone();
+                if !remote_identifier.is_lid() {
+                    return Err(SignalError::InvalidInput("peer LID is unavailable".into()));
+                }
+            }
+        }
+        let code = wacore::runtime::blocking(&*self.client.runtime, move || {
+            numeric_security_code(
+                version,
+                &local_identifier,
+                &own_keys,
+                &remote_identifier,
+                &peer_keys,
+            )
+        })
+        .await
+        .map_err(|e| SignalError::InvalidInput(e.to_string()))?;
+        let current_device = self.client.persistence_manager.get_device_snapshot();
+        if current_device.identity_key.public_key != device.identity_key.public_key
+            || current_device.pn != device.pn
+            || current_device.lid != device.lid
+            || self.client.device_topology.current() != topology
+            || !self
+                .client
+                .signal_cache
+                .identity_continuity
+                .unchanged_for(continuity, [&own_address.user[..], &peer_address.user[..]])
+        {
+            return Err(SignalError::InvalidInput(
+                "identities or devices changed during verification; retry".into(),
+            ));
+        }
+        Ok(code)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,6 +945,38 @@ mod tests {
             )))
             .await;
         (client, backend)
+    }
+
+    #[tokio::test]
+    async fn security_code_rejects_non_contact_and_offline_partial_state() {
+        let (client, _) = memory_client().await;
+        let invalid: Jid = "12345@g.us".parse().unwrap();
+        assert!(matches!(
+            client
+                .signal()
+                .security_code(&invalid, SecurityCodeVersion::V3)
+                .await,
+            Err(SignalError::InvalidInput(_))
+        ));
+        let peer = Jid::pn("15551234567");
+        client
+            .update_device_list(DeviceListRecord {
+                user: peer.user.clone().into(),
+                devices: [DeviceInfo::new(0, None)].into(),
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            client
+                .signal()
+                .security_code(&peer, SecurityCodeVersion::V3)
+                .await
+                .is_err(),
+            "a cached primary-only record must not substitute for a failed authoritative refresh"
+        );
     }
 
     fn peer_prekey_bundle(registration_id: u32, device_id: u32) -> PreKeyBundle {
