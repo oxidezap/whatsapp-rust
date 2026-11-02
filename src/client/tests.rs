@@ -7357,6 +7357,71 @@ mod ensure_sessions_concurrency {
         }
     }
 
+    #[tokio::test]
+    async fn cold_companion_only_fetch_authenticates_trimmed_certificate() {
+        use buffa::Message;
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let primary = Jid::pn("12025550128");
+        let companion = primary.with_device(2);
+        let running = client.clone();
+        let requested = companion.clone();
+        let task = tokio::spawn(async move { running.fetch_pre_keys(&[requested], None).await });
+        let request = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let id = request
+            .get()
+            .attrs()
+            .optional_string("id")
+            .unwrap()
+            .into_owned();
+        let requested: Vec<_> = request
+            .get()
+            .get_optional_child("key")
+            .unwrap()
+            .children()
+            .unwrap()
+            .iter()
+            .map(|user| user.attrs().optional_jid("jid").unwrap())
+            .collect();
+        assert!(requested.contains(&primary));
+        assert!(requested.contains(&companion));
+        let keys = PeerKeys::generate();
+        let mut companion_user = keys.bundle_response(&companion, &id, 1).children().unwrap()[0]
+            .children()
+            .unwrap()[0]
+            .clone();
+        let mut certificate =
+            waproto::codec::adv_signed_device_identity_decode(&keys.certificate()).unwrap();
+        certificate.account_signature_key = None;
+        if let Some(wacore_binary::NodeContent::Nodes(children)) = &mut companion_user.content {
+            children
+                .iter_mut()
+                .find(|node| node.tag == "device-identity")
+                .unwrap()
+                .content = Some(wacore_binary::NodeContent::Bytes(
+                certificate.encode_to_vec(),
+            ));
+        }
+        let primary_user = keys.bundle_response(&primary, &id, 2).children().unwrap()[0]
+            .children()
+            .unwrap()[0]
+            .clone();
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("id", id.as_str())
+            .children([NodeBuilder::new("list")
+                .children([companion_user, primary_user])
+                .build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &id, &response).await;
+        let result = task.await.unwrap().unwrap();
+        assert!(result.bundles.contains_key(&companion));
+        assert!(
+            !result.bundles.contains_key(&primary),
+            "bootstrap keys must not expand the requested outcome"
+        );
+        client.signal_shutdown_sync();
+    }
+
     /// Runs `CONCURRENT_CALLS` ensures for `peer` while answering every prekey
     /// IQ the client writes, and reports how many it had to answer.
     ///

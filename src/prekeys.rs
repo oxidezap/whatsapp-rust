@@ -148,9 +148,17 @@ impl Client {
         jids: &[Jid],
         reason: Option<PreKeyFetchReason>,
     ) -> Result<wacore::prekeys::PreKeyFetchOutcome, anyhow::Error> {
+        let account_identities = self.collect_account_identities(jids).await?;
+        let mut requested = jids.to_vec();
+        for jid in jids.iter().filter(|jid| jid.device != 0) {
+            let primary = jid.with_device(0);
+            if !account_identities.contains_key(jid) && !requested.contains(&primary) {
+                requested.push(primary);
+            }
+        }
         let spec = match reason {
-            Some(r) => PreKeyFetchSpec::with_reason(jids.to_vec(), r),
-            None => PreKeyFetchSpec::new(jids.to_vec()),
+            Some(r) => PreKeyFetchSpec::with_reason(requested, r),
+            None => PreKeyFetchSpec::new(requested),
         };
 
         // Pre-load each companion's account (device 0) identity as the ADV
@@ -159,9 +167,13 @@ impl Client {
         // primary identity the client already stores. Without it we'd reject the
         // bundle and the device would stop receiving (WA Web uses the same stored
         // identity as the fallback in validateADVwithIdentityKey).
-        let spec = spec.with_account_identities(self.collect_account_identities(jids).await?);
+        let spec = spec.with_account_identities(account_identities);
 
-        let outcome = self.execute(spec).await?;
+        let mut outcome = self.execute(spec).await?;
+        // Extra primaries only authenticate trimmed companion certificates.
+        // Keep the public fetch outcome scoped to the caller's requested devices.
+        outcome.bundles.retain(|jid, _| jids.contains(jid));
+        outcome.rejected.retain(|entry| jids.contains(&entry.jid));
 
         for jid in outcome.bundles.keys() {
             log::debug!("Successfully parsed pre-key bundle for {}", jid.observe());
@@ -210,6 +222,15 @@ impl Client {
     /// First contact uses the primary's signed prekey, just as a direct primary
     /// session does. Device-list blobs never rotate an already stored identity.
     pub(crate) async fn ensure_adv_account_identity(&self, jid: &Jid) -> anyhow::Result<[u8; 32]> {
+        self.ensure_adv_account_identity_with_permit(jid, false)
+            .await
+    }
+
+    pub(crate) async fn ensure_adv_account_identity_with_permit(
+        &self,
+        jid: &Jid,
+        processing_permit_held: bool,
+    ) -> anyhow::Result<[u8; 32]> {
         use wacore::libsignal::protocol::IdentityKeyStore;
         use wacore::types::jid::JidExt;
         let primary = jid.with_device(0);
@@ -245,13 +266,32 @@ impl Client {
             .identity_store
             .save_identity(&address, &identity)
             .await?;
-        self.flush_signal_cache().await?;
+        // Never wait for the processing permit while holding a primary session
+        // lock: a message holding that permit may need the same primary.
+        drop(_guard);
+        if processing_permit_held {
+            if self.inbound_commit_batch.is_active() {
+                let client = self
+                    .self_weak
+                    .get()
+                    .and_then(|weak| weak.upgrade())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("client unavailable during ADV trust persistence")
+                    })?;
+                if !client.commit_inbound_batch_holding_permit().await {
+                    anyhow::bail!("ADV trust persistence deferred: inbound batch commit failed");
+                }
+            }
+            self.flush_signal_cache().await?;
+        } else {
+            self.flush_signal_cache_batch_safe().await?;
+        }
         Ok(key)
     }
 
     /// Load, for each companion JID, its account (device 0) identity key from the
     /// store, keyed by the normalized companion JID so the prekey parser can use
-    /// it as the ADV account anchor. Missing primaries are authenticated first.
+    /// it as the ADV account anchor. Missing primaries join the fetch request.
     async fn collect_account_identities(
         &self,
         jids: &[Jid],
@@ -1054,13 +1094,46 @@ mod tests {
         use wacore::protocol::ProtocolNode;
         use wacore::types::jid::JidExt;
         use wacore_binary::{Jid, builder::NodeBuilder};
-        for valid in [false, true] {
+        for (valid, draining, permit_held, fail_commit) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (true, true, false, false),
+            (true, true, true, false),
+            (true, true, false, true),
+            (true, true, true, true),
+        ] {
             let (client, transport) = crate::test_utils::create_iq_test_client().await;
+            if draining {
+                client.inbound_commit_batch.reset();
+                client.swap_message_semaphore(1);
+                let mut message = waproto::whatsapp::Message::default();
+                message.conversation = Some("pending before trust bootstrap".into());
+                let pending = wacore::types::events::InboundMessage::builder()
+                    .message(std::sync::Arc::new(message))
+                    .info(std::sync::Arc::new(crate::types::message::MessageInfo {
+                        id: "BEFORE_ADV".into(),
+                        source: crate::types::message::MessageSource {
+                            chat: "12025550125@s.whatsapp.net".parse().unwrap(),
+                            sender: "12025550125@s.whatsapp.net".parse().unwrap(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }))
+                    .build();
+                client.commit_or_batch_inbound(pending, false).await;
+                client
+                    .inbound_commit_batch
+                    .fail_commits
+                    .store(fail_commit, std::sync::atomic::Ordering::Release);
+            }
             let primary = Jid::pn("12025550124");
             let companion = primary.with_device(7);
             let running = client.clone();
-            let task =
-                tokio::spawn(async move { running.ensure_adv_account_identity(&companion).await });
+            let task = tokio::spawn(async move {
+                running
+                    .ensure_adv_account_identity_with_permit(&companion, permit_held)
+                    .await
+            });
             let request = crate::test_utils::decode_sent_iq(&transport, 0).await;
             let id = request
                 .get()
@@ -1110,13 +1183,13 @@ mod tests {
                 .build();
             crate::test_utils::answer_iq(&client, &id, &response).await;
             let result = task.await.unwrap();
-            assert_eq!(result.is_ok(), valid);
+            assert_eq!(result.is_ok(), valid && !fail_commit);
             let backend = client.persistence_manager.backend();
             let persisted = backend
                 .load_identity(&primary.to_protocol_address().to_string())
                 .await
                 .unwrap();
-            if valid {
+            if valid && !fail_commit {
                 let key: [u8; 32] = account.public_key.public_key_bytes().try_into().unwrap();
                 assert_eq!(result.unwrap(), key);
                 assert_eq!(persisted, Some(key));
@@ -1135,7 +1208,7 @@ mod tests {
             } else {
                 assert!(
                     persisted.is_none(),
-                    "invalid signatures must not establish trust"
+                    "invalid signatures or failed inbound commits must not persist trust"
                 );
             }
             client.signal_shutdown_sync();
