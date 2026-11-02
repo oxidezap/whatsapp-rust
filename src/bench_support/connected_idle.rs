@@ -113,6 +113,8 @@ impl Drop for BackendFixture {
 pub const IDLE: Duration = Duration::from_secs(61);
 pub const LANES: usize = 32;
 pub const MESSAGES: usize = 256;
+/// One offline publication, then one live publication per remaining message.
+pub const COMMIT_BATCHES: usize = 1 + MESSAGES - LANES;
 pub const TEXT_BYTES: usize = 4096;
 pub const HISTORY_MESSAGES: usize = 256;
 /// Fixture-only sender-key/signature randomness, never for a shipping client.
@@ -124,6 +126,7 @@ struct Counts {
     messages: AtomicUsize,
     history: AtomicUsize,
     committed: AtomicUsize,
+    commit_batches: AtomicUsize,
 }
 
 impl EventHandler for Counts {
@@ -148,6 +151,7 @@ struct Commit(Arc<Counts>);
 impl InboundDurabilityHook for Commit {
     async fn on_messages(&self, _: Arc<Client>, batch: &[InboundMessage]) -> Result<()> {
         self.0.committed.fetch_add(batch.len(), Ordering::Relaxed);
+        self.0.commit_batches.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -167,6 +171,7 @@ pub struct Checkpoint {
     pub running_workers: usize,
     pub messages: usize,
     pub committed: usize,
+    pub commit_batches: usize,
     pub history: usize,
 }
 
@@ -389,7 +394,8 @@ impl Session {
             self.client.bench_startup.pending_before_offline() == 0,
             "pre-offline startup entered activity measurement"
         );
-        for node in activity.stanzas {
+        let mut stanzas = activity.stanzas.into_iter();
+        for node in stanzas.by_ref().take(LANES) {
             self.wire.reply(node).await?;
         }
         // History input is intentionally at the task boundary, as in history_sync's
@@ -402,7 +408,28 @@ impl Session {
             .process_history_sync_task_tracked("IDLE-HISTORY".into(), history, &mut tracker)
             .await;
         drop(tracker);
-        self.finish_offline(MESSAGES).await?;
+        // Wire delivery only enqueues work on the chat lanes. Do not let the
+        // offline marker overtake decryption of the first wave. Only send the
+        // remaining waves after the transition, fixing both publication modes.
+        self.wait_until(|| {
+            self.client.inbound_commit_batch.pending_stats().0
+                + self.counts.committed.load(Ordering::Relaxed)
+                == LANES
+        })
+        .await
+        .context("activity did not reach the offline commit boundary")?;
+        ensure!(
+            self.counts.committed.load(Ordering::Relaxed) == 0,
+            "activity timed out into an early offline commit"
+        );
+        self.finish_offline(LANES).await?;
+        ensure!(
+            self.counts.commit_batches.load(Ordering::Relaxed) == 1,
+            "activity must publish one complete offline batch"
+        );
+        for node in stanzas {
+            self.wire.reply(node).await?;
+        }
         self.wait_until(|| self.counts.messages.load(Ordering::Relaxed) == MESSAGES)
             .await?;
         ensure!(
@@ -420,6 +447,10 @@ impl Session {
             .await
             .context("activity receipts did not finish pending-row cleanup")?;
         self.settle().await?;
+        ensure!(
+            self.counts.commit_batches.load(Ordering::Relaxed) == COMMIT_BATCHES,
+            "activity did not preserve its offline/live publication boundary"
+        );
         Ok(())
     }
 
@@ -489,6 +520,7 @@ impl Session {
             running_workers,
             messages: self.counts.messages.load(Ordering::Relaxed),
             committed: self.counts.committed.load(Ordering::Relaxed),
+            commit_batches: self.counts.commit_batches.load(Ordering::Relaxed),
             history: self.counts.history.load(Ordering::Relaxed),
         }
     }
@@ -555,6 +587,25 @@ impl Session {
     /// `None` means a commit still owns the buffer.
     pub fn drain_encode_capacity(&self) -> Option<usize> {
         self.client.inbound_commit_batch.encode_arena_capacity()
+    }
+
+    /// Finish a normal keepalive exchange with an identical final wire frame.
+    /// The reader retains its last input buffer while waiting for the next frame;
+    /// random request-ID widths otherwise change requested heap by a few bytes.
+    /// This does not clear library state or replace the periodic keepalive check.
+    pub async fn retention_barrier(&self) -> Result<()> {
+        self.client
+            .send_iq_node(
+                NodeBuilder::new("iq")
+                    .attr("id", "RETENTION-CHECKPOINT")
+                    .attr("type", "get")
+                    .attr("to", "s.whatsapp.net")
+                    .attr("xmlns", "w:p")
+                    .build(),
+                Some(DEADLINE),
+            )
+            .await?;
+        self.settle().await
     }
 
     pub fn pongs(&self) -> usize {

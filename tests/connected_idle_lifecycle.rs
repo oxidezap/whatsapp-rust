@@ -4,7 +4,9 @@
 mod fixture_util;
 
 use anyhow::{Result, ensure};
-use whatsapp_rust::bench_support::connected_idle::{BackendFixture, LANES, MESSAGES, Session};
+use whatsapp_rust::bench_support::connected_idle::{
+    BackendFixture, COMMIT_BATCHES, LANES, MESSAGES, Session,
+};
 
 #[tokio::test(start_paused = true)]
 async fn connected_activity_and_idle_lifecycle() -> Result<()> {
@@ -17,6 +19,10 @@ async fn connected_activity_and_idle_lifecycle() -> Result<()> {
         "completed drain retained its encode buffer"
     );
     let busy = session.checkpoint().await;
+    ensure!(
+        busy.commit_batches == COMMIT_BATCHES,
+        "activity split across commits: {busy:?}"
+    );
     ensure!(
         busy.connected && busy.open_lanes == LANES,
         "activity did not create live workers: {busy:?}"
@@ -51,6 +57,8 @@ async fn sqlite_connected_activity_and_virtual_idle() -> Result<()> {
         session.checkpoint().await.open_lanes == LANES,
         "SQLite activity missed workers"
     );
+    ensure!(session.checkpoint().await.commit_batches == COMMIT_BATCHES);
+    session.retention_barrier().await?;
     tokio::time::pause();
     session.idle().await?;
     tokio::time::resume();
