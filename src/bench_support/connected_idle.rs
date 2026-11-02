@@ -593,7 +593,32 @@ impl Session {
     /// The reader retains its last input buffer while waiting for the next frame;
     /// random request-ID widths otherwise change requested heap by a few bytes.
     /// This does not clear library state or replace the periodic keepalive check.
-    pub async fn retention_barrier(&self) -> Result<()> {
+    pub async fn retention_barrier(&self) -> Result<usize> {
+        // feed_received_data starts a fresh receive burst after a ten-second
+        // gap. A fixed ID alone is insufficient: appending it to an earlier
+        // burst can grow the decoder's accumulator by one CHUNK_SIZE.
+        let quiet = Duration::from_secs(11);
+        tokio::time::timeout(DEADLINE, async {
+            loop {
+                let last = self
+                    .client
+                    .stats
+                    .last_data_received()
+                    .context("retention checkpoint has no received frame")?;
+                let elapsed = self
+                    .client
+                    .runtime
+                    .monotonic_time()
+                    .saturating_duration_since(last);
+                if elapsed >= quiet {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                self.client.runtime.sleep(quiet - elapsed).await;
+            }
+        })
+        .await
+        .context("retention checkpoint did not reach a receive idle boundary")??;
+        let pongs = self.pongs();
         self.client
             .send_iq_node(
                 NodeBuilder::new("iq")
@@ -605,7 +630,12 @@ impl Session {
                 Some(DEADLINE),
             )
             .await?;
-        self.settle().await
+        self.settle().await?;
+        ensure!(
+            self.pongs() == pongs + 1,
+            "another keepalive overlapped the retention checkpoint"
+        );
+        Ok(pongs + 1)
     }
 
     pub fn pongs(&self) -> usize {

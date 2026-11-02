@@ -105,11 +105,16 @@ The native probe fixes its blocking executor to one worker with a five-minute
 keepalive, exceeding the measured idle period. This holds executor metadata
 constant; it does not measure storage throughput. Both revisions use these
 same settings and the same fixture source, included in the harness hash.
-After verifying a periodic production keepalive during the real 61-second
-idle, each retained-state checkpoint completes a normal ping with a fixed ID.
-The reader's last wire buffer is therefore the same input in each sample,
-rather than depending on the width of a randomized request ID. This does not
-clear caches, close lanes, drop claims or bypass pending-row cleanup.
+After verifying a periodic production keepalive during at least 61 seconds of
+real idle, the probe waits for an 11-second receive gap and completes one normal
+ping with a fixed ID. The production decoder uses a ten-second gap to start a
+fresh receive burst; without this fence, a probe immediately after a random
+periodic pong could instead grow the previous accumulator by a 1 KiB chunk.
+The reader therefore retains the same final input and burst state in each
+sample. No second probe is sent after maintenance; an overlapping pong rejects
+the sample. The `after_61s` label means at least 61 seconds, with actual elapsed
+time recorded per checkpoint. This does not clear caches, close lanes, drop
+claims or bypass pending-row cleanup.
 
 Build first, then invoke the executable (not Cargo/nextest/Divan) from the repo
 root. The small parent launches **one fresh child process per backend, mode and

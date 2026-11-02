@@ -152,10 +152,13 @@ fn child(backend: &str, mode: &str) -> Result<Run> {
             session.pongs() > 0,
             "production keepalive never reached the server during real idle"
         );
-        session.retention_barrier().await?;
+        let checkpoint_pongs = session.retention_barrier().await?;
         samples.push(sample("after_61s", start, Some(&session)).await?);
         session.maintenance().await?;
-        session.retention_barrier().await?;
+        ensure!(
+            session.pongs() == checkpoint_pongs,
+            "keepalive overlapped the maintenance checkpoint"
+        );
         samples.push(sample("after_maintenance", start, Some(&session)).await?);
         let idle = samples[3].lifecycle.context("idle lifecycle missing")?;
         ensure!(
