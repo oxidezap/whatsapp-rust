@@ -133,8 +133,8 @@ serde-big-array = "0.5"
 serde_json = { version = "1.0", default-features = false }
 sha1 = { version = "0.11.0", default-features = false }
 sha2 = { version = "0.11.0", default-features = false }
-wasm-encoder = "0.262"
-wasmparser = { version = "0.262", default-features = false, features = ["std", "validate", "features"] }
+wasm-encoder = "0.263"
+wasmparser = { version = "0.263", default-features = false, features = ["std", "validate", "features"] }
 wasmtime = { version = "48.0.8", default-features = false, features = [
     "runtime",
     "anyhow",

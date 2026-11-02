@@ -26,7 +26,7 @@ hex = { workspace = true }
 log = { workspace = true }
 portable-atomic = { workspace = true }
 rand = { workspace = true }
-ringbuf = "0.5"
+ringbuf = "0.6"
 tokio = { workspace = true, features = ["full"] }
 wacore = { path = "../../wacore", features = ["voip"] }
 whatsapp-rust = { path = "../..", features = [
