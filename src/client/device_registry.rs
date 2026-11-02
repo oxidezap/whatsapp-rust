@@ -722,7 +722,7 @@ impl Client {
                 Err(e) => {
                     warn!(
                         "Failed to check device registry for {}: {e}",
-                        wacore_binary::jid::observe_str(key)
+                        wacore_binary::jid::ObservedJid::from(key)
                     );
                 }
             }
@@ -797,7 +797,7 @@ impl Client {
             if let Err(e) = backend.delete_devices(&original_user).await {
                 warn!(
                     "Failed to delete stale device row under {} after canonical flip: {e}",
-                    wacore_binary::jid::observe_str(&original_user)
+                    wacore_binary::jid::ObservedJid::from(&original_user)
                 );
             }
             self.device_registry_cache
@@ -805,8 +805,8 @@ impl Client {
                 .await;
             debug!(
                 "Device registry: stored under LID {} (resolved from {})",
-                wacore_binary::jid::observe_str(&canonical_key),
-                wacore_binary::jid::observe_str(&original_user)
+                wacore_binary::jid::ObservedJid::from(&canonical_key),
+                wacore_binary::jid::ObservedJid::from(&original_user)
             );
         }
 
@@ -899,7 +899,7 @@ impl Client {
             if let Err(e) = backend.delete_devices(&original_user).await {
                 warn!(
                     "Failed to delete stale device row under {} after canonical flip: {e}",
-                    wacore_binary::jid::observe_str(&original_user)
+                    wacore_binary::jid::ObservedJid::from(&original_user)
                 );
             }
             self.device_registry_cache
@@ -964,7 +964,7 @@ impl Client {
             if let Err(e) = self.persistence_manager.backend().delete_devices(key).await {
                 warn!(
                     "Failed to delete device registry from DB for {}: {e}",
-                    wacore_binary::jid::observe_str(key)
+                    wacore_binary::jid::ObservedJid::from(key)
                 );
             }
             // Invalidate again after the delete: a concurrent reader that read
@@ -976,7 +976,7 @@ impl Client {
 
         debug!(
             "Invalidated device cache for user: {}",
-            wacore_binary::jid::observe_str(user)
+            wacore_binary::jid::ObservedJid::from(user)
         );
     }
 
@@ -1037,7 +1037,7 @@ impl Client {
                     {
                         warn!(
                             "patch_device_add: sender-key cleanup failed for {}: {error}",
-                            wacore_binary::jid::observe_str(user)
+                            wacore_binary::jid::ObservedJid::from(user)
                         );
                         return;
                     }
@@ -1051,7 +1051,7 @@ impl Client {
                 {
                     info!(
                         "raw_id mismatch for user {}: stored={stored_raw_id}, received={}. Resetting companion devices.",
-                        wacore_binary::jid::observe_str(user),
+                        wacore_binary::jid::ObservedJid::from(user),
                         decoded.raw_id
                     );
                     self.clear_device_record(user, device.jid.server.as_str(), &record)
@@ -1078,7 +1078,7 @@ impl Client {
             } else {
                 warn!(
                     "patch_device_add: failed to decode key-index-list for user {}",
-                    wacore_binary::jid::observe_str(user)
+                    wacore_binary::jid::ObservedJid::from(user)
                 );
                 self.append_or_refresh_device(&mut record, device_id, device.key_index, is_hosted);
             }
@@ -1175,7 +1175,7 @@ impl Client {
             .collect();
         info!(
             "Clearing device record for user {}: removing {} non-primary device(s) due to raw_id change",
-            wacore_binary::jid::observe_str(user),
+            wacore_binary::jid::ObservedJid::from(user),
             non_primary_ids.len()
         );
 
@@ -1230,7 +1230,7 @@ impl Client {
                     warn!(
                         "patch_device_remove: sender-key cleanup failed for {user}:{device_id}: {e} \
                          — aborting registry update",
-                        user = wacore_binary::jid::observe_str(user)
+                        user = wacore_binary::jid::ObservedJid::from(user)
                     );
                     return;
                 }
@@ -1363,7 +1363,7 @@ impl Client {
                 Err(e) => {
                     warn!(
                         "load_device_record: DB lookup failed for {}: {e}",
-                        wacore_binary::jid::observe_str(key)
+                        wacore_binary::jid::ObservedJid::from(key)
                     );
                 }
             }
@@ -1556,7 +1556,7 @@ impl Client {
                 Err(e) => {
                     warn!(
                         "get_devices_from_registry: DB lookup failed for {}: {e}",
-                        wacore_binary::jid::observe_str(key)
+                        wacore_binary::jid::ObservedJid::from(key)
                     );
                 }
             }
@@ -1599,8 +1599,8 @@ impl Client {
             Ok(Some(mut record)) => {
                 info!(
                     "Migrating device registry entry from PN {} to LID {} ({} devices)",
-                    wacore_binary::jid::observe_str(pn),
-                    wacore_binary::jid::observe_str(lid),
+                    wacore_binary::jid::ObservedJid::from(pn),
+                    wacore_binary::jid::ObservedJid::from(lid),
                     record.devices.len()
                 );
 

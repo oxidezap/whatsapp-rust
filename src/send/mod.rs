@@ -2062,7 +2062,7 @@ impl Client {
 
     /// SKDM target resolution for the status path, whose `GroupRoutingInfo` is built
     /// fresh per send (no stable identity to memoize against).
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.resolve_skdm_targets", level = "debug", skip_all, fields(group = %wacore_binary::jid::observe_str(group_jid))))]
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.resolve_skdm_targets", level = "debug", skip_all, fields(group = %wacore_binary::jid::ObservedJid::from(group_jid))))]
     async fn resolve_status_skdm_targets(
         &self,
         group_jid: &str,

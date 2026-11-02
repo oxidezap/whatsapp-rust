@@ -77,7 +77,7 @@ pub async fn group_encrypt<S: SenderKeyStore + ?Sized, R: Rng + CryptoRng>(
         .ok_or_else(|| {
             SignalProtocolError::NoSenderKeyState(format!(
                 "no sender key record for group {}",
-                wacore_binary::jid::observe_str(sender_key_name.group_id())
+                wacore_binary::jid::ObservedJid::from(sender_key_name.group_id())
             ))
         })?;
 
@@ -229,7 +229,7 @@ pub async fn group_decrypt_shared(
         .ok_or_else(|| {
             SignalProtocolError::NoSenderKeyState(format!(
                 "no sender key record for group {}",
-                wacore_binary::jid::observe_str(sender_key_name.group_id())
+                wacore_binary::jid::ObservedJid::from(sender_key_name.group_id())
             ))
         })?;
 
@@ -289,8 +289,8 @@ pub async fn group_decrypt_shared(
             DecryptionErrorCrypto::BadKeyOrIv => {
                 log::error!(
                     "incoming sender key state corrupt for group {} sender {} (chain ID {chain_id})",
-                    wacore_binary::jid::observe_str(sender_key_name.group_id()),
-                    wacore_binary::jid::observe_str(sender_key_name.sender_id())
+                    wacore_binary::jid::ObservedJid::from(sender_key_name.group_id()),
+                    wacore_binary::jid::ObservedJid::from(sender_key_name.sender_id())
                 );
                 return Err(SignalProtocolError::InvalidSenderKeySession);
             }
@@ -320,8 +320,8 @@ pub async fn process_sender_key_distribution_message(
 ) -> Result<()> {
     log::debug!(
         "Processing SenderKey distribution for group {} from sender {} with chain ID {}",
-        wacore_binary::jid::observe_str(sender_key_name.group_id()),
-        wacore_binary::jid::observe_str(sender_key_name.sender_id()),
+        wacore_binary::jid::ObservedJid::from(sender_key_name.group_id()),
+        wacore_binary::jid::ObservedJid::from(sender_key_name.sender_id()),
         skdm.chain_id()
     );
 

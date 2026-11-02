@@ -2217,8 +2217,8 @@ impl Client {
     fn warn_ack_waiter_dropped(rejected: &Arc<wacore_binary::OwnedNodeRef>) {
         warn!(
             target: "Client/Ack",
-            "Failed to send ACK response to waiter for ID {:?}. Receiver was likely dropped.",
-            rejected.get().get_attr("id")
+            "Failed to send ACK response to waiter: {}. Receiver was likely dropped.",
+            StanzaSummary::from(rejected.get())
         );
     }
 
@@ -2236,32 +2236,31 @@ impl Client {
         // resolves Ok to the caller, so without this the failure is invisible.
         if let Some(error_code) = &ack_error {
             let code = error_code.as_str();
-            let id = ack_id.as_ref().map(|v| v.as_str());
             match code.as_ref() {
                 "463" => {
                     warn!(
                         target: "Client/Ack",
-                        "Received 463 (MissingTcToken) nack for msg {:?}. \
+                        "Received 463 (MissingTcToken) nack: {}. \
                          The recipient requires a valid tctoken or cstoken. \
                          This may indicate a reachout timelock on the account.",
-                        id
+                        StanzaSummary::from(node)
                     );
                 }
                 "479" => {
                     warn!(
                         target: "Client/Ack",
-                        "Received 479 (SmaxInvalid) nack for msg {:?}. \
+                        "Received 479 (SmaxInvalid) nack: {}. \
                          A stanza field has an incorrect format (e.g. wrong JID format or content type).",
-                        id
+                        StanzaSummary::from(node)
                     );
                 }
-                other => {
+                _ => {
                     warn!(
                         target: "Client/Ack",
-                        "Received {other} nack for msg {:?}; the message was likely \
+                        "Received nack: {}; the message was likely \
                          not delivered (e.g. 400 = malformed stanza, 404 = recipient \
                          not found, 503 = service unavailable).",
-                        id
+                        StanzaSummary::from(node)
                     );
                 }
             }
@@ -2333,7 +2332,7 @@ impl Client {
             self.record_protocol_terminal_reason(ProtocolTerminalReason::Conflict(kind));
             info!(
                 "Got stream error indicating client was removed or replaced (conflict={}). Logging out.",
-                conflict_type
+                wacore_binary::diagnostics::ProtocolText::new(&conflict_type)
             );
             self.expect_session_disconnect();
             self.stop_auto_reconnect_permanently();
@@ -2460,11 +2459,12 @@ impl Client {
                         );
                         self.invalidate_session_authentication();
                         should_disconnect = true;
-                    } else if node.get_optional_child("ack").is_some() {
+                    } else if let Some(ack) = node.get_optional_child("ack") {
                         warn!(
-                            "Stream error carrying <ack>: the server is \
+                            "Stream error carrying {}: the server is \
                              still owed a transport ack for that stanza and recycles the stream \
-                             until it arrives; reconnect follows on stream end"
+                             until it arrives; reconnect follows on stream end",
+                            StanzaSummary::from(ack)
                         );
                     } else {
                         warn!("Unknown stream error: {}", StanzaSummary::from(node));

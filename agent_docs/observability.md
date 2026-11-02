@@ -51,8 +51,20 @@ claim about current memory or performance.
 
 Logs must never include linking codes, QR payloads or cryptographic key bytes,
 including public identity/ratchet keys and short fingerprints. Use `Jid::observe()`
-for JIDs and `observe_str()` for string identifiers; `tracing-pii` deliberately
+for JIDs and borrowed `ObservedJid::from(&text)` for string identifiers; `tracing-pii` deliberately
 opts into raw identifiers, never secrets. Low-level Signal address diagnostics
 use process-keyed tokens. Stanza logs use `StanzaSummary` at every level because
-unrecognized attributes and nested content can carry secrets. Full payloads
+unrecognized attributes and nested content can carry secrets. The common borrowed
+`wacore_binary::diagnostics::NodeSummary` preserves known protocol tags, numeric
+codes, known reason/status atoms and bounded child/body shape; opaque stanza IDs
+get per-process correlation tokens. Unknown free-form text is represented only by
+length, never a content fingerprint. It visits at most 32 nodes, three levels and
+16 attributes per node, and never converts or clones a node. Safe views borrow
+without hashing or allocating at construction; formatting performs the work only
+when the backend consumes it. Global log filtering skips argument evaluation,
+while a backend target filter may still construct the borrowed view.
+
+IQ/disconnect error formatting follows the same policy. Backend/source errors
+with arbitrary application text use known typed classifications and I/O kind/OS
+code; typed source data remains accessible for programmatic handling. Full payloads
 remain available through the existing application events and return values.

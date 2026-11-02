@@ -88,9 +88,9 @@ pub enum IqError {
     Timeout,
     #[error("client is not connected")]
     NotConnected,
-    #[error("received disconnect node during IQ wait (payload omitted)")]
+    #[error("received disconnect node during IQ wait: {}", wacore_binary::diagnostics::NodeSummary::from(.0.as_ref()))]
     Disconnected(Box<Node>),
-    #[error("received a server error response: code={code}, text='{text}'")]
+    #[error("received a server error response: code={code}, text={}, class={:?}, backoff={backoff:?}", wacore_binary::diagnostics::ProtocolText::new(.text), .error_type.as_deref().map(wacore_binary::diagnostics::ProtocolText::new))]
     ServerError {
         code: u16,
         text: String,
@@ -100,7 +100,7 @@ pub enum IqError {
         /// WA Web honors this (`setProtocolBackoffMs`) before retrying throttled IQs.
         backoff: Option<u32>,
     },
-    #[error("received unexpected IQ response type: {got:?}")]
+    #[error("received unexpected IQ response type: {:?}", .got.as_deref().map(wacore_binary::diagnostics::ProtocolText::new))]
     UnexpectedResponseType { got: Option<String> },
     #[error("internal channel closed unexpectedly")]
     InternalChannelClosed,
@@ -114,13 +114,19 @@ impl std::fmt::Debug for IqError {
             Self::Timeout => f.write_str("Timeout"),
             Self::NotConnected => f.write_str("NotConnected"),
             Self::InternalChannelClosed => f.write_str("InternalChannelClosed"),
-            Self::Disconnected(_) => f
+            Self::Disconnected(node) => f
                 .debug_tuple("Disconnected")
-                .field(&"<payload omitted>")
+                .field(&wacore_binary::diagnostics::NodeSummary::from(
+                    node.as_ref(),
+                ))
                 .finish(),
             Self::UnexpectedResponseType { got } => f
                 .debug_struct("UnexpectedResponseType")
-                .field("got", got)
+                .field(
+                    "got",
+                    &got.as_deref()
+                        .map(wacore_binary::diagnostics::ProtocolText::new),
+                )
                 .finish(),
             Self::ServerError {
                 code,
@@ -130,8 +136,13 @@ impl std::fmt::Debug for IqError {
             } => f
                 .debug_struct("ServerError")
                 .field("code", code)
-                .field("text", text)
-                .field("error_type", error_type)
+                .field("text", &wacore_binary::diagnostics::ProtocolText::new(text))
+                .field(
+                    "error_type",
+                    &error_type
+                        .as_deref()
+                        .map(wacore_binary::diagnostics::ProtocolText::new),
+                )
                 .field("backoff", backoff)
                 .finish(),
         }
@@ -172,8 +183,8 @@ impl IqError {
 /// originating from the high-level crate's own `IqError`).
 ///
 /// To check a specific code: `err.downcast_ref::<ServerErrorCode>().is_some_and(|e| e.code == 406)`
-#[derive(Debug, Clone, Error)]
-#[error("server error: code={code}, text='{text}'")]
+#[derive(Clone, Error)]
+#[error("server error: code={code}, text={}, class={:?}, backoff={backoff:?}", wacore_binary::diagnostics::ProtocolText::new(.text), .error_type.as_deref().map(wacore_binary::diagnostics::ProtocolText::new))]
 pub struct ServerErrorCode {
     pub code: u16,
     pub text: String,
@@ -181,6 +192,25 @@ pub struct ServerErrorCode {
     pub error_type: Option<String>,
     /// Server-directed retry delay in seconds from the `backoff` attr; `None` if absent.
     pub backoff: Option<u32>,
+}
+impl std::fmt::Debug for ServerErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerErrorCode")
+            .field("code", &self.code)
+            .field(
+                "text",
+                &wacore_binary::diagnostics::ProtocolText::new(&self.text),
+            )
+            .field(
+                "error_type",
+                &self
+                    .error_type
+                    .as_deref()
+                    .map(wacore_binary::diagnostics::ProtocolText::new),
+            )
+            .field("backoff", &self.backoff)
+            .finish()
+    }
 }
 
 impl ServerErrorCode {

@@ -142,7 +142,7 @@ impl Client {
                 "reset_sender_key_device_tracking: clear failed for {group_jid}; \
                  marked {} existing rows cold: {clear_error}",
                 rows.len(),
-                group_jid = wacore_binary::jid::observe_str(group_jid)
+                group_jid = wacore_binary::jid::ObservedJid::from(group_jid)
             );
         }
         if scope.is_none_or(|scope| scope.is_current(self)) {
@@ -391,7 +391,7 @@ impl Client {
                         if let Err(e) = backend.take_sent_message(&chat_str, &mid).await {
                             log::warn!(
                                 "Failed to clean up sent message {}:{mid}: {e}",
-                                wacore_binary::jid::observe_str(&chat_str)
+                                wacore_binary::jid::ObservedJid::from(&chat_str)
                             );
                         }
                     }))

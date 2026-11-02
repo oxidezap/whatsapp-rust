@@ -1,44 +1,5 @@
 //! Logging must not become a second delivery channel for protocol payloads.
-use std::fmt;
-use wacore::stanza::wire_tags::StanzaTag;
-use wacore_binary::{Node, NodeRef};
-
-/// Only closed stanza categories and numeric error codes belong in diagnostics.
-/// Attributes, children and content may contain linking secrets even at trace.
-/// Consumers that need the payload receive it through the existing events.
-pub(crate) struct StanzaSummary<'a> {
-    tag: &'a str,
-    code: Option<u32>,
-}
-
-impl<'a> From<&'a Node> for StanzaSummary<'a> {
-    fn from(node: &'a Node) -> Self {
-        Self {
-            tag: &node.tag,
-            code: node.attrs.get("code").and_then(|s| s.as_str().parse().ok()),
-        }
-    }
-}
-
-impl<'a> From<&'a NodeRef<'_>> for StanzaSummary<'a> {
-    fn from(node: &'a NodeRef<'_>) -> Self {
-        Self {
-            tag: node.tag.as_ref(),
-            code: node.get_attr("code").and_then(|s| s.as_str().parse().ok()),
-        }
-    }
-}
-
-impl fmt::Display for StanzaSummary<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let tag = StanzaTag::try_from(self.tag).map_or("unknown", |tag| tag.as_str());
-        write!(f, "<{tag}")?;
-        if let Some(code) = self.code {
-            write!(f, " code={code}")?;
-        }
-        f.write_str(" payload=omitted>")
-    }
-}
+pub(crate) use wacore_binary::diagnostics::NodeSummary as StanzaSummary;
 
 #[cfg(test)]
 mod tests {
@@ -55,6 +16,8 @@ mod tests {
         }
         let capture = log_capture::session();
         let node = NodeBuilder::new("failure")
+            .attr("code", "515")
+            .attr("reason", "replaced")
             .attr("appeal_token", "synthetic-disconnect-secret")
             .attr("from", "19990000005@s.whatsapp.net")
             .bytes(b"synthetic-disconnect-key".to_vec())
@@ -71,11 +34,10 @@ mod tests {
         assert_eq!(records.len(), 6);
         for (_, message) in records {
             assert!(message.contains("disconnect") || message.contains("Disconnected"));
-            for marker in [
-                "synthetic-disconnect-secret",
-                "19990000005",
-                "synthetic-disconnect-key",
-            ] {
+            assert!(message.contains("code=515"));
+            assert!(message.contains("reason=replaced"));
+            assert!(message.contains("body=bytes(24)"));
+            for marker in ["synthetic-disconnect-secret", "synthetic-disconnect-key"] {
                 assert!(
                     !message.contains(marker),
                     "disconnect error leaked its retained stanza"
@@ -167,7 +129,7 @@ mod tests {
             "Received unhandled IQ",
             "Unknown stream error",
             "Unknown connect failure",
-            "Stream error carrying <ack>",
+            "Stream error carrying <ack",
         ] {
             assert!(
                 records
@@ -178,7 +140,6 @@ mod tests {
         }
         for (_, message) in records {
             for marker in [
-                "19990000003",
                 "synthetic-handler-secret",
                 "synthetic-handler-key",
                 "synthetic-ack-secret",
@@ -190,15 +151,17 @@ mod tests {
     }
 
     #[test]
-    fn stanza_logs_omit_attributes_and_nested_payloads_at_every_level() {
+    fn stanza_logs_preserve_safe_context_at_every_level() {
         if log_capture::delegated_to_child(
-            "logging::tests::stanza_logs_omit_attributes_and_nested_payloads_at_every_level",
+            "logging::tests::stanza_logs_preserve_safe_context_at_every_level",
         ) {
             return;
         }
         let capture = log_capture::session();
         let node = NodeBuilder::new("stream:error")
             .attr("code", "599")
+            .attr("reason", "replaced")
+            .attr("id", "synthetic-stanza-id")
             .attr("from", "19990000001@s.whatsapp.net")
             .attr("appeal_token", "synthetic-appeal-token")
             .children([NodeBuilder::new("key")
@@ -218,13 +181,26 @@ mod tests {
         let records = capture.records_for("whatsapp_rust::logging");
         assert_eq!(records.len(), 10);
         for (_, message) in records {
-            assert_eq!(message, "<stream:error code=599 payload=omitted>");
+            assert!(message.contains("<stream:error code=599"));
+            assert!(message.contains("reason=replaced"));
+            assert!(message.contains("id=id#"));
+            assert!(message.contains("children=1[<key attrs=0 body=bytes(19)>]"));
+            for marker in [
+                "synthetic-appeal-token",
+                "synthetic-key-bytes",
+                "synthetic-stanza-id",
+            ] {
+                assert!(!message.contains(marker));
+            }
+            if !cfg!(feature = "tracing-pii") {
+                assert!(!message.contains("19990000001"));
+            }
         }
         for tag in ["chatstate", "xmlstreamend"] {
             let node = NodeBuilder::new(tag).build();
             assert_eq!(
                 StanzaSummary::from(&node).to_string(),
-                format!("<{tag} payload=omitted>")
+                format!("<{tag} attrs=0 body=none>")
             );
         }
         let unknown = NodeBuilder::new("synthetic-secret-tag")
@@ -232,7 +208,233 @@ mod tests {
             .build();
         assert_eq!(
             StanzaSummary::from(&unknown).to_string(),
-            "<unknown payload=omitted>"
+            "<unknown attrs=1 body=none>"
         );
+    }
+    #[test]
+    fn safe_views_and_enabled_formatting_do_not_allocate() {
+        if log_capture::delegated_to_child(
+            "logging::tests::safe_views_and_enabled_formatting_do_not_allocate",
+        ) {
+            return;
+        }
+        use std::fmt::Write;
+        struct Sink;
+        impl Write for Sink {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                std::hint::black_box(s);
+                Ok(())
+            }
+        }
+        struct FormatLogger;
+        impl log::Log for FormatLogger {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                true
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                write!(Sink, "{}", record.args()).expect("valid diagnostic fixture");
+            }
+            fn flush(&self) {}
+        }
+        log::set_max_level(log::LevelFilter::Trace);
+        let node = NodeBuilder::new("stream:error")
+            .attr("code", "515")
+            .attr("from", "19990000001:2@s.whatsapp.net")
+            .attr("id", "synthetic-message-id")
+            .children([NodeBuilder::new("conflict")
+                .attr("reason", "replaced")
+                .build()])
+            .build();
+        let borrowed = node.as_node_ref(); // Conversion is setup, never a log argument.
+        let jid: wacore_binary::Jid = "19990000001:2@s.whatsapp.net"
+            .parse()
+            .expect("valid diagnostic fixture");
+        // Warm the process's keyed identifier formatter outside attribution.
+        write!(Sink, "{}", jid.observe()).expect("valid diagnostic fixture");
+        let (sample, ()) = crate::test_alloc::heap_sample(|| {
+            for _ in 0..128 {
+                std::hint::black_box(StanzaSummary::from(&node));
+                log::info!(logger: &FormatLogger, "{}", StanzaSummary::from(&node));
+                write!(
+                    Sink,
+                    "{} {} {} {}",
+                    StanzaSummary::from(&node),
+                    StanzaSummary::from(&borrowed),
+                    jid.observe(),
+                    wacore_binary::jid::ObservedJid::from("19990000001:2@s.whatsapp.net")
+                )
+                .expect("valid diagnostic fixture");
+            }
+        });
+        assert_eq!(sample.allocations, 0, "{sample:?}");
+        assert_eq!(sample.peak, 0);
+    }
+
+    #[test]
+    fn disabled_and_target_filtered_logs_do_not_format_safe_views() {
+        if log_capture::delegated_to_child(
+            "logging::tests::disabled_and_target_filtered_logs_do_not_format_safe_views",
+        ) {
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counter<'a>(&'a AtomicUsize);
+        impl std::fmt::Display for Counter<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                f.write_str("formatted")
+            }
+        }
+        struct Reject;
+        impl log::Log for Reject {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                false
+            }
+            fn log(&self, _: &log::Record<'_>) {}
+            fn flush(&self) {}
+        }
+        let constructions = AtomicUsize::new(0);
+        let formats = AtomicUsize::new(0);
+        log::set_max_level(log::LevelFilter::Off);
+        log::info!(logger: &Reject, "{}", { constructions.fetch_add(1, Ordering::Relaxed); Counter(&formats) });
+        assert_eq!(constructions.load(Ordering::Relaxed), 0);
+        log::set_max_level(log::LevelFilter::Trace);
+        log::info!(logger: &Reject, "{}", { constructions.fetch_add(1, Ordering::Relaxed); Counter(&formats) });
+        assert_eq!(constructions.load(Ordering::Relaxed), 1);
+        assert_eq!(formats.load(Ordering::Relaxed), 0);
+        #[cfg(feature = "tracing")]
+        {
+            let dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            log::set_max_level(log::LevelFilter::Off);
+            tracing::dispatcher::with_default(&dispatch, || {
+                tracing::info!(peer = %Counter(&formats), "filtered");
+            });
+        }
+        assert_eq!(formats.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn nested_errors_preserve_classification_without_untrusted_text() {
+        let io = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "synthetic-private-path-key",
+        );
+        let nested = crate::socket::error::EncryptSendError::transport(io);
+        let output = format!("{nested:?}");
+        assert!(output.contains("Transport"));
+        assert!(output.contains("PermissionDenied"));
+        assert!(!output.contains("synthetic-private-path-key"));
+        let raw = anyhow::anyhow!("synthetic-server-plaintext");
+        let error = crate::request::IqError::ParseError(raw);
+        assert!(!format!("{error:#?}").contains("synthetic-server-plaintext"));
+        assert!(
+            std::error::Error::source(&error)
+                .expect("valid diagnostic fixture")
+                .to_string()
+                .contains("synthetic-server-plaintext")
+        );
+        let server = wacore::request::IqError::ServerError {
+            code: 429,
+            text: "synthetic-server-plaintext".into(),
+            error_type: Some("wait".into()),
+            backoff: Some(60),
+        };
+        for output in [server.to_string(), format!("{server:#?}")] {
+            assert!(output.contains("429"));
+            assert!(output.contains("wait"));
+            assert!(output.contains("60"));
+            assert!(!output.contains("synthetic-server-plaintext"));
+        }
+    }
+    #[test]
+    fn string_identifier_views_validate_before_pii_opt_in() {
+        use wacore_binary::jid::ObservedJid;
+        let invalid = "synthetic-credential";
+        assert!(!ObservedJid::from(invalid).to_string().contains(invalid));
+        assert_eq!(
+            ObservedJid::from("s.whatsapp.net").to_string(),
+            "s.whatsapp.net"
+        );
+        for value in [
+            "19990000001:2@s.whatsapp.net",
+            "12345@lid",
+            "120000000001@g.us",
+        ] {
+            let jid: wacore_binary::Jid = value.parse().expect("valid diagnostic fixture");
+            assert_eq!(
+                ObservedJid::from(value).to_string(),
+                jid.observe().to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn stanza_summary_bounds_work_and_matches_borrowed_shape() {
+        let leaf = NodeBuilder::new("key").bytes(vec![0x5a; 8192]).build();
+        let node = NodeBuilder::new("iq")
+            .attr("id", "synthetic-id")
+            .children(
+                (0..64)
+                    .map(|_| {
+                        NodeBuilder::new("error")
+                            .attr("code", "500")
+                            .children([leaf.clone()])
+                            .build()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .build();
+        let output = StanzaSummary::from(&node).to_string();
+        assert_eq!(output, StanzaSummary::from(&node.as_node_ref()).to_string());
+        assert!(output.contains("children=64"));
+        assert!(output.contains("code=500"));
+        assert!(output.contains("body=bytes(8192)"));
+        assert!(output.ends_with(", ...]>"));
+        assert!(output.len() < 1400);
+        assert!(!output.contains("90, 90"));
+    }
+
+    #[cfg(feature = "tracing")]
+    #[test]
+    fn enabled_tracing_formats_borrowed_views_without_allocating() {
+        use std::fmt::Write;
+        use tracing_subscriber::{
+            Layer,
+            layer::{Context, SubscriberExt},
+        };
+        struct Discard;
+        impl Write for Discard {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                std::hint::black_box(s);
+                Ok(())
+            }
+        }
+        struct Visitor;
+        impl tracing::field::Visit for Visitor {
+            fn record_debug(&mut self, _: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                write!(Discard, "{value:?}").expect("valid diagnostic fixture");
+            }
+        }
+        struct FormatLayer;
+        impl<S: tracing::Subscriber> Layer<S> for FormatLayer {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                event.record(&mut Visitor);
+            }
+        }
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(FormatLayer));
+        let node = NodeBuilder::new("failure")
+            .attr("code", "401")
+            .attr("from", "19990000001@s.whatsapp.net")
+            .build();
+        tracing::dispatcher::with_default(&dispatch, || {
+            let emit = || tracing::info!(node = %StanzaSummary::from(&node), "diagnostic");
+            emit(); // Register the callsite and initialize identifier entropy.
+            let (sample, ()) = crate::test_alloc::heap_sample(|| {
+                for _ in 0..128 {
+                    emit();
+                }
+            });
+            assert_eq!(sample.allocations, 0, "{sample:?}");
+        });
     }
 }

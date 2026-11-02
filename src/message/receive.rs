@@ -259,13 +259,14 @@ impl Client {
                 info.media_type = media_type;
                 Arc::new(info)
             }
-            Err(_) => {
-                let id = nr.get_attr("id").map(|v| v.as_str());
-                let from = nr
-                    .get_attr("from")
-                    .map(|v| wacore_binary::jid::observe_str(&v.as_str()));
-                // Parser errors can quote rejected attributes or payloads.
-                log::warn!("Failed to parse message info (id={id:?}, from={from:?})");
+            Err(error) => {
+                // The common view retains protocol context without quoting
+                // rejected attributes or eagerly formatting identifiers.
+                log::warn!(
+                    "Failed to parse message info: {}; {}",
+                    wacore::diagnostics::ErrorSummary(error.as_ref()),
+                    crate::logging::StanzaSummary::from(nr)
+                );
                 self.spawn_stanza_nack(nr, NackReason::ParsingError, None);
                 return None;
             }

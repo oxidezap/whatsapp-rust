@@ -619,7 +619,8 @@ pub(crate) async fn handle_pair_code_notification_scoped(
         _ => {
             warn!(
                 target: "Client/PairCode",
-                "Ignoring link_code_companion_reg notification with unrecognized stage"
+                "Ignoring link_code_companion_reg notification with unrecognized stage: {}",
+                crate::logging::StanzaSummary::from(reg_node)
             );
             false
         }
@@ -962,7 +963,7 @@ async fn report_stage_two_failure(
         return;
     }
 
-    error!(target: "Client/PairCode", "companion_finish failed");
+    error!(target: "Client/PairCode", "companion_finish failed: {error}");
     if !retire_stage_two_flow(client, pairing_ref, attempt, shutdown).await {
         return;
     }

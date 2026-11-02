@@ -1287,7 +1287,7 @@ impl std::fmt::Display for ResourceReport {
 /// `NotConnected`, `NotLoggedIn`, IQ failures, socket / encrypt-send errors. It
 /// is NOT an umbrella over the whole API; the per-domain typed errors remain
 /// the public return types.
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum ClientError {
     #[error("client is not connected")]
@@ -1301,10 +1301,26 @@ pub enum ClientError {
     #[error("IQ request failed: {0}")]
     Iq(#[from] crate::request::IqError),
     /// Last-resort catch-all for internal failures threaded through `?` that do
-    /// not (yet) have a dedicated variant. `Display` forwards to the inner
-    /// error while `source()` still exposes it for downcast.
-    #[error("{0}")]
+    /// not (yet) have a dedicated variant. Formatting retains known typed
+    /// diagnostics; `source()` preserves the complete error for downcast.
+    #[error("internal client error: {}", wacore::diagnostics::ErrorSummary(.0.as_ref()))]
     Internal(#[from] anyhow::Error),
+}
+
+impl std::fmt::Debug for ClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotConnected => f.write_str("NotConnected"),
+            Self::NotLoggedIn => f.write_str("NotLoggedIn"),
+            Self::Socket(e) => f.debug_tuple("Socket").field(e).finish(),
+            Self::EncryptSend(e) => f.debug_tuple("EncryptSend").field(e).finish(),
+            Self::Iq(e) => f.debug_tuple("Iq").field(e).finish(),
+            Self::Internal(e) => f
+                .debug_tuple("Internal")
+                .field(&wacore::diagnostics::ErrorSummary(e.as_ref()))
+                .finish(),
+        }
+    }
 }
 
 /// The step of the connect flow a [`ConnectError::Timeout`] refers to.

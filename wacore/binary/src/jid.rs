@@ -366,7 +366,7 @@ impl TryFrom<&str> for Server {
     type Error = JidError;
     fn try_from(s: &str) -> Result<Self, Self::Error> {
         Server::parse_known(s)
-            .ok_or_else(|| JidError::InvalidFormat(format!("unknown server: {s}")))
+            .ok_or_else(|| JidError::InvalidFormat(format!("unknown server ({} bytes)", s.len())))
     }
 }
 
@@ -1005,7 +1005,8 @@ impl FromStr for Jid {
 
         if user_part.is_empty() && Server::try_from(server).is_err() {
             return Err(JidError::InvalidFormat(format!(
-                "unknown server '{server}'"
+                "unknown server ({} bytes)",
+                server.len()
             )));
         }
 
@@ -1270,13 +1271,43 @@ impl fmt::Display for Jid {
 /// (a fresh key each start). Enable the `tracing-pii` feature to render raw
 /// numbers (local debugging only). The token is computed only while formatting an
 /// already-enabled log or span, so it costs nothing on disabled call sites.
-pub struct ObservedJid<'a>(&'a Jid);
+pub struct ObservedJid<'a>(ObservedSource<'a>);
+
+enum ObservedSource<'a> {
+    Jid(JidRef<'a>),
+    Text(&'a str),
+}
+
+impl<'a, T: AsRef<str> + ?Sized> From<&'a T> for ObservedJid<'a> {
+    fn from(value: &'a T) -> Self {
+        Self(ObservedSource::Text(value.as_ref()))
+    }
+}
+
+impl JidRef<'_> {
+    /// Borrowed privacy-aware formatting, without parsing or hashing until used.
+    pub fn observe(&self) -> ObservedJid<'_> {
+        ObservedJid(ObservedSource::Jid(JidRef {
+            user: NodeStr::Borrowed(self.user.as_ref()),
+            server: self.server,
+            agent: self.agent,
+            device: self.device,
+            integrator: self.integrator,
+        }))
+    }
+}
 
 impl Jid {
     /// Privacy-aware display for logs and tracing spans/fields. See [`ObservedJid`].
     #[inline]
     pub fn observe(&self) -> ObservedJid<'_> {
-        ObservedJid(self)
+        ObservedJid(ObservedSource::Jid(JidRef {
+            user: NodeStr::Borrowed(self.user.as_str()),
+            server: self.server,
+            agent: self.agent,
+            device: self.device,
+            integrator: self.integrator,
+        }))
     }
 }
 
@@ -1331,48 +1362,51 @@ pub fn observe_str(s: &str) -> String {
     }
 }
 
+impl fmt::Debug for ObservedJid<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
 impl fmt::Display for ObservedJid<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let jid = self.0;
-        if jid.user.is_empty() || cfg!(feature = "tracing-pii") {
-            return fmt::Display::fmt(jid, f);
+        match &self.0 {
+            ObservedSource::Jid(jid) => fmt_observed_jid(jid, f),
+            ObservedSource::Text(text) => match parse_jid_ref(text) {
+                Some(jid) => fmt_observed_jid(&jid, f),
+                None => match Server::parse_known(text) {
+                    Some(server) => f.write_str(server.as_str()),
+                    None => write!(f, "?#{:016x}", observe_token(text)),
+                },
+            },
         }
-        // Decide the privacy-safe `user` rendering.
-        let redacted: Option<String> = if jid.server.carries_phone_number() {
-            // The whole user is a phone number.
-            Some(format!("pn#{:016x}", observe_token(jid.user.as_str())))
-        } else if matches!(jid.server, Server::Group | Server::Broadcast) {
-            // Legacy group/broadcast ids embed the creator phone as
-            // "<phone>-<timestamp>". Redact the numeric prefix and keep the
-            // timestamp (not PII) so the group still correlates across spans.
-            match jid.user.find('-') {
-                Some(i) if i > 0 && jid.user.as_bytes()[..i].iter().all(|b| b.is_ascii_digit()) => {
-                    Some(format!(
-                        "pn#{:016x}{}",
-                        observe_token(&jid.user[..i]),
-                        &jid.user[i..]
-                    ))
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let Some(user) = redacted else {
-            // Pseudonymous (LID) or non-personal: safe to render in full.
-            return fmt::Display::fmt(jid, f);
-        };
-        f.write_str(&user)?;
-        // Preserve agent where it is part of the identity (e.g. Interop/Messenger),
-        // mirroring the normal JID display so distinct IDs stay distinct.
-        if jid.agent > 0 && jid.server.renders_agent() {
-            write!(f, ".{}", jid.agent)?;
-        }
-        if jid.device > 0 {
-            write!(f, ":{}", jid.device)?;
-        }
-        write!(f, "@{}", jid.server.as_str())
     }
+}
+
+fn fmt_observed_jid(jid: &JidRef<'_>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let user = jid.user.as_ref();
+    if user.is_empty() || cfg!(feature = "tracing-pii") {
+        return fmt::Display::fmt(jid, f);
+    }
+    if jid.server.carries_phone_number() {
+        write!(f, "pn#{:016x}", observe_token(user))?;
+    } else if matches!(jid.server, Server::Group | Server::Broadcast) {
+        match user.find('-') {
+            Some(i) if i > 0 && user[..i].bytes().all(|c| c.is_ascii_digit()) => {
+                write!(f, "pn#{:016x}{}", observe_token(&user[..i]), &user[i..])?;
+            }
+            _ => return fmt::Display::fmt(jid, f),
+        }
+    } else {
+        return fmt::Display::fmt(jid, f);
+    }
+    if jid.agent > 0 && jid.server.renders_agent() {
+        write!(f, ".{}", jid.agent)?;
+    }
+    if jid.device > 0 {
+        write!(f, ":{}", jid.device)?;
+    }
+    write!(f, "@{}", jid.server.as_str())
 }
 
 impl<'a> fmt::Display for JidRef<'a> {

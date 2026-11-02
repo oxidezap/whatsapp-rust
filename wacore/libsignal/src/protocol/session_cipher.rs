@@ -301,7 +301,7 @@ async fn message_encrypt_inner(
     let their_identity_key = session_state.remote_identity_key()?.ok_or_else(|| {
         SignalProtocolError::InvalidState(
             "message_encrypt",
-            format!("no remote identity key for {remote_address}"),
+            format!("no remote identity key for {}", remote_address.observe()),
         )
     })?;
 
@@ -592,7 +592,7 @@ async fn message_decrypt_prekey_inner<R: Rng + CryptoRng>(
                     &errs,
                     session_record,
                     ciphertext.pre_key_message().message()
-                )?
+                )
             );
             let [e] = errs;
             return Err(e);
@@ -771,76 +771,61 @@ fn take_key_agreement_failure(errs: &mut Vec<SignalProtocolError>) -> Option<Sig
     Some(errs.remove(at))
 }
 
-fn create_decryption_failure_log(
-    remote_address: &ProtocolAddress,
-    mut errs: &[SignalProtocolError],
-    record: &SessionRecord,
+struct DecryptionFailure<'a> {
+    peer: &'a ProtocolAddress,
+    errors: &'a [SignalProtocolError],
+    record: &'a SessionRecord,
+    counter: u32,
+}
+
+fn create_decryption_failure_log<'a>(
+    peer: &'a ProtocolAddress,
+    errors: &'a [SignalProtocolError],
+    record: &'a SessionRecord,
     ciphertext: &SignalMessage,
-) -> Result<String> {
-    fn append_session_summary(
-        lines: &mut Vec<String>,
-        idx: usize,
-        state: std::result::Result<&SessionState, crate::protocol::state::InvalidSessionError>,
-        err: Option<&SignalProtocolError>,
-    ) {
-        let chains = state.map(|state| state.receiver_chain_count());
-        match (err, &chains) {
-            (Some(err), Ok(chains)) => {
-                lines.push(format!(
-                    "Candidate session {} failed with '{}', had {} receiver chains",
-                    idx, err, chains
-                ));
+) -> DecryptionFailure<'a> {
+    DecryptionFailure {
+        peer,
+        errors,
+        record,
+        counter: ciphertext.counter(),
+    }
+}
+
+impl std::fmt::Display for DecryptionFailure<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn session(
+            f: &mut std::fmt::Formatter<'_>,
+            idx: usize,
+            state: std::result::Result<&SessionState, &crate::protocol::state::InvalidSessionError>,
+            error: Option<&SignalProtocolError>,
+        ) -> std::fmt::Result {
+            write!(f, "\nCandidate session {idx}")?;
+            if let Some(error) = error {
+                write!(f, " failed with '{error}'")?;
             }
-            (Some(err), Err(state_err)) => {
-                lines.push(format!(
-                    "Candidate session {idx} failed with '{err}'; cannot get receiver chain info ({state_err})",
-                ));
-            }
-            (None, Ok(chains)) => {
-                lines.push(format!(
-                    "Candidate session {} had {} receiver chains",
-                    idx, chains
-                ));
-            }
-            (None, Err(state_err)) => {
-                lines.push(format!(
-                    "Candidate session {idx}: cannot get receiver chain info ({state_err})",
-                ));
+            match state {
+                Ok(state) => write!(f, "; had {} receiver chains", state.receiver_chain_count()),
+                Err(error) => write!(f, "; cannot get receiver chain info ({error})"),
             }
         }
-    }
-
-    let mut lines = vec![];
-
-    lines.push(format!(
-        "Message from {} failed to decrypt; message counter {}",
-        remote_address.observe(),
-        ciphertext.counter()
-    ));
-
-    if let Some(current_session) = record.session_state() {
-        let err = errs.first();
-        if err.is_some() {
-            errs = &errs[1..];
+        write!(
+            f,
+            "Message from {} failed to decrypt; message counter {}",
+            self.peer.observe(),
+            self.counter
+        )?;
+        let mut errors = self.errors.iter();
+        if let Some(state) = self.record.session_state() {
+            session(f, 0, Ok(state), errors.next())?;
+        } else {
+            f.write_str("\nNo current session")?;
         }
-        append_session_summary(&mut lines, 0, Ok(current_session), err);
-    } else {
-        lines.push("No current session".to_string());
+        for (idx, state) in self.record.previous_session_states().enumerate() {
+            session(f, idx + 1, state.as_ref(), errors.next())?;
+        }
+        Ok(())
     }
-
-    for (idx, (state, err)) in record
-        .previous_session_states()
-        .zip(errs.iter().map(Some).chain(std::iter::repeat(None)))
-        .enumerate()
-    {
-        let state = match state {
-            Ok(ref state) => Ok(state),
-            Err(err) => Err(err),
-        };
-        append_session_summary(&mut lines, idx + 1, state, err);
-    }
-
-    Ok(lines.join("\n"))
 }
 
 enum RecordDecryptState {
@@ -1113,7 +1098,7 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
                                 &errs,
                                 record,
                                 ciphertext.signal_message()
-                            )?
+                            )
                         );
                         if let Some(refused) = take_key_agreement_failure(&mut errs) {
                             return Err(refused);
@@ -1251,7 +1236,7 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
     );
     log::error!(
         "{}",
-        create_decryption_failure_log(remote_address, &errs, record, ciphertext.signal_message())?
+        create_decryption_failure_log(remote_address, &errs, record, ciphertext.signal_message())
     );
 
     if let Some(refused) = take_key_agreement_failure(&mut errs) {

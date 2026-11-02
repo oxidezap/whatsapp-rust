@@ -2,17 +2,34 @@ use crate::handshake::NoiseError;
 use thiserror::Error;
 use wacore_binary::error::BinaryError;
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum SocketError {
     #[error("socket is closed")]
     SocketClosed,
-    #[error("I/O error")]
+    #[error("I/O error: {}", crate::diagnostics::ErrorSummary(.0))]
     Io(#[from] std::io::Error),
-    #[error("noise cipher operation failed")]
+    #[error("noise cipher operation failed: {0}")]
     Cipher(#[from] NoiseError),
-    #[error("binary protocol marshalling failed")]
+    #[error("binary protocol marshalling failed: {}", crate::diagnostics::ErrorSummary(.0))]
     Marshal(#[source] BinaryError),
+}
+
+impl std::fmt::Debug for SocketError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SocketClosed => f.write_str("SocketClosed"),
+            Self::Io(e) => f
+                .debug_tuple("Io")
+                .field(&crate::diagnostics::ErrorSummary(e))
+                .finish(),
+            Self::Cipher(e) => f.debug_tuple("Cipher").field(e).finish(),
+            Self::Marshal(e) => f
+                .debug_tuple("Marshal")
+                .field(&crate::diagnostics::ErrorSummary(e))
+                .finish(),
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, SocketError>;
@@ -40,13 +57,25 @@ pub enum EncryptSendErrorKind {
     Poisoned,
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("{kind}")]
+#[derive(thiserror::Error)]
+#[error("{kind}: {}", crate::diagnostics::ErrorSummary(.source.as_ref()))]
 #[non_exhaustive]
 pub struct EncryptSendError {
     pub kind: EncryptSendErrorKind,
     #[source]
     pub source: anyhow::Error,
+}
+
+impl std::fmt::Debug for EncryptSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptSendError")
+            .field("kind", &self.kind)
+            .field(
+                "source",
+                &crate::diagnostics::ErrorSummary(self.source.as_ref()),
+            )
+            .finish()
+    }
 }
 
 impl EncryptSendError {
