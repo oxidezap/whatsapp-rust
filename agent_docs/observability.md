@@ -52,8 +52,11 @@ claim about current memory or performance.
 Logs must never include linking codes, QR payloads or cryptographic key bytes,
 including public identity/ratchet keys and short fingerprints. Use `Jid::observe()`
 for JIDs and borrowed `ObservedJid::from(&text)` for string identifiers; `tracing-pii` deliberately
-opts into raw identifiers, never secrets. Low-level Signal address diagnostics
-use process-keyed tokens. Stanza logs use `StanzaSummary` at every level because
+opts into raw identifiers, never secrets. Signal addresses use borrowed `ProtocolAddress::observe()` and process-keyed
+tokens, including identity retries, group failures and key repair. Message/stanza
+IDs use `ObservedId` correlation; group strings use `ObservedJid` so legacy
+creator-phone prefixes are redacted while modern group IDs stay public.
+Stanza logs use `StanzaSummary` at every level because
 unrecognized attributes and nested content can carry secrets. The common borrowed
 `wacore_binary::diagnostics::NodeSummary` preserves known protocol tags, numeric
 codes, known reason/status atoms and bounded child/body shape; opaque stanza IDs

@@ -90,3 +90,62 @@ fn binary(
         _ => fmt::Display::fmt(error, f),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wacore_binary::{
+        attrs::{AttrParser, AttrParserRef},
+        builder::NodeBuilder,
+    };
+
+    #[test]
+    fn parser_producers_keep_their_safe_error_categories() {
+        for (kind, key, expected) in [
+            (0, "offline", "bool"),
+            (1, "count", "u64"),
+            (2, "t", "i64"),
+            (3, "from", "JID"),
+        ] {
+            let node = NodeBuilder::new("message")
+                .attr(key, "synthetic-private-value")
+                .build();
+            let borrowed = node.as_node_ref();
+            let mut owned = AttrParser::new(&node);
+            let mut reference = AttrParserRef::new(&borrowed);
+            match kind {
+                0 => {
+                    owned.bool(key);
+                    reference.bool(key);
+                }
+                1 => {
+                    owned.optional_u64(key);
+                    reference.optional_u64(key);
+                }
+                2 => {
+                    owned.unix_time(key);
+                    reference.unix_time(key);
+                }
+                _ => {
+                    owned.jid(key);
+                    reference.jid(key);
+                }
+            }
+            for error in [
+                owned.finish().expect_err("rejected value"),
+                reference.finish().expect_err("rejected value"),
+            ] {
+                let summary = ErrorSummary(&error).to_string();
+                if kind == 3 {
+                    assert!(summary.contains("invalid JID"), "{summary}");
+                } else {
+                    assert_eq!(
+                        summary,
+                        format!("1 attribute errors[invalid {expected} attribute]")
+                    );
+                }
+                assert!(!summary.contains("synthetic-private-value"));
+            }
+        }
+    }
+}

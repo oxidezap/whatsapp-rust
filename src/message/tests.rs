@@ -962,6 +962,164 @@ async fn submit_and_check_session(
 }
 
 #[tokio::test]
+async fn identity_replacement_logs_keep_private_addresses_and_useful_context() {
+    use crate::test_utils::log_capture;
+    if log_capture::delegated_to_child(
+        "message::tests::identity_replacement_logs_keep_private_addresses_and_useful_context",
+    ) {
+        return;
+    }
+    let client = crate::test_utils::create_test_client_with_name("identity_log_privacy").await;
+    let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+    let bob_address = bob_jid.to_protocol_address();
+    let mut original = AlicePeer::new("19990000041@s.whatsapp.net").await;
+    original.install_bob_session(&bob_address, &bundle).await;
+    let first = original
+        .encrypt_text(&bob_address, "synthetic-initial-content")
+        .await;
+    assert!(
+        submit_and_check_session(&client, &original.jid, &first)
+            .await
+            .0
+    );
+    client
+        .flush_signal_cache()
+        .await
+        .expect("persist initial identity");
+
+    let (bundle, _) = bobs_prekey_bundle(&client).await;
+    let mut replacement = AlicePeer::new("19990000041@s.whatsapp.net").await;
+    replacement.install_bob_session(&bob_address, &bundle).await;
+    let encrypted = replacement
+        .encrypt_text(&bob_address, "synthetic-replacement-content")
+        .await;
+    let capture = log_capture::session();
+    assert!(
+        submit_and_check_session(&client, &replacement.jid, &encrypted)
+            .await
+            .0,
+        "real pre-key decryption must accept the new identity, like WhatsApp Web"
+    );
+    // The SDK's trust adapter always returns true. Exercise the actual
+    // ReplacedExisting reaction, not a synthetic strict-trust branch.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if capture
+                .records_for("whatsapp_rust::handlers::notification::device")
+                .iter()
+                .any(|(_, text)| text.contains("Local identity change detected"))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("real identity-change reaction must run");
+    let mut records = capture.records_for("whatsapp_rust::message::receive");
+    records.extend(capture.records_for("whatsapp_rust::handlers::notification::device"));
+    assert!(
+        records
+            .iter()
+            .any(|(_, text)| text.contains("Local identity change detected"))
+    );
+    for (_, text) in records {
+        if !cfg!(feature = "tracing-pii") {
+            assert!(!text.contains("19990000041"), "raw peer address in {text}");
+        }
+        assert!(!text.contains("synthetic-replacement-content"));
+    }
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
+#[tokio::test]
+async fn group_decrypt_logs_keep_private_addresses_and_useful_context() {
+    use crate::test_utils::log_capture;
+    if log_capture::delegated_to_child(
+        "message::tests::group_decrypt_logs_keep_private_addresses_and_useful_context",
+    ) {
+        return;
+    }
+    let (client, _) = capturing_client("group_log_privacy").await;
+    let mut alice = AlicePeer::new("19990000043@s.whatsapp.net").await;
+    let group: Jid = "19990000042-1700000000@g.us".parse().expect("legacy group");
+    let skdm = alice.create_group_skdm(&group).await;
+    let distribution = wacore::libsignal::protocol::SenderKeyDistributionMessage::try_from(
+        skdm.axolotl_sender_key_distribution_message
+            .as_deref()
+            .expect("distribution bytes"),
+    )
+    .expect("real distribution");
+    let name = make_sender_key_name(&group, &alice.jid.to_protocol_address());
+    let mut adapter = client.signal_adapter();
+    wacore::libsignal::protocol::process_sender_key_distribution_message(
+        &name,
+        &distribution,
+        &mut adapter.sender_key_store,
+    )
+    .await
+    .expect("install sender key");
+    let capture = log_capture::session();
+    for (i, mode) in [DecryptFailMode::Show, DecryptFailMode::Hide]
+        .into_iter()
+        .enumerate()
+    {
+        let mut ciphertext = alice
+            .encrypt_group_message(&group, b"synthetic-group-content")
+            .await;
+        *ciphertext.last_mut().expect("signature byte") ^= 1;
+        let info = group_message_info(
+            &format!("synthetic-group-id-{i}"),
+            &group,
+            &alice.jid,
+            false,
+        );
+        client
+            .clone()
+            .process_classified_message(
+                ClassifiedMessage {
+                    info,
+                    sender_encryption_jid: alice.jid.clone(),
+                    session_payloads: vec![],
+                    group_payloads: vec![skmsg_payload_from_bytes(ciphertext)],
+                    bot_payloads: vec![],
+                    max_sender_retry_count: 0,
+                    decrypt_fail_mode: mode,
+                    ack_recipient: None,
+                },
+                client.connection_generation.load(Ordering::Acquire),
+            )
+            .await;
+    }
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    let records = capture.records_for("whatsapp_rust::message::receive");
+    for level in [log::Level::Warn, log::Level::Debug] {
+        assert!(
+            records
+                .iter()
+                .any(|(actual, text)| *actual == level
+                    && text.contains("Group batch decrypt failed")),
+            "missing decrypt failure at {level}"
+        );
+    }
+    assert!(
+        records
+            .iter()
+            .any(|(_, text)| text.contains("invalid signature"))
+    );
+    for (_, text) in records {
+        if !cfg!(feature = "tracing-pii") {
+            for marker in ["19990000042", "19990000043"] {
+                assert!(!text.contains(marker), "raw address in {text}");
+            }
+        }
+        for marker in ["synthetic-group-content", "synthetic-group-id-"] {
+            assert!(!text.contains(marker), "payload or opaque id in {text}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_badmac_migrates_pn_session_when_lid_shadow_exists() {
     use crate::lid_pn_cache::{LearningSource, LidPnEntry};
 
@@ -5261,10 +5419,11 @@ fn receive_logs_for(
     session: &crate::test_utils::log_capture::Session,
     msg_id: &str,
 ) -> Vec<(log::Level, String)> {
+    let observed = wacore_binary::diagnostics::ObservedId::new(msg_id).to_string();
     session
         .records_for("whatsapp_rust::message::receive")
         .into_iter()
-        .filter(|(_, message)| message.contains(msg_id))
+        .filter(|(_, message)| message.contains(&observed))
         .collect()
 }
 

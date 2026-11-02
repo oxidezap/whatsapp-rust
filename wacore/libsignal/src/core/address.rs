@@ -194,7 +194,7 @@ impl fmt::Debug for ProtocolAddress {
 
 impl ProtocolAddress {
     /// Correlate low-level diagnostics without formatting a phone-number name.
-    pub(crate) fn observe(&self) -> impl fmt::Display + '_ {
+    pub fn observe(&self) -> impl fmt::Display + '_ {
         struct Observed<'a>(&'a ProtocolAddress);
         impl fmt::Display for Observed<'_> {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

@@ -243,12 +243,18 @@ pub async fn group_decrypt_shared(
             log::debug!(
                 "SenderKey could not find chain ID {} (known chain IDs: {:?})",
                 chain_id,
-                record.chain_ids_for_logging().collect::<Vec<_>>(),
+                std::fmt::from_fn(|f| f
+                    .debug_list()
+                    .entries(record.chain_ids_for_logging())
+                    .finish()),
             );
             return Err(SignalProtocolError::NoSenderKeyState(format!(
                 "no sender key state for chain id {} (known chain IDs: {:?})",
                 chain_id,
-                record.chain_ids_for_logging().collect::<Vec<_>>()
+                std::fmt::from_fn(|f| f
+                    .debug_list()
+                    .entries(record.chain_ids_for_logging())
+                    .finish())
             )));
         }
     };

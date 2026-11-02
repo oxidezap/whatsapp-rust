@@ -581,6 +581,9 @@ pub mod log_capture {
         "whatsapp_rust::client::lifecycle",
         "whatsapp_rust::history_sync",
         "whatsapp_rust::message::receive",
+        "whatsapp_rust::send",
+        "whatsapp_rust::retry",
+        "whatsapp_rust::handlers::notification::device",
         "whatsapp_rust::handlers::ib",
     ];
 

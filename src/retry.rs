@@ -5,6 +5,7 @@ use crate::send::SendError;
 use crate::types::events::Receipt;
 use log::{debug, info, warn};
 use wacore::types::message::MessageCategory;
+use wacore_binary::diagnostics::ObservedId;
 
 use std::sync::Arc;
 use wacore::iq::prekeys::{OneTimePreKeyNode, SignedPreKeyNode};
@@ -615,7 +616,7 @@ impl Client {
             debug!(
                 "Refusing retry #{} for message {} from {}: exceeds max attempts ({})",
                 retry_count,
-                message_id,
+                ObservedId::new(&message_id),
                 receipt.source.sender.observe(),
                 MAX_RETRY_COUNT
             );
@@ -693,7 +694,8 @@ impl Client {
         let Some(admission) = route.device_checked(device_known, keys_node_present) else {
             warn!(
                 "handle_retry_receipt: device not found for device={}, user={}",
-                sender_device_id, info.requester.user
+                sender_device_id,
+                info.requester.observe()
             );
             return Ok(());
         };
@@ -771,7 +773,8 @@ impl Client {
                         self.mark_requester_for_fresh_skdm(&info, jid).await;
                     }
                     log::debug!(
-                        "Ignoring retry for message {message_id}: already handled or not found in cache."
+                        "Ignoring retry for message {message_id}: already handled or not found in cache.",
+                        message_id = ObservedId::new(&message_id)
                     );
                     return Ok(());
                 }
@@ -818,7 +821,7 @@ impl Client {
                 Err(e) => {
                     log::warn!(
                         "Failed to fetch group info for retry of msg {} in {}: {e}",
-                        message_id,
+                        ObservedId::new(&message_id),
                         info.chat.observe()
                     );
                     None
@@ -925,7 +928,8 @@ impl Client {
             {
                 info!(
                     "Recreating session with {} for retry of {message_id}: {reason}",
-                    resolved_jid.observe()
+                    resolved_jid.observe(),
+                    message_id = ObservedId::new(&message_id)
                 );
                 self.signal_cache.delete_session(&signal_address).await;
                 drop(guard);
@@ -953,7 +957,7 @@ impl Client {
         {
             debug!(
                 "Throttling resend of {} to {}: per-chat resend rate cap reached",
-                message_id,
+                ObservedId::new(&message_id),
                 info.chat.observe()
             );
             return Ok(());
@@ -961,7 +965,7 @@ impl Client {
 
         info!(
             "Resending message {} to {} (retry #{})",
-            message_id,
+            ObservedId::new(&message_id),
             info.chat.observe(),
             retry_count
         );
@@ -1478,7 +1482,7 @@ impl Client {
                 info!(
                     "Registration ID mismatch for {} (stored: {}, received: {}). \
                      Deleting session since no key bundle provided.",
-                    wacore::types::jid::observe_protocol_address(signal_address),
+                    signal_address.observe(),
                     stored_reg_id,
                     received_reg_id
                 );
@@ -1511,12 +1515,12 @@ impl Client {
             {
                 Ok(()) => info!(
                     "Saved base key for {} at retry #{} for collision detection",
-                    wacore::types::jid::observe_protocol_address(signal_address),
+                    signal_address.observe(),
                     retry_count
                 ),
                 Err(e) => warn!(
                     "Failed to save base key for {}: {}",
-                    wacore::types::jid::observe_protocol_address(signal_address),
+                    signal_address.observe(),
                     e
                 ),
             }
@@ -1537,8 +1541,8 @@ impl Client {
                     info!(
                         "Base key collision detected for {} (msg {}) at retry #{}. \
                          Session hasn't been regenerated. Forcing fresh session.",
-                        wacore::types::jid::observe_protocol_address(signal_address),
-                        message_id,
+                        signal_address.observe(),
+                        ObservedId::new(message_id),
                         retry_count
                     );
                     wacore::telemetry::base_key_collision();
@@ -1552,8 +1556,8 @@ impl Client {
                 Ok(false) => {
                     info!(
                         "Base key changed for {} (msg {}) at retry #{} - session regenerated",
-                        wacore::types::jid::observe_protocol_address(signal_address),
-                        message_id,
+                        signal_address.observe(),
+                        ObservedId::new(message_id),
                         retry_count
                     );
                     let _ = device_snapshot
@@ -1564,7 +1568,7 @@ impl Client {
                 Err(e) => {
                     warn!(
                         "Failed to check base key for {}: {}",
-                        wacore::types::jid::observe_protocol_address(signal_address),
+                        signal_address.observe(),
                         e
                     );
                 }
@@ -1611,7 +1615,8 @@ impl Client {
             Err(e) => {
                 warn!(
                     "should_recreate_session: has_session failed for {}: {} — skipping recreate",
-                    signal_address, e
+                    signal_address.observe(),
+                    e
                 );
                 return None;
             }
@@ -1682,14 +1687,16 @@ impl Client {
                         return Err(anyhow::anyhow!(
                             "Registration ID changed for peer device {} (was {}, now {}). \
                              This may indicate the device was reinstalled.",
-                            signal_address,
+                            signal_address.observe(),
                             existing_reg_id,
                             registration_id
                         ));
                     }
                     info!(
                         "Registration ID changed for {} (was {}, now {}). Session will be replaced.",
-                        signal_address, existing_reg_id, registration_id
+                        signal_address.observe(),
+                        existing_reg_id,
+                        registration_id
                     );
                 }
             }
@@ -1726,16 +1733,19 @@ impl Client {
                 wacore::adv::AdvValidation::Valid => {}
                 wacore::adv::AdvValidation::Invalid => {
                     return Err(anyhow::anyhow!(
-                        "device-identity ADV validation failed for companion {requester_jid}"
+                        "device-identity ADV validation failed for companion {requester_jid}",
+                        requester_jid = requester_jid.observe()
                     ));
                 }
                 wacore::adv::AdvValidation::NoAccountKey => log::debug!(
-                    "retry key bundle for companion {requester_jid} omits account_signature_key and no stored account identity; proceeding without ADV validation"
+                    "retry key bundle for companion {requester_jid} omits account_signature_key and no stored account identity; proceeding without ADV validation",
+                    requester_jid = requester_jid.observe()
                 ),
             }
         } else if requester_jid.device != 0 {
             log::warn!(
-                "retry key bundle for companion {requester_jid} omits <device-identity>; proceeding without ADV validation"
+                "retry key bundle for companion {requester_jid} omits <device-identity>; proceeding without ADV validation",
+                requester_jid = requester_jid.observe()
             );
         }
 
@@ -1787,7 +1797,7 @@ impl Client {
 
         info!(
             "Processed key bundle from retry receipt for {}",
-            signal_address
+            signal_address.observe()
         );
 
         Ok(())
@@ -1817,7 +1827,7 @@ impl Client {
         if retry_receipt_always_suppressed(info) {
             log::debug!(
                 "Skipping retry receipt for message {} from bot {} in non-bot chat {}",
-                info.id,
+                ObservedId::new(info.id.as_str()),
                 info.source.sender.observe(),
                 info.source.chat.observe()
             );
@@ -1827,7 +1837,7 @@ impl Client {
         debug!(
             "Sending retry receipt #{} for message {} in chat {} from {} (reason: {:?})",
             retry_count,
-            info.id,
+            ObservedId::new(info.id.as_str()),
             info.source.chat.observe(),
             info.source.sender.observe(),
             reason

@@ -16,6 +16,8 @@ use wacore::types::message::AddressingMode;
 #[cfg(test)]
 use wacore_binary::DeviceKey;
 use wacore_binary::builder::NodeBuilder;
+use wacore_binary::diagnostics::ObservedId;
+use wacore_binary::jid::ObservedJid;
 use wacore_binary::{Jid, JidExt as _, Server};
 use wacore_binary::{Node, NodeContent};
 use waproto::whatsapp as wa;
@@ -2011,7 +2013,7 @@ impl Client {
                     .unwrap_or_else(|e| {
                         log::warn!(
                             "Failed to read sender key devices for {}: {:?}",
-                            group_jid,
+                            ObservedJid::from(group_jid),
                             e
                         );
                         vec![]
@@ -2055,14 +2057,14 @@ impl Client {
             "Resolved {} devices ({} need SKDM) for {}",
             all_devices.len(),
             needs_skdm.len(),
-            group_jid
+            ObservedJid::from(group_jid)
         );
         needs_skdm
     }
 
     /// SKDM target resolution for the status path, whose `GroupRoutingInfo` is built
     /// fresh per send (no stable identity to memoize against).
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.resolve_skdm_targets", level = "debug", skip_all, fields(group = %wacore_binary::jid::ObservedJid::from(group_jid))))]
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.resolve_skdm_targets", level = "debug", skip_all, fields(group = %ObservedJid::from(group_jid))))]
     async fn resolve_status_skdm_targets(
         &self,
         group_jid: &str,
@@ -2118,14 +2120,14 @@ impl Client {
                 log::debug!(
                     "Resolved {} status devices needing SKDM for {}",
                     devices.len(),
-                    group_jid
+                    ObservedJid::from(group_jid)
                 );
                 Ok(Some(devices))
             }
             Err(error) if freshness == crate::cache::Freshness::CachePreferred => {
                 log::warn!(
                     "Failed to resolve devices for SKDM check in {}: {:?}",
-                    group_jid,
+                    ObservedJid::from(group_jid),
                     error
                 );
                 Ok(None)
@@ -2137,7 +2139,7 @@ impl Client {
     /// SKDM target resolution for cached-group sends: the full device set
     /// comes from the per-group memo (`resolve_group_devices_memoized`), so a
     /// warm repeat send skips the per-member registry fan-out entirely.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.resolve_skdm_targets_memoized", level = "debug", skip_all, fields(group = %group_jid)))]
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.resolve_skdm_targets_memoized", level = "debug", skip_all, fields(group = %ObservedJid::from(group_jid))))]
     pub(crate) async fn resolve_skdm_targets_memoized(
         &self,
         group: &Jid,
@@ -2268,7 +2270,7 @@ impl Client {
                     .record_skdm_targets(Outcome::ResolveFailed);
                 log::warn!(
                     "Failed to resolve devices for SKDM check in {}: {:?}",
-                    group_jid,
+                    ObservedJid::from(group_jid),
                     e
                 );
                 None
@@ -2346,7 +2348,7 @@ impl Client {
         {
             log::warn!(
                 "Failed to update sender key devices for {}: {:?}",
-                group_jid,
+                ObservedJid::from(group_jid),
                 e
             );
             // A failed write may still have partially landed (backend
@@ -2497,7 +2499,8 @@ impl Client {
         log::info!(
             "phash mismatch for {}: resending {message_id} to {} device(s) the send missed",
             chat.observe(),
-            uncovered.len()
+            uncovered.len(),
+            message_id = ObservedId::new(message_id)
         );
         // Read once, after the refresh: repairing the device list is worth
         // doing even when the plaintext has aged out of the retry cache.
@@ -2505,7 +2508,8 @@ impl Client {
             log::debug!(
                 "phash mismatch for {}: message {message_id} is no longer held; \
                  the device list is refreshed, so the next send reaches everyone",
-                chat.observe()
+                chat.observe(),
+                message_id = ObservedId::new(message_id)
             );
             return;
         };
@@ -2520,7 +2524,8 @@ impl Client {
                 Err(e) => {
                     log::warn!(
                         "phash mismatch for {}: cached {message_id} does not decode: {e}",
-                        chat.observe()
+                        chat.observe(),
+                        message_id = ObservedId::new(message_id)
                     );
                     return;
                 }
@@ -2559,7 +2564,8 @@ impl Client {
                 log::warn!(
                     "phash mismatch for {}: resend of {message_id} to {} failed: {e}",
                     chat.observe(),
-                    device.observe()
+                    device.observe(),
+                    message_id = ObservedId::new(message_id)
                 );
             }
         }

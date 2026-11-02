@@ -150,6 +150,50 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn skdm_logs_apply_the_same_identifier_policy() {
+        if log_capture::delegated_to_child(
+            "logging::tests::skdm_logs_apply_the_same_identifier_policy",
+        ) {
+            return;
+        }
+        let client = crate::test_utils::create_test_client_with_name("skdm_log_privacy").await;
+        let map = crate::sender_key_device_cache::SenderKeyDeviceMap::from_db_rows(&[]);
+        let own = wacore_binary::Jid::lid("100000000000001");
+        let devices = [wacore_binary::Jid::lid("100000000000002")];
+        let capture = log_capture::session();
+        for group in ["19990000044-1700000000@g.us", "120363000000001@g.us"] {
+            assert_eq!(
+                client.filter_skdm_targets(group, &devices, &map, &own),
+                devices
+            );
+        }
+        let records = capture.records_for("whatsapp_rust::send");
+        assert_eq!(records.len(), 2);
+        assert!(
+            records
+                .iter()
+                .all(|(_, text)| text.contains("Resolved 1 devices (1 need SKDM)"))
+        );
+        assert!(
+            records
+                .iter()
+                .any(|(_, text)| text.contains("120363000000001@g.us"))
+        );
+        assert!(
+            records
+                .iter()
+                .any(|(_, text)| text.contains("-1700000000@g.us"))
+        );
+        if !cfg!(feature = "tracing-pii") {
+            assert!(
+                records
+                    .iter()
+                    .all(|(_, text)| !text.contains("19990000044"))
+            );
+        }
+    }
+
     #[test]
     fn stanza_logs_preserve_safe_context_at_every_level() {
         if log_capture::delegated_to_child(
@@ -249,19 +293,22 @@ mod tests {
         let jid: wacore_binary::Jid = "19990000001:2@s.whatsapp.net"
             .parse()
             .expect("valid diagnostic fixture");
+        let address =
+            wacore::libsignal::protocol::ProtocolAddress::new("19990000001:2@c.us", 0.into());
         // Warm the process's keyed identifier formatter outside attribution.
-        write!(Sink, "{}", jid.observe()).expect("valid diagnostic fixture");
+        write!(Sink, "{} {}", jid.observe(), address.observe()).expect("valid diagnostic fixture");
         let (sample, ()) = crate::test_alloc::heap_sample(|| {
             for _ in 0..128 {
                 std::hint::black_box(StanzaSummary::from(&node));
                 log::info!(logger: &FormatLogger, "{}", StanzaSummary::from(&node));
                 write!(
                     Sink,
-                    "{} {} {} {}",
+                    "{} {} {} {} {}",
                     StanzaSummary::from(&node),
                     StanzaSummary::from(&borrowed),
                     jid.observe(),
-                    wacore_binary::jid::ObservedJid::from("19990000001:2@s.whatsapp.net")
+                    wacore_binary::jid::ObservedJid::from("19990000001:2@s.whatsapp.net"),
+                    address.observe()
                 )
                 .expect("valid diagnostic fixture");
             }
