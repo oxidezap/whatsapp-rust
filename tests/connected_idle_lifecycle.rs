@@ -114,6 +114,7 @@ async fn startup_is_joined_before_maintenance_for_both_backends() -> Result<()> 
             .expect_err("offline startup is pending");
         ensure!(error.to_string().contains("startup is still in flight"));
         session.finish_control().await?;
+        session.prepare_retention().await?;
         let initialization_iqs = session.initialization_iqs();
         ensure!(
             initialization_iqs > 0,
@@ -163,6 +164,7 @@ async fn connected_control_stays_alive_without_activity() -> Result<()> {
     session.idle().await?;
     // Recent-activity decisions use wacore's real monotonic clock, not Tokio
     // time. The native measurement verifies periodic keepalive instead.
+    let pongs = session.pongs();
     session.probe().await?;
     let control = session.checkpoint().await;
     ensure!(
@@ -170,7 +172,7 @@ async fn connected_control_stays_alive_without_activity() -> Result<()> {
         "{control:?}"
     );
     ensure!(
-        session.pongs() > 0,
+        session.pongs() == pongs + 1,
         "keepalive never reached the synthetic server"
     );
     session.shutdown().await?;

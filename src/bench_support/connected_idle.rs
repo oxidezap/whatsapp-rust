@@ -188,6 +188,10 @@ impl Session {
     /// marker to `receive_activity`/`finish_control`. Requires a running Tokio runtime.
     pub async fn connect(backend: Arc<dyn Backend>) -> Result<Self> {
         let pm = Arc::new(PersistenceManager::new(backend).await?);
+        // A valid fixed-width synthetic registration ID. Random varint widths
+        // otherwise change the retained serialized Signal session by a byte.
+        pm.modify_device(|device| device.registration_id = 0x1234_5678)
+            .await;
         for command in [
             DeviceCommand::SetId(Some(Jid::new(super::OWN_USER, Server::Pn).with_device(1))),
             DeviceCommand::SetLid(Some(
@@ -214,6 +218,7 @@ impl Session {
             pongs: AtomicUsize::new(0),
             initialization_iqs: AtomicUsize::new(0),
             delivery_receipts: Mutex::new([false; MESSAGES]),
+            max_batch_frames: AtomicUsize::new(0),
         });
         let counts = Arc::new(Counts::default());
         let client = ClientBuilder::new()
@@ -296,11 +301,14 @@ impl Session {
             keys.push(key);
         }
         let text = "x".repeat(TEXT_BYTES);
-        let plaintext = wacore::messages::MessageUtils::encode_and_pad(&{
+        let mut plaintext = waproto::codec::message_to_vec(&{
             let mut proto_value = wa::Message::default();
             proto_value.conversation = Some(text.clone());
             proto_value
         });
+        // Fixed valid v2 padding keeps the AES scratch footprint identical.
+        // Production padding remains random; only this synthetic input is fixed.
+        plaintext.resize(plaintext.len() + 16, 16);
         let mut stanzas = Vec::with_capacity(MESSAGES);
         for i in 0..MESSAGES {
             let ciphertext = group_encrypt(
@@ -456,6 +464,50 @@ impl Session {
 
     pub async fn finish_control(&self) -> Result<()> {
         self.finish_offline(0).await?;
+        self.settle().await
+    }
+
+    /// Exercise a fixed, completed IQ burst before native retention sampling.
+    /// Startup concurrency otherwise leaves variable capacities in the waiter
+    /// table and sender batch vector. Their metadata remains allocated and measured.
+    pub async fn prepare_retention(&self) -> Result<()> {
+        ensure!(
+            self.client.bench_startup.pending() == 0,
+            "startup must finish before preparing retention"
+        );
+        use std::future::Future;
+        const REQUESTS: usize = 16;
+        self.wire.max_batch_frames.store(0, Ordering::Relaxed);
+        let replies = futures::future::join_all((0..REQUESTS).map(|i| {
+            self.client.send_iq_node(
+                NodeBuilder::new("iq")
+                    .attr("id", format!("RETENTION-WARM-{i:02}"))
+                    .attr("type", "get")
+                    .attr("to", "s.whatsapp.net")
+                    .attr("xmlns", "w:p")
+                    .build(),
+                Some(DEADLINE),
+            )
+        }));
+        futures::pin_mut!(replies);
+        let mut peak = 0;
+        let replies = std::future::poll_fn(|cx| {
+            let result = replies.as_mut().poll(cx);
+            peak = peak.max(self.client.response_waiters_guard().len());
+            result
+        })
+        .await;
+        for reply in replies {
+            reply?;
+        }
+        ensure!(
+            peak == REQUESTS,
+            "metadata burst did not overlap all IQs: {peak}"
+        );
+        ensure!(
+            self.wire.max_batch_frames.load(Ordering::Relaxed) >= 8,
+            "metadata burst did not fill the sender's eight-slot queue"
+        );
         self.settle().await
     }
 
@@ -728,6 +780,7 @@ struct Wire {
     pongs: AtomicUsize,
     initialization_iqs: AtomicUsize,
     delivery_receipts: Mutex<[bool; MESSAGES]>,
+    max_batch_frames: AtomicUsize,
 }
 
 impl Wire {
@@ -891,7 +944,9 @@ impl Transport for Wire {
         } else {
             &data
         };
+        let mut batch_frames = 0;
         while !remaining.is_empty() {
+            batch_frames += 1;
             ensure!(remaining.len() >= 3, "short fixture frame");
             let length = (usize::from(remaining[0]) << 16)
                 | (usize::from(remaining[1]) << 8)
@@ -947,6 +1002,8 @@ impl Transport for Wire {
                 }
             }
         }
+        self.max_batch_frames
+            .fetch_max(batch_frames, Ordering::Relaxed);
         Ok(())
     }
 
@@ -995,6 +1052,7 @@ mod tests {
             pongs: AtomicUsize::new(0),
             initialization_iqs: AtomicUsize::new(0),
             delivery_receipts: Mutex::new([false; MESSAGES]),
+            max_batch_frames: AtomicUsize::new(0),
         }
     }
 

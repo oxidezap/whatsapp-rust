@@ -17,7 +17,10 @@ Signal sessions/device lists/sender keys are established in fixture setup.
 Workload sender-key/signature RNG uses seed `0x434f4e4e45435431`; stanza IDs,
 chat IDs and repeated `x` payloads are fixed. Client identity/session and Noise
 handshake keys are freshly randomized by existing library helpers; the seed
-is not a claim that the entire handshake byte trace is identical.
+is not a claim that the entire handshake byte trace is identical. Synthetic
+registration IDs have fixed five-byte varint widths and message v2 padding is
+fixed at a valid 16 bytes: otherwise session serialization and retained AES
+scratch differ by 1 and 16 bytes respectively despite the same text payload.
 This is a representative *bounded receive/history workload*, not a fully synced
 account with all service responses or a production workload distribution.
 
@@ -105,6 +108,12 @@ The native probe fixes its blocking executor to one worker with a five-minute
 keepalive, exceeding the measured idle period. This holds executor metadata
 constant; it does not measure storage throughput. Both revisions use these
 same settings and the same fixture source, included in the harness hash.
+Before idle, both native scenarios complete a burst of 16 concurrent small IQs.
+The fixture verifies all 16 registrations overlap, at least eight frames share
+a transport write, and every waiter is removed normally. This gives the pending
+request table and reusable sender batch vector a fixed exercised high-water
+state; their allocations remain included in the measurement. No table is reset
+or shrunk. This preparation is outside the CPU benchmark surfaces.
 After verifying a periodic production keepalive during at least 61 seconds of
 real idle, the probe waits for an 11-second receive gap and completes one normal
 ping with a fixed ID. The production decoder uses a ten-second gap to start a
