@@ -7838,7 +7838,7 @@ async fn process_group_classified_with_payloads(
         .clone()
         .process_classified_message(
             ClassifiedMessage {
-                device_identity: Some(certificate),
+                device_identity: None,
                 info,
                 sender_encryption_jid: sender.clone(),
                 session_payloads,
@@ -19509,6 +19509,7 @@ async fn suppressed_resend_still_installs_the_sender_key_it_carries() {
     let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
     let bob_addr = bob_jid.to_protocol_address();
     let mut rotated = AlicePeer::new(sender_jid).await;
+    crate::test_utils::seed_adv_primary(&client, &rotated.jid).await;
     rotated.install_bob_session(&bob_addr, &bundle).await;
     let skdm = rotated.create_group_skdm(&group).await;
     let session_ct = rotated
@@ -19538,6 +19539,9 @@ async fn suppressed_resend_still_installs_the_sender_key_it_carries() {
                 crate::types::message::AddressingMode::Lid.as_str(),
             )
             .children(vec![
+                NodeBuilder::new("device-identity")
+                    .bytes(rotated.adv_certificate())
+                    .build(),
                 NodeBuilder::new("enc")
                     .attr("type", "pkmsg")
                     .attr("v", "2")

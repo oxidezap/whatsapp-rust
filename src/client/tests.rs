@@ -7289,6 +7289,23 @@ mod ensure_sessions_concurrency {
             }
         }
 
+        fn certificate(&self) -> Vec<u8> {
+            use buffa::Message;
+            let pair = KeyPair::new(
+                *self.identity.identity_key().public_key(),
+                self.identity.private_key().clone(),
+            );
+            wacore::adv::test_util::signed_identity(
+                &pair,
+                &pair,
+                b"\x18\x01",
+                &[6, 0],
+                Some(&[6, 1]),
+                true,
+            )
+            .encode_to_vec()
+        }
+
         /// A `<user>` bundle response. The one-time prekey id varies per call,
         /// as the server's does: each fetch burns one of the peer's prekeys.
         fn bundle_response(&self, jid: &Jid, request_id: &str, one_time_id: u32) -> Node {
@@ -7304,6 +7321,9 @@ mod ensure_sessions_concurrency {
                     .children([NodeBuilder::new("user")
                         .attr("jid", jid.to_string())
                         .children([
+                            NodeBuilder::new("device-identity")
+                                .bytes(self.certificate())
+                                .build(),
                             NodeBuilder::new("registration")
                                 .bytes(1234u32.to_be_bytes().to_vec())
                                 .build(),

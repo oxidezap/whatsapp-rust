@@ -10356,11 +10356,7 @@ mod tests {
                     };
                     proto
                 };
-                let signed = {
-                    let mut proto = wa::ADVSignedKeyIndexList::default();
-                    proto.details = Some(index.encode_to_vec());
-                    proto
-                };
+                let signed = crate::test_utils::sign_adv_key_index(index.encode_to_vec());
                 NodeBuilder::new("user")
                     .attr("jid", jid.clone())
                     .children([NodeBuilder::new("devices")
@@ -10368,7 +10364,7 @@ mod tests {
                             NodeBuilder::new("device-list").children(devices).build(),
                             NodeBuilder::new("key-index-list")
                                 .attr("ts", "1000")
-                                .bytes(signed.encode_to_vec())
+                                .bytes(signed)
                                 .build(),
                         ])
                         .build()])
