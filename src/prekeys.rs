@@ -1130,6 +1130,11 @@ mod tests {
             let companion = primary.with_device(7);
             let running = client.clone();
             let task = tokio::spawn(async move {
+                let _permit = if permit_held {
+                    Some(running.acquire_message_processing_permit().await)
+                } else {
+                    None
+                };
                 running
                     .ensure_adv_account_identity_with_permit(&companion, permit_held)
                     .await
