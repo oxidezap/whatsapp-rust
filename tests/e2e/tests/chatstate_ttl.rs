@@ -64,6 +64,7 @@ async fn test_fresh_chatstate_delivered_on_reconnect() -> anyhow::Result<()> {
     let mut client_b = TestClient::connect("e2e_off_chatstate_fresh_b").await?;
 
     let jid_b = client_b.jid().await;
+    let presence_from_b = client_b.client.lid().expect("paired LID").to_non_ad();
 
     info!("B={jid_b}");
 
@@ -74,7 +75,7 @@ async fn test_fresh_chatstate_delivered_on_reconnect() -> anyhow::Result<()> {
     client_a
         .wait_for_event(5, |event| {
             matches!(event,
-                Event::Presence(update) if update.from == jid_b
+                Event::Presence(update) if update.from == presence_from_b
                     && update.status == wacore::types::presence::PresenceStatus::Available
             )
         })
@@ -83,7 +84,7 @@ async fn test_fresh_chatstate_delivered_on_reconnect() -> anyhow::Result<()> {
     client_a
         .wait_for_event(5, |event| {
             matches!(event,
-                Event::Presence(update) if update.from == jid_b
+                Event::Presence(update) if update.from == presence_from_b
                     && update.status == wacore::types::presence::PresenceStatus::Unavailable
             )
         })

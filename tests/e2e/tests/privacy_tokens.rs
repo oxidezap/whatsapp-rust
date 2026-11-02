@@ -1045,6 +1045,7 @@ async fn test_restricted_presence_subscribe_requires_tctoken() -> anyhow::Result
     let mut client_b = TestClient::connect("e2e_presence_priv_b").await?;
 
     let jid_a = client_a.jid().await;
+    let presence_from_a = client_a.client.lid().expect("paired LID").to_non_ad();
     let jid_b = client_b.jid().await;
 
     let denied_waiter = client_b.client.wait_for_sent_node(
@@ -1060,35 +1061,47 @@ async fn test_restricted_presence_subscribe_requires_tctoken() -> anyhow::Result
     assert!(!has_child(&denied_node, "tctoken"));
     assert!(!has_child(&denied_node, "cstoken"));
 
+    // Finish the denied request before publishing. No token has been issued yet.
+    client_b
+        .client
+        .execute(wacore::iq::keepalive::KeepaliveSpec::with_timeout(
+            tokio::time::Duration::from_secs(2),
+        ))
+        .await?;
     client_a.client.presence().set_unavailable().await?;
-    // The tc-token seeding message doubles as the barrier. A presence update is
-    // dispatched inline off the read loop while a message goes through its chat
-    // lane first, so a presence B was not entitled to would be in B's channel
-    // before this text is.
     client_a
         .client
-        .send_message(jid_b.clone(), text_msg("seed presence tc token"))
+        .execute(wacore::iq::keepalive::KeepaliveSpec::with_timeout(
+            tokio::time::Duration::from_secs(2),
+        ))
         .await?;
     client_b
-        .assert_no_event_before(
-            30,
-            |e| matches!(e, Event::Presence(update) if update.from == jid_a && update.status == whatsapp_rust::PresenceStatus::Unavailable),
-            |e| {
-                e.messages()
-                    .any(|m| m.message.conversation.as_deref() == Some("seed presence tc token"))
+        .assert_no_event(
+            5,
+            |event| {
+                matches!(event,
+                    Event::Presence(update) if update.from == presence_from_a
+                        && update.status == whatsapp_rust::PresenceStatus::Unavailable
+                )
             },
             "restricted presence subscribe without tctoken should not deliver updates",
         )
         .await?;
-    let key_a = client_a.tc_token_key().await?;
-    client_b.wait_for_tc_token(&key_a, 10).await?;
 
+    // The token notification automatically retries the pending subscription.
+    // Capture it before seeding, and accept either order of message decryption
+    // and the now-authorized immediate presence reply.
     let allowed_waiter = client_b.client.wait_for_sent_node(
         NodeFilter::tag("presence")
             .attr("type", "subscribe")
             .attr("to", jid_a.to_string()),
     );
-    client_b.client.presence().subscribe(&jid_a).await?;
+    client_a
+        .client
+        .send_message(jid_b.clone(), text_msg("seed presence tc token"))
+        .await?;
+    let key_a = client_a.tc_token_key().await?;
+    client_b.wait_for_tc_token(&key_a, 10).await?;
     let allowed_node = tokio::time::timeout(tokio::time::Duration::from_secs(10), allowed_waiter)
         .await
         .map_err(|_| anyhow::anyhow!("Timed out waiting for allowed presence subscribe"))?
@@ -1096,18 +1109,25 @@ async fn test_restricted_presence_subscribe_requires_tctoken() -> anyhow::Result
     assert!(has_child(&allowed_node, "tctoken"));
     assert!(!has_child(&allowed_node, "cstoken"));
 
-    let _ = client_b
-        .wait_for_event(
-            5,
-            |e| matches!(e, Event::Presence(update) if update.from == jid_a && update.status == whatsapp_rust::PresenceStatus::Unavailable),
-        )
+    let mut saw_message = false;
+    let mut saw_presence = false;
+    client_b
+        .wait_for_event(10, |event| {
+            saw_message |= event.messages().any(|message| {
+                message.message.conversation.as_deref() == Some("seed presence tc token")
+            });
+            saw_presence |= matches!(event, Event::Presence(update)
+            if update.from == presence_from_a
+                && update.status == whatsapp_rust::PresenceStatus::Unavailable);
+            saw_message && saw_presence
+        })
         .await?;
 
     client_a.client.presence().set_available().await?;
     let _ = client_b
         .wait_for_event(
             10,
-            |e| matches!(e, Event::Presence(update) if update.from == jid_a && update.status == whatsapp_rust::PresenceStatus::Available),
+            |e| matches!(e, Event::Presence(update) if update.from == presence_from_a && update.status == whatsapp_rust::PresenceStatus::Available),
         )
         .await?;
 

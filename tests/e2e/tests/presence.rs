@@ -33,11 +33,12 @@ async fn test_presence_available() -> anyhow::Result<()> {
     let client_b = TestClient::connect("e2e_presence_b").await?;
 
     let jid_a = client_a.jid().await;
+    let presence_from_a = client_a.client.lid().expect("paired LID").to_non_ad();
 
     // Register waiter BEFORE subscribing so no presence stanza is missed.
     let presence_waiter = client_b
         .client
-        .wait_for_node(NodeFilter::tag("presence").attr("from", jid_a.to_string()));
+        .wait_for_node(NodeFilter::tag("presence").attr("from", presence_from_a.to_string()));
 
     // A sets available first; the server tracks this state.
     client_a.client.presence().set_available().await?;

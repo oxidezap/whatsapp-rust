@@ -606,6 +606,20 @@ impl TestClient {
         Ok(())
     }
 
+    /// Model the primary separately from this companion's socket.
+    pub async fn take_primary_offline(&self) -> anyhow::Result<()> {
+        let url = mock_admin_scan_qr_url().replace("/scan-qr", "/offline");
+        let response = UreqHttpClient::new()
+            .execute(HttpRequest::post(url).with_body(self.jid().await.user.as_bytes().to_vec()))
+            .await?;
+        anyhow::ensure!(
+            (200..300).contains(&response.status_code),
+            "taking simulated primary offline returned {}",
+            response.status_code
+        );
+        Ok(())
+    }
+
     /// Disconnect and wait for the run task to complete cleanly.
     pub async fn disconnect(self) {
         let _ = self.client.shutdown().await;
