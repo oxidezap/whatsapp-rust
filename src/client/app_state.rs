@@ -3462,11 +3462,14 @@ impl Client {
         // client is not on WhatsApp's rollout and may simply never be sent the
         // prop, and treating silence as "no" would turn the escalation off for
         // everyone it exists to help.
-        let rollout = self
-            .ab_props()
-            .get(wacore::iq::abprops::web::ENABLE_PEER_SNAPSHOT_RECOVERY)
-            .await;
-        if !RecoveryRequest::allowed_by_rollout(rollout.as_deref()) {
+        let allowed = {
+            let rollout = self
+                .ab_props()
+                .get(wacore::iq::abprops::web::ENABLE_PEER_SNAPSHOT_RECOVERY)
+                .await;
+            RecoveryRequest::allowed_by_rollout(rollout.as_deref())
+        };
+        if !allowed {
             warn!(
                 target: "Client/AppState",
                 "Not asking the primary to rebuild {name:?}: the account has peer snapshot recovery turned off"
