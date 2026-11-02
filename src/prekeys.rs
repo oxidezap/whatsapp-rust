@@ -172,9 +172,11 @@ impl Client {
             .cloned()
             .collect();
         let mut requested = jids.to_vec();
+        let mut bootstrap_primaries = Vec::new();
         for jid in jids.iter().filter(|jid| jid.device != 0) {
             let primary = jid.with_device(0);
             if !account_identities.contains_key(jid) && !requested.contains(&primary) {
+                bootstrap_primaries.push(primary.clone());
                 requested.push(primary);
             }
         }
@@ -208,14 +210,13 @@ impl Client {
         // holds companion locks, and taking the primary lock could invert its
         // lock ordering. The cache operation compares and inserts atomically.
         let backend = self.persistence_manager.backend();
-        let mut learned_primary = false;
-        for (jid, bundle) in &outcome.bundles {
-            if jid.device == 0 && !jids.contains(jid) {
+        for jid in &bootstrap_primaries {
+            if let Some(bundle) = outcome.bundles.get(jid) {
                 use wacore::types::jid::JidExt;
                 let identity = authenticated_primary_identity(bundle)?;
                 if !self
                     .signal_cache
-                    .put_identity_if_absent_or_equal(
+                    .persist_identity_if_absent_or_equal(
                         &jid.to_protocol_address(),
                         identity.public_key().public_key_bytes(),
                         &*backend,
@@ -224,11 +225,7 @@ impl Client {
                 {
                     anyhow::bail!("primary identity changed during companion bootstrap");
                 }
-                learned_primary = true;
             }
-        }
-        if learned_primary {
-            self.flush_signal_cache_batch_safe().await?;
         }
         // Keep the public fetch outcome scoped to the caller's requested devices.
         outcome.bundles.retain(|jid, _| jids.contains(jid));
@@ -281,15 +278,6 @@ impl Client {
     /// First contact uses the primary's signed prekey, just as a direct primary
     /// session does. Device-list blobs never rotate an already stored identity.
     pub(crate) async fn ensure_adv_account_identity(&self, jid: &Jid) -> anyhow::Result<[u8; 32]> {
-        self.ensure_adv_account_identity_with_permit(jid, false)
-            .await
-    }
-
-    pub(crate) async fn ensure_adv_account_identity_with_permit(
-        &self,
-        jid: &Jid,
-        processing_permit_held: bool,
-    ) -> anyhow::Result<[u8; 32]> {
         use wacore::types::jid::JidExt;
         let primary = jid.with_device(0);
         let address = primary.to_protocol_address();
@@ -311,30 +299,10 @@ impl Client {
         let backend = self.persistence_manager.backend();
         if !self
             .signal_cache
-            .put_identity_if_absent_or_equal(&address, &key, &*backend)
+            .persist_identity_if_absent_or_equal(&address, &key, &*backend)
             .await?
         {
             anyhow::bail!("primary identity changed during ADV bootstrap");
-        }
-        // Never wait for the processing permit while holding a primary session
-        // lock: a message holding that permit may need the same primary.
-        drop(_guard);
-        if processing_permit_held {
-            if self.inbound_commit_batch.is_active() {
-                let client = self
-                    .self_weak
-                    .get()
-                    .and_then(|weak| weak.upgrade())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("client unavailable during ADV trust persistence")
-                    })?;
-                if !client.commit_inbound_batch_holding_permit().await {
-                    anyhow::bail!("ADV trust persistence deferred: inbound batch commit failed");
-                }
-            }
-            self.flush_signal_cache().await?;
-        } else {
-            self.flush_signal_cache_batch_safe().await?;
         }
         Ok(key)
     }
@@ -1156,6 +1124,13 @@ mod tests {
             if draining {
                 client.inbound_commit_batch.reset();
                 client.swap_message_semaphore(1);
+                client
+                    .signal_cache
+                    .put_session(
+                        &wacore::libsignal::protocol::ProtocolAddress::new("unrelated", 0.into()),
+                        wacore::libsignal::protocol::SessionRecord::new_fresh(),
+                    )
+                    .await;
                 let mut message = waproto::whatsapp::Message::default();
                 message.conversation = Some("pending before trust bootstrap".into());
                 let pending = wacore::types::events::InboundMessage::builder()
@@ -1185,9 +1160,7 @@ mod tests {
                 } else {
                     None
                 };
-                running
-                    .ensure_adv_account_identity_with_permit(&companion, permit_held)
-                    .await
+                running.ensure_adv_account_identity(&companion).await
             });
             let request = crate::test_utils::decode_sent_iq(&transport, 0).await;
             let id = request
@@ -1238,13 +1211,44 @@ mod tests {
                 .build();
             crate::test_utils::answer_iq(&client, &id, &response).await;
             let result = task.await.unwrap();
-            assert_eq!(result.is_ok(), valid && !fail_commit);
+            assert_eq!(result.is_ok(), valid);
             let backend = client.persistence_manager.backend();
+            if draining {
+                assert!(
+                    client.inbound_commit_batch.has_entries(),
+                    "trust persistence must not drain unrelated plaintext"
+                );
+                assert!(
+                    backend
+                        .get_pending_inbound(
+                            "12025550125@s.whatsapp.net",
+                            "12025550125@s.whatsapp.net",
+                            "BEFORE_ADV"
+                        )
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    backend
+                        .get_session(
+                            wacore::libsignal::protocol::ProtocolAddress::new(
+                                "unrelated",
+                                0.into()
+                            )
+                            .as_str()
+                        )
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "unrelated ratchets must stay unflushed"
+                );
+            }
             let persisted = backend
                 .load_identity(&primary.to_protocol_address().to_string())
                 .await
                 .unwrap();
-            if valid && !fail_commit {
+            if valid {
                 let key: [u8; 32] = account.public_key.public_key_bytes().try_into().unwrap();
                 assert_eq!(result.unwrap(), key);
                 assert_eq!(persisted, Some(key));
@@ -1264,7 +1268,7 @@ mod tests {
             } else {
                 assert!(
                     persisted.is_none(),
-                    "invalid signatures or failed inbound commits must not persist trust"
+                    "invalid signatures must not persist trust"
                 );
             }
             client.signal_shutdown_sync();

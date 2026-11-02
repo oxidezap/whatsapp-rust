@@ -1719,14 +1719,22 @@ impl SignalStoreCache {
     }
 
     /// Establish first-contact trust without replacing a concurrently learned
-    /// identity. Unlike a Signal identity rotation, bootstrap must fail closed
+    /// identity. Persists only that identity, without flushing session state.
+    /// Unlike a Signal identity rotation, bootstrap must fail closed
     /// when another key is already known, including in the persisted store.
-    pub async fn put_identity_if_absent_or_equal(
+    pub async fn persist_identity_if_absent_or_equal(
         &self,
         address: &ProtocolAddress,
         data: &[u8],
         backend: &dyn SignalStore,
     ) -> Result<bool> {
+        let key: [u8; 32] = data
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid bootstrap identity length"))?;
+        // Serialize with full flushes so an older snapshot cannot overwrite
+        // this write. Persist only this identity: session ratchets may belong
+        // to an offline batch whose plaintext is not durable yet.
+        let _flush = self.flush_lock.lock().await;
         let mut state = self.identities.lock().await;
         let previous = match state.cache.get(address.as_str()) {
             Some(cached) => cached.clone(),
@@ -1738,8 +1746,11 @@ impl SignalStoreCache {
         if previous.as_deref().is_some_and(|known| known != data) {
             return Ok(false);
         }
+        backend.put_identity(address.as_str(), key).await?;
         let _change = self.identity_write_change(&state, address, data);
         state.put_dedup(address.as_str(), data);
+        state.dirty.remove(address.as_str());
+        state.deleted.remove(address.as_str());
         state.evict_if_needed(self.max_entries);
         Ok(true)
     }
@@ -7698,8 +7709,8 @@ mod identity_continuity_tests {
         let backend = crate::store::in_memory::InMemoryBackend::new();
         let address = ProtocolAddress::new("15550000002", 0.into());
         let (first, second) = futures::join!(
-            cache.put_identity_if_absent_or_equal(&address, &[1; 32], &backend),
-            cache.put_identity_if_absent_or_equal(&address, &[2; 32], &backend),
+            cache.persist_identity_if_absent_or_equal(&address, &[1; 32], &backend),
+            cache.persist_identity_if_absent_or_equal(&address, &[2; 32], &backend),
         );
         let first = first.unwrap();
         assert_ne!(first, second.unwrap());
@@ -7709,12 +7720,12 @@ mod identity_continuity_tests {
         let cold = SignalStoreCache::new();
         assert!(
             !cold
-                .put_identity_if_absent_or_equal(&address, &rejected, &backend)
+                .persist_identity_if_absent_or_equal(&address, &rejected, &backend)
                 .await
                 .unwrap()
         );
         assert!(
-            cold.put_identity_if_absent_or_equal(&address, &accepted, &backend)
+            cold.persist_identity_if_absent_or_equal(&address, &accepted, &backend)
                 .await
                 .unwrap()
         );

@@ -7389,9 +7389,18 @@ mod ensure_sessions_concurrency {
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
         let primary = Jid::pn("12025550128");
         let companion = primary.with_device(2);
+        client.inbound_commit_batch.reset();
+        client.swap_message_semaphore(1);
+        let processing_permit = client.acquire_message_processing_permit().await;
         let running = client.clone();
         let requested = companion.clone();
-        let task = tokio::spawn(async move { running.fetch_pre_keys(&[requested], None).await });
+        let task = tokio::spawn(async move {
+            let lock = running
+                .session_lock_for(requested.to_protocol_address().as_str())
+                .await;
+            let _session = lock.lock().await;
+            running.fetch_pre_keys(&[requested], None).await
+        });
         let request = crate::test_utils::decode_sent_iq(&transport, 0).await;
         let id = request
             .get()
@@ -7431,15 +7440,45 @@ mod ensure_sessions_concurrency {
             .children()
             .unwrap()[0]
             .clone();
+        let unsolicited = Jid::pn("12025550130");
+        let unsolicited_user = keys
+            .bundle_response(&unsolicited, &id, 4)
+            .children()
+            .unwrap()[0]
+            .children()
+            .unwrap()[0]
+            .clone();
         let response = NodeBuilder::new("iq")
             .attr("type", "result")
             .attr("id", id.as_str())
             .children([NodeBuilder::new("list")
-                .children([companion_user, primary_user])
+                .children([companion_user, primary_user, unsolicited_user])
                 .build()])
             .build();
         crate::test_utils::answer_iq(&client, &id, &response).await;
-        let result = task.await.unwrap().unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("bootstrap must not acquire the held processing permit")
+            .unwrap()
+            .unwrap();
+        drop(processing_permit);
+        assert!(
+            client
+                .cached_adv_account_identity(&unsolicited)
+                .await
+                .unwrap()
+                .is_none(),
+            "unsolicited primary keys must never become trusted"
+        );
+        assert!(
+            client
+                .persistence_manager
+                .backend()
+                .load_identity(unsolicited.to_protocol_address().as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(result.bundles.contains_key(&companion));
         assert_eq!(
             client

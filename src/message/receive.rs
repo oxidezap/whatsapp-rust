@@ -171,9 +171,7 @@ impl Client {
         }
         let certificate = certificate
             .ok_or_else(|| anyhow::anyhow!("companion message omits ADV certificate"))?;
-        let primary = self
-            .ensure_adv_account_identity_with_permit(sender, true)
-            .await?;
+        let primary = self.ensure_adv_account_identity(sender).await?;
         if wacore::adv::validate_adv_with_identity_key(
             certificate,
             identity,
