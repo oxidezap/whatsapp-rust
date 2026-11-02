@@ -408,3 +408,51 @@ impl RecoveryCollection {
         self.0
     }
 }
+
+pub const MAX_SYNC_PAGES: u32 = 500;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Pagination {
+    pages: u32,
+}
+
+impl Pagination {
+    #[inline]
+    pub fn next_page(&mut self) -> Option<u32> {
+        if self.pages == MAX_SYNC_PAGES {
+            return None;
+        }
+        self.pages += 1;
+        Some(self.pages)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryRequest {
+    NotNeeded,
+    BlockList,
+    Eligible,
+}
+
+impl RecoveryRequest {
+    #[inline]
+    pub fn for_error(name: WAPatchName, error: Option<&crate::appstate::AppStateError>) -> Self {
+        use crate::appstate::AppStateError;
+        if !matches!(
+            error,
+            Some(AppStateError::SnapshotMACMismatch | AppStateError::SnapshotMACMissing)
+        ) {
+            Self::NotNeeded
+        } else if name == WAPatchName::CriticalBlock {
+            Self::BlockList
+        } else {
+            Self::Eligible
+        }
+    }
+
+    /// An absent rollout property is not a refusal for clients outside the rollout.
+    #[inline]
+    pub fn allowed_by_rollout(value: Option<&str>) -> bool {
+        !value.is_some_and(|value| value == "0" || value.eq_ignore_ascii_case("false"))
+    }
+}

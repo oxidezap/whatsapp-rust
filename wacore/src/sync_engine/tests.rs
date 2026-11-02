@@ -450,3 +450,48 @@ fn recovery_record_limit_is_inclusive_and_nonpositive_means_unbounded() {
         assert!(collection.admit_records(usize::MAX, allowed).is_ok());
     }
 }
+
+#[test]
+fn pagination_allows_exactly_five_hundred_pages() {
+    let mut pagination = Pagination::default();
+    for expected in 1..=500 {
+        assert_eq!(pagination.next_page(), Some(expected));
+    }
+    assert_eq!(pagination.next_page(), None);
+    assert_eq!(pagination.next_page(), None);
+}
+
+#[test]
+fn snapshot_recovery_escalates_only_snapshot_authentication_failures() {
+    use crate::appstate::AppStateError;
+    for name in [WAPatchName::Regular, WAPatchName::CriticalBlock] {
+        assert_eq!(
+            RecoveryRequest::for_error(name, None),
+            RecoveryRequest::NotNeeded
+        );
+        for error in [
+            AppStateError::SnapshotMACMissing,
+            AppStateError::SnapshotMACMismatch,
+        ] {
+            assert_eq!(
+                RecoveryRequest::for_error(name, Some(&error)),
+                if name == WAPatchName::CriticalBlock {
+                    RecoveryRequest::BlockList
+                } else {
+                    RecoveryRequest::Eligible
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn absent_rollout_is_not_a_refusal_and_false_is_case_insensitive() {
+    assert!(RecoveryRequest::allowed_by_rollout(None));
+    for value in ["1", "true", "", " false ", "00"] {
+        assert!(RecoveryRequest::allowed_by_rollout(Some(value)));
+    }
+    for value in ["0", "false", "FALSE", "FaLsE"] {
+        assert!(!RecoveryRequest::allowed_by_rollout(Some(value)));
+    }
+}

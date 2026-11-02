@@ -6,9 +6,10 @@ pub(crate) mod prefetch_bench;
 use super::*;
 pub(crate) use wacore::sync_engine::app_state::{
     BatchedSyncOutcome, BatchedSyncRequest, BootstrapState, CollectionDisposition,
-    CollectionRetryState, CriticalSyncPlan, RecoveryCollection, ReservationSkip, ReservationWait,
-    RetryBudget, RetryProgress, ScopeLost, StandDown, SyncHolder, SyncOutcome, SyncScope,
-    SyncSettles, Unaccounted, initial_key_retry as initial_app_state_key_retry, next_key_retry,
+    CollectionRetryState, CriticalSyncPlan, MAX_SYNC_PAGES, Pagination, RecoveryCollection,
+    RecoveryRequest, ReservationSkip, ReservationWait, RetryBudget, RetryProgress, ScopeLost,
+    StandDown, SyncHolder, SyncOutcome, SyncScope, SyncSettles, Unaccounted,
+    initial_key_retry as initial_app_state_key_retry, next_key_retry,
 };
 
 use crate::features::{AppStateError, AppStateResyncMode, AppStateResyncReport};
@@ -138,7 +139,7 @@ const APP_STATE_PATCH_SEND_ATTEMPTS: usize = 5;
 ///
 /// A holder's honest worst case is not derivable: a patch send keeps the
 /// reservation across `fetch_app_state_with_retry_inner`, which may page up to
-/// `MAX_PAGINATION_ITERATIONS` IQs, so any bound short enough to be useful can
+/// `MAX_SYNC_PAGES` IQs, so any bound short enough to be useful can
 /// expire on healthy work. What makes the bound safe is not its size but that
 /// running out is never lossy — the collection comes back `retryable` and the
 /// retry scheduler picks it up. This value covers the common case
@@ -1819,8 +1820,7 @@ impl Client {
         // never bites. Rounds are back-to-back there too; the syncd backoff
         // applies to retrying a *failed* collection later, not to paging one
         // that is still making progress.
-        const MAX_ITERATIONS: usize = 500;
-        let mut iteration = 0;
+        let mut pages = Pagination::default();
         // Spent on the first round: the rebuild is what stands the collection
         // down, and every round after it is the pagination that follows from
         // there — re-standing it down would throw away the page just applied and
@@ -1836,7 +1836,9 @@ impl Client {
         // reads `from_full_sync` to tell apart.
         let mut replaying_snapshot: HashSet<WAPatchName> = HashSet::new();
 
-        while !pending.is_empty() && iteration < MAX_ITERATIONS {
+        while !pending.is_empty()
+            && let Some(iteration) = pages.next_page()
+        {
             // With the cap at WA Web's 500, a collection paging healthily can
             // outlast the bootstrap's watchdog and be cut off mid-page on every
             // attempt, never reaching readiness though every page succeeded.
@@ -1850,11 +1852,10 @@ impl Client {
                 outcome.retryable.extend(pending);
                 return Ok(());
             }
-            iteration += 1;
             debug!(
                 target: "Client/AppState",
                 "Batched sync iteration {}/{}: {:?}",
-                iteration, MAX_ITERATIONS, pending
+                iteration, MAX_SYNC_PAGES, pending
             );
 
             let backend = self.persistence_manager.backend();
@@ -2287,7 +2288,7 @@ impl Client {
             warn!(
                 target: "Client/AppState",
                 "Batched sync: max iterations ({}) reached for {:?}",
-                MAX_ITERATIONS, pending
+                MAX_SYNC_PAGES, pending
             );
             outcome.retryable.extend(pending);
         }
@@ -2328,8 +2329,7 @@ impl Client {
         let mut want_snapshot = full_sync;
         // Safety cap to prevent infinite loops if the server keeps returning
         // has_more_patches=true without advancing the version (WA Web uses 500).
-        const MAX_PAGINATION_ITERATIONS: u32 = 500;
-        let mut iteration = 0u32;
+        let mut pages = Pagination::default();
         // Every exit below still falls through to `set_version`: the pages
         // already applied are durable whether or not the rest arrived. Only
         // what the caller is told changes.
@@ -2341,9 +2341,8 @@ impl Client {
                 outcome = SyncOutcome::Deferred;
                 break;
             }
-            iteration += 1;
-            if iteration > MAX_PAGINATION_ITERATIONS {
-                warn!(target: "Client/AppState", "App state sync for {:?} exceeded {} iterations, aborting", name, MAX_PAGINATION_ITERATIONS);
+            let Some(_page) = pages.next_page() else {
+                warn!(target: "Client/AppState", "App state sync for {:?} exceeded {} iterations, aborting", name, MAX_SYNC_PAGES);
                 // `has_more` is still set, so the persisted version is below the
                 // server's head — which is the definition of deferred, whatever
                 // the reason for stopping. Reporting completion here would have
@@ -2356,7 +2355,7 @@ impl Client {
                 // a later attempt is the only thing that ever fixes it.
                 outcome = SyncOutcome::Deferred;
                 break;
-            }
+            };
             debug!(target: "Client/AppState", "Fetching app state patch batch: name={:?} want_snapshot={want_snapshot} version={} full_sync={} has_more_previous={}", name, state.version, full_sync, has_more);
 
             // See the batched builder: `version` is unconditional, matching
@@ -3447,24 +3446,13 @@ impl Client {
     /// the one collection where being wrong means talking to somebody who was
     /// blocked.
     async fn escalate_to_snapshot_recovery(&self, name: WAPatchName, err: &anyhow::Error) {
-        use wacore::appstate::AppStateError;
-
-        // A snapshot that omits its MAC or key id is refused by the same gate
-        // for the same reason -- unverified records are not applied -- and
-        // leaves the collection just as stuck. WA Web's anti-tampering compares
-        // against a possibly-undefined mac and reaches recovery either way.
-        if !matches!(
-            err.downcast_ref::<AppStateError>(),
-            Some(AppStateError::SnapshotMACMismatch | AppStateError::SnapshotMACMissing)
-        ) {
-            return;
-        }
-        if name == WAPatchName::CriticalBlock {
-            warn!(
-                target: "Client/AppState",
-                "Not asking the primary to rebuild {name:?}: the block list is not recovered this way"
-            );
-            return;
+        match RecoveryRequest::for_error(name, err.downcast_ref()) {
+            RecoveryRequest::NotNeeded => return,
+            RecoveryRequest::BlockList => {
+                warn!(target: "Client/AppState", "Not asking the primary to rebuild {name:?}: the block list is not recovered this way");
+                return;
+            }
+            RecoveryRequest::Eligible => {}
         }
 
         // The rollout gate WA Web reads. Honoured when the server has actually
@@ -3474,12 +3462,11 @@ impl Client {
         // client is not on WhatsApp's rollout and may simply never be sent the
         // prop, and treating silence as "no" would turn the escalation off for
         // everyone it exists to help.
-        if self
+        let rollout = self
             .ab_props()
             .get(wacore::iq::abprops::web::ENABLE_PEER_SNAPSHOT_RECOVERY)
-            .await
-            .is_some_and(|value| value == "0" || value.eq_ignore_ascii_case("false"))
-        {
+            .await;
+        if !RecoveryRequest::allowed_by_rollout(rollout.as_deref()) {
             warn!(
                 target: "Client/AppState",
                 "Not asking the primary to rebuild {name:?}: the account has peer snapshot recovery turned off"
