@@ -48,13 +48,26 @@ impl UnifiedSessionManager {
     }
 
     /// Update server time offset from node's `t` attribute (Unix timestamp in seconds).
+    #[cfg(test)]
     pub(crate) fn update_server_time_offset(&self, node: &wacore_binary::NodeRef<'_>) {
+        self.update_server_time_offset_at(node, wacore::time::now_secs());
+    }
+
+    pub(crate) fn update_server_time_offset_at(
+        &self,
+        node: &wacore_binary::NodeRef<'_>,
+        local_time: i64,
+    ) {
         if let Some(t_val) = node.get_attr("t").map(|v| v.as_str())
             && let Ok(server_time) = t_val.parse::<i64>()
             && server_time > 0
         {
-            let local_time = wacore::time::now_secs();
-            let offset_ms = (server_time - local_time) * 1000;
+            let Some(offset_ms) = server_time
+                .checked_sub(local_time)
+                .and_then(|offset| offset.checked_mul(1000))
+            else {
+                return;
+            };
             self.server_time_offset_ms
                 .store(offset_ms, Ordering::Relaxed);
             debug!(target: "UnifiedSession", "Server time offset: {}ms", offset_ms);
@@ -77,22 +90,40 @@ impl UnifiedSessionManager {
             && let Ok(server_time) = t_val.parse::<i64>()
             && server_time > 0
         {
-            let midpoint_s = (start_time_ms + rtt_ms / 2) / 1000;
-            let offset_ms = (server_time - midpoint_s) * 1000;
+            let Some(midpoint_ms) = start_time_ms.checked_add(rtt_ms / 2) else {
+                return;
+            };
+            let midpoint_s = midpoint_ms / 1000;
+            let Some(offset_ms) = server_time
+                .checked_sub(midpoint_s)
+                .and_then(|offset| offset.checked_mul(1000))
+            else {
+                return;
+            };
             self.server_time_offset_ms
                 .store(offset_ms, Ordering::Relaxed);
             debug!(target: "UnifiedSession", "Server time offset: {}ms (RTT: {}ms)", offset_ms, rtt_ms);
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn calculate_session_id(&self) -> String {
+        self.calculate_session_id_at(wacore::time::now_millis())
+    }
+
+    pub(crate) fn calculate_session_id_at(&self, now_millis: i64) -> String {
         let offset = self.server_time_offset_ms.load(Ordering::Relaxed);
-        UnifiedSession::calculate_id(offset)
+        UnifiedSession::calculate_id_at(offset, now_millis)
     }
 
     /// Prepare to send unified session. Returns None if duplicate (already sent this ID).
+    #[cfg(test)]
     pub(crate) async fn prepare_send(&self) -> Option<(Node, u64)> {
-        let session_id = self.calculate_session_id();
+        self.prepare_send_at(wacore::time::now_millis()).await
+    }
+
+    pub(crate) async fn prepare_send_at(&self, now_millis: i64) -> Option<(Node, u64)> {
+        let session_id = self.calculate_session_id_at(now_millis);
 
         {
             let mut last_id = self.last_sent_id.lock().await;
@@ -137,6 +168,27 @@ impl UnifiedSessionManager {
 mod tests {
     use super::*;
     use wacore_binary::builder::NodeBuilder;
+
+    #[test]
+    fn explicit_server_offset_keeps_the_previous_value_on_overflow() {
+        let session = UnifiedSessionManager::new();
+        let valid = NodeBuilder::new("success").attr("t", "1700000010").build();
+        session.update_server_time_offset_at(&valid.as_node_ref(), 1_700_000_000);
+        assert_eq!(session.server_time_offset_ms(), 10_000);
+        assert_eq!(
+            session.calculate_session_id_at(1_700_000_000_000),
+            UnifiedSession::calculate_id_at(10_000, 1_700_000_000_000)
+        );
+        let invalid = NodeBuilder::new("success")
+            .attr("t", "1000000000000000000")
+            .build();
+        session.update_server_time_offset_at(&invalid.as_node_ref(), 1_700_000_000);
+        assert_eq!(session.server_time_offset_ms(), 10_000);
+        assert_eq!(
+            session.calculate_session_id_at(1_700_000_000_000),
+            UnifiedSession::calculate_id_at(10_000, 1_700_000_000_000)
+        );
+    }
 
     #[test]
     fn test_manager_fields_are_inline() {

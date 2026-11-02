@@ -889,6 +889,12 @@ fn unsupported_pending_inbound() -> crate::store::error::StoreError {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait ProtocolStore: Send + Sync {
+    /// The clock used for locally generated storage timestamps.
+    #[cfg(feature = "instance-clock")]
+    fn clock(&self) -> Option<&Arc<dyn crate::time::Clock>> {
+        None
+    }
+
     // --- Per-Device Sender Key Tracking (matches WA Web's participant.senderKey Map) ---
 
     /// Get the sender key distribution status for all known devices in a group.
@@ -1600,6 +1606,16 @@ pub fn merge_msg_secret_message_ts(existing: i64, incoming: i64) -> i64 {
 pub trait Backend:
     SignalStore + AppSyncStore + ProtocolStore + MsgSecretStore + DeviceStore + Send + Sync
 {
+}
+
+impl dyn Backend + '_ {
+    #[inline]
+    pub fn instance_clock(&self) -> Option<&Arc<dyn crate::time::Clock>> {
+        #[cfg(feature = "instance-clock")]
+        return self.clock();
+        #[cfg(not(feature = "instance-clock"))]
+        None
+    }
 }
 
 impl<T> Backend for T where

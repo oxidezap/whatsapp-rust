@@ -658,7 +658,7 @@ impl Client {
             .optional_u64("t")
             .and_then(|t| i64::try_from(t).ok())
             .and_then(wacore::time::from_secs)
-            .unwrap_or_else(wacore::time::now_utc);
+            .unwrap_or_else(|| self.runtime.wall_time_utc());
 
         // WA Web downgrades a delivery ack to "sent" (not delivered) when the receipt carries
         // <error reason="lid" type="feature-incapable"> (the LID peer can't receive it).
@@ -946,7 +946,7 @@ impl Client {
         };
         self.outbound_flush.spawn(&*self.runtime, async move {
             let active = client.receipts_are_active();
-            let timestamp = wacore::time::now_utc().timestamp().to_string();
+            let timestamp = client.runtime.wall_time_secs().to_string();
             let groups = group_delivery_receipts(&infos, active);
             debug!(
                 target: "Client/Receipt",
@@ -1172,7 +1172,7 @@ impl Client {
             return Ok(());
         }
 
-        let timestamp = wacore::time::now_secs_u64().to_string();
+        let timestamp = self.runtime.wall_time_secs_u64().to_string();
 
         // Status reads from a LID author carry peer_participant_pn (the resolved
         // LID->PN), matching WA Web's LidMigrationUtils.toPn.
@@ -1233,7 +1233,7 @@ impl Client {
             return Ok(());
         }
 
-        let timestamp = wacore::time::now_secs_u64().to_string();
+        let timestamp = self.runtime.wall_time_secs_u64().to_string();
 
         debug!(target: "Client/Receipt", "Sending played receipt for {} message(s) to {}", message_ids.len(), chat.observe());
 

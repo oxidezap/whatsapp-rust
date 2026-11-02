@@ -10219,7 +10219,7 @@ async fn app_state_key_share_transport_retry_waits_for_reconnect() {
     // A new connection generation is a new Noise session: production reruns the
     // handshake and installs fresh keys and counters. Swap the socket to match,
     // since the one the failed frame poisoned dies with the old connection.
-    client.connection_generation.fetch_add(1, Ordering::AcqRel);
+    client.advance_generation_for_test(1, Ordering::AcqRel);
     *client.noise_socket.lock().unwrap() = Some(Arc::new(crate::socket::NoiseSocket::new(
         Arc::new(crate::runtime_impl::TokioRuntime),
         transport.clone() as Arc<dyn crate::transport::Transport>,
@@ -10333,7 +10333,7 @@ async fn app_state_key_share_survives_a_closed_flush_scope() {
     .expect("key-share job should observe the closed scope");
     assert_eq!(transport.sent_count(), sent_before);
 
-    client.connection_generation.fetch_add(1, Ordering::AcqRel);
+    client.advance_generation_for_test(1, Ordering::AcqRel);
     client.outbound_flush.reopen();
     client.offline_sync_notifier.notify(usize::MAX);
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -15728,7 +15728,7 @@ async fn a_stanza_abandoned_by_a_teardown_reports_what_it_never_tried() {
 
     // The generation this stanza was classified under, before teardown bumps it.
     let stale_generation = client.connection_generation.load(Ordering::Acquire);
-    client.connection_generation.fetch_add(1, Ordering::AcqRel);
+    client.advance_generation_for_test(1, Ordering::AcqRel);
 
     client
         .clone()

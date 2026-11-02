@@ -170,6 +170,7 @@ zerocopy = { version = "0.8.55", default-features = false, features = ["derive"]
 zlib-rs = { version = "0.6.6", default-features = false, features = ["std", "rust-allocator"] }
 
 [features]
+instance-clock = ["wacore/instance-clock", "whatsapp-rust-sqlite-storage?/instance-clock"]
 # Source-qualified group parsing requires explicit effective account facts.
 # Kept opt-in to preserve the default runtime footprint.
 generated-group-notifications = []
@@ -340,6 +341,9 @@ getrandom = { workspace = true, features = ["wasm_js"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 send_wrapper = { version = "0.6", features = ["futures"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+parking_lot = "=0.12.5"
 
 [dev-dependencies]
 aes = { workspace = true }

@@ -201,6 +201,19 @@ impl LidPnCache {
         }
     }
 
+    pub(crate) fn with_config_on(
+        config: &CacheEntryConfig,
+        store: Option<Arc<dyn wacore::store::CacheStore>>,
+        runtime: &Arc<dyn wacore::runtime::Runtime>,
+    ) -> Self {
+        let mut this = Self::with_config(config, store);
+        this.lid_to_entry = this.lid_to_entry.on_runtime(runtime);
+        this.pn_to_entry = this.pn_to_entry.on_runtime(runtime);
+        this.persisted = this.persisted.on_runtime(runtime);
+        this.contact_hash_to_lid = this.contact_hash_to_lid.on_runtime(runtime);
+        this
+    }
+
     /// Releases transient startup provenance on success, read error, or cancellation.
     pub(crate) fn warm_up_guard(&self) -> LidPnWarmUpGuard<'_> {
         LidPnWarmUpGuard(self)

@@ -18,6 +18,7 @@ use futures::FutureExt;
 use futures::future::{Fuse, FusedFuture};
 
 use crate::runtime::{BoxFuture, Runtime};
+#[cfg(not(feature = "instance-clock"))]
 use crate::time::Instant;
 use crate::voip::audio::EncodedAudioFrame;
 use crate::voip::demux::{RelayPacketKind, classify_relay_packet};
@@ -778,18 +779,42 @@ pub async fn run_call(
     channels: CallChannels,
     eng: CallEngine,
 ) -> MediaCloseReason {
-    let epoch = Instant::now();
-    let wallclock_ms = crate::time::now_millis().max(0) as u64;
-    run_call_with_clock_and_wallclock(
-        rt,
-        transport,
-        relay_events,
-        channels,
-        eng,
-        move || epoch.elapsed().as_millis() as u64,
-        wallclock_ms,
-    )
-    .await
+    #[cfg(feature = "instance-clock")]
+    {
+        let epoch = rt.monotonic_time();
+        let wallclock_ms = rt.wall_time_millis().max(0) as u64;
+        let clock = Arc::clone(&rt);
+        run_call_with_clock_and_wallclock(
+            rt,
+            transport,
+            relay_events,
+            channels,
+            eng,
+            move || {
+                clock
+                    .monotonic_time()
+                    .saturating_duration_since(epoch)
+                    .as_millis() as u64
+            },
+            wallclock_ms,
+        )
+        .await
+    }
+    #[cfg(not(feature = "instance-clock"))]
+    {
+        let epoch = Instant::now();
+        let wallclock_ms = crate::time::now_millis().max(0) as u64;
+        run_call_with_clock_and_wallclock(
+            rt,
+            transport,
+            relay_events,
+            channels,
+            eng,
+            move || epoch.elapsed().as_millis() as u64,
+            wallclock_ms,
+        )
+        .await
+    }
 }
 
 /// [`run_call`] with an injectable monotonic clock, so tests can drive the keepalive/playout timers
@@ -1656,6 +1681,7 @@ async fn run_call_with_clock_and_wallclock(
 mod tests {
     use super::*;
     use crate::runtime::AbortHandle;
+    use crate::time::Instant;
     use crate::types::group_call::{
         GroupCallDevice, GroupCallParticipant, GroupCallRelay, GroupCallRelayEndpoint,
         GroupCallUpdate,

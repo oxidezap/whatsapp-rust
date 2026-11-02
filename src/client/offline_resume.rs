@@ -787,9 +787,7 @@ mod tests {
         let sender = tokio::spawn(async move { send_continuation(&send_client, generation).await });
         started.recv().await.unwrap();
         client.offline_batch.reset();
-        client
-            .connection_generation
-            .store(generation + 1, Ordering::Release);
+        client.set_generation_for_test(generation + 1, Ordering::Release);
         client.offline_batch.arm(generation + 1, 1_000);
         let seen = client.offline_batch.stanza_activity();
         release.send(()).await.unwrap();

@@ -381,7 +381,7 @@ async fn handle_client_expiration(client: &Arc<Client>, child: &wacore_binary::N
     let decision = ServerClientExpiration::decide(
         snapshot.server_client_expiration.as_ref(),
         t,
-        wacore::time::now_secs() as i64,
+        client.runtime.wall_time_secs(),
         version,
     );
 

@@ -1,3 +1,8 @@
+#[cfg(feature = "instance-clock")]
+mod clocked;
+#[cfg(feature = "instance-clock")]
+pub use clocked::ClockedRuntime;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -13,6 +18,14 @@ use crate::sync_marker::{MaybeSend, MaybeSendSync};
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 pub trait Runtime: MaybeSendSync + 'static {
+    /// An instance clock with a fixed domain for this runtime's lifetime.
+    /// `None` preserves the existing process-wide providers.
+    /// Decorators must forward this port to preserve the wrapped clock and its timers.
+    #[cfg(feature = "instance-clock")]
+    fn clock(&self) -> Option<&std::sync::Arc<dyn crate::time::Clock>> {
+        None
+    }
+
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> AbortHandle;
 
     /// Spawn a task nobody will cancel.
@@ -56,6 +69,14 @@ pub trait Runtime: MaybeSendSync + 'static {
 #[cfg(target_arch = "wasm32")]
 #[async_trait(?Send)]
 pub trait Runtime: MaybeSendSync + 'static {
+    /// An instance clock with a fixed domain for this runtime's lifetime.
+    /// `None` preserves the existing process-wide providers.
+    /// Decorators must forward this port to preserve the wrapped clock and its timers.
+    #[cfg(feature = "instance-clock")]
+    fn clock(&self) -> Option<&std::sync::Arc<dyn crate::time::Clock>> {
+        None
+    }
+
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + 'static>>) -> AbortHandle;
 
     /// See the native variant: skips building an [`AbortHandle`] nobody keeps.
@@ -76,6 +97,72 @@ pub trait Runtime: MaybeSendSync + 'static {
     /// Single-threaded runtimes should return 1 to avoid starving the event loop.
     fn yield_frequency(&self) -> u32 {
         10
+    }
+}
+
+impl dyn Runtime {
+    #[inline]
+    pub fn instance_clock(&self) -> Option<&std::sync::Arc<dyn crate::time::Clock>> {
+        #[cfg(feature = "instance-clock")]
+        return self.clock();
+        #[cfg(not(feature = "instance-clock"))]
+        None
+    }
+
+    #[inline]
+    pub fn has_instance_clock(&self) -> bool {
+        #[cfg(feature = "instance-clock")]
+        return self.clock().is_some();
+        #[cfg(not(feature = "instance-clock"))]
+        false
+    }
+
+    #[inline]
+    pub fn wall_time_millis(&self) -> i64 {
+        #[cfg(feature = "instance-clock")]
+        if let Some(clock) = self.clock() {
+            return clock.wall_time_millis();
+        }
+        crate::time::now_millis()
+    }
+
+    /// Read calendar time from the selected provider.
+    ///
+    /// # Panics
+    /// Panics if a custom clock violates its calendar-range contract after construction.
+    pub fn wall_time_utc(&self) -> chrono::DateTime<chrono::Utc> {
+        #[cfg(feature = "instance-clock")]
+        if let Some(clock) = self.clock() {
+            return clock
+                .reading()
+                .expect("clock implementation returned an invalid calendar time")
+                .wall_time_utc();
+        }
+        crate::time::now_utc()
+    }
+
+    pub fn wall_time_secs(&self) -> i64 {
+        self.wall_time_millis() / 1000
+    }
+    pub fn wall_time_secs_u64(&self) -> u64 {
+        self.wall_time_secs().max(0) as u64
+    }
+
+    #[inline]
+    pub fn monotonic_time(&self) -> crate::time::Instant {
+        #[cfg(feature = "instance-clock")]
+        if let Some(clock) = self.clock() {
+            return clock.monotonic_time();
+        }
+        crate::time::Instant::now()
+    }
+
+    pub fn clock_reading(&self) -> Result<crate::time::ClockReading, crate::time::ClockError> {
+        #[cfg(feature = "instance-clock")]
+        if let Some(clock) = self.clock() {
+            return clock.reading();
+        }
+        crate::time::ClockReading::new(crate::time::now_millis(), crate::time::Instant::now())
     }
 }
 

@@ -212,6 +212,24 @@ impl FrameDecoder {
         }
     }
 
+    /// Starts a new receive burst after an idle boundary.
+    /// An empty accumulator releases its previous backing allocation. Small
+    /// reads are copied because their view capacity cannot bound a retained
+    /// prefix allocation. Partial frames keep the normal reassembly rules.
+    pub fn feed_owned_after_idle(&mut self, data: Bytes) {
+        if !self.buffer.is_empty() {
+            self.feed_owned(data);
+            return;
+        }
+        self.buffer = BytesMut::new();
+        self.grew_oversized = false;
+        if data.len() >= CHUNK_SIZE {
+            self.feed_owned(data);
+        } else {
+            self.buffer = BytesMut::from(data.as_ref());
+        }
+    }
+
     /// Makes room for `incoming` more bytes.
     ///
     /// Growing only once the bytes genuinely do not fit uses up the tail of the
@@ -298,6 +316,64 @@ impl Default for FrameDecoder {
 mod tests {
     use super::*;
     use crate::state::NoiseCipher;
+
+    #[test]
+    fn idle_burst_detaches_a_small_read_from_the_old_buffer() {
+        let mut decoder = FrameDecoder::new();
+        let large = encode_frame(&vec![7; 16 * 1024], None).unwrap();
+        decoder.feed_owned(large.into());
+        drop(decoder.decode_frame().unwrap());
+        let small = Bytes::from(encode_frame(b"small", None).unwrap());
+        let pointer = small.as_ptr();
+        decoder.feed_owned_after_idle(small);
+        let frame = decoder.decode_frame().unwrap();
+        assert_eq!(frame.as_ref(), b"small");
+        assert_ne!(frame.as_ptr(), pointer.wrapping_add(FRAME_LENGTH_SIZE));
+        drop(frame);
+        decoder.feed(&[0]);
+        assert!(decoder.capacity_for_test() <= CHUNK_SIZE);
+    }
+
+    #[test]
+    fn idle_burst_preserves_a_partial_frame() {
+        let wire = encode_frame(&vec![3; 8192], None).unwrap();
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&wire[..31]);
+        assert!(decoder.decode_frame().is_none());
+        decoder.feed_owned_after_idle(Bytes::copy_from_slice(&wire[31..]));
+        assert_eq!(decoder.decode_frame().unwrap().as_ref(), vec![3; 8192]);
+    }
+
+    #[test]
+    fn idle_burst_copies_shared_or_oversized_small_backings() {
+        for shared in [false, true] {
+            let mut backing = BytesMut::with_capacity(64 * 1024);
+            backing.extend_from_slice(&encode_frame(b"small", None).unwrap());
+            let wire = backing.freeze();
+            let witness = shared.then(|| wire.clone());
+            let mut decoder = FrameDecoder::new();
+            decoder.feed_owned_after_idle(wire);
+            assert_eq!(decoder.decode_frame().unwrap().as_ref(), b"small");
+            decoder.feed(&[0]);
+            assert!(decoder.capacity_for_test() <= CHUNK_SIZE);
+            drop(witness);
+        }
+    }
+
+    #[test]
+    fn idle_burst_does_not_retain_a_unique_small_suffix_of_a_large_allocation() {
+        let wire = encode_frame(b"suffix", None).unwrap();
+        let mut backing = BytesMut::with_capacity(64 * 1024);
+        backing.resize(64 * 1024 - wire.len(), 0);
+        backing.extend_from_slice(&wire);
+        let mut suffix = backing.freeze();
+        suffix.advance(suffix.len() - wire.len());
+        let mut decoder = FrameDecoder::new();
+        decoder.feed_owned_after_idle(suffix);
+        assert_eq!(decoder.decode_frame().unwrap().as_ref(), b"suffix");
+        decoder.feed(&[0]);
+        assert!(decoder.capacity_for_test() <= CHUNK_SIZE);
+    }
 
     #[test]
     fn test_encode_frame_no_header() {

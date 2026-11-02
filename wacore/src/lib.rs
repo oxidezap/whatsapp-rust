@@ -44,6 +44,7 @@ pub mod secret_enc_addon;
 pub mod send;
 mod serde_helpers;
 pub mod session;
+pub mod session_engine;
 pub mod shortcake;
 pub mod socket;
 pub mod stanza;

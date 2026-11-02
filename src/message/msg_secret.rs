@@ -122,7 +122,7 @@ impl Client {
             &self.cache_config.msg_secret_retention,
             class,
             message_ts,
-            wacore::time::now_secs(),
+            self.runtime.wall_time_secs(),
         );
         Some(wacore::store::traits::MsgSecretEntry::new(
             chat,

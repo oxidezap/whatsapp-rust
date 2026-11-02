@@ -14,7 +14,7 @@
 //!   whenever its advance is covered by a durable counter lease (see
 //!   `SessionRecord::reserve_sender_chain_counters`,
 //!   `SenderKeyRecord::reserve_iterations`, and
-//!   `Client::persist_signal_state_pre_wire`); only a send that raises either
+//!   `Client::confirm_signal_state_pre_wire`); only a send that raises either
 //!   lease still flushes
 //!   synchronously before the wire, because reusing an outbound counter would
 //!   reuse its message key + IV.
@@ -313,7 +313,10 @@ mod tests {
         // Lease-covered advance (no raised reservation): no synchronous write —
         // the session is still absent from the backend when the gate returns.
         let covered = dirty_session(&client, "15550003001");
-        client.persist_signal_state_pre_wire().await.unwrap();
+        assert_eq!(
+            client.confirm_signal_state_pre_wire().await.unwrap(),
+            wacore::session_engine::publication::SignalCommitOutcome::DurableLease
+        );
         assert!(
             backend_session(&client, &covered).await.is_none(),
             "a covered advance must not flush synchronously"
@@ -326,7 +329,10 @@ mod tests {
         let mut record = SessionRecord::new_fresh();
         record.reserve_sender_chain_counters(0);
         assert!(client.signal_cache.try_put_session(&addr, record).is_ok());
-        client.persist_signal_state_pre_wire().await.unwrap();
+        assert_eq!(
+            client.confirm_signal_state_pre_wire().await.unwrap(),
+            wacore::session_engine::publication::SignalCommitOutcome::CommittedWrite
+        );
         assert!(
             backend_session(&client, &addr).await.is_some(),
             "the leased session must be durable when the gate returns"
@@ -446,7 +452,7 @@ mod tests {
         assert!(client.signal_flush_worker_alive());
 
         // Bump the generation as teardown does — no explicit scheduler reset.
-        client.connection_generation.fetch_add(1, Ordering::SeqCst);
+        client.advance_generation_for_test(1, Ordering::SeqCst);
         // The next connection's first request takes over for the new
         // generation; stop injecting failures so its worker succeeds.
         client
@@ -499,7 +505,7 @@ mod tests {
 
         // Reconnect: bump the generation, then a new request takes over and
         // arms worker B on the new generation (also blocked in the flush).
-        let new_gen = client.connection_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let new_gen = client.advance_generation_for_test(1, Ordering::SeqCst) + 1;
         dirty_session(&client, "15550007002");
         client.schedule_signal_flush_live();
         let s = client.signal_flush_state.load(Ordering::Acquire);
@@ -531,7 +537,7 @@ mod tests {
         let client = crate::test_utils::create_test_client().await;
 
         // Live generation 1, with generation 1's running+dirty state installed.
-        client.connection_generation.store(1, Ordering::SeqCst);
+        client.set_generation_for_test(1, Ordering::SeqCst);
         let installed = pack_flush_state(1, FLUSH_RUNNING | FLUSH_DIRTY);
         client
             .signal_flush_state
@@ -548,7 +554,7 @@ mod tests {
         // And the no-regress guard holds even if the live generation matched
         // the lane while the state already carried a newer generation (the
         // window between the live-generation check and the CAS).
-        client.connection_generation.store(0, Ordering::SeqCst);
+        client.set_generation_for_test(0, Ordering::SeqCst);
         client.schedule_signal_flush(0);
         assert_eq!(
             client.signal_flush_state.load(Ordering::Acquire),
@@ -567,7 +573,7 @@ mod tests {
             .store(true, Ordering::Release);
 
         // Arm worker B on generation 1 and wait until it is inside the flush.
-        client.connection_generation.fetch_add(1, Ordering::SeqCst);
+        client.advance_generation_for_test(1, Ordering::SeqCst);
         dirty_session(&client, "15550008001");
         client.schedule_signal_flush_live();
         let deadline = wacore::time::Instant::now() + Duration::from_secs(1);
@@ -652,7 +658,7 @@ mod tests {
         // generation and holding the gate across the settle).
         let gate = client.signal_flush_lifecycle.lock().await;
         client.schedule_signal_flush_live();
-        client.connection_generation.fetch_add(1, Ordering::SeqCst);
+        client.advance_generation_for_test(1, Ordering::SeqCst);
 
         // Let the worker wake and block on the gate, then release it.
         tokio::time::sleep(SIGNAL_FLUSH_WINDOW * 3).await;

@@ -222,7 +222,7 @@ async fn client_with_http_and_runtime(
         wacore::handshake::NoiseCipher::new(&[0; 32]).unwrap(),
     )));
     client.set_connected_for_test(true);
-    client.is_running.store(true, Ordering::Release);
+    client.set_driver_running_for_test(true, Ordering::Release);
     client.enter_live_mode_for_tests();
     client
         .persistence_manager
@@ -616,7 +616,7 @@ async fn durable_history_full_or_closed_queue_preserves_journal_without_waiting_
 #[tokio::test]
 async fn durable_history_inline_replay_before_run_succeeds_but_terminal_replay_is_rejected() {
     let (client, hook, _) = memory_client().await;
-    client.is_running.store(false, Ordering::Release);
+    client.set_driver_running_for_test(false, Ordering::Release);
     client.set_connected_for_test(false);
     *client.noise_socket.lock().unwrap() = None;
     client.set_auto_reconnect(false);
@@ -632,7 +632,7 @@ async fn durable_history_inline_replay_before_run_succeeds_but_terminal_replay_i
         .await
         .unwrap();
     assert_eq!(hook.chunks.load(Ordering::SeqCst), 1);
-    assert!(!client.is_running.load(Ordering::Acquire));
+    assert!(!client.driver_running(Ordering::Acquire));
     client.signal_shutdown_sync();
     assert!(
         client

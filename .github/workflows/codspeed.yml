@@ -31,6 +31,68 @@ env:
   MALLOC_TOP_PAD_: "131072"
 
 jobs:
+  connected-retention:
+    name: Connected retention against PR base
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@${{ env.PROTOC_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: connected-retention
+          cache-targets: "false"
+      - name: Build library revisions with a shared measurement harness
+        env:
+          BASE_REVISION: ${{ github.event.pull_request.base.sha }}
+          HEAD_REVISION: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mkdir -p .retention-out/results/harness/connected_idle
+          cargo build --locked -p whatsapp-xtask
+          cp target/debug/whatsapp-xtask .retention-out/compare
+          cp examples/connected_idle.rs .retention-out/results/harness/
+          cp examples/connected_idle/allocator.rs examples/connected_idle/process_locks.rs .retention-out/results/harness/connected_idle/
+          git checkout --detach "$BASE_REVISION"
+          cp .retention-out/results/harness/connected_idle.rs examples/connected_idle.rs
+          cp .retention-out/results/harness/connected_idle/*.rs examples/connected_idle/
+          cargo add --offline -p whatsapp-rust --dev --target 'cfg(not(target_arch = "wasm32"))' parking_lot@=0.12.5
+          git diff -- Cargo.toml Cargo.lock examples/connected_idle.rs examples/connected_idle/allocator.rs > .retention-out/results/base-harness.patch
+          cargo build --locked --release -p whatsapp-rust --no-default-features --features bench-harness,sqlite-storage-bundled --example connected_idle
+          cp target/release/examples/connected_idle .retention-out/base
+          git restore -- Cargo.toml Cargo.lock examples/connected_idle.rs examples/connected_idle
+          git clean -f -- examples/connected_idle/process_locks.rs
+          git checkout --detach "$HEAD_REVISION"
+          cargo build --locked --release -p whatsapp-rust --no-default-features --features bench-harness,sqlite-storage-bundled --example connected_idle
+          cp target/release/examples/connected_idle .retention-out/head
+      - name: Compare connected requested heap on the same host
+        env:
+          BASE_REVISION: ${{ github.event.pull_request.base.sha }}
+          HEAD_REVISION: ${{ github.event.pull_request.head.sha }}
+        run: >
+          .retention-out/compare ci session-retention
+          --base-executable .retention-out/base
+          --head-executable .retention-out/head
+          --base-revision "$BASE_REVISION"
+          --head-revision "$HEAD_REVISION"
+          --repeats 3 --out-dir .retention-out/results
+      - name: Preserve retention measurements and failures
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: connected-retention
+          path: .retention-out/results
+          retention-days: 14
+
   prefetch-walltime:
     name: Prefetch walltime (shared-host diagnostic)
     runs-on: ubuntu-24.04

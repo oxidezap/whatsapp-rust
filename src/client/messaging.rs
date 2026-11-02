@@ -208,7 +208,11 @@ impl Client {
             return;
         }
 
-        let Some((node, _sequence)) = self.unified_session.prepare_send().await else {
+        let Some((node, _sequence)) = self
+            .unified_session
+            .prepare_send_at(self.runtime.wall_time_millis())
+            .await
+        else {
             return;
         };
 
@@ -333,7 +337,7 @@ impl Client {
             original_id,
             participant,
             new_content(),
-            wacore::time::now_millis(),
+            self.runtime.wall_time_millis(),
         );
 
         // Default (`request_id = None`) uses a fresh stanza ID instead of
@@ -431,7 +435,7 @@ impl Client {
             None
         };
 
-        let envelope = build_secret_message_edit(
+        let envelope = build_secret_message_edit_at(
             &to,
             &original_id,
             participant,
@@ -439,6 +443,7 @@ impl Client {
             &self_jid.to_string(),
             message_secret,
             new_content,
+            self.runtime.wall_time_millis(),
         )?;
 
         self.send_built_message(
@@ -458,7 +463,7 @@ impl Client {
         server_id: u64,
         reaction: &str,
     ) -> Result<String, anyhow::Error> {
-        let request_id = self.generate_message_id_at(wacore::time::now_secs_u64());
+        let request_id = self.generate_message_id_at(self.runtime.wall_time_secs_u64());
 
         let stanza = NodeBuilder::new("message")
             .attr("to", to)
@@ -702,7 +707,8 @@ impl Client {
 /// Encrypt the edit protocol message under the original creation's secret.
 /// The replacement content selects both the envelope kind and HKDF use case;
 /// the addressing reference alone does not describe the original body kind.
-fn build_secret_message_edit(
+#[allow(clippy::too_many_arguments)]
+fn build_secret_message_edit_at(
     to: &Jid,
     original_id: &str,
     participant: Option<String>,
@@ -710,6 +716,7 @@ fn build_secret_message_edit(
     self_jid_str: &str,
     message_secret: &[u8],
     new_content: wa::Message,
+    timestamp_ms: i64,
 ) -> Result<wa::Message, anyhow::Error> {
     use wa::message::secret_encrypted_message::SecretEncType;
     use wacore::secret_enc_addon::{AddonContext, ModificationType, encrypt_addon};
@@ -732,7 +739,7 @@ fn build_secret_message_edit(
         original_id.to_string(),
         participant.clone(),
         new_content,
-        wacore::time::now_millis(),
+        timestamp_ms,
     );
 
     // The creator is the original cryptographic namespace, not a routing alias.
@@ -773,6 +780,28 @@ fn build_secret_message_edit(
         });
         proto
     })
+}
+
+#[cfg(test)]
+fn build_secret_message_edit(
+    to: &Jid,
+    original_id: &str,
+    participant: Option<String>,
+    creator_jid_str: &str,
+    self_jid_str: &str,
+    message_secret: &[u8],
+    new_content: wa::Message,
+) -> Result<wa::Message, anyhow::Error> {
+    build_secret_message_edit_at(
+        to,
+        original_id,
+        participant,
+        creator_jid_str,
+        self_jid_str,
+        message_secret,
+        new_content,
+        wacore::time::now_millis(),
+    )
 }
 
 #[cfg(test)]

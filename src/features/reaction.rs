@@ -63,7 +63,7 @@ impl Client {
             // Keep their frame out of ordinary DM/group reaction futures.
             Box::pin(self.prepare_enc_reaction(chat, target_key, emoji)).await?
         } else {
-            plain_reaction_request(chat, target_key, emoji)
+            plain_reaction_request(chat, target_key, emoji, self.runtime.wall_time_millis())
         };
         self.send(request).await
     }
@@ -121,7 +121,7 @@ impl Client {
 
         let (enc_payload, iv) = wacore::reaction::encrypt_reaction_with_secret(
             emoji,
-            wacore::time::now_millis(),
+            self.runtime.wall_time_millis(),
             &secret,
             &target_id,
             &author.to_non_ad_string(),
@@ -145,9 +145,13 @@ impl Client {
 
 // Construct full protobufs outside async bodies so their uninitialized slots
 // do not remain in every suspended reaction future after sharing the content.
-fn plain_reaction_request(chat: &Jid, key: wa::MessageKey, emoji: &str) -> SendRequest {
-    let message =
-        wacore::proto_helpers::build_reaction_message(key, emoji, wacore::time::now_millis());
+fn plain_reaction_request(
+    chat: &Jid,
+    key: wa::MessageKey,
+    emoji: &str,
+    timestamp_ms: i64,
+) -> SendRequest {
+    let message = wacore::proto_helpers::build_reaction_message(key, emoji, timestamp_ms);
     SendRequest::new(chat, message)
 }
 

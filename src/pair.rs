@@ -136,7 +136,7 @@ pub(crate) async fn handle_iq_scoped(
                                 } else {
                                     std::time::Duration::from_secs(20)
                                 };
-                                let started = wacore::time::Instant::now();
+                                let started = runtime.monotonic_time();
 
                                 // Re-rendering the ref already on screen is its
                                 // own loop, because the payload embeds the adv
@@ -181,7 +181,14 @@ pub(crate) async fn handle_iq_scoped(
                                     client_clone.core.event_bus.dispatch(Event::PairingQrCode(
                                         crate::types::events::PairingQrCode::builder()
                                             .code(code)
-                                            .timeout(ttl.saturating_sub(started.elapsed()))
+                                            .timeout(
+                                                ttl.saturating_sub(
+                                                    client_clone
+                                                        .runtime
+                                                        .monotonic_time()
+                                                        .saturating_duration_since(started),
+                                                ),
+                                            )
                                             .build(),
                                     ));
                                     drop(snapshot);
@@ -243,7 +250,7 @@ pub(crate) async fn handle_iq_scoped(
                                 state = state => state,
                             };
                             let pair_code_outstanding =
-                                state.is_outstanding(wacore::time::Instant::now());
+                                state.is_outstanding(client_clone.runtime.monotonic_time());
                             drop(state);
                             if stopped() {
                                 return;
@@ -502,7 +509,7 @@ async fn handle_pair_success<'a>(
                 .arm_for_pairing(client.connection_generation.load(Ordering::SeqCst));
             // --- END: FIX ---
 
-            client.expected_disconnect.store(true, Ordering::Relaxed);
+            client.expect_session_disconnect();
 
             info!("Successfully paired {}", jid.observe());
 
@@ -677,7 +684,10 @@ mod tests {
             let device = client.persistence_manager.get_device_snapshot();
             assert_eq!(device.pn.is_some(), !replace);
             assert_eq!(device.account.is_some(), !replace);
-            assert_eq!(client.expected_disconnect.load(Ordering::Relaxed), !replace);
+            assert_eq!(
+                client.expected_session_disconnect(Ordering::Relaxed),
+                !replace
+            );
             assert_eq!(transport.sent().is_empty(), replace);
             assert_eq!(
                 collector
@@ -715,7 +725,7 @@ mod tests {
             *client.pair_code_state.lock().await,
             PairCodeState::Completed
         ));
-        assert!(!client.expected_disconnect.load(Ordering::Relaxed));
+        assert!(!client.expected_session_disconnect(Ordering::Relaxed));
         assert!(transport.sent().is_empty());
     }
 
@@ -749,7 +759,7 @@ mod tests {
             "old pair-success must not reply on the new socket"
         );
         assert!(collector.events().is_empty());
-        assert!(!client.expected_disconnect.load(Ordering::Relaxed));
+        assert!(!client.expected_session_disconnect(Ordering::Relaxed));
         assert!(
             client
                 .persistence_manager
@@ -1076,7 +1086,7 @@ mod tests {
         .await;
 
         assert!(
-            client.is_running.load(Ordering::Relaxed),
+            client.driver_running(Ordering::Relaxed),
             "a pending pair-success still needs this socket"
         );
     }
@@ -1107,7 +1117,7 @@ mod tests {
         .await;
 
         assert!(
-            client.is_running.load(Ordering::Relaxed),
+            client.driver_running(Ordering::Relaxed),
             "exhausted QR refs must not tear down a connection a pair-code flow is still using"
         );
     }
@@ -1136,7 +1146,7 @@ mod tests {
         .await;
 
         poll_until("the QR-only client to disconnect", || {
-            !client.is_running.load(Ordering::Relaxed)
+            !client.driver_running(Ordering::Relaxed)
         })
         .await;
     }

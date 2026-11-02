@@ -288,11 +288,15 @@ pub struct PortableCache<K, V, S = RandomState> {
     /// single-flight path they never take. [`Clone`] forces it, so clones of one
     /// cache still share one registry — which is what makes the flight single.
     init_locks: OnceLock<Arc<InitLocks>>,
+    #[cfg(not(feature = "instance-clock"))]
     max_capacity: Option<u64>,
     ttl: Option<Duration>,
     tti: Option<Duration>,
     /// See [`PortableCacheBuilder::evict_guard`].
+    #[cfg(not(feature = "instance-clock"))]
     evict_guard: Option<fn(&V) -> bool>,
+    #[cfg(feature = "instance-clock")]
+    policy: CachePolicy<V>,
     #[cfg(test)]
     tti_renewals: Arc<portable_atomic::AtomicU64>,
 }
@@ -464,6 +468,8 @@ pub(crate) struct SyncTtlCache<K, V> {
     inner: std::sync::Mutex<CacheInner<K, V, RandomState>>,
     capacity: u64,
     ttl: Option<Duration>,
+    #[cfg(feature = "instance-clock")]
+    clock: Option<Arc<dyn wacore::time::Clock>>,
 }
 
 pub(crate) struct SyncTtlGuard<'a, K, V> {
@@ -536,7 +542,33 @@ impl<K: Hash + Eq + Clone, V: Clone> SyncTtlCache<K, V> {
             inner: std::sync::Mutex::new(CacheInner::new(true, RandomState::new())),
             capacity,
             ttl,
+            #[cfg(feature = "instance-clock")]
+            clock: None,
         }
+    }
+
+    pub(crate) fn on_runtime(self, runtime: &Arc<dyn wacore::runtime::Runtime>) -> Self {
+        #[cfg(feature = "instance-clock")]
+        {
+            let mut this = self;
+            if this.ttl.is_some() {
+                this.clock = runtime.clock().cloned();
+            }
+            this
+        }
+        #[cfg(not(feature = "instance-clock"))]
+        {
+            let _ = runtime;
+            self
+        }
+    }
+
+    fn entry_time(&self) -> Instant {
+        #[cfg(feature = "instance-clock")]
+        if let Some(clock) = &self.clock {
+            return clock.monotonic_time();
+        }
+        Instant::now()
     }
 
     pub(crate) fn configured_capacity(&self) -> Option<u64> {
@@ -549,7 +581,7 @@ impl<K: Hash + Eq + Clone, V: Clone> SyncTtlCache<K, V> {
             inner,
             capacity: self.capacity,
             ttl: self.ttl,
-            now: Instant::now(),
+            now: self.entry_time(),
         })
     }
 
@@ -595,7 +627,7 @@ impl<K: Hash + Eq + Clone, V: Clone> SyncTtlCache<K, V> {
 
     pub(crate) fn run_pending_tasks(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let now = Instant::now();
+        let now = self.entry_time();
         let expired: Vec<_> = inner
             .iter()
             .filter(|(_, entry)| {
@@ -1180,18 +1212,104 @@ where
     PortableCache {
         inner: Arc::new(RwLock::new(inner)),
         init_locks: OnceLock::new(),
+        #[cfg(not(feature = "instance-clock"))]
         max_capacity,
         ttl,
         tti,
+        #[cfg(not(feature = "instance-clock"))]
         evict_guard,
+        #[cfg(feature = "instance-clock")]
+        policy: CachePolicy::Global {
+            max_capacity,
+            evict_guard,
+        },
         #[cfg(test)]
         tti_renewals: Arc::new(portable_atomic::AtomicU64::new(0)),
+    }
+}
+
+#[cfg(feature = "instance-clock")]
+enum CachePolicy<V> {
+    Global {
+        max_capacity: Option<u64>,
+        evict_guard: Option<fn(&V) -> bool>,
+    },
+    Instance(Arc<InstanceCachePolicy<V>>),
+}
+
+#[cfg(feature = "instance-clock")]
+struct InstanceCachePolicy<V> {
+    max_capacity: Option<u64>,
+    evict_guard: Option<fn(&V) -> bool>,
+    clock: Arc<dyn wacore::time::Clock>,
+}
+
+#[cfg(feature = "instance-clock")]
+impl<V> Clone for CachePolicy<V> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Global {
+                max_capacity,
+                evict_guard,
+            } => Self::Global {
+                max_capacity: *max_capacity,
+                evict_guard: *evict_guard,
+            },
+            Self::Instance(policy) => Self::Instance(Arc::clone(policy)),
+        }
     }
 }
 
 // -- PortableCache impl --
 
 impl<K, V, S> PortableCache<K, V, S> {
+    #[inline]
+    fn capacity_limit(&self) -> Option<u64> {
+        #[cfg(feature = "instance-clock")]
+        return match &self.policy {
+            CachePolicy::Global { max_capacity, .. } => *max_capacity,
+            CachePolicy::Instance(policy) => policy.max_capacity,
+        };
+        #[cfg(not(feature = "instance-clock"))]
+        self.max_capacity
+    }
+
+    #[inline]
+    fn eviction_guard(&self) -> Option<fn(&V) -> bool> {
+        #[cfg(feature = "instance-clock")]
+        return match &self.policy {
+            CachePolicy::Global { evict_guard, .. } => *evict_guard,
+            CachePolicy::Instance(policy) => policy.evict_guard,
+        };
+        #[cfg(not(feature = "instance-clock"))]
+        self.evict_guard
+    }
+
+    #[cfg(feature = "instance-clock")]
+    pub(crate) fn with_clock(mut self, clock: Option<Arc<dyn wacore::time::Clock>>) -> Self {
+        if (self.ttl.is_some() || self.tti.is_some())
+            && let Some(clock) = clock
+        {
+            self.policy = CachePolicy::Instance(Arc::new(InstanceCachePolicy {
+                max_capacity: self.capacity_limit(),
+                evict_guard: self.eviction_guard(),
+                clock,
+            }));
+        }
+        self
+    }
+
+    #[inline]
+    pub(crate) fn on_runtime(self, runtime: &Arc<dyn wacore::runtime::Runtime>) -> Self {
+        #[cfg(feature = "instance-clock")]
+        return self.with_clock(runtime.clock().cloned());
+        #[cfg(not(feature = "instance-clock"))]
+        {
+            let _ = runtime;
+            self
+        }
+    }
+
     /// The single-flight registry, built on first use. Unbounded impl block so
     /// [`Clone`] can force it too, keeping every clone on one registry.
     fn init_locks(&self) -> &Arc<InitLocks> {
@@ -1246,6 +1364,10 @@ where
     #[inline]
     fn entry_time(&self) -> Instant {
         if self.ttl.is_some() || self.tti.is_some() {
+            #[cfg(feature = "instance-clock")]
+            if let CachePolicy::Instance(policy) = &self.policy {
+                return policy.clock.monotonic_time();
+            }
             Instant::now()
         } else {
             Instant::ZERO
@@ -1346,7 +1468,7 @@ where
     }
 
     pub async fn insert(&self, key: K, value: V) {
-        if self.max_capacity == Some(0) {
+        if self.capacity_limit() == Some(0) {
             return;
         }
         let now = self.entry_time();
@@ -1368,7 +1490,13 @@ where
                     entry.last_accessed_at = now;
                     return;
                 }
-                inner.insert_new(key, value, now, self.max_capacity, self.evict_guard);
+                inner.insert_new(
+                    key,
+                    value,
+                    now,
+                    self.capacity_limit(),
+                    self.eviction_guard(),
+                );
             }
         }
     }
@@ -1398,7 +1526,7 @@ where
                 };
                 if let Some(slot) = inner.get_mut(key) {
                     *slot = next;
-                } else if self.max_capacity != Some(0) {
+                } else if self.capacity_limit() != Some(0) {
                     inner.insert_new(key.to_owned(), next);
                 }
                 result
@@ -1420,13 +1548,13 @@ where
                     entry.value = next;
                     entry.inserted_at = now;
                     entry.last_accessed_at = now;
-                } else if self.max_capacity != Some(0) {
+                } else if self.capacity_limit() != Some(0) {
                     inner.insert_new(
                         key.to_owned(),
                         next,
                         now,
-                        self.max_capacity,
-                        self.evict_guard,
+                        self.capacity_limit(),
+                        self.eviction_guard(),
                     );
                 }
 
@@ -1437,7 +1565,7 @@ where
 
     /// Insert and return a clone of the value in one write lock.
     async fn insert_and_return(&self, key: K, value: V) -> V {
-        if self.max_capacity == Some(0) {
+        if self.capacity_limit() == Some(0) {
             return value;
         }
         let now = self.entry_time();
@@ -1458,7 +1586,13 @@ where
                 }
 
                 let ret = value.clone();
-                inner.insert_new(key, value, now, self.max_capacity, self.evict_guard);
+                inner.insert_new(
+                    key,
+                    value,
+                    now,
+                    self.capacity_limit(),
+                    self.eviction_guard(),
+                );
                 ret
             }
         }
@@ -1552,7 +1686,7 @@ where
     /// and a caller can skip work that only makes sense when it does.
     #[cfg(feature = "bench-harness")]
     pub fn configured_capacity(&self) -> Option<u64> {
-        self.max_capacity
+        self.capacity_limit()
     }
 
     /// Best-effort entry count: a `try_read` that answers `0` while a writer
@@ -1842,10 +1976,14 @@ impl<K, V, S> Clone for PortableCache<K, V, S> {
         Self {
             inner: Arc::clone(&self.inner),
             init_locks: OnceLock::from(Arc::clone(self.init_locks())),
-            max_capacity: self.max_capacity,
+            #[cfg(not(feature = "instance-clock"))]
+            max_capacity: self.capacity_limit(),
             ttl: self.ttl,
             tti: self.tti,
-            evict_guard: self.evict_guard,
+            #[cfg(not(feature = "instance-clock"))]
+            evict_guard: self.eviction_guard(),
+            #[cfg(feature = "instance-clock")]
+            policy: self.policy.clone(),
             #[cfg(test)]
             tti_renewals: Arc::clone(&self.tti_renewals),
         }
@@ -3627,5 +3765,72 @@ mod tests {
             slot <= size_of::<Slot<wacore::types::message::SenderMessageId, ()>>(),
             "a dispatch-gate slot grew to {slot} bytes; the gate keeps one per delivered message"
         );
+    }
+}
+
+#[cfg(all(test, feature = "instance-clock", target_pointer_width = "64"))]
+#[test]
+fn instance_clock_policy_keeps_default_config_footprint() {
+    assert_eq!(
+        size_of::<CachePolicy<u8>>(),
+        size_of::<Option<u64>>() + size_of::<Option<fn(&u8) -> bool>>()
+    );
+}
+
+#[cfg(all(test, feature = "instance-clock"))]
+mod instance_clock_tests {
+    use super::*;
+    use wacore::time::{Clock, VirtualClock};
+
+    #[tokio::test]
+    async fn independent_cache_clocks_expire_only_their_own_entries() {
+        let a = Arc::new(VirtualClock::new(0, Instant::ZERO).unwrap());
+        let b = Arc::new(VirtualClock::new(0, Instant::ZERO).unwrap());
+        let ca = PortableCache::builder()
+            .time_to_live(Duration::from_secs(5))
+            .build()
+            .with_clock(Some(a.clone()));
+        let cb = PortableCache::builder()
+            .time_to_live(Duration::from_secs(5))
+            .build()
+            .with_clock(Some(b.clone()));
+        ca.insert(1, 10).await;
+        cb.insert(1, 20).await;
+        a.advance(Duration::from_secs(5)).unwrap();
+        assert_eq!(ca.get(&1).await, None);
+        assert_eq!(cb.get(&1).await, Some(20));
+        assert_eq!(b.monotonic_time(), Instant::ZERO);
+    }
+
+    #[tokio::test]
+    async fn a_fill_stamps_completion_time_after_virtual_time_advanced() {
+        let clock = Arc::new(VirtualClock::new(0, Instant::ZERO).unwrap());
+        let cache = Arc::new(
+            PortableCache::builder()
+                .time_to_live(Duration::from_secs(5))
+                .build()
+                .with_clock(Some(clock.clone())),
+        );
+        let (entered, notified) = futures::channel::oneshot::channel();
+        let (finish, release) = futures::channel::oneshot::channel();
+        let task = tokio::spawn({
+            let cache = cache.clone();
+            async move {
+                cache
+                    .get_with(1, async {
+                        entered.send(()).unwrap();
+                        release.await.unwrap();
+                        10
+                    })
+                    .await
+            }
+        });
+        notified.await.unwrap();
+        clock.advance(Duration::from_secs(20)).unwrap();
+        finish.send(()).unwrap();
+        assert_eq!(task.await.unwrap(), 10);
+        assert_eq!(cache.get(&1).await, Some(10));
+        clock.advance(Duration::from_secs(5)).unwrap();
+        assert_eq!(cache.get(&1).await, None);
     }
 }

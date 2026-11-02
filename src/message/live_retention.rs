@@ -264,6 +264,19 @@ impl Drop for ReceiptProducer {
     }
 }
 impl LiveRetention {
+    pub fn reclaim_idle_capacity(&self) {
+        // Keep amortized burst capacity on the receive path. Idle boundaries
+        // may release empty storage, but never an active or replayable delivery.
+        let mut state = lock(&self.state);
+        if state.reservations.is_empty() {
+            state.reservations = Vec::new();
+        }
+        state.receipts.retain(|scope| scope.strong_count() != 0);
+        if state.receipts.is_empty() {
+            state.receipts = Vec::new();
+        }
+    }
+
     #[inline(never)]
     pub fn has_owned_for_message(&self, info: &MessageInfo) -> bool {
         let state = lock(&self.state);
@@ -786,6 +799,50 @@ fn same_entry(first: &RetainedDelivery, second: &PendingDelivery) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_reclamation_releases_completed_burst_metadata() {
+        let retention = LiveRetention::default();
+        let info = Arc::new(MessageInfo::default());
+        let admissions: Vec<_> = (0..256)
+            .map(|_| {
+                retention
+                    .reserve_with_info(StanzaOrigin::new(), 0, 0, &info)
+                    .unwrap()
+            })
+            .collect();
+        let receipt = retention.begin_receipts(&info).unwrap();
+        drop(admissions);
+        drop(receipt);
+        assert!(lock(&retention.state).reservations.capacity() >= 256);
+        retention.reclaim_idle_capacity();
+        let state = lock(&retention.state);
+        assert_eq!(state.reservations.capacity(), 0);
+        assert_eq!(state.receipts.capacity(), 0);
+        assert_eq!(lock(&retention.budget).bytes, 0);
+    }
+
+    #[test]
+    fn idle_reclamation_preserves_active_and_replayable_deliveries() {
+        let retention = LiveRetention::default();
+        let info = Arc::new(MessageInfo::default());
+        let producer = StanzaOrigin::new();
+        let admission = retention
+            .reserve_with_info(producer, 1024, 1, &info)
+            .unwrap();
+        let receipt = retention.begin_receipts(&info).unwrap();
+        retention.reclaim_idle_capacity();
+        assert_eq!(lock(&retention.state).reservations.len(), 1);
+        assert_eq!(lock(&retention.state).receipts.len(), 1);
+        retention.stage(&info, producer, (0, "msg", 3), b"pending");
+        drop(admission);
+        retention.reclaim_idle_capacity();
+        let raw = retention.raw_for_message(&info);
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].plaintext.as_ref(), b"pending");
+        assert!(lock(&retention.budget).bytes > 0);
+        drop(receipt);
+    }
 
     #[test]
     fn raw_pending_projection_preserves_other_slots_backing_budget() {

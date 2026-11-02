@@ -44,6 +44,14 @@ where
     K: std::hash::Hash + Eq + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
 {
+    pub(crate) fn on_runtime(mut self, runtime: &Arc<dyn wacore::runtime::Runtime>) -> Self {
+        self.inner = match self.inner {
+            Inner::Local(cache) => Inner::Local(cache.on_runtime(runtime)),
+            other => other,
+        };
+        self
+    }
+
     /// Wrap an in-process [`Cache`] (zero overhead vs. using the cache directly).
     pub fn from_local(cache: Cache<K, V>) -> Self {
         Self {

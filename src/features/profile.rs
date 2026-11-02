@@ -304,7 +304,7 @@ impl<'a> Profile<'a> {
                 proto.name = Some(name.to_string());
                 proto
             });
-            proto.timestamp = Some(wacore::time::now_millis());
+            proto.timestamp = Some(self.client.runtime.wall_time_millis());
             proto
         };
         // setting_pushName's index has no args (collection/version come from the schema).

@@ -84,6 +84,12 @@ impl ClientBuild {
 pub enum ClientBuilderError {
     #[error("missing async runtime")]
     MissingRuntime,
+    #[error("an instance clock requires the instance-clock SDK feature")]
+    InstanceClockFeatureDisabled,
+    #[error("runtime and storage must share the same instance clock")]
+    InstanceClockMismatch,
+    #[error("invalid instance clock")]
+    InvalidInstanceClock(#[source] wacore::time::ClockError),
     #[error("missing persistence manager")]
     MissingPersistenceManager,
     #[error("missing transport factory")]
@@ -687,11 +693,20 @@ impl ClientBuilder {
                 .as_ref()
                 .cloned()
                 .ok_or(ClientBuilderError::MissingRuntime)?;
+            if runtime.has_instance_clock() && !cfg!(feature = "instance-clock") {
+                return Err(ClientBuilderError::InstanceClockFeatureDisabled);
+            }
             let persistence_manager = self
                 .persistence_manager
                 .as_ref()
                 .cloned()
                 .ok_or(ClientBuilderError::MissingPersistenceManager)?;
+            validate_clock_alignment(&runtime, &persistence_manager)?;
+            if let Some(clock) = runtime.instance_clock() {
+                clock
+                    .reading()
+                    .map_err(ClientBuilderError::InvalidInstanceClock)?;
+            }
             let transport_factory = self
                 .transport_factory
                 .as_ref()
@@ -748,6 +763,8 @@ impl ClientBuilder {
             }
             None => runtime,
         };
+
+        validate_clock_alignment(&runtime, &persistence_manager)?;
 
         #[cfg(feature = "client-lifecycle")]
         let lifecycle_handler = self.lifecycle;
@@ -1010,6 +1027,26 @@ async fn probe_durability_backend_owned(
         return Err(ClientBuilderError::UnsupportedDurabilityBackend(
             "bounded pending-inbound CAS did not round-trip and clean up".to_string(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_clock_alignment(
+    runtime: &Arc<dyn Runtime>,
+    persistence: &PersistenceManager,
+) -> Result<(), ClientBuilderError> {
+    let runtime = runtime.instance_clock();
+    let storage = persistence.backend_ref().instance_clock();
+    if !cfg!(feature = "instance-clock") && (runtime.is_some() || storage.is_some()) {
+        return Err(ClientBuilderError::InstanceClockFeatureDisabled);
+    }
+    let aligned = match (runtime, storage) {
+        (None, None) => true,
+        (Some(runtime), Some(storage)) => Arc::ptr_eq(runtime, storage),
+        _ => false,
+    };
+    if !aligned {
+        return Err(ClientBuilderError::InstanceClockMismatch);
     }
     Ok(())
 }
@@ -1842,7 +1879,7 @@ mod tests {
             .await
             .expect("client leaked during install");
         tokio::task::yield_now().await;
-        assert!(!leaked_client.is_running.load(Ordering::Acquire));
+        assert!(!leaked_client.driver_running(Ordering::Acquire));
 
         release_tx.send(()).await.expect("release installation");
         let client = build
@@ -1851,7 +1888,7 @@ mod tests {
             .expect("successful build")
             .into_client();
         tokio::time::timeout(Duration::from_secs(1), async {
-            while !client.is_running.load(Ordering::Acquire) {
+            while !client.driver_running(Ordering::Acquire) {
                 tokio::task::yield_now().await;
             }
         })
@@ -1901,7 +1938,7 @@ mod tests {
                 .is_err(),
             "transport started before construction activation"
         );
-        assert!(!leaked_client.is_connecting.load(Ordering::Acquire));
+        assert!(!leaked_client.connection_attempt_active(Ordering::Acquire));
 
         install_release_tx
             .send(())
@@ -1975,7 +2012,7 @@ mod tests {
                 .expect("connect-finished sender closed")
         );
         assert!(transport_started_rx.try_recv().is_err());
-        assert!(!leaked_client.is_connecting.load(Ordering::Acquire));
+        assert!(!leaked_client.connection_attempt_active(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -2009,7 +2046,7 @@ mod tests {
             .await
             .expect("rejected run stop timeout")
             .expect("rejected run stopped");
-        assert!(!leaked_client.is_running.load(Ordering::Acquire));
+        assert!(!leaked_client.driver_running(Ordering::Acquire));
     }
 
     #[tokio::test]

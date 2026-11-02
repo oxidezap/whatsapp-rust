@@ -19,7 +19,22 @@ use waproto::whatsapp as wa;
 /// Dispatch inbound sticker mutations synced from a linked device, returning
 /// the [`crate::client::AppStateDispatchOutcome`] for the semantic
 /// per-mutation log line.
+#[cfg(test)]
 pub(crate) fn dispatch_sticker_mutation_outcome(
+    event_bus: &wacore::types::events::CoreEventBus,
+    m: &mut Mutation,
+    event_full_sync: bool,
+) -> AppStateDispatchOutcome {
+    dispatch_sticker_mutation_outcome_with_clock(
+        wacore::time::now_utc,
+        event_bus,
+        m,
+        event_full_sync,
+    )
+}
+
+pub(crate) fn dispatch_sticker_mutation_outcome_with_clock(
+    now: impl FnOnce() -> chrono::DateTime<chrono::Utc>,
     event_bus: &wacore::types::events::CoreEventBus,
     m: &mut Mutation,
     event_full_sync: bool,
@@ -45,7 +60,7 @@ pub(crate) fn dispatch_sticker_mutation_outcome(
         .as_ref()
         .and_then(|v| v.timestamp)
         .unwrap_or(0);
-    let time = wacore::time::from_millis_or_now(ts);
+    let time = wacore::time::from_millis(ts).unwrap_or_else(now);
 
     if is_favorite {
         // `isFavorite` is what says which way the mutation goes, so WA Web

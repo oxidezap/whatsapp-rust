@@ -16,7 +16,7 @@ pub struct IdentityTags {
 impl Client {
     /// Whether a finished connection will be retried by [`Self::run`].
     pub fn auto_reconnect_enabled(&self) -> bool {
-        self.enable_auto_reconnect.load(Ordering::Acquire)
+        self.session_state.load(Ordering::Acquire)
     }
 
     /// Change the reconnect preference without closing the current connection.
@@ -26,13 +26,13 @@ impl Client {
     /// shut down or resume a paused session. Re-enabling cannot clear a terminal
     /// shutdown or protocol verdict; construct a new Client for a new session.
     pub fn set_auto_reconnect(&self, enabled: bool) {
-        if self.enable_auto_reconnect.swap(enabled, Ordering::AcqRel) != enabled {
+        if self.session_state.swap(enabled, Ordering::AcqRel) != enabled {
             self.notify_session_state();
         }
     }
 
     pub(crate) fn stop_auto_reconnect_permanently(&self) {
-        self.enable_auto_reconnect.stop_permanently();
+        self.session_state.stop_permanently();
         self.notify_session_state();
     }
 
@@ -59,11 +59,11 @@ impl Client {
     pub(crate) fn get_group_cache(&self) -> &Arc<GroupCache> {
         self.group_cache.get_or_init(|| {
             debug!("Initializing Group Cache for the first time.");
-            Arc::new(
-                self.cache_config
-                    .group_cache
-                    .build_typed_ttl(self.cache_config.group_cache_store.clone(), "group"),
-            )
+            Arc::new(self.cache_config.group_cache.build_typed_ttl_on(
+                self.cache_config.group_cache_store.clone(),
+                "group",
+                &self.runtime,
+            ))
         })
     }
 
@@ -339,8 +339,23 @@ impl Client {
     /// headers and AEAD tags included; handshake and TLS/WebSocket overhead
     /// excluded), so two clients in one process can be compared directly.
     pub fn stats(&self) -> StatsSnapshot {
-        let mut snapshot = self.stats.snapshot();
-        snapshot.reconnect_errors = self.auto_reconnect_errors.load(Ordering::Relaxed);
+        let mut snapshot = {
+            #[cfg(feature = "instance-clock")]
+            {
+                if let Some(clock) = self.runtime.instance_clock() {
+                    self.stats.snapshot_with_clock(|| {
+                        clock
+                            .reading()
+                            .expect("clock implementation returned an invalid calendar time")
+                    })
+                } else {
+                    self.stats.snapshot()
+                }
+            }
+            #[cfg(not(feature = "instance-clock"))]
+            self.stats.snapshot()
+        };
+        snapshot.reconnect_errors = self.reconnect_errors(Ordering::Relaxed);
         snapshot.resends_throttled = self.resend_rate_limiter.throttled_total();
         snapshot.messages_suppressed_duplicate =
             self.duplicate_dispatch_suppressed.load(Ordering::Relaxed);
@@ -511,7 +526,7 @@ impl Client {
                         .unwrap_or(u64::MAX),
                     )
                 });
-        let subsystems = subsystem::memory(&self.subsystems);
+        let subsystems = subsystem::memory(&self.subsystems, || self.runtime.monotonic_time());
         #[cfg(feature = "plugins")]
         let plugin_stats = self.plugin_stats();
         #[cfg(feature = "plugins")]

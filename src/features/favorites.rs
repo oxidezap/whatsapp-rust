@@ -18,7 +18,22 @@ use waproto::whatsapp as wa;
 /// Dispatch an inbound `favorites` mutation synced from a linked device,
 /// returning the [`crate::client::AppStateDispatchOutcome`] for the semantic
 /// per-mutation log line.
+#[cfg(test)]
 pub(crate) fn dispatch_favorites_mutation_outcome(
+    event_bus: &wacore::types::events::CoreEventBus,
+    m: &mut Mutation,
+    event_full_sync: bool,
+) -> AppStateDispatchOutcome {
+    dispatch_favorites_mutation_outcome_with_clock(
+        wacore::time::now_utc,
+        event_bus,
+        m,
+        event_full_sync,
+    )
+}
+
+pub(crate) fn dispatch_favorites_mutation_outcome_with_clock(
+    now: impl FnOnce() -> chrono::DateTime<chrono::Utc>,
     event_bus: &wacore::types::events::CoreEventBus,
     m: &mut Mutation,
     event_full_sync: bool,
@@ -42,7 +57,7 @@ pub(crate) fn dispatch_favorites_mutation_outcome(
     {
         event_bus.dispatch(Event::FavoritesUpdate(
             FavoritesUpdate::builder()
-                .timestamp(wacore::time::from_millis_or_now(ts))
+                .timestamp(wacore::time::from_millis(ts).unwrap_or_else(now))
                 .action(Box::new(act))
                 .from_full_sync(event_full_sync)
                 .build(),

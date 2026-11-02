@@ -281,7 +281,7 @@ async fn wedged_client() -> (
         Some(transport.clone() as Arc<dyn crate::transport::Transport>);
     *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
     client.set_connected_for_test(true);
-    client.is_running.store(true, Ordering::Release);
+    client.set_driver_running_for_test(true, Ordering::Release);
     // The link carried traffic until the write wedged.
     client.stats.mark_recv_activity();
     (client, transport)

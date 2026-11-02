@@ -606,7 +606,7 @@ impl Client {
         // A reconnect may have happened while we were waiting, making this
         // timeout belong to the old connection.
         if self.connection_generation.load(Ordering::Acquire) != wait_generation
-            || self.expected_disconnect.load(Ordering::Relaxed)
+            || self.expected_session_disconnect(Ordering::Relaxed)
         {
             log::debug!(
                 target: "Client/OfflineSync",
@@ -644,16 +644,16 @@ impl Client {
         // complete_offline_sync above started nothing, and an unbounded
         // wait here would defeat this helper's whole point — callers
         // proceed and the finisher keeps running in the background.
-        let deadline = wacore::time::Instant::now() + timeout;
+        let deadline = self.runtime.monotonic_time() + timeout;
         loop {
             let listener = self.offline_sync_notifier.listen();
             if self.offline_sync_completed.load(Ordering::Acquire)
                 || self.connection_generation.load(Ordering::Acquire) != wait_generation
-                || self.expected_disconnect.load(Ordering::Relaxed)
+                || self.expected_session_disconnect(Ordering::Relaxed)
             {
                 return;
             }
-            if wacore::time::Instant::now() >= deadline {
+            if self.runtime.monotonic_time() >= deadline {
                 log::warn!(
                     target: "Client/OfflineSync",
                     "Drain finisher still running {:?} after the offline sync timeout; proceeding without it",
@@ -684,13 +684,12 @@ impl Client {
     /// "all tasks finished" and report a sync that never happened.
     pub async fn wait_for_startup_sync(&self, timeout: Duration) -> Result<()> {
         use anyhow::anyhow;
-        use wacore::time::Instant;
 
-        let deadline = Instant::now() + timeout;
+        let deadline = self.runtime.monotonic_time() + timeout;
         let wait_generation = self.connection_generation.load(Ordering::Acquire);
         let connection_ended = || {
             self.connection_generation.load(Ordering::Acquire) != wait_generation
-                || self.expected_disconnect.load(Ordering::Relaxed)
+                || self.expected_session_disconnect(Ordering::Relaxed)
         };
 
         // Ticked rather than one long wait: a teardown ends this wait's answer
@@ -707,7 +706,7 @@ impl Client {
             if connection_ended() {
                 return Err(anyhow!("Connection ended before offline sync completed"));
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = deadline.saturating_duration_since(self.runtime.monotonic_time());
             if remaining.is_zero() {
                 return Err(anyhow!("Timeout waiting for offline sync completion"));
             }
@@ -734,7 +733,7 @@ impl Client {
                 return Ok(());
             }
 
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = deadline.saturating_duration_since(self.runtime.monotonic_time());
             wacore::runtime::timeout(&*self.runtime, remaining, history_fut)
                 .await
                 .map_err(|_| anyhow!("Timeout waiting for history sync tasks to become idle"))?;

@@ -534,7 +534,7 @@ impl Client {
             let created_at = if is_stale_source(source) {
                 0
             } else {
-                wacore::time::now_secs()
+                self.runtime.wall_time_secs()
             };
             let entry = LidPnEntry::with_timestamp(lid, phone_number, created_at, source);
             self.lid_pn_cache.add_guarded(&entry, guard).await;
@@ -3336,7 +3336,7 @@ mod tests {
             .insert(stale.clone());
 
         // What a reconnect does to the generation.
-        client.connection_generation.fetch_add(1, Ordering::SeqCst);
+        client.advance_generation_for_test(1, Ordering::SeqCst);
 
         client
             .refresh_lid_mapping_for(Jid::new(pn, Server::Pn))

@@ -114,3 +114,10 @@ jobs:
           cargo build -p whatsapp-rust --lib --release
           --target wasm32-unknown-unknown
           --no-default-features --features voip-mlow
+      - name: Build instance-clock VoIP runtime for wasm32 (release)
+        env:
+          RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
+        run: >
+          cargo build -p whatsapp-rust --lib --release
+          --target wasm32-unknown-unknown
+          --no-default-features --features voip-mlow,instance-clock

@@ -105,7 +105,7 @@ impl Client {
             .persistence_manager
             .get_device_snapshot()
             .last_signed_pre_key_rotation_ms;
-        let now = wacore::time::now_millis();
+        let now = self.runtime.wall_time_millis();
 
         if last == 0 {
             self.persistence_manager
@@ -150,7 +150,7 @@ impl Client {
         reschedule_on_failure: bool,
     ) -> Result<(), SignalMaintenanceError> {
         let snapshot = self.persistence_manager.get_device_snapshot();
-        let now = wacore::time::now_millis();
+        let now = self.runtime.wall_time_millis();
         let backend = self.persistence_manager.backend();
 
         let old_id = snapshot.signed_pre_key_id;
@@ -215,7 +215,7 @@ impl Client {
                         ))
                     })?;
                 let record =
-                    new_signed_pre_key_record(new_id, &kp, signature, wacore::time::now_utc());
+                    new_signed_pre_key_record(new_id, &kp, signature, self.runtime.wall_time_utc());
                 backend
                     .store_signed_prekey(
                         new_id,
@@ -235,7 +235,7 @@ impl Client {
             old_id,
             &snapshot.signed_pre_key,
             snapshot.signed_pre_key_signature,
-            wacore::time::now_utc(),
+            self.runtime.wall_time_utc(),
         );
         backend
             .store_signed_prekey(

@@ -26,6 +26,10 @@ pub struct PreparedPatch {
 }
 
 impl PreparedPatch {
+    pub fn mark_bootstrapped(&mut self) {
+        self.result.state.bootstrapped = true;
+    }
+
     pub fn result(&self) -> &PatchProcessingResult {
         &self.result
     }

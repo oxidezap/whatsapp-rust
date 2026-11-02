@@ -85,19 +85,19 @@ async fn active_incoming_waiter_survives_both_reconnect_modes() {
             client.reconnect().await;
         }
         assert_eq!(
-            client.expected_disconnect.load(Ordering::Relaxed),
+            client.expected_session_disconnect(Ordering::Relaxed),
             immediate
         );
         assert_eq!(
-            client.intentional_reconnect.load(Ordering::Relaxed),
+            client.intentional_session_disconnect(Ordering::Relaxed),
             !immediate
         );
         assert_eq!(
-            client.backoff_reset_suppressed.load(Ordering::Relaxed),
+            client.backoff_penalty_pending(Ordering::Relaxed),
             !immediate
         );
         if !immediate {
-            assert_eq!(client.auto_reconnect_errors.load(Ordering::Relaxed), 4);
+            assert_eq!(client.reconnect_errors(Ordering::Relaxed), 4);
         }
         client.cleanup_connection_state().await;
         assert!(sent.await.is_err());

@@ -53,7 +53,24 @@ use waproto::whatsapp as wa;
 ///
 /// `event_full_sync` is public event provenance (lands on
 /// `CallLogSync::from_full_sync`), never a logging level.
+#[cfg(test)]
 pub(crate) fn dispatch_call_log_mutation_outcome(
+    event_bus: &wacore::types::events::CoreEventBus,
+    m: &mut Mutation,
+    event_full_sync: bool,
+    is_own_jid: impl FnOnce(&Jid) -> bool,
+) -> AppStateDispatchOutcome {
+    dispatch_call_log_mutation_outcome_with_clock(
+        wacore::time::now_utc,
+        event_bus,
+        m,
+        event_full_sync,
+        is_own_jid,
+    )
+}
+
+pub(crate) fn dispatch_call_log_mutation_outcome_with_clock(
+    now: impl FnOnce() -> chrono::DateTime<chrono::Utc>,
     event_bus: &wacore::types::events::CoreEventBus,
     m: &mut Mutation,
     event_full_sync: bool,
@@ -90,7 +107,7 @@ pub(crate) fn dispatch_call_log_mutation_outcome(
         .as_ref()
         .and_then(|v| v.timestamp)
         .unwrap_or(0);
-    let timestamp = wacore::time::from_millis_or_now(ts);
+    let timestamp = wacore::time::from_millis(ts).unwrap_or_else(now);
 
     let Some(record) = m
         .action_value

@@ -48,6 +48,10 @@ impl<T> PendingRequests<T> {
         self.entries.get(id).map(|e| &e.value)
     }
 
+    pub fn get_mut(&mut self, id: &str) -> Option<&mut T> {
+        self.entries.get_mut(id).map(|entry| &mut entry.value)
+    }
+
     pub fn remove(&mut self, id: &str) -> Option<T> {
         self.entries.remove(id).map(|e| e.value)
     }

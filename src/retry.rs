@@ -43,19 +43,8 @@ use wacore::protocol::retry::{
     BaseKeyAction, base_key_action, registration_mismatch, session_recreation,
 };
 
-#[derive(Clone, Copy)]
-pub(crate) enum RetransmissionRoute {
-    Direct,
-    Group,
-    Status,
-    BroadcastList,
-}
-
-impl RetransmissionRoute {
-    const fn uses_sender_key(self) -> bool {
-        matches!(self, Self::Group | Self::Status)
-    }
-}
+pub(crate) use wacore::session_engine::retry::RetransmissionRoute;
+use wacore::session_engine::retry::RetryKeyOrder;
 
 #[inline]
 fn is_own_account_jid(jid: &Jid, own_pn: Option<&Jid>, own_lid: Option<&Jid>) -> bool {
@@ -656,8 +645,6 @@ impl Client {
                 return Ok(());
             }
         };
-        let uses_sender_key = route.uses_sender_key();
-
         // WA Web doesn't dedupe receipts (Message/Queue.js just serializes per-chat);
         // MAX_RETRY_COUNT covers loop prevention. This lock only guards against
         // two concurrent receipts racing on session state.
@@ -703,16 +690,13 @@ impl Client {
         }
 
         let keys_node_present = nr.get_optional_child("keys").is_some();
-        if wacore::protocol::retry::should_drop_unknown_device_retry(
-            keys_node_present,
-            device_known,
-        ) {
+        let Some(admission) = route.device_checked(device_known, keys_node_present) else {
             warn!(
                 "handle_retry_receipt: device not found for device={}, user={}",
                 sender_device_id, info.requester.user
             );
             return Ok(());
-        }
+        };
 
         // Check if this is a retry from our own device (peer).
         let is_peer = is_own_account_jid(
@@ -725,8 +709,7 @@ impl Client {
         // processes every receipt), so it is an operator opt-in, gated here
         // before the expensive repair stages below. Own devices (`is_peer`) and
         // DMs are never gated: dropping their retries has no safe SKDM fallback.
-        if uses_sender_key
-            && !is_peer
+        if admission.operator_policy_applies(is_peer)
             && let Some(policy) = self.retry_admission.as_ref()
             && policy.decide(&crate::RetryContext {
                 chat: &info.chat,
@@ -745,19 +728,20 @@ impl Client {
         // Direct is the only route the lookup can still re-address. Install
         // the retry keys here, but defer sender-key repair until after reading
         // the cached message: history bundles were sent pairwise.
-        let settled_jid = if matches!(route, RetransmissionRoute::Direct) {
-            None
-        } else {
-            let jid = self
-                .resolve_retransmission_encryption_jid(route, &info.requester)
-                .await?;
-            if !self
-                .install_retry_key_bundle(&info, &jid, nr, is_peer)
-                .await
-            {
-                return Ok(());
+        let (lookup, settled_jid) = match admission.admitted() {
+            RetryKeyOrder::AfterLookup(lookup) => (lookup, None),
+            RetryKeyOrder::BeforeLookup(keys) => {
+                let jid = self
+                    .resolve_retransmission_encryption_jid(route, &info.requester)
+                    .await?;
+                if !self
+                    .install_retry_key_bundle(&info, &jid, nr, is_peer)
+                    .await
+                {
+                    return Ok(());
+                }
+                (keys.installed(), Some(jid))
             }
-            Some(jid)
         };
 
         // Peek keeps the message in the cache, so we avoid the decode + re-encode
@@ -781,8 +765,7 @@ impl Client {
                     // IDs fail closed toward the ordinary repair path.
                     let is_history_bundle =
                         self.history_payload_kind(&message_id) == Some(HistoryPayloadKind::Bundle);
-                    if !is_history_bundle
-                        && uses_sender_key
+                    if lookup.repair_missing_sender_key(is_history_bundle)
                         && let Some(jid) = settled_jid.as_ref()
                     {
                         self.mark_requester_for_fresh_skdm(&info, jid).await;
@@ -821,7 +804,8 @@ impl Client {
         };
 
         let is_history_bundle = !original_msg.message_history_bundle.is_unset();
-        if uses_sender_key && !is_history_bundle {
+        let repair = lookup.found(is_history_bundle);
+        if repair.refresh_sender_key() {
             self.mark_requester_for_fresh_skdm(&info, &resolved_jid)
                 .await;
         }
@@ -848,10 +832,7 @@ impl Client {
         // force full sender key rotation by clearing all sender key device tracking.
         // This is separate from updateLocalSignalSession and specific to group retries.
         let mut rotated_sender_key = false;
-        if matches!(route, RetransmissionRoute::Group)
-            && !is_history_bundle
-            && !info.requester.is_lid()
-        {
+        if repair.rotate_sender_key(info.requester.is_lid(), false) {
             let group_jid = info.chat.to_string();
             let is_known_participant = cached_group_info
                 .as_ref()
@@ -910,13 +891,14 @@ impl Client {
         }
 
         // Direct only: every other route installed before the lookup.
-        if matches!(route, RetransmissionRoute::Direct)
+        if repair.install_keys_after_lookup()
             && !self
                 .install_retry_key_bundle(&info, &resolved_jid, nr, is_peer)
                 .await
         {
             return Ok(());
         }
+        let reconciliation = repair.keys_ready();
         // Every route reconciles here, behind the lookup: these steps delete
         // sessions and write message-keyed rows that only the resend undoes.
         self.reconcile_retry_session(&resolved_jid, &message_id, retry_count, nr)
@@ -962,7 +944,13 @@ impl Client {
         // re-requests this one on its own timer once the bucket refills. DMs have
         // no SKDM fallback, so they keep the unconditional resend (bounded by
         // MAX_RETRY_COUNT) rather than risk dropping a delivery.
-        if info.chat.is_group() && !self.resend_rate_limiter.try_acquire(&info.chat).await {
+        let rate_admission = reconciliation.reconciled();
+        if rate_admission.rate_limit_applies()
+            && !self
+                .resend_rate_limiter
+                .try_acquire_with_clock(&info.chat, || self.runtime.monotonic_time())
+                .await
+        {
             debug!(
                 "Throttling resend of {} to {}: per-chat resend rate cap reached",
                 message_id,
@@ -978,6 +966,7 @@ impl Client {
             retry_count
         );
 
+        let route = rate_admission.admitted().route();
         let wire_requester = if matches!(route, RetransmissionRoute::Direct) {
             info.original_from
         } else {
@@ -1000,9 +989,13 @@ impl Client {
         Ok(())
     }
 
-    async fn send_retry_stanza(&self, stanza: Node) -> Result<(), anyhow::Error> {
-        self.persist_signal_state_pre_wire().await?;
-        self.send_node(stanza).await?;
+    async fn send_retry_stanza(
+        &self,
+        stanza: wacore::session_engine::publication::CommittingSignal<Node>,
+    ) -> Result<(), anyhow::Error> {
+        let confirmation = self.confirm_signal_state_pre_wire().await?;
+        self.send_node(stanza.confirm(confirmation).into_payload())
+            .await?;
         Ok(())
     }
 
@@ -1047,7 +1040,7 @@ impl Client {
                 && !crate::features::group_history_bundle_fits_current_limits(
                     &message,
                     current_limits,
-                    wacore::time::now_secs().max(0) as u64,
+                    self.runtime.wall_time_secs_u64(),
                 )
             {
                 anyhow::bail!(
@@ -1151,27 +1144,30 @@ impl Client {
             }
             RetransmissionRoute::Status => unreachable!("status handled above"),
         };
-        let stanza = wacore::send::prepare_pairwise_retry_stanza(
-            &mut store_adapter.session_store,
-            &mut store_adapter.identity_store,
-            wacore::send::PairwiseRetryRequest {
-                destination,
-                encryption_jid,
-                message: &message,
-                message_id,
-                retry_count,
-                account: device_snapshot.account.as_deref(),
-                edit,
-                pre_encoded: pre_encoded.as_deref().map(Vec::as_slice),
-            },
+        let stanza = wacore::session_engine::publication::PreparedSignal::new(
+            wacore::send::prepare_pairwise_retry_stanza(
+                &mut store_adapter.session_store,
+                &mut store_adapter.identity_store,
+                wacore::send::PairwiseRetryRequest {
+                    destination,
+                    encryption_jid,
+                    message: &message,
+                    message_id,
+                    retry_count,
+                    account: device_snapshot.account.as_deref(),
+                    edit,
+                    pre_encoded: pre_encoded.as_deref().map(Vec::as_slice),
+                },
+            )
+            .await?,
         )
-        .await?;
+        .begin_commit();
 
         // Persistence may need the processing permit, whose holder may in turn
         // need this session lock. Release it before the durability gate.
         drop(session_guard);
         if history {
-            self.persist_signal_state_pre_wire().await?;
+            let confirmation = self.confirm_signal_state_pre_wire().await?;
             let groups = self.groups();
             let (metadata, current_limits) =
                 groups
@@ -1195,7 +1191,7 @@ impl Client {
                 && !crate::features::group_history_bundle_fits_current_limits(
                     &message,
                     current_limits,
-                    wacore::time::now_secs_u64(),
+                    self.runtime.wall_time_secs_u64(),
                 )
             {
                 anyhow::bail!("history bundle expired before retransmission");
@@ -1207,7 +1203,10 @@ impl Client {
             {
                 anyhow::bail!("connection changed while preparing history retransmission");
             }
-            return self.send_node(stanza).await.map_err(Into::into);
+            return self
+                .send_node(stanza.confirm(confirmation).into_payload())
+                .await
+                .map_err(Into::into);
         }
         self.send_retry_stanza(stanza).await
     }
@@ -1296,7 +1295,10 @@ impl Client {
                 return Err(error);
             }
         };
-        self.send_retry_stanza(prepared.node).await?;
+        self.send_retry_stanza(
+            wacore::session_engine::publication::PreparedSignal::new(prepared.node).begin_commit(),
+        )
+        .await?;
         self.update_sender_key_devices(
             &chat_key,
             &prepared.skdm_devices,
@@ -1581,7 +1583,7 @@ impl Client {
     /// Callers pair this with `signal_cache.delete_session` so the next
     /// `ensure_e2e_sessions_resolved` does the prekey fetch + rebuild.
     async fn should_recreate_session(&self, retry_count: u8, jid: &Jid) -> Option<&'static str> {
-        self.should_recreate_session_at(retry_count, jid, wacore::time::Instant::now())
+        self.should_recreate_session_at(retry_count, jid, self.runtime.monotonic_time())
             .await
     }
 
@@ -2075,7 +2077,12 @@ mod tests {
         let mut waiter =
             client.wait_for_sent_node(crate::client::NodeFilter::tag("message").attr("id", id));
         let result = client
-            .send_retry_stanza(NodeBuilder::new("message").attr("id", id).build())
+            .send_retry_stanza(
+                wacore::session_engine::publication::PreparedSignal::new(
+                    NodeBuilder::new("message").attr("id", id).build(),
+                )
+                .begin_commit(),
+            )
             .await;
 
         client
@@ -2114,7 +2121,12 @@ mod tests {
         let waiter =
             client.wait_for_sent_node(crate::client::NodeFilter::tag("message").attr("id", id));
         let result = client
-            .send_retry_stanza(NodeBuilder::new("message").attr("id", id).build())
+            .send_retry_stanza(
+                wacore::session_engine::publication::PreparedSignal::new(
+                    NodeBuilder::new("message").attr("id", id).build(),
+                )
+                .begin_commit(),
+            )
             .await;
 
         client

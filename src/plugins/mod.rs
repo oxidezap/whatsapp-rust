@@ -6789,7 +6789,7 @@ mod tests {
         assert_eq!(event.connection_generation, generation);
         assert_eq!(event.sequence, 1);
 
-        let next_generation = client.connection_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let next_generation = client.advance_generation_for_test(1, Ordering::SeqCst) + 1;
         publisher
             .publish(&tick, 2, PluginEventPayloadEncoding::Json, Bytes::new())
             .expect("publish after generation change");

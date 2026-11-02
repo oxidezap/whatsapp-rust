@@ -264,7 +264,7 @@ struct SkdmUpdate {
 /// epilogue of `send_message_impl` consumes. Each branch runs as its own
 /// boxed future, so a DM send never pays for the group branch's frame.
 struct SendBranchOutput {
-    node: Node,
+    node: wacore::session_engine::publication::PreparedSignal<Node>,
     /// Generated `MessageContextInfo.message_secret`, persisted after send_node.
     msg_secret: Option<[u8; 32]>,
     /// Group sends: the identity (LID or PN) the secret must be keyed under,
@@ -412,7 +412,7 @@ fn validate_extra_stanza_nodes(nodes: &[Node]) -> Result<(), SendError> {
 impl SendBranchOutput {
     fn stanza_only(node: Node) -> Self {
         Self {
-            node,
+            node: wacore::session_engine::publication::PreparedSignal::new(node),
             msg_secret: None,
             group_sender_identity: None,
             skdm_update: None,
@@ -547,6 +547,11 @@ impl EditOptions {
 pub(crate) struct SendInstant(i64);
 
 impl SendInstant {
+    pub(crate) fn from_runtime(runtime: &std::sync::Arc<dyn wacore::runtime::Runtime>) -> Self {
+        Self(runtime.wall_time_secs())
+    }
+
+    #[cfg(test)]
     pub(crate) fn now() -> Self {
         Self(wacore::time::now_secs())
     }
@@ -1599,7 +1604,7 @@ impl Client {
         let stanza_type_override = options.stanza_type_override;
         let group_metadata_freshness = options.group_metadata_freshness;
         let device_freshness = options.device_freshness;
-        let sent_at = SendInstant::now();
+        let sent_at = SendInstant::from_runtime(&self.runtime);
         let request_id = match options.message_id {
             Some(id) => id.into_string(),
             None => self.generate_message_id_at(sent_at.unix_secs_u64()),
@@ -1728,7 +1733,7 @@ impl Client {
 
         let to = Jid::status_broadcast();
         let request_id = id_override
-            .unwrap_or_else(|| self.generate_message_id_at(wacore::time::now_secs_u64()));
+            .unwrap_or_else(|| self.generate_message_id_at(self.runtime.wall_time_secs_u64()));
 
         // Borrow from the held snapshot: no field clones, the Arc keeps it alive.
         let device_snapshot = self.persistence_manager.get_device_snapshot();
@@ -1936,7 +1941,10 @@ impl Client {
 
         // Gate the stanza on the sender-key ratchet advance being durable
         // (same rule as the DM/group send path); a failure aborts the send.
-        self.persist_signal_state_pre_wire().await?;
+        let pending_stanza =
+            wacore::session_engine::publication::PreparedSignal::new(stanza).begin_commit();
+        let confirmation = self.confirm_signal_state_pre_wire().await?;
+        let stanza = pending_stanza.confirm(confirmation).into_payload();
 
         let ack = stanza
             .attrs()
@@ -2619,7 +2627,7 @@ impl Client {
                 crate::retry::HistoryPayloadKind::Bundle
             },
         );
-        let sent_at = SendInstant::now();
+        let sent_at = SendInstant::from_runtime(&self.runtime);
         let request_id = message_id.to_owned();
         let Some((ack_receiver, ack_generation)) = self.try_register_ack_waiter(&request_id) else {
             return Err(GroupDirectSendError::AckAlreadyPending);
@@ -2704,7 +2712,7 @@ impl Client {
         // Sampled here and lent down, the way `send_message_with_options_inner`
         // does it, so the send still names its message and stamps its instant
         // exactly once.
-        let sent_at = SendInstant::now();
+        let sent_at = SendInstant::from_runtime(&self.runtime);
         let borrowed_message_id = borrowed_stanza_id.is_some();
         let request_id = borrowed_stanza_id
             .unwrap_or_else(|| self.generate_message_id_at(sent_at.unix_secs_u64()));
@@ -2764,7 +2772,7 @@ impl Client {
             if !crate::features::group_history_bundle_fits_current_limits(
                 message,
                 limits,
-                wacore::time::now_secs_u64(),
+                self.runtime.wall_time_secs_u64(),
             ) {
                 return Err(SendError::InvalidRequest(
                     "group history expired before publication".into(),
@@ -2809,7 +2817,7 @@ impl Client {
         } = options;
         // Callers that already stamped their message hand the instant down; the
         // rest sample here so the pipeline below still has exactly one.
-        let sent_at = sent_at.unwrap_or_else(SendInstant::now);
+        let sent_at = sent_at.unwrap_or_else(|| SendInstant::from_runtime(&self.runtime));
         let send_generation = self
             .connection_generation
             .load(std::sync::atomic::Ordering::Acquire);
@@ -2968,7 +2976,9 @@ impl Client {
         // schedule the coalesced write-behind; a send that raised either lease
         // flushes synchronously, and a persistence failure must abort the send
         // rather than transmit an advance we couldn't save.
-        Box::pin(self.persist_signal_state_pre_wire()).await?;
+        let pending_stanza = stanza_to_send.begin_commit();
+        let confirmation = Box::pin(self.confirm_signal_state_pre_wire()).await?;
+        let stanza_to_send = pending_stanza.confirm(confirmation).into_payload();
 
         // A borrowed id must not register a phash ack-waiter: the waiter map is
         // keyed by outer stanza id, so it would overwrite the original send's
@@ -3592,7 +3602,7 @@ impl Client {
             }
         };
         Ok(SendBranchOutput {
-            node,
+            node: wacore::session_engine::publication::PreparedSignal::new(node),
             msg_secret: outbound_msg_secret,
             group_sender_identity: outbound_group_sender_identity,
             skdm_update,
@@ -3789,7 +3799,7 @@ impl Client {
             (prepared, dm_devices)
         };
         Ok(SendBranchOutput {
-            node: prepared.node,
+            node: wacore::session_engine::publication::PreparedSignal::new(prepared.node),
             msg_secret: prepared.message_secret,
             group_sender_identity: None,
             skdm_update: None,
@@ -3977,7 +3987,7 @@ impl Client {
             .addressed
             .saturating_sub(prepared.unreached_devices.len());
         Ok(SendBranchOutput {
-            node: prepared.node,
+            node: wacore::session_engine::publication::PreparedSignal::new(prepared.node),
             msg_secret: prepared.message_secret,
             group_sender_identity: Some(sender_identity),
             skdm_update: None,

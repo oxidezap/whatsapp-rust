@@ -180,11 +180,48 @@ pub async fn resolve_and_update_version(
     http_client: &Arc<dyn HttpClient>,
     override_version: Option<(u32, u32, u32)>,
 ) -> Result<Option<AppVersionFallback>> {
+    resolve_version_with_runtime(persistence_manager, http_client, override_version, None).await
+}
+
+pub(crate) async fn resolve_and_update_version_on(
+    persistence_manager: &Arc<PersistenceManager>,
+    http_client: &Arc<dyn HttpClient>,
+    override_version: Option<(u32, u32, u32)>,
+    runtime: &Arc<dyn wacore::runtime::Runtime>,
+) -> Result<Option<AppVersionFallback>> {
+    resolve_version_with_runtime(
+        persistence_manager,
+        http_client,
+        override_version,
+        Some(runtime),
+    )
+    .await
+}
+
+async fn stamp_version(
+    persistence_manager: &PersistenceManager,
+    version: (u32, u32, u32),
+    runtime: Option<&Arc<dyn wacore::runtime::Runtime>>,
+) {
+    let command = DeviceCommand::SetAppVersion(version);
+    if let Some(runtime) = runtime {
+        persistence_manager
+            .process_command_on(command, runtime)
+            .await;
+    } else {
+        persistence_manager.process_command(command).await;
+    }
+}
+
+async fn resolve_version_with_runtime(
+    persistence_manager: &Arc<PersistenceManager>,
+    http_client: &Arc<dyn HttpClient>,
+    override_version: Option<(u32, u32, u32)>,
+    runtime: Option<&Arc<dyn wacore::runtime::Runtime>>,
+) -> Result<Option<AppVersionFallback>> {
     if let Some((p, s, t)) = override_version {
         debug!("Using user-provided override version: {}.{}.{}", p, s, t);
-        persistence_manager
-            .process_command(DeviceCommand::SetAppVersion((p, s, t)))
-            .await;
+        stamp_version(persistence_manager, (p, s, t), runtime).await;
         return Ok(None);
     }
 
@@ -196,8 +233,12 @@ pub async fn resolve_and_update_version(
     } else {
         match wacore::time::from_millis(last_fetched_ms) {
             Some(last_fetched_dt) => {
-                wacore::time::now_utc().signed_duration_since(last_fetched_dt)
-                    > chrono::Duration::hours(24)
+                let now = runtime.map_or_else(wacore::time::now_millis, |runtime| {
+                    runtime.wall_time_millis()
+                });
+                wacore::time::from_millis(now).is_none_or(|now| {
+                    now.signed_duration_since(last_fetched_dt) > chrono::Duration::hours(24)
+                })
             }
             None => true,
         }
@@ -240,9 +281,7 @@ pub async fn resolve_and_update_version(
         };
 
         debug!("Fetched latest version: {}.{}.{}", p, s, t);
-        persistence_manager
-            .process_command(DeviceCommand::SetAppVersion((p, s, t)))
-            .await;
+        stamp_version(persistence_manager, (p, s, t), runtime).await;
     } else {
         debug!(
             "Using cached version: {}.{}.{}",

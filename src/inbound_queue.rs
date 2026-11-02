@@ -804,7 +804,7 @@ mod overload_tests {
         without_queues.inbound_ack_charged_bytes = 0;
         assert!(total >= without_queues.total_estimated_bytes() + 2048);
         drop(ack_lease);
-        client.connection_generation.fetch_add(1, Ordering::AcqRel);
+        client.advance_generation_for_test(1, Ordering::AcqRel);
         client.reset_connection_shutdown();
         let mut cancelled = false;
         crate::handlers::message::MessageHandler::handle_inline(
@@ -908,7 +908,7 @@ mod overload_tests {
         assert!(futures::poll!(&mut future).is_pending());
         client.notify_connection_shutdown();
         client.reset_connection_shutdown();
-        client.connection_generation.fetch_add(1, Ordering::AcqRel);
+        client.advance_generation_for_test(1, Ordering::AcqRel);
         drop(guard);
         assert!(future.await);
         assert!(cancelled);

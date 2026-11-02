@@ -5334,6 +5334,7 @@ dependencies = [
  "log",
  "metrics-exporter-prometheus",
  "opus",
+ "parking_lot",
  "portable-atomic",
  "rand 0.10.3",
  "rtc-datachannel",

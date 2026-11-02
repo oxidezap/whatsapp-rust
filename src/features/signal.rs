@@ -329,14 +329,17 @@ impl<'a> Signal<'a> {
         let mut store = self.client.sender_key_adapter();
         let chain_lock = store.sender_key_lock(&sender_key_name).await;
         let chain_guard = chain_lock.lock().await;
-        let distribution = wacore::send::create_sender_key_distribution_message_for_group(
-            &mut store,
-            &sender_key_name,
+        let distribution = wacore::session_engine::publication::PreparedSignal::new(
+            wacore::send::create_sender_key_distribution_message_for_group(
+                &mut store,
+                &sender_key_name,
+            )
+            .await?,
         )
-        .await?;
+        .begin_commit();
         drop(chain_guard);
-        self.client.persist_signal_state_pre_wire().await?;
-        Ok(distribution)
+        let confirmation = self.client.confirm_signal_state_pre_wire().await?;
+        Ok(distribution.confirm(confirmation).into_payload())
     }
 
     /// Check whether sender-key state exists for a group and sender.
@@ -428,26 +431,30 @@ impl<'a> Signal<'a> {
         plaintext: &[u8],
     ) -> Result<(EncType, Vec<u8>), SignalError> {
         let encryption_jid = self.client.resolve_encryption_jid(jid).await;
-        let encrypted = match self.encrypt_pairwise_at(&encryption_jid, plaintext).await {
-            Ok(encrypted) => encrypted,
-            Err(error @ SignalError::Protocol(SignalProtocolError::SessionNotFound(_))) => {
-                if !self
-                    .migrate_legacy_pairwise_state(jid, &encryption_jid)
-                    .await?
-                {
-                    return Err(error);
+        let encrypted = wacore::session_engine::publication::PreparedSignal::new(
+            match self.encrypt_pairwise_at(&encryption_jid, plaintext).await {
+                Ok(encrypted) => encrypted,
+                Err(error @ SignalError::Protocol(SignalProtocolError::SessionNotFound(_))) => {
+                    if !self
+                        .migrate_legacy_pairwise_state(jid, &encryption_jid)
+                        .await?
+                    {
+                        return Err(error);
+                    }
+                    self.encrypt_pairwise_at(&encryption_jid, plaintext).await?
                 }
-                self.encrypt_pairwise_at(&encryption_jid, plaintext).await?
-            }
-            Err(error) => return Err(error),
-        };
+                Err(error) => return Err(error),
+            },
+        )
+        .begin_commit();
 
         // Same pre-wire gate as the send path: the caller transmits these
         // bytes, so a raised lease must be durable before they leave here.
-        self.client.persist_signal_state_pre_wire().await?;
+        let confirmation = self.client.confirm_signal_state_pre_wire().await?;
 
-        let (_, is_prekey, bytes) = wacore::send::extract_ciphertext(encrypted)
-            .ok_or_else(|| SignalError::Unsupported("unexpected ciphertext variant".into()))?;
+        let (_, is_prekey, bytes) =
+            wacore::send::extract_ciphertext(encrypted.confirm(confirmation).into_payload())
+                .ok_or_else(|| SignalError::Unsupported("unexpected ciphertext variant".into()))?;
         let enc_type = if is_prekey {
             EncType::PreKeyMessage
         } else {
@@ -572,15 +579,18 @@ impl<'a> Signal<'a> {
             None
         };
 
-        let ciphertext =
+        let ciphertext = wacore::session_engine::publication::PreparedSignal::new(
             wacore::send::encrypt_group_message(&mut store, &sender_key_name, plaintext, &mut rng)
-                .await?;
+                .await?,
+        )
+        .begin_commit();
 
         // The durability gate can need the processing permit, whose holder may
         // need this chain lock.
         drop(_chain_guard);
-        self.client.persist_signal_state_pre_wire().await?;
+        let confirmation = self.client.confirm_signal_state_pre_wire().await?;
 
+        let ciphertext = ciphertext.confirm(confirmation).into_payload();
         if let Some(distribution) = &skdm_bytes {
             self.client
                 .signal_cache
@@ -689,20 +699,24 @@ impl<'a> Signal<'a> {
         let hide_decrypt_fail = wacore::send::should_hide_decrypt_fail(message);
 
         let mut stores = adapter.as_signal_stores();
-        let result = wacore::send::encrypt_for_devices(
-            &*self.client.runtime,
-            &mut stores,
-            self.client,
-            &device_jids,
-            &plaintext,
-            hide_decrypt_fail,
-            mediatype,
+        let result = wacore::session_engine::publication::PreparedSignal::new(
+            wacore::send::encrypt_for_devices(
+                &*self.client.runtime,
+                &mut stores,
+                self.client,
+                &device_jids,
+                &plaintext,
+                hide_decrypt_fail,
+                mediatype,
+            )
+            .await?,
         )
-        .await?;
+        .begin_commit();
 
         drop(_session_guards);
-        self.client.persist_signal_state_pre_wire().await?;
+        let confirmation = self.client.confirm_signal_state_pre_wire().await?;
 
+        let result = result.confirm(confirmation).into_payload();
         Ok((result.participant_nodes, result.includes_prekey_message))
     }
 

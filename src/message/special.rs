@@ -212,7 +212,7 @@ impl Client {
     ) {
         let weak = Arc::downgrade(self);
         let runtime = self.runtime.clone();
-        let message_id = self.generate_message_id_at(wacore::time::now_secs_u64());
+        let message_id = self.generate_message_id_at(self.runtime.wall_time_secs_u64());
         self.runtime
             .spawn(Box::pin(async move {
                 let mut attempt = 0;
@@ -222,7 +222,7 @@ impl Client {
 
                 loop {
                     let wait_deadline =
-                        wacore::time::Instant::now() + Client::DEFAULT_OFFLINE_SYNC_TIMEOUT;
+                        runtime.monotonic_time() + Client::DEFAULT_OFFLINE_SYNC_TIMEOUT;
                     loop {
                         let Some(client) = weak.upgrade() else {
                             return;
@@ -258,7 +258,7 @@ impl Client {
                             break;
                         }
                         let remaining = wait_deadline
-                            .saturating_duration_since(wacore::time::Instant::now());
+                            .saturating_duration_since(runtime.monotonic_time());
                         if remaining.is_zero()
                             || wacore::runtime::timeout(&*runtime, remaining, listener)
                                 .await
