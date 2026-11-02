@@ -4,6 +4,13 @@
 pub(crate) mod prefetch_bench;
 
 use super::*;
+pub(crate) use wacore::sync_engine::app_state::{
+    BatchedSyncOutcome, BatchedSyncRequest, BootstrapState, CollectionRetryState, CriticalSyncPlan,
+    ReservationSkip, ReservationWait, RetryBudget, RetryProgress, ScopeLost, StandDown, SyncHolder,
+    SyncOutcome, SyncScope, SyncSettles, Unaccounted,
+    initial_key_retry as initial_app_state_key_retry, next_key_retry,
+};
+
 use crate::features::{AppStateError, AppStateResyncMode, AppStateResyncReport};
 use crate::request::DEFAULT_IQ_TIMEOUT;
 use std::borrow::Cow;
@@ -123,7 +130,6 @@ impl AppStateMutationPersistence for AppStateClientPersistence {
 const APP_STATE_KEY_REQUEST_DEDUP: Duration = Duration::from_secs(24 * 3600);
 const APP_STATE_KEY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const APP_STATE_KEY_PARTIAL_RETRY: Duration = Duration::from_secs(10);
-const APP_STATE_KEY_RETRY_MAX: Duration = Duration::from_secs(60);
 /// How many times an outgoing patch is rebuilt against a newer base before the
 /// send gives up. WA Web's `serverSync` runs the same resolve-and-retry loop
 /// with `y = 5` (`WAWebSyncdServerSync`).
@@ -142,56 +148,12 @@ const APP_STATE_PATCH_SEND_ATTEMPTS: usize = 5;
 /// reservation that never releases would stall everything queued behind it.
 const APP_STATE_RESERVATION_WAIT: Duration =
     Duration::from_secs(DEFAULT_IQ_TIMEOUT.as_secs() * (APP_STATE_PATCH_SEND_ATTEMPTS as u64 + 1));
-/// Spacing between re-syncs of a collection a run left retryable, mirroring the
-/// syncd backoff WA Web applies to exactly this case (`WASyncdConst`:
-/// `BACKOFF_MIN_TIMEOUT` 1s, `BACKOFF_BASE` 2, `BACKOFF_MAX_TIMEOUT` 1h).
-const APP_STATE_RETRY_BACKOFF_MIN: Duration = Duration::from_secs(1);
-const APP_STATE_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
-/// How many spaced attempts one connection makes before leaving the collection
-/// to the next sync trigger. WA Web keeps retrying against a persisted
-/// first-failure timestamp and only gives up after two days; without that column
-/// this is what a single connection can promise, and the doubling already puts
-/// the last wait minutes out.
-const APP_STATE_RETRY_MAX_ROUNDS: u32 = 8;
-/// How many extra rounds the loop may burn waiting for a writer to release a
-/// collection before the attempt budget is spent.
-const APP_STATE_RETRY_ROUND_SLACK: u32 = 4;
-
-/// Delay before the attempt after `attempts` failures, doubling from
-/// [`APP_STATE_RETRY_BACKOFF_MIN`] and clamped at
-/// [`APP_STATE_RETRY_BACKOFF_MAX`].
-///
-/// Indexed by failed attempts rather than by loop iterations: rounds also pass
-/// while waiting for a socket or for another writer, and those are not failures
-/// to back off from. Letting them advance the exponent would put the next real
-/// attempt an hour away once the clamp is reached.
-fn app_state_retry_backoff(attempts: u32) -> Duration {
-    APP_STATE_RETRY_BACKOFF_MIN
-        .saturating_mul(2u32.saturating_pow(attempts))
-        .min(APP_STATE_RETRY_BACKOFF_MAX)
-}
-
-/// What a sync run actually achieved.
-///
-/// `Result<()>` could not tell "the collection is current" from "the connection
-/// went away before anything was asked", so every caller re-derived the
-/// difference from lifecycle flags — each with its own approximation, each
-/// missing a case the next one caught. The 429 and 503 stream errors are the
-/// ones they all missed: those clear `is_logged_in` without setting
-/// `expected_disconnect` or retiring the generation, so a run cut short there
-/// answered `Ok(())` and every proxy read it as done. The trigger is consumed
-/// by then, and nothing asks again.
-///
-/// Skipping is not a variant of finishing, so it is not a variant of `Ok(())`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SyncOutcome {
-    /// The server was asked, and answered until it had nothing more to send.
-    Completed,
-    /// Nothing was asked, or the run stopped with pages outstanding. Whatever
-    /// arrived is persisted, but the trigger has not been honoured and the work
-    /// is still owed.
-    Deferred,
-}
+use wacore::sync_engine::app_state::RETRY_MAX_ATTEMPTS as APP_STATE_RETRY_MAX_ROUNDS;
+#[cfg(test)]
+use wacore::sync_engine::app_state::{
+    RETRY_BACKOFF_MAX as APP_STATE_RETRY_BACKOFF_MAX,
+    RETRY_BACKOFF_MIN as APP_STATE_RETRY_BACKOFF_MIN, retry_backoff as app_state_retry_backoff,
+};
 
 /// Whether an attempt that ended this way leaves the collection still owed a
 /// sync.
@@ -203,70 +165,6 @@ pub(crate) enum SyncOutcome {
 /// kept turning out to be one short.
 fn sync_still_owed(outcome: &Result<SyncOutcome>) -> bool {
     !matches!(outcome, Ok(SyncOutcome::Completed))
-}
-
-/// The connection a piece of app-state work belongs to, and the clock it runs
-/// against.
-///
-/// Every sync path awaits round trips, and between them the socket can retire
-/// or the bootstrap's watchdog can fire. Checking that by hand at each await
-/// boundary is what this replaces: the checks drifted apart, some paths grew a
-/// check the next one forgot, and the same load answered two different
-/// questions. A scope makes the question single — [`Client::admits`] — and the
-/// answer typed, so a new boundary that forgets to ask is a boundary that
-/// cannot compile against the API.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SyncScope {
-    /// The connection this work was started for.
-    generation: u64,
-    /// When the work stops being worth doing. Only the initial bootstrap sets
-    /// one, because only it runs under a watchdog that reconnects underneath.
-    deadline: Option<wacore::time::Instant>,
-}
-
-/// Why a scope no longer admits its work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ScopeLost {
-    /// The connection was replaced. Anything this work would publish or persist
-    /// belongs to a socket that is gone.
-    Retired,
-    /// The deadline passed. The watchdog either has reconnected or is about to,
-    /// so finishing would race it.
-    Expired,
-}
-
-impl SyncScope {
-    /// The generation this scope is pinned to. Used by logs and by tests that
-    /// need to retire a connection out from under a scope.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn generation(self) -> u64 {
-        self.generation
-    }
-
-    /// How long the work has left, or `None` when it is not on a clock.
-    pub(crate) fn remaining_with(
-        self,
-        now: impl FnOnce() -> wacore::time::Instant,
-    ) -> Option<Duration> {
-        self.deadline.map(|d| d.saturating_duration_since(now()))
-    }
-
-    /// Whether this scope is bound to a deadline at all, which is what
-    /// distinguishes the bootstrap from every background trigger.
-    pub(crate) fn is_bootstrap(self) -> bool {
-        self.deadline.is_some()
-    }
-
-    /// Move to the live connection, for work that must outlive a reconnect.
-    ///
-    /// Returns whether it moved. The caller decides what that costs: an outcome
-    /// computed for the old socket must not be published, and a retry that
-    /// rebinds can no longer settle the bootstrap it was scheduled by.
-    pub(crate) fn rebind(&mut self, to: u64) -> bool {
-        let moved = self.generation != to;
-        self.generation = to;
-        moved
-    }
 }
 
 /// The initial-bootstrap flag, tagged with the connection that last wrote it.
@@ -285,16 +183,12 @@ impl BootstrapGate {
     /// Armed by pairing before any connection exists, so generation zero owns
     /// the first write and every later connection outranks it.
     pub(crate) fn new(outstanding: bool) -> Self {
-        Self(AtomicU64::new(Self::encode(0, outstanding)))
-    }
-
-    const fn encode(generation: u64, outstanding: bool) -> u64 {
-        (generation << 1) | outstanding as u64
+        Self(AtomicU64::new(BootstrapState::new(outstanding).word()))
     }
 
     /// Whether the bootstrap still owes work, whoever last said so.
     pub(crate) fn is_armed(&self) -> bool {
-        self.0.load(Ordering::Acquire) & 1 == 1
+        BootstrapState::from_word(self.0.load(Ordering::Acquire)).is_armed()
     }
 
     /// Arm for a fresh pairing, above every connection that already exists.
@@ -328,10 +222,10 @@ impl BootstrapGate {
             // equal generation — that is a connection revising its own answer,
             // which it is entitled to do — so a tag merely level with an
             // existing one still lets that connection clear the arm.
-            let generation = (current >> 1).max(current_generation).saturating_add(1);
+            let next = BootstrapState::from_word(current).arm_for_pairing(current_generation);
             match self.0.compare_exchange_weak(
                 current,
-                Self::encode(generation, true),
+                next.word(),
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
@@ -351,12 +245,13 @@ impl BootstrapGate {
         loop {
             // Strictly newer wins. Equal is the same connection revising its own
             // answer, which it is entitled to do.
-            if (current >> 1) > generation {
+            let Some(next) = BootstrapState::from_word(current).settle(generation, outstanding)
+            else {
                 return false;
-            }
+            };
             match self.0.compare_exchange_weak(
                 current,
-                Self::encode(generation, outstanding),
+                next.word(),
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
@@ -367,237 +262,7 @@ impl BootstrapGate {
     }
 }
 
-/// What kind of work holds a collection's reservation.
-///
-/// Skipping behind a holder is only sound when that holder is doing the same
-/// fetch. A patch send takes the same reservation and never fetches, so a sync
-/// that skipped behind one would silently drop the work its caller asked for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SyncHolder {
-    /// A collection sync: fetches from the server, then writes the collection's
-    /// version and mutation MACs.
-    Sync,
-    /// A patch send: writes the same rows, but never fetches.
-    PatchSend,
-}
-
-/// What a snapshot recovery from the primary holds its collection as; why is
-/// where `write_recovered_collection` takes the reservation.
 const RECOVERY_HOLDER: SyncHolder = SyncHolder::PatchSend;
-
-/// Why a sync did not get the collection reserved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReservationSkip {
-    /// An equivalent sync already holds it, so it is already doing this work.
-    EquivalentSyncInFlight,
-    /// Nobody else is covering the collection and this call did not get it: the
-    /// holder outlasted the bound, or the caller was not willing to wait.
-    WaitTimedOut,
-}
-
-/// What finishing a sync, or the retries it schedules, settles beyond the
-/// collections themselves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SyncSettles {
-    /// Only the collections. Every trigger except the initial bootstrap: a
-    /// `server_sync` or a dirty bit says nothing about whether the first full
-    /// sync ever finished.
-    JustTheCollections,
-    /// The initial bootstrap too. Its gate stays armed while anything it asked
-    /// for is still outstanding, so recovering the last of them — even rounds
-    /// later — is what stands it down.
-    InitialSync,
-}
-
-/// What a sync should do when the collection is already reserved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReservationWait {
-    /// Skip when an equivalent sync holds it. The batched sync asks for whatever
-    /// the server has for a set of collections, so another sync of the same
-    /// collection does this call's work and dropping it costs nothing.
-    SkipBehindSync,
-    /// Wait for whoever holds it. A consumer asking for one specific collection
-    /// is not made redundant by a sync already in flight: a full sync asks for
-    /// the snapshot while an incremental one asks for patches after the
-    /// persisted version, so skipping would turn the request into a no-op.
-    Always,
-    /// Take it if it is free, and report it otherwise. For a caller that has
-    /// already waited out the holders separately — waiting again here would be
-    /// waiting while holding the collections reserved before this one, which is
-    /// what that earlier wait exists to avoid.
-    TryOnce,
-}
-
-/// The two choices a batched sync makes for itself unless a caller overrides
-/// them.
-///
-/// Both defaults are right for a trigger the server raised — a `server_sync`
-/// notification, a dirty bit, the bootstrap — and wrong for a consumer that
-/// asked for a named collection by hand. Such a caller wants the collection
-/// re-read *now*: an equivalent sync in flight does not discharge its request
-/// (see [`ReservationWait`]), and a collection it has declared untrustworthy is
-/// not repaired by resuming from where it was. Overriding is deliberately not
-/// the default — a background trigger that waited on every holder would queue
-/// behind patch sends it has no reason to outrank, and one that rebuilt would
-/// re-download whole collections on every dirty bit.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BatchedSyncRequest {
-    /// Stand each collection down to unsynced before asking, so the round that
-    /// follows rebuilds it from a snapshot instead of resuming from where it
-    /// was.
-    pub(crate) rebuild: bool,
-    /// Wait for whoever holds the collection rather than skipping behind an
-    /// equivalent sync. The bootstrap already does this on account of its
-    /// deadline; this is how a non-bootstrap caller asks for the same.
-    pub(crate) wait_for_holder: bool,
-}
-
-/// Whether a collection was stood down for a rebuild, or left alone because the
-/// connection it was being stood down for is gone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StandDown {
-    /// The collection is unsynced now — either it was already, or both halves of
-    /// the reset landed.
-    Done,
-    /// Nothing was written. The collection is exactly as it was, and the caller
-    /// should treat it as one this run did not cover.
-    Declined(ScopeLost),
-}
-
-/// What a batched sync achieved, collection by collection.
-///
-/// A single `Ok`/`Err` for the whole batch cannot carry this. The initial
-/// bootstrap must not read "one collection was refused" as permission to
-/// dispatch Connected, while a background `server_sync` only wants to log it,
-/// and both read the same return value. So the call reports what happened and
-/// each caller decides what a partial result means for it.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct BatchedSyncOutcome {
-    /// Applied and persisted.
-    pub(crate) synced: Vec<WAPatchName>,
-    /// The server refused the collection outright (400/404). Repeating the same
-    /// request gets the same answer, so retrying on its own never clears this.
-    pub(crate) fatal: Vec<WAPatchName>,
-    /// Did not sync, but a later attempt can: a retryable server error, a decode
-    /// key that never landed, or the iteration cap.
-    pub(crate) retryable: Vec<WAPatchName>,
-    /// Another holder had it reserved, so this call did nothing for it.
-    pub(crate) skipped: Vec<WAPatchName>,
-    /// Whether a collection IQ actually went out.
-    ///
-    /// Recorded at the send, not inferred from the buckets above. Inferring it
-    /// was wrong in a way that is worth keeping written down: `retryable` looks
-    /// like it means "the server was asked and the answer was retryable", and it
-    /// does hold those — but it also holds the collections a scope loss or a
-    /// reservation timeout dropped *before* the wire. A batch of nothing but
-    /// those reads as a real attempt under any bucket-based test.
-    reached_server: bool,
-}
-
-impl BatchedSyncOutcome {
-    /// Whether this call got as far as asking the server about anything.
-    ///
-    /// A round that reserved nothing sent no IQ and learned nothing. A retry
-    /// that charges an attempt for it spends its budget on whoever is holding
-    /// the collection — waiting again, dressed as trying.
-    pub(crate) fn reached_server(&self) -> bool {
-        self.reached_server
-    }
-
-    /// Record that a collection IQ went out. The single place that decides it.
-    fn note_reached_server(&mut self) {
-        self.reached_server = true;
-    }
-
-    /// Every collection this call did not leave synced, whatever the reason.
-    pub(crate) fn unsynced(&self) -> impl Iterator<Item = WAPatchName> + '_ {
-        self.fatal
-            .iter()
-            .chain(&self.retryable)
-            .chain(&self.skipped)
-            .copied()
-    }
-
-    /// True when every collection asked for came back synced.
-    pub(crate) fn all_synced(&self) -> bool {
-        self.unsynced().next().is_none()
-    }
-
-    /// Everything the batch asked for, reported as retryable.
-    ///
-    /// Deliberately imprecise: a batch can fail after a collection was already
-    /// applied, and the `?` on the inner call takes the partial outcome with it,
-    /// so nothing downstream can tell which of them landed. Over-reporting costs
-    /// an incremental re-sync that resumes from the persisted version, which is
-    /// what the retry scheduler already spends on a global failure. Silence
-    /// costs more, because next to a `Connected` it reads as a clean startup on
-    /// a session that may have no push name.
-    pub(crate) fn all_retryable(requested: &[WAPatchName]) -> Self {
-        Self {
-            retryable: requested.to_vec(),
-            ..Default::default()
-        }
-    }
-}
-
-/// What the critical bootstrap does with the answer its batched sync produced.
-///
-/// Pure, and deliberately apart from the I/O that carries it out: the decision
-/// used to live inside a detached post-login task with a socket behind it, which
-/// is why nothing tested it and why two of its four branches left an
-/// authenticated, no-longer-passive connection announced to nobody.
-///
-/// Every answer announces. A connection that has left passive mode is already
-/// delivering stanzas, so withholding [`Event::Connected`] hides a working
-/// session rather than protecting anyone from it; what did not sync is reported
-/// and retried instead.
-#[derive(Debug)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
-pub(crate) struct CriticalSyncPlan {
-    /// Collections to hand to the background sync that follows the bootstrap.
-    pub(crate) retry: Vec<WAPatchName>,
-    /// Something the bootstrap owes is not in `retry` and never will be, so a
-    /// later clean round must not stand the gate down on its behalf.
-    pub(crate) stranded: bool,
-}
-
-impl CriticalSyncPlan {
-    /// The plan for a batch that ran to an outcome.
-    pub(crate) fn from_outcome(outcome: &BatchedSyncOutcome) -> Self {
-        // Destructured rather than read field by field: a bucket added to
-        // `BatchedSyncOutcome` breaks this line, which is the only place that
-        // decides what a bucket costs the bootstrap.
-        //
-        // `reached_server` is read and deliberately changes nothing. How far the
-        // attempt got is already reflected in which bucket each collection
-        // landed in, and a round that sent no IQ leaves those collections in
-        // `retry` exactly like one that did.
-        let BatchedSyncOutcome {
-            synced: _,
-            fatal,
-            retryable,
-            skipped,
-            reached_server: _,
-        } = outcome;
-        // A refusal is not retried, since the same request gets the same
-        // answer, but the batch's other misses are no less recoverable for it
-        // having happened, and the watchdog is no longer there to ask again.
-        let retry: Vec<WAPatchName> = retryable.iter().chain(skipped).copied().collect();
-        Self {
-            retry,
-            stranded: !fatal.is_empty(),
-        }
-    }
-
-    /// Whether the bootstrap still owes work, which is also what makes the
-    /// outcome worth publishing: a consumer needs to hear about a sync that left
-    /// a gap, and about nothing else.
-    ///
-    /// Derived rather than stored so the two can never disagree.
-    pub(crate) fn outstanding(&self) -> bool {
-        self.stranded || !self.retry.is_empty()
-    }
-}
 
 /// In-flight dedup registry for app-state collection syncs.
 ///
@@ -726,12 +391,6 @@ impl Drop for SyncInFlightGuard {
         // re-check its own collection.
         self.registry.released.notify(usize::MAX);
     }
-}
-
-fn initial_app_state_key_retry(timeout: Duration) -> Duration {
-    (timeout / 2)
-        .max(Duration::from_millis(1))
-        .min(APP_STATE_KEY_PARTIAL_RETRY)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -901,33 +560,15 @@ enum Recovery {
     Failed(anyhow::Error),
 }
 
-/// Why a collection this round asked for is missing from its results.
-///
-/// A `<sync>` that omits a requested `<collection>` parses fine, so the omission
-/// has to be reconciled rather than detected. But an apply that failed leaves the
-/// collection unaccounted for too, and calling that "the response omitted it"
-/// blames the server for our own error -- which is exactly what a production
-/// investigation into a permanently unsyncable `regular_low` had to unpick.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Unaccounted {
-    /// The response never mentioned it.
-    Omitted,
-    /// It came back, and the apply stopped before finishing it.
-    NotApplied,
-}
-
 fn unaccounted_for(
     name: WAPatchName,
     responded: &HashSet<WAPatchName>,
     answered: &HashSet<WAPatchName>,
 ) -> Option<Unaccounted> {
-    if answered.contains(&name) {
-        None
-    } else if responded.contains(&name) {
-        Some(Unaccounted::NotApplied)
-    } else {
-        Some(Unaccounted::Omitted)
-    }
+    wacore::sync_engine::app_state::unaccounted_for(
+        responded.contains(&name),
+        answered.contains(&name),
+    )
 }
 
 impl Client {
@@ -1429,15 +1070,9 @@ impl Client {
     /// a scheduled retry — and nowhere else, so there is one answer per boundary
     /// rather than one per author.
     pub(crate) fn admits(&self, scope: SyncScope) -> Result<(), ScopeLost> {
-        if self.connection_generation.load(Ordering::SeqCst) != scope.generation {
-            return Err(ScopeLost::Retired);
-        }
-        if let Some(deadline) = scope.deadline
-            && self.runtime.monotonic_time() >= deadline
-        {
-            return Err(ScopeLost::Expired);
-        }
-        Ok(())
+        scope.admits(self.connection_generation.load(Ordering::SeqCst), || {
+            self.runtime.monotonic_time()
+        })
     }
 
     /// Record whether the initial bootstrap still has work outstanding.
@@ -1638,12 +1273,9 @@ impl Client {
             // never reached the server, so spending an attempt on it would let a
             // long-lived holder burn the budget without the sync being tried
             // once. Rounds still bound the loop overall.
-            let mut attempts = 0u32;
-            for _ in 0..APP_STATE_RETRY_MAX_ROUNDS * APP_STATE_RETRY_ROUND_SLACK {
-                if attempts >= APP_STATE_RETRY_MAX_ROUNDS {
-                    break;
-                }
-                runtime.sleep(app_state_retry_backoff(attempts)).await;
+            let mut budget = RetryBudget::default();
+            while let Some(delay) = budget.next_delay() {
+                runtime.sleep(delay).await;
                 let Some(client) = weak_client.upgrade() else {
                     debug!(target: "Client/AppState", "App state task retry cancelled: client is gone");
                     return;
@@ -1698,7 +1330,7 @@ impl Client {
                     drop(guard);
                     continue;
                 }
-                attempts += 1;
+                budget.record_attempt();
                 let outcome = client.process_app_state_sync_task(name, full_sync).await;
                 if let Err(e) = &outcome {
                     drop(guard);
@@ -1718,6 +1350,7 @@ impl Client {
                 }
                 debug!(target: "Client/AppState", "The {name:?} attempt did not settle it; keeping it queued");
             }
+            let attempts = budget.attempts();
             warn!(
                 target: "Client/AppState",
                 "App state task for {name:?} still unsynced after {attempts} attempts"
@@ -1760,26 +1393,16 @@ impl Client {
         let runtime = self.runtime.clone();
         self.runtime.spawn_detached(Box::pin(async move {
             let mut scope = scope;
-            let mut settles = settles;
+            let mut recovery = CollectionRetryState::new(settles, already_stranded);
             let mut pending = collections;
-            // Sticky, and only for misses that do not come back. A round can
-            // strand one collection as fatal or skipped while another stays
-            // retryable; if that last one then succeeds, its own `all_synced()`
-            // is true even though the first never synced. Retryable ones are
-            // exactly what the next round carries, so counting them would keep
-            // the gate armed forever after any transient round.
-            let mut left_unresolved = already_stranded;
             // Attempts and rounds are counted separately. A round spent waiting
             // for a socket never reached the server, and the reconnect backoff
             // runs far longer than these delays do, so charging it as an attempt
             // would exhaust the budget before the replacement connection exists
             // and drop a trigger that is already consumed.
-            let mut attempts = 0u32;
-            for _ in 0..APP_STATE_RETRY_MAX_ROUNDS * APP_STATE_RETRY_ROUND_SLACK {
-                if attempts >= APP_STATE_RETRY_MAX_ROUNDS {
-                    break;
-                }
-                runtime.sleep(app_state_retry_backoff(attempts)).await;
+            let mut budget = RetryBudget::default();
+            while let Some(delay) = budget.next_delay() {
+                runtime.sleep(delay).await;
                 let Some(client) = weak_client.upgrade() else {
                     debug!(target: "Client/AppState", "App state retry cancelled: client is gone");
                     return;
@@ -1795,12 +1418,7 @@ impl Client {
 
                 // Rebound after the wait, not before: the connection that
                 // arrives is the one this attempt belongs to.
-                if scope.rebind(client.connection_generation.load(Ordering::SeqCst)) {
-                    // The work carries over; the authority to settle does not.
-                    // This run no longer belongs to the bootstrap that scheduled
-                    // it, so it must never stand that gate down.
-                    settles = SyncSettles::JustTheCollections;
-                }
+                recovery.rebind(&mut scope, client.connection_generation.load(Ordering::SeqCst));
 
                 // The same guard the task retry makes, and for the same reason:
                 // the wait can resolve just as a planned reconnect begins, and
@@ -1815,7 +1433,7 @@ impl Client {
                 debug!(
                     target: "Client/AppState",
                     "Retrying app state {pending:?} (attempt {}/{APP_STATE_RETRY_MAX_ROUNDS})",
-                    attempts + 1
+                    budget.attempts() + 1
                 );
                 let result = client
                     .sync_collections_batched(pending.clone(), scope)
@@ -1829,15 +1447,14 @@ impl Client {
                     Err(_) => true,
                 };
                 if reached_server {
-                    attempts += 1;
+                    budget.record_attempt();
                 }
 
                 // Rebinding here drops the outcome, not the work: publishing a
                 // retired socket's refusal could have a consumer log out the
                 // live session, while abandoning the names would strand them.
-                if scope.rebind(client.connection_generation.load(Ordering::SeqCst)) {
+                if recovery.rebind(&mut scope, client.connection_generation.load(Ordering::SeqCst)) {
                     debug!(target: "Client/AppState", "App state retry outcome dropped; rebound");
-                    settles = SyncSettles::JustTheCollections;
                     continue;
                 }
 
@@ -1849,13 +1466,11 @@ impl Client {
                                 client.session_ready_reached(Ordering::Relaxed),
                             );
                         }
-                        if !outcome.fatal.is_empty() || !outcome.skipped.is_empty() {
-                            left_unresolved = true;
-                        }
+                        let progress = recovery.observe(&outcome);
                         pending = outcome.retryable;
-                        if pending.is_empty() {
-                            if settles == SyncSettles::InitialSync {
-                                client.settle_bootstrap(scope, left_unresolved);
+                        if let RetryProgress::Complete { bootstrap_outstanding } = progress {
+                            if let Some(outstanding) = bootstrap_outstanding {
+                                client.settle_bootstrap(scope, outstanding);
                             }
                             return;
                         }
@@ -1863,6 +1478,7 @@ impl Client {
                     Err(e) => client.log_sync_error("app state retry", &e),
                 }
             }
+            let attempts = budget.attempts();
             warn!(
                 target: "Client/AppState",
                 "App state {pending:?} still unsynced after {attempts} attempts; \
@@ -1913,14 +1529,10 @@ impl Client {
     ) -> Result<SyncInFlightGuard, ReservationSkip> {
         match self.app_state_syncing.try_begin_as(name, SyncHolder::Sync) {
             Ok(guard) => return Ok(guard),
-            Err(SyncHolder::Sync) if wait == ReservationWait::SkipBehindSync => {
-                return Err(ReservationSkip::EquivalentSyncInFlight);
-            }
-            Err(holder) if wait == ReservationWait::TryOnce => {
-                debug!(target: "Client/AppState", "Not waiting for the {holder:?} holding {name:?}");
-                return Err(ReservationSkip::WaitTimedOut);
-            }
             Err(holder) => {
+                if let Some(skip) = wait.blocked_by(holder) {
+                    return Err(skip);
+                }
                 debug!(target: "Client/AppState", "Waiting for the {holder:?} holding {name:?}");
             }
         }
@@ -2996,7 +2608,7 @@ impl Client {
             };
             if schedule.sent {
                 debug!(target: "Client/AppState", "Requested {} missing app-state key(s); retrying after {retry_after:?} if no share arrives", missing.len());
-                retry_after = retry_after.saturating_mul(2).min(APP_STATE_KEY_RETRY_MAX);
+                retry_after = next_key_retry(retry_after);
             }
 
             let listener = self.initial_keys_synced_notifier.listen();

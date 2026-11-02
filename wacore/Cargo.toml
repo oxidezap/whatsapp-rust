@@ -162,6 +162,10 @@ name = "message_utils_benchmark"
 harness = false
 
 [[bench]]
+name = "sync_recovery_benchmark"
+harness = false
+
+[[bench]]
 name = "appstate_sync_benchmark"
 harness = false
 

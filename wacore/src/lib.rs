@@ -52,6 +52,7 @@ pub mod stats;
 pub mod sticker_pack;
 
 pub mod store;
+pub mod sync_engine;
 pub mod sync_marker;
 pub mod telemetry;
 pub mod time;

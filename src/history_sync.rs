@@ -10,6 +10,9 @@ use wacore::history_sync::{
 use wacore::messages::DetachedHistorySyncNotification;
 use wacore::msg_secret::{MsgSecretPolicy, MsgSecretRetention, RetentionClass};
 use wacore::store::traits::MsgSecretEntry;
+use wacore::sync_engine::history::{
+    HistoryAdmission, HistoryPublication, HistoryReceiptPoint, HistoryRecovery,
+};
 use wacore_binary::{Jid, JidExt as _};
 
 use crate::HistorySyncKey;
@@ -492,13 +495,13 @@ impl Client {
             "history sync is shutting down"
         );
         let metadata = history_sync_metadata(&notification);
-        if self.skip_history_sync_enabled()
-            || self
-                .history_sync_admission
+        if HistoryAdmission::decide(self.skip_history_sync_enabled(), || {
+            self.history_sync_admission
                 .as_ref()
                 .is_some_and(|admission| {
                     admission.decide(&metadata) == HistorySyncDecision::RejectAndAcknowledge
                 })
+        }) == HistoryAdmission::RejectAndAcknowledge
         {
             self.send_protocol_receipt(
                 key.id.clone(),
@@ -603,40 +606,21 @@ impl Client {
             return;
         }
 
-        if self.skip_history_sync_enabled() {
-            log::debug!(
-                "Skipping history sync for message {} (Type: {:?})",
-                message_id,
-                notification.notification.sync_type
-            );
-            // Send receipt so the phone considers this chunk delivered and stops
-            // retrying. This intentionally diverges from WhatsApp Web's AB prop
-            // drop path (which sends no receipt) because bots will never process
-            // history, and without the receipt the phone would keep re-uploading
-            // blobs that will never be consumed.
+        let decision = HistoryAdmission::decide(self.skip_history_sync_enabled(), || {
+            self.history_sync_admission
+                .as_ref()
+                .is_some_and(|admission| {
+                    admission.decide(&history_sync_metadata(&notification))
+                        == HistorySyncDecision::RejectAndAcknowledge
+                })
+        });
+        if decision == HistoryAdmission::RejectAndAcknowledge {
             self.send_protocol_receipt(
                 message_id,
                 crate::types::presence::ReceiptType::HistorySync,
             )
             .await;
             return;
-        }
-
-        if let Some(admission) = self.history_sync_admission.as_ref() {
-            let metadata = history_sync_metadata(&notification);
-            if admission.decide(&metadata) == HistorySyncDecision::RejectAndAcknowledge {
-                log::debug!(
-                    "Rejecting history sync {} by admission policy (Type: {:?})",
-                    message_id,
-                    notification.notification.sync_type
-                );
-                self.send_protocol_receipt(
-                    message_id,
-                    crate::types::presence::ReceiptType::HistorySync,
-                )
-                .await;
-                return;
-            }
         }
 
         // Enqueue a MajorSyncTask for the dedicated sync worker to consume.
@@ -698,14 +682,6 @@ impl Client {
             .await;
     }
 
-    fn history_processing_stopped(&self, durable: bool) -> bool {
-        if durable {
-            self.is_permanently_stopped()
-        } else {
-            self.is_shutting_down()
-        }
-    }
-
     async fn process_history_sync_task_inner(
         self: &Arc<Self>,
         message_id: String,
@@ -713,7 +689,12 @@ impl Client {
         tracker: &mut crate::sync_task::HistorySyncTaskTracker,
         durable_key: Option<&HistorySyncKey>,
     ) -> bool {
-        if self.history_processing_stopped(durable_key.is_some()) {
+        let recovery = if durable_key.is_some() {
+            HistoryRecovery::Durable
+        } else {
+            HistoryRecovery::Session
+        };
+        if recovery.stopped(|| self.is_shutting_down(), || self.is_permanently_stopped()) {
             log::debug!("Aborting history sync {} before processing", message_id);
             return false;
         }
@@ -731,10 +712,9 @@ impl Client {
             notification.sync_type
         );
 
-        // With a capture hook the receipt waits until the hook has captured
-        // the chunk. Download or capture failures leave it unacknowledged.
         let capture_hook = self.history_sync_capture_hook.get().cloned();
-        if capture_hook.is_none() && durable_key.is_none() {
+        let publication = HistoryPublication::new(recovery, capture_hook.is_some());
+        if publication.receipt_at(HistoryReceiptPoint::BeforePayload) {
             self.send_protocol_receipt(
                 message_id.clone(),
                 crate::types::presence::ReceiptType::HistorySync,
@@ -749,11 +729,11 @@ impl Client {
             self.signal_shutdown_sync();
         }
 
-        if self.history_processing_stopped(durable_key.is_some()) {
+        if publication.stopped(|| self.is_shutting_down(), || self.is_permanently_stopped()) {
             log::debug!(
                 "Aborting history sync {} before payload acquisition during shutdown (early receipt attempted: {})",
                 message_id,
-                capture_hook.is_none() && durable_key.is_none()
+                publication.receipt_at(HistoryReceiptPoint::BeforePayload)
             );
             return false;
         }
@@ -768,7 +748,8 @@ impl Client {
             (inline_payload, payload_bytes)
         } else {
             log::info!("Downloading external history sync blob...");
-            if self.history_processing_stopped(durable_key.is_some()) || !self.is_socket_connected()
+            if publication.stopped(|| self.is_shutting_down(), || self.is_permanently_stopped())
+                || !self.is_socket_connected()
             {
                 log::debug!(
                     "Aborting history sync {} before blob download: client disconnected",
@@ -797,7 +778,9 @@ impl Client {
                     (Bytes::from(bytes), payload_bytes)
                 }
                 Err(e) => {
-                    if self.history_processing_stopped(durable_key.is_some()) {
+                    if publication
+                        .stopped(|| self.is_shutting_down(), || self.is_permanently_stopped())
+                    {
                         log::debug!(
                             "History sync blob download aborted during shutdown: {:?}",
                             e
@@ -849,7 +832,7 @@ impl Client {
                 );
                 return false;
             }
-            if durable_key.is_none() {
+            if publication.receipt_at(HistoryReceiptPoint::Captured) {
                 self.send_protocol_receipt(
                     message_id.clone(),
                     crate::types::presence::ReceiptType::HistorySync,
@@ -891,7 +874,7 @@ impl Client {
             result_rx.await.ok()
         };
 
-        if self.history_processing_stopped(durable_key.is_some()) {
+        if publication.stopped(|| self.is_shutting_down(), || self.is_permanently_stopped()) {
             log::debug!(
                 "Aborting history sync {} after parse during shutdown",
                 message_id
@@ -901,7 +884,7 @@ impl Client {
 
         match parse_result {
             Some((Ok(sync_result), secret_entries)) => {
-                if durable_key.is_some() {
+                if publication.receipt_at(HistoryReceiptPoint::Parsed) {
                     self.send_protocol_receipt(
                         message_id.clone(),
                         crate::types::presence::ReceiptType::HistorySync,

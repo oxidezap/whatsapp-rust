@@ -336,6 +336,14 @@ fn protocol_state_does_not_execute_io_or_read_global_time() {
         ),
         ("history", include_str!("../src/history_sync/parse_job.rs")),
         (
+            "sync admission and recovery",
+            include_str!("../wacore/src/sync_engine/app_state.rs"),
+        ),
+        (
+            "history publication",
+            include_str!("../wacore/src/sync_engine/history.rs"),
+        ),
+        (
             "session lifecycle",
             include_str!("../wacore/src/session_engine/lifecycle.rs"),
         ),
