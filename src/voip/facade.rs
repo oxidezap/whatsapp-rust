@@ -1769,10 +1769,13 @@ async fn fanout_group_epoch_for_generation(
         device.account.as_deref(),
     )
     .map_err(|_| CallError::MissingDeviceIdentity)?;
-    client
-        .persist_signal_state_pre_wire()
+    let encrypted =
+        wacore::session_engine::publication::PreparedSignal::new(encrypted).begin_commit();
+    let confirmation = client
+        .confirm_signal_state_pre_wire()
         .await
         .map_err(|error| CallError::Setup(error.to_string()))?;
+    let encrypted = encrypted.confirm(confirmation).into_payload();
     ensure_group_rekey_generation(client, &update.call_id, generation)?;
     publish_group_epoch_ciphertexts(
         client,

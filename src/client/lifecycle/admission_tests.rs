@@ -45,10 +45,8 @@ impl ConnectAdmission for Extend {
 async fn admission_extension_retains_timer_on_unrelated_wakes_and_cancels_on_stop() {
     let checks = Arc::new(AtomicUsize::new(0));
     let client = client_with_policy(Extend(checks.clone())).await;
-    client.auto_reconnect_errors.store(5, Ordering::Relaxed);
-    client
-        .backoff_reset_suppressed
-        .store(true, Ordering::Relaxed);
+    client.set_reconnect_errors_for_test(5, Ordering::Relaxed);
+    client.set_backoff_penalty_for_test(true, Ordering::Relaxed);
     let runner = client.clone();
     let run = tokio::spawn(async move { runner.run().await });
     crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
@@ -59,10 +57,10 @@ async fn admission_extension_retains_timer_on_unrelated_wakes_and_cancels_on_sto
         tokio::task::yield_now().await;
         crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
         assert_eq!(checks.load(Ordering::SeqCst), 1);
-        assert!(!client.is_connecting.load(Ordering::Relaxed));
+        assert!(!client.connection_attempt_active(Ordering::Relaxed));
         assert_eq!(client.stats().reconnects, 0);
         assert_eq!(client.stats().reconnect_errors, 5);
-        assert!(client.backoff_reset_suppressed.load(Ordering::Relaxed));
+        assert!(client.backoff_penalty_pending(Ordering::Relaxed));
     }
     tokio::time::advance(Duration::from_secs(300)).await;
     tokio::task::yield_now().await;
@@ -101,10 +99,8 @@ async fn admission_stop_preserves_stopped_reason() {
 async fn admission_ignores_unrelated_wakes_and_preserves_generation_penalty() {
     let client = client().await;
     // A rate-limit penalty and old generation must not be erased by waiting.
-    client.auto_reconnect_errors.store(5, Ordering::Relaxed);
-    client
-        .backoff_reset_suppressed
-        .store(true, Ordering::Relaxed);
+    client.set_reconnect_errors_for_test(5, Ordering::Relaxed);
+    client.set_backoff_penalty_for_test(true, Ordering::Relaxed);
     let generation = client.connection_generation.load(Ordering::SeqCst);
     let runner = client.clone();
     let run = tokio::spawn(async move { runner.run().await });
@@ -115,10 +111,10 @@ async fn admission_ignores_unrelated_wakes_and_preserves_generation_penalty() {
         // Wait until the prior listener was consumed and a fresh one registered.
         tokio::task::yield_now().await;
         crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
-        assert!(!client.is_connecting.load(Ordering::Relaxed));
+        assert!(!client.connection_attempt_active(Ordering::Relaxed));
         assert_eq!(client.stats().reconnects, 0);
         assert_eq!(client.stats().reconnect_errors, 5);
-        assert!(client.backoff_reset_suppressed.load(Ordering::Relaxed));
+        assert!(client.backoff_penalty_pending(Ordering::Relaxed));
         assert_eq!(
             client.connection_generation.load(Ordering::SeqCst),
             generation

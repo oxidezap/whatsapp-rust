@@ -205,7 +205,10 @@ pub(crate) async fn handle_business_notification(client: &Arc<Client>, node: &No
                     .update_type(BusinessUpdateType::from(
                         notification.notification_type.clone(),
                     ))
-                    .timestamp(wacore::time::from_secs_or_now(notification.timestamp))
+                    .timestamp(
+                        wacore::time::from_secs(notification.timestamp)
+                            .unwrap_or_else(|| client.runtime.wall_time_utc()),
+                    )
                     .maybe_target_jid(notification.jid.clone())
                     .maybe_hash(notification.hash.clone())
                     .maybe_verified_name(

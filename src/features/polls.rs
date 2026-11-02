@@ -186,7 +186,7 @@ impl<'a> Polls<'a> {
             // submessage emits a stray `1A 00` (tag 3) on the wire. Omit it.
 
             proto.metadata = buffa::MessageField::none();
-            proto.sender_timestamp_ms = Some(wacore::time::now_millis());
+            proto.sender_timestamp_ms = Some(self.client.runtime.wall_time_millis());
             proto
         };
 

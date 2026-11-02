@@ -287,10 +287,12 @@ impl StanzaHandler for CallHandler {
                             {
                                 Ok(Some(generation)) => {
                                     call.set_ringing_generation(generation);
-                                    buffered_initial_group_controls =
-                                        client.call_registry().take_initial_group_controls(
+                                    buffered_initial_group_controls = client
+                                        .call_registry()
+                                        .take_initial_group_controls_with_now(
                                             call.action.call_id(),
                                             call.action.call_creator(),
+                                            || client.runtime.monotonic_time(),
                                         );
                                     false
                                 }
@@ -478,7 +480,10 @@ impl StanzaHandler for CallHandler {
                             if group_transition_generation.is_none() =>
                         {
                             let registry = client.call_registry();
-                            dispatch_call = if registry.buffer_initial_group_control(call.clone()) {
+                            dispatch_call = if registry
+                                .buffer_initial_group_control_with_now(call.clone(), || {
+                                    client.runtime.monotonic_time()
+                                }) {
                                 false
                             } else {
                                 apply_current_group_control(&client, &call).await

@@ -2128,7 +2128,7 @@ impl<'a> Groups<'a> {
             }));
         }
 
-        let now = wacore::time::now_secs().max(0) as u64;
+        let now = self.client.runtime.wall_time_secs_u64();
         let Some(selected) = select_group_history_messages(&jid, history_messages, now, limits)
         else {
             return Ok(HistorySharePreparation::Settled(GroupHistoryAddResult {
@@ -2191,10 +2191,10 @@ impl<'a> Groups<'a> {
         });
         let bundle_message_id = self
             .client
-            .generate_message_id_at(wacore::time::now_secs_u64());
+            .generate_message_id_at(self.client.runtime.wall_time_secs_u64());
         let notice_message_id = self
             .client
-            .generate_message_id_at(wacore::time::now_secs_u64());
+            .generate_message_id_at(self.client.runtime.wall_time_secs_u64());
         let upload_retry = GroupHistoryRetryToken::upload(
             &jid,
             &history_receivers,
@@ -2252,7 +2252,11 @@ impl<'a> Groups<'a> {
         }
         if message_count > current_limits.max_messages
             || selected.oldest_timestamp
-                < wacore::time::now_secs_u64().saturating_sub(current_limits.time_window_seconds)
+                < self
+                    .client
+                    .runtime
+                    .wall_time_secs_u64()
+                    .saturating_sub(current_limits.time_window_seconds)
         {
             return Ok(HistorySharePreparation::Settled(GroupHistoryAddResult {
                 participants: participant_results,
@@ -2306,7 +2310,11 @@ impl<'a> Groups<'a> {
         }
         if prepared.message_count > current_limits.max_messages
             || prepared.oldest_timestamp
-                < wacore::time::now_secs_u64().saturating_sub(current_limits.time_window_seconds)
+                < self
+                    .client
+                    .runtime
+                    .wall_time_secs_u64()
+                    .saturating_sub(current_limits.time_window_seconds)
         {
             return GroupHistoryShareOutcome::Skipped(GroupHistorySkipReason::NoEligibleMessages);
         }
@@ -2363,7 +2371,9 @@ impl<'a> Groups<'a> {
     ) -> GroupHistoryShareOutcome {
         let mut notice_stage = start_at_notice;
         loop {
-            if !notice_stage && !retry.fits_current_limits(limits, wacore::time::now_secs_u64()) {
+            if !notice_stage
+                && !retry.fits_current_limits(limits, self.client.runtime.wall_time_secs_u64())
+            {
                 return GroupHistoryShareOutcome::Skipped(
                     GroupHistorySkipReason::NoEligibleMessages,
                 );
@@ -2514,7 +2524,7 @@ impl<'a> Groups<'a> {
             Err(reason) => return GroupHistoryShareOutcome::Skipped(reason),
         };
         if !retry.is_notice_stage()
-            && !retry.fits_current_limits(limits, wacore::time::now_secs_u64())
+            && !retry.fits_current_limits(limits, self.client.runtime.wall_time_secs_u64())
         {
             return GroupHistoryShareOutcome::Skipped(GroupHistorySkipReason::NoEligibleMessages);
         }
@@ -2543,7 +2553,7 @@ impl<'a> Groups<'a> {
                     };
                 }
             };
-            if !retry.fits_current_limits(limits, wacore::time::now_secs_u64()) {
+            if !retry.fits_current_limits(limits, self.client.runtime.wall_time_secs_u64()) {
                 return GroupHistoryShareOutcome::Skipped(
                     GroupHistorySkipReason::NoEligibleMessages,
                 );
@@ -2762,7 +2772,7 @@ impl<'a> Groups<'a> {
         let group_jid = &group_jid.into();
         let admin_jid = &admin_jid.into();
         if expiration > 0 {
-            let now = wacore::time::now_millis() / 1000;
+            let now = self.client.runtime.wall_time_millis() / 1000;
             if expiration < now {
                 return Err(GroupError::InvalidRequest(format!(
                     "V4 invite has expired (expiration={expiration}, now={now})"
@@ -3187,7 +3197,10 @@ impl<'a> Groups<'a> {
                 "update_member_label requires a group JID, got {group_jid}"
             )));
         }
-        let msg = wacore::send::build_member_label_message(label.into(), wacore::time::now_secs());
+        let msg = wacore::send::build_member_label_message(
+            label.into(),
+            self.client.runtime.wall_time_secs(),
+        );
         // This low-level send bypasses send_message_with_options (no reporting
         // token for a protocol message), so compute the <meta> here and pass it
         // as an extra node — otherwise the member_label appdata/tag_reason attrs
@@ -3195,7 +3208,7 @@ impl<'a> Groups<'a> {
         let (_edit, meta) = crate::send::infer_stanza_metadata(&msg);
         let message_id = self
             .client
-            .generate_message_id_at(wacore::time::now_secs_u64());
+            .generate_message_id_at(self.client.runtime.wall_time_secs_u64());
         self.client
             .send_message_impl(
                 group_jid.clone(),
@@ -3290,13 +3303,17 @@ impl<'a> Groups<'a> {
 
     /// Returns the tc_token if present and not expired.
     async fn lookup_valid_token(&self, token_key: &str) -> Option<Vec<u8>> {
-        use wacore::iq::tctoken::is_tc_token_expired_with;
+        use wacore::iq::tctoken::is_tc_token_expired_with_at;
         let tc_config = self.client.tc_token_config().await;
         let backend = self.client.persistence_manager.backend();
         match backend.get_tc_token(token_key).await {
             Ok(Some(entry))
                 if !entry.token.is_empty()
-                    && !is_tc_token_expired_with(entry.token_timestamp, &tc_config) =>
+                    && !is_tc_token_expired_with_at(
+                        entry.token_timestamp,
+                        &tc_config,
+                        self.client.runtime.wall_time_secs(),
+                    ) =>
             {
                 Some(entry.token)
             }

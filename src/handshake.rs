@@ -94,7 +94,7 @@ async fn negotiate(
     cert_policy: NoiseCertPolicy,
 ) -> Result<(NoiseCipher, NoiseCipher)> {
     let device_snapshot = persistence_manager.get_device_snapshot();
-    let now_secs = wacore::time::now_secs();
+    let now_secs = runtime.wall_time_secs();
     let pattern = select_pattern(
         &device_snapshot,
         ik_handshake_failures.load(Ordering::Acquire),

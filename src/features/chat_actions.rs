@@ -147,7 +147,17 @@ const CHAT_ACTION_KINDS: &[&str] = &[
 /// `event_full_sync` is public event provenance (lands on
 /// `*.from_full_sync`); it is never a logging level (see
 /// `dispatch_app_state_mutation_inner`).
+#[cfg(test)]
 pub(crate) fn dispatch_chat_mutation_outcome(
+    event_bus: &wacore::types::events::CoreEventBus,
+    m: &mut Mutation,
+    event_full_sync: bool,
+) -> AppStateDispatchOutcome {
+    dispatch_chat_mutation_outcome_with_clock(wacore::time::now_utc, event_bus, m, event_full_sync)
+}
+
+pub(crate) fn dispatch_chat_mutation_outcome_with_clock(
+    now: impl FnOnce() -> chrono::DateTime<chrono::Utc>,
     event_bus: &wacore::types::events::CoreEventBus,
     m: &mut Mutation,
     event_full_sync: bool,
@@ -183,7 +193,7 @@ pub(crate) fn dispatch_chat_mutation_outcome(
     // consumers see no change. Neither is an instant the server sent, which
     // is why a consumer that must tell a replay from a live change reads
     // `action_timestamp` instead (#1551).
-    let time = wacore::time::from_millis_or_now(ts.unwrap_or(0));
+    let time = wacore::time::from_millis(ts.unwrap_or(0)).unwrap_or_else(now);
     let jid: Jid = if m.index.len() > 1 {
         match m.index[1].parse() {
             Ok(j) => j,
@@ -592,7 +602,7 @@ impl<'a> ChatActions<'a> {
                 "mute_end_timestamp_ms must be a positive future timestamp (use mute_chat() for indefinite)".into(),
             ));
         }
-        let now_ms = wacore::time::now_millis();
+        let now_ms = self.client.runtime.wall_time_millis();
         if mute_end_timestamp_ms <= now_ms {
             return Err(AppStateError::InvalidRequest(format!(
                 "mute_end_timestamp_ms is in the past ({mute_end_timestamp_ms} <= {now_ms})"
@@ -653,7 +663,7 @@ impl<'a> ChatActions<'a> {
                 proto.message_range = message_range.into();
                 proto
             });
-            proto.timestamp = Some(wacore::time::now_millis());
+            proto.timestamp = Some(self.client.runtime.wall_time_millis());
             proto
         };
         let jid = jid.to_string();
@@ -677,7 +687,7 @@ impl<'a> ChatActions<'a> {
                 proto.message_range = message_range.into();
                 proto
             });
-            proto.timestamp = Some(wacore::time::now_millis());
+            proto.timestamp = Some(self.client.runtime.wall_time_millis());
             proto
         };
         let jid = jid.to_string();
@@ -746,7 +756,7 @@ impl<'a> ChatActions<'a> {
                 proto.message_range = message_range.into();
                 proto
             });
-            proto.timestamp = Some(wacore::time::now_millis());
+            proto.timestamp = Some(self.client.runtime.wall_time_millis());
             proto
         };
         let jid = jid.to_string();
@@ -770,7 +780,7 @@ impl<'a> ChatActions<'a> {
                 proto.muted = Some(muted);
                 proto
             });
-            proto.timestamp = Some(wacore::time::now_millis());
+            proto.timestamp = Some(self.client.runtime.wall_time_millis());
             proto
         };
         let jid = jid.to_string();
@@ -795,7 +805,7 @@ impl<'a> ChatActions<'a> {
                 proto.message_timestamp = message_timestamp;
                 proto
             });
-            proto.timestamp = Some(wacore::time::now_millis());
+            proto.timestamp = Some(self.client.runtime.wall_time_millis());
             proto
         };
         self.client
@@ -844,7 +854,7 @@ impl<'a> ChatActions<'a> {
                 proto.save_on_primary_addressbook = Some(save_on_primary_addressbook);
                 proto
             });
-            proto.timestamp = Some(wacore::time::now_millis());
+            proto.timestamp = Some(self.client.runtime.wall_time_millis());
             proto
         };
         let jid_str = jid.to_string();
@@ -878,7 +888,7 @@ impl<'a> ChatActions<'a> {
             let mut proto = wa::SyncActionValue::default();
             proto.contact_action =
                 buffa::MessageField::some(wa::sync_action_value::ContactAction::default());
-            proto.timestamp = Some(wacore::time::now_millis());
+            proto.timestamp = Some(self.client.runtime.wall_time_millis());
             proto
         };
         let jid_str = jid.to_string();
@@ -901,7 +911,7 @@ impl<'a> ChatActions<'a> {
                 proto.message_range = message_range.into();
                 proto
             });
-            proto.timestamp = Some(wacore::time::now_millis());
+            proto.timestamp = Some(self.client.runtime.wall_time_millis());
             proto
         };
         let jid = jid.to_string();
@@ -918,7 +928,7 @@ impl<'a> ChatActions<'a> {
                 proto.pinned = Some(pinned);
                 proto
             });
-            proto.timestamp = Some(wacore::time::now_millis());
+            proto.timestamp = Some(self.client.runtime.wall_time_millis());
             proto
         };
         let jid = jid.to_string();
@@ -947,7 +957,7 @@ impl<'a> ChatActions<'a> {
                 proto.mute_end_timestamp = mute_end;
                 proto
             });
-            proto.timestamp = Some(wacore::time::now_millis());
+            proto.timestamp = Some(self.client.runtime.wall_time_millis());
             proto
         };
         let jid = jid.to_string();
@@ -964,7 +974,7 @@ impl<'a> ChatActions<'a> {
                 proto.locked = Some(locked);
                 proto
             });
-            proto.timestamp = Some(wacore::time::now_millis());
+            proto.timestamp = Some(self.client.runtime.wall_time_millis());
             proto
         };
         let jid = jid.to_string();
@@ -986,7 +996,7 @@ impl<'a> ChatActions<'a> {
                 proto.starred = Some(starred);
                 proto
             });
-            proto.timestamp = Some(wacore::time::now_millis());
+            proto.timestamp = Some(self.client.runtime.wall_time_millis());
             proto
         };
         self.client

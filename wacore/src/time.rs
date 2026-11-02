@@ -18,6 +18,9 @@
 //! mid-measurement. That is why `std::time` separates `SystemTime` from
 //! `Instant`, and we mirror the split here.
 
+mod clock;
+pub use clock::{Clock, ClockError, ClockReading, GlobalClock, VirtualClock};
+
 use std::sync::OnceLock;
 
 /// Test-only clock-read accounting, so a budget over the hot path can be
@@ -371,6 +374,11 @@ impl Instant {
     #[inline]
     pub fn now() -> Self {
         Self(now_nanos())
+    }
+
+    pub fn checked_add(self, duration: std::time::Duration) -> Option<Self> {
+        let nanos = u64::try_from(duration.as_nanos()).ok()?;
+        self.0.checked_add(nanos).map(Self)
     }
 
     /// Duration elapsed since this instant was captured. Returns

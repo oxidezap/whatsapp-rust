@@ -24,14 +24,22 @@ impl UnifiedSession {
 
     /// Calculate session ID from server time offset.
     pub fn calculate_id(server_time_offset_ms: i64) -> String {
+        Self::calculate_id_at(server_time_offset_ms, crate::time::now_millis())
+    }
+
+    pub fn calculate_id_at(server_time_offset_ms: i64, now: i64) -> String {
         const DAY_MS: i64 = 24 * 60 * 60 * 1000;
         const WEEK_MS: i64 = 7 * DAY_MS;
         const OFFSET_MS: i64 = 3 * DAY_MS;
-
-        let now = crate::time::now_millis();
-        let adjusted_now = now + server_time_offset_ms;
-        let id = (adjusted_now + OFFSET_MS) % WEEK_MS;
-        id.to_string()
+        match now
+            .checked_add(server_time_offset_ms)
+            .and_then(|time| time.checked_add(OFFSET_MS))
+        {
+            Some(time) => (time % WEEK_MS).to_string(),
+            None => ((i128::from(now) + i128::from(server_time_offset_ms) + i128::from(OFFSET_MS))
+                % i128::from(WEEK_MS))
+            .to_string(),
+        }
     }
 
     pub fn from_offset(server_time_offset_ms: i64) -> Self {

@@ -66,13 +66,35 @@ pub fn reset_peak() {
 }
 
 #[cfg(test)]
+pub fn run_in_child(test: &str) -> bool {
+    const CHILD_TEST: &str = "WHATSAPP_RETENTION_ALLOCATION_TEST";
+    if std::env::var(CHILD_TEST).as_deref() == Ok(test) {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env(CHILD_TEST, test)
+        .output()
+        .expect("isolated allocation test");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn allocation_growth_shrink_release_and_peak_are_counted() {
-        // Bounds allow the test runner's small concurrent allocations. The only
-        // allocator test in this binary, so no other large test runs overlap.
+        if run_in_child("allocator::tests::allocation_growth_shrink_release_and_peak_are_counted") {
+            return;
+        }
+        // Bounds include the isolated test runner's small concurrent allocations.
         const SIZE: usize = 4 * 1024 * 1024;
         let baseline = live();
         reset_peak();

@@ -743,6 +743,13 @@ impl CallRegistry {
 
     /// Snapshot active registry retention without cloning call state or exposing identifiers.
     pub fn memory_stats(&self) -> crate::stats::CollectionStats {
+        self.memory_stats_with_now(crate::time::Instant::now)
+    }
+
+    pub fn memory_stats_with_now(
+        &self,
+        now: impl FnOnce() -> crate::time::Instant,
+    ) -> crate::stats::CollectionStats {
         use crate::stats::HeapSize;
 
         let (active_entries, active_bytes) = {
@@ -755,7 +762,7 @@ impl CallRegistry {
         };
         let (pending_entries, pending_bytes) = {
             let mut pending = self.pending_controls();
-            let now = crate::time::Instant::now();
+            let now = now();
             pending.retain(|queued| queued.expires_at > now);
             let bytes = pending
                 .iter()
@@ -790,6 +797,14 @@ impl CallRegistry {
     /// The pending lock is acquired before checking the active map. The offer path inserts first
     /// and drains second, so either ordering leaves the control with exactly one consumer.
     pub fn buffer_initial_group_control(&self, call: IncomingCall) -> bool {
+        self.buffer_initial_group_control_with_now(call, crate::time::Instant::now)
+    }
+
+    pub fn buffer_initial_group_control_with_now(
+        &self,
+        call: IncomingCall,
+        now: impl FnOnce() -> crate::time::Instant,
+    ) -> bool {
         if !matches!(
             call.action,
             CallAction::GroupUpdate { .. } | CallAction::EncRekey { .. }
@@ -800,7 +815,7 @@ impl CallRegistry {
         }
 
         let mut pending = self.pending_controls();
-        let now = crate::time::Instant::now();
+        let now = now();
         pending.retain(|queued| queued.expires_at > now);
         if self.active_calls().contains_key(call.action.call_id()) {
             return false;
@@ -884,9 +899,18 @@ impl CallRegistry {
         call_id: &str,
         call_creator: &Jid,
     ) -> Vec<IncomingCall> {
+        self.take_initial_group_controls_with_now(call_id, call_creator, crate::time::Instant::now)
+    }
+
+    pub fn take_initial_group_controls_with_now(
+        &self,
+        call_id: &str,
+        call_creator: &Jid,
+        now: impl FnOnce() -> crate::time::Instant,
+    ) -> Vec<IncomingCall> {
         let creator = call_creator.to_non_ad();
         let mut pending = self.pending_controls();
-        let now = crate::time::Instant::now();
+        let now = now();
         pending.retain(|queued| queued.expires_at > now);
         let mut retained = VecDeque::with_capacity(pending.len());
         let mut matched = Vec::new();

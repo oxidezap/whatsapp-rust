@@ -131,16 +131,14 @@ impl FlushScope {
     /// Wait until every tracked task has finished or the timeout elapses.
     /// Emits a warn log on timeout with the number of leaked tasks.
     pub async fn flush(&self, rt: &dyn Runtime, timeout: Duration) -> DrainOutcome {
-        use wacore::time::Instant;
-
-        let deadline = Instant::now() + timeout;
+        let deadline = rt.monotonic_time() + timeout;
         loop {
             let listener = self.idle.listen();
             if self.tracked() == 0 {
                 return DrainOutcome::Completed;
             }
 
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = deadline.saturating_duration_since(rt.monotonic_time());
             if remaining.is_zero()
                 || wacore::runtime::timeout(rt, remaining, listener)
                     .await

@@ -58,7 +58,8 @@ impl<'a> TcToken<'a> {
             return Ok(Vec::new());
         }
 
-        let spec = IssuePrivacyTokensSpec::new(jids);
+        let spec =
+            IssuePrivacyTokensSpec::with_timestamp(jids, self.client.runtime.wall_time_secs());
         let response = self.client.execute(spec).await?;
         self.client.store_issued_tc_tokens(&response.tokens).await;
 
@@ -73,13 +74,17 @@ impl<'a> TcToken<'a> {
     /// row is dropped only when both are stale.
     pub async fn prune_expired(&self) -> Result<u32, TcTokenError> {
         use wacore::iq::tctoken::{
-            sender_tc_token_expiration_cutoff_with, tc_token_expiration_cutoff_with,
+            sender_tc_token_expiration_cutoff_with_at, tc_token_expiration_cutoff_with_at,
         };
 
         let backend = self.client.persistence_manager.backend();
         let tc_config = self.client.tc_token_config().await;
-        let token_cutoff = tc_token_expiration_cutoff_with(&tc_config);
-        let sender_cutoff = sender_tc_token_expiration_cutoff_with(&tc_config);
+        let token_cutoff =
+            tc_token_expiration_cutoff_with_at(&tc_config, self.client.runtime.wall_time_secs());
+        let sender_cutoff = sender_tc_token_expiration_cutoff_with_at(
+            &tc_config,
+            self.client.runtime.wall_time_secs(),
+        );
         let deleted = backend
             .delete_expired_tc_tokens(token_cutoff, sender_cutoff)
             .await?;

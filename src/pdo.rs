@@ -496,7 +496,7 @@ impl Client {
                 })
                 .await;
         }
-        let request_id = self.generate_message_id_at(wacore::time::now_secs_u64());
+        let request_id = self.generate_message_id_at(self.runtime.wall_time_secs_u64());
         let mut admission = None;
         self.pdo_requested
             .upsert_with_by_ref(
@@ -566,7 +566,7 @@ impl Client {
         let pending = (
             PendingPdoRequest {
                 message_info: Arc::clone(info),
-                requested_at: wacore::time::Instant::now(),
+                requested_at: self.runtime.monotonic_time(),
             },
             memo.clone(),
         );
@@ -923,7 +923,7 @@ impl Client {
             proto.syncd_collection_fatal_recovery_request = buffa::MessageField::some({
                 let mut proto = wa::message::peer_data_operation_request_message::SyncDCollectionFatalRecoveryRequest::default();
                 proto.collection_name = Some(collection.to_string());
-                proto.timestamp = Some(wacore::time::now_secs() as i64);
+                proto.timestamp = Some(self.runtime.wall_time_secs());
                 proto
             });
             proto
@@ -981,7 +981,7 @@ impl Client {
                 .connection_generation
                 .load(std::sync::atomic::Ordering::Acquire);
             let socket = self.get_noise_socket()?;
-            let request_id = self.generate_message_id_at(wacore::time::now_secs_u64());
+            let request_id = self.generate_message_id_at(self.runtime.wall_time_secs_u64());
             if !proc
                 .mark_recovery_requested_with_id(collection, generation, &request_id)
                 .await
@@ -1608,7 +1608,12 @@ impl Client {
 
         let elapsed = pending
             .as_ref()
-            .map(|p| p.requested_at.elapsed().as_millis())
+            .map(|p| {
+                self.runtime
+                    .monotonic_time()
+                    .saturating_duration_since(p.requested_at)
+                    .as_millis()
+            })
             .unwrap_or(0);
 
         info!(
@@ -1848,8 +1853,10 @@ impl Client {
         };
 
         let timestamp = message_timestamp
-            .map(|ts| wacore::time::from_secs_or_now(ts as i64))
-            .unwrap_or_else(wacore::time::now_utc);
+            .map(|ts| {
+                wacore::time::from_secs(ts as i64).unwrap_or_else(|| self.runtime.wall_time_utc())
+            })
+            .unwrap_or_else(|| self.runtime.wall_time_utc());
 
         Ok(MessageInfo {
             id: id.unwrap_or_default().into(),
@@ -1901,7 +1908,7 @@ impl Client {
         // Skip ancient messages (14d, matching the AB prop), compared in seconds
         // like WA Web's `age_s > i`. Uses the wacore time primitive (mockable).
         const PDO_MAX_AGE_SECS: i64 = 14 * 24 * 60 * 60;
-        let age_secs = wacore::time::now_secs() - info.timestamp.timestamp();
+        let age_secs = self.runtime.wall_time_secs() - info.timestamp.timestamp();
         if age_secs > PDO_MAX_AGE_SECS {
             debug!(
                 "PDO request skipped for message {} (age {age_secs}s exceeds {PDO_MAX_AGE_SECS}s limit)",
@@ -3071,9 +3078,7 @@ mod tests {
         }
 
         fn authenticate_recovery_fixture(client: &Arc<Client>) {
-            client
-                .is_logged_in
-                .store(true, std::sync::atomic::Ordering::Release);
+            client.set_logged_in_for_test(true, std::sync::atomic::Ordering::Release);
             client.authenticated_generation.store(
                 client
                     .connection_generation
@@ -3089,9 +3094,7 @@ mod tests {
             let generation = client
                 .connection_generation
                 .load(std::sync::atomic::Ordering::Acquire);
-            client
-                .is_logged_in
-                .store(true, std::sync::atomic::Ordering::Release);
+            client.set_logged_in_for_test(true, std::sync::atomic::Ordering::Release);
             client
                 .authenticated_generation
                 .store(generation, std::sync::atomic::Ordering::SeqCst);
@@ -3115,12 +3118,8 @@ mod tests {
             .unwrap();
             // Teardown increments first; connect publishes a socket; success
             // authenticates and increments again only after the parked send resumes.
-            client
-                .connection_generation
-                .store(generation + 1, std::sync::atomic::Ordering::SeqCst);
-            client
-                .is_logged_in
-                .store(false, std::sync::atomic::Ordering::Release);
+            client.set_generation_for_test(generation + 1, std::sync::atomic::Ordering::SeqCst);
+            client.set_logged_in_for_test(false, std::sync::atomic::Ordering::Release);
             let replacement = Arc::new(crate::transport::mock::CapturingMockTransport::new());
             install_socket(&client, replacement.clone());
             let prior_listeners = client.session_state_notifier.total_listeners();
@@ -3139,15 +3138,11 @@ mod tests {
                 "an intermediate pre-login generation must send no recovery"
             );
             assert!(!job.is_finished(), "retry must await authentication");
-            client
-                .connection_generation
-                .store(generation + 2, std::sync::atomic::Ordering::SeqCst);
+            client.set_generation_for_test(generation + 2, std::sync::atomic::Ordering::SeqCst);
             client
                 .authenticated_generation
                 .store(generation + 2, std::sync::atomic::Ordering::SeqCst);
-            client
-                .is_logged_in
-                .store(true, std::sync::atomic::Ordering::Release);
+            client.set_logged_in_for_test(true, std::sync::atomic::Ordering::Release);
             client.session_state_notifier.notify(usize::MAX);
             let id = tokio::time::timeout(std::time::Duration::from_secs(5), job)
                 .await
@@ -3176,18 +3171,14 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let (second_entered, second_release) = failure_socket(&client);
-            client
-                .connection_generation
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            client.advance_generation_for_test(1, std::sync::atomic::Ordering::AcqRel);
             authenticate_recovery_fixture(&client);
             first_release.send(()).await.unwrap();
             tokio::time::timeout(std::time::Duration::from_secs(5), second_entered.recv())
                 .await
                 .unwrap()
                 .unwrap();
-            client
-                .connection_generation
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            client.advance_generation_for_test(1, std::sync::atomic::Ordering::AcqRel);
             authenticate_recovery_fixture(&client);
             second_release.send(()).await.unwrap();
             assert!(
@@ -3445,9 +3436,7 @@ mod tests {
                 )
                 .await
             );
-            client
-                .connection_generation
-                .store(generation + 1, std::sync::atomic::Ordering::Release);
+            client.set_generation_for_test(generation + 1, std::sync::atomic::Ordering::Release);
 
             let reply = regular_low_reply(8, "1@s.whatsapp.net", 0x5A);
             deliver_together(&client, &[(&reply, "asked-before-reconnect")], 1, &[]).await;
@@ -3785,9 +3774,7 @@ mod tests {
             .unwrap();
             let replacement = Arc::new(crate::transport::mock::CapturingMockTransport::new());
             install_socket(&client, replacement.clone());
-            client
-                .connection_generation
-                .store(generation + 1, std::sync::atomic::Ordering::Release);
+            client.set_generation_for_test(generation + 1, std::sync::atomic::Ordering::Release);
             authenticate_recovery_fixture(&client);
             drop(held);
             let id = tokio::time::timeout(std::time::Duration::from_secs(5), job)

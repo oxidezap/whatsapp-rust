@@ -572,6 +572,14 @@ impl Default for Device {
 
 impl Device {
     pub fn new() -> Self {
+        Self::new_with_time(crate::time::now_millis)
+    }
+
+    pub fn new_with_clock(clock: &dyn crate::time::Clock) -> Self {
+        Self::new_with_time(|| clock.wall_time_millis())
+    }
+
+    fn new_with_time(now: impl FnOnce() -> i64) -> Self {
         use rand::{Rng, RngExt};
 
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
@@ -626,7 +634,7 @@ impl Device {
             login_counter: 0,
             lid_migrated: false,
             server_client_expiration: None,
-            last_signed_pre_key_rotation_ms: crate::time::now_millis(),
+            last_signed_pre_key_rotation_ms: now(),
             read_receipts_disabled: false,
         }
     }

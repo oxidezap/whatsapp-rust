@@ -307,7 +307,7 @@ mod tests {
         Arc<crate::transport::mock::CapturingMockTransport>,
     ) {
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
-        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.set_logged_in_for_test(true, Ordering::Relaxed);
         client.authenticated_generation.store(
             client.connection_generation.load(Ordering::SeqCst),
             Ordering::SeqCst,
@@ -351,7 +351,7 @@ mod tests {
             .optional_string("id")
             .expect("every IQ carries an id")
             .into_owned();
-        client.connection_generation.fetch_add(1, Ordering::SeqCst);
+        client.advance_generation_for_test(1, Ordering::SeqCst);
         crate::test_utils::answer_iq(&client, &id, &batch_result(&id, &[("regular", None)])).await;
 
         let _ = tokio::time::timeout(Duration::from_secs(5), resync).await;
@@ -590,7 +590,7 @@ mod tests {
         .await;
 
         // The socket this request was admitted on is replaced.
-        client.connection_generation.fetch_add(1, Ordering::SeqCst);
+        client.advance_generation_for_test(1, Ordering::SeqCst);
         drop(held);
 
         let error = tokio::time::timeout(Duration::from_secs(5), resync)
@@ -639,7 +639,7 @@ mod tests {
 
         // Not the generation: leaving it alone is what makes `send_iq` the first
         // thing to notice, rather than the scope check before it.
-        client.is_running.store(false, Ordering::Release);
+        client.set_driver_running_for_test(false, Ordering::Release);
         drop(held);
 
         let report = tokio::time::timeout(Duration::from_secs(5), resync)
@@ -689,7 +689,7 @@ mod tests {
         .await;
 
         // The socket this rebuild was admitted on is replaced while it waits.
-        client.connection_generation.fetch_add(1, Ordering::SeqCst);
+        client.advance_generation_for_test(1, Ordering::SeqCst);
         drop(held);
 
         let error = tokio::time::timeout(Duration::from_secs(5), resync)

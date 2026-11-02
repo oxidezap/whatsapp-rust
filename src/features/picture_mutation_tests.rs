@@ -61,7 +61,7 @@ async fn fixture() -> (Arc<Client>, Arc<CapturingMockTransport>, Arc<CountingHtt
     );
     *client.noise_socket.lock().unwrap() = Some(Arc::new(socket));
     client.set_connected_for_test(true);
-    client.is_running.store(true, Ordering::Release);
+    client.set_driver_running_for_test(true, Ordering::Release);
     client.enter_live_mode_for_tests();
     (client, transport, http)
 }

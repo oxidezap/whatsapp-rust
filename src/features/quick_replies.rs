@@ -22,7 +22,22 @@ use waproto::whatsapp as wa;
 /// Dispatch inbound quick-reply mutations synced from a linked device,
 /// returning the [`crate::client::AppStateDispatchOutcome`] for the semantic
 /// per-mutation log line.
+#[cfg(test)]
 pub(crate) fn dispatch_quick_reply_mutation_outcome(
+    event_bus: &wacore::types::events::CoreEventBus,
+    m: &mut Mutation,
+    event_full_sync: bool,
+) -> AppStateDispatchOutcome {
+    dispatch_quick_reply_mutation_outcome_with_clock(
+        wacore::time::now_utc,
+        event_bus,
+        m,
+        event_full_sync,
+    )
+}
+
+pub(crate) fn dispatch_quick_reply_mutation_outcome_with_clock(
+    now: impl FnOnce() -> chrono::DateTime<chrono::Utc>,
     event_bus: &wacore::types::events::CoreEventBus,
     m: &mut Mutation,
     event_full_sync: bool,
@@ -43,7 +58,7 @@ pub(crate) fn dispatch_quick_reply_mutation_outcome(
         .as_ref()
         .and_then(|v| v.timestamp)
         .unwrap_or(0);
-    let time = wacore::time::from_millis_or_now(ts);
+    let time = wacore::time::from_millis(ts).unwrap_or_else(now);
 
     if let Some(val) = &mut m.action_value
         && let Some(act) = val.quick_reply_action.take()
@@ -122,15 +137,18 @@ impl<'a> QuickReplies<'a> {
         // WA Web's builders hardcode `associatedLabelIds: []`, and its receiving
         // side never reads the field. A repeated field left at its default
         // encodes to the same bytes, so this is what the official client sends.
-        let value = quick_reply_value({
-            let mut proto = wa::sync_action_value::QuickReplyAction::default();
-            proto.shortcut = Some(shortcut.to_string());
-            proto.message = Some(message.to_string());
-            proto.keywords = keywords;
-            proto.count = Some(count);
-            proto.deleted = Some(false);
-            proto
-        });
+        let value = quick_reply_value_at(
+            {
+                let mut proto = wa::sync_action_value::QuickReplyAction::default();
+                proto.shortcut = Some(shortcut.to_string());
+                proto.message = Some(message.to_string());
+                proto.keywords = keywords;
+                proto.count = Some(count);
+                proto.deleted = Some(false);
+                proto
+            },
+            self.client.runtime.wall_time_millis(),
+        );
         self.client
             .send_app_state_action(&schemas::QUICK_REPLY, &[id], &value)
             .await
@@ -147,28 +165,39 @@ impl<'a> QuickReplies<'a> {
             ));
         }
         debug!("Deleting quick reply {}", fingerprint_id(id));
-        let value = quick_reply_value({
-            let mut proto = wa::sync_action_value::QuickReplyAction::default();
-            proto.shortcut = Some(String::new());
-            proto.message = Some(String::new());
-            proto.keywords = Vec::new();
-            proto.count = Some(0);
-            proto.deleted = Some(true);
-            proto
-        });
+        let value = quick_reply_value_at(
+            {
+                let mut proto = wa::sync_action_value::QuickReplyAction::default();
+                proto.shortcut = Some(String::new());
+                proto.message = Some(String::new());
+                proto.keywords = Vec::new();
+                proto.count = Some(0);
+                proto.deleted = Some(true);
+                proto
+            },
+            self.client.runtime.wall_time_millis(),
+        );
         self.client
             .send_app_state_action(&schemas::QUICK_REPLY, &[id], &value)
             .await
     }
 }
 
-fn quick_reply_value(action: wa::sync_action_value::QuickReplyAction) -> wa::SyncActionValue {
+fn quick_reply_value_at(
+    action: wa::sync_action_value::QuickReplyAction,
+    timestamp_ms: i64,
+) -> wa::SyncActionValue {
     {
         let mut proto = wa::SyncActionValue::default();
         proto.quick_reply_action = buffa::MessageField::some(action);
-        proto.timestamp = Some(wacore::time::now_millis());
+        proto.timestamp = Some(timestamp_ms);
         proto
     }
+}
+
+#[cfg(test)]
+fn quick_reply_value(action: wa::sync_action_value::QuickReplyAction) -> wa::SyncActionValue {
+    quick_reply_value_at(action, wacore::time::now_millis())
 }
 
 impl Client {

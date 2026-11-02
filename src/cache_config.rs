@@ -84,6 +84,30 @@ impl CacheEntryConfig {
         Self { timeout, capacity }
     }
 
+    pub(crate) fn build_with_ttl_on<K, V>(
+        &self,
+        runtime: &Arc<dyn wacore::runtime::Runtime>,
+    ) -> Cache<K, V>
+    where
+        K: std::hash::Hash + Eq + Clone + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+    {
+        self.build_with_ttl().on_runtime(runtime)
+    }
+
+    pub(crate) fn build_typed_ttl_on<K, V>(
+        &self,
+        store: Option<Arc<dyn CacheStore>>,
+        namespace: &'static str,
+        runtime: &Arc<dyn wacore::runtime::Runtime>,
+    ) -> TypedCache<K, V>
+    where
+        K: std::hash::Hash + Eq + Clone + Display + Send + Sync + 'static,
+        V: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
+    {
+        self.build_typed_ttl(store, namespace).on_runtime(runtime)
+    }
+
     /// Build a Cache using time_to_live semantics.
     pub(crate) fn build_with_ttl<K, V>(&self) -> Cache<K, V>
     where

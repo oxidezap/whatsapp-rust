@@ -630,7 +630,7 @@ async fn wait_for_writes(writes: &AtomicUsize, write_notify: &tokio::sync::Notif
 
 async fn await_connected(client: &Client) {
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !client.is_socket_connected() || !client.is_running.load(Ordering::Acquire) {
+        while !client.is_socket_connected() || !client.driver_running(Ordering::Acquire) {
             tokio::task::yield_now().await;
         }
     })

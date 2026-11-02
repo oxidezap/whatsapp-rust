@@ -176,7 +176,7 @@ impl Client {
         let message = wacore::proto_helpers::build_keep_in_chat_message(
             key,
             keep,
-            wacore::time::now_millis(),
+            self.runtime.wall_time_millis(),
         );
         self.send_message(chat, message).await
     }
@@ -230,7 +230,7 @@ impl Client {
                 let mut proto = wa::message::PinInChatMessage::default();
                 proto.key = buffa::MessageField::some(key);
                 proto.r#type = Some(pin_type);
-                proto.sender_timestamp_ms = Some(wacore::time::now_millis());
+                proto.sender_timestamp_ms = Some(self.runtime.wall_time_millis());
                 proto
             });
             proto.message_context_info = buffa::MessageField::some({

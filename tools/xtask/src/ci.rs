@@ -8,6 +8,21 @@ use xtask_support::{capture, write};
 
 #[derive(Subcommand)]
 pub enum Task {
+    /// Compare process-isolated connected retention against matched baseline executables.
+    SessionRetention {
+        #[arg(long)]
+        base_executable: PathBuf,
+        #[arg(long)]
+        head_executable: PathBuf,
+        #[arg(long)]
+        base_revision: String,
+        #[arg(long)]
+        head_revision: String,
+        #[arg(long, default_value_t = 3)]
+        repeats: usize,
+        #[arg(long, default_value = ".retention-out")]
+        out_dir: PathBuf,
+    },
     /// Prove SDK and host-contract removals fail downstream compilation.
     CompatibilityControls {
         #[arg(long, value_enum)]
@@ -210,6 +225,26 @@ fn timed_report(
 
 pub fn run(root: &Path, task: Task) -> Result<u8> {
     match task {
+        Task::SessionRetention {
+            base_executable,
+            head_executable,
+            base_revision,
+            head_revision,
+            repeats,
+            out_dir,
+        } => {
+            super::session_retention::run(
+                root,
+                super::session_retention::Options {
+                    base_executable,
+                    head_executable,
+                    base_revision,
+                    head_revision,
+                    repeats,
+                    out_dir,
+                },
+            )?;
+        }
         Task::Consumers { task } => return super::consumers::run(root, task),
         Task::CompatibilityControls { lane, toolchain } => {
             super::compatibility::controls(root, lane, &toolchain)?;

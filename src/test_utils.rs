@@ -504,6 +504,17 @@ pub(crate) async fn create_iq_test_client_with_backend(
     Arc<Client>,
     Arc<crate::transport::mock::CapturingMockTransport>,
 ) {
+    create_iq_test_client_with_runtime(backend, Arc::new(TokioRuntime)).await
+}
+
+#[cfg(test)]
+pub(crate) async fn create_iq_test_client_with_runtime(
+    backend: Arc<dyn Backend>,
+    runtime: Arc<dyn wacore::runtime::Runtime>,
+) -> (
+    Arc<Client>,
+    Arc<crate::transport::mock::CapturingMockTransport>,
+) {
     use crate::transport::mock::CapturingMockTransportFactory;
     use wacore::handshake::NoiseCipher;
 
@@ -515,7 +526,7 @@ pub(crate) async fn create_iq_test_client_with_backend(
     let factory = CapturingMockTransportFactory::new();
     let transport = factory.transport();
     let (client, _sync_rx) = Client::builder()
-        .with_runtime_arc(Arc::new(TokioRuntime))
+        .with_runtime_arc(runtime)
         .with_persistence_manager(pm)
         .with_transport_factory_arc(Arc::new(factory))
         .with_http_client_arc(Arc::new(MockHttpClient))
@@ -527,7 +538,7 @@ pub(crate) async fn create_iq_test_client_with_backend(
     // Wired to the client's own observers like the real socket is, so per-frame
     // bookkeeping and sent-frame forwarding are part of what tests observe.
     let noise_socket = crate::socket::NoiseSocket::with_observers(
-        Arc::new(TokioRuntime),
+        client.runtime.clone(),
         transport.clone() as Arc<dyn crate::transport::Transport>,
         NoiseCipher::new(&[0u8; 32]).expect("32-byte key"),
         NoiseCipher::new(&[0u8; 32]).expect("32-byte key"),
@@ -536,9 +547,7 @@ pub(crate) async fn create_iq_test_client_with_backend(
     );
     *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
     client.set_connected_for_test(true);
-    client
-        .is_running
-        .store(true, std::sync::atomic::Ordering::Release);
+    client.set_driver_running_for_test(true, std::sync::atomic::Ordering::Release);
     client.enter_live_mode_for_tests();
 
     (client, transport)

@@ -6,6 +6,12 @@ use crate::test_utils::MockHttpClient;
 use futures::channel::oneshot;
 use wacore_binary::SERVER_JID;
 
+#[cfg(all(
+    feature = "instance-clock",
+    feature = "tokio-runtime",
+    not(target_arch = "wasm32")
+))]
+mod instance_clocks;
 mod online_device_sync;
 mod owned_waiters;
 
@@ -1877,7 +1883,7 @@ async fn connect_failure_403_dispatches_account_locked_logout() {
         _ => panic!("expected Event::LoggedOut for reason=403"),
     }
     assert!(
-        !client.enable_auto_reconnect.load(Ordering::Relaxed),
+        !client.session_state.load(Ordering::Relaxed),
         "a server-side lock must not auto-reconnect"
     );
 }
@@ -3398,7 +3404,7 @@ async fn test_stream_error_401_disables_reconnect() {
     let node = NodeBuilder::new("stream:error").attr("code", "401").build();
     client.handle_stream_error(&node.as_node_ref()).await;
     assert!(
-        !client.enable_auto_reconnect.load(Ordering::Relaxed),
+        !client.session_state.load(Ordering::Relaxed),
         "401 should disable auto-reconnect"
     );
     assert_eq!(
@@ -3417,7 +3423,7 @@ async fn test_stream_error_409_disables_reconnect() {
     let node = NodeBuilder::new("stream:error").attr("code", "409").build();
     client.handle_stream_error(&node.as_node_ref()).await;
     assert!(
-        !client.enable_auto_reconnect.load(Ordering::Relaxed),
+        !client.session_state.load(Ordering::Relaxed),
         "409 should disable auto-reconnect"
     );
 }
@@ -3425,23 +3431,23 @@ async fn test_stream_error_409_disables_reconnect() {
 #[tokio::test]
 async fn test_stream_error_429_keeps_reconnect_with_backoff() {
     let client = create_offline_sync_test_client().await;
-    client.is_logged_in.store(true, Ordering::Relaxed);
-    let before = client.auto_reconnect_errors.load(Ordering::Relaxed);
+    client.set_logged_in_for_test(true, Ordering::Relaxed);
+    let before = client.reconnect_errors(Ordering::Relaxed);
     let node = NodeBuilder::new("stream:error").attr("code", "429").build();
     client.handle_stream_error(&node.as_node_ref()).await;
     assert!(
-        client.enable_auto_reconnect.load(Ordering::Relaxed),
+        client.session_state.load(Ordering::Relaxed),
         "429 should keep auto-reconnect enabled"
     );
     assert!(
-        !client.is_logged_in.load(Ordering::Relaxed),
+        !client.is_logged_in(),
         "429 must clear is_logged_in so sends bail before the server flags abuse"
     );
     assert!(
-        !client.expected_disconnect.load(Ordering::Relaxed),
+        !client.expected_session_disconnect(Ordering::Relaxed),
         "429 must not mark the disconnect as expected (auto-reconnect path)"
     );
-    let after = client.auto_reconnect_errors.load(Ordering::Relaxed);
+    let after = client.reconnect_errors(Ordering::Relaxed);
     assert_eq!(
         after,
         before + 5,
@@ -3458,7 +3464,7 @@ async fn test_stream_error_429_dispatches_stream_error_event() {
     use wacore::types::events::{Event, EventHandler};
 
     let client = create_offline_sync_test_client().await;
-    client.is_logged_in.store(true, Ordering::Relaxed);
+    client.set_logged_in_for_test(true, Ordering::Relaxed);
     let collector = Arc::new(crate::test_utils::TestEventCollector::default());
     client
         .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
@@ -3541,19 +3547,19 @@ async fn test_stream_error_neighbours_keep_their_events() {
 #[tokio::test]
 async fn test_stream_error_503_keeps_reconnect() {
     let client = create_offline_sync_test_client().await;
-    client.is_logged_in.store(true, Ordering::Relaxed);
+    client.set_logged_in_for_test(true, Ordering::Relaxed);
     let node = NodeBuilder::new("stream:error").attr("code", "503").build();
     client.handle_stream_error(&node.as_node_ref()).await;
     assert!(
-        client.enable_auto_reconnect.load(Ordering::Relaxed),
+        client.session_state.load(Ordering::Relaxed),
         "503 should keep auto-reconnect enabled"
     );
     assert!(
-        !client.is_logged_in.load(Ordering::Relaxed),
+        !client.is_logged_in(),
         "503 must clear is_logged_in so sends bail against the dying socket"
     );
     assert!(
-        !client.expected_disconnect.load(Ordering::Relaxed),
+        !client.expected_session_disconnect(Ordering::Relaxed),
         "503 must not mark the disconnect as expected (auto-reconnect path)"
     );
 }
@@ -3566,19 +3572,19 @@ async fn test_stream_error_unknown_keeps_connection_alive() {
     // real disconnect and races the read loop into shutdown.
     let client = create_offline_sync_test_client().await;
     // Simulate an authenticated session before the stream error arrives.
-    client.is_logged_in.store(true, Ordering::Relaxed);
+    client.set_logged_in_for_test(true, Ordering::Relaxed);
     let node = NodeBuilder::new("stream:error").build();
     client.handle_stream_error(&node.as_node_ref()).await;
     assert!(
-        client.is_logged_in.load(Ordering::Relaxed),
+        client.is_logged_in(),
         "unknown stream:error must NOT log the client out"
     );
     assert!(
-        !client.expected_disconnect.load(Ordering::Relaxed),
+        !client.expected_session_disconnect(Ordering::Relaxed),
         "unknown stream:error must not mark the disconnect as expected"
     );
     assert!(
-        client.enable_auto_reconnect.load(Ordering::Relaxed),
+        client.session_state.load(Ordering::Relaxed),
         "unknown stream:error must keep auto-reconnect enabled"
     );
 }
@@ -3589,7 +3595,7 @@ async fn test_stream_error_ack_shaped_does_not_force_shutdown() {
     // with no `code` attribute. Treat as informational, not as a fatal
     // stream teardown.
     let client = create_offline_sync_test_client().await;
-    client.is_logged_in.store(true, Ordering::Relaxed);
+    client.set_logged_in_for_test(true, Ordering::Relaxed);
     let ack_child = NodeBuilder::new("ack")
         .attr("class", "message")
         .attr("type", "text")
@@ -3600,11 +3606,11 @@ async fn test_stream_error_ack_shaped_does_not_force_shutdown() {
         .build();
     client.handle_stream_error(&node.as_node_ref()).await;
     assert!(
-        client.is_logged_in.load(Ordering::Relaxed),
+        client.is_logged_in(),
         "ack-shaped stream:error must NOT log the client out"
     );
     assert!(
-        !client.expected_disconnect.load(Ordering::Relaxed),
+        !client.expected_session_disconnect(Ordering::Relaxed),
         "ack-shaped stream:error must not mark the disconnect as expected"
     );
 }
@@ -3847,6 +3853,31 @@ fn client_size_pins_runtime_cache_config_saving() {
         - size_of::<Arc<RwLock<Option<crate::mediaconn::MediaConn>>>>();
     expected += size_of::<std::sync::Mutex<HashSet<Jid>>>()
         - size_of::<Arc<std::sync::Mutex<HashSet<Jid>>>>();
+
+    expected += size_of::<Mutex<HashMap<Vec<u8>, wacore::time::Instant>>>()
+        - size_of::<Arc<Mutex<HashMap<Vec<u8>, wacore::time::Instant>>>>();
+    expected += 2 * (size_of::<Mutex<()>>() - size_of::<Arc<Mutex<()>>>());
+    expected += 2
+        * (size_of::<Mutex<Option<async_channel::Sender<()>>>>()
+            - size_of::<Arc<Mutex<Option<async_channel::Sender<()>>>>>());
+    expected += size_of::<Mutex<wacore::pair_code::PairCodeState>>()
+        - size_of::<Arc<Mutex<wacore::pair_code::PairCodeState>>>();
+
+    // The lifecycle model replaces ten flags, its timer/counter and the old Arc.
+    // Keep the fixed base and total retained-memory budget independent of this inline move.
+    let legacy_status = size_of::<Arc<AtomicU8>>()
+        + 10 * size_of::<AtomicBool>()
+        + size_of::<AtomicU32>()
+        + size_of::<wacore::time::AtomicInstant>();
+    // Six of the legacy bytes occupied padding shared with neighboring fields.
+    let legacy_status = legacy_status / align_of::<SessionState>() * align_of::<SessionState>();
+    expected = expected
+        .checked_add_signed(size_of::<SessionState>() as isize - legacy_status as isize)
+        .unwrap();
+    #[cfg(feature = "instance-clock")]
+    {
+        expected += size_of::<Option<Arc<dyn wacore::time::Clock>>>();
+    }
 
     let retry_slot = size_of::<Option<Arc<dyn crate::RetryAdmission>>>();
     let decrypt_slot = size_of::<Option<Arc<dyn crate::DecryptFailureAdmission>>>();
@@ -4138,7 +4169,7 @@ async fn test_is_socket_connected_not_affected_by_mutex_contention() {
         read_key,
     );
     *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
-    client.is_connected.store(true, Ordering::Release);
+    client.set_connected_for_test(true);
 
     assert!(client.is_socket_connected(), "should report connected");
 
@@ -4222,7 +4253,7 @@ async fn assert_teardown_flush_order(reconnect_immediately: Option<bool>) {
 
     *client.transport.lock().await = Some(transport);
     *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
-    client.is_connected.store(true, Ordering::Release);
+    client.set_connected_for_test(true);
 
     let cleanup_signal = client.connection_shutdown_signal();
     let cleanup_client = Arc::clone(&client);
@@ -4807,7 +4838,7 @@ async fn delivery_receipt_worker_sends_and_releases_flush() {
     );
     *client.transport.lock().await = Some(transport);
     *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
-    client.is_connected.store(true, Ordering::Release);
+    client.set_connected_for_test(true);
 
     client.ack_received_message(&receipt_test_info("RCPT-WORKER-1"));
 
@@ -4938,7 +4969,7 @@ async fn flush_waits_for_queued_delivery_receipts() {
     );
     *client.transport.lock().await = Some(transport);
     *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
-    client.is_connected.store(true, Ordering::Release);
+    client.set_connected_for_test(true);
 
     client.ack_received_message(&receipt_test_info("RCPT-QUEUE-1"));
     tokio::time::timeout(Duration::from_secs(1), send_started_rx.recv())
@@ -5024,19 +5055,19 @@ async fn outbound_teardown_gate_covers_both_disconnect_signals() {
     let client = crate::test_utils::create_test_client().await;
 
     client.set_connected_for_test(true);
-    client.expected_disconnect.store(false, Ordering::Relaxed);
+    client.clear_expected_session_disconnect();
     assert!(
         !client.outbound_teardown_in_progress(),
         "a live connection must not be treated as tearing down"
     );
 
-    client.expected_disconnect.store(true, Ordering::Relaxed);
+    client.expect_session_disconnect();
     assert!(
         client.outbound_teardown_in_progress(),
         "an expected disconnect (an intentional close, or a 515) must gate sends"
     );
 
-    client.expected_disconnect.store(false, Ordering::Relaxed);
+    client.clear_expected_session_disconnect();
     client.set_connected_for_test(false);
     assert!(
         client.outbound_teardown_in_progress(),
@@ -5067,14 +5098,14 @@ async fn deferred_ack_worker_drops_teardown_batches_and_recovers_cleanly() {
         crate::test_utils::node_to_owned_ref(&node)
     };
 
-    client.expected_disconnect.store(true, Ordering::Relaxed);
+    client.expect_session_disconnect();
     client
         .process_node(receipt("ACK-EXPECTED-DISCONNECT"))
         .await;
     crate::test_utils::wait_for_outbound_tasks(&client).await;
     assert_eq!(transport.sent_count(), 0);
 
-    client.expected_disconnect.store(false, Ordering::Relaxed);
+    client.clear_expected_session_disconnect();
     client.set_connected_for_test(false);
     client.process_node(receipt("ACK-DISCONNECTED")).await;
     crate::test_utils::wait_for_outbound_tasks(&client).await;
@@ -5112,7 +5143,7 @@ async fn test_send_ack_for_returns_ok_on_expected_disconnect() {
         .into_parts();
 
     // Set expected disconnect — send_ack_for should gracefully return Ok
-    client.expected_disconnect.store(true, Ordering::Relaxed);
+    client.expect_session_disconnect();
 
     let receipt = NodeBuilder::new("receipt")
         .attr("from", "120363040237990503@g.us")
@@ -5251,7 +5282,7 @@ async fn stats_snapshot_reflects_counters() {
     client.stats.record_frame_sent(150);
     client.stats.record_recv_batch(300, 2);
     client.stats.record_message_sent();
-    client.auto_reconnect_errors.store(3, Ordering::Relaxed);
+    client.set_reconnect_errors_for_test(3, Ordering::Relaxed);
 
     let snap = client.stats();
     assert_eq!(snap.bytes_sent, 150);
@@ -6254,7 +6285,7 @@ fn phash_waiter_sweep_drops_only_entries_that_lived_through_a_sweep() {
 #[tokio::test]
 async fn a_terminal_connect_failure_releases_a_parked_wait() {
     let client = create_offline_sync_test_client().await;
-    client.is_running.store(true, Ordering::Relaxed);
+    client.set_driver_running_for_test(true, Ordering::Relaxed);
 
     let waiter = {
         let client = Arc::clone(&client);
@@ -7959,14 +7990,12 @@ mod ensure_sessions_concurrency {
 #[tokio::test]
 async fn a_reconnecting_client_and_a_finished_one_refuse_a_call_identically() {
     let reconnecting = crate::test_utils::create_test_client().await;
-    reconnecting.is_running.store(true, Ordering::Relaxed);
+    reconnecting.set_driver_running_for_test(true, Ordering::Relaxed);
 
     let finished = crate::test_utils::create_test_client().await;
-    finished.is_running.store(true, Ordering::Relaxed);
-    finished
-        .enable_auto_reconnect
-        .store(false, Ordering::Relaxed);
-    finished.expected_disconnect.store(true, Ordering::Relaxed);
+    finished.set_driver_running_for_test(true, Ordering::Relaxed);
+    finished.session_state.store(false, Ordering::Relaxed);
+    finished.expect_session_disconnect();
 
     let jid = Jid::pn("12025550111");
     let transient = reconnecting
@@ -8002,9 +8031,9 @@ async fn a_reconnecting_client_and_a_finished_one_refuse_a_call_identically() {
 /// authenticated, and with a reader running.
 async fn create_reachable_wait_test_client(name: &str) -> Arc<Client> {
     let client = crate::test_utils::create_test_client_with_name(name).await;
-    client.is_running.store(true, Ordering::Relaxed);
+    client.set_driver_running_for_test(true, Ordering::Relaxed);
     client.set_connected_for_test(true);
-    client.is_logged_in.store(true, Ordering::Relaxed);
+    client.set_logged_in_for_test(true, Ordering::Relaxed);
     client.authenticated_generation.store(
         client.connection_generation.load(Ordering::SeqCst),
         Ordering::SeqCst,
@@ -8019,7 +8048,7 @@ async fn create_reachable_wait_test_client(name: &str) -> Arc<Client> {
 #[tokio::test]
 async fn the_wait_ends_when_the_replacement_connection_authenticates() {
     let client = crate::test_utils::create_test_client_with_name("wait-release").await;
-    client.is_running.store(true, Ordering::Relaxed);
+    client.set_driver_running_for_test(true, Ordering::Relaxed);
     assert_eq!(client.reachability(), Reachability::Reconnecting);
 
     let waiter = {
@@ -8031,7 +8060,7 @@ async fn the_wait_ends_when_the_replacement_connection_authenticates() {
     // What `handle_success` publishes, in its order: the session, then the
     // generation it is authenticated under, then the announcement.
     client.set_connected_for_test(true);
-    client.is_logged_in.store(true, Ordering::Relaxed);
+    client.set_logged_in_for_test(true, Ordering::Relaxed);
     client.authenticated_generation.store(
         client.connection_generation.load(Ordering::SeqCst),
         Ordering::SeqCst,
@@ -8073,7 +8102,7 @@ async fn a_terminal_session_ends_the_wait_however_it_became_terminal() {
     // Parked first, on a client that is merely between connections, so the only
     // thing that can end this wait is the transition under test.
     let client = crate::test_utils::create_test_client_with_name("terminal-parked").await;
-    client.is_running.store(true, Ordering::Relaxed);
+    client.set_driver_running_for_test(true, Ordering::Relaxed);
     let waiter = {
         let client = Arc::clone(&client);
         tokio::spawn(async move { client.wait_until_reachable().await })
@@ -8130,7 +8159,7 @@ async fn a_rate_limited_session_is_not_a_reachable_one() {
 async fn a_client_with_no_reader_is_told_rather_than_parked() {
     let client = crate::test_utils::create_test_client_with_name("no-reader").await;
     client.set_connected_for_test(true);
-    client.is_logged_in.store(true, Ordering::Relaxed);
+    client.set_logged_in_for_test(true, Ordering::Relaxed);
     client.authenticated_generation.store(
         client.connection_generation.load(Ordering::SeqCst),
         Ordering::SeqCst,
@@ -8180,7 +8209,7 @@ async fn a_pause_ends_the_public_wait_and_not_the_internal_one() {
 
     client.resume();
     client.set_connected_for_test(true);
-    client.is_logged_in.store(true, Ordering::Relaxed);
+    client.set_logged_in_for_test(true, Ordering::Relaxed);
     client.authenticated_generation.store(
         client.connection_generation.load(Ordering::SeqCst),
         Ordering::SeqCst,
@@ -8201,7 +8230,7 @@ async fn a_pause_ends_the_public_wait_and_not_the_internal_one() {
 #[tokio::test]
 async fn a_wake_that_settles_nothing_leaves_the_wait_parked() {
     let client = crate::test_utils::create_test_client_with_name("relooping-wait").await;
-    client.is_running.store(true, Ordering::Relaxed);
+    client.set_driver_running_for_test(true, Ordering::Relaxed);
 
     let waiter = {
         let client = Arc::clone(&client);
@@ -8268,19 +8297,17 @@ async fn a_reachable_client_completes_the_wait_without_parking() {
 #[tokio::test]
 async fn a_first_connection_and_a_restored_one_report_the_same_state() {
     let first = crate::test_utils::create_test_client_with_name("never-connected").await;
-    first.is_running.store(true, Ordering::Relaxed);
+    first.set_driver_running_for_test(true, Ordering::Relaxed);
 
     let restoring = crate::test_utils::create_test_client_with_name("lost-session").await;
-    restoring.is_running.store(true, Ordering::Relaxed);
+    restoring.set_driver_running_for_test(true, Ordering::Relaxed);
     // What one authenticated-then-lost cycle leaves standing: the persistent
     // record of a login, and the generations `<success>` and the teardown bump.
     restoring
         .persistence_manager
         .process_command(DeviceCommand::IncrementLoginCounter)
         .await;
-    restoring
-        .connection_generation
-        .fetch_add(2, Ordering::SeqCst);
+    restoring.advance_generation_for_test(2, Ordering::SeqCst);
 
     assert_eq!(first.connection_generation.load(Ordering::SeqCst), 0);
     assert_eq!(
@@ -8328,7 +8355,7 @@ async fn a_first_connection_and_a_restored_one_report_the_same_state() {
 #[tokio::test]
 async fn a_first_connection_is_waited_out_like_any_other() {
     let client = crate::test_utils::create_test_client_with_name("first-connect-wait").await;
-    client.is_running.store(true, Ordering::Relaxed);
+    client.set_driver_running_for_test(true, Ordering::Relaxed);
     assert_eq!(
         client.connection_generation.load(Ordering::SeqCst),
         0,
@@ -8346,7 +8373,7 @@ async fn a_first_connection_is_waited_out_like_any_other() {
     );
 
     client.set_connected_for_test(true);
-    client.is_logged_in.store(true, Ordering::Relaxed);
+    client.set_logged_in_for_test(true, Ordering::Relaxed);
     client.authenticated_generation.store(
         client.connection_generation.load(Ordering::SeqCst),
         Ordering::SeqCst,
@@ -8782,7 +8809,7 @@ async fn wait_for_startup_sync_reports_a_teardown_without_waiting_out_its_timeou
     crate::test_utils::wait_for_notifier_listeners(&client.offline_sync_notifier, 1).await;
 
     // The teardown lands under the parked waiter, and never notifies it.
-    client.connection_generation.fetch_add(1, Ordering::SeqCst);
+    client.advance_generation_for_test(1, Ordering::SeqCst);
 
     let result = waiter.await.expect("waiter task must not panic");
     let waited = started.elapsed();
@@ -8908,7 +8935,7 @@ async fn a_completion_for_a_retired_generation_is_ignored() {
 
     arm_offline_drain(&client, 711, 5).await;
     let stale_generation = client.connection_generation.load(Ordering::Acquire);
-    client.connection_generation.fetch_add(1, Ordering::SeqCst);
+    client.advance_generation_for_test(1, Ordering::SeqCst);
 
     client
         .complete_offline_sync_for_generation(711, stale_generation)
@@ -9015,7 +9042,7 @@ async fn wait_for_startup_sync_fails_when_the_connection_ends_mid_history_sync()
         .await;
 
     // Exactly what `cleanup_connection_state` does, in that order.
-    client.connection_generation.fetch_add(1, Ordering::SeqCst);
+    client.advance_generation_for_test(1, Ordering::SeqCst);
     client.history_sync_activity.reset();
 
     let result = waiter.await.expect("waiter task must not panic");

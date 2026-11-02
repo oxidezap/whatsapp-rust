@@ -625,8 +625,14 @@ impl MessageInfo {
     /// WA Web: expired status messages (>24h) are silently dropped — no retry receipts,
     /// no undecryptable events. Matches `WAWebMsgProcessingDecryptionHandler.E()`.
     pub fn is_expired_status(&self) -> bool {
+        self.is_expired_status_with(crate::time::now_utc)
+    }
+
+    /// Evaluate the status age against the supplied clock. The closure is
+    /// called only for status broadcasts; exactly 24 hours is still valid.
+    pub fn is_expired_status_with(&self, now: impl FnOnce() -> DateTime<Utc>) -> bool {
         self.source.chat.is_status_broadcast()
-            && (crate::time::now_utc() - self.timestamp) > chrono::Duration::hours(24)
+            && (now() - self.timestamp) > chrono::Duration::hours(24)
     }
 }
 
@@ -639,6 +645,21 @@ mod tests {
     /// directly. That is only safe while the borrowed and owned constructors
     /// agree on every input, including the `Unknown` fallback that is the one
     /// case actually needing an allocation.
+    #[test]
+    fn status_expiry_uses_the_selected_clock_and_keeps_the_exact_boundary() {
+        let at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let mut info = MessageInfo {
+            timestamp: at,
+            ..Default::default()
+        };
+        assert!(!info.is_expired_status_with(|| panic!("direct message read status clock")));
+        info.source.chat = "status@broadcast".parse().unwrap();
+        assert!(!info.is_expired_status_with(|| at + chrono::Duration::hours(24)));
+        assert!(info.is_expired_status_with(|| at
+            + chrono::Duration::hours(24)
+            + chrono::Duration::milliseconds(1)));
+    }
+
     #[test]
     fn edit_attribute_parses_identically_from_borrowed_and_owned() {
         for wire in ["", "1", "2", "3", "7", "8", "0", "99", "revogação", " 7"] {

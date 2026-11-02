@@ -17,6 +17,8 @@ autobenches = false
 ignored = ["getrandom"]
 
 [features]
+instance-clock = []
+session-simulator = []
 debug-snapshots = []
 # Typed interop with the decoded libsignal SessionRecord v1 model.
 legacy-session-interop = ["wacore-libsignal/legacy-session-interop"]

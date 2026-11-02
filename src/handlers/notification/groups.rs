@@ -183,7 +183,7 @@ pub(crate) async fn handle_group_notification(
     let timestamp = i64::try_from(notification.timestamp)
         .ok()
         .and_then(wacore::time::from_secs)
-        .unwrap_or_else(wacore::time::now_utc);
+        .unwrap_or_else(|| client.runtime.wall_time_utc());
 
     let actions = std::mem::take(&mut notification.actions);
     let action_count = actions.len();

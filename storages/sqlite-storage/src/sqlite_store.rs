@@ -175,8 +175,7 @@ struct FreshDeviceRow {
 impl FreshDeviceRow {
     /// Build the row for a brand-new, unpaired account, optionally pinning the
     /// id. Serialization of the key pairs is the only fallible step.
-    fn new(id: Option<i32>) -> Result<Self> {
-        let device = CoreDevice::new();
+    fn from_device(id: Option<i32>, device: CoreDevice) -> Result<Self> {
         Ok(Self {
             id,
             lid: String::new(),
@@ -532,6 +531,8 @@ pub(crate) struct ReadPool {
 /// ```
 #[derive(Clone)]
 pub struct SqliteStore {
+    #[cfg(feature = "instance-clock")]
+    clock: Option<Arc<dyn wacore::time::Clock>>,
     pub(crate) pool: SqlitePool,
     pub(crate) db_semaphore: Arc<tokio::sync::Semaphore>,
     /// A separate, `query_only` pool and its permits, when
@@ -1050,6 +1051,40 @@ fn is_shared_cache(database_url: &str) -> bool {
 }
 
 impl SqliteStore {
+    #[cfg(feature = "instance-clock")]
+    pub fn with_clock(mut self, clock: Arc<dyn wacore::time::Clock>) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
+    fn insertion_time(&self) -> InsertionTime {
+        InsertionTime {
+            #[cfg(feature = "instance-clock")]
+            clock: self.clock.clone(),
+        }
+    }
+
+    fn wall_time_secs(&self) -> i64 {
+        #[cfg(feature = "instance-clock")]
+        if let Some(clock) = &self.clock {
+            return clock.wall_time_millis() / 1000;
+        }
+        wacore::time::now_secs()
+    }
+
+    fn wall_time_i32(&self) -> Result<i32> {
+        let now = self.wall_time_secs();
+        #[cfg(feature = "instance-clock")]
+        if self.clock.is_some() {
+            return i32::try_from(now).map_err(|_| {
+                StoreError::Validation(
+                    "instance clock exceeds the SQLite 32-bit timestamp range".into(),
+                )
+            });
+        }
+        Ok(now as i32)
+    }
+
     /// Open one account (device id 1) with the default low-memory configuration.
     /// This does not create the device row; the client's normal provisioning
     /// path calls `DeviceStore::create`.
@@ -1272,6 +1307,8 @@ impl SqliteStore {
         let database_path = parse_database_path(database_url)?;
 
         Ok(Self {
+            #[cfg(feature = "instance-clock")]
+            clock: None,
             pool,
             db_semaphore: Arc::new(tokio::sync::Semaphore::new(pool_size as usize)),
             reads,
@@ -1342,6 +1379,8 @@ impl SqliteStore {
     /// The public account-selection entry point is `SqliteDatabase::store`.
     pub(crate) fn share_for_device(&self, device_id: i32) -> Self {
         Self {
+            #[cfg(feature = "instance-clock")]
+            clock: self.clock.clone(),
             pool: self.pool.clone(),
             db_semaphore: Arc::clone(&self.db_semaphore),
             reads: self.reads.clone(),
@@ -1498,9 +1537,11 @@ impl SqliteStore {
             key.id.to_owned(),
         );
         let device_id = self.device_id;
+        let timestamp = self.insertion_time();
         self.with_retry(mutation.operation(), || {
             let (chat, sender, id) = (chat.clone(), sender.clone(), id.clone());
             let mutation = mutation.clone();
+            let timestamp = timestamp.clone();
             Box::new(move |conn| {
                 conn.immediate_transaction(|conn| {
                     let current = match read_pending_inbound_bounded_row(
@@ -1541,6 +1582,7 @@ impl SqliteStore {
                                 &sender,
                                 &id,
                                 payload.bytes(),
+                                &timestamp,
                             )?;
                         }
                         OwnedPendingMutation::Delete(_) => {
@@ -1851,7 +1893,7 @@ impl SqliteStore {
 
     pub(crate) async fn create_new_device(&self) -> Result<i32> {
         let device_id = self.device_id;
-        let new_device = wacore::store::Device::new();
+        let new_device = self.insertion_time().device();
 
         let noise_key_data: Arc<[u8]> = self.serialize_keypair(&new_device.noise_key)?.into();
         let identity_key_data: Arc<[u8]> = self.serialize_keypair(&new_device.identity_key)?.into();
@@ -1961,7 +2003,10 @@ impl SqliteStore {
     }
 
     pub(crate) async fn create_sibling_device_impl(&self) -> Result<(i32, SqliteStore)> {
-        let row = Arc::new(FreshDeviceRow::new(None)?);
+        let row = Arc::new(FreshDeviceRow::from_device(
+            None,
+            self.insertion_time().device(),
+        )?);
         let device_id = self
             .with_retry("create_sibling_device", move || {
                 let row = Arc::clone(&row);
@@ -1979,7 +2024,10 @@ impl SqliteStore {
     }
 
     pub(crate) async fn reset_device_impl(&self, device_id: i32) -> Result<SqliteStore> {
-        let row = Arc::new(FreshDeviceRow::new(Some(device_id))?);
+        let row = Arc::new(FreshDeviceRow::from_device(
+            Some(device_id),
+            self.insertion_time().device(),
+        )?);
         self.with_retry("reset_device", move || {
             let row = Arc::clone(&row);
             Box::new(move |conn: &mut SqliteConnection| {
@@ -3347,6 +3395,32 @@ impl AppSyncStore for SqliteStore {
     }
 }
 
+#[derive(Clone, Default)]
+struct InsertionTime {
+    #[cfg(feature = "instance-clock")]
+    clock: Option<Arc<dyn wacore::time::Clock>>,
+}
+
+impl InsertionTime {
+    fn device(&self) -> CoreDevice {
+        #[cfg(feature = "instance-clock")]
+        if let Some(clock) = &self.clock {
+            return CoreDevice::new_with_clock(clock.as_ref());
+        }
+        CoreDevice::new()
+    }
+
+    fn seconds(&self) -> Option<i64> {
+        #[cfg(feature = "instance-clock")]
+        return self
+            .clock
+            .as_ref()
+            .map(|clock| clock.wall_time_millis() / 1000);
+        #[cfg(not(feature = "instance-clock"))]
+        None
+    }
+}
+
 /// Single source of the pending-inbound row insert, shared by the single-row
 /// and batch write paths so a schema or conflict-strategy change cannot
 /// silently diverge between them.
@@ -3357,7 +3431,22 @@ fn insert_pending_inbound_row(
     sender: &str,
     id: &str,
     message: &[u8],
+    timestamp: &InsertionTime,
 ) -> QueryResult<usize> {
+    #[cfg(feature = "instance-clock")]
+    if let Some(seconds) = timestamp.seconds() {
+        return diesel::replace_into(pending_inbound_messages::table)
+            .values((
+                pending_inbound_messages::chat.eq(chat),
+                pending_inbound_messages::sender.eq(sender),
+                pending_inbound_messages::id.eq(id),
+                pending_inbound_messages::message.eq(message),
+                pending_inbound_messages::device_id.eq(device_id),
+                pending_inbound_messages::inserted_at.eq(seconds),
+            ))
+            .execute(conn);
+    }
+    let _ = timestamp;
     diesel::replace_into(pending_inbound_messages::table)
         .values((
             pending_inbound_messages::chat.eq(chat),
@@ -3441,6 +3530,11 @@ fn delete_pending_inbound_row(
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl ProtocolStore for SqliteStore {
+    #[cfg(feature = "instance-clock")]
+    fn clock(&self) -> Option<&Arc<dyn wacore::time::Clock>> {
+        self.clock.as_ref()
+    }
+
     async fn get_sender_key_devices(&self, group_jid: &str) -> Result<Vec<(String, bool)>> {
         // On the write queue: the result initializes `sender_key_device_cache`,
         // so a stale `has_key = true` is cached over a concurrent forget and the
@@ -3478,7 +3572,7 @@ impl ProtocolStore for SqliteStore {
                 .map(|(jid, has_key)| (jid.to_string(), *has_key))
                 .collect(),
         );
-        let now = wacore::time::now_secs();
+        let now = self.wall_time_secs();
         self.with_retry("set_sender_key_status", || {
             let group_jid = group_jid.clone();
             let owned_entries = Arc::clone(&owned_entries);
@@ -3742,7 +3836,7 @@ impl ProtocolStore for SqliteStore {
         let address = address.to_string();
         let message_id = message_id.to_string();
         let base_key = base_key.to_vec();
-        let now = wacore::time::now_secs() as i32;
+        let now = self.wall_time_i32()?;
         self.write_blocking(move |conn| {
             diesel::insert_into(base_keys::table)
                 .values((
@@ -3828,7 +3922,7 @@ impl ProtocolStore for SqliteStore {
         let device_id = self.device_id;
         let devices_json = serde_json::to_string(&*record.devices)
             .map_err(|e| StoreError::Serialization(Box::new(e)))?;
-        let now = wacore::time::now_secs() as i32;
+        let now = self.wall_time_i32()?;
         self.write_blocking(move |conn| {
             let raw_id_i32 = record.raw_id.map(|r| r as i32);
             crate::upsert_queries::UpsertDeviceRegistry {
@@ -3852,7 +3946,7 @@ impl ProtocolStore for SqliteStore {
             return Ok(());
         }
         let device_id = self.device_id;
-        let now = wacore::time::now_secs() as i32;
+        let now = self.wall_time_i32()?;
 
         // Pre-serialize devices_json once (outside the retry loop and outside
         // spawn_blocking) so retries are zero-allocation. Each row carries its
@@ -3995,7 +4089,7 @@ impl ProtocolStore for SqliteStore {
         let device_id = self.device_id;
         let group_jid = group_jid.to_string();
         let blob = blob.to_vec();
-        let now = wacore::time::now_secs();
+        let now = self.wall_time_secs();
         self.write_blocking(move |conn| {
             diesel::insert_into(group_metadata::table)
                 .values((
@@ -4119,7 +4213,7 @@ impl ProtocolStore for SqliteStore {
         let device_id = self.device_id;
         let jid = jid.to_string();
         let entry = entry.clone();
-        let now = wacore::time::now_secs();
+        let now = self.wall_time_secs();
         self.write_blocking(move |conn| {
             diesel::insert_into(tc_tokens::table)
                 .values((
@@ -4216,7 +4310,7 @@ impl ProtocolStore for SqliteStore {
         let device_id = self.device_id;
         let jid = jid.to_string();
         let token = token.to_vec();
-        let now = wacore::time::now_secs();
+        let now = self.wall_time_secs();
         // IMMEDIATE so the read + conditional write is atomic against concurrent
         // writers (WAL + busy_timeout serialize them): this is the lock-free
         // newer-wins that lets history-sync and the privacy path converge without
@@ -4271,7 +4365,7 @@ impl ProtocolStore for SqliteStore {
     ) -> Result<()> {
         let device_id = self.device_id;
         let jid = jid.to_string();
-        let now = wacore::time::now_secs();
+        let now = self.wall_time_secs();
         self.write_blocking(move |conn| {
             // On conflict touch only sender_timestamp, and only to advance it,
             // so a concurrently stored real token is never overwritten and the
@@ -4320,11 +4414,27 @@ impl ProtocolStore for SqliteStore {
         // Arc avoids cloning the full payload bytes on each retry iteration
         let payload: Arc<Vec<u8>> = Arc::new(payload.to_vec());
         let device_id = self.device_id;
+        let timestamp = self.insertion_time();
         self.with_retry("store_sent_message", || {
+            let timestamp = timestamp.clone();
             let chat_jid = chat_jid.clone();
             let message_id = message_id.clone();
             let payload = Arc::clone(&payload);
             Box::new(move |conn: &mut SqliteConnection| {
+                #[cfg(feature = "instance-clock")]
+                if let Some(seconds) = timestamp.seconds() {
+                    diesel::replace_into(sent_messages::table)
+                        .values((
+                            sent_messages::chat_jid.eq(&chat_jid),
+                            sent_messages::message_id.eq(&message_id),
+                            sent_messages::payload.eq(payload.as_slice()),
+                            sent_messages::device_id.eq(device_id),
+                            sent_messages::created_at.eq(seconds),
+                        ))
+                        .execute(conn)?;
+                    return Ok(());
+                }
+                let _ = timestamp;
                 diesel::replace_into(sent_messages::table)
                     .values((
                         sent_messages::chat_jid.eq(&chat_jid),
@@ -4423,13 +4533,17 @@ impl ProtocolStore for SqliteStore {
         // Arc avoids cloning the payload bytes on each retry iteration.
         let message: Arc<Vec<u8>> = Arc::new(message.to_vec());
         let device_id = self.device_id;
+        let timestamp = self.insertion_time();
         self.with_retry("store_pending_inbound", || {
+            let timestamp = timestamp.clone();
             let chat = chat.clone();
             let sender = sender.clone();
             let id = id.clone();
             let message = Arc::clone(&message);
             Box::new(move |conn: &mut SqliteConnection| {
-                insert_pending_inbound_row(conn, device_id, &chat, &sender, &id, &message)?;
+                insert_pending_inbound_row(
+                    conn, device_id, &chat, &sender, &id, &message, &timestamp,
+                )?;
                 Ok(())
             })
         })
@@ -4646,7 +4760,9 @@ impl ProtocolStore for SqliteStore {
                 .collect(),
         );
         let device_id = self.device_id;
+        let timestamp = self.insertion_time();
         self.with_retry("store_pending_inbound_batch", || {
+            let timestamp = timestamp.clone();
             let rows = Arc::clone(&rows);
             Box::new(move |conn: &mut SqliteConnection| {
                 // Per-row statements inside ONE transaction: the WAL commit is
@@ -4656,7 +4772,9 @@ impl ProtocolStore for SqliteStore {
                 // 32 KiB per-PR budget — not worth it for microseconds.
                 conn.transaction(|conn| {
                     for (chat, sender, id, message) in rows.iter() {
-                        insert_pending_inbound_row(conn, device_id, chat, sender, id, message)?;
+                        insert_pending_inbound_row(
+                            conn, device_id, chat, sender, id, message, &timestamp,
+                        )?;
                     }
                     Ok(())
                 })
@@ -4886,6 +5004,7 @@ impl DeviceStore for SqliteStore {
 
         let sanitized_name = sanitize_snapshot_name(name)?;
 
+        let timestamp = self.insertion_time();
         let pool = self.pool.clone();
         let db_path = self.database_path.clone();
         let extra_data = extra_content.map(|b| b.to_vec());
@@ -4895,7 +5014,7 @@ impl DeviceStore for SqliteStore {
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
 
-            let timestamp = wacore::time::now_secs();
+            let timestamp = timestamp.seconds().unwrap_or_else(wacore::time::now_secs);
 
             // Construct target path: db_path.snapshot-TIMESTAMP-SANITIZED_NAME
             let target_path = format!("{}.snapshot-{}-{}", db_path, timestamp, sanitized_name);
@@ -5143,6 +5262,24 @@ mod tests {
     }
 
     #[cfg(not(target_family = "wasm"))]
+    #[cfg(feature = "instance-clock")]
+    #[tokio::test]
+    async fn sibling_and_reset_device_creation_use_the_configured_clock() {
+        use wacore::time::{Instant, VirtualClock};
+        let clock = Arc::new(VirtualClock::new(1_700_000_000_000, Instant::ZERO).unwrap());
+        let store = SqliteStore::open("file:instance-account-clock?mode=memory&cache=shared")
+            .await
+            .unwrap()
+            .with_clock(clock.clone());
+        let (id, sibling) = store.create_sibling_device_impl().await.unwrap();
+        let created = DeviceStore::load(&sibling).await.unwrap().unwrap();
+        assert_eq!(created.last_signed_pre_key_rotation_ms, 1_700_000_000_000);
+        clock.advance(Duration::from_secs(5)).unwrap();
+        let reset = store.reset_device_impl(id).await.unwrap();
+        let created = DeviceStore::load(&reset).await.unwrap().unwrap();
+        assert_eq!(created.last_signed_pre_key_rotation_ms, 1_700_000_005_000);
+    }
+
     #[tokio::test]
     async fn shared_retry_accepts_send_only_factory_and_preserves_commit_barrier() {
         use std::cell::Cell;

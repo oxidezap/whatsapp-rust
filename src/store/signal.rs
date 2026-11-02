@@ -354,7 +354,14 @@ impl SignedPreKeyStore for Device {
                 self.signed_pre_key_id,
                 &self.signed_pre_key,
                 self.signed_pre_key_signature,
-                wacore::time::now_utc(),
+                self.backend
+                    .instance_clock()
+                    .map_or_else(wacore::time::now_utc, |clock| {
+                        clock
+                            .reading()
+                            .expect("clock implementation returned an invalid calendar time")
+                            .wall_time_utc()
+                    }),
             );
             return Ok(Some(record));
         }

@@ -308,7 +308,7 @@ async fn process_queued(
     // Two clock reads per message, kept: sampling or gating on lane
     // backlog would stop reporting the single pathological message
     // this guard exists to catch.
-    let start = wacore::time::Instant::now();
+    let start = client.runtime.monotonic_time();
     // Classification can drop the parsed node before its heavy processing
     // finishes. Keep this admission charged until the whole handler completes;
     // escaped slices independently retain the same charge for longer.
@@ -325,7 +325,10 @@ async fn process_queued(
             .handle_incoming_message_scoped(msg_node, spawn_generation)
             .await;
     }
-    let elapsed = start.elapsed();
+    let elapsed = client
+        .runtime
+        .monotonic_time()
+        .saturating_duration_since(start);
     if elapsed.as_millis() as u64 > MAX_MESSAGE_DELAY_MS {
         warn!(
             target: "MessageQueue",
@@ -365,9 +368,7 @@ mod tests {
         );
         client.notify_connection_shutdown();
         client.chat_lanes.clear().await;
-        client
-            .connection_generation
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        client.advance_generation_for_test(1, std::sync::atomic::Ordering::AcqRel);
         client.reset_connection_shutdown();
         // Finish the old cache initializer after the reconnect's clear.
         client

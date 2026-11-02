@@ -47,6 +47,7 @@ impl Boundary {
             && !joined.starts_with("std::time::Duration::");
         let reads_now = parts.len() > 1 && parts.last().is_some_and(|part| part == "now");
         let unreviewed_root = parts.len() > 1
+            && joined != "thiserror::Error"
             && parts.first().is_some_and(|root| {
                 root.starts_with(char::is_lowercase)
                     && ![
@@ -90,6 +91,7 @@ impl Boundary {
                 "std::num::NonZeroU64",
                 "std::time::Duration",
                 "std::cmp::Ordering",
+                "std::mem::take",
             ]
             .iter()
             .any(|prefix| joined == *prefix || joined.starts_with(&format!("{prefix}::")));
@@ -127,6 +129,27 @@ impl Boundary {
             "super::keepalive::elapsed_since_at",
             "super::keepalive::is_dead_socket_at",
             "crate::time::Instant",
+            "crate::protocol::reconnect::backoff_delay",
+            "crate::protocol::reconnect::fibonacci_base_millis",
+            "crate::protocol::reconnect::next_backoff_attempt",
+            "crate::protocol::reconnect::should_reset_backoff",
+            "crate::protocol::retry::should_drop_unknown_device_retry",
+            "crate::request::pending::PendingRequests",
+            "super::lifecycle::AttemptTicket",
+            "super::lifecycle::AuthenticationTicket",
+            "super::lifecycle::BackoffRequest",
+            "super::lifecycle::CleanupTicket",
+            "super::lifecycle::WorkerGeneration",
+            "super::publication::CommittingSignal",
+            "super::publication::PreparedSignal",
+            "super::publication::SignalCommitOutcome",
+            "super::lifecycle::DriveKind",
+            "super::lifecycle::DriveLease",
+            "super::lifecycle::Lifecycle",
+            "super::lifecycle::LifecycleError",
+            "super::lifecycle::LifecycleSnapshot",
+            "super::lifecycle::NextConnection",
+            "super::lifecycle::TransportTicket",
             "crate::appstate::hash::HashState",
             "crate::appstate::keys::ExpandedAppStateKeys",
             "crate::appstate::processor::PatchProcessingResult",
@@ -177,6 +200,34 @@ impl Boundary {
     }
 }
 
+struct MatchesArguments {
+    value: Expr,
+    pattern: syn::Pat,
+    guard: Option<Expr>,
+}
+
+impl syn::parse::Parse for MatchesArguments {
+    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+        let value = input.parse()?;
+        input.parse::<syn::Token![,]>()?;
+        let pattern = syn::Pat::parse_multi_with_leading_vert(input)?;
+        let guard = if input.peek(syn::Token![if]) {
+            input.parse::<syn::Token![if]>()?;
+            Some(input.parse()?)
+        } else {
+            None
+        };
+        if input.peek(syn::Token![,]) {
+            input.parse::<syn::Token![,]>()?;
+        }
+        Ok(Self {
+            value,
+            pattern,
+            guard,
+        })
+    }
+}
+
 impl<'ast> Visit<'ast> for Boundary {
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
         self.check_path(
@@ -194,6 +245,19 @@ impl<'ast> Visit<'ast> for Boundary {
             && !mac.path.is_ident("assert_ne")
         {
             self.violations.push("unreviewed macro".into());
+        }
+        if mac.path.is_ident("matches") {
+            match syn::parse2::<MatchesArguments>(mac.tokens.clone()) {
+                Ok(arguments) => {
+                    self.visit_expr(&arguments.value);
+                    self.visit_pat(&arguments.pattern);
+                    if let Some(guard) = arguments.guard {
+                        self.visit_expr(&guard);
+                    }
+                }
+                Err(_) => self.violations.push("uninspectable match arguments".into()),
+            }
+            return;
         }
         let parser = Punctuated::<Expr, syn::Token![,]>::parse_terminated;
         match parser.parse2(mac.tokens.clone()) {
@@ -271,6 +335,26 @@ fn protocol_state_does_not_execute_io_or_read_global_time() {
             include_str!("../wacore/src/appstate_sync/preparation.rs"),
         ),
         ("history", include_str!("../src/history_sync/parse_job.rs")),
+        (
+            "session lifecycle",
+            include_str!("../wacore/src/session_engine/lifecycle.rs"),
+        ),
+        (
+            "session exchanges",
+            include_str!("../wacore/src/session_engine/exchange.rs"),
+        ),
+        (
+            "session retries",
+            include_str!("../wacore/src/session_engine/retry.rs"),
+        ),
+        (
+            "Signal publication",
+            include_str!("../wacore/src/session_engine/publication.rs"),
+        ),
+        (
+            "session simulator",
+            include_str!("../wacore/src/session_engine/simulator.rs"),
+        ),
     ] {
         assert_eq!(violations(source), Vec::<String>::new(), "{name}");
     }
@@ -305,4 +389,11 @@ fn guard_detects_aliased_clocks_and_runtime_dependencies() {
         assert!(!violations(source).is_empty(), "{source}");
     }
     assert!(violations("use crate::time::Instant; fn age(now: Instant, at: Instant) { now.saturating_duration_since(at); }").is_empty());
+}
+
+#[test]
+fn match_guards_are_parsed_without_hiding_clock_reads() {
+    assert!(violations("fn f(value: Option<u32>, limit: u32) { let _ = matches!(value, Some(n) if n < limit); }").is_empty());
+    assert!(!violations("fn f(value: Option<u32>) { let _ = matches!(value, Some(_) if std::time::Instant::now().elapsed().is_zero()); }").is_empty());
+    assert!(!violations("fn f() { let _ = matches!(crate::time::now_secs(), 0); }").is_empty());
 }

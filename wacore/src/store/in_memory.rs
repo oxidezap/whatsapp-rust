@@ -242,6 +242,8 @@ const MAX_MSG_SECRETS: usize = 8192;
 /// Thread-safe and runtime-agnostic (uses [`async_lock::Mutex`]).
 /// All data is ephemeral — it lives only as long as this struct.
 pub struct InMemoryBackend {
+    #[cfg(feature = "instance-clock")]
+    clock: Option<Arc<dyn crate::time::Clock>>,
     state: Mutex<InMemoryState>,
     next_device_id: AtomicI32,
     #[cfg(any(test, feature = "test-util"))]
@@ -286,6 +288,20 @@ pub struct InMemoryBackend {
 }
 
 impl InMemoryBackend {
+    #[cfg(feature = "instance-clock")]
+    pub fn with_clock(mut self, clock: Arc<dyn crate::time::Clock>) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
+    fn wall_time_secs(&self) -> i64 {
+        #[cfg(feature = "instance-clock")]
+        if let Some(clock) = &self.clock {
+            return clock.wall_time_millis() / 1000;
+        }
+        crate::time::now_secs()
+    }
+
     /// Report an error after the next conditional replacement became visible.
     #[cfg(any(test, feature = "test-util"))]
     pub fn fail_next_pending_replace_after_commit(&self) {
@@ -331,6 +347,8 @@ impl InMemoryBackend {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(InMemoryState::default()),
+            #[cfg(feature = "instance-clock")]
+            clock: None,
             #[cfg(any(test, feature = "test-util"))]
             fail_pending_delete: AtomicU32::new(0),
             #[cfg(any(test, feature = "test-util"))]
@@ -855,6 +873,11 @@ impl AppSyncStore for InMemoryBackend {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl ProtocolStore for InMemoryBackend {
+    #[cfg(feature = "instance-clock")]
+    fn clock(&self) -> Option<&Arc<dyn crate::time::Clock>> {
+        self.clock.as_ref()
+    }
+
     // --- Per-Device Sender Key Tracking ---
 
     async fn get_sender_key_devices(&self, group_jid: &str) -> Result<Vec<(String, bool)>> {
@@ -953,7 +976,7 @@ impl ProtocolStore for InMemoryBackend {
                 address: address.to_string(),
                 message_id: message_id.to_string(),
             },
-            (base_key.to_vec(), crate::time::now_secs()),
+            (base_key.to_vec(), self.wall_time_secs()),
         );
         Ok(())
     }
@@ -1147,7 +1170,7 @@ impl ProtocolStore for InMemoryBackend {
         message_id: &str,
         payload: &[u8],
     ) -> Result<()> {
-        let now = crate::time::now_secs();
+        let now = self.wall_time_secs();
         let mut s = self.state.lock().await;
 
         // Memory bound only: when the map hits the cap, drop the oldest entries
@@ -1240,7 +1263,7 @@ impl ProtocolStore for InMemoryBackend {
         id: &str,
         message: &[u8],
     ) -> Result<()> {
-        let now = crate::time::now_secs();
+        let now = self.wall_time_secs();
         self.state.lock().await.pending_inbound.insert(
             (chat.to_string(), sender.to_string(), id.to_string()),
             PendingInboundEntry {
@@ -1356,7 +1379,7 @@ impl ProtocolStore for InMemoryBackend {
             key,
             PendingInboundEntry {
                 bytes: replacement.bytes().to_vec(),
-                inserted_at: crate::time::now_secs(),
+                inserted_at: self.wall_time_secs(),
                 revision: Some(installed),
             },
         );
@@ -1606,7 +1629,14 @@ impl DeviceStore for InMemoryBackend {
         // Materialize a default Device so that `exists()` returns true after `create()`.
         let mut state = self.state.lock().await;
         if state.device.is_none() {
-            state.device = Some(Device::new());
+            #[cfg(feature = "instance-clock")]
+            let device = self
+                .clock
+                .as_ref()
+                .map_or_else(Device::new, |clock| Device::new_with_clock(clock.as_ref()));
+            #[cfg(not(feature = "instance-clock"))]
+            let device = Device::new();
+            state.device = Some(device);
         }
         Ok(id)
     }

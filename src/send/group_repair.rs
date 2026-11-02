@@ -457,7 +457,10 @@ impl Client {
         if participants.is_empty() {
             anyhow::bail!("group repair could not encrypt for any missed device");
         }
-        self.persist_signal_state_pre_wire().await?;
+        let participants =
+            wacore::session_engine::publication::PreparedSignal::new(participants).begin_commit();
+        let confirmation = self.confirm_signal_state_pre_wire().await?;
+        let participants = participants.confirm(confirmation).into_payload();
         // Discard ciphertext for accounts changed during encryption or flush.
         // Later changes cannot re-encrypt these bytes under a replacement key.
         let mut permitted = Vec::with_capacity(participants.len());

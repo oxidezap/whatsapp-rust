@@ -117,10 +117,7 @@ pub(crate) async fn handle_prekey_low(client: &Arc<Client>) {
             // Wait for offline delivery first (matches WA Web's waitForOfflineDeliveryEnd)
             client_clone.wait_for_offline_delivery_end().await;
 
-            if !client_clone
-                .is_logged_in
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
+            if !client_clone.is_logged_in() {
                 debug!("Pre-key upload skipped: disconnected during offline delivery wait");
                 return;
             }
@@ -693,7 +690,7 @@ pub(crate) async fn handle_account_sync_devices(
         .attrs()
         .optional_u64("t")
         .map(|v| v as i64)
-        .unwrap_or_else(wacore::time::now_secs);
+        .unwrap_or_else(|| client.runtime.wall_time_secs());
 
     // Preserve existing raw_id so account_sync doesn't erase it
     let existing_raw_id = client

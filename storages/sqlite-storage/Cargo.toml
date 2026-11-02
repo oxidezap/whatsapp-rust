@@ -15,6 +15,7 @@ description = "SQLite storage backend for whatsapp-rust"
 ignored = ["libsqlite3-sys", "sqlite-wasm-rs"]
 
 [features]
+instance-clock = ["wacore/instance-clock"]
 default = ["bundled-sqlite"]
 bundled-sqlite = ["libsqlite3-sys/bundled"]
 test-util = []

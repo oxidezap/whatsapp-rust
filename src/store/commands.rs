@@ -5,3 +5,11 @@ pub use wacore::store::commands::*;
 pub fn apply_command_to_device(device: &mut crate::store::Device, command: DeviceCommand) {
     wacore::store::commands::apply_command_to_device(&mut device.core, command);
 }
+
+pub fn apply_command_to_device_at(
+    device: &mut crate::store::Device,
+    command: DeviceCommand,
+    now_millis: i64,
+) {
+    wacore::store::commands::apply_command_to_device_at(&mut device.core, command, now_millis);
+}

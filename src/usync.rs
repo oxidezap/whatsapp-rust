@@ -499,7 +499,7 @@ impl Client {
             device_records.push(wacore::store::traits::DeviceListRecord {
                 user: std::sync::Arc::from(user_list.user.user.as_str()),
                 devices: devices.into_boxed_slice(),
-                timestamp: wacore::time::now_secs(),
+                timestamp: self.runtime.wall_time_secs(),
                 phash: user_list.phash.clone().map(Box::<str>::from),
                 raw_id,
             });

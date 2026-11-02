@@ -630,16 +630,22 @@ mod tests {
         // Item 3: a foreign backend cannot open a group call without the group inputs, so they ride
         // the spec rather than a separate `open` parameter. The roster carries a relay and the local
         // participant is connected, so `configure_group` accepts it and the engine reports a group.
-        let group = MediaGroupSpec::builder()
-            .call_creator(wacore_binary::Jid::new("1", wacore_binary::Server::Lid))
-            .self_jid(wacore_binary::Jid::new("1", wacore_binary::Server::Lid))
-            .initial_update(group_update())
-            .build();
-        let mut spec = spec();
-        spec.enable_media = true;
-        spec.group = Some(group);
-        let engine = build_engine(spec, tx_ids()).expect("a group spec builds a group engine");
-        assert!(engine.is_group());
+        for io in [MediaAudioIo::Encoded]
+            .into_iter()
+            .chain(cfg!(feature = "voip-mlow").then_some(MediaAudioIo::Pcm))
+        {
+            let group = MediaGroupSpec::builder()
+                .call_creator(wacore_binary::Jid::new("1", wacore_binary::Server::Lid))
+                .self_jid(wacore_binary::Jid::new("1", wacore_binary::Server::Lid))
+                .initial_update(group_update())
+                .build();
+            let mut spec = spec();
+            spec.enable_media = true;
+            spec.audio.io = io;
+            spec.group = Some(group);
+            let engine = build_engine(spec, tx_ids()).expect("a group spec builds a group engine");
+            assert!(engine.is_group());
+        }
     }
 
     fn group_update() -> wacore::types::group_call::GroupCallUpdate {
