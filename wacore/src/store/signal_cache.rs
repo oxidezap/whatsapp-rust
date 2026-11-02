@@ -1718,6 +1718,32 @@ impl SignalStoreCache {
         Ok(arc_data)
     }
 
+    /// Establish first-contact trust without replacing a concurrently learned
+    /// identity. Unlike a Signal identity rotation, bootstrap must fail closed
+    /// when another key is already known, including in the persisted store.
+    pub async fn put_identity_if_absent_or_equal(
+        &self,
+        address: &ProtocolAddress,
+        data: &[u8],
+        backend: &dyn SignalStore,
+    ) -> Result<bool> {
+        let mut state = self.identities.lock().await;
+        let previous = match state.cache.get(address.as_str()) {
+            Some(cached) => cached.clone(),
+            None => backend
+                .load_identity(address.as_str())
+                .await?
+                .map(Arc::from),
+        };
+        if previous.as_deref().is_some_and(|known| known != data) {
+            return Ok(false);
+        }
+        let _change = self.identity_write_change(&state, address, data);
+        state.put_dedup(address.as_str(), data);
+        state.evict_if_needed(self.max_entries);
+        Ok(true)
+    }
+
     pub async fn put_identity(&self, address: &ProtocolAddress, data: &[u8]) {
         let mut state = self.identities.lock().await;
         let _change = self.identity_write_change(&state, address, data);
@@ -7664,6 +7690,41 @@ mod identity_continuity_tests {
         assert_eq!(continuity.snapshot(), None);
         drop(continuity.changing(["second"]));
         assert_eq!(continuity.snapshot(), None);
+    }
+
+    #[tokio::test]
+    async fn first_contact_identity_insert_cannot_replace_concurrent_or_persisted_trust() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let address = ProtocolAddress::new("15550000002", 0.into());
+        let (first, second) = futures::join!(
+            cache.put_identity_if_absent_or_equal(&address, &[1; 32], &backend),
+            cache.put_identity_if_absent_or_equal(&address, &[2; 32], &backend),
+        );
+        let first = first.unwrap();
+        assert_ne!(first, second.unwrap());
+        let accepted = if first { [1; 32] } else { [2; 32] };
+        let rejected = if first { [2; 32] } else { [1; 32] };
+        cache.flush(&backend).await.unwrap();
+        let cold = SignalStoreCache::new();
+        assert!(
+            !cold
+                .put_identity_if_absent_or_equal(&address, &rejected, &backend)
+                .await
+                .unwrap()
+        );
+        assert!(
+            cold.put_identity_if_absent_or_equal(&address, &accepted, &backend)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            cold.get_identity(&address, &backend)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(accepted.as_slice())
+        );
     }
 
     #[tokio::test]

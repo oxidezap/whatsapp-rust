@@ -170,7 +170,33 @@ impl Client {
         let spec = spec.with_account_identities(account_identities);
 
         let mut outcome = self.execute(spec).await?;
-        // Extra primaries only authenticate trimmed companion certificates.
+        // Remember authenticated bootstrap primaries before discarding their
+        // bundles. No session lock is acquired here: the session engine already
+        // holds companion locks, and taking the primary lock could invert its
+        // lock ordering. The cache operation compares and inserts atomically.
+        let backend = self.persistence_manager.backend();
+        let mut learned_primary = false;
+        for (jid, bundle) in &outcome.bundles {
+            if jid.device == 0 && !jids.contains(jid) {
+                use wacore::types::jid::JidExt;
+                let identity = bundle.identity_key()?;
+                if !self
+                    .signal_cache
+                    .put_identity_if_absent_or_equal(
+                        &jid.to_protocol_address(),
+                        identity.public_key().public_key_bytes(),
+                        &*backend,
+                    )
+                    .await?
+                {
+                    anyhow::bail!("primary identity changed during companion bootstrap");
+                }
+                learned_primary = true;
+            }
+        }
+        if learned_primary {
+            self.flush_signal_cache_batch_safe().await?;
+        }
         // Keep the public fetch outcome scoped to the caller's requested devices.
         outcome.bundles.retain(|jid, _| jids.contains(jid));
         outcome.rejected.retain(|entry| jids.contains(&entry.jid));

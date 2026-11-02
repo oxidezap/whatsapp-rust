@@ -7414,6 +7414,39 @@ mod ensure_sessions_concurrency {
         crate::test_utils::answer_iq(&client, &id, &response).await;
         let result = task.await.unwrap().unwrap();
         assert!(result.bundles.contains_key(&companion));
+        assert_eq!(
+            client
+                .persistence_manager
+                .backend()
+                .load_identity(primary.to_protocol_address().as_str())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(keys.identity.public_key().public_key_bytes())
+        );
+        let next = primary.with_device(3);
+        let running = client.clone();
+        let task = tokio::spawn(async move { running.fetch_pre_keys(&[next], None).await });
+        let request = crate::test_utils::decode_sent_iq(&transport, 1).await;
+        let next_id = request
+            .get()
+            .attrs()
+            .optional_string("id")
+            .unwrap()
+            .into_owned();
+        let replacement = PeerKeys::generate();
+        crate::test_utils::answer_iq(
+            &client,
+            &next_id,
+            &replacement.bundle_response(&primary.with_device(3), &next_id, 3),
+        )
+        .await;
+        let second = task.await.unwrap().unwrap();
+        assert!(
+            second.bundles.is_empty(),
+            "a different primary key cannot authenticate a later companion"
+        );
+
         assert!(
             !result.bundles.contains_key(&primary),
             "bootstrap keys must not expand the requested outcome"
