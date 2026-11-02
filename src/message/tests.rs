@@ -16617,6 +16617,69 @@ mod pdo_alias_tests {
     }
 
     #[tokio::test]
+    async fn complete_publication_releases_owner_across_lookup_paths() {
+        for (admit_pdo, complete_pdo) in [(false, false), (true, false), (false, true)] {
+            let (client, _) = client().await;
+            let ordinary = info(Shape::Incoming);
+            let mut recovery = ordinary.clone();
+            let source = &mut Arc::make_mut(&mut recovery).source;
+            source.chat = PN.parse().unwrap();
+            source.sender = source.chat.clone();
+            source.sender_alt = None;
+            let admitted = if admit_pdo { &recovery } else { &ordinary };
+            let completed = if complete_pdo { &recovery } else { &ordinary };
+            let fingerprint = [0x46; 16];
+            let mut publication = PublicationGuard::default();
+            assert!(!client.admit_message_dispatch(
+                admitted,
+                admit_pdo,
+                Some(fingerprint),
+                true,
+                &mut publication,
+            ));
+            let owner = Arc::downgrade(&publication.owner());
+            let admitted_key = Client::dispatch_key(admitted);
+            let completed_key = Client::dispatch_key(completed);
+            assert_eq!(admitted_key == completed_key, !admit_pdo && !complete_pdo);
+            client.dispatched_messages.with_metadata(|cache| {
+                if admitted_key != completed_key {
+                    assert!(cache.get_mut(&completed_key).is_none());
+                }
+                let claim = cache.get_mut(&admitted_key).unwrap();
+                if complete_pdo {
+                    assert_eq!(claim.alias, Some(completed_key));
+                } else if admit_pdo {
+                    assert_eq!(
+                        completed.source.sender_alt.as_ref(),
+                        Some(&admitted.source.chat)
+                    );
+                }
+            });
+            assert!(owner.upgrade().is_some());
+            client.complete_dispatch_publication(publication, [completed], complete_pdo);
+            assert!(owner.upgrade().is_none());
+            client.dispatched_messages.with_metadata(|cache| {
+                let claim = cache.get_mut(&admitted_key).unwrap();
+                assert_eq!(claim.payloads.len(), 1);
+                assert!(matches!(
+                    claim.payloads[0].publication,
+                    CachedPublication::Complete
+                ));
+                assert!(claim.payloads[0].hook_committed);
+            });
+            let mut replay = PublicationGuard::default();
+            assert!(client.admit_message_dispatch(
+                admitted,
+                true,
+                Some(fingerprint),
+                true,
+                &mut replay,
+            ));
+            assert!(replay.owner.is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn pdo_publication_committed_ordinary_part_keeps_distinct_recovery() {
         for alias in [false, true] {
             let (client, events) = client().await;
