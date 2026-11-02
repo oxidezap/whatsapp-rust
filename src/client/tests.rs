@@ -7290,20 +7290,20 @@ mod ensure_sessions_concurrency {
         }
 
         fn certificate(&self) -> Vec<u8> {
-            use buffa::Message;
             let pair = KeyPair::new(
                 *self.identity.identity_key().public_key(),
                 self.identity.private_key().clone(),
             );
-            wacore::adv::test_util::signed_identity(
-                &pair,
-                &pair,
-                b"\x18\x01",
-                &[6, 0],
-                Some(&[6, 1]),
-                true,
+            waproto::codec::adv_signed_device_identity_to_vec(
+                &wacore::adv::test_util::signed_identity(
+                    &pair,
+                    &pair,
+                    b"\x18\x01",
+                    &[6, 0],
+                    Some(&[6, 1]),
+                    true,
+                ),
             )
-            .encode_to_vec()
         }
 
         /// A `<user>` bundle response. The one-time prekey id varies per call,
@@ -7359,7 +7359,6 @@ mod ensure_sessions_concurrency {
 
     #[tokio::test]
     async fn cold_companion_only_fetch_authenticates_trimmed_certificate() {
-        use buffa::Message;
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
         let primary = Jid::pn("12025550128");
         let companion = primary.with_device(2);
@@ -7398,7 +7397,7 @@ mod ensure_sessions_concurrency {
                 .find(|node| node.tag == "device-identity")
                 .unwrap()
                 .content = Some(wacore_binary::NodeContent::Bytes(
-                certificate.encode_to_vec(),
+                waproto::codec::adv_signed_device_identity_to_vec(&certificate),
             ));
         }
         let primary_user = keys.bundle_response(&primary, &id, 2).children().unwrap()[0]

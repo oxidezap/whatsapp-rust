@@ -26,7 +26,6 @@ pub(crate) async fn seed_adv_primary(client: &Client, user: &Jid) {
 
 #[cfg(test)]
 pub(crate) fn sign_adv_key_index(details: Vec<u8>) -> Vec<u8> {
-    use buffa::Message;
     let mut signed = waproto::whatsapp::ADVSignedKeyIndexList::default();
     signed.account_signature = Some(
         adv_test_account()
@@ -39,7 +38,7 @@ pub(crate) fn sign_adv_key_index(details: Vec<u8>) -> Vec<u8> {
             .to_vec(),
     );
     signed.details = Some(details);
-    signed.encode_to_vec()
+    waproto::codec::adv_signed_key_index_list_to_vec(&signed)
 }
 
 #[cfg(test)]

@@ -2902,7 +2902,6 @@ mod tests {
 #[cfg(test)]
 mod adv_tests {
     use super::*;
-    use buffa::Message;
 
     #[tokio::test]
     async fn incoming_companions_require_adv_before_trusting_a_new_identity() {
@@ -2919,15 +2918,16 @@ mod adv_tests {
                 .await
                 .is_err()
         );
-        let certificate = wacore::adv::test_util::signed_identity(
-            crate::test_utils::adv_test_account(),
-            &device,
-            b"\x18\x07",
-            &[6, 0],
-            Some(&[6, 1]),
-            true,
-        )
-        .encode_to_vec();
+        let certificate = waproto::codec::adv_signed_device_identity_to_vec(
+            &wacore::adv::test_util::signed_identity(
+                crate::test_utils::adv_test_account(),
+                &device,
+                b"\x18\x07",
+                &[6, 0],
+                Some(&[6, 1]),
+                true,
+            ),
+        );
         assert!(
             client
                 .validate_incoming_companion_identity(&sender, Some(&certificate), &identity)
