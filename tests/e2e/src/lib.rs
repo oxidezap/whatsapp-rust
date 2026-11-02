@@ -24,6 +24,16 @@ pub fn mock_server_url() -> String {
     std::env::var("MOCK_SERVER_URL").unwrap_or_else(|_| "wss://127.0.0.1:8080/ws/chat".to_string())
 }
 
+fn mock_server_authority() -> String {
+    let ws = mock_server_url();
+    let after_scheme = ws.split("://").nth(1).unwrap_or(&ws);
+    after_scheme
+        .split('/')
+        .next()
+        .unwrap_or(after_scheme)
+        .to_owned()
+}
+
 /// Translate the `MOCK_SERVER_URL` (a `ws[s]://host:port/ws/chat` WebSocket
 /// URL) to the matching admin HTTP URL for the QR-scan endpoint exposed by
 /// bartender. Same host/port, scheme `ws`→`http` / `wss`→`https`, path
@@ -35,8 +45,7 @@ fn mock_admin_scan_qr_url() -> String {
     } else {
         "http://"
     };
-    let after_scheme = ws.split("://").nth(1).unwrap_or(&ws);
-    let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
+    let host_port = mock_server_authority();
     format!("{http_scheme}{host_port}/admin/mock-phone/scan-qr")
 }
 
@@ -202,6 +211,15 @@ impl TestClient {
                 whatsapp_rust::handshake::NoiseCertPolicy::DangerSkipCertChainVerify,
             )
             .with_version((2, 3000, 0));
+
+        // The mock's static media shares this explicitly configured endpoint.
+        // This authorizes only its exact HTTPS authority, leaving TLS policy
+        // in the test transport and keeping production defaults unchanged.
+        let mut options = builder.client_options().clone();
+        options.additional_static_media_hosts = vec![whatsapp_rust::download::MediaHost::new(
+            mock_server_authority(),
+        )];
+        builder = builder.with_client_options(options);
 
         let push_name_pre_seeded = push_name.is_some();
         if let Some(name) = push_name {

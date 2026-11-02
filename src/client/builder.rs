@@ -808,7 +808,9 @@ impl ClientBuilder {
                 #[cfg(feature = "plugins")]
                 plugin_host,
                 noise_cert_policy: options.noise_cert_policy,
-                additional_static_media_hosts: options.additional_static_media_hosts,
+                additional_static_media_hosts: options
+                    .additional_static_media_hosts
+                    .into_boxed_slice(),
                 ..self
                     .extensions
                     .map(|extensions| *extensions)
@@ -1108,7 +1110,7 @@ pub(super) struct ClientExtensions {
     #[cfg(feature = "plugins")]
     pub(super) plugin_host: Option<Arc<PluginHost>>,
     pub(super) noise_cert_policy: NoiseCertPolicy,
-    pub(super) additional_static_media_hosts: Vec<wacore::download::MediaHost>,
+    pub(super) additional_static_media_hosts: Box<[wacore::download::MediaHost]>,
     pub(super) history_sync_admission: Option<Arc<dyn HistorySyncAdmission>>,
     pub(super) connect_admission: Option<Arc<dyn ConnectAdmission>>,
 }

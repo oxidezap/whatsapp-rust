@@ -164,6 +164,7 @@ impl EncPayload {
 /// Parsed and classified message ready for decryption. All data is owned --
 /// the original node tree is no longer borrowed.
 pub(crate) struct ClassifiedMessage {
+    pub device_identity: Option<bytes::Bytes>,
     pub info: Arc<MessageInfo>,
     pub sender_encryption_jid: Jid,
     pub session_payloads: Vec<EncPayload>,

@@ -149,6 +149,41 @@ fn defer_plaintext(
 }
 
 impl Client {
+    async fn validate_incoming_companion_identity(
+        &self,
+        sender: &Jid,
+        certificate: Option<&[u8]>,
+        identity: &[u8; 32],
+    ) -> anyhow::Result<()> {
+        let address = sender.to_protocol_address();
+        let backend = self
+            .persistence_manager
+            .get_device_snapshot()
+            .backend
+            .clone();
+        if self
+            .signal_cache
+            .get_identity(&address, &*backend)
+            .await?
+            .is_some_and(|known| known.as_ref() == identity)
+        {
+            return Ok(());
+        }
+        let certificate = certificate
+            .ok_or_else(|| anyhow::anyhow!("companion message omits ADV certificate"))?;
+        let primary = self.ensure_adv_account_identity(sender).await?;
+        if wacore::adv::validate_adv_with_identity_key(
+            certificate,
+            identity,
+            Some(&primary),
+            sender,
+        ) != wacore::adv::AdvValidation::Valid
+        {
+            anyhow::bail!("companion message ADV validation failed");
+        }
+        Ok(())
+    }
+
     #[inline(never)]
     pub(super) fn stage_retained_plaintext(
         &self,
@@ -289,7 +324,6 @@ impl Client {
             .await;
         }
         let sender_encryption_jid = self.resolve_encryption_jid(&info.source.sender).await;
-
         let ack_recipient = if info.source.recipient.is_none() {
             nr.attrs().optional_jid("recipient")
         } else {
@@ -523,6 +557,10 @@ impl Client {
         }
 
         Some(ClassifiedMessage {
+            device_identity: nr
+                .get_optional_child("device-identity")
+                .and_then(NodeRef::content_bytes)
+                .map(|bytes| node.slice_bytes(bytes)),
             info,
             sender_encryption_jid,
             session_payloads,
@@ -549,6 +587,7 @@ impl Client {
         lane_generation: u64,
     ) {
         let ClassifiedMessage {
+            device_identity,
             info,
             sender_encryption_jid,
             session_payloads,
@@ -595,6 +634,37 @@ impl Client {
                 );
             }
             return;
+        }
+
+        if sender_encryption_jid.device != 0 {
+            for payload in &session_payloads {
+                if payload.enc_type != EncType::PreKeyMessage {
+                    continue;
+                }
+                let Ok(message) = PreKeySignalMessage::try_from(payload.ciphertext.clone()) else {
+                    continue;
+                };
+                let Ok(identity) =
+                    <[u8; 32]>::try_from(message.identity_key().public_key().public_key_bytes())
+                else {
+                    return;
+                };
+                drop(message);
+                if self
+                    .validate_incoming_companion_identity(
+                        &sender_encryption_jid,
+                        device_identity.as_deref(),
+                        &identity,
+                    )
+                    .await
+                    .is_err()
+                {
+                    log::warn!(
+                        "Dropping companion prekey message with an unverifiable ADV identity"
+                    );
+                    return;
+                }
+            }
         }
 
         let stanza_origin = raw_pending::StanzaOrigin::new();
@@ -2389,10 +2459,13 @@ impl Client {
         // history, so honour it only from self. WA Web
         // `WAWebHandleHistorySyncNotification` gates on `isMePrimaryNonLid`.
         if let Some(history_sync) = history_sync_taken {
-            if info.source.is_from_me && self.history_sync_durability_hook.get().is_none() {
+            if info.source.is_from_me
+                && info.source.sender.device == 0
+                && self.history_sync_durability_hook.get().is_none()
+            {
                 self.handle_history_sync(info.id.to_string(), history_sync)
                     .await;
-            } else if !info.source.is_from_me {
+            } else if !info.source.is_from_me || info.source.sender.device != 0 {
                 warn!(
                     "[msg:{}] Dropping history_sync_notification from non-self sender {}",
                     info.id,
@@ -2821,5 +2894,68 @@ mod tests {
 
         let pending = client.pending_device_sync.take_all();
         assert_eq!(pending, vec![user]);
+    }
+}
+
+#[cfg(test)]
+mod adv_tests {
+    use super::*;
+    use buffa::Message;
+
+    #[tokio::test]
+    async fn incoming_companions_require_adv_before_trusting_a_new_identity() {
+        let client = crate::test_utils::create_test_client().await;
+        let sender = Jid::pn_device("12025550127", 7);
+        crate::test_utils::seed_adv_primary(&client, &sender).await;
+        let device = wacore::libsignal::protocol::KeyPair::generate(&mut rand::make_rng::<
+            rand::rngs::StdRng,
+        >());
+        let identity: [u8; 32] = device.public_key.public_key_bytes().try_into().unwrap();
+        assert!(
+            client
+                .validate_incoming_companion_identity(&sender, None, &identity)
+                .await
+                .is_err()
+        );
+        let certificate = wacore::adv::test_util::signed_identity(
+            crate::test_utils::adv_test_account(),
+            &device,
+            b"\x18\x07",
+            &[6, 0],
+            Some(&[6, 1]),
+            true,
+        )
+        .encode_to_vec();
+        assert!(
+            client
+                .validate_incoming_companion_identity(&sender, Some(&certificate), &identity)
+                .await
+                .is_ok()
+        );
+        assert!(
+            client
+                .validate_incoming_companion_identity(&sender, Some(&certificate), &[0; 32])
+                .await
+                .is_err()
+        );
+        client
+            .signal_cache
+            .put_identity(&sender.to_protocol_address(), &identity)
+            .await;
+        assert!(
+            client
+                .validate_incoming_companion_identity(&sender, None, &identity)
+                .await
+                .is_ok()
+        );
+        client.delete_sessions_for_devices(&sender.user, &[7]).await;
+        assert!(
+            client
+                .validate_incoming_companion_identity(&sender, None, &identity)
+                .await
+                .is_err(),
+            "revoked device identities must not retain the known-key shortcut"
+        );
+        client.signal_shutdown_sync();
     }
 }

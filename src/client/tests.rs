@@ -3879,6 +3879,9 @@ fn client_size_pins_runtime_cache_config_saving() {
         expected += size_of::<Option<Arc<dyn wacore::time::Clock>>>();
     }
 
+    // The static-media allowlist is an empty boxed slice by default. Its two
+    // inline words are independent of feature-sensitive cache attachments.
+    expected += size_of::<Box<[wacore::download::MediaHost]>>();
     let retry_slot = size_of::<Option<Arc<dyn crate::RetryAdmission>>>();
     let decrypt_slot = size_of::<Option<Arc<dyn crate::DecryptFailureAdmission>>>();
     let handler_slot = size_of::<Option<HashMap<String, Arc<dyn EncHandler>>>>();

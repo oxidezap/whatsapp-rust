@@ -159,7 +159,7 @@ impl Client {
         // primary identity the client already stores. Without it we'd reject the
         // bundle and the device would stop receiving (WA Web uses the same stored
         // identity as the fallback in validateADVwithIdentityKey).
-        let spec = spec.with_account_identities(self.collect_account_identities(jids).await);
+        let spec = spec.with_account_identities(self.collect_account_identities(jids).await?);
 
         let outcome = self.execute(spec).await?;
 
@@ -170,59 +170,105 @@ impl Client {
         Ok(outcome)
     }
 
+    /// Read trust without requesting network data. Notification handling runs
+    /// on the read loop and must never wait for an IQ response of its own.
+    pub(crate) async fn cached_adv_account_identity(
+        &self,
+        jid: &Jid,
+    ) -> anyhow::Result<Option<[u8; 32]>> {
+        use wacore::types::jid::JidExt;
+        let primary = jid.with_device(0);
+        let backend = self.persistence_manager.backend();
+        if let Some(identity) = self
+            .signal_cache
+            .get_identity(&primary.to_protocol_address(), &*backend)
+            .await?
+        {
+            return Ok(Some(identity.as_ref().try_into().map_err(|_| {
+                anyhow::anyhow!("invalid stored primary identity")
+            })?));
+        }
+        let snapshot = self.persistence_manager.get_device_snapshot();
+        let is_self = [snapshot.pn.as_ref(), snapshot.lid.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|own| own.user == primary.user && own.server == primary.server);
+        if is_self
+            && let Some(key) = snapshot
+                .account
+                .as_ref()
+                .and_then(|account| account.account_signature_key.as_deref())
+        {
+            return Ok(Some(key.try_into().map_err(|_| {
+                anyhow::anyhow!("invalid paired primary identity")
+            })?));
+        }
+        Ok(None)
+    }
+
+    /// Establish the primary identity before trusting any companion metadata.
+    /// First contact uses the primary's signed prekey, just as a direct primary
+    /// session does. Device-list blobs never rotate an already stored identity.
+    pub(crate) async fn ensure_adv_account_identity(&self, jid: &Jid) -> anyhow::Result<[u8; 32]> {
+        use wacore::libsignal::protocol::IdentityKeyStore;
+        use wacore::types::jid::JidExt;
+        let primary = jid.with_device(0);
+        let address = primary.to_protocol_address();
+        let lock = self.session_lock_for(address.as_str()).await;
+        let _guard = lock.lock().await;
+        if let Some(identity) = self.cached_adv_account_identity(jid).await? {
+            return Ok(identity);
+        }
+        let identity = {
+            let response = self
+                .execute(PreKeyFetchSpec::new(vec![primary.clone()]))
+                .await?;
+            let bundle = response.bundles.get(&primary).ok_or_else(|| {
+                anyhow::anyhow!("primary identity unavailable for ADV verification")
+            })?;
+            let identity = *bundle.identity_key()?;
+            let signature: &[u8; 64] = bundle
+                .signed_pre_key_signature()?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid primary signed prekey signature length"))?;
+            if !identity
+                .public_key()
+                .verify_signature(&bundle.signed_pre_key_public()?.serialize(), signature)
+            {
+                anyhow::bail!("invalid primary signed prekey signature");
+            }
+            identity
+        };
+        let key: [u8; 32] = identity.public_key().public_key_bytes().try_into()?;
+        let mut adapter = self.signal_adapter();
+        adapter
+            .identity_store
+            .save_identity(&address, &identity)
+            .await?;
+        self.flush_signal_cache().await?;
+        Ok(key)
+    }
+
     /// Load, for each companion JID, its account (device 0) identity key from the
     /// store, keyed by the normalized companion JID so the prekey parser can use
-    /// it as the ADV `account_signature_key` fallback. Missing entries are simply
-    /// absent (no fallback for that JID).
+    /// it as the ADV account anchor. Missing primaries are authenticated first.
     async fn collect_account_identities(
         &self,
         jids: &[Jid],
-    ) -> std::collections::HashMap<Jid, [u8; 32]> {
-        use futures::StreamExt;
-        // Fan out the per-companion identity loads (independent cache/DB reads) —
-        // the keyless-companion set can be large on a cold group send. Owned Vec so
-        // the stream doesn't borrow `jids` through buffer_unordered (Send bound).
-        const COMPANION_IDENTITY_LOAD_CONCURRENCY: usize = 16;
+    ) -> anyhow::Result<std::collections::HashMap<Jid, [u8; 32]>> {
+        use futures::{StreamExt, TryStreamExt};
         let companions: Vec<Jid> = jids.iter().filter(|j| j.device != 0).cloned().collect();
         futures::stream::iter(companions)
-            .map(|jid| async move { self.load_account_identity(&jid).await.map(|id| (jid, id)) })
-            .buffer_unordered(COMPANION_IDENTITY_LOAD_CONCURRENCY)
-            .filter_map(|entry| async move { entry })
-            .collect()
+            .map(|jid| async move {
+                Ok(self
+                    .cached_adv_account_identity(&jid)
+                    .await?
+                    .map(|identity| (jid, identity)))
+            })
+            .buffer_unordered(16)
+            .try_filter_map(|entry| async move { Ok(entry) })
+            .try_collect()
             .await
-    }
-
-    /// Load a companion's account (device 0) identity from the store, for use as
-    /// the ADV `account_signature_key` fallback (WA Web `validateADVwithIdentityKey`
-    /// loads the same stored identity). Reads through the signal cache so an
-    /// identity established earlier this session (not yet flushed) is still found.
-    /// `None` when not stored.
-    pub(crate) async fn load_account_identity(&self, companion_jid: &Jid) -> Option<[u8; 32]> {
-        use wacore::types::jid::JidExt;
-
-        let account_jid = companion_jid.with_device(0);
-        let addr = account_jid.to_protocol_address();
-        let backend = self
-            .persistence_manager
-            .get_device_snapshot()
-            .backend
-            .clone();
-        match self.signal_cache.get_identity(&addr, &*backend).await {
-            Ok(Some(id)) if id.len() == 32 => {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&id);
-                Some(arr)
-            }
-            Ok(_) => None,
-            Err(e) => {
-                log::debug!(
-                    "ADV fallback: failed to load account identity for {}: {}",
-                    account_jid.observe(),
-                    e
-                );
-                None
-            }
-        }
     }
 
     /// Query the WhatsApp server for how many pre-keys it currently has for this device.
@@ -1000,6 +1046,149 @@ mod tests {
         DEFAULT_WANTED_PRE_KEY_COUNT, MAX_PRE_KEY_UPLOAD_BATCH, MAX_PREKEY_ID, MIN_PRE_KEY_COUNT,
         clamp_wanted_pre_key_count, plan_prekey_upload, should_upload_pre_keys, start_prekey_id,
     };
+
+    #[tokio::test]
+    async fn adv_bootstrap_authenticates_primary_prekeys_before_persisting_trust() {
+        use wacore::iq::prekeys::PreKeyBundleUserNode;
+        use wacore::libsignal::protocol::{IdentityKey, KeyPair, PreKeyBundle};
+        use wacore::protocol::ProtocolNode;
+        use wacore::types::jid::JidExt;
+        use wacore_binary::{Jid, builder::NodeBuilder};
+        for valid in [false, true] {
+            let (client, transport) = crate::test_utils::create_iq_test_client().await;
+            let primary = Jid::pn("12025550124");
+            let companion = primary.with_device(7);
+            let running = client.clone();
+            let task =
+                tokio::spawn(async move { running.ensure_adv_account_identity(&companion).await });
+            let request = crate::test_utils::decode_sent_iq(&transport, 0).await;
+            let id = request
+                .get()
+                .attrs()
+                .optional_string("id")
+                .unwrap()
+                .into_owned();
+            assert_eq!(
+                request
+                    .get()
+                    .get_optional_child("key")
+                    .unwrap()
+                    .get_optional_child("user")
+                    .unwrap()
+                    .attrs()
+                    .optional_jid("jid"),
+                Some(primary.clone())
+            );
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let account = KeyPair::generate(&mut rng);
+            let prekey = KeyPair::generate(&mut rng);
+            let mut signature = account
+                .private_key
+                .calculate_signature(&prekey.public_key.serialize(), &mut rng)
+                .unwrap()
+                .to_vec();
+            if !valid {
+                signature[0] ^= 1;
+            }
+            let bundle = PreKeyBundle::new(
+                1,
+                0u32.into(),
+                None,
+                1u32.into(),
+                prekey.public_key,
+                signature,
+                IdentityKey::new(account.public_key),
+            )
+            .unwrap();
+            let user = PreKeyBundleUserNode::from_bundle(primary.clone(), &bundle, None)
+                .unwrap()
+                .into_node();
+            let response = NodeBuilder::new("iq")
+                .attr("id", id.as_str())
+                .attr("type", "result")
+                .children([NodeBuilder::new("list").children([user]).build()])
+                .build();
+            crate::test_utils::answer_iq(&client, &id, &response).await;
+            let result = task.await.unwrap();
+            assert_eq!(result.is_ok(), valid);
+            let backend = client.persistence_manager.backend();
+            let persisted = backend
+                .load_identity(&primary.to_protocol_address().to_string())
+                .await
+                .unwrap();
+            if valid {
+                let key: [u8; 32] = account.public_key.public_key_bytes().try_into().unwrap();
+                assert_eq!(result.unwrap(), key);
+                assert_eq!(persisted, Some(key));
+                assert_eq!(
+                    client
+                        .ensure_adv_account_identity(&primary.with_device(9))
+                        .await
+                        .unwrap(),
+                    key
+                );
+                assert_eq!(
+                    transport.sent_count(),
+                    1,
+                    "warm trust must not fetch another primary bundle"
+                );
+            } else {
+                assert!(
+                    persisted.is_none(),
+                    "invalid signatures must not establish trust"
+                );
+            }
+            client.signal_shutdown_sync();
+        }
+    }
+
+    #[tokio::test]
+    async fn adv_uses_paired_primary_and_observes_signal_identity_rotation() {
+        use wacore::libsignal::protocol::{IdentityKey, IdentityKeyStore, KeyPair};
+        use wacore::store::commands::DeviceCommand;
+        use wacore::types::jid::JidExt;
+        use wacore_binary::Jid;
+        let client = crate::test_utils::create_test_client().await;
+        let own = Jid::pn("12025550125");
+        let account = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let mut certificate = waproto::whatsapp::ADVSignedDeviceIdentity::default();
+        certificate.account_signature_key = Some(account.public_key.public_key_bytes().to_vec());
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetId(Some(own.with_device(1))))
+            .await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetAccount(Some(certificate)))
+            .await;
+        let key: [u8; 32] = account.public_key.public_key_bytes().try_into().unwrap();
+        assert_eq!(
+            client
+                .ensure_adv_account_identity(&own.with_device(7))
+                .await
+                .unwrap(),
+            key
+        );
+        let replacement = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let mut adapter = client.signal_adapter();
+        adapter
+            .identity_store
+            .save_identity(
+                &own.to_protocol_address(),
+                &IdentityKey::new(replacement.public_key),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .ensure_adv_account_identity(&own.with_device(7))
+                .await
+                .unwrap()
+                .as_slice(),
+            replacement.public_key.public_key_bytes()
+        );
+        client.signal_shutdown_sync();
+    }
 
     #[test]
     fn plan_initialises_window_for_legacy_device() {

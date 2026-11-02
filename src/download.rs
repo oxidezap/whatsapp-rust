@@ -1171,7 +1171,7 @@ impl Client {
             source,
         };
         let route = if downloadable.static_url().is_some() {
-            MediaRoute::new(self.additional_static_media_hosts.clone())
+            MediaRoute::new(self.additional_static_media_hosts.to_vec())
         } else if !force_refresh
             && let Some(route) = self.cached_download_route().await.map_err(session_error)?
         {
