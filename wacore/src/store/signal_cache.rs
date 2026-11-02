@@ -1746,7 +1746,15 @@ impl SignalStoreCache {
         if previous.as_deref().is_some_and(|known| known != data) {
             return Ok(false);
         }
-        backend.put_identity(address.as_str(), key).await?;
+        if let Err(error) = backend.put_identity(address.as_str(), key).await {
+            // A host may report failure after committing. Do not retain a
+            // negative cache entry that could permit a different bootstrap key
+            // to overwrite that uncertain write on the next attempt.
+            if previous.is_none() {
+                state.cache.remove(address.as_str());
+            }
+            return Err(error.into());
+        }
         let _change = self.identity_write_change(&state, address, data);
         state.put_dedup(address.as_str(), data);
         state.dirty.remove(address.as_str());
@@ -6222,6 +6230,7 @@ mod cold_read_race_tests {
         reads: AtomicUsize,
         session: SyncMutex<Option<Vec<u8>>>,
         identity: SyncMutex<Option<[u8; 32]>>,
+        fail_identity_after_write: AtomicBool,
     }
 
     impl GatedColdRead {
@@ -6233,6 +6242,7 @@ mod cold_read_race_tests {
                 reads: AtomicUsize::new(0),
                 session: SyncMutex::new(None),
                 identity: SyncMutex::new(None),
+                fail_identity_after_write: AtomicBool::new(false),
             }
         }
 
@@ -6281,6 +6291,11 @@ mod cold_read_race_tests {
 
         async fn put_identity(&self, _: &str, key: [u8; 32]) -> StoreResult<()> {
             *self.identity.lock().unwrap_or_else(|p| p.into_inner()) = Some(key);
+            if self.fail_identity_after_write.load(Ordering::Relaxed) {
+                return Err(
+                    std::io::Error::other("synthetic failure after identity commit").into(),
+                );
+            }
             Ok(())
         }
 
@@ -6325,6 +6340,42 @@ mod cold_read_race_tests {
         async fn delete_sender_key(&self, _: &str) -> StoreResult<()> {
             unreachable!()
         }
+    }
+
+    #[tokio::test]
+    async fn uncertain_bootstrap_write_cannot_be_replaced_through_negative_cache() {
+        let backend = GatedColdRead::new(0);
+        let cache = SignalStoreCache::new();
+        let address = ProtocolAddress::new("15550000003", 0.into());
+        assert!(
+            cache
+                .get_identity(&address, &backend)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        backend
+            .fail_identity_after_write
+            .store(true, Ordering::Relaxed);
+        assert!(
+            cache
+                .persist_identity_if_absent_or_equal(&address, &[1; 32], &backend)
+                .await
+                .is_err()
+        );
+        backend
+            .fail_identity_after_write
+            .store(false, Ordering::Relaxed);
+        assert!(
+            !cache
+                .persist_identity_if_absent_or_equal(&address, &[2; 32], &backend)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            backend.load_identity(address.as_str()).await.unwrap(),
+            Some([1; 32])
+        );
     }
 
     fn session_at_index(index: u32) -> SessionRecord {
