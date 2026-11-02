@@ -90,7 +90,7 @@ pub enum SignalProtocolError {
     #[error("MAC verification failed for {0:?} message")]
     BadMac(CiphertextMessageType),
 
-    #[error("error while invoking an ffi callback: {0}")]
+    #[error("error while invoking an ffi callback (detail bytes={})", .0.len())]
     FfiBindingError(String),
     #[error("error in application callback method '{0}'")]
     ApplicationCallbackError(
@@ -98,7 +98,7 @@ pub enum SignalProtocolError {
         #[source] Box<dyn std::error::Error + Send + Sync + UnwindSafe + 'static>,
     ),
 
-    #[error("invalid sealed sender message: {0}")]
+    #[error("invalid sealed sender message (detail bytes={})", .0.len())]
     InvalidSealedSenderMessage(String),
     #[error("unknown sealed sender message version {0}")]
     UnknownSealedSenderVersion(u8),
@@ -210,6 +210,22 @@ mod tests {
                 assert!(output.contains("peer#"));
                 assert!(output.contains(".7"));
                 assert!(!output.contains("19990000001"));
+            }
+        }
+        for error in [
+            SignalProtocolError::FfiBindingError("synthetic-private-key-bytes".into()),
+            SignalProtocolError::InvalidSealedSenderMessage("synthetic-private-key-bytes".into()),
+        ] {
+            for output in [error.to_string(), format!("{error:#?}")] {
+                assert!(!output.contains("synthetic-private-key-bytes"));
+                assert!(output.contains("detail bytes="));
+            }
+            match error {
+                SignalProtocolError::FfiBindingError(text)
+                | SignalProtocolError::InvalidSealedSenderMessage(text) => {
+                    assert_eq!(text, "synthetic-private-key-bytes");
+                }
+                _ => unreachable!("fixture uses string-bearing external errors"),
             }
         }
         let error = SignalProtocolError::BackendError(

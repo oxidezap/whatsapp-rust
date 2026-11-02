@@ -315,6 +315,39 @@ mod tests {
 
     #[test]
     fn nested_errors_preserve_classification_without_untrusted_text() {
+        if log_capture::delegated_to_child(
+            "logging::tests::nested_errors_preserve_classification_without_untrusted_text",
+        ) {
+            return;
+        }
+        let capture = log_capture::session();
+        use wacore::libsignal::protocol::SignalProtocolError;
+        #[derive(Debug, thiserror::Error)]
+        #[error("{0}")]
+        struct ExternalError(&'static str);
+        for error in [
+            SignalProtocolError::FfiBindingError("synthetic-external-key".into()),
+            SignalProtocolError::InvalidSealedSenderMessage("synthetic-external-key".into()),
+            SignalProtocolError::BackendError(
+                "load_session",
+                Box::new(ExternalError("synthetic-external-key")),
+            ),
+            SignalProtocolError::ApplicationCallbackError(
+                "decrypt",
+                Box::new(ExternalError("synthetic-external-key")),
+            ),
+        ] {
+            log::warn!(target: "whatsapp_rust::logging", "{error}");
+            log::debug!(target: "whatsapp_rust::logging", "{error:#?}");
+        }
+        let records = capture.records_for("whatsapp_rust::logging");
+        assert_eq!(records.len(), 8);
+        for (_, message) in &records {
+            assert!(!message.contains("synthetic-external-key"));
+        }
+        for context in ["ffi callback", "sealed sender", "load_session", "decrypt"] {
+            assert!(records.iter().any(|(_, message)| message.contains(context)));
+        }
         let io = std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "synthetic-private-path-key",
