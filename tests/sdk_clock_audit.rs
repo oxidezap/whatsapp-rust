@@ -44,7 +44,96 @@ struct Audit {
     calls: Vec<(String, String)>,
 }
 
+fn clock_function(name: &str) -> bool {
+    matches!(
+        name,
+        "elapsed"
+            | "now"
+            | "now_secs"
+            | "now_secs_u64"
+            | "now_millis"
+            | "now_utc"
+            | "from_secs_or_now"
+            | "from_millis_or_now"
+    )
+}
+
+impl Audit {
+    fn record(&mut self, call: String) {
+        self.calls.push((self.function.clone(), call));
+    }
+
+    fn inspect_use(&mut self, prefix: &mut Vec<String>, tree: &syn::UseTree) {
+        match tree {
+            syn::UseTree::Path(path) => {
+                prefix.push(path.ident.to_string());
+                self.inspect_use(prefix, &path.tree);
+                prefix.pop();
+            }
+            syn::UseTree::Group(group) => {
+                for item in &group.items {
+                    self.inspect_use(prefix, item);
+                }
+            }
+            syn::UseTree::Name(name) if clock_function(&name.ident.to_string()) => {
+                self.record(format!("import {}::{}", prefix.join("::"), name.ident));
+            }
+            syn::UseTree::Rename(name) if clock_function(&name.ident.to_string()) => {
+                self.record(format!("import {}::{}", prefix.join("::"), name.ident));
+            }
+            syn::UseTree::Glob(_) if prefix.last().is_some_and(|name| name == "time") => {
+                self.record(format!("clock glob {}::*", prefix.join("::")));
+            }
+            _ => {}
+        }
+    }
+
+    fn inspect_tokens(&mut self, mut cursor: syn::buffer::Cursor<'_>) {
+        let mut colons = 0;
+        let mut dot = false;
+        while !cursor.eof() {
+            if let Some((inside, _, _, next)) = cursor.any_group() {
+                self.inspect_tokens(inside);
+                cursor = next;
+                colons = 0;
+                dot = false;
+            } else if let Some((ident, next)) = cursor.ident() {
+                let name = ident.to_string();
+                if colons >= 2 && clock_function(&name) || dot && name == "elapsed" {
+                    self.record(format!("macro clock {name}"));
+                }
+                cursor = next;
+                colons = 0;
+                dot = false;
+            } else if let Some((punct, next)) = cursor.punct() {
+                colons = if punct.as_char() == ':' {
+                    colons + 1
+                } else {
+                    0
+                };
+                dot = punct.as_char() == '.';
+                cursor = next;
+            } else {
+                cursor = cursor.token_tree().expect("token before end").1;
+                colons = 0;
+                dot = false;
+            }
+        }
+    }
+}
+
 impl<'ast> Visit<'ast> for Audit {
+    fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+        if !fixture(&node.attrs) {
+            self.inspect_use(&mut Vec::new(), &node.tree);
+        }
+    }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        let buffer = syn::buffer::TokenBuffer::new2(mac.tokens.clone());
+        self.inspect_tokens(buffer.begin());
+    }
+
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
         if !fixture(&node.attrs) {
             syn::visit::visit_item_mod(self, node);
@@ -68,18 +157,7 @@ impl<'ast> Visit<'ast> for Audit {
     }
     fn visit_expr_path(&mut self, node: &'ast ExprPath) {
         let name = node.path.segments.last().unwrap().ident.to_string();
-        if node.path.segments.len() > 1
-            && ([
-                "now_secs",
-                "now_secs_u64",
-                "now_millis",
-                "now_utc",
-                "from_secs_or_now",
-                "from_millis_or_now",
-            ]
-            .contains(&name.as_str())
-                || name == "now")
-        {
+        if (node.path.segments.len() > 1 || node.qself.is_some()) && clock_function(&name) {
             self.calls.push((
                 self.function.clone(),
                 node.path
@@ -156,4 +234,28 @@ fn clock_audit_skips_fixtures_and_accepts_explicit_ports() {
     assert!(audit.calls.is_empty());
     audit.visit_file(&syn::parse_file("fn f() { let _ = wacore::time::now_secs(); }").unwrap());
     assert_eq!(audit.calls.len(), 1);
+}
+
+#[test]
+fn macro_and_import_bypasses_are_rejected() {
+    for source in [
+        r#"fn f() { log::debug!("{}", wacore::time::now_millis()); }"#,
+        r#"fn f() { let _ = format!("{}", std::time::Instant::now().elapsed().as_secs()); }"#,
+        "fn f(v: u32) { let _ = matches!(v, _ if wacore::time::now_secs() > 0); }",
+        "use wacore::time::now_secs; fn f() { now_secs(); }",
+        "use crate::time::now_millis as clock; fn f() { clock(); }",
+        "use wacore::time::*; fn f() { now_secs(); }",
+        "fn f(value: Instant) { let _ = Instant::elapsed(&value); }",
+        r#"fn f() { log::debug!(target: "test", "{}", <std::time::Instant>::now().elapsed().as_secs()); }"#,
+    ] {
+        let mut audit = Audit::default();
+        audit.visit_file(&syn::parse_file(source).unwrap());
+        assert!(
+            !audit.calls.is_empty(),
+            "ambient read escaped audit: {source}"
+        );
+    }
+    let mut audit = Audit::default();
+    audit.visit_file(&syn::parse_file(r#"fn f(rt: &dyn Runtime) { log::debug!(target: "test", "{}", rt.wall_time_secs()); let _ = format!("literal now_secs() {}", rt.monotonic_time()); }"#).unwrap());
+    assert!(audit.calls.is_empty());
 }

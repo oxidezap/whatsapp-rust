@@ -69,6 +69,7 @@ pub fn reset_peak() {
 pub fn run_in_child(test: &str) -> bool {
     const CHILD_TEST: &str = "WHATSAPP_RETENTION_ALLOCATION_TEST";
     if std::env::var(CHILD_TEST).as_deref() == Ok(test) {
+        eprintln!("WHATSAPP_RETENTION_TEST_MATCHED {test}");
         return false;
     }
     let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
@@ -82,12 +83,24 @@ pub fn run_in_child(test: &str) -> bool {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .any(|line| line == format!("WHATSAPP_RETENTION_TEST_MATCHED {test}")),
+        "isolated child did not execute {test}"
+    );
     true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[should_panic(expected = "isolated child did not execute")]
+    fn a_missing_child_test_cannot_pass() {
+        run_in_child("allocator::tests::nonexistent_allocation_probe");
+    }
 
     #[test]
     fn allocation_growth_shrink_release_and_peak_are_counted() {

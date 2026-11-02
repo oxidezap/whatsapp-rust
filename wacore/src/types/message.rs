@@ -641,10 +641,6 @@ mod tests {
     use super::*;
     use buffa::MessageField;
 
-    /// The stanza parser reads `edit` as a borrowed attribute and parses it
-    /// directly. That is only safe while the borrowed and owned constructors
-    /// agree on every input, including the `Unknown` fallback that is the one
-    /// case actually needing an allocation.
     #[test]
     fn status_expiry_uses_the_selected_clock_and_keeps_the_exact_boundary() {
         let at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
@@ -660,6 +656,10 @@ mod tests {
             + chrono::Duration::milliseconds(1)));
     }
 
+    /// The stanza parser reads `edit` as a borrowed attribute and parses it
+    /// directly. That is only safe while the borrowed and owned constructors
+    /// agree on every input, including the `Unknown` fallback that is the one
+    /// case actually needing an allocation.
     #[test]
     fn edit_attribute_parses_identically_from_borrowed_and_owned() {
         for wire in ["", "1", "2", "3", "7", "8", "0", "99", "revogação", " 7"] {
