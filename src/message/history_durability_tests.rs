@@ -510,11 +510,9 @@ async fn durable_history_malformed_chunk_and_download_failure_keep_host_copy_wit
 #[tokio::test]
 async fn durable_history_same_id_different_sender_has_distinct_identity() {
     let (client, hook, _) = memory_client().await;
-    for device in [7, 8] {
+    for sender in ["15550000001@s.whatsapp.net", "15550000001@lid"] {
         let mut info = (*info("SAME_ID")).clone();
-        info.source.sender = format!("15550000001:{device}@s.whatsapp.net")
-            .parse()
-            .unwrap();
+        info.source.sender = sender.parse().unwrap();
         assert!(receive(&client, &Arc::new(info), notification()).await);
     }
     history_idle(&client).await;
