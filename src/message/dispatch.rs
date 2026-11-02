@@ -91,7 +91,7 @@ impl Client {
         };
         let result = update(&mut claim);
         if !claim.payloads.is_empty() {
-            cache.insert(key, claim);
+            cache.insert_absent(key, claim);
         }
         result
     }
@@ -105,15 +105,22 @@ impl Client {
         let tracked = publication.owner.is_some();
         publication.complete();
         if tracked && self.dispatch_gate_enabled() {
-            self.dispatched_messages.with(|cache| {
+            self.dispatched_messages.with_metadata(|cache| {
                 for info in messages {
-                    Self::update_dispatch_claim(
-                        cache,
-                        Self::dispatch_key(info),
-                        info,
-                        pdo,
-                        &mut |_| false,
-                    );
+                    let key = Self::dispatch_key(info);
+                    if let Some(claim) = cache.get_mut(&key) {
+                        claim.prune();
+                    } else if pdo {
+                        cache.for_each_mut(|_, claim| {
+                            if claim.alias == Some(key) {
+                                claim.prune();
+                            }
+                        });
+                    } else if let Some(alias) = Self::dispatch_alias(info)
+                        && let Some(claim) = cache.get_mut(&alias)
+                    {
+                        claim.prune();
+                    }
                 }
             });
         }

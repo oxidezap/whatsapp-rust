@@ -472,6 +472,22 @@ pub(crate) struct SyncTtlCache<K, V> {
     clock: Option<Arc<dyn wacore::time::Clock>>,
 }
 
+pub(crate) struct SyncTtlMetadataGuard<'a, K, V> {
+    inner: std::sync::MutexGuard<'a, CacheInner<K, V, RandomState>>,
+}
+
+impl<K: Hash + Eq + Clone, V> SyncTtlMetadataGuard<'_, K, V> {
+    pub(crate) fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        self.inner.get_mut(key).map(|entry| &mut entry.value)
+    }
+
+    pub(crate) fn for_each_mut(&mut self, mut update: impl FnMut(&K, &mut V)) {
+        for entry in self.inner.table.iter_mut() {
+            update(&entry.key, &mut entry.value);
+        }
+    }
+}
+
 pub(crate) struct SyncTtlGuard<'a, K, V> {
     inner: std::sync::MutexGuard<'a, CacheInner<K, V, RandomState>>,
     capacity: u64,
@@ -481,21 +497,37 @@ pub(crate) struct SyncTtlGuard<'a, K, V> {
 
 impl<K: Hash + Eq + Clone, V> SyncTtlGuard<'_, K, V> {
     pub(crate) fn get(&mut self, key: &K) -> Option<&mut V> {
-        if self.inner.get(key).is_some_and(|entry| {
-            self.ttl
-                .is_some_and(|ttl| self.now.saturating_duration_since(entry.inserted_at) >= ttl)
-        }) {
+        let hash = self.inner.hash_of(key);
+        let entry = self.inner.table.find(hash, |slot| &slot.key == key)?;
+        if self
+            .ttl
+            .is_some_and(|ttl| self.now.saturating_duration_since(entry.inserted_at) >= ttl)
+        {
             self.inner.remove_key(key);
             self.inner.shrink_if_empty();
+            return None;
         }
-        self.inner.get_mut(key).map(|entry| {
-            entry
-                .referenced
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            &mut entry.value
-        })
+        self.inner
+            .table
+            .find_mut(hash, |slot| &slot.key == key)
+            .map(|entry| {
+                entry
+                    .referenced
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                &mut entry.value
+            })
     }
 
+    /// The caller must have observed a miss under this same exclusive guard.
+    pub(crate) fn insert_absent(&mut self, key: K, value: V) {
+        debug_assert!(self.inner.get(&key).is_none());
+        if self.capacity != 0 {
+            self.inner
+                .insert_new(key, value, self.now, Some(self.capacity), None);
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn insert(&mut self, key: K, value: V) {
         if let Some(entry) = self.inner.get_mut(&key) {
             entry.value = value;
@@ -583,6 +615,15 @@ impl<K: Hash + Eq + Clone, V: Clone> SyncTtlCache<K, V> {
             ttl: self.ttl,
             now: self.entry_time(),
         })
+    }
+
+    /// Internal state transitions must not refresh TTL or CLOCK reference bits.
+    pub(crate) fn with_metadata<R>(
+        &self,
+        update: impl FnOnce(&mut SyncTtlMetadataGuard<'_, K, V>) -> R,
+    ) -> R {
+        let inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        update(&mut SyncTtlMetadataGuard { inner })
     }
 
     /// Entry count plus estimated retained bytes: the table the cache itself
@@ -856,7 +897,7 @@ where
     /// Stays out of line like [`PlainInner::insert_new`]: under fat LTO this
     /// would otherwise inline into every managed insert path (`insert`,
     /// `upsert_with_by_ref`, `insert_and_return`, plus the synchronous
-    /// [`SyncTtlGuard::insert`](SyncTtlGuard::insert)), stamping the eviction
+    /// [`SyncTtlGuard::insert_absent`](SyncTtlGuard::insert_absent)), stamping the eviction
     /// prologue and the hashbrown growth call per caller instead of per table.
     #[inline(never)]
     fn insert_new(
@@ -3832,5 +3873,69 @@ mod instance_clock_tests {
         assert_eq!(cache.get(&1).await, Some(10));
         clock.advance(Duration::from_secs(5)).unwrap();
         assert_eq!(cache.get(&1).await, None);
+    }
+}
+
+#[cfg(test)]
+mod sync_hash_budget {
+    use super::*;
+
+    #[derive(Clone)]
+    struct Key {
+        value: u64,
+        hashes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl PartialEq for Key {
+        fn eq(&self, other: &Self) -> bool {
+            self.value == other.value
+        }
+    }
+    impl Eq for Key {}
+    impl std::hash::Hash for Key {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.hashes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.value.hash(state);
+        }
+    }
+
+    #[test]
+    fn synchronous_lookup_hashes_a_key_once_on_hit_and_miss() {
+        let hashes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let key = Key {
+            value: 1,
+            hashes: Arc::clone(&hashes),
+        };
+        let cache = SyncTtlCache::new(2, None);
+        cache.with(|guard| guard.insert(key.clone(), 7));
+        hashes.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(cache.get(&key), Some(7));
+        assert_eq!(hashes.load(std::sync::atomic::Ordering::Relaxed), 1);
+        hashes.store(0, std::sync::atomic::Ordering::Relaxed);
+        let missing = Key {
+            value: 2,
+            hashes: Arc::clone(&hashes),
+        };
+        assert_eq!(cache.get(&missing), None);
+        assert_eq!(hashes.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+}
+
+#[cfg(test)]
+mod sync_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_updates_preserve_expiry_and_eviction_reference_state() {
+        let cache = SyncTtlCache::new(2, Some(Duration::from_secs(10)));
+        cache.with(|guard| guard.insert_absent(1, 7));
+        let inserted = cache.inner.lock().unwrap().get(&1).unwrap().inserted_at;
+        cache.with_metadata(|guard| *guard.get_mut(&1).unwrap() = 9);
+        let inner = cache.inner.lock().unwrap();
+        let entry = inner.get(&1).unwrap();
+        assert_eq!(entry.value, 9);
+        assert_eq!(entry.inserted_at, inserted);
+        assert!(!entry.referenced.load(std::sync::atomic::Ordering::Relaxed));
     }
 }
