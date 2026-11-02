@@ -458,7 +458,7 @@ pub const DEFAULT_MEDIA_HOSTS: [&str; 2] = ["mmg.whatsapp.net", "mmg-fallback.wh
 // WA Web 2.3000.1052559453, WAWebMediaUrlAllowlist, bundle a018f64e2c88a443...
 // bytes 810279..810903. Unlike its A/B-gated caller, this policy always applies.
 // Extra origins come from the explicit route, not the sender's media reference.
-fn validate_static_media_url(url: &str, route: &MediaRoute) -> Result<()> {
+fn validate_static_media_url(url: &str, hosts: &[MediaHost]) -> Result<()> {
     use fluent_uri::{Uri, component::Host};
     let parsed = Uri::parse(url).map_err(|_| DownloadPreparationError::UntrustedStaticUrl)?;
     let authority = parsed
@@ -495,7 +495,7 @@ fn validate_static_media_url(url: &str, route: &MediaRoute) -> Result<()> {
             || host.len() > suffix.len() + 1
                 && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
                 && host[host.len() - suffix.len()..].eq_ignore_ascii_case(suffix));
-    let is_explicit_origin = route.hosts.iter().any(|allowed| {
+    let is_explicit_origin = hosts.iter().any(|allowed| {
         let Ok(base) = Uri::parse(format!("https://{}/", allowed.hostname)) else {
             return false;
         };
@@ -681,9 +681,19 @@ impl DownloadUtils {
         Ok(())
     }
 
+    #[inline]
     pub fn prepare_download_requests(
         downloadable: &dyn Downloadable,
         route: &MediaRoute,
+    ) -> Result<Vec<DownloadRequest>> {
+        Self::prepare_download_requests_with_hosts(downloadable, &route.hosts)
+    }
+
+    /// Prepare requests using borrowed route hosts, without a temporary owned route.
+    /// Applies the same origin and metadata validation as [`Self::prepare_download_requests`].
+    pub fn prepare_download_requests_with_hosts(
+        downloadable: &dyn Downloadable,
+        hosts: &[MediaHost],
     ) -> Result<Vec<DownloadRequest>> {
         Self::validate_download_metadata(downloadable)?;
         let is_encrypted = downloadable.is_encrypted();
@@ -710,7 +720,7 @@ impl DownloadUtils {
         // whatsapp.net. Always enforce it here, independently of its A/B gate.
         // Other CDNs require an explicit route; transport must not follow redirects.
         if let Some(static_url) = downloadable.static_url() {
-            validate_static_media_url(static_url, route)?;
+            validate_static_media_url(static_url, hosts)?;
             return Ok(vec![DownloadRequest {
                 url: static_url.to_string(),
                 decryption,
@@ -735,7 +745,7 @@ impl DownloadUtils {
             BASE64_URL_SAFE_NO_PAD.encode(hash)
         };
 
-        let candidates = route.hosts.iter().map(|host| -> Result<DownloadRequest> {
+        let candidates = hosts.iter().map(|host| -> Result<DownloadRequest> {
             use fluent_uri::{Uri, UriRef, component::Host, pct_enc::EStr};
 
             let base = Uri::parse(format!("https://{}/", host.hostname))
@@ -814,7 +824,7 @@ impl DownloadUtils {
                 decryption: decryption.clone(),
             })
         });
-        let mut requests = Vec::with_capacity(route.hosts.len());
+        let mut requests = Vec::with_capacity(hosts.len());
         let mut last_error = None;
         for candidate in candidates {
             match candidate {
@@ -2351,19 +2361,25 @@ mod tests {
             "https://%6dmg.whatsapp.net/file",
         ] {
             assert!(
-                validate_static_media_url(url, &default_route).is_err(),
+                validate_static_media_url(url, &default_route.hosts).is_err(),
                 "{url}"
             );
         }
-        assert!(validate_static_media_url("https://mmg.whatsapp.net/file", &default_route).is_ok());
         assert!(
-            validate_static_media_url("https://scontent.example.fbcdn.net/file", &default_route)
-                .is_err()
+            validate_static_media_url("https://mmg.whatsapp.net/file", &default_route.hosts)
+                .is_ok()
+        );
+        assert!(
+            validate_static_media_url(
+                "https://scontent.example.fbcdn.net/file",
+                &default_route.hosts
+            )
+            .is_err()
         );
         let local = MediaRoute::new(vec![MediaHost::new("127.0.0.1:8443")]);
-        assert!(validate_static_media_url("https://127.0.0.1:8443/file", &local).is_ok());
-        assert!(validate_static_media_url("https://127.0.0.1:8444/file", &local).is_err());
-        assert!(validate_static_media_url("http://127.0.0.1:8443/file", &local).is_err());
+        assert!(validate_static_media_url("https://127.0.0.1:8443/file", &local.hosts).is_ok());
+        assert!(validate_static_media_url("https://127.0.0.1:8444/file", &local.hosts).is_err());
+        assert!(validate_static_media_url("http://127.0.0.1:8443/file", &local.hosts).is_err());
     }
 
     #[test]

@@ -1170,9 +1170,14 @@ impl Client {
             force_refresh,
             source,
         };
-        let route = if downloadable.static_url().is_some() {
-            MediaRoute::new(self.additional_static_media_hosts.to_vec())
-        } else if !force_refresh
+        if downloadable.static_url().is_some() {
+            return DownloadUtils::prepare_download_requests_with_hosts(
+                downloadable,
+                &self.additional_static_media_hosts,
+            )
+            .map_err(DownloadRequestError::Prepare);
+        }
+        let route = if !force_refresh
             && let Some(route) = self.cached_download_route().await.map_err(session_error)?
         {
             route
@@ -1684,6 +1689,64 @@ mod tests {
     use std::sync::Arc;
     use wacore::time::Instant;
     use waproto::whatsapp as wa;
+
+    #[tokio::test]
+    async fn static_media_preparation_borrows_configured_host_storage() {
+        use futures::FutureExt;
+
+        async fn client(hosts: Vec<MediaHost>, http: Arc<RoutedHttpClient>) -> Arc<Client> {
+            crate::ClientBuilder::new()
+                .with_runtime(crate::TokioRuntime)
+                .with_persistence_manager(Arc::new(
+                    crate::store::persistence_manager::PersistenceManager::new(
+                        crate::test_utils::create_test_backend().await,
+                    )
+                    .await
+                    .unwrap(),
+                ))
+                .with_transport_factory(crate::transport::mock::MockTransportFactory::new())
+                .with_http_client_arc(http)
+                .with_options(crate::ClientOptions {
+                    additional_static_media_hosts: hosts,
+                    ..Default::default()
+                })
+                .build()
+                .await
+                .unwrap()
+                .into_client()
+        }
+        let http = RoutedHttpClient::new(Vec::new(), (200, Vec::new()));
+        let host = || MediaHost::new("127.0.0.1:8443");
+        let one = client(vec![host()], http.clone()).await;
+        let mut hosts = vec![host()];
+        hosts.extend((0..100).map(|i| MediaHost::new(format!("unused-{i}.example"))));
+        let many = client(hosts, http.clone()).await;
+        let mut image = wa::message::ImageMessage::default();
+        image.static_url = Some("https://127.0.0.1:8443/fixture".into());
+        image.file_sha256 = Some(vec![0; 32]);
+        let sample = |client: &Client| {
+            crate::test_alloc::heap_sample(|| {
+                client
+                    .prepare_requests(&image, false)
+                    .now_or_never()
+                    .expect("static preparation needs no I/O")
+                    .unwrap()
+            })
+        };
+        let (one_heap, one_requests) = sample(&one);
+        let (many_heap, many_requests) = sample(&many);
+        assert_eq!(one_requests[0].url, image.static_url.as_deref().unwrap());
+        assert_eq!(many_requests[0].url, one_requests[0].url);
+        assert_eq!(
+            one_heap.allocations, many_heap.allocations,
+            "unused policy hosts must not be cloned during preparation"
+        );
+        assert_eq!(one_heap.peak, many_heap.peak);
+        assert_eq!(one_heap.retained, many_heap.retained);
+        assert!(http.urls().is_empty());
+        one.signal_shutdown_sync();
+        many.signal_shutdown_sync();
+    }
 
     #[cfg(feature = "tracing")]
     mod diagnostics {
