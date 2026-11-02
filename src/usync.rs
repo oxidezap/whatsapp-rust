@@ -158,6 +158,7 @@ impl Client {
         users: &[Jid],
         topology_generation: u64,
     ) -> Result<Option<Vec<Jid>>, anyhow::Error> {
+        self.prepare_device_list_identities(response).await?;
         let mapping_guard = self.lid_pn_cache.lock_mutation().await;
         let registry_guard = self.device_topology.lock_registry().await;
         if !self
@@ -296,6 +297,7 @@ impl Client {
     ) -> Result<Vec<Jid>, anyhow::Error> {
         // Keep this order stable: mapping writers never acquire the registry
         // guard while holding their lock, so mapping -> registry cannot cycle.
+        self.prepare_device_list_identities(response).await?;
         let mapping_guard = self.lid_pn_cache.lock_mutation().await;
         let registry_guard = self.device_topology.lock_registry().await;
         self.learn_device_list_mappings_guarded(response, &mapping_guard)
@@ -312,6 +314,7 @@ impl Client {
     ) -> Result<Option<Vec<Jid>>, anyhow::Error> {
         // Serialize both mutation classes across the CAS and publication. The
         // response's own mappings are deliberately learned only after the CAS.
+        self.prepare_device_list_identities(response).await?;
         let mapping_guard = self.lid_pn_cache.lock_mutation().await;
         let registry_guard = self.device_topology.lock_registry().await;
         if !self
@@ -325,6 +328,21 @@ impl Client {
         self.process_device_list_response_guarded(response, freshness.into(), &registry_guard)
             .await
             .map(Some)
+    }
+
+    // Network lookups must finish before taking mapping/registry guards: a
+    // device notification on the read loop may need those guards before the IQ
+    // reply can be read. The guarded phase re-reads the current trust anchor.
+    async fn prepare_device_list_identities(
+        &self,
+        response: &DeviceListResponse,
+    ) -> anyhow::Result<()> {
+        for user in &response.device_lists {
+            if user.key_index_bytes.is_some() {
+                self.ensure_adv_account_identity(&user.user).await?;
+            }
+        }
+        Ok(())
     }
 
     async fn process_device_list_response_guarded(
@@ -368,7 +386,10 @@ impl Client {
             let mut existing_record = existing_records.next().flatten();
 
             let decoded_key_index = if let Some(bytes) = user_list.key_index_bytes.as_deref() {
-                let identity = self.ensure_adv_account_identity(&user_list.user).await?;
+                let identity = self
+                    .cached_adv_account_identity(&user_list.user)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("device list account identity unavailable"))?;
                 let decoded = wacore::adv::verify_key_index_list(bytes, &identity);
                 if decoded.is_none() {
                     if mode == DeviceListApplyMode::GroupRefresh {
@@ -759,6 +780,50 @@ mod tests {
             .has_session(address, &*snapshot.backend)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn waiting_for_primary_identity_does_not_hold_registry_or_mapping_locks() {
+        use wacore::usync::{UserDeviceList, UsyncDevice};
+        let client = create_test_client().await;
+        let user = Jid::pn("12025550127");
+        let lock = client
+            .session_lock_for(user.to_protocol_address().as_str())
+            .await;
+        let primary_guard = lock.lock().await;
+        let response = DeviceListResponse {
+            device_lists: vec![UserDeviceList {
+                user: user.clone(),
+                devices: vec![UsyncDevice::new(0, None), UsyncDevice::new(2, Some(1))],
+                phash: None,
+                key_index_bytes: Some(signed_key_index_bytes(vec![1], 1)),
+            }],
+            lid_mappings: Vec::new(),
+        };
+        let operation = client.process_device_list_response(&response, Freshness::Refresh);
+        futures::pin_mut!(operation);
+        assert!(futures::poll!(operation.as_mut()).is_pending());
+        let mapping = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.lid_pn_cache.lock_mutation(),
+        )
+        .await
+        .unwrap();
+        let registry = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.device_topology.lock_registry(),
+        )
+        .await
+        .unwrap();
+        drop(registry);
+        drop(mapping);
+        crate::test_utils::seed_adv_primary(&client, &user).await;
+        drop(primary_guard);
+        assert_eq!(
+            operation.await.unwrap(),
+            vec![user.clone(), user.with_device(2)]
+        );
+        client.signal_shutdown_sync();
     }
 
     #[tokio::test]

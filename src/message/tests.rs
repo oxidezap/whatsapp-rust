@@ -18794,6 +18794,8 @@ async fn pdo_retry_publication_holds_new_skdm_receipt(teardown: bool) {
     );
 
     let mut peer = AlicePeer::new("777000000000003:2@lid").await;
+    let certificate = peer.adv_certificate();
+    crate::test_utils::seed_adv_primary(&fixture.client, &peer.jid).await;
     let group: Jid = "120363000000000071@g.us".parse().unwrap();
     let (bundle, receiver) = bobs_prekey_bundle(&fixture.client).await;
     peer.install_bob_session(&receiver.to_protocol_address(), &bundle)
@@ -18822,11 +18824,16 @@ async fn pdo_retry_publication_holds_new_skdm_receipt(teardown: bool) {
                 .attr("offline", "1")
                 .attr("type", "text")
                 .attr("t", wacore::time::now_secs().to_string())
-                .children([NodeBuilder::new("enc")
-                    .attr("type", enc.enc_type.as_wire_str())
-                    .attr("v", "2")
-                    .bytes(enc.ciphertext.to_vec())
-                    .build()])
+                .children([
+                    NodeBuilder::new("enc")
+                        .attr("type", enc.enc_type.as_wire_str())
+                        .attr("v", "2")
+                        .bytes(enc.ciphertext.to_vec())
+                        .build(),
+                    NodeBuilder::new("device-identity")
+                        .bytes(certificate)
+                        .build(),
+                ])
                 .build(),
         ))
         .await;
