@@ -148,4 +148,25 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn jid_pair_decoder_keeps_its_safe_error_category() {
+        use wacore_binary::{marshal::unmarshal_ref, token};
+
+        let mut wire = vec![token::LIST_8, 3];
+        for value in ["message", "from"] {
+            wire.extend([token::BINARY_8, value.len() as u8]);
+            wire.extend_from_slice(value.as_bytes());
+        }
+        wire.push(token::JID_PAIR);
+        for value in ["19990000049", "synthetic-private-server"] {
+            wire.extend([token::BINARY_8, value.len() as u8]);
+            wire.extend_from_slice(value.as_bytes());
+        }
+        let error = unmarshal_ref(&wire).expect_err("unknown JID_PAIR server");
+        assert!(
+            matches!(&error, wacore_binary::BinaryError::AttrParse(reason) if reason.starts_with("JID_PAIR"))
+        );
+        assert_eq!(ErrorSummary(&error).to_string(), "invalid JID attribute");
+    }
 }
