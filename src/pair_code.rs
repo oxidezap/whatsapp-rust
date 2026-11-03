@@ -349,8 +349,7 @@ impl Client {
 
         info!(
             target: "Client/PairCode",
-            "Starting pair code authentication for phone: {}",
-            phone_number
+            "Starting pair code authentication"
         );
 
         // Generate ephemeral keypair for this pairing session
@@ -401,7 +400,7 @@ impl Client {
             OS_COERCE_WARNED.call_once(|| {
                 warn!(
                     target: "Client/PairCode",
-                    "companion_platform_display OS {os:?} is not a recognized OS; coerced to \"Linux\" for pair-code (the server would reject a non-OS display with bad-request)"
+                    "companion_platform_display OS is not a recognized OS; coerced to \"Linux\" for pair-code (the server would reject a non-OS display with bad-request)"
                 );
             });
         }
@@ -469,8 +468,7 @@ impl Client {
 
         info!(
             target: "Client/PairCode",
-            "Stage 1 complete, waiting for phone confirmation. Code: {}",
-            code
+            "Stage 1 complete, waiting for phone confirmation"
         );
 
         // Store state for when phone confirms, unless the claim was withdrawn
@@ -618,10 +616,11 @@ pub(crate) async fn handle_pair_code_notification_scoped(
     match reg_node.get_attr("stage").map(|v| v.as_str()).as_deref() {
         Some("primary_hello") => handle_primary_hello(client, reg_node, shutdown).await,
         Some("refresh_code") => handle_refresh_code(client, reg_node, shutdown).await,
-        other => {
+        _ => {
             warn!(
                 target: "Client/PairCode",
-                "Ignoring link_code_companion_reg notification with stage {other:?}"
+                "Ignoring link_code_companion_reg notification with unrecognized stage: {}",
+                crate::logging::StanzaSummary::from(reg_node)
             );
             false
         }
@@ -1921,6 +1920,45 @@ mod tests {
                 .build()])
             .build();
         crate::test_utils::answer_iq(client, &id, &response).await;
+    }
+
+    #[tokio::test]
+    async fn pair_code_logs_never_disclose_linking_secrets() {
+        use crate::test_utils::log_capture;
+        if log_capture::delegated_to_child(
+            "pair_code::tests::pair_code_logs_never_disclose_linking_secrets",
+        ) {
+            return;
+        }
+        let capture = log_capture::session();
+        let (client, transport) = create_iq_test_client().await;
+        let pending = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .pair_with_code(PairCodeOptions {
+                        custom_code: Some("SECR3T12".to_owned()),
+                        ..options()
+                    })
+                    .await
+            })
+        };
+        answer_companion_hello(&client, &transport, 0, b"synthetic-pairing-ref-marker").await;
+        assert_eq!(pending.await.unwrap().unwrap(), "SECR3T12");
+        let records: Vec<_> = ["Client/PairCode", "Client/Send", "Client/Recv"]
+            .iter()
+            .flat_map(|target| capture.records_for(target))
+            .collect();
+        assert!(
+            records
+                .iter()
+                .any(|(_, message)| message.contains("waiting for phone confirmation"))
+        );
+        for (_, message) in records {
+            for secret in ["SECR3T12", "15551234567", "synthetic-pairing-ref-marker"] {
+                assert!(!message.contains(secret), "sensitive pairing value logged");
+            }
+        }
     }
 
     fn options() -> PairCodeOptions {

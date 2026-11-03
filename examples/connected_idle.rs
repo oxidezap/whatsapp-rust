@@ -118,6 +118,10 @@ fn child(backend: &str, mode: &str) -> Result<Run> {
     process_locks::warm();
     let start = Instant::now();
     let rt = tokio::runtime::Builder::new_current_thread()
+        // Keep the test executor's retained thread table and worker lifetime
+        // fixed. This is a heap-retention probe, not an I/O throughput benchmark.
+        .max_blocking_threads(1)
+        .thread_keep_alive(std::time::Duration::from_secs(300))
         .enable_all()
         .build()?;
     let mut run = rt.block_on(async {
@@ -137,15 +141,26 @@ fn child(backend: &str, mode: &str) -> Result<Run> {
         } else {
             session.finish_control().await?;
         }
+        session.prepare_retention().await?;
         samples.push(sample("after_activity", start, Some(&session)).await?);
+        let idle_pongs = session.pongs();
         let idle_start = Instant::now();
         session.idle().await?;
         ensure!(
             idle_start.elapsed() >= IDLE,
             "native path must wait real elapsed time"
         );
+        ensure!(
+            session.pongs() > idle_pongs,
+            "production keepalive never reached the server during real idle"
+        );
+        let checkpoint_pongs = session.retention_barrier().await?;
         samples.push(sample("after_61s", start, Some(&session)).await?);
         session.maintenance().await?;
+        ensure!(
+            session.pongs() == checkpoint_pongs,
+            "keepalive overlapped the maintenance checkpoint"
+        );
         samples.push(sample("after_maintenance", start, Some(&session)).await?);
         let idle = samples[3].lifecycle.context("idle lifecycle missing")?;
         ensure!(
@@ -153,7 +168,7 @@ fn child(backend: &str, mode: &str) -> Result<Run> {
             "idle workers did not stop"
         );
         ensure!(
-            session.pongs() > 0,
+            session.pongs() > idle_pongs,
             "production keepalive never reached the server during real idle"
         );
         ensure!(
@@ -194,6 +209,9 @@ fn harness_sha256() -> String {
         include_bytes!("connected_idle.rs").as_slice(),
         include_bytes!("connected_idle/allocator.rs").as_slice(),
         include_bytes!("connected_idle/process_locks.rs").as_slice(),
+        include_bytes!("../src/bench_support.rs").as_slice(),
+        include_bytes!("../src/bench_support/connected_idle.rs").as_slice(),
+        include_bytes!("../src/bench_support/connected_idle/util.rs").as_slice(),
     ] {
         hash.update((source.len() as u64).to_le_bytes());
         hash.update(source);

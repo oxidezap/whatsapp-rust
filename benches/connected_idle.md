@@ -17,15 +17,22 @@ Signal sessions/device lists/sender keys are established in fixture setup.
 Workload sender-key/signature RNG uses seed `0x434f4e4e45435431`; stanza IDs,
 chat IDs and repeated `x` payloads are fixed. Client identity/session and Noise
 handshake keys are freshly randomized by existing library helpers; the seed
-is not a claim that the entire handshake byte trace is identical.
+is not a claim that the entire handshake byte trace is identical. Synthetic
+registration IDs have fixed five-byte varint widths and message v2 padding is
+fixed at a valid 16 bytes: otherwise session serialization and retained AES
+scratch differ by 1 and 16 bytes respectively despite the same text payload.
 This is a representative *bounded receive/history workload*, not a fully synced
 account with all service responses or a production workload distribution.
 
 Each activity session receives **256 encrypted group text messages, 4,096 ASCII
 bytes each, across 32 chats** (8 messages/chat). They enter through Noise frames
-and the real reader. The initial offline marker is withheld until after activity,
-so the registered successful consumer hook exercises the library's real
-pending-inbound persistence/commit arena and offline-to-live drain. The external
+and the real reader. The first wave contains one message per chat. The fixture waits until those 32
+messages are buffered, sends the offline marker, and waits for that one commit
+before sending the remaining 224 live messages. This fixes the retained
+publication topology at 225 commit batches while exercising both the real
+pending-inbound persistence/commit arena and the offline-to-live transition.
+Sending the marker after merely writing all frames allowed it to overtake
+queued decryption and produced a variable number of publication tokens. The external
 consumer hook just counts; it does not retain messages or implement another DB.
 The event consumer counts individual delivered messages, not batches, and retains
 no event payloads. A failure to decrypt/commit/dispatch fails the run.
@@ -96,6 +103,27 @@ claims come from virtual-time tests. Cache TTL clocks use their own time sources
 Tokio clock advance, nor pin the number of closed lanes main retains.
 
 ## Native retained heap and Linux RssAnon
+
+The native probe fixes its blocking executor to one worker with a five-minute
+keepalive, exceeding the measured idle period. This holds executor metadata
+constant; it does not measure storage throughput. Both revisions use these
+same settings and the same fixture source, included in the harness hash.
+Before idle, both native scenarios complete a burst of 16 concurrent small IQs.
+The fixture verifies all 16 registrations overlap, at least eight frames share
+a transport write, and every waiter is removed normally. This gives the pending
+request table and reusable sender batch vector a fixed exercised high-water
+state; their allocations remain included in the measurement. No table is reset
+or shrunk. This preparation is outside the CPU benchmark surfaces.
+After verifying a periodic production keepalive during at least 61 seconds of
+real idle, the probe waits for an 11-second receive gap and completes one normal
+ping with a fixed ID. The production decoder uses a ten-second gap to start a
+fresh receive burst; without this fence, a probe immediately after a random
+periodic pong could instead grow the previous accumulator by a 1 KiB chunk.
+The reader therefore retains the same final input and burst state in each
+sample. No second probe is sent after maintenance; an overlapping pong rejects
+the sample. The `after_61s` label means at least 61 seconds, with actual elapsed
+time recorded per checkpoint. This does not clear caches, close lanes, drop
+claims or bypass pending-row cleanup.
 
 Build first, then invoke the executable (not Cargo/nextest/Divan) from the repo
 root. The small parent launches **one fresh child process per backend, mode and

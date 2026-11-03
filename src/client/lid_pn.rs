@@ -1084,14 +1084,18 @@ impl Client {
                     outcome.migrated += 1;
                     info!(
                         "Migrated session {} -> {} (PN wins on conflict)",
-                        pn_proto, lid_proto
+                        pn_jid.observe(),
+                        lid_jid.observe()
                     );
                 }
                 Ok(None) => {}
                 Err(error) => {
                     outcome.total += 1;
                     outcome.skipped += 1;
-                    warn!("Skipping session migration for {}: {error:?}", pn_proto);
+                    warn!(
+                        "Skipping session migration for {}: {error:?}",
+                        pn_jid.observe()
+                    );
                 }
             }
 
@@ -1115,7 +1119,11 @@ impl Client {
                                 .await;
                             self.signal_cache.delete_identity(&pn_proto).await;
                             outcome.migrated_identities += 1;
-                            info!("Migrated identity {} -> {}", pn_proto, lid_proto);
+                            info!(
+                                "Migrated identity {} -> {}",
+                                pn_jid.observe(),
+                                lid_jid.observe()
+                            );
                         }
                         Ok(Some(_)) => {
                             // LID-wins: existing LID identity preserved; drop the PN copy.
@@ -1127,7 +1135,8 @@ impl Client {
                             warn!(
                                 "Skipping identity migration {} -> {}: \
                              failed to read LID identity: {e:?}",
-                                pn_proto, lid_proto
+                                pn_jid.observe(),
+                                lid_jid.observe()
                             );
                         }
                     }
@@ -1135,7 +1144,10 @@ impl Client {
                 Ok(None) => {}
                 Err(error) => {
                     outcome.skipped_identities += 1;
-                    warn!("Skipping identity migration for {}: {error:?}", pn_proto);
+                    warn!(
+                        "Skipping identity migration for {}: {error:?}",
+                        pn_jid.observe()
+                    );
                 }
             }
         }
@@ -3108,6 +3120,42 @@ mod tests {
 
         let backend = client.persistence_manager.backend();
         assert!(backend.get_tc_token(lid).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn identity_migration_logs_redact_phone_numbers() {
+        use crate::test_utils::log_capture;
+        use wacore::types::jid::JidExt as _;
+        if log_capture::delegated_to_child(
+            "client::lid_pn::tests::identity_migration_logs_redact_phone_numbers",
+        ) {
+            return;
+        }
+        let capture = log_capture::session();
+        let client = create_test_client().await;
+        let pn = "19990000004";
+        let lid = "100000000000104";
+        client
+            .signal_cache
+            .put_identity(&Jid::pn_device(pn, 0).to_protocol_address(), &[7; 32])
+            .await;
+        client
+            .migrate_signal_sessions_on_lid_discovery(pn, lid)
+            .await;
+        let records = capture.records_for("whatsapp_rust::client::lid_pn");
+        assert!(
+            records
+                .iter()
+                .any(|(_, message)| message.contains("Migrated identity"))
+        );
+        for (_, message) in records {
+            if !cfg!(feature = "tracing-pii") {
+                assert!(
+                    !message.contains(pn),
+                    "phone number logged during identity migration"
+                );
+            }
+        }
     }
 
     /// Identity cleanup still needs a durable flush, but cannot make a failed

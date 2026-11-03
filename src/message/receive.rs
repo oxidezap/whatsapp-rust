@@ -3,6 +3,8 @@
 use super::*;
 use smallvec::SmallVec;
 use wacore::telemetry::LiveAdmissionRefusal;
+use wacore_binary::diagnostics::{ObservedId, ProtocolText};
+use wacore_binary::jid::ObservedJid;
 
 /// Parsed session envelope with explicit retry/ownership semantics.
 ///
@@ -259,10 +261,14 @@ impl Client {
                 info.media_type = media_type;
                 Arc::new(info)
             }
-            Err(e) => {
-                let id = nr.get_attr("id").map(|v| v.as_str());
-                let from = nr.get_attr("from").map(|v| v.as_str());
-                log::warn!("Failed to parse message info (id={id:?}, from={from:?}): {e:?}");
+            Err(error) => {
+                // The common view retains protocol context without quoting
+                // rejected attributes or eagerly formatting identifiers.
+                log::warn!(
+                    "Failed to parse message info: {}; {}",
+                    wacore::diagnostics::ErrorSummary(error.as_ref()),
+                    crate::logging::StanzaSummary::from(nr)
+                );
                 self.spawn_stanza_nack(nr, NackReason::ParsingError, None);
                 return None;
             }
@@ -301,8 +307,8 @@ impl Client {
         if all_enc_nodes.is_empty() && unavailable_node.is_none() {
             log::warn!(
                 "[msg:{}] Received non-newsletter message without <enc> child: {}",
-                info.id,
-                nr.tag
+                ObservedId::new(info.id.as_str()),
+                ProtocolText::new(nr.tag.as_ref())
             );
             return None;
         }
@@ -336,13 +342,13 @@ impl Client {
                 log::info!(
                     "[msg:{}] Message has unrecoverable <unavailable> child (type: {:?}); \
                      skipping futile PDO placeholder-resend and acking directly",
-                    info.id,
+                    ObservedId::new(info.id.as_str()),
                     unavailable_type,
                 );
             } else {
                 log::info!(
                     "[msg:{}] Message has <unavailable> child (type: {:?}), requesting from phone via PDO",
-                    info.id,
+                    ObservedId::new(info.id.as_str()),
                     unavailable_type,
                 );
             }
@@ -496,7 +502,7 @@ impl Client {
             log::error!(
                 "[msg:{}] Protocol violation: skmsg is first in multi-enc message from {}. \
                  Expected pkmsg/msg first (containing SKDM).",
-                info.id,
+                ObservedId::new(info.id.as_str()),
                 info.source.sender.observe()
             );
         }
@@ -514,7 +520,7 @@ impl Client {
         {
             log::info!(
                 "[msg:{}] All enc payloads unrecognized; transport-acking to drop from offline queue",
-                info.id
+                ObservedId::new(info.id.as_str())
             );
             if !info.source.chat.is_status_broadcast() {
                 self.spawn_node_transport_ack(nr).await;
@@ -573,7 +579,7 @@ impl Client {
             // no committable entry — bail unacked, the server redelivers.
             log::debug!(
                 "Connection torn down while awaiting the processing permit; leaving message {} for redelivery",
-                info.id
+                ObservedId::new(info.id.as_str())
             );
             // Every `<enc>` still queued here is abandoned without being tried.
             // Reported before the bail, because classification already reported
@@ -724,7 +730,7 @@ impl Client {
                 .await;
             log::debug!(
                 "[msg:{}] Sender retry count {} pre-seeded into cache",
-                info.id,
+                ObservedId::new(info.id.as_str()),
                 max_sender_retry_count
             );
         }
@@ -814,7 +820,7 @@ impl Client {
                     Err(e) => {
                         log::warn!(
                             "[msg:{}] Batch group decrypt from {} in {} failed: {e:?}",
-                            info.id,
+                            ObservedId::new(info.id.as_str()),
                             info.source.sender.observe(),
                             info.source.chat.observe()
                         );
@@ -844,7 +850,7 @@ impl Client {
                     if info.is_expired_status_with(|| self.runtime.wall_time_utc()) {
                         log::debug!(
                             "[msg:{}] Silently dropping expired status from {}",
-                            info.id,
+                            ObservedId::new(info.id.as_str()),
                             info.source.sender.observe()
                         );
                     } else {
@@ -854,7 +860,7 @@ impl Client {
                         // failure itself is already logged and retried.
                         log::debug!(
                             "Skipping skmsg decryption for message {} from {} because pkmsg failed to decrypt.",
-                            info.id,
+                            ObservedId::new(info.id.as_str()),
                             info.source.sender.observe()
                         );
                         if !session_dispatched_undecryptable {
@@ -893,7 +899,7 @@ impl Client {
                 log::log!(
                     decrypt_fail_log_level(decrypt_fail_mode),
                     "Message {} from {} failed to decrypt and has no group content. Dispatching UndecryptableMessage event.",
-                    info.id,
+                    ObservedId::new(info.id.as_str()),
                     info.source.sender.observe()
                 );
                 self.dispatch_undecryptable_event(
@@ -951,7 +957,7 @@ impl Client {
         }
     }
 
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.session_decrypt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %sender_encryption_jid.observe(), msg_id = %info.id)))]
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.session_decrypt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %sender_encryption_jid.observe(), msg_id = %ObservedId::new(info.id.as_str()))))]
     #[cfg(test)]
     pub(crate) async fn process_session_enc_batch(
         self: Arc<Self>,
@@ -1028,7 +1034,7 @@ impl Client {
                 Err(e) => {
                     log::warn!(
                         "[msg:{}] Failed processing plaintext from {}: {e:?}",
-                        info.id,
+                        ObservedId::new(info.id.as_str()),
                         info.source.sender.observe()
                     );
                     outcome.plaintext_failed = true;
@@ -1166,7 +1172,7 @@ impl Client {
                 Err(e) => {
                     log::error!(
                         "[msg:{}] Failed to parse {enc_type} Signal envelope from {}: {e:?}. Sending nack.",
-                        info.id,
+                        ObservedId::new(info.id.as_str()),
                         info.source.sender.observe()
                     );
                     // |= so a later dedup'd return (false) can't clobber a true
@@ -1278,8 +1284,8 @@ impl Client {
                     if let SignalProtocolError::UntrustedIdentity(ref address) = e {
                         log::warn!(
                             "[msg:{}] Received message from untrusted identity: {}. This typically means the sender re-installed WhatsApp or changed their device. Clearing old identity to trust new key (keeping session for in-flight messages).",
-                            info.id,
-                            address
+                            ObservedId::new(info.id.as_str()),
+                            address.observe()
                         );
 
                         // Delete the old, untrusted identity through the signal cache.
@@ -1299,7 +1305,7 @@ impl Client {
                         {
                             log::warn!(
                                 "Deferring identity-change flush for {}: the drain batch commit failed and its entries must stay unflushed",
-                                wacore::types::jid::observe_protocol_address(address)
+                                address.observe()
                             );
                             outcome.had_failure = true;
                             self.report_enc_decrypt_failure(
@@ -1315,7 +1321,7 @@ impl Client {
                         if let Err(e) = self.flush_signal_cache().await {
                             log::warn!(
                                 "Failed to flush identity deletion for {}: {e:?}",
-                                wacore::types::jid::observe_protocol_address(address)
+                                address.observe()
                             );
                             outcome.had_failure = true;
                             self.report_enc_decrypt_failure(
@@ -1328,14 +1334,14 @@ impl Client {
                         }
                         log::info!(
                             "Cleared old identity for {} from cache and backend",
-                            address
+                            address.observe()
                         );
 
                         // Re-attempt decryption with the new identity
                         log::info!(
                             "[msg:{}] Retrying message decryption for {} after clearing untrusted identity",
-                            info.id,
-                            address
+                            ObservedId::new(info.id.as_str()),
+                            address.observe()
                         );
 
                         let retry_decrypt_res = decrypt_session_message(
@@ -1357,8 +1363,8 @@ impl Client {
                                 );
                                 log::debug!(
                                     "[msg:{}] Successfully decrypted message from {} after handling untrusted identity",
-                                    info.id,
-                                    address
+                                    ObservedId::new(info.id.as_str()),
+                                    address.observe()
                                 );
                                 if let Some(prekey_id) = decrypted.consumed_prekey_id {
                                     adapter
@@ -1402,7 +1408,7 @@ impl Client {
                                 {
                                     log::debug!(
                                         "Message from {} was already processed (chain {}, counter {}) - detected during untrusted identity retry. This is normal during reconnection.",
-                                        address,
+                                        address.observe(),
                                         chain,
                                         counter
                                     );
@@ -1447,8 +1453,8 @@ impl Client {
                                             log::debug!(
                                                 "[msg:{}] InvalidPreKeyId after identity change for {}. \
                                                  Sending retry receipt with fresh keys.",
-                                                info.id,
-                                                address
+                                                ObservedId::new(info.id.as_str()),
+                                                address.observe()
                                             );
                                             outcome.had_failure = true;
                                             self.report_enc_decrypt_failure(
@@ -1472,8 +1478,8 @@ impl Client {
                                 } else {
                                     log::error!(
                                         "[msg:{}] Decryption failed even after clearing untrusted identity for {}: {:?}",
-                                        info.id,
-                                        address,
+                                        ObservedId::new(info.id.as_str()),
+                                        address.observe(),
                                         retry_err
                                     );
                                     // Send retry receipt so the sender resends with a PreKeySignalMessage
@@ -1575,7 +1581,7 @@ impl Client {
 
                         debug!(
                             "[msg:{}] No session found for {} message from {}. Sending retry receipt to request session establishment.",
-                            info.id,
+                            ObservedId::new(info.id.as_str()),
                             enc_type,
                             info.source.sender.observe()
                         );
@@ -1658,7 +1664,7 @@ impl Client {
                             decrypt_fail_log_level(decrypt_fail_mode),
                             "[msg:{}] Decryption failed for {} message from {} due to {label}. \
                              Sending retry receipt.",
-                            info.id,
+                            ObservedId::new(info.id.as_str()),
                             enc_type,
                             info.source.sender.observe()
                         );
@@ -1720,7 +1726,7 @@ impl Client {
                             "[msg:{}] Decryption failed for {} message from {} due to InvalidPreKeyId. \
                              Sender is using a prekey we don't have (likely session established while offline). \
                              Sending retry receipt with fresh prekeys.",
-                            info.id,
+                            ObservedId::new(info.id.as_str()),
                             enc_type,
                             info.source.sender.observe()
                         );
@@ -1749,7 +1755,7 @@ impl Client {
                         log::debug!(
                             "[msg:{}] Decryption failed for {} message from {} due to InvalidSignedPreKeyId. \
                              Sender used a signed prekey we've rotated out. Sending retry receipt with fresh prekeys.",
-                            info.id,
+                            ObservedId::new(info.id.as_str()),
                             enc_type,
                             info.source.sender.observe()
                         );
@@ -1774,7 +1780,7 @@ impl Client {
                         // Catch-all → WA Web's UnhandledError nack (500).
                         log::error!(
                             "[msg:{}] Batch session decrypt failed (type: {}) from {}: {:?}. Sending nack.",
-                            info.id,
+                            ObservedId::new(info.id.as_str()),
                             enc_type,
                             info.source.sender.observe(),
                             e
@@ -1813,7 +1819,7 @@ impl Client {
         (outcome, deferred, Some(timer))
     }
 
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.group_decrypt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id), err(Debug)))]
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.group_decrypt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %ObservedId::new(info.id.as_str())), err(Debug)))]
     async fn process_group_enc_batch(
         self: Arc<Self>,
         payloads: &[EncPayload],
@@ -1853,7 +1859,7 @@ impl Client {
             log::debug!(
                 "Looking up sender key for group {} with sender address {} (from sender JID: {})",
                 info.source.chat.observe(),
-                sender_address,
+                sender_address.observe(),
                 info.source.sender.observe()
             );
 
@@ -1890,7 +1896,7 @@ impl Client {
                     if !self.is_from_known_device(&info.source.sender).await {
                         debug!(
                             "[msg:{}] Unknown device {}, triggering device sync",
-                            info.id,
+                            ObservedId::new(info.id.as_str()),
                             info.source.sender.observe()
                         );
                         self.handle_unknown_device_sync(info).await;
@@ -1948,7 +1954,7 @@ impl Client {
                     if info.is_expired_status_with(|| self.runtime.wall_time_utc()) {
                         log::debug!(
                             "[msg:{}] Skipping retry for expired status from {}",
-                            info.id,
+                            ObservedId::new(info.id.as_str()),
                             info.source.sender.observe()
                         );
                         continue;
@@ -1963,7 +1969,7 @@ impl Client {
 
                     debug!(
                         "No sender key state for group message [msg:{}] from {}: {}. Sending retry receipt.",
-                        info.id,
+                        ObservedId::new(info.id.as_str()),
                         info.source.sender.observe(),
                         msg
                     );
@@ -2001,7 +2007,7 @@ impl Client {
                     if info.is_expired_status_with(|| self.runtime.wall_time_utc()) {
                         log::debug!(
                             "[msg:{}] Ignoring decrypt error for expired status from {}: {:?}",
-                            info.id,
+                            ObservedId::new(info.id.as_str()),
                             info.source.sender.observe(),
                             e
                         );
@@ -2014,9 +2020,9 @@ impl Client {
                         log::log!(
                             decrypt_fail_log_level(decrypt_fail_mode),
                             "Group batch decrypt failed [msg:{}] for group {} sender {}: {:?}. Sending retry receipt.",
-                            info.id,
-                            sender_key_name.group_id(),
-                            sender_key_name.sender_id(),
+                            ObservedId::new(info.id.as_str()),
+                            ObservedJid::from(sender_key_name.group_id()),
+                            sender_address.observe(),
                             e
                         );
                         self.handle_decrypt_failure(info, reason, decrypt_fail_mode, ack_recipient)
@@ -2027,9 +2033,9 @@ impl Client {
                     log::log!(
                         decrypt_fail_log_level(decrypt_fail_mode),
                         "Group batch decrypt failed [msg:{}] for group {} sender {}: {:?}",
-                        info.id,
-                        sender_key_name.group_id(),
-                        sender_key_name.sender_id(),
+                        ObservedId::new(info.id.as_str()),
+                        ObservedJid::from(sender_key_name.group_id()),
+                        sender_address.observe(),
                         e
                     );
                     // Always surface the failure to consumers; nack only non-status
@@ -2052,7 +2058,7 @@ impl Client {
     }
 
     /// WA Web: online → `syncDeviceListJob`, offline → `OfflinePendingDeviceCache`.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.unknown_device_sync", level = "debug", skip_all, fields(sender = %info.source.sender.observe(), msg_id = %info.id)))]
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.unknown_device_sync", level = "debug", skip_all, fields(sender = %info.source.sender.observe(), msg_id = %ObservedId::new(info.id.as_str()))))]
     async fn handle_unknown_device_sync(self: &Arc<Self>, info: &MessageInfo) {
         self.schedule_unknown_device_sync(info.source.sender.to_non_ad(), info.is_offline)
             .await;
@@ -2111,7 +2117,7 @@ impl Client {
         }
     }
 
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.handle_plaintext", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id, enc_type = %enc_type), err(Debug)))]
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.handle_plaintext", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %ObservedId::new(info.id.as_str()), enc_type = %enc_type), err(Debug)))]
     #[cfg(any(test, feature = "bench-harness"))]
     pub(crate) async fn handle_decrypted_plaintext(
         self: &Arc<Self>,
@@ -2219,7 +2225,7 @@ impl Client {
                 .inspect_err(|_| self.finish_retained_raw(origin))?;
         log::debug!(
             "[msg:{}] Successfully decrypted message from {}: type={} [batch path]",
-            info.id,
+            ObservedId::new(info.id.as_str()),
             info.source.sender.observe(),
             enc_type
         );
@@ -2229,7 +2235,7 @@ impl Client {
         if original_msg.device_sent_message.is_set() && !info.source.is_from_me {
             warn!(
                 "[msg:{}] DeviceSentMessage present but sender {} is not self",
-                info.id,
+                ObservedId::new(info.id.as_str()),
                 info.source.sender.observe(),
             );
         }
@@ -2246,7 +2252,7 @@ impl Client {
             warn!(
                 "[msg:{}] bcl hash mismatch on device-sent broadcast (expected={expected}); \
                  keeping message (validate-only)",
-                info.id,
+                ObservedId::new(info.id.as_str()),
             );
         }
 
@@ -2315,7 +2321,7 @@ impl Client {
                     // carrier remains retained until consumer commit succeeds.
                     warn!(
                         "[msg:{}] Ignoring malformed auxiliary SKDM: {error}",
-                        info.id
+                        ObservedId::new(info.id.as_str())
                     );
                 } else {
                     return Err(error.into());
@@ -2333,7 +2339,7 @@ impl Client {
             } else {
                 warn!(
                     "[msg:{}] Dropping app_state_sync_key_share from non-self sender {}",
-                    info.id,
+                    ObservedId::new(info.id.as_str()),
                     info.source.sender.observe()
                 );
             }
@@ -2348,7 +2354,7 @@ impl Client {
             } else {
                 warn!(
                     "[msg:{}] Dropping app_state_sync_key_request from non-self sender {}",
-                    info.id,
+                    ObservedId::new(info.id.as_str()),
                     info.source.sender.observe()
                 );
             }
@@ -2366,7 +2372,7 @@ impl Client {
             } else {
                 warn!(
                     "[msg:{}] Dropping lid_migration_mapping_sync from non-self sender {}",
-                    info.id,
+                    ObservedId::new(info.id.as_str()),
                     info.source.sender.observe()
                 );
             }
@@ -2395,7 +2401,7 @@ impl Client {
             } else if !info.source.is_from_me {
                 warn!(
                     "[msg:{}] Dropping history_sync_notification from non-self sender {}",
-                    info.id,
+                    ObservedId::new(info.id.as_str()),
                     info.source.sender.observe()
                 );
             }
@@ -2408,7 +2414,7 @@ impl Client {
         if skdm_only {
             log::debug!(
                 "[msg:{}] Skipping event dispatch for sender key distribution message",
-                info.id
+                ObservedId::new(info.id.as_str())
             );
             Ok(PlaintextHandleOutcome {
                 skdm_only: true,
@@ -2477,7 +2483,7 @@ impl Client {
                         wacore::telemetry::recv("duplicate_resend");
                         log::debug!(
                             "[msg:{}] already dispatched for this sender; suppressing the resend's event",
-                            info.id
+                            ObservedId::new(info.id.as_str())
                         );
                     }
                     // The event is a duplicate; the key share is not. Our phone asking
@@ -2503,7 +2509,7 @@ impl Client {
                             ) => {
                                 warn!(
                                     "[msg:{}] Deferring app-state key-share until durable retry",
-                                    info.id
+                                    ObservedId::new(info.id.as_str())
                                 );
                             }
                         }
@@ -2547,7 +2553,7 @@ impl Client {
                     InboundCommitState::Deferred(None) | InboundCommitState::Failed => {
                         warn!(
                             "[msg:{}] Deferring app-state key-share recovery to the requester's retry because the inbound request was not durable",
-                            info.id
+                            ObservedId::new(info.id.as_str())
                         );
                     }
                 }
@@ -2571,7 +2577,7 @@ impl Client {
     /// decrypt and replaces the caller's `session_guard` on the way out
     /// so the next payload in the batch stays serialized.
     #[allow(clippy::too_many_arguments)]
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.pn_lid_migration_decrypt", level = "debug", skip_all, fields(sender = %sender_jid.observe(), msg_id = %info.id, enc_type = %enc_type)))]
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.pn_lid_migration_decrypt", level = "debug", skip_all, fields(sender = %sender_jid.observe(), msg_id = %ObservedId::new(info.id.as_str()), enc_type = %enc_type)))]
     async fn try_pn_to_lid_migration_decrypt(
         self: &Arc<Self>,
         sender_jid: &Jid,
@@ -2615,7 +2621,7 @@ impl Client {
         if !migrated {
             log::debug!(
                 "[msg:{}] No PN state to migrate for {}; skipping migration retry decrypt",
-                info.id,
+                ObservedId::new(info.id.as_str()),
                 info.source.sender.observe()
             );
             return MigrationDecryptResult::NotDecrypted(None);
@@ -2635,7 +2641,7 @@ impl Client {
                 );
                 log::info!(
                     "[msg:{}] Decrypted after PN→LID session migration for {}",
-                    info.id,
+                    ObservedId::new(info.id.as_str()),
                     info.source.sender.observe()
                 );
                 if let Some(prekey_id) = decrypted.consumed_prekey_id {
@@ -2659,14 +2665,14 @@ impl Client {
             Err(SignalProtocolError::DuplicatedMessage(chain, counter)) => {
                 log::debug!(
                     "[msg:{}] Already processed (chain {chain}, counter {counter}) after migration",
-                    info.id
+                    ObservedId::new(info.id.as_str())
                 );
                 MigrationDecryptResult::Duplicate
             }
             Err(retry_err) => {
                 log::warn!(
                     "[msg:{}] Decryption still failed after PN→LID migration: {retry_err:?}",
-                    info.id
+                    ObservedId::new(info.id.as_str())
                 );
                 // A session was found and moved; whatever failed now is the
                 // terminal cause, not the error that opened the migration.

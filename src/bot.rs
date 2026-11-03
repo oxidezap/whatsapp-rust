@@ -652,15 +652,15 @@ impl Bot {
 
                 // Request pair code
                 match client_for_pair.pair_with_code(options).await {
-                    Ok(code) => {
-                        info!(target: "Bot/PairCode", "Pair code generated: {}", code);
+                    Ok(_) => {
+                        info!(target: "Bot/PairCode", "Pair code generated");
                     }
                     Err(e) => {
                         // Only logged here: `pair_with_code` already dispatched
                         // `Event::PairingCodeError`, which is what a consumer
                         // observes — this task is detached, so returning the
                         // error is not an option.
-                        warn!(target: "Bot/PairCode", "Failed to request pair code: {}", e);
+                        warn!(target: "Bot/PairCode", "Failed to request pair code (server rejection: {:?})", e.rejection());
                     }
                 }
             })).detach();

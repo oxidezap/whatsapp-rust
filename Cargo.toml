@@ -201,7 +201,7 @@ tracing = ["dep:tracing", "wacore/tracing"]
 # default: no dependency, zero overhead. Emits only; the application installs a
 # recorder (e.g. metrics-exporter-prometheus). See examples/metrics.rs.
 metrics = ["wacore/metrics"]
-# Render raw phone numbers in tracing fields instead of the redacted `pn#<hash>`.
+# Render raw phone numbers in logs/tracing fields instead of the redacted `pn#<hash>`.
 # Local debugging only; never enable in production.
 tracing-pii = ["wacore/tracing-pii", "wacore-binary/tracing-pii"]
 # Native fixtures for the client-level benchmarks (`benches/`). Not a public

@@ -2,6 +2,7 @@ pub mod attrs;
 pub mod builder;
 pub mod consts;
 mod decoder;
+pub mod diagnostics;
 pub mod encoder;
 pub mod error;
 pub mod jid;

@@ -182,7 +182,7 @@ impl Client {
     /// marshal its whole batch before touching the socket, which is what keeps
     /// the sends orderable.
     pub(crate) fn marshal_node_for_send(&self, node: Node) -> Result<Vec<u8>, ClientError> {
-        debug!(target: "Client/Send", "{}", DisplayableNode(&node));
+        debug!(target: "Client/Send", "{}", StanzaSummary::from(&node));
         if self.sent_node_waiter_count.load(Ordering::Acquire) > 0 {
             self.resolve_sent_node_waiters(&Arc::new(node.clone()));
         }

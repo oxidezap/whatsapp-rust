@@ -92,8 +92,11 @@ impl<'a> AttrParserRef<'a> {
             None => {
                 // to_jid() only returns None if it's a String that failed to parse
                 if let ValueRef::String(s) = v {
-                    self.errors
-                        .push(BinaryError::AttrParse(format!("Invalid JID: {s}")));
+                    self.errors.push(BinaryError::AttrParse(format!(
+                        "Invalid JID for key {} ({} bytes)",
+                        crate::diagnostics::ProtocolText::new(key),
+                        s.len()
+                    )));
                 }
                 None
             }
@@ -138,7 +141,9 @@ impl<'a> AttrParserRef<'a> {
                 Some(val) => Some(val),
                 None => {
                     self.errors.push(BinaryError::AttrParse(format!(
-                        "Failed to parse bool from '{s}' for key '{key}'"
+                        "Failed to parse bool for key {} ({} bytes)",
+                        crate::diagnostics::ProtocolText::new(key),
+                        s.len()
                     )));
                     None
                 }
@@ -164,7 +169,9 @@ impl<'a> AttrParserRef<'a> {
                 Ok(val) => Some(val),
                 Err(e) => {
                     self.errors.push(BinaryError::AttrParse(format!(
-                        "Failed to parse u64 from '{s}' for key '{key}': {e}"
+                        "Failed to parse u64 for key {} ({} bytes): {e}",
+                        crate::diagnostics::ProtocolText::new(key),
+                        s.len()
                     )));
                     None
                 }
@@ -193,7 +200,9 @@ impl<'a> AttrParserRef<'a> {
                 Ok(val) => Some(val),
                 Err(e) => {
                     self.errors.push(BinaryError::AttrParse(format!(
-                        "Failed to parse i64 from '{s}' for key '{key}': {e}"
+                        "Failed to parse i64 for key {} ({} bytes): {e}",
+                        crate::diagnostics::ProtocolText::new(key),
+                        s.len()
                     )));
                     None
                 }
@@ -307,7 +316,9 @@ impl<'a> AttrParser<'a> {
                 Some(val) => Some(val),
                 None => {
                     self.errors.push(BinaryError::AttrParse(format!(
-                        "Failed to parse bool from '{s}' for key '{key}'"
+                        "Failed to parse bool for key {} ({} bytes)",
+                        crate::diagnostics::ProtocolText::new(key),
+                        s.len()
                     )));
                     None
                 }
@@ -334,7 +345,9 @@ impl<'a> AttrParser<'a> {
                 Ok(val) => Some(val),
                 Err(e) => {
                     self.errors.push(BinaryError::AttrParse(format!(
-                        "Failed to parse u64 from '{s}' for key '{key}': {e}"
+                        "Failed to parse u64 for key {} ({} bytes): {e}",
+                        crate::diagnostics::ProtocolText::new(key),
+                        s.len()
                     )));
                     None
                 }
@@ -363,7 +376,9 @@ impl<'a> AttrParser<'a> {
                 Ok(val) => Some(val),
                 Err(e) => {
                     self.errors.push(BinaryError::AttrParse(format!(
-                        "Failed to parse i64 from '{s}' for key '{key}': {e}"
+                        "Failed to parse i64 for key {} ({} bytes): {e}",
+                        crate::diagnostics::ProtocolText::new(key),
+                        s.len()
                     )));
                     None
                 }
@@ -375,6 +390,35 @@ impl<'a> AttrParser<'a> {
 mod required_getter_tests {
     use super::*;
     use crate::builder::NodeBuilder;
+
+    #[test]
+    fn rejected_values_do_not_become_nested_error_payloads() {
+        let node = NodeBuilder::new("message")
+            .attr("from", "synthetic-credential")
+            .attr("offline", "synthetic-key-bytes")
+            .attr("count", "synthetic-message-content")
+            .build();
+        let borrowed = node.as_node_ref();
+        let mut parser = AttrParserRef::new(&borrowed);
+        parser.jid("from");
+        parser.bool("offline");
+        parser.optional_u64("count");
+        let error = parser
+            .finish()
+            .expect_err("invalid attribute values must fail");
+        let output = format!("{error}: {error:#?}");
+        for marker in [
+            "synthetic-credential",
+            "synthetic-key-bytes",
+            "synthetic-message-content",
+        ] {
+            assert!(!output.contains(marker));
+        }
+        assert!(output.contains("Invalid JID"));
+        assert!(output.contains("bool"));
+        assert!(output.contains("u64"));
+        assert!(output.contains("offline"));
+    }
 
     /// The required getters used to look the attribute up once to report it
     /// missing and again to read it. Folding that into one lookup must not move
