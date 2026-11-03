@@ -265,15 +265,22 @@ pub(crate) fn append_session_parts(
     incarnation: Option<&[u8; 16]>,
     out: &mut Vec<u8>,
 ) {
-    SessionParts {
+    let message = SessionParts {
         current,
         previous,
         metadata: ReservationFields {
             reservation,
             incarnation,
         },
+    };
+    // Archived bytes dominate large snapshots. Size a fresh or undersized
+    // buffer once instead of repeatedly copying its already-written history.
+    // Reused buffers and sessions without archives keep the direct write path.
+    let history_bytes: usize = previous.iter().map(|state| state.encoded().len()).sum();
+    if history_bytes > out.capacity() - out.len() {
+        out.reserve(encoded_len(&message));
     }
-    .encode(&mut VecSink(out));
+    message.encode(&mut VecSink(out));
 }
 
 pub(crate) fn append_sender_record(
