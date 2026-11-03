@@ -1681,7 +1681,14 @@ impl SignalStoreCache {
         let change = match previous.filter(|bytes| !bytes.is_empty()) {
             None => IdentityChange::NewOrUnchanged,
             Some(bytes) => {
-                let previous = IdentityKey::new(PublicKey::from_djb_public_key_bytes(bytes)?);
+                let previous = IdentityKey::new(
+                    PublicKey::from_djb_public_key_bytes(bytes).map_err(|error| {
+                        SignalProtocolError::BackendError(
+                            "stored record",
+                            Box::new(SignalProtocolError::from(error)),
+                        )
+                    })?,
+                );
                 if previous == *identity {
                     IdentityChange::NewOrUnchanged
                 } else {
@@ -4037,6 +4044,41 @@ mod sender_key_lock_tests {
             cache.try_get_identity(&addr),
             Some(None),
             "known-absent identity must answer synchronously"
+        );
+    }
+}
+
+#[cfg(test)]
+mod identity_save_error_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn corrupt_identity_saves_report_storage_failure_without_overwriting() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let address = ProtocolAddress::new("15550009999", 0.into());
+        let replacement =
+            IdentityKey::new(PublicKey::from_djb_public_key_bytes(&[22; 32]).unwrap());
+        cache.put_identity(&address, &[11; 31]).await;
+
+        let synchronous = cache.try_save_identity(&address, &replacement).unwrap();
+        let asynchronous = cache.save_identity(&address, &replacement, &backend).await;
+        for result in [synchronous, asynchronous] {
+            let Err(SignalProtocolError::BackendError("stored record", source)) = result else {
+                panic!("a corrupt persisted key must remain a storage failure");
+            };
+            assert!(source.downcast_ref::<SignalProtocolError>().is_some());
+        }
+        assert_eq!(
+            cache.try_get_identity(&address).unwrap().unwrap().as_ref(),
+            &[11; 31],
+        );
+        assert!(
+            backend
+                .load_identity(address.as_str())
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 }

@@ -1208,13 +1208,10 @@ mod tests {
             .cache
             .put_identity(&addr, &[11; 31])
             .await;
-        assert!(
-            adapter
-                .identity_store
-                .save_identity(&addr, &current)
-                .await
-                .is_err()
-        );
+        assert!(matches!(
+            adapter.identity_store.save_identity(&addr, &current).await,
+            Err(SignalProtocolError::BackendError("stored record", _))
+        ));
         assert_eq!(
             adapter
                 .identity_store
