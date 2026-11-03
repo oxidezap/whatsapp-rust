@@ -37,7 +37,7 @@ pub(crate) fn private_keys_match(left: Option<&[u8; 32]>, right: Option<&[u8; 32
 impl PreparedContext {
     fn matches(&self, public: &[u8; 32], private: Option<&[u8; 32]>) -> bool {
         self.public == *public
-            && private_keys_match(self.private.as_ref().map(|key| &**key), private)
+            && private_keys_match(self.private.as_deref(), private)
     }
 }
 impl GroupCryptoCache {
@@ -101,7 +101,7 @@ impl GroupCryptoCache {
     /// provider handles retain their own contexts until their operation completes.
     pub(crate) fn retain(&self, mut keep: impl FnMut(&[u8; 32], Option<&[u8; 32]>) -> bool) {
         self.entries()
-            .retain(|entry| keep(&entry.public, entry.private.as_ref().map(|key| &**key)));
+            .retain(|entry| keep(&entry.public, entry.private.as_deref()));
     }
 }
 #[derive(Clone)]

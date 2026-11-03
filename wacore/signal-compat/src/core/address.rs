@@ -50,9 +50,9 @@ pub struct ProtocolAddress {
     device: DeviceId,
 }
 impl ProtocolAddress {
-    pub fn new(name: impl AsRef<str>, device: DeviceId) -> Self {
+    pub fn new(name: &str, device: DeviceId) -> Self {
         let mut out = Self::empty(device);
-        out.reset_with(|buf| buf.push_str(name.as_ref()));
+        out.reset_with(|buf| buf.push_str(name));
         out
     }
     pub fn empty(device: DeviceId) -> Self {

@@ -374,8 +374,10 @@ mod tests {
 
     #[test]
     fn zero_ceiling_omits_all_reservation_fields_and_override_wins() {
-        let mut reservation = Reservation::default();
-        reservation.incarnation = Some([7; 16]);
+        let mut reservation = Reservation {
+            incarnation: Some([7; 16]),
+            ..Reservation::default()
+        };
         for ceiling in [None, Some(0)] {
             reservation.ceiling = ceiling;
             let mut out = Vec::new();
@@ -407,9 +409,11 @@ mod tests {
                 bytes: second.into(),
             },
         ];
-        let mut reservation = Reservation::default();
-        reservation.ceiling = Some(129);
-        reservation.incarnation = Some([7; 16]);
+        let reservation = Reservation {
+            ceiling: Some(129),
+            incarnation: Some([7; 16]),
+            ..Reservation::default()
+        };
         let parts = SessionParts {
             current: Some(&current),
             previous: &previous,
