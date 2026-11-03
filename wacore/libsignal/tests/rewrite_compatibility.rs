@@ -39,9 +39,7 @@ fn independent_signatures_cross_verify_with_legacy_signatures() {
             .private_key
             .calculate_signature(message, &mut random.0)
             .unwrap();
-        RustCrypto
-            .verify(&key.public, message, &signature)
-            .unwrap();
+        RustCrypto.verify(&key.public, message, &signature).unwrap();
     }
 }
 

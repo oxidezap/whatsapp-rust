@@ -58,34 +58,13 @@ impl<'ast> Visit<'ast> for Boundary {
 fn signal_transitions_have_no_io_executor_clock_or_global_randomness() {
     for (name, source) in [
         ("lib", include_str!("../src/lib.rs")),
-        (
-            "encode",
-            include_str!("../src/encode.rs"),
-        ),
-        (
-            "codec",
-            include_str!("../src/codec.rs"),
-        ),
-        (
-            "crypto",
-            include_str!("../src/crypto.rs"),
-        ),
-        (
-            "rustcrypto",
-            include_str!("../src/rustcrypto.rs"),
-        ),
-        (
-            "pairwise",
-            include_str!("../src/pairwise.rs"),
-        ),
-        (
-            "sender",
-            include_str!("../src/sender.rs"),
-        ),
-        (
-            "state",
-            include_str!("../src/state.rs"),
-        ),
+        ("encode", include_str!("../src/encode.rs")),
+        ("codec", include_str!("../src/codec.rs")),
+        ("crypto", include_str!("../src/crypto.rs")),
+        ("rustcrypto", include_str!("../src/rustcrypto.rs")),
+        ("pairwise", include_str!("../src/pairwise.rs")),
+        ("sender", include_str!("../src/sender.rs")),
+        ("state", include_str!("../src/state.rs")),
         ("wire", include_str!("../src/wire.rs")),
     ] {
         let syntax = syn::parse_file(source).unwrap();

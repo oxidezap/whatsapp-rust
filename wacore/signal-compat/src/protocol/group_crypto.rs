@@ -36,8 +36,7 @@ pub(crate) fn private_keys_match(left: Option<&[u8; 32]>, right: Option<&[u8; 32
 }
 impl PreparedContext {
     fn matches(&self, public: &[u8; 32], private: Option<&[u8; 32]>) -> bool {
-        self.public == *public
-            && private_keys_match(self.private.as_deref(), private)
+        self.public == *public && private_keys_match(self.private.as_deref(), private)
     }
 }
 impl GroupCryptoCache {
