@@ -97,6 +97,34 @@ jobs:
           path: .retention-out/results
           retention-days: 14
 
+  signal-walltime:
+    name: Signal rewrite walltime (matched legacy and replacement)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@${{ env.PROTOC_VERSION }},cargo-codspeed@5.0.2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: signal-rewrite-walltime
+          cache-targets: "false"
+      - name: Build matched Signal benchmarks
+        run: cargo codspeed build -m walltime -p wacore-libsignal --bench rewrite_benchmark
+      - name: Measure native Signal transitions and storage
+        uses: CodSpeedHQ/action@61efe07e57e55bedeab750c434504de272a56e8c # v5.6.1
+        with:
+          mode: walltime
+          runner-version: "5.4.2"
+          run: cargo codspeed run -p wacore-libsignal --bench rewrite_benchmark
+
   prefetch-walltime:
     name: Prefetch walltime (shared-host diagnostic)
     runs-on: ubuntu-24.04
