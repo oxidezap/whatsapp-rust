@@ -515,6 +515,7 @@ impl Client {
             retry_admission,
             decrypt_failure_admission,
             noise_cert_policy,
+            additional_static_media_hosts,
             history_sync_admission,
             connect_admission,
         } = extensions;
@@ -560,6 +561,7 @@ impl Client {
             send_active_receipts: AtomicU32::new(0),
             ik_handshake_failures: AtomicU32::new(0),
             noise_cert_policy,
+            additional_static_media_hosts,
             shutdown_notifier: wacore::runtime::ShutdownNotifier::new(),
             connection_shutdown: std::sync::Mutex::new(wacore::runtime::ShutdownNotifier::new()),
             protocol_terminal_reason: std::sync::Mutex::new(None),

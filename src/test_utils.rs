@@ -3,6 +3,88 @@ use std::sync::Arc;
 use crate::Client;
 use wacore_binary::{Jid, Node, OwnedNodeRef};
 
+#[cfg(test)]
+pub(crate) fn adv_test_account() -> &'static wacore::libsignal::protocol::KeyPair {
+    static KEY: std::sync::OnceLock<wacore::libsignal::protocol::KeyPair> =
+        std::sync::OnceLock::new();
+    KEY.get_or_init(|| {
+        wacore::libsignal::protocol::KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>())
+    })
+}
+
+#[cfg(test)]
+pub(crate) async fn seed_adv_primary(client: &Client, user: &Jid) {
+    use wacore::types::jid::JidExt;
+    client
+        .signal_cache
+        .put_identity(
+            &user.with_device(0).to_protocol_address(),
+            adv_test_account().public_key.public_key_bytes(),
+        )
+        .await;
+}
+
+#[cfg(test)]
+pub(crate) fn sign_adv_key_index(details: Vec<u8>) -> Vec<u8> {
+    let mut signed = waproto::whatsapp::ADVSignedKeyIndexList::default();
+    signed.account_signature = Some(
+        adv_test_account()
+            .private_key
+            .calculate_signature(
+                &[&[6, 2], details.as_slice()].concat(),
+                &mut rand::make_rng::<rand::rngs::StdRng>(),
+            )
+            .unwrap()
+            .to_vec(),
+    );
+    signed.details = Some(details);
+    waproto::codec::adv_signed_key_index_list_to_vec(&signed)
+}
+
+#[cfg(test)]
+pub(crate) async fn signed_device_add(
+    client: &Client,
+    user: &str,
+    device: &wacore::stanza::devices::DeviceElement,
+) {
+    seed_adv_primary(client, &device.jid).await;
+    let Some(mut record) = client.load_device_record(user).await else {
+        client.patch_device_add(user, device, None).await;
+        return;
+    };
+    record.edit_devices(|devices| {
+        for old in devices {
+            if old.device_id() != 0 && old.key_index().is_none() {
+                *old = wacore::store::traits::DeviceInfo::new(
+                    old.device_id(),
+                    Some(u32::from(old.device_id())),
+                )
+                .with_hosting(old.is_hosted());
+            }
+        }
+    });
+    client.update_device_list(record.clone()).await.unwrap();
+    let mut device = device.clone();
+    let index = *device.key_index.get_or_insert(u32::from(device.jid.device));
+    let mut details = waproto::whatsapp::ADVKeyIndexList::default();
+    details.raw_id = record.raw_id.or(Some(1));
+    details.timestamp = Some(100);
+    details.valid_indexes = record
+        .devices
+        .iter()
+        .filter_map(|old| old.key_index())
+        .chain([index])
+        .collect();
+    details.current_index = details.valid_indexes.iter().copied().max();
+    let signed = wacore::stanza::devices::KeyIndexInfo {
+        timestamp: 100,
+        signed_bytes: Some(sign_adv_key_index(
+            waproto::codec::adv_key_index_list_to_vec(&details),
+        )),
+    };
+    client.patch_device_add(user, &device, Some(&signed)).await;
+}
+
 /// Marshal a `Node` into an `Arc<OwnedNodeRef>` for use in tests, through the
 /// same unpack step the receive path takes.
 pub fn node_to_owned_ref(node: &Node) -> Arc<OwnedNodeRef> {

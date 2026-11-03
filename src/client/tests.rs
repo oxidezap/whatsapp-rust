@@ -3879,6 +3879,9 @@ fn client_size_pins_runtime_cache_config_saving() {
         expected += size_of::<Option<Arc<dyn wacore::time::Clock>>>();
     }
 
+    // The static-media allowlist is an empty boxed slice by default. Its two
+    // inline words are independent of feature-sensitive cache attachments.
+    expected += size_of::<Box<[wacore::download::MediaHost]>>();
     let retry_slot = size_of::<Option<Arc<dyn crate::RetryAdmission>>>();
     let decrypt_slot = size_of::<Option<Arc<dyn crate::DecryptFailureAdmission>>>();
     let handler_slot = size_of::<Option<HashMap<String, Arc<dyn EncHandler>>>>();
@@ -7286,6 +7289,23 @@ mod ensure_sessions_concurrency {
             }
         }
 
+        fn certificate(&self) -> Vec<u8> {
+            let pair = KeyPair::new(
+                *self.identity.identity_key().public_key(),
+                self.identity.private_key().clone(),
+            );
+            waproto::codec::adv_signed_device_identity_to_vec(
+                &wacore::adv::test_util::signed_identity(
+                    &pair,
+                    &pair,
+                    b"\x18\x01",
+                    &[6, 0],
+                    Some(&[6, 1]),
+                    true,
+                ),
+            )
+        }
+
         /// A `<user>` bundle response. The one-time prekey id varies per call,
         /// as the server's does: each fetch burns one of the peer's prekeys.
         fn bundle_response(&self, jid: &Jid, request_id: &str, one_time_id: u32) -> Node {
@@ -7301,6 +7321,9 @@ mod ensure_sessions_concurrency {
                     .children([NodeBuilder::new("user")
                         .attr("jid", jid.to_string())
                         .children([
+                            NodeBuilder::new("device-identity")
+                                .bytes(self.certificate())
+                                .build(),
                             NodeBuilder::new("registration")
                                 .bytes(1234u32.to_be_bytes().to_vec())
                                 .build(),
@@ -7332,6 +7355,174 @@ mod ensure_sessions_concurrency {
                     .build()])
                 .build()
         }
+    }
+
+    #[tokio::test]
+    async fn cold_companion_cannot_omit_requested_primary_even_with_embedded_account_key() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let peer = Jid::pn("12025550129").with_device(2);
+        let running = client.clone();
+        let requested = peer.clone();
+        let task = tokio::spawn(async move { running.fetch_pre_keys(&[requested], None).await });
+        let request = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let id = request
+            .get()
+            .attrs()
+            .optional_string("id")
+            .unwrap()
+            .into_owned();
+        let keys = PeerKeys::generate();
+        crate::test_utils::answer_iq(&client, &id, &keys.bundle_response(&peer, &id, 1)).await;
+        assert!(task.await.unwrap().unwrap().bundles.is_empty());
+        assert!(
+            client
+                .cached_adv_account_identity(&peer)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn cold_companion_only_fetch_authenticates_trimmed_certificate() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let primary = Jid::pn("12025550128");
+        let companion = primary.with_device(2);
+        client.inbound_commit_batch.reset();
+        client.swap_message_semaphore(1);
+        let processing_permit = client.acquire_message_processing_permit().await;
+        let running = client.clone();
+        let requested = companion.clone();
+        let task = tokio::spawn(async move {
+            let lock = running
+                .session_lock_for(requested.to_protocol_address().as_str())
+                .await;
+            let _session = lock.lock().await;
+            running.fetch_pre_keys(&[requested], None).await
+        });
+        let request = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let id = request
+            .get()
+            .attrs()
+            .optional_string("id")
+            .unwrap()
+            .into_owned();
+        let requested: Vec<_> = request
+            .get()
+            .get_optional_child("key")
+            .unwrap()
+            .children()
+            .unwrap()
+            .iter()
+            .map(|user| user.attrs().optional_jid("jid").unwrap())
+            .collect();
+        assert!(requested.contains(&primary));
+        assert!(requested.contains(&companion));
+        let keys = PeerKeys::generate();
+        let mut companion_user = keys.bundle_response(&companion, &id, 1).children().unwrap()[0]
+            .children()
+            .unwrap()[0]
+            .clone();
+        let mut certificate =
+            waproto::codec::adv_signed_device_identity_decode(&keys.certificate()).unwrap();
+        certificate.account_signature_key = None;
+        if let Some(wacore_binary::NodeContent::Nodes(children)) = &mut companion_user.content {
+            children
+                .iter_mut()
+                .find(|node| node.tag == "device-identity")
+                .unwrap()
+                .content = Some(wacore_binary::NodeContent::Bytes(
+                waproto::codec::adv_signed_device_identity_to_vec(&certificate),
+            ));
+        }
+        let primary_user = keys.bundle_response(&primary, &id, 2).children().unwrap()[0]
+            .children()
+            .unwrap()[0]
+            .clone();
+        let unsolicited = Jid::pn("12025550130");
+        let unsolicited_user = keys
+            .bundle_response(&unsolicited, &id, 4)
+            .children()
+            .unwrap()[0]
+            .children()
+            .unwrap()[0]
+            .clone();
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("id", id.as_str())
+            .children([NodeBuilder::new("list")
+                .children([companion_user, primary_user, unsolicited_user])
+                .build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &id, &response).await;
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("bootstrap must not acquire the held processing permit")
+            .unwrap()
+            .unwrap();
+        drop(processing_permit);
+        assert!(
+            client
+                .cached_adv_account_identity(&unsolicited)
+                .await
+                .unwrap()
+                .is_none(),
+            "unsolicited primary keys must never become trusted"
+        );
+        assert!(
+            client
+                .persistence_manager
+                .backend()
+                .load_identity(unsolicited.to_protocol_address().as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(result.bundles.contains_key(&companion));
+        assert_eq!(
+            client
+                .persistence_manager
+                .backend()
+                .load_identity(primary.to_protocol_address().as_str())
+                .await
+                .unwrap(),
+            Some(
+                keys.identity
+                    .public_key()
+                    .public_key_bytes()
+                    .try_into()
+                    .unwrap()
+            )
+        );
+        let next = primary.with_device(3);
+        let running = client.clone();
+        let task = tokio::spawn(async move { running.fetch_pre_keys(&[next], None).await });
+        let request = crate::test_utils::decode_sent_iq(&transport, 1).await;
+        let next_id = request
+            .get()
+            .attrs()
+            .optional_string("id")
+            .unwrap()
+            .into_owned();
+        let replacement = PeerKeys::generate();
+        crate::test_utils::answer_iq(
+            &client,
+            &next_id,
+            &replacement.bundle_response(&primary.with_device(3), &next_id, 3),
+        )
+        .await;
+        let second = task.await.unwrap().unwrap();
+        assert!(
+            second.bundles.is_empty(),
+            "a different primary key cannot authenticate a later companion"
+        );
+
+        assert!(
+            !result.bundles.contains_key(&primary),
+            "bootstrap keys must not expand the requested outcome"
+        );
+        client.signal_shutdown_sync();
     }
 
     /// Runs `CONCURRENT_CALLS` ensures for `peer` while answering every prekey
@@ -7632,6 +7823,15 @@ mod ensure_sessions_concurrency {
         let shared = Jid::lid_device("444444444444444".to_string(), 0);
         let extra = Jid::lid_device("444444444444444".to_string(), 3);
         let keys = PeerKeys::generate();
+        // This test isolates session-fetch coalescing with existing account
+        // trust. The cold trimmed-certificate test covers primary bootstrap.
+        client
+            .signal_cache
+            .put_identity(
+                &shared.to_protocol_address(),
+                keys.identity.public_key().public_key_bytes(),
+            )
+            .await;
 
         let leader = {
             let client = client.clone();

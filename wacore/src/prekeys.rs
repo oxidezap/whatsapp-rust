@@ -202,6 +202,37 @@ impl PreKeyUtils {
             .ok_or_else(|| anyhow::anyhow!("<list> not found in pre-key response"))?;
 
         let children = list_node.children().unwrap_or_default();
+        // A normal fanout fetch includes the primary and companions together.
+        // Authenticate the primary's signed prekey first so trimmed companion
+        // certificates can use the same first-contact identity as Signal.
+        let mut primary_identities = HashMap::new();
+        for user in children {
+            let Some(jid) = user.attrs().optional_jid("jid") else {
+                continue;
+            };
+            if jid.device != 0 || jid.user.contains(':') {
+                continue;
+            }
+            let Ok(bundle) = Self::node_to_pre_key_bundle_ref(&jid, user, None) else {
+                continue;
+            };
+            let Ok(identity) = bundle.identity_key() else {
+                continue;
+            };
+            let (Ok(prekey), Ok(signature)) = (
+                bundle.signed_pre_key_public(),
+                bundle.signed_pre_key_signature(),
+            ) else {
+                continue;
+            };
+            if identity
+                .public_key()
+                .verify_signature(&prekey.serialize(), signature)
+                && let Ok(key) = <[u8; 32]>::try_from(identity.public_key().public_key_bytes())
+            {
+                primary_identities.insert(jid, key);
+            }
+        }
         let mut outcome = PreKeyFetchOutcome {
             bundles: HashMap::with_capacity(children.len()),
             rejected: Vec::new(),
@@ -258,7 +289,9 @@ impl PreKeyUtils {
                 }
                 continue;
             }
-            let account_identity = account_identities.get(&jid);
+            let account_identity = account_identities
+                .get(&jid)
+                .or_else(|| primary_identities.get(&jid.with_device(0)));
             let bundle =
                 match Self::node_to_pre_key_bundle_ref(&jid, user_node_ref, account_identity) {
                     Ok(b) => b,
@@ -354,9 +387,7 @@ impl PreKeyUtils {
         // account key is the in-blob `account_signature_key` or, when the server
         // omits it (the normal case for a contact's companion), the account's
         // primary identity from the store (`account_identity`). Invalid → reject
-        // the bundle; a missing device-identity or an unverifiable-for-lack-of-key
-        // chain is logged but not fatal (WA Web throws here, but our store-set is
-        // best-effort and a relay could already strip <device-identity> entirely).
+        // the bundle. A missing certificate or primary identity also fails closed.
         if jid.device != 0 {
             let device_identity = node
                 .get_optional_child("device-identity")
@@ -378,13 +409,11 @@ impl PreKeyUtils {
                             "device-identity ADV validation failed for companion {jid}"
                         ));
                     }
-                    crate::adv::AdvValidation::NoAccountKey => log::debug!(
-                        "prekey bundle for companion {jid} omits account_signature_key and no stored account identity; proceeding without ADV validation"
-                    ),
+                    crate::adv::AdvValidation::NoAccountKey => {
+                        anyhow::bail!("companion ADV account identity unavailable");
+                    }
                 },
-                None => log::warn!(
-                    "prekey bundle for companion {jid} omits <device-identity>; proceeding without ADV validation"
-                ),
+                None => anyhow::bail!("companion prekey bundle omits device identity"),
             }
         }
 
@@ -468,7 +497,7 @@ impl PreKeyUtils {
 mod tests {
     use super::*;
     use crate::iq::prekeys::PreKeyBundleUserNode;
-    use crate::libsignal::protocol::{IdentityKeyPair, KeyPair};
+    use crate::libsignal::protocol::KeyPair;
     use crate::protocol::ProtocolNode;
 
     use wacore_binary::NodeValue;
@@ -521,9 +550,27 @@ mod tests {
         assert_eq!(extract_prekey_public_key(&bad_wire), None);
     }
 
+    fn mock_device_key() -> &'static KeyPair {
+        static KEY: std::sync::OnceLock<KeyPair> = std::sync::OnceLock::new();
+        KEY.get_or_init(|| KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>()))
+    }
+
+    fn mock_certificate() -> Vec<u8> {
+        use buffa::Message;
+        let account = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        crate::adv::test_util::signed_identity(
+            &account,
+            mock_device_key(),
+            b"\x18\x01",
+            &[6, 0],
+            Some(&[6, 1]),
+            true,
+        )
+        .encode_to_vec()
+    }
+
     fn create_mock_bundle(device_id: u32) -> PreKeyBundle {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-        let identity_pair = IdentityKeyPair::generate(&mut rng);
         let signed_prekey_pair = KeyPair::generate(&mut rng);
         let prekey_pair = KeyPair::generate(&mut rng);
 
@@ -534,7 +581,7 @@ mod tests {
             2u32.into(),
             signed_prekey_pair.public_key,
             vec![0u8; 64],
-            *identity_pair.identity_key(),
+            IdentityKey::new(mock_device_key().public_key),
         )
         .expect("Failed to create PreKeyBundle")
     }
@@ -543,9 +590,10 @@ mod tests {
     fn test_parse_prekeys_response_normalizes_lid_device_jid() {
         let base_jid = Jid::lid_device("100000012345678", 33);
         let bundle = create_mock_bundle(33);
-        let mut user_node = PreKeyBundleUserNode::from_bundle(base_jid.clone(), &bundle, None)
-            .expect("build bundle node")
-            .into_node();
+        let mut user_node =
+            PreKeyBundleUserNode::from_bundle(base_jid.clone(), &bundle, Some(mock_certificate()))
+                .expect("build bundle node")
+                .into_node();
 
         let raw_jid = Jid {
             user: "100000012345678:33".into(),
@@ -587,10 +635,13 @@ mod tests {
         let good_jid = Jid::lid_device("100000012345678", 1);
         let gone_jid = Jid::lid_device("100000087654321", 2);
 
-        let good =
-            PreKeyBundleUserNode::from_bundle(good_jid.clone(), &create_mock_bundle(1), None)
-                .expect("build bundle node")
-                .into_node();
+        let good = PreKeyBundleUserNode::from_bundle(
+            good_jid.clone(),
+            &create_mock_bundle(1),
+            Some(mock_certificate()),
+        )
+        .expect("build bundle node")
+        .into_node();
 
         // What the server sends in place of key material for a device it no
         // longer knows: an <error> where the bundle would be.
@@ -799,26 +850,22 @@ mod tests {
         );
     }
 
-    // A trimmed device-identity (no account_signature_key) with no stored
-    // account-identity fallback is unverifiable, not forged: the bundle must be
-    // KEPT (proceed without ADV), otherwise the companion stops receiving. This
-    // is the regression #772 introduced (it dropped the bundle outright).
     #[test]
-    fn parse_keeps_companion_bundle_when_account_key_omitted_and_no_fallback() {
-        use crate::libsignal::protocol::KeyPair;
+    fn parse_rejects_companion_without_a_trusted_account_key() {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let account = KeyPair::generate(&mut rng);
         let device = KeyPair::generate(&mut rng);
         let companion = Jid::lid_device("100000012345678", 33);
-        // device-identity without account_signature_key, signatures over the
-        // bundle's identity key (create_mock_bundle's identity is unrelated, but
-        // the NoAccountKey path short-circuits before signature checks anyway).
         let di = trimmed_device_identity(&account, &device, b"\x18\x01");
-        let bundles = parse_one(companion.clone(), Some(di));
         assert!(
-            bundles.contains_key(&companion),
-            "trimmed device-identity with no fallback must be kept, not dropped"
+            !parse_one(companion, Some(di)).contains_key(&Jid::lid_device("100000012345678", 33))
         );
+    }
+
+    #[test]
+    fn parse_rejects_companion_without_a_certificate() {
+        let companion = Jid::lid_device("100000012345678", 33);
+        assert!(!parse_one(companion.clone(), None).contains_key(&companion));
     }
 
     #[test]

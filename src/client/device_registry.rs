@@ -988,7 +988,7 @@ impl Client {
     /// 3. Add the new device
     /// 4. Replace the full device record
     ///
-    /// If `signed_bytes` is absent, falls back to simple append (lenient).
+    /// Missing or unverifiable signed bytes never authorize a device addition.
     ///
     /// New devices need no explicit cache invalidation: `resolve_skdm_targets`
     /// queries the registry on each send and `device_has_key()` returns `None`
@@ -1022,69 +1022,68 @@ impl Client {
 
         let signed_bytes = key_index_info.and_then(|ki| ki.signed_bytes.as_deref());
 
-        if let Some(bytes) = signed_bytes {
-            if let Some(decoded) = wacore::adv::decode_key_index_list(bytes) {
-                // Clear tracking before pruning, including an ID re-added by
-                // this same notification with a different key index.
-                let identity_changed = record.raw_id.is_some_and(|raw_id| raw_id != decoded.raw_id);
-                for previous in &record.devices {
-                    if previous.device_id() != 0
-                        && (identity_changed
-                            || !wacore::adv::is_key_index_valid(previous.key_index(), &decoded))
-                        && let Err(error) = self
-                            .delete_sender_key_rows_for_device(user, previous.device_id())
-                            .await
-                    {
-                        warn!(
-                            "patch_device_add: sender-key cleanup failed for {}: {error}",
-                            wacore_binary::jid::ObservedJid::from(user)
-                        );
-                        return;
-                    }
-                }
-                // Check raw_id mismatch (identity change)
-                // TODO: WA Web also triggers clearRecord on advAccountType change
-                // (HOSTED ↔ E2EE), gated behind bizCoexGatingUtils.bizHostedDevicesEnabled().
-                // Add when we implement hosted device coexistence support.
-                if let Some(stored_raw_id) = record.raw_id
-                    && stored_raw_id != decoded.raw_id
+        let Some(bytes) = signed_bytes else {
+            return;
+        };
+        let Ok(Some(identity)) = self.cached_adv_account_identity(&device.jid).await else {
+            return;
+        };
+        if let Some(decoded) = wacore::adv::verify_key_index_list(bytes, &identity) {
+            // Clear tracking before pruning, including an ID re-added by
+            // this same notification with a different key index.
+            let identity_changed = record.raw_id.is_some_and(|raw_id| raw_id != decoded.raw_id);
+            for previous in &record.devices {
+                if previous.device_id() != 0
+                    && (identity_changed
+                        || !wacore::adv::is_key_index_valid(previous.key_index(), &decoded))
+                    && let Err(error) = self
+                        .delete_sender_key_rows_for_device(user, previous.device_id())
+                        .await
                 {
-                    info!(
-                        "raw_id mismatch for user {}: stored={stored_raw_id}, received={}. Resetting companion devices.",
-                        wacore_binary::jid::ObservedJid::from(user),
-                        decoded.raw_id
+                    warn!(
+                        "patch_device_add: sender-key cleanup failed for {}: {error}",
+                        wacore_binary::jid::ObservedJid::from(user)
                     );
-                    self.clear_device_record(user, device.jid.server.as_str(), &record)
-                        .await;
-                    record.edit_devices(|devices| devices.retain(|device| device.device_id() == 0));
-                } else {
-                    // Filter stale devices by valid_indexes. A raw_id reset already
-                    // removed every companion while preserving primary metadata.
-                    record.edit_devices(|devices| {
-                        wacore::adv::retain_devices_by_key_index(devices, &decoded)
-                    });
+                    return;
                 }
-                record.raw_id = Some(decoded.raw_id);
-
-                // Only trust notification metadata when its key index is accepted.
-                if wacore::adv::is_key_index_valid(device.key_index, &decoded) {
-                    self.append_or_refresh_device(
-                        &mut record,
-                        device_id,
-                        device.key_index,
-                        is_hosted,
-                    );
-                }
-            } else {
-                warn!(
-                    "patch_device_add: failed to decode key-index-list for user {}",
-                    wacore_binary::jid::ObservedJid::from(user)
+            }
+            // Check raw_id mismatch (identity change)
+            // TODO: WA Web also triggers clearRecord on advAccountType change
+            // (HOSTED ↔ E2EE), gated behind bizCoexGatingUtils.bizHostedDevicesEnabled().
+            // Add when we implement hosted device coexistence support.
+            if let Some(stored_raw_id) = record.raw_id
+                && stored_raw_id != decoded.raw_id
+            {
+                info!(
+                    "raw_id mismatch for user {}: stored={stored_raw_id}, received={}. Resetting companion devices.",
+                    wacore_binary::jid::ObservedJid::from(user),
+                    decoded.raw_id
                 );
+                self.clear_device_record(user, device.jid.server.as_str(), &record)
+                    .await;
+                record.edit_devices(|devices| devices.retain(|device| device.device_id() == 0));
+            } else {
+                // Filter stale devices by valid_indexes. A raw_id reset already
+                // removed every companion while preserving primary metadata.
+                record.edit_devices(|devices| {
+                    wacore::adv::retain_devices_by_key_index(devices, &decoded)
+                });
+            }
+            record.raw_id = Some(decoded.raw_id);
+
+            // Only trust notification metadata when its key index is accepted.
+            if device.key_index.is_some_and(|index| {
+                decoded.valid_indexes.contains(&index)
+                    || index > decoded.current_index
+                        && record.devices.iter().any(|previous| {
+                            previous.device_id() == device_id && previous.key_index() == Some(index)
+                        })
+            }) {
                 self.append_or_refresh_device(&mut record, device_id, device.key_index, is_hosted);
             }
         } else {
-            // No signed bytes — fall back to simple append
-            self.append_or_refresh_device(&mut record, device_id, device.key_index, is_hosted);
+            warn!("patch_device_add: invalid key-index-list signature");
+            return;
         }
 
         // WA Web `AdvDeviceNotificationApi.handleDeviceAddNotification` re-adds the
@@ -1132,7 +1131,7 @@ impl Client {
 
     /// Delete Signal sessions for specific device IDs in every user namespace,
     /// then flush. Shared by `clear_device_record` and `patch_device_remove`.
-    async fn delete_sessions_for_devices(&self, user: &str, device_ids: &[u16]) {
+    pub(crate) async fn delete_sessions_for_devices(&self, user: &str, device_ids: &[u16]) {
         let lookup = self.resolve_lookup_keys(user).await;
         for (key, server) in lookup.signal_namespaces() {
             for &device_id in device_ids {
@@ -1140,6 +1139,7 @@ impl Client {
                 jid.device = device_id;
                 let addr = wacore::types::jid::JidExt::to_protocol_address(&jid);
                 self.signal_cache.delete_session(&addr).await;
+                self.signal_cache.delete_identity(&addr).await;
             }
         }
         self.flush_signal_cache_batch_safe_logged("delete_sessions_for_devices", None)
@@ -2310,6 +2310,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unsigned_device_add_cannot_mutate_the_registry() {
+        let client = create_test_client().await;
+        let user = "15551234567";
+        setup_device_record(&client, user, &[0]).await;
+        crate::test_utils::seed_adv_primary(&client, &Jid::pn(user)).await;
+        let device = make_device_element(7, Some(7));
+        client.patch_device_add(user, &device, None).await;
+        let invalid = wacore::stanza::devices::KeyIndexInfo {
+            timestamp: 100,
+            signed_bytes: Some(vec![0xff]),
+        };
+        client.patch_device_add(user, &device, Some(&invalid)).await;
+        assert_eq!(
+            client.load_device_record(user).await.unwrap().devices.len(),
+            1
+        );
+        client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
     async fn test_patch_device_add_to_existing_cache() {
         let client = create_test_client().await;
 
@@ -2318,7 +2338,7 @@ mod tests {
 
         // Patch: add device 3
         let elem = make_device_element(3, Some(5));
-        client.patch_device_add("15551234567", &elem, None).await;
+        crate::test_utils::signed_device_add(&client, "15551234567", &elem).await;
 
         let updated = client
             .device_registry_cache
@@ -2340,7 +2360,7 @@ mod tests {
         // Patch: add device 3 again — should refresh its namespace, not duplicate it.
         let mut elem = make_device_element(3, None);
         elem.jid.server = Server::Hosted;
-        client.patch_device_add("15551234567", &elem, None).await;
+        crate::test_utils::signed_device_add(&client, "15551234567", &elem).await;
 
         let updated = client
             .device_registry_cache
@@ -2371,7 +2391,7 @@ mod tests {
 
         // No pre-populated cache — patch should be a no-op
         let elem = make_device_element(3, None);
-        client.patch_device_add("15551234567", &elem, None).await;
+        crate::test_utils::signed_device_add(&client, "15551234567", &elem).await;
 
         assert!(
             client
@@ -2530,7 +2550,7 @@ mod tests {
 
         // Patch: add device 3
         let elem = make_device_element(3, Some(2));
-        client.patch_device_add("15551234567", &elem, None).await;
+        crate::test_utils::signed_device_add(&client, "15551234567", &elem).await;
 
         let updated = client
             .device_registry_cache
@@ -2549,7 +2569,7 @@ mod tests {
 
         let mut elem = make_device_element(3, Some(2));
         elem.jid.server = Server::Hosted;
-        client.patch_device_add("15551234567", &elem, None).await;
+        crate::test_utils::signed_device_add(&client, "15551234567", &elem).await;
 
         let updated = client
             .device_registry_cache
@@ -2570,33 +2590,21 @@ mod tests {
         );
     }
 
-    /// Encode an `ADVSignedKeyIndexList` whose decoded `raw_id`/`valid_indexes`
-    /// drive `patch_device_add` (the signature is not verified locally; the
-    /// notification arrives over the authenticated Noise channel).
-    fn make_signed_key_index_bytes(
+    async fn make_signed_key_index_bytes(
+        client: &Client,
+        user: &str,
         raw_id: u32,
         current_index: u32,
         valid_indexes: Vec<u32>,
     ) -> Vec<u8> {
-        use buffa::Message;
-        let details = {
-            let mut proto_ = waproto::whatsapp::ADVKeyIndexList::default();
-            proto_.raw_id = Some(raw_id);
-            proto_.timestamp = Some(100);
-            proto_.current_index = Some(current_index);
-            proto_.valid_indexes = valid_indexes;
-            proto_.account_type = None;
-            proto_
-        }
-        .encode_to_vec();
-        {
-            let mut proto_ = waproto::whatsapp::ADVSignedKeyIndexList::default();
-            proto_.details = Some(details);
-            proto_.account_signature = None;
-            proto_.account_signature_key = None;
-            proto_
-        }
-        .encode_to_vec()
+        crate::test_utils::seed_adv_primary(client, &Jid::pn(user)).await;
+        crate::test_utils::seed_adv_primary(client, &Jid::new(user, Server::Hosted)).await;
+        let mut details = waproto::whatsapp::ADVKeyIndexList::default();
+        details.raw_id = Some(raw_id);
+        details.timestamp = Some(100);
+        details.current_index = Some(current_index);
+        details.valid_indexes = valid_indexes;
+        crate::test_utils::sign_adv_key_index(waproto::codec::adv_key_index_list_to_vec(&details))
     }
 
     fn record_with_raw_id(
@@ -2631,7 +2639,9 @@ mod tests {
 
         let key_index_info = wacore::stanza::devices::KeyIndexInfo {
             timestamp: 100,
-            signed_bytes: Some(make_signed_key_index_bytes(1, 0, vec![7])),
+            signed_bytes: Some(
+                make_signed_key_index_bytes(&client, "15551234567", 1, 0, vec![7]).await,
+            ),
         };
         let mut elem = make_device_element(5, Some(7));
         elem.jid.server = Server::Hosted;
@@ -2675,7 +2685,7 @@ mod tests {
 
         // New raw_id (2) != stored (1) → clear + rebuild. Notified device 19 has a
         // valid key index, so the rebuilt list is the companion plus the primary.
-        let signed = make_signed_key_index_bytes(2, 0, vec![7]);
+        let signed = make_signed_key_index_bytes(&client, "15551234567", 2, 0, vec![7]).await;
         let key_index_info = wacore::stanza::devices::KeyIndexInfo {
             timestamp: 100,
             signed_bytes: Some(signed),
@@ -2726,7 +2736,7 @@ mod tests {
 
         // current_index 10, empty valid set → notified key index 3 is invalid
         // (not in valid set, not > current_index), so no companion is added.
-        let signed = make_signed_key_index_bytes(2, 10, vec![]);
+        let signed = make_signed_key_index_bytes(&client, "15551234567", 2, 10, vec![]).await;
         let key_index_info = wacore::stanza::devices::KeyIndexInfo {
             timestamp: 100,
             signed_bytes: Some(signed),
@@ -2912,7 +2922,7 @@ mod tests {
         );
 
         let elem = make_device_element(3, Some(7));
-        client.patch_device_add("15551234567", &elem, None).await;
+        crate::test_utils::signed_device_add(&client, "15551234567", &elem).await;
 
         // Verify patch was applied to DB (not silently dropped)
         let updated = client
@@ -2996,7 +3006,7 @@ mod tests {
             .await;
 
         let elem = make_device_element(3, Some(5));
-        client.patch_device_add("15551234567", &elem, None).await;
+        crate::test_utils::signed_device_add(&client, "15551234567", &elem).await;
 
         let warm = client
             .sender_key_device_cache
@@ -3041,7 +3051,7 @@ mod tests {
 
         // Re-add device 3 (already exists) — should NOT invalidate cache
         let elem = make_device_element(3, Some(5));
-        client.patch_device_add("15551234567", &elem, None).await;
+        crate::test_utils::signed_device_add(&client, "15551234567", &elem).await;
 
         // Cache should still have the old entry
         let cached = client
@@ -3379,7 +3389,7 @@ mod tests {
             .unwrap();
         let info = wacore::stanza::devices::KeyIndexInfo {
             timestamp: 100,
-            signed_bytes: Some(make_signed_key_index_bytes(1, 4, vec![4])),
+            signed_bytes: Some(make_signed_key_index_bytes(&client, user, 1, 4, vec![4]).await),
         };
         client
             .patch_device_add(
@@ -3449,7 +3459,7 @@ mod tests {
             .await;
 
         let elem = make_device_element(3, Some(5));
-        client.patch_device_add("15551234567", &elem, None).await;
+        crate::test_utils::signed_device_add(&client, "15551234567", &elem).await;
 
         let warm = client
             .sender_key_device_cache

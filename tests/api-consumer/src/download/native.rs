@@ -83,7 +83,7 @@ mod tests {
     #[async_trait]
     impl HttpClient for Rejected {
         async fn execute(&self, request: HttpRequest) -> Result<HttpResponse> {
-            assert_eq!(request.url, "https://cdn.example.com/static");
+            assert_eq!(request.url, "https://mmg.whatsapp.net/static");
             Ok(HttpResponse::new(410, Vec::new()))
         }
     }
@@ -112,7 +112,7 @@ mod tests {
         let client = client().await;
         let message = {
             let mut proto_ = proto::whatsapp::message::ImageMessage::default();
-            proto_.static_url = Some("https://cdn.example.com/static".into());
+            proto_.static_url = Some("https://mmg.whatsapp.net/static".into());
             proto_.file_sha256 = Some(vec![0; 32]);
             proto_
         };
@@ -282,7 +282,7 @@ mod tests {
             wacore::upload::encrypt_media(b"external destination", MediaType::Image).unwrap();
         let message = {
             let mut proto_ = proto::whatsapp::message::ImageMessage::default();
-            proto_.static_url = Some("https://cdn.example.com/static".into());
+            proto_.static_url = Some("https://mmg.whatsapp.net/static".into());
             proto_.file_sha256 = Some(encrypted.file_sha256.to_vec());
             proto_
         };

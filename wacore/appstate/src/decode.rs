@@ -1,6 +1,7 @@
 use crate::AppStateError;
 use crate::hash::{generate_content_mac, validate_index_mac};
 use crate::keys::ExpandedAppStateKeys;
+use subtle::ConstantTimeEq;
 use wacore_libsignal::crypto::aes_256_cbc_decrypt_into;
 use waproto::whatsapp as wa;
 
@@ -71,7 +72,7 @@ pub fn decode_record(
             key_id,
             &keys.value_mac,
         );
-        if expected != value_mac {
+        if !bool::from(expected.as_slice().ct_eq(value_mac)) {
             return Err(AppStateError::MismatchingContentMAC);
         }
     }

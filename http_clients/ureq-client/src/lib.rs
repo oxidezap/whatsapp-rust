@@ -199,7 +199,10 @@ fn build_agent() -> ureq::Agent {
 /// ([`UreqHttpClient::with_agent`]) — which carries ureq's defaults, not ours —
 /// still honors the contract.
 fn status_as_response<Any>(req: ureq::RequestBuilder<Any>) -> ureq::RequestBuilder<Any> {
-    req.config().http_status_as_error(false).build()
+    req.config()
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .build()
 }
 
 /// Ceiling on a non-2xx body, on top of [`UreqHttpClient::max_body_bytes`]
@@ -1095,10 +1098,7 @@ mod tests {
         );
     }
 
-    /// A redirect to a malformed `Location` fails with the same error a
-    /// malformed request does, but the first hop already reached the wire. The
-    /// latch is decided before dispatch precisely so this case is not read as a
-    /// request that never left.
+    /// Redirects are returned without parsing or following their target.
     #[tokio::test(flavor = "current_thread")]
     async fn a_redirect_to_a_bad_location_still_counts_as_dispatched() {
         let url = spawn_status_server_with_headers(
@@ -1108,16 +1108,43 @@ mod tests {
             Vec::new(),
         );
         let client = UreqHttpClient::new();
-        client
-            .execute(get(url))
-            .await
-            .expect_err("a redirect to a malformed location cannot be followed");
+        let response = client.execute(get(url)).await.expect("return the redirect");
+        assert_eq!(response.status_code, 302);
 
         assert_eq!(
             client.resource_report().and_then(|r| r.pool_connections),
             Some(MAX_IDLE_CONNECTIONS),
             "the first hop connected, so the pool is no longer provably empty"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn redirects_cannot_escape_to_another_origin_even_with_a_custom_agent() {
+        let canary = TcpListener::bind("127.0.0.1:0").unwrap();
+        canary.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/private", canary.local_addr().unwrap());
+        for streaming in [false, true] {
+            let url = spawn_status_server_with_headers(
+                302,
+                "Found",
+                &[("location", &target)],
+                Vec::new(),
+            );
+            let client = UreqHttpClient::with_agent(ureq::Agent::new_with_defaults());
+            let status = if streaming {
+                tokio::task::spawn_blocking(move || {
+                    client.execute_streaming(get(url)).unwrap().status_code
+                })
+                .await
+                .unwrap()
+            } else {
+                client.execute(get(url)).await.unwrap().status_code
+            };
+            assert_eq!(status, 302);
+            assert!(
+                matches!(canary.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+            );
+        }
     }
 
     /// A transport failure still attempts a connection, so the estimate must

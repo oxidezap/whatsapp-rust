@@ -104,7 +104,7 @@ pub enum AdvValidation {
 /// The account prefix follows the signed `ADVDeviceIdentity.device_type`; the
 /// device prefix follows `device_jid.is_hosted()`. Both signatures must verify
 /// with those exact prefixes, including mixed hosted-account/regular-device chains.
-/// An in-blob account key takes precedence over `account_identity_fallback`.
+/// An in-blob account key must match a known `account_identity_fallback`.
 /// Callers must supply the fetched device's JID, preserving its hosting identity.
 pub fn validate_adv_with_identity_key(
     device_identity_bytes: &[u8],
@@ -143,6 +143,12 @@ pub fn validate_adv_with_identity_key(
             None => return AdvValidation::NoAccountKey,
         },
     };
+    // A self-consistent certificate must not replace an already trusted primary.
+    if let Some(trusted) = account_identity_fallback
+        && account_key != trusted.as_slice()
+    {
+        return AdvValidation::Invalid;
+    }
     let (Ok(account_pub), Ok(device_pub)) = (
         PublicKey::from_djb_public_key_bytes(account_key),
         PublicKey::from_djb_public_key_bytes(fetched_identity_key),
@@ -180,12 +186,10 @@ pub struct DecodedKeyIndex {
     pub valid_indexes: Vec<u32>,
 }
 
-/// Decode signed key index bytes from a `key-index-list` element.
+/// Decode a key-index list without authenticating it.
 ///
-/// The bytes are an `ADVSignedKeyIndexList` protobuf whose `details` field
-/// contains a serialized `ADVKeyIndexList`. Signature verification is deferred
-/// (the notification arrives over a Noise-encrypted connection, so content is
-/// already authenticated).
+/// For diagnostics and fixtures only. Network device lists must go through
+/// [`verify_key_index_list`] against the account's trusted primary identity.
 pub fn decode_key_index_list(signed_bytes: &[u8]) -> Option<DecodedKeyIndex> {
     let signed = waproto::codec::adv_signed_key_index_list_decode(signed_bytes).ok()?;
     let details_bytes = signed.details.as_ref()?;
@@ -201,6 +205,31 @@ pub fn decode_key_index_list(signed_bytes: &[u8]) -> Option<DecodedKeyIndex> {
         current_index,
         valid_indexes: key_index.valid_indexes,
     })
+}
+
+/// Authenticate the device list against the trusted primary identity before decoding.
+/// WA Web `WAWebAdvKeyIndexSignatureVerify` signs `[6, 2] || details`.
+/// The key carried alongside a signature is never a substitute for local trust.
+pub fn verify_key_index_list(
+    signed_bytes: &[u8],
+    account_identity: &[u8; 32],
+) -> Option<DecodedKeyIndex> {
+    let signed = waproto::whatsapp::ADVSignedKeyIndexListView::decode_view(signed_bytes).ok()?;
+    let details = signed.details?;
+    let signature: &[u8; 64] = signed.account_signature?.try_into().ok()?;
+    if let Some(key) = signed.account_signature_key.filter(|key| !key.is_empty())
+        && key != account_identity.as_slice()
+    {
+        return None;
+    }
+    let public = PublicKey::from_djb_public_key_bytes(account_identity).ok()?;
+    let mut message = AdvSigBuffer::with_capacity(2 + details.len());
+    message.extend_from_slice(&[6, 2]);
+    message.extend_from_slice(details);
+    if !public.verify_signature(&message, signature) {
+        return None;
+    }
+    decode_key_index_list(signed_bytes)
 }
 
 /// Filter a device list using `valid_indexes` and `current_index` from an
@@ -254,6 +283,40 @@ mod tests {
 
     fn dev(id: u16, key_index: Option<u32>) -> DeviceInfo {
         DeviceInfo::new(id, key_index)
+    }
+
+    #[test]
+    fn signed_key_index_list_rejects_tampering_missing_signature_and_foreign_primary() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let account = KeyPair::generate(&mut rng);
+        let foreign = KeyPair::generate(&mut rng);
+        let mut list = waproto::whatsapp::ADVKeyIndexList::default();
+        list.raw_id = Some(7);
+        list.timestamp = Some(42);
+        list.current_index = Some(2);
+        list.valid_indexes = vec![1, 2];
+        let details = list.encode_to_vec();
+        let signature = account
+            .private_key
+            .calculate_signature(&[&[6, 2], details.as_slice()].concat(), &mut rng)
+            .unwrap();
+        let mut signed = waproto::whatsapp::ADVSignedKeyIndexList::default();
+        signed.details = Some(details);
+        signed.account_signature = Some(signature.to_vec());
+        assert_eq!(
+            verify_key_index_list(&signed.encode_to_vec(), &id32(&account))
+                .unwrap()
+                .valid_indexes,
+            vec![1, 2]
+        );
+        assert!(verify_key_index_list(&signed.encode_to_vec(), &id32(&foreign)).is_none());
+        signed.account_signature_key = Some(id32(&foreign).to_vec());
+        assert!(verify_key_index_list(&signed.encode_to_vec(), &id32(&account)).is_none());
+        signed.account_signature_key = None;
+        signed.details.as_mut().unwrap().push(0);
+        assert!(verify_key_index_list(&signed.encode_to_vec(), &id32(&account)).is_none());
+        signed.account_signature = None;
+        assert!(verify_key_index_list(&signed.encode_to_vec(), &id32(&account)).is_none());
     }
 
     #[test]
@@ -793,10 +856,9 @@ mod tests {
         );
     }
 
-    // The in-blob key takes precedence over the fallback (WA Web `|| t`): a valid
-    // full blob still verifies even if an unrelated fallback is passed.
+    // A valid certificate signed by another account cannot replace local trust.
     #[test]
-    fn adv_chain_in_blob_key_takes_precedence_over_fallback() {
+    fn adv_chain_rejects_in_blob_key_that_conflicts_with_trusted_account() {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let account = KeyPair::generate(&mut rng);
         let device = KeyPair::generate(&mut rng);
@@ -809,7 +871,7 @@ mod tests {
                 Some(&id32(&unrelated)),
                 &Jid::pn_device(TEST_PN, 1)
             ),
-            AdvValidation::Valid
+            AdvValidation::Invalid
         );
     }
 }

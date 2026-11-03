@@ -1925,6 +1925,7 @@ pub struct Client {
     /// including reconnects, reads this same value, so the policy cannot
     /// change under an in-flight handshake.
     pub(crate) noise_cert_policy: wacore::handshake::NoiseCertPolicy,
+    pub(crate) additional_static_media_hosts: Box<[wacore::download::MediaHost]>,
     /// Terminal shutdown (process-wide). Fired by shutdown, logout or synchronous drop cleanup.
     /// Long-lived subscribers that must outlive reconnect cycles (saver,
     /// device registry cleanup) subscribe here.

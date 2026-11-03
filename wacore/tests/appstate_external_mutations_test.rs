@@ -9,7 +9,7 @@
 
 use buffa::Message;
 use wacore::appstate::WAPATCH_INTEGRITY;
-use wacore::appstate::hash::{HashState, generate_content_mac};
+use wacore::appstate::hash::{HashState, generate_content_mac, generate_patch_mac};
 use wacore::appstate::keys::expand_app_state_keys;
 use wacore::appstate::processor::validate_patch_macs;
 use waproto::whatsapp as wa;
@@ -270,7 +270,7 @@ fn test_validate_patch_macs_reports_divergence_regardless_of_has_missing_remove(
     };
 
     // Create a patch with a snapshot_mac that won't match our state
-    let patch = {
+    let mut patch = {
         let mut proto = wa::SyncdPatch::default();
         proto.version = {
             let mut proto = wa::SyncdVersion::default();
@@ -289,6 +289,14 @@ fn test_validate_patch_macs_reports_divergence_regardless_of_has_missing_remove(
         proto
     };
 
+    // Authenticate the patch envelope while deliberately keeping its aggregate
+    // snapshot MAC divergent from local state.
+    patch.patch_mac = Some(generate_patch_mac(
+        &patch,
+        collection_name,
+        &keys.patch_mac,
+        2,
+    ));
     for has_missing_remove in [false, true] {
         let verdict = validate_patch_macs(
             &patch,
