@@ -1507,6 +1507,23 @@ mod tests {
             events
         );
 
+        let identity = events
+            .iter()
+            .find_map(|e| match &**e {
+                Event::IdentityChange(e) => Some(e),
+                _ => None,
+            })
+            .unwrap();
+        let json = serde_json::to_value(identity).unwrap();
+        assert_eq!(
+            json["previous_identity_key"],
+            serde_json::json!(vec![7; 32])
+        );
+        assert!(
+            json.get("current_identity_key").is_none(),
+            "the server push carries no replacement key"
+        );
+
         // Device registry cache should be invalidated
         assert!(
             client
@@ -1574,7 +1591,7 @@ mod tests {
         client.subscribe_handler(collector.clone()).detach();
 
         let sender: Jid = "5511777777777@s.whatsapp.net".parse().unwrap();
-        handle_local_identity_change(&client, sender).await;
+        handle_local_identity_change(&client, sender, None).await;
 
         let events = collector.events();
         // The event is dispatched last (after clear_device_record +
@@ -1595,6 +1612,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_identity_event_keeps_the_exact_replaced_public_keys() {
+        use wacore::libsignal::protocol::{IdentityKey, PublicKey};
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client.subscribe_handler(collector.clone()).detach();
+        let previous = IdentityKey::new(PublicKey::from_djb_public_key_bytes(&[11; 32]).unwrap());
+        let current = IdentityKey::new(PublicKey::from_djb_public_key_bytes(&[22; 32]).unwrap());
+        handle_local_identity_change(&client, Jid::pn("15551234567"), Some((previous, current)))
+            .await;
+        let events = collector.events();
+        let event = events
+            .iter()
+            .find_map(|e| match &**e {
+                Event::IdentityChange(e) => Some(e),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(event.previous_identity_key, Some([11; 32]));
+        assert_eq!(event.current_identity_key, Some([22; 32]));
+        assert!(event.implicit);
+    }
+
+    #[tokio::test]
     async fn test_local_identity_change_skips_self() {
         let client = create_test_client().await;
         let collector = Arc::new(TestEventCollector::default());
@@ -1608,7 +1648,7 @@ mod tests {
             .await;
 
         let sender: Jid = "5511999999999@s.whatsapp.net".parse().unwrap();
-        handle_local_identity_change(&client, sender).await;
+        handle_local_identity_change(&client, sender, None).await;
 
         assert!(
             collector.events().is_empty(),
@@ -1623,7 +1663,7 @@ mod tests {
         client.subscribe_handler(collector.clone()).detach();
 
         let sender: Jid = "5511777777777:5@s.whatsapp.net".parse().unwrap();
-        handle_local_identity_change(&client, sender).await;
+        handle_local_identity_change(&client, sender, None).await;
 
         assert!(
             collector.events().is_empty(),

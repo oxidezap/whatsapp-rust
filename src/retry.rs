@@ -946,13 +946,8 @@ impl Client {
             }
         }
 
-        // Bound the aggregate resend rate per group (the anti-abuse signal): a
-        // PN to LID fan-out has many distinct devices retry the same messages,
-        // which per-device/per-message caps miss. Group-only: the requester was
-        // marked for fresh SKDM above so future messages recover, and it
-        // re-requests this one on its own timer once the bucket refills. DMs have
-        // no SKDM fallback, so they keep the unconditional resend (bounded by
-        // MAX_RETRY_COUNT) rather than risk dropping a delivery.
+        // Bound aggregate group and direct resends per chat, in addition to the
+        // per-message retry count. A new message id must not reset this budget.
         let rate_admission = reconciliation.reconciled();
         if rate_admission.rate_limit_applies()
             && !self
@@ -1714,12 +1709,8 @@ impl Client {
             .ok_or_else(|| anyhow::anyhow!("Missing identity key in retry receipt"))?;
         let identity_key = PublicKey::from_djb_public_key_bytes(identity_bytes)?;
 
-        // Companion devices ADV-bind the fetched identity via <device-identity>;
-        // reject a present-but-invalid one so a relay can't swap in a forged key.
-        // Mirrors the prekey-fetch path. The account key is the in-blob
-        // `account_signature_key` or, when the server omits it, the contact's
-        // primary (device 0) identity from the store. An unverifiable-for-lack-of-key
-        // chain or a missing device-identity is logged, not fatal.
+        // A companion retry must carry a certificate anchored to the primary,
+        // just like a fetched prekey bundle. Missing proof fails closed.
         if requester_jid.device != 0
             && let Some(device_identity) = keys_node
                 .get_optional_child("device-identity")
@@ -1728,7 +1719,7 @@ impl Client {
             let fetched_identity: [u8; 32] = identity_bytes
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("identity key in retry receipt is not 32 bytes"))?;
-            let account_identity = self.load_account_identity(requester_jid).await;
+            let account_identity = Some(self.ensure_adv_account_identity(requester_jid).await?);
             match wacore::adv::validate_adv_with_identity_key(
                 device_identity,
                 &fetched_identity,
@@ -1742,16 +1733,12 @@ impl Client {
                         requester_jid = requester_jid.observe()
                     ));
                 }
-                wacore::adv::AdvValidation::NoAccountKey => log::debug!(
-                    "retry key bundle for companion {requester_jid} omits account_signature_key and no stored account identity; proceeding without ADV validation",
-                    requester_jid = requester_jid.observe()
-                ),
+                wacore::adv::AdvValidation::NoAccountKey => {
+                    anyhow::bail!("retry companion account identity unavailable")
+                }
             }
         } else if requester_jid.device != 0 {
-            log::warn!(
-                "retry key bundle for companion {requester_jid} omits <device-identity>; proceeding without ADV validation",
-                requester_jid = requester_jid.observe()
-            );
+            anyhow::bail!("retry companion key bundle omits device identity");
         }
 
         // Extract prekey (optional in some cases).

@@ -178,7 +178,7 @@ const INLINE_ENCRYPT_DEVICES: usize = 5;
 /// orchestrator because a spawned task holds no borrow of the resolver.
 enum SessionOutcome {
     /// Session ready; `Some` when establishing it replaced a stored identity.
-    Established(Option<Jid>),
+    Established(Option<(Jid, IdentityChange)>),
     /// Dropped here, so the encrypt fan-out must not count it a second time.
     /// `reason` is `None` when the prekey fetch already counted the drop, which
     /// is the case for a device the server named.
@@ -1037,10 +1037,11 @@ pub async fn ensure_sessions_for_devices_resolved(
                         {
                             // Surface a replaced identity so the caller can react
                             // (resolver has no 'static handle into this spawned task).
-                            Ok(IdentityChange::ReplacedExisting) => SessionOutcome::Established(
-                                Some(encryption_jid.unwrap_or(lookup_jid)),
+                            Ok(change) => SessionOutcome::Established(
+                                change
+                                    .is_changed()
+                                    .then(|| (encryption_jid.unwrap_or(lookup_jid), change)),
                             ),
-                            Ok(IdentityChange::NewOrUnchanged) => SessionOutcome::Established(None),
                             Err(error) => SessionOutcome::Dropped {
                                 jid: lookup_jid,
                                 reason: Some(UnkeyableDevice::SessionSetup),
@@ -1076,8 +1077,8 @@ pub async fn ensure_sessions_for_devices_resolved(
                 match outcome {
                     // Some(jid) => establishing this session replaced a stored
                     // identity; notify the client so it can react off-path.
-                    SessionOutcome::Established(Some(changed_jid)) => {
-                        resolver.on_local_identity_change(&changed_jid)
+                    SessionOutcome::Established(Some((changed_jid, change))) => {
+                        resolver.on_local_identity_change_with_keys(&changed_jid, change)
                     }
                     SessionOutcome::Established(None) => {}
                     // Isolate the failure to this device so one participant can't abort

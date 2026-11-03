@@ -263,6 +263,7 @@ pub(crate) async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<
     // than silently skip it, matching the old always-reset behavior. Collapsing
     // an Err into "no prior identity" would be a fail-open regression on a
     // session-deletion path (see the same explicit-match rule in lid_pn.rs).
+    let mut previous_identity_key = None;
     let mut had_prior_identity = false;
     for cand in &reset_addrs {
         match client
@@ -270,7 +271,8 @@ pub(crate) async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<
             .get_identity(cand, backend.as_ref())
             .await
         {
-            Ok(Some(_)) => {
+            Ok(Some(key)) => {
+                previous_identity_key = key.as_ref().try_into().ok();
                 had_prior_identity = true;
                 break;
             }
@@ -361,6 +363,7 @@ pub(crate) async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<
                     .user(from_jid.clone())
                     .maybe_lid_user(stanza_lid)
                     .implicit(false)
+                    .maybe_previous_identity_key(previous_identity_key)
                     .build(),
             )
         });
@@ -411,7 +414,14 @@ pub(crate) async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<
 /// local `handleNewIdentity` omits those steps that only the server-push
 /// `handleE2eIdentityChange` performs.
 #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.notif.local_identity_change", level = "debug", skip_all, fields(sender = %sender.observe())))]
-pub(crate) async fn handle_local_identity_change(client: &Arc<Client>, sender: Jid) {
+pub(crate) async fn handle_local_identity_change(
+    client: &Arc<Client>,
+    sender: Jid,
+    keys: Option<(
+        wacore::libsignal::protocol::IdentityKey,
+        wacore::libsignal::protocol::IdentityKey,
+    )>,
+) {
     // Only a peer's primary-device identity change matters; companion devices
     // carry their own identities (WA Web ignores them on this path).
     if sender.device != 0 {
@@ -462,6 +472,12 @@ pub(crate) async fn handle_local_identity_change(client: &Arc<Client>, sender: J
                     .user(sender)
                     .maybe_lid_user(None)
                     .implicit(true)
+                    .maybe_previous_identity_key(keys.and_then(|(previous, _)| {
+                        previous.public_key().public_key_bytes().try_into().ok()
+                    }))
+                    .maybe_current_identity_key(keys.and_then(|(_, current)| {
+                        current.public_key().public_key_bytes().try_into().ok()
+                    }))
                     .build(),
             )
         });

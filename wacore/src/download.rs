@@ -60,6 +60,8 @@ pub enum DownloadPreparationError {
     InvalidQuery,
     #[error("Invalid media download URL")]
     InvalidUrl,
+    #[error("Static media URL is outside the permitted HTTPS CDN origins")]
+    UntrustedStaticUrl,
 }
 
 #[derive(Debug, Error)]
@@ -453,6 +455,67 @@ impl MediaHost {
 /// which is what lets a test harness point downloads at itself.
 pub const DEFAULT_MEDIA_HOSTS: [&str; 2] = ["mmg.whatsapp.net", "mmg-fallback.whatsapp.net"];
 
+// WA Web 2.3000.1052559453, WAWebMediaUrlAllowlist, bundle a018f64e2c88a443...
+// bytes 810279..810903. Unlike its A/B-gated caller, this policy always applies.
+// Extra origins come from the explicit route, not the sender's media reference.
+fn validate_static_media_url(url: &str, hosts: &[MediaHost]) -> Result<()> {
+    use fluent_uri::{Uri, component::Host};
+    let parsed = Uri::parse(url).map_err(|_| DownloadPreparationError::UntrustedStaticUrl)?;
+    let authority = parsed
+        .authority()
+        .ok_or(DownloadPreparationError::UntrustedStaticUrl)?;
+    let port = authority
+        .port_to_u16()
+        .map_err(|_| DownloadPreparationError::UntrustedStaticUrl)?
+        .unwrap_or(443);
+    if !parsed.scheme().as_str().eq_ignore_ascii_case("https")
+        || authority.userinfo().is_some()
+        || authority.port().is_some_and(|p| p.is_empty())
+    {
+        return Err(DownloadPreparationError::UntrustedStaticUrl.into());
+    }
+    let host = authority.host();
+    if match authority.host_parsed() {
+        Host::RegName(name) => {
+            name.is_empty()
+                || !name
+                    .as_str()
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+        }
+        Host::IpvFuture { .. } => true,
+        _ => false,
+    } {
+        return Err(DownloadPreparationError::UntrustedStaticUrl.into());
+    }
+    let suffix = "whatsapp.net";
+    let is_default_cdn = matches!(authority.host_parsed(), Host::RegName(_))
+        && port == 443
+        && (host.eq_ignore_ascii_case(suffix)
+            || host.len() > suffix.len() + 1
+                && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+                && host[host.len() - suffix.len()..].eq_ignore_ascii_case(suffix));
+    let is_explicit_origin = hosts.iter().any(|allowed| {
+        let Ok(base) = Uri::parse(format!("https://{}/", allowed.hostname)) else {
+            return false;
+        };
+        let Some(origin) = base.authority() else {
+            return false;
+        };
+        origin.userinfo().is_none()
+            && !origin.port().is_some_and(|p| p.is_empty())
+            && base.path().as_str() == "/"
+            && base.query().is_none()
+            && base.fragment().is_none()
+            && same_media_host(host, origin.host())
+            && origin.port_to_u16().is_ok_and(|p| p.unwrap_or(443) == port)
+    });
+    if !is_default_cdn && !is_explicit_origin {
+        return Err(DownloadPreparationError::UntrustedStaticUrl.into());
+    }
+    Ok(())
+}
+
 /// CDN hosts to try in order. Download authorization comes from the media
 /// reference; session upload credentials are not part of a download route.
 #[derive(Debug, Clone, Default)]
@@ -618,9 +681,19 @@ impl DownloadUtils {
         Ok(())
     }
 
+    #[inline]
     pub fn prepare_download_requests(
         downloadable: &dyn Downloadable,
         route: &MediaRoute,
+    ) -> Result<Vec<DownloadRequest>> {
+        Self::prepare_download_requests_with_hosts(downloadable, &route.hosts)
+    }
+
+    /// Prepare requests using borrowed route hosts, without a temporary owned route.
+    /// Applies the same origin and metadata validation as [`Self::prepare_download_requests`].
+    pub fn prepare_download_requests_with_hosts(
+        downloadable: &dyn Downloadable,
+        hosts: &[MediaHost],
     ) -> Result<Vec<DownloadRequest>> {
         Self::validate_download_metadata(downloadable)?;
         let is_encrypted = downloadable.is_encrypted();
@@ -643,9 +716,11 @@ impl DownloadUtils {
             MediaDecryption::Plaintext { file_sha256 }
         };
 
-        // Static URL: use directly without host construction.
-        // WhatsApp Web uses staticUrl for newsletter CDN media.
+        // WA Web `WAWebMediaUrlAllowlist.isAllowedMediaUrl` checks HTTPS and
+        // whatsapp.net. Always enforce it here, independently of its A/B gate.
+        // Other CDNs require an explicit route; transport must not follow redirects.
         if let Some(static_url) = downloadable.static_url() {
+            validate_static_media_url(static_url, hosts)?;
             return Ok(vec![DownloadRequest {
                 url: static_url.to_string(),
                 decryption,
@@ -670,7 +745,7 @@ impl DownloadUtils {
             BASE64_URL_SAFE_NO_PAD.encode(hash)
         };
 
-        let candidates = route.hosts.iter().map(|host| -> Result<DownloadRequest> {
+        let candidates = hosts.iter().map(|host| -> Result<DownloadRequest> {
             use fluent_uri::{Uri, UriRef, component::Host, pct_enc::EStr};
 
             let base = Uri::parse(format!("https://{}/", host.hostname))
@@ -749,7 +824,7 @@ impl DownloadUtils {
                 decryption: decryption.clone(),
             })
         });
-        let mut requests = Vec::with_capacity(route.hosts.len());
+        let mut requests = Vec::with_capacity(hosts.len());
         let mut last_error = None;
         for candidate in candidates {
             match candidate {
@@ -2065,7 +2140,7 @@ mod tests {
     fn transport_validation_preserves_optional_metadata_and_raw_keys() {
         let mut media = MockDownloadable {
             direct_path: None,
-            static_url: Some("https://cdn.example/static?signature=unchanged#fragment".into()),
+            static_url: Some("https://mmg.whatsapp.net/static?signature=unchanged#fragment".into()),
             media_key: Some(vec![1; 16]),
             file_sha256: None,
             file_enc_sha256: None,
@@ -2271,10 +2346,47 @@ mod tests {
     }
 
     #[test]
+    fn static_media_origins_fail_closed_and_allow_explicit_tls_fixtures() {
+        let default_route = MediaRoute::default_hosts();
+        for url in [
+            "http://mmg.whatsapp.net/file",
+            "https://127.0.0.1/file",
+            "https://[::1]/file",
+            "https://localhost/file",
+            "https://mmg.whatsapp.net.evil.example/file",
+            "https://mmg.whatsapp.net@localhost/file",
+            "https://mmg.whatsapp.net:8443/file",
+            "file:///etc/passwd",
+            "https://mmg.whatsapp.net:/file",
+            "https://%6dmg.whatsapp.net/file",
+        ] {
+            assert!(
+                validate_static_media_url(url, &default_route.hosts).is_err(),
+                "{url}"
+            );
+        }
+        assert!(
+            validate_static_media_url("https://mmg.whatsapp.net/file", &default_route.hosts)
+                .is_ok()
+        );
+        assert!(
+            validate_static_media_url(
+                "https://scontent.example.fbcdn.net/file",
+                &default_route.hosts
+            )
+            .is_err()
+        );
+        let local = MediaRoute::new(vec![MediaHost::new("127.0.0.1:8443")]);
+        assert!(validate_static_media_url("https://127.0.0.1:8443/file", &local.hosts).is_ok());
+        assert!(validate_static_media_url("https://127.0.0.1:8444/file", &local.hosts).is_err());
+        assert!(validate_static_media_url("http://127.0.0.1:8443/file", &local.hosts).is_err());
+    }
+
+    #[test]
     fn prepare_requests_static_url() {
         let d = MockDownloadable {
             direct_path: Some("/unused".into()),
-            static_url: Some("https://static.cdn.example.com/media/abc123".into()),
+            static_url: Some("https://static.whatsapp.net/media/abc123".into()),
             media_key: None,
             file_sha256: Some(vec![5; 32]),
             file_enc_sha256: None,
@@ -2283,7 +2395,7 @@ mod tests {
         let reqs = DownloadUtils::prepare_download_requests(&d, &mock_route()).unwrap();
         // Static URL bypasses host construction → single request
         assert_eq!(reqs.len(), 1);
-        assert_eq!(reqs[0].url, "https://static.cdn.example.com/media/abc123");
+        assert_eq!(reqs[0].url, "https://static.whatsapp.net/media/abc123");
         assert!(matches!(
             &reqs[0].decryption,
             MediaDecryption::Plaintext { .. }
@@ -2294,7 +2406,7 @@ mod tests {
     fn prepare_requests_static_url_needs_no_hosts() {
         let d = MockDownloadable {
             direct_path: Some("/unused".into()),
-            static_url: Some("https://static.cdn.example.com/media/abc123".into()),
+            static_url: Some("https://static.whatsapp.net/media/abc123".into()),
             media_key: None,
             file_sha256: Some(vec![5; 32]),
             file_enc_sha256: None,
@@ -2303,7 +2415,7 @@ mod tests {
         let reqs =
             DownloadUtils::prepare_download_requests(&d, &MediaRoute::new(Vec::new())).unwrap();
         assert_eq!(reqs.len(), 1);
-        assert_eq!(reqs[0].url, "https://static.cdn.example.com/media/abc123");
+        assert_eq!(reqs[0].url, "https://static.whatsapp.net/media/abc123");
     }
 
     #[test]

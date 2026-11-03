@@ -1828,6 +1828,7 @@ dependencies = [
  "serde-big-array",
  "serde_json",
  "sha2",
+ "subtle",
  "thiserror",
  "wacore-binary",
  "wacore-libsignal",

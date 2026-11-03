@@ -158,6 +158,7 @@ impl Client {
         users: &[Jid],
         topology_generation: u64,
     ) -> Result<Option<Vec<Jid>>, anyhow::Error> {
+        self.prepare_device_list_identities(response).await?;
         let mapping_guard = self.lid_pn_cache.lock_mutation().await;
         let registry_guard = self.device_topology.lock_registry().await;
         if !self
@@ -296,6 +297,7 @@ impl Client {
     ) -> Result<Vec<Jid>, anyhow::Error> {
         // Keep this order stable: mapping writers never acquire the registry
         // guard while holding their lock, so mapping -> registry cannot cycle.
+        self.prepare_device_list_identities(response).await?;
         let mapping_guard = self.lid_pn_cache.lock_mutation().await;
         let registry_guard = self.device_topology.lock_registry().await;
         self.learn_device_list_mappings_guarded(response, &mapping_guard)
@@ -312,6 +314,7 @@ impl Client {
     ) -> Result<Option<Vec<Jid>>, anyhow::Error> {
         // Serialize both mutation classes across the CAS and publication. The
         // response's own mappings are deliberately learned only after the CAS.
+        self.prepare_device_list_identities(response).await?;
         let mapping_guard = self.lid_pn_cache.lock_mutation().await;
         let registry_guard = self.device_topology.lock_registry().await;
         if !self
@@ -325,6 +328,21 @@ impl Client {
         self.process_device_list_response_guarded(response, freshness.into(), &registry_guard)
             .await
             .map(Some)
+    }
+
+    // Network lookups must finish before taking mapping/registry guards: a
+    // device notification on the read loop may need those guards before the IQ
+    // reply can be read. The guarded phase re-reads the current trust anchor.
+    async fn prepare_device_list_identities(
+        &self,
+        response: &DeviceListResponse,
+    ) -> anyhow::Result<()> {
+        for user in &response.device_lists {
+            if user.key_index_bytes.is_some() {
+                self.ensure_adv_account_identity(&user.user).await?;
+            }
+        }
+        Ok(())
     }
 
     async fn process_device_list_response_guarded(
@@ -367,18 +385,28 @@ impl Client {
             // Preserve key_index values from existing records (set via account_sync)
             let mut existing_record = existing_records.next().flatten();
 
-            // Decode key-index-list if present (WA Web: handleKeyIndexResult)
-            let decoded_key_index = user_list
-                .key_index_bytes
-                .as_deref()
-                .and_then(wacore::adv::decode_key_index_list);
-
-            if mode == DeviceListApplyMode::GroupRefresh
-                && user_list.key_index_bytes.is_some()
-                && decoded_key_index.is_none()
-            {
-                continue;
-            }
+            let decoded_key_index = if let Some(bytes) = user_list.key_index_bytes.as_deref() {
+                let identity = self
+                    .cached_adv_account_identity(&user_list.user)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("device list account identity unavailable"))?;
+                let decoded = wacore::adv::verify_key_index_list(bytes, &identity);
+                if decoded.is_none() {
+                    if mode == DeviceListApplyMode::GroupRefresh {
+                        continue;
+                    }
+                    anyhow::bail!("device list ADV signature verification failed");
+                }
+                decoded
+            } else {
+                if user_list.devices.iter().any(|device| device.device != 0) {
+                    if mode == DeviceListApplyMode::GroupRefresh {
+                        continue;
+                    }
+                    anyhow::bail!("companion device list omits ADV signature");
+                }
+                None
+            };
 
             // Check raw_id mismatch for identity change detection
             // TODO: also check advAccountType mismatch (see patch_device_add TODO)
@@ -432,7 +460,19 @@ impl Client {
 
             // Apply valid_indexes filtering if key-index-list was decoded
             if let Some(ref decoded) = decoded_key_index {
-                wacore::adv::retain_devices_by_key_index(&mut devices, decoded);
+                devices.retain(|device| {
+                    device.device_id() == 0
+                        || device.key_index().is_some_and(|index| {
+                            decoded.valid_indexes.contains(&index)
+                                || index > decoded.current_index
+                                    && existing_record.as_ref().is_some_and(|record| {
+                                        record.devices.iter().any(|previous| {
+                                            previous.device_id() == device.device_id()
+                                                && previous.key_index() == Some(index)
+                                        })
+                                    })
+                        })
+                });
             }
 
             // An empty device list is never valid — WA Web always keeps the primary
@@ -517,6 +557,8 @@ impl Client {
         self.update_device_lists_guarded(device_records, guard)
             .await?;
         for (user, device_id) in pending_removals {
+            self.delete_sessions_for_devices(&user.user, &[device_id])
+                .await;
             if let Err(e) = self
                 .delete_sender_key_rows_for_device(&user.user, device_id)
                 .await
@@ -669,12 +711,57 @@ mod tests {
             proto_.valid_indexes = valid_indexes;
             proto_
         };
-        let signed = {
-            let mut proto_ = waproto::whatsapp::ADVSignedKeyIndexList::default();
-            proto_.details = Some(waproto::codec::adv_key_index_list_to_vec(&key_index));
-            proto_
-        };
-        waproto::codec::adv_signed_key_index_list_to_vec(&signed)
+        crate::test_utils::sign_adv_key_index(waproto::codec::adv_key_index_list_to_vec(&key_index))
+    }
+
+    async fn authenticated_response_fixture(
+        client: &Client,
+        mut response: DeviceListResponse,
+    ) -> DeviceListResponse {
+        for user in &mut response.device_lists {
+            crate::test_utils::seed_adv_primary(client, &user.user).await;
+            if let Some(bytes) = &user.key_index_bytes {
+                if let Ok(signed) = waproto::codec::adv_signed_key_index_list_decode(bytes)
+                    && let Some(details) = signed.details
+                    && waproto::codec::adv_key_index_list_decode(&details).is_ok()
+                {
+                    user.key_index_bytes = Some(crate::test_utils::sign_adv_key_index(details));
+                }
+            } else if user.devices.iter().any(|device| device.device != 0) {
+                let previous = client.load_device_record_for_jid(&user.user).await;
+                for device in &mut user.devices {
+                    if device.device != 0 && device.key_index.is_none() {
+                        device.key_index = previous
+                            .as_ref()
+                            .and_then(|record| {
+                                record
+                                    .devices
+                                    .iter()
+                                    .find(|old| old.device_id() == device.device)
+                                    .and_then(|old| old.key_index())
+                            })
+                            .or(Some(u32::from(device.device)));
+                    }
+                }
+                let indexes: Vec<_> = user
+                    .devices
+                    .iter()
+                    .filter_map(|device| device.key_index)
+                    .collect();
+                let mut list = waproto::whatsapp::ADVKeyIndexList::default();
+                list.raw_id = previous
+                    .as_ref()
+                    .and_then(|record| record.raw_id)
+                    .or(Some(1));
+                list.timestamp = Some(1_700_000_000);
+                list.current_index = indexes.iter().copied().max();
+                list.valid_indexes = indexes;
+                user.key_index_bytes = Some(crate::test_utils::sign_adv_key_index(
+                    waproto::codec::adv_key_index_list_to_vec(&list),
+                ));
+            }
+        }
+        response
     }
 
     async fn seed_fresh_session(client: &Client, jid: &Jid) -> ProtocolAddress {
@@ -693,6 +780,116 @@ mod tests {
             .has_session(address, &*snapshot.backend)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn waiting_for_primary_identity_does_not_hold_registry_or_mapping_locks() {
+        use wacore::usync::{UserDeviceList, UsyncDevice};
+        let client = create_test_client().await;
+        let user = Jid::pn("12025550127");
+        let lock = client
+            .session_lock_for(user.to_protocol_address().as_str())
+            .await;
+        let primary_guard = lock.lock().await;
+        let response = DeviceListResponse {
+            device_lists: vec![UserDeviceList {
+                user: user.clone(),
+                devices: vec![UsyncDevice::new(0, None), UsyncDevice::new(2, Some(1))],
+                phash: None,
+                key_index_bytes: Some(signed_key_index_bytes(vec![1], 1)),
+            }],
+            lid_mappings: Vec::new(),
+        };
+        let operation = client.process_device_list_response(&response, Freshness::Refresh);
+        futures::pin_mut!(operation);
+        assert!(futures::poll!(operation.as_mut()).is_pending());
+        let mapping = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.lid_pn_cache.lock_mutation(),
+        )
+        .await
+        .unwrap();
+        let registry = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.device_topology.lock_registry(),
+        )
+        .await
+        .unwrap();
+        drop(registry);
+        drop(mapping);
+        crate::test_utils::seed_adv_primary(&client, &user).await;
+        drop(primary_guard);
+        assert_eq!(
+            operation.await.unwrap(),
+            vec![user.clone(), user.with_device(2)]
+        );
+        client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn unverified_device_lists_preserve_registry_and_cannot_add_future_indexes() {
+        use wacore::usync::{UserDeviceList, UsyncDevice};
+        let client = create_test_client().await;
+        let user = Jid::pn("12025550126");
+        crate::test_utils::seed_adv_primary(&client, &user).await;
+        client
+            .update_device_list(DeviceListRecord {
+                user: user.user.as_str().into(),
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(1))].into(),
+                timestamp: 1,
+                phash: None,
+                raw_id: Some(1),
+            })
+            .await
+            .unwrap();
+        let valid = signed_key_index_bytes(vec![1], 1);
+        let mut tampered = valid.clone();
+        tampered[0] ^= 1;
+        for signature in [None, Some(vec![0xff]), Some(tampered)] {
+            let response = DeviceListResponse {
+                device_lists: vec![UserDeviceList {
+                    user: user.clone(),
+                    devices: vec![UsyncDevice::new(0, None), UsyncDevice::new(8, Some(100))],
+                    phash: None,
+                    key_index_bytes: signature,
+                }],
+                lid_mappings: Vec::new(),
+            };
+            assert!(
+                client
+                    .process_device_list_response(&response, Freshness::Refresh)
+                    .await
+                    .is_err()
+            );
+            let record = client.load_device_record_for_jid(&user).await.unwrap();
+            assert_eq!(
+                record
+                    .devices
+                    .iter()
+                    .map(|device| device.device_id())
+                    .collect::<Vec<_>>(),
+                vec![0, 7]
+            );
+        }
+        let response = DeviceListResponse {
+            device_lists: vec![UserDeviceList {
+                user: user.clone(),
+                devices: vec![
+                    UsyncDevice::new(0, None),
+                    UsyncDevice::new(7, Some(1)),
+                    UsyncDevice::new(8, Some(100)),
+                ],
+                phash: None,
+                key_index_bytes: Some(valid),
+            }],
+            lid_mappings: Vec::new(),
+        };
+        let devices = client
+            .process_device_list_response(&response, Freshness::Refresh)
+            .await
+            .unwrap();
+        assert_eq!(devices, vec![user.clone(), user.with_device(7)]);
+        client.signal_shutdown_sync();
     }
 
     #[tokio::test]
@@ -799,6 +996,7 @@ mod tests {
                 }],
                 lid_mappings: Vec::new(),
             };
+            let response = authenticated_response_fixture(&client, response).await;
             let devices = client
                 .try_process_group_device_list_response(
                     &response,
@@ -833,17 +1031,16 @@ mod tests {
             .await
             .unwrap();
         let generation = client.device_topology.current();
-        client
-            .patch_device_add(
-                &user.user,
-                &wacore::stanza::devices::DeviceElement {
-                    jid: user.with_device(7),
-                    key_index: None,
-                    lid: None,
-                },
-                None,
-            )
-            .await;
+        crate::test_utils::signed_device_add(
+            &client,
+            &user.user,
+            &wacore::stanza::devices::DeviceElement {
+                jid: user.with_device(7),
+                key_index: None,
+                lid: None,
+            },
+        )
+        .await;
         let response = DeviceListResponse {
             device_lists: vec![UserDeviceList {
                 user: user.clone(),
@@ -853,6 +1050,7 @@ mod tests {
             }],
             lid_mappings: Vec::new(),
         };
+        let response = authenticated_response_fixture(&client, response).await;
         assert!(
             client
                 .try_process_group_device_list_response(
@@ -932,6 +1130,7 @@ mod tests {
             }],
             lid_mappings: Vec::new(),
         };
+        let response = authenticated_response_fixture(&client, response).await;
         client
             .try_process_group_device_list_response(
                 &response,
@@ -941,17 +1140,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        client
-            .patch_device_add(
-                &user.user,
-                &wacore::stanza::devices::DeviceElement {
-                    jid: user.with_device(7),
-                    key_index: Some(4),
-                    lid: None,
-                },
-                None,
-            )
-            .await;
+        crate::test_utils::signed_device_add(
+            &client,
+            &user.user,
+            &wacore::stanza::devices::DeviceElement {
+                jid: user.with_device(7),
+                key_index: Some(4),
+                lid: None,
+            },
+        )
+        .await;
         let rows = client
             .persistence_manager
             .get_sender_key_devices(group)
@@ -1033,6 +1231,7 @@ mod tests {
                 }],
                 lid_mappings: Vec::new(),
             };
+            let response = authenticated_response_fixture(&client, response).await;
             let devices = client
                 .try_process_group_device_list_response(
                     &response,
@@ -1124,6 +1323,7 @@ mod tests {
             }],
             lid_mappings: Vec::new(),
         };
+        let response = authenticated_response_fixture(&client, response).await;
         client
             .fail_next_device_list_write
             .store(true, Ordering::SeqCst);
@@ -1353,6 +1553,7 @@ mod tests {
             }],
             lid_mappings: vec![],
         };
+        let response = authenticated_response_fixture(&client, response).await;
 
         let fetched = client
             .process_device_list_response(&response, Freshness::CachePreferred)
@@ -1395,6 +1596,7 @@ mod tests {
             }],
             lid_mappings: Vec::new(),
         };
+        let response = authenticated_response_fixture(&client, response).await;
 
         let fetched = client
             .process_device_list_response(&response, Freshness::CachePreferred)
@@ -1445,17 +1647,16 @@ mod tests {
             lid_mappings: Vec::new(),
         };
 
-        client
-            .patch_device_add(
-                &user.user,
-                &wacore::stanza::devices::DeviceElement {
-                    jid: user.with_device(7),
-                    key_index: None,
-                    lid: None,
-                },
-                None,
-            )
-            .await;
+        crate::test_utils::signed_device_add(
+            &client,
+            &user.user,
+            &wacore::stanza::devices::DeviceElement {
+                jid: user.with_device(7),
+                key_index: None,
+                lid: None,
+            },
+        )
+        .await;
 
         let published = client
             .try_process_refreshed_device_list_response(
@@ -1532,6 +1733,7 @@ mod tests {
                 lid: lid.into(),
             }],
         };
+        let response = authenticated_response_fixture(&client, response).await;
 
         let published = client
             .try_process_refreshed_device_list_response(
@@ -1579,6 +1781,7 @@ mod tests {
             }],
             lid_mappings: Vec::new(),
         };
+        let response = authenticated_response_fixture(&client, response).await;
         let published = client
             .try_process_refreshed_device_list_response(
                 &response,
@@ -1615,6 +1818,7 @@ mod tests {
             }],
             lid_mappings: Vec::new(),
         };
+        let response = authenticated_response_fixture(&client, response).await;
         let published = client
             .try_process_refreshed_device_list_response(
                 &response,
@@ -1659,6 +1863,7 @@ mod tests {
             }],
             lid_mappings: vec![],
         };
+        let response = authenticated_response_fixture(&client, response).await;
 
         let fetched = client
             .process_device_list_response(&response, Freshness::CachePreferred)
@@ -1711,6 +1916,7 @@ mod tests {
             }],
             lid_mappings: Vec::new(),
         };
+        let response = authenticated_response_fixture(&client, response).await;
 
         let error = client
             .process_device_list_response(&response, Freshness::Refresh)
@@ -1769,6 +1975,7 @@ mod tests {
             ],
             lid_mappings: Vec::new(),
         };
+        let response = authenticated_response_fixture(&client, response).await;
 
         client
             .process_device_list_response(&response, Freshness::Refresh)
@@ -1813,6 +2020,7 @@ mod tests {
             }],
             lid_mappings: Vec::new(),
         };
+        let response = authenticated_response_fixture(&client, response).await;
 
         let fetched = client
             .process_device_list_response(&response, Freshness::CachePreferred)
@@ -1856,6 +2064,7 @@ mod tests {
                 lid: "100000000000123".into(),
             }],
         };
+        let response = authenticated_response_fixture(&client, response).await;
 
         assert!(
             client

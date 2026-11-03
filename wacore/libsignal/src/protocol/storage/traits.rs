@@ -27,6 +27,8 @@ pub enum Direction {
 }
 
 /// The result of saving a new identity key for a protocol address.
+/// Use [`Self::is_changed`] to detect replacements, including stores that
+/// retain the exact public keys in [`Self::ReplacedExistingWithKeys`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub enum IdentityChange {
@@ -34,6 +36,13 @@ pub enum IdentityChange {
     NewOrUnchanged,
     /// The new identity key replaced a different key for the protocol address.
     ReplacedExisting,
+    /// A replacement with the exact public keys observed at the store write.
+    ReplacedExistingWithKeys {
+        /// Previous public identity.
+        previous: IdentityKey,
+        /// Replacement public identity.
+        current: IdentityKey,
+    },
 }
 
 // `isize` rather than the narrower `u8` the variants fit in: `repr(C)` leaves
@@ -572,6 +581,19 @@ pub trait SenderKeyStore: ThreadSafe {
 pub trait ProtocolStore: SessionStore + PreKeyStore + SignedPreKeyStore + IdentityKeyStore {}
 
 impl IdentityChange {
+    /// Whether saving the identity replaced a previously known key.
+    pub fn is_changed(self) -> bool {
+        !matches!(self, Self::NewOrUnchanged)
+    }
+
+    /// Exact public identities, when supplied by the store implementation.
+    pub fn keys(self) -> Option<(IdentityKey, IdentityKey)> {
+        match self {
+            Self::ReplacedExistingWithKeys { previous, current } => Some((previous, current)),
+            _ => None,
+        }
+    }
+
     /// Convenience constructor from a boolean `changed` flag.
     ///
     /// Returns [`IdentityChange::ReplacedExisting`] if `changed` is `true`,

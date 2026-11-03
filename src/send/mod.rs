@@ -6160,6 +6160,9 @@ mod tests {
             .await;
         let member: Jid = "20000000000010@lid".parse().unwrap();
         let member_pn: Jid = "5511000000010@s.whatsapp.net".parse().unwrap();
+        for user in [&own, &own_lid, &member, &member_pn] {
+            crate::test_utils::seed_adv_primary(&client, user).await;
+        }
         let group: Jid = "120363000000000042@g.us".parse().unwrap();
         client
             .get_group_cache()
@@ -6277,11 +6280,7 @@ mod tests {
                     proto.valid_indexes = vec![0, 2];
                     proto
                 };
-                let signed = {
-                    let mut proto = wa::ADVSignedKeyIndexList::default();
-                    proto.details = Some(index.encode_to_vec());
-                    proto
-                };
+                let signed = crate::test_utils::sign_adv_key_index(index.encode_to_vec());
                 let answer = NodeBuilder::new("iq")
                     .attr("type", "result")
                     .attr("id", id.clone())
@@ -6312,7 +6311,7 @@ mod tests {
                                                 .build(),
                                             NodeBuilder::new("key-index-list")
                                                 .attr("ts", "1000")
-                                                .bytes(signed.encode_to_vec())
+                                                .bytes(signed.clone())
                                                 .build(),
                                         ])
                                         .build()])
@@ -10338,6 +10337,9 @@ mod tests {
                 .await
         });
         let iq_id = fixture.next_iq_id_with_xmlns(0, "usync").await.unwrap();
+        for user in [&fixture.member, &fixture.own_sending] {
+            crate::test_utils::seed_adv_primary(&fixture.client, user).await;
+        }
         let users = [&fixture.member, &fixture.own_sending]
             .into_iter()
             .map(|jid| {
@@ -10362,11 +10364,7 @@ mod tests {
                     };
                     proto
                 };
-                let signed = {
-                    let mut proto = wa::ADVSignedKeyIndexList::default();
-                    proto.details = Some(index.encode_to_vec());
-                    proto
-                };
+                let signed = crate::test_utils::sign_adv_key_index(index.encode_to_vec());
                 NodeBuilder::new("user")
                     .attr("jid", jid.clone())
                     .children([NodeBuilder::new("devices")
@@ -10374,7 +10372,7 @@ mod tests {
                             NodeBuilder::new("device-list").children(devices).build(),
                             NodeBuilder::new("key-index-list")
                                 .attr("ts", "1000")
-                                .bytes(signed.encode_to_vec())
+                                .bytes(signed)
                                 .build(),
                         ])
                         .build()])

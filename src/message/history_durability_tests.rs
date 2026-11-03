@@ -134,7 +134,7 @@ fn info(id: &str) -> Arc<MessageInfo> {
         id: id.into(),
         source: MessageSource {
             chat: "15550000001@s.whatsapp.net".parse().unwrap(),
-            sender: "15550000001:7@s.whatsapp.net".parse().unwrap(),
+            sender: "15550000001@s.whatsapp.net".parse().unwrap(),
             is_from_me: true,
             ..Default::default()
         },
@@ -297,6 +297,29 @@ async fn history_idle(client: &Client) {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn companion_history_cannot_reach_durability_hook() {
+    let (client, hook, _) = memory_client().await;
+    let mut source = (*info("COMPANION_HISTORY")).clone();
+    source.source.sender.device = 7;
+    let mut protocol = wa::message::ProtocolMessage::default();
+    protocol.r#type = Some(wa::message::protocol_message::Type::HistorySyncNotification);
+    protocol.history_sync_notification = buffa::MessageField::some(notification());
+    let mut message = wa::Message::default();
+    message.protocol_message = buffa::MessageField::some(protocol);
+    client
+        .commit_history_sync_carrier(
+            &source,
+            Bytes::from(waproto::codec::message_to_vec(&message)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(hook.notifications.load(Ordering::SeqCst), 0);
+    assert_eq!(hook.chunks.load(Ordering::SeqCst), 0);
+    assert_eq!(client.history_sync_activity.tasks(), 0);
+    client.signal_shutdown_sync();
 }
 
 #[tokio::test]
@@ -487,11 +510,9 @@ async fn durable_history_malformed_chunk_and_download_failure_keep_host_copy_wit
 #[tokio::test]
 async fn durable_history_same_id_different_sender_has_distinct_identity() {
     let (client, hook, _) = memory_client().await;
-    for device in [7, 8] {
+    for sender in ["15550000001@s.whatsapp.net", "15550000001@lid"] {
         let mut info = (*info("SAME_ID")).clone();
-        info.source.sender = format!("15550000001:{device}@s.whatsapp.net")
-            .parse()
-            .unwrap();
+        info.source.sender = sender.parse().unwrap();
         assert!(receive(&client, &Arc::new(info), notification()).await);
     }
     history_idle(&client).await;

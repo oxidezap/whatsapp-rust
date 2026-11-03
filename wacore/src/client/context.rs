@@ -459,6 +459,17 @@ pub trait SendContextResolver: crate::sync_marker::MaybeSendSync {
         let _ = jid;
     }
 
+    /// Identity-change notification including exact public keys when the store
+    /// supplies them. Older resolvers retain their existing callback behavior.
+    fn on_local_identity_change_with_keys(
+        &self,
+        jid: &Jid,
+        change: crate::libsignal::protocol::IdentityChange,
+    ) {
+        let _ = change;
+        self.on_local_identity_change(jid);
+    }
+
     /// Notify that `count` devices were dropped from this send's recipient set
     /// for `reason`, so the drop lands on a counter instead of only in a log.
     ///

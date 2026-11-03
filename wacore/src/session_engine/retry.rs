@@ -103,7 +103,10 @@ impl RetryReconciliation {
 
 impl RetryRateAdmission {
     pub fn rate_limit_applies(&self) -> bool {
-        self.0 == RetransmissionRoute::Group
+        matches!(
+            self.0,
+            RetransmissionRoute::Group | RetransmissionRoute::Direct
+        )
     }
     pub fn admitted(self) -> RetryPublication {
         RetryPublication(self.0)
@@ -121,7 +124,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unknown_devices_require_keys_for_every_route() {
+    fn unknown_devices_are_rejected_for_every_route() {
         for route in [
             RetransmissionRoute::Direct,
             RetransmissionRoute::Group,
@@ -129,7 +132,7 @@ mod tests {
             RetransmissionRoute::BroadcastList,
         ] {
             assert!(route.device_checked(false, false).is_none());
-            assert!(route.device_checked(false, true).is_some());
+            assert!(route.device_checked(false, true).is_none());
             assert!(route.device_checked(true, false).is_some());
         }
     }
@@ -179,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn rotation_and_rate_limit_are_group_only() {
+    fn rotation_is_group_only_and_direct_resends_are_rate_limited() {
         for route in [
             RetransmissionRoute::Direct,
             RetransmissionRoute::Group,
@@ -196,7 +199,10 @@ mod tests {
             let rate = repair.keys_ready().reconciled();
             assert_eq!(
                 rate.rate_limit_applies(),
-                route == RetransmissionRoute::Group
+                matches!(
+                    route,
+                    RetransmissionRoute::Group | RetransmissionRoute::Direct
+                )
             );
             assert_eq!(rate.admitted().route(), route);
         }

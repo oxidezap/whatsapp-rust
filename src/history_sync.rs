@@ -443,7 +443,10 @@ impl Client {
         info: &crate::types::message::MessageInfo,
         carrier: Bytes,
     ) -> anyhow::Result<()> {
-        if self.history_sync_durability_hook.get().is_none() || !info.source.is_from_me {
+        if self.history_sync_durability_hook.get().is_none()
+            || !info.source.is_from_me
+            || info.source.sender.device != 0
+        {
             return Ok(());
         }
         let wire = wacore::messages::history_sync_notification_wire(&carrier)?;
