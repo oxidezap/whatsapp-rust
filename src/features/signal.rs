@@ -985,7 +985,7 @@ mod tests {
 
     async fn security_code_success(version: SecurityCodeVersion) {
         use wacore::identity_verification::numeric_security_code;
-        use wacore::libsignal::protocol::IdentityKey;
+        use wacore::libsignal::protocol::{IdentityKey, IdentityKeyPair};
         use wacore_binary::builder::NodeBuilder;
 
         let (client, transport) =
@@ -1017,6 +1017,16 @@ mod tests {
             ])
             .await;
         let device = client.persistence_manager.get_device_snapshot();
+        // The refresh verifies ADV against each primary identity before using
+        // the companion list. Keep those trust anchors available without IQs.
+        client
+            .signal_cache
+            .put_identity(
+                &own_lid.to_protocol_address(),
+                device.identity_key.public_key.public_key_bytes(),
+            )
+            .await;
+        let peer_identity = IdentityKeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
         let mut own_keys = vec![IdentityKey::new(device.identity_key.public_key)];
         let mut peer_keys = Vec::new();
         for (jid, local) in [
@@ -1024,7 +1034,11 @@ mod tests {
             (peer_lid.clone(), false),
             (peer_lid.with_device(3), false),
         ] {
-            let bundle = peer_prekey_bundle(4242, u32::from(jid.device));
+            let bundle = if jid == peer_lid {
+                peer_prekey_bundle_with_identity(4242, u32::from(jid.device), &peer_identity)
+            } else {
+                peer_prekey_bundle(4242, u32::from(jid.device))
+            };
             let keys = if local { &mut own_keys } else { &mut peer_keys };
             keys.push(*bundle.identity_key().unwrap());
             client
@@ -1083,9 +1097,24 @@ mod tests {
                                 indexes.timestamp = Some(1000);
                                 indexes.current_index = Some(u32::from(companion));
                                 indexes.valid_indexes = vec![0, u32::from(companion)];
+                                let details = waproto::codec::adv_key_index_list_to_vec(&indexes);
+                                let signer = if jid == &own_lid {
+                                    &device.identity_key.private_key
+                                } else {
+                                    peer_identity.private_key()
+                                };
                                 let mut signed =
                                     waproto::whatsapp::ADVSignedKeyIndexList::default();
-                            signed.details = Some(waproto::codec::adv_key_index_list_to_vec(&indexes));
+                                signed.account_signature = Some(
+                                    signer
+                                        .calculate_signature(
+                                            &[&[6, 2], details.as_slice()].concat(),
+                                            &mut rand::make_rng::<rand::rngs::StdRng>(),
+                                        )
+                                        .unwrap()
+                                        .to_vec(),
+                                );
+                                signed.details = Some(details);
                                 NodeBuilder::new("user")
                                     .attr("jid", jid)
                                     .children([NodeBuilder::new("devices")
@@ -1148,10 +1177,21 @@ mod tests {
     }
 
     fn peer_prekey_bundle(registration_id: u32, device_id: u32) -> PreKeyBundle {
-        use wacore::libsignal::protocol::{IdentityKeyPair, KeyPair};
+        use wacore::libsignal::protocol::IdentityKeyPair;
 
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let identity = IdentityKeyPair::generate(&mut rng);
+        peer_prekey_bundle_with_identity(registration_id, device_id, &identity)
+    }
+
+    fn peer_prekey_bundle_with_identity(
+        registration_id: u32,
+        device_id: u32,
+        identity: &wacore::libsignal::protocol::IdentityKeyPair,
+    ) -> PreKeyBundle {
+        use wacore::libsignal::protocol::KeyPair;
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let signed_prekey = KeyPair::generate(&mut rng);
         let prekey = KeyPair::generate(&mut rng);
         let signature = identity
