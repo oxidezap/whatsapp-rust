@@ -51,7 +51,11 @@ pub struct ProtocolAddress {
 }
 impl ProtocolAddress {
     pub fn new(name: &str, device: DeviceId) -> Self {
-        let mut out = Self::empty(device);
+        let mut out = Self {
+            text: AddressBuf::empty(),
+            name_len: 0,
+            device,
+        };
         out.reset_with(|buf| buf.push_str(name));
         out
     }
@@ -68,8 +72,9 @@ impl ProtocolAddress {
         self.text.clear();
         write(&mut self.text);
         self.name_len = self.text.0.len();
-        use std::fmt::Write;
-        let _ = write!(self.text.0, ".{}", self.device);
+        self.text.push('.');
+        self.text
+            .push_str(itoa::Buffer::new().format(self.device.0));
     }
     pub fn name(&self) -> &str {
         &self.text.0[..self.name_len]
@@ -119,5 +124,19 @@ mod tests {
         address.reset_with(|name| name.push_str("short@lid"));
         assert_eq!(address.name(), "short@lid");
         assert_eq!(address.as_str(), "short@lid.0");
+    }
+
+    #[test]
+    fn decimal_device_suffix_preserves_names_and_empty_addresses() {
+        for device in [0, 1, 9, 10, 255, 65535, u32::MAX] {
+            let mut address = ProtocolAddress::empty(device.into());
+            assert_eq!(address.as_str(), format!(".{device}"));
+            for name in ["", "synthetic@lid", "utf8-λ", "name.with.dots"] {
+                address.reset_with(|out| out.push_str(name));
+                assert_eq!(address.name(), name);
+                assert_eq!(address.as_str(), format!("{name}.{device}"));
+                assert_eq!(ProtocolAddress::new(name, device.into()), address);
+            }
+        }
     }
 }

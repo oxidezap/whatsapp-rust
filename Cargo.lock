@@ -4929,6 +4929,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac 0.13.0",
+ "itoa",
  "log",
  "portable-atomic",
  "rand 0.10.3",
