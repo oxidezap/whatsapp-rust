@@ -619,6 +619,141 @@ async fn replace_sending_identity(f: &mut SignalFixture) -> IdentityKey {
     *replacement.pair.identity_key()
 }
 #[test]
+fn replacing_prekey_bundle_materializes_archived_sender_reservation() {
+    run(async {
+        let mut f = established_signal_fixture(930).await;
+        message_encrypt(b"reserved output", &f.ba, &mut f.a_sessions, &mut f.a)
+            .await
+            .unwrap();
+        let before = &f.a_sessions.0[&f.ba];
+        let ceiling = before.reserved_sender_chain_index();
+        let sender = before
+            .current
+            .as_ref()
+            .unwrap()
+            .inner
+            .sender
+            .as_ref()
+            .unwrap();
+        let old_ratchet = sender.ratchet;
+        assert!(sender.index < ceiling);
+        process_prekey_bundle(
+            &f.ba,
+            &mut f.a_sessions,
+            &mut f.a,
+            &f.bundle,
+            &mut f.rng,
+            UsePQRatchet::No,
+        )
+        .await
+        .unwrap();
+        let persisted = f.a_sessions.0[&f.ba].serialize().unwrap();
+        let loaded = SessionRecord::deserialize(&persisted).unwrap();
+        let archived = loaded.previous_session_states().next().unwrap().unwrap();
+        let sender = archived.inner.sender.as_ref().unwrap();
+        assert_eq!(sender.ratchet, old_ratchet);
+        assert_eq!(sender.index, ceiling);
+    })
+}
+#[test]
+fn invalid_prekey_bundle_reservation_burn_precedes_identity_save() {
+    run(async {
+        let mut f = established_signal_fixture(931).await;
+        let (_, _, replacement_bundle, _) = setup(&mut f.rng);
+        let record = f.a_sessions.0.get_mut(&f.ba).unwrap();
+        let index = record
+            .session_state()
+            .unwrap()
+            .get_sender_chain_key()
+            .unwrap()
+            .index();
+        record.inner.reservation.ceiling = Some(index + 2001);
+        let before = record.serialize().unwrap();
+        let identity_before = f.a.known[&f.ba];
+        let saves = f.a.save_calls;
+        assert!(matches!(
+            process_prekey_bundle(
+                &f.ba,
+                &mut f.a_sessions,
+                &mut f.a,
+                &replacement_bundle,
+                &mut f.rng,
+                UsePQRatchet::No,
+            )
+            .await,
+            Err(SignalProtocolError::Engine(
+                wacore_signal_engine::Error::Encoding("reservation burn exceeds limit")
+            ))
+        ));
+        assert_eq!(f.a.save_calls, saves);
+        assert_eq!(f.a.known[&f.ba], identity_before);
+        assert_eq!(f.a_sessions.0[&f.ba].serialize().unwrap(), before);
+    })
+}
+#[test]
+fn prekey_bundle_identity_save_error_keeps_original_record() {
+    run(async {
+        let mut f = established_signal_fixture(932).await;
+        let before = f.a_sessions.0[&f.ba].serialize().unwrap();
+        f.a.fail_save = true;
+        assert!(matches!(
+            process_prekey_bundle(
+                &f.ba,
+                &mut f.a_sessions,
+                &mut f.a,
+                &f.bundle,
+                &mut f.rng,
+                UsePQRatchet::No,
+            )
+            .await,
+            Err(SignalProtocolError::InvalidState("test", _))
+        ));
+        assert_eq!(f.a_sessions.0[&f.ba].serialize().unwrap(), before);
+    })
+}
+#[test]
+fn cancelling_prekey_bundle_identity_save_returns_original_checkout() {
+    run(async {
+        let mut f = established_signal_fixture(933).await;
+        let before = f.a_sessions.0[&f.ba].serialize().unwrap();
+        let mut sessions = checkout_store();
+        *sessions.record.lock().unwrap() = f.a_sessions.0.remove(&f.ba);
+        f.a.block_save = true;
+        let mut future = Box::pin(process_prekey_bundle(
+            &f.ba,
+            &mut sessions,
+            &mut f.a,
+            &f.bundle,
+            &mut f.rng,
+            UsePQRatchet::No,
+        ));
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        drop(future);
+        assert_eq!(
+            sessions.queued.as_ref().unwrap().serialize().unwrap(),
+            before
+        );
+        assert_eq!(sessions.cancelled, 0);
+        sessions.complete_session_checkout().await;
+        assert_eq!(
+            sessions
+                .record
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .serialize()
+                .unwrap(),
+            before
+        );
+    })
+}
+#[test]
 fn ordinary_signal_decrypt_promotes_persisted_archive_without_current() {
     run(async {
         let mut f = established_signal_fixture(910).await;

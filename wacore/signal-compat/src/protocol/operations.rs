@@ -72,12 +72,14 @@ pub async fn process_prekey_bundle<
             }
         })?;
     let mut checkout = SessionCheckout::load_or_fresh(sessions, address).await?;
-    let change = save_identity(identities, address, &bundle.identity).await?;
-    checkout.record_mut().operate(|record| {
+    let mut candidate = checkout.record().clone();
+    candidate.operate(|record| {
         record.materialize_reservation(&engine::RustCrypto)?;
         record.install(state);
         Ok(())
     })?;
+    let change = save_identity(identities, address, &bundle.identity).await?;
+    *checkout.record_mut() = candidate;
     checkout.commit().await?;
     Ok(change)
 }
