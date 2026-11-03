@@ -5,3 +5,6 @@ extern crate wacore_signal_runtime as wacore_libsignal;
 mod counter_lease;
 #[path = "fixtures/session_divergence.rs"]
 mod session_divergence;
+
+#[path = "fixtures/support/signed_prekey.rs"]
+mod constructed_signed_prekey;

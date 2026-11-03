@@ -257,11 +257,12 @@ pub async fn group_encrypt<S: SenderKeyStore + ?Sized, R: rand::Rng + rand::Cryp
         .first()
         .ok_or(SignalProtocolError::InvalidSenderKeySession)?
         .iteration;
-    if record
-        .inner
-        .reservation
-        .ceiling
-        .is_none_or(|ceiling| iteration >= ceiling)
+    if !record.inner.reservation.is_waived()
+        && record
+            .inner
+            .reservation
+            .ceiling
+            .is_none_or(|ceiling| iteration >= ceiling)
     {
         let ceiling = iteration
             .checked_add(64)

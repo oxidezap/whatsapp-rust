@@ -693,6 +693,27 @@ impl SenderKeyRecord {
     pub fn new_empty() -> Self {
         Self::default()
     }
+    /// Opt out of reservations for this in-memory record after consuming its
+    /// current lease. The waiver is deliberately not serialized.
+    pub fn waive_counter_lease(&mut self) -> Result<()> {
+        if let (Some(ceiling), Some(state)) = (
+            self.inner.reservation.ceiling,
+            self.inner.states.first_mut(),
+        ) {
+            if ceiling.saturating_sub(state.iteration) > engine::PEER_FUTURE_LIMIT {
+                return Err(
+                    engine::Error::Encoding("sender reservation burn exceeds limit").into(),
+                );
+            }
+            while state.iteration < ceiling {
+                state.chain_key = engine::RustCrypto.hmac_sha256(&state.chain_key, &[2]);
+                state.iteration += 1;
+            }
+        }
+        self.inner.reservation.waive();
+        self.clear_wire_gated();
+        Ok(())
+    }
     pub fn reserved_iteration(&self) -> u32 {
         self.inner.reservation.ceiling.unwrap_or(0)
     }

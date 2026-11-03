@@ -5,11 +5,11 @@
 //! Async I/O uses `futures::executor::block_on` (no tokio in this crate).
 #![allow(clippy::too_many_lines)]
 
+use crate::constructed_signed_prekey::ValidatedSignedPreKey as _;
 use async_trait::async_trait;
-#[path = "support/signed_prekey.rs"]
-mod constructed_signed_prekey;
-use constructed_signed_prekey::ValidatedSignedPreKey as _;
 use std::collections::HashMap;
+// The legacy oracle exposes its constructor through this trait.
+#[allow(unused_imports)]
 use wacore_libsignal::protocol::GenericSignedPreKey as _;
 use wacore_libsignal::protocol::{
     CiphertextMessage, Direction, IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore,

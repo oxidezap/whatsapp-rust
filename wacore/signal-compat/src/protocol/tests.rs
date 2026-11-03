@@ -786,39 +786,122 @@ fn ordinary_signal_decrypt_promotes_persisted_archive_without_current() {
         assert_eq!(f.b.save_calls, saves + 1);
     })
 }
+async fn decrypt_receiver_entrypoint(
+    entrypoint: u8,
+    packet: &CiphertextMessage,
+    fixture: &mut SignalFixture,
+    keys: &Keys,
+) -> error::Result<DecryptionResult> {
+    match entrypoint {
+        0 => match packet {
+            CiphertextMessage::SignalMessage(message) => {
+                message_decrypt_signal(
+                    message,
+                    &fixture.aa,
+                    &mut fixture.b_sessions,
+                    &mut fixture.b,
+                    &mut fixture.rng,
+                )
+                .await
+            }
+            CiphertextMessage::PreKeySignalMessage(message) => {
+                message_decrypt_prekey(
+                    message,
+                    &fixture.aa,
+                    &mut fixture.b_sessions,
+                    &mut fixture.b,
+                    &mut keys.clone_for_prekey(),
+                    keys,
+                    &mut fixture.rng,
+                    UsePQRatchet::No,
+                )
+                .await
+            }
+            _ => panic!("expected pairwise message"),
+        },
+        1 => {
+            message_decrypt(
+                packet,
+                &fixture.aa,
+                &mut fixture.b_sessions,
+                &mut fixture.b,
+                &mut keys.clone_for_prekey(),
+                keys,
+                &mut fixture.rng,
+                UsePQRatchet::No,
+            )
+            .await
+        }
+        _ => {
+            let mut owned = OwnedCiphertextMessage::from(packet.clone());
+            let result = message_decrypt_owned(
+                &mut owned,
+                &fixture.aa,
+                &mut fixture.b_sessions,
+                &mut fixture.b,
+                &mut keys.clone_for_prekey(),
+                keys,
+                &mut fixture.rng,
+                UsePQRatchet::No,
+            )
+            .await;
+            assert_eq!(owned.is_available(), result.is_err());
+            result
+        }
+    }
+}
 #[test]
 fn ordinary_archived_identity_is_selected_before_trust_and_saved_without_rotation_event() {
     run(async {
-        let mut f = established_signal_fixture(911).await;
-        let packet = message_encrypt(
-            b"old authenticated identity",
-            &f.ba,
-            &mut f.a_sessions,
-            &mut f.a,
-        )
-        .await
-        .unwrap();
-        let replacement = replace_sending_identity(&mut f).await;
-        assert_eq!(f.b.known.get(&f.aa), Some(&replacement));
-        f.b.only_trusted = Some(*f.a.pair.identity_key());
-        let CiphertextMessage::SignalMessage(message) = &packet else {
-            panic!("expected ordinary message");
-        };
-        let result =
-            message_decrypt_signal(message, &f.aa, &mut f.b_sessions, &mut f.b, &mut f.rng)
+        for entrypoint in 0..3 {
+            let mut f = established_signal_fixture(911 + u64::from(entrypoint)).await;
+            let packet = message_encrypt(
+                b"old authenticated identity",
+                &f.ba,
+                &mut f.a_sessions,
+                &mut f.a,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(packet, CiphertextMessage::SignalMessage(_)));
+            let replacement = replace_sending_identity(&mut f).await;
+            assert_eq!(f.b.known.get(&f.aa), Some(&replacement));
+            f.b.only_trusted = Some(*f.a.pair.identity_key());
+            let keys = f.keys.clone_for_prekey();
+            let result = decrypt_receiver_entrypoint(entrypoint, &packet, &mut f, &keys)
                 .await
                 .unwrap();
-        assert_eq!(result.plaintext, b"old authenticated identity");
-        assert_eq!(result.identity_change, IdentityChange::NewOrUnchanged);
-        assert_eq!(f.b.known.get(&f.aa), Some(f.a.pair.identity_key()));
-        assert_eq!(
-            f.b_sessions.0[&f.aa]
-                .session_state()
-                .unwrap()
-                .remote_identity_key()
-                .unwrap(),
-            Some(*f.a.pair.identity_key())
-        );
+            assert_eq!(result.plaintext, b"old authenticated identity");
+            assert_eq!(result.identity_change, IdentityChange::NewOrUnchanged);
+            assert_eq!(f.b.known.get(&f.aa), Some(f.a.pair.identity_key()));
+            assert_eq!(
+                f.b_sessions.0[&f.aa]
+                    .session_state()
+                    .unwrap()
+                    .remote_identity_key()
+                    .unwrap(),
+                Some(*f.a.pair.identity_key())
+            );
+            // After recovery, a policy trusting only the persisted row must
+            // permit the promoted session to send a reply.
+            f.b.only_trusted = f.b.known.get(&f.aa).copied();
+            let reply = message_encrypt(b"trusted reply", &f.aa, &mut f.b_sessions, &mut f.b)
+                .await
+                .unwrap();
+            let recovered = message_decrypt(
+                &reply,
+                &f.ba,
+                &mut f.a_sessions,
+                &mut f.a,
+                &mut keys.clone_for_prekey(),
+                &keys,
+                &mut f.rng,
+                UsePQRatchet::No,
+            )
+            .await
+            .unwrap();
+            assert_eq!(recovered.plaintext, b"trusted reply");
+        }
     })
 }
 #[test]
@@ -909,29 +992,25 @@ fn cancelling_ordinary_identity_save_returns_original_checkout_and_packet_is_rep
 #[test]
 fn delayed_archived_prekey_updates_identity_row_without_fresh_rotation_or_prekey_use() {
     run(async {
-        let mut f = established_signal_fixture(914).await;
-        let replacement = replace_sending_identity(&mut f).await;
-        assert_eq!(f.b.known.get(&f.aa), Some(&replacement));
-        f.b.only_trusted = Some(*f.a.pair.identity_key());
-        let mut unavailable = f.keys.clone_for_prekey();
-        unavailable.prekey.inner.id = 900;
-        unavailable.signed.inner.id = 900;
-        let result = message_decrypt(
-            &f.late_prekey,
-            &f.aa,
-            &mut f.b_sessions,
-            &mut f.b,
-            &mut unavailable.clone_for_prekey(),
-            &unavailable,
-            &mut f.rng,
-            UsePQRatchet::No,
-        )
-        .await
-        .unwrap();
-        assert_eq!(result.plaintext, b"delayed prekey");
-        assert_eq!(result.identity_change, IdentityChange::NewOrUnchanged);
-        assert_eq!(result.consumed_prekey_id, None);
-        assert_eq!(f.b.known.get(&f.aa), Some(f.a.pair.identity_key()));
+        for entrypoint in 0..3 {
+            let mut f = established_signal_fixture(914 + u64::from(entrypoint)).await;
+            let replacement = replace_sending_identity(&mut f).await;
+            assert_eq!(f.b.known.get(&f.aa), Some(&replacement));
+            f.b.only_trusted = Some(*f.a.pair.identity_key());
+            let mut unavailable = f.keys.clone_for_prekey();
+            unavailable.prekey.inner.id = 900;
+            unavailable.signed.inner.id = 900;
+            let packet = f.late_prekey.clone();
+            let saves = f.b.save_calls;
+            let result = decrypt_receiver_entrypoint(entrypoint, &packet, &mut f, &unavailable)
+                .await
+                .unwrap();
+            assert_eq!(result.plaintext, b"delayed prekey");
+            assert_eq!(result.identity_change, IdentityChange::NewOrUnchanged);
+            assert_eq!(result.consumed_prekey_id, None);
+            assert_eq!(f.b.save_calls, saves + 1);
+            assert_eq!(f.b.known.get(&f.aa), Some(f.a.pair.identity_key()));
+        }
     })
 }
 
@@ -969,5 +1048,77 @@ fn authenticated_bad_group_ciphertext_is_not_stored_state_corruption() {
         ));
         assert!(!error.is_stored_session_corruption());
         assert_eq!(receiver.records[&name].serialize().unwrap(), before);
+    });
+}
+
+#[test]
+fn sender_lease_waiver_consumes_reserved_keys_and_remains_in_memory() {
+    futures::executor::block_on(async {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x1828_1ea5);
+        let name = SenderKeyName::new("synthetic-group".into(), "synthetic-sender".into());
+        let mut sender = Groups::default();
+        let mut receiver = Groups::default();
+        let distribution = create_sender_key_distribution_message(&name, &mut sender, &mut rng)
+            .await
+            .unwrap();
+        process_sender_key_distribution_message(&name, &distribution, &mut receiver)
+            .await
+            .unwrap();
+        let record = sender.records.get_mut(&name).unwrap();
+        record.reserve_iterations(0);
+        let ceiling = record.reserved_iteration();
+        record.waive_counter_lease().unwrap();
+        assert_eq!(
+            record
+                .sender_key_state()
+                .unwrap()
+                .sender_chain_key()
+                .unwrap()
+                .iteration(),
+            ceiling
+        );
+        assert!(!record.is_wire_gated());
+        let message = group_encrypt(&mut sender, &name, b"after waiver", &mut rng)
+            .await
+            .unwrap();
+        assert_eq!(message.iteration(), ceiling);
+        let record = &sender.records[&name];
+        assert_eq!(record.reserved_iteration(), 0);
+        assert!(!record.is_wire_gated());
+        assert_eq!(
+            group_decrypt(message.serialized(), &mut receiver, &name)
+                .await
+                .unwrap(),
+            b"after waiver"
+        );
+        let reloaded = SenderKeyRecord::deserialize(&record.serialize().unwrap()).unwrap();
+        assert!(!reloaded.inner.reservation.is_waived());
+        assert_eq!(
+            reloaded
+                .sender_key_state()
+                .unwrap()
+                .sender_chain_key()
+                .unwrap()
+                .iteration(),
+            ceiling + 1
+        );
+    });
+}
+
+#[test]
+fn sender_lease_waiver_rejects_excessive_burn_without_mutation() {
+    futures::executor::block_on(async {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x1828_1ea6);
+        let name = SenderKeyName::new("synthetic-group".into(), "synthetic-sender".into());
+        let mut store = Groups::default();
+        create_sender_key_distribution_message(&name, &mut store, &mut rng)
+            .await
+            .unwrap();
+        let record = store.records.get_mut(&name).unwrap();
+        record.reserve_iterations(2001);
+        let before = record.serialize().unwrap();
+        assert!(record.waive_counter_lease().is_err());
+        assert_eq!(record.serialize().unwrap(), before);
+        assert!(record.is_wire_gated());
     });
 }
