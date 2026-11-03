@@ -972,12 +972,14 @@ impl SenderKeyRecord {
         Self::deserialize(&waproto::codec::sender_key_record_to_vec(&proto))
     }
     pub fn into_components(mut self) -> Result<SenderKeyRecordComponents> {
-        if let Some(ceiling) = self.inner.reservation.ceiling {
-            for state in &mut self.inner.states {
-                if ceiling.saturating_sub(state.iteration) > 2000 {
-                    state.signing_private = None;
-                    continue;
-                }
+        // A reservation belongs only to the current sending chain. Historical
+        // states must retain unread counters and any retained private key.
+        if let Some(ceiling) = self.inner.reservation.ceiling
+            && let Some(state) = self.inner.states.first_mut()
+        {
+            if ceiling.saturating_sub(state.iteration) > 2000 {
+                state.signing_private = None;
+            } else {
                 while state.iteration < ceiling {
                     state.chain_key = engine::RustCrypto.hmac_sha256(&state.chain_key, &[2]);
                     state.iteration += 1;

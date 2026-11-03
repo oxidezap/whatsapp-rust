@@ -672,3 +672,131 @@ fn stored_history_has_a_bounded_budget_separate_from_network_envelopes() {
     .encode();
     assert!(new::wire::SignalMessageView::decode(&oversized_wire).is_err());
 }
+
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn ignored_receiver_private_bytes_do_not_reject_usable_historical_sessions() {
+    use buffa::Message as _;
+    let (mut alice, mut bob, _, _) = pair();
+    let mut random = Random::seeded();
+    let mut engine = new::Engine::new(&RustCrypto, &mut random);
+    let first = engine
+        .encrypt(&mut alice, b"synthetic first message")
+        .unwrap();
+    engine.decrypt(&mut bob, &first).unwrap();
+    grant(&mut bob);
+    let reply = engine
+        .encrypt(&mut bob, b"synthetic historical reply")
+        .unwrap();
+    let original = new::codec::encode_session_record(&alice);
+    for length in [0, 1, 31, 32, 33, 64] {
+        let mut proto = waproto::whatsapp::RecordStructure::decode_from_slice(&original).unwrap();
+        proto
+            .current_session
+            .as_option_mut()
+            .unwrap()
+            .receiver_chains[0]
+            .sender_ratchet_key_private = Some(vec![0x37; length]);
+        let historical = proto.encode_to_vec();
+        let oracle = old::SessionRecord::deserialize_for_store(&historical, &INCARNATION).unwrap();
+        let mut normalized = Vec::new();
+        oracle.serialize_into_for_store(&mut normalized, &INCARNATION);
+        let mut through_oracle =
+            new::codec::decode_session_record_live(&RustCrypto, &normalized, &INCARNATION).unwrap();
+        assert_eq!(
+            engine.decrypt(&mut through_oracle, &reply).unwrap(),
+            b"synthetic historical reply"
+        );
+        let mut direct =
+            new::codec::decode_session_record_live(&RustCrypto, &historical, &INCARNATION).unwrap();
+        assert!(
+            direct.current.as_ref().unwrap().receivers[0]
+                .private
+                .is_none()
+        );
+        assert_eq!(
+            engine.decrypt(&mut direct, &reply).unwrap(),
+            b"synthetic historical reply"
+        );
+    }
+    for length in [1, 31, 33, 64] {
+        let mut proto = waproto::whatsapp::RecordStructure::decode_from_slice(&original).unwrap();
+        proto
+            .current_session
+            .as_option_mut()
+            .unwrap()
+            .sender_chain
+            .as_option_mut()
+            .unwrap()
+            .sender_ratchet_key_private = Some(vec![0x37; length]);
+        let invalid = proto.encode_to_vec();
+        let oracle = old::SessionRecord::deserialize_for_store(&invalid, &INCARNATION).unwrap();
+        assert!(
+            oracle
+                .session_state()
+                .unwrap()
+                .sender_ratchet_private_key()
+                .is_err()
+        );
+        assert!(
+            new::codec::decode_session_record_live(&RustCrypto, &invalid, &INCARNATION).is_err()
+        );
+    }
+}
+
+#[test]
+fn component_handoff_preserves_delayed_group_messages_and_historical_private_keys() {
+    use replacement::protocol as sdk;
+    for (current_iteration, retain_historical_private) in [(0, false), (4096, true)] {
+        let plaintext = b"synthetic delayed historical message";
+        let mut random = Random::seeded();
+        let mut engine = new::Engine::new(&RustCrypto, &mut random);
+        let mut earlier = new::SenderKeyRecord::default();
+        engine.create_sender_distribution(&mut earlier).unwrap();
+        let mut historical = earlier.states[0].clone();
+        if !retain_historical_private {
+            historical.signing_private = None;
+        }
+        let expected_private = historical.signing_private;
+        earlier.reservation.prepare(0, 64, INCARNATION).unwrap();
+        earlier.reservation.mark_committed();
+        let delayed = engine.encrypt_sender_key(&mut earlier, plaintext).unwrap();
+        let mut combined = new::SenderKeyRecord::default();
+        engine.create_sender_distribution(&mut combined).unwrap();
+        assert_ne!(combined.states[0].id, historical.id);
+        combined.states[0].iteration = current_iteration;
+        combined.states.push(historical);
+        let original = new::codec::encode_sender_key_record(&combined);
+        let mut oracle =
+            old::SenderKeyRecord::deserialize_for_store(&original, &INCARNATION).unwrap();
+        let mut runtime =
+            sdk::SenderKeyRecord::deserialize_for_store(&original, &INCARNATION).unwrap();
+        oracle.reserve_iterations(current_iteration);
+        runtime.reserve_iterations(current_iteration);
+        let oracle =
+            old::SenderKeyRecord::from_components(oracle.into_components().unwrap()).unwrap();
+        let runtime =
+            sdk::SenderKeyRecord::from_components(runtime.into_components().unwrap()).unwrap();
+        let name = old::SenderKeyName::from_parts(
+            "synthetic-group@g.us",
+            "synthetic-sender:1@s.whatsapp.net",
+        );
+        let oracle_clear = futures::executor::block_on(old::group_decrypt(
+            &delayed,
+            &mut SenderStore(Some(oracle)),
+            &name,
+        ))
+        .unwrap();
+        assert_eq!(oracle_clear, plaintext);
+        let mut rebuilt =
+            new::codec::decode_sender_key_record(&RustCrypto, &runtime.serialize().unwrap())
+                .unwrap();
+        assert_eq!(rebuilt.states[0].iteration, current_iteration + 64);
+        assert_eq!(rebuilt.states[1].iteration, 0);
+        assert_eq!(rebuilt.states[1].signing_private, expected_private);
+        assert_eq!(
+            engine.decrypt_sender_key(&mut rebuilt, &delayed).unwrap(),
+            plaintext
+        );
+    }
+}

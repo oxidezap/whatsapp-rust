@@ -61,7 +61,11 @@ fn message_key(input: &[u8]) -> Result<MessageKey> {
         seed: raw(&f, 100)?,
     })
 }
-fn decode_chain(input: &[u8]) -> Result<Chain> {
+enum StoredChainRole {
+    Sender,
+    Receiver,
+}
+fn decode_chain(input: &[u8], role: StoredChainRole) -> Result<Chain> {
     let f = fields(input)?;
     let ck = data(&f, 3)?.map(fields).transpose()?;
     let mut skipped = VecDeque::new();
@@ -73,10 +77,14 @@ fn decode_chain(input: &[u8]) -> Result<Chain> {
     }
     Ok(Chain {
         ratchet: public(&f, 1)?,
-        private: data(&f, 2)?
-            .filter(|b| !b.is_empty())
-            .map(array)
-            .transpose()?,
+        // Historical readers ignore this unused field on receiving chains.
+        private: match role {
+            StoredChainRole::Sender => data(&f, 2)?
+                .filter(|b| !b.is_empty())
+                .map(array)
+                .transpose()?,
+            StoredChainRole::Receiver => None,
+        },
         index: ck.as_ref().map(|f| number(f, 1)).transpose()?.unwrap_or(0),
         key: ck
             .as_ref()
@@ -125,7 +133,7 @@ pub fn decode_session_state<C: CryptoProvider>(_crypto: &C, input: &[u8]) -> Res
             if receivers.len() == MAX_RECEIVER_CHAINS {
                 return Err(Error::Encoding("too many receiver chains"));
             }
-            receivers.push(decode_chain(as_bytes(*v)?)?);
+            receivers.push(decode_chain(as_bytes(*v)?, StoredChainRole::Receiver)?);
         }
     }
     let pending_key_exchange = data(&f, 8)?.map(<[u8]>::to_vec);
@@ -138,7 +146,9 @@ pub fn decode_session_state<C: CryptoProvider>(_crypto: &C, input: &[u8]) -> Res
         remote_identity: public(&f, 3)?,
         root: raw(&f, 4)?,
         previous_counter: number(&f, 5)?,
-        sender: data(&f, 6)?.map(decode_chain).transpose()?,
+        sender: data(&f, 6)?
+            .map(|bytes| decode_chain(bytes, StoredChainRole::Sender))
+            .transpose()?,
         receivers,
         pending_key_exchange,
         pending_pre_key: data(&f, 9)?.map(decode_pending).transpose()?,
