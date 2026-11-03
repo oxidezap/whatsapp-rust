@@ -1824,6 +1824,48 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "Encode a synthetic storage fixture with both historical key representations"
+    )]
+    fn matching_expanded_message_key_keeps_seed_for_operational_export() {
+        use buffa::Message;
+        let seed = [0x91; 32];
+        let mut session = reference_session(72, LegacySessionDispositionV1::Current);
+        session.chains[1].message_keys = vec![LegacySessionMessageKeyV1 {
+            index: 0,
+            seed: Bytes::copy_from_slice(&seed),
+        }];
+        let native = record(vec![session])
+            .into_session_record(local_context())
+            .unwrap();
+        let mut persisted =
+            waproto::whatsapp::SessionStructure::from(native.session_state().unwrap());
+        let expected = MessageKeyGenerator::new_from_seed(&seed, 0).generate_keys();
+        let stored = &mut persisted.receiver_chains[0].message_keys[0];
+        stored.cipher_key = Some(Bytes::copy_from_slice(expected.cipher_key()));
+        stored.mac_key = Some(Bytes::copy_from_slice(expected.mac_key()));
+        stored.iv = Some(Bytes::copy_from_slice(expected.iv()));
+        let state = super::super::SessionState {
+            inner: crate::engine::codec::decode_session_state(
+                &crate::engine::RustCrypto,
+                &persisted.encode_to_vec(),
+            )
+            .unwrap(),
+        };
+        let native = SessionRecord::new(state);
+        let native = SessionRecord::deserialize(&native.serialize().unwrap()).unwrap();
+        let projected = native.into_legacy_session_v1_operational().unwrap();
+        let chain = projected.sessions[0]
+            .session
+            .chains
+            .iter()
+            .find(|chain| chain.role == LegacySessionChainRoleV1::Receiving)
+            .unwrap();
+        assert_eq!(chain.message_keys[0].seed.as_ref(), &seed);
+    }
+
+    #[test]
     fn malformed_or_duplicate_skipped_keys_are_never_filtered() {
         let mut duplicate = reference_session(51, LegacySessionDispositionV1::Current);
         duplicate.chains[1].message_keys = vec![

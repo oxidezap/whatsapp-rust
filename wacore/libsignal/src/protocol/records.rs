@@ -852,20 +852,37 @@ impl SenderKeyRecord {
                 version.into(),
             ));
         }
-        self.inner.states.insert(
-            0,
-            engine::SenderKeyState {
-                id,
-                iteration,
-                chain_key: chain_key
-                    .try_into()
-                    .map_err(|_| SignalProtocolError::InvalidSenderKeySession)?,
-                signing_public: *public.public_key_bytes(),
-                signing_private: private.map(|p| *p.serialize()),
-                skipped: engine::SharedDeque::new(),
-            },
+        let chain_key = Zeroizing::new(
+            <[u8; 32]>::try_from(chain_key)
+                .map_err(|_| SignalProtocolError::InvalidSenderKeySession)?,
         );
+        let same_active = self.inner.states.first().is_some_and(|state| {
+            state.id == id && state.signing_public == *public.public_key_bytes()
+        });
+        let retained = self
+            .inner
+            .states
+            .iter()
+            .position(|state| state.id == id && state.signing_public == *public.public_key_bytes())
+            .map(|index| self.inner.states.remove(index));
+        self.inner.states.retain(|state| state.id != id);
+        let state = retained.unwrap_or_else(|| engine::SenderKeyState {
+            id,
+            iteration,
+            chain_key: *chain_key,
+            signing_public: *public.public_key_bytes(),
+            signing_private: private.map(|p| *p.serialize()),
+            skipped: engine::SharedDeque::new(),
+        });
+        self.inner.states.insert(0, state);
         self.inner.states.truncate(engine::MAX_SENDER_STATES);
+        if !same_active {
+            // Reservations and publication proof belong to the active chain.
+            self.inner.reservation.reset_chain();
+            if self.inner.states[0].signing_private.is_some() {
+                self.mark_wire_gated();
+            }
+        }
         self.prune_prepared_crypto();
         Ok(())
     }

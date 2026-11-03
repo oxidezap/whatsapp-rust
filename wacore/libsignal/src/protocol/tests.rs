@@ -1397,3 +1397,172 @@ fn persisted_closed_receiver_reports_unreceived_counter_as_retryable_failure() {
         assert_eq!(f.a_sessions.0[&f.ba].serialize().unwrap(), bytes);
     })
 }
+
+#[test]
+fn readding_known_sender_state_preserves_consumed_and_delayed_messages() {
+    run(async {
+        for advertised in [0, 100] {
+            let mut random = rand::rngs::StdRng::seed_from_u64(1204);
+            let mut sender = Groups::default();
+            let mut receiver = Groups::default();
+            let name = SenderKeyName::from_parts("synthetic.invalid@g.us", "synthetic.invalid:1");
+            let distribution =
+                create_sender_key_distribution_message(&name, &mut sender, &mut random)
+                    .await
+                    .unwrap();
+            process_sender_key_distribution_message(&name, &distribution, &mut receiver)
+                .await
+                .unwrap();
+            let delayed = group_encrypt(&mut sender, &name, b"delayed", &mut random)
+                .await
+                .unwrap();
+            let consumed = group_encrypt(&mut sender, &name, b"consumed", &mut random)
+                .await
+                .unwrap();
+            assert_eq!(
+                group_decrypt_shared(
+                    bytes::Bytes::copy_from_slice(consumed.serialized()),
+                    &mut receiver,
+                    &name
+                )
+                .await
+                .unwrap(),
+                b"consumed"
+            );
+            receiver
+                .records
+                .get_mut(&name)
+                .unwrap()
+                .add_sender_key_state(
+                    3,
+                    distribution.id(),
+                    advertised,
+                    distribution.chain_key(),
+                    *distribution.signing_key(),
+                    None,
+                )
+                .unwrap();
+            assert!(matches!(
+                group_decrypt_shared(
+                    bytes::Bytes::copy_from_slice(consumed.serialized()),
+                    &mut receiver,
+                    &name
+                )
+                .await,
+                Err(SignalProtocolError::DuplicatedMessage(..))
+            ));
+            assert_eq!(
+                group_decrypt_shared(
+                    bytes::Bytes::copy_from_slice(delayed.serialized()),
+                    &mut receiver,
+                    &name
+                )
+                .await
+                .unwrap(),
+                b"delayed"
+            );
+        }
+    })
+}
+#[test]
+fn readding_own_sender_state_preserves_private_key_and_reservation() {
+    run(async {
+        let mut random = rand::rngs::StdRng::seed_from_u64(1205);
+        let mut sender = Groups::default();
+        let name = SenderKeyName::from_parts("synthetic.invalid@g.us", "synthetic.invalid:1");
+        let distribution = create_sender_key_distribution_message(&name, &mut sender, &mut random)
+            .await
+            .unwrap();
+        let record = sender.records.get_mut(&name).unwrap();
+        let before = record.serialize().unwrap();
+        let gated = record.is_wire_gated();
+        record
+            .add_sender_key_state(
+                3,
+                distribution.id(),
+                0,
+                distribution.chain_key(),
+                *distribution.signing_key(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(record.serialize().unwrap(), before);
+        assert_eq!(record.is_wire_gated(), gated);
+        assert!(matches!(
+            record.add_sender_key_state(
+                3,
+                distribution.id(),
+                0,
+                &[1; 31],
+                *distribution.signing_key(),
+                None
+            ),
+            Err(SignalProtocolError::InvalidSenderKeySession)
+        ));
+        assert_eq!(record.serialize().unwrap(), before);
+        group_encrypt(&mut sender, &name, b"still owns sender key", &mut random)
+            .await
+            .unwrap();
+    })
+}
+
+#[test]
+fn activating_another_own_sender_state_rebinds_reservation_before_publication() {
+    run(async {
+        let mut random = rand::rngs::StdRng::seed_from_u64(1206);
+        let mut sender = Groups::default();
+        let name = SenderKeyName::from_parts("synthetic.invalid@g.us", "synthetic.invalid:1");
+        let original = create_sender_key_distribution_message(&name, &mut sender, &mut random)
+            .await
+            .unwrap();
+        group_encrypt(&mut sender, &name, b"original zero", &mut random)
+            .await
+            .unwrap();
+        let other = KeyPair::generate(&mut random);
+        let record = sender.records.get_mut(&name).unwrap();
+        record.clear_wire_gated();
+        record
+            .add_sender_key_state(
+                3,
+                original.id() ^ 1,
+                0,
+                &[99; 32],
+                other.public_key,
+                Some(other.private_key),
+            )
+            .unwrap();
+        assert_eq!(record.reserved_iteration(), 0);
+        assert!(record.is_wire_gated());
+        assert_eq!(
+            group_encrypt(&mut sender, &name, b"other zero", &mut random)
+                .await
+                .unwrap()
+                .iteration(),
+            0
+        );
+        let record = sender.records.get_mut(&name).unwrap();
+        record.clear_wire_gated();
+        record
+            .add_sender_key_state(
+                3,
+                original.id(),
+                0,
+                original.chain_key(),
+                *original.signing_key(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(record.reserved_iteration(), 0);
+        assert!(record.is_wire_gated());
+        assert_eq!(
+            group_encrypt(&mut sender, &name, b"original one", &mut random)
+                .await
+                .unwrap()
+                .iteration(),
+            1
+        );
+        let reloaded =
+            SenderKeyRecord::deserialize(&sender.records[&name].serialize().unwrap()).unwrap();
+        assert_eq!(reloaded.inner.states[0].iteration, 65);
+    })
+}

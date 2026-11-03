@@ -47,6 +47,25 @@ fn message_key(input: &[u8]) -> Result<MessageKey> {
         && mac.len() == 32
         && iv.len() == 16
     {
+        // A redundant seed is useful for operational export only when it
+        // reproduces the authoritative expanded fields exactly.
+        if let Some(Value::Bytes(seed)) = one(&f, 100)
+            && seed.len() == 32
+        {
+            use subtle::ConstantTimeEq;
+            let candidate = MessageKey::Seed {
+                index,
+                seed: array(seed)?,
+            };
+            let expanded = zeroize::Zeroizing::new(candidate.expanded(&crate::engine::RustCrypto)?);
+            if bool::from(
+                expanded.0.as_slice().ct_eq(cipher)
+                    & expanded.1.as_slice().ct_eq(mac)
+                    & expanded.2.as_slice().ct_eq(iv),
+            ) {
+                return Ok(candidate);
+            }
+        }
         return Ok(MessageKey::Derived {
             index,
             material: Box::new(DerivedMessageKey {
@@ -554,5 +573,46 @@ mod parser_budget_tests {
         assert_eq!(decoded.receivers[0].skipped.len(), 4096);
         assert_eq!(decoded.receivers[0].message_key_limit, Some(10_000));
         assert_eq!(decoded.receivers[0].skipped[4095].index(), 4095);
+    }
+}
+
+#[cfg(test)]
+mod message_key_tests {
+    use super::*;
+    #[test]
+    fn redundant_seed_requires_all_expanded_fields_to_match() {
+        let seed = [17; 32];
+        for variant in 0..8 {
+            let (mut cipher, mut mac, mut iv) = MessageKey::Seed { index: 5, seed }
+                .expanded(&crate::engine::RustCrypto)
+                .unwrap();
+            let mut stored_seed = seed.to_vec();
+            match variant {
+                1 => cipher[0] ^= 1,
+                2 => mac[0] ^= 1,
+                3 => iv[0] ^= 1,
+                4 => stored_seed[0] ^= 1,
+                5 => {
+                    stored_seed.pop();
+                }
+                _ => {}
+            }
+            let mut wire = Vec::new();
+            uint(&mut wire, 1, 5);
+            bytes(&mut wire, 2, &cipher);
+            bytes(&mut wire, 3, &mac);
+            bytes(&mut wire, 4, &iv);
+            match variant {
+                6 => {}
+                7 => uint(&mut wire, 100, 1),
+                _ => bytes(&mut wire, 100, &stored_seed),
+            }
+            let key = message_key(&wire).unwrap();
+            assert_eq!(matches!(key, MessageKey::Seed { .. }), variant == 0);
+            assert_eq!(
+                key.expanded(&crate::engine::RustCrypto).unwrap(),
+                (cipher, mac, iv)
+            );
+        }
     }
 }
