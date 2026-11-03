@@ -446,10 +446,15 @@ impl Reservation {
         *self = Self::default();
         self.waived = waived;
     }
-    /// A fresh DH chain has new key material. The existing record reservation
-    /// still covers its first batch; retaining that fact avoids a flush per reply.
+    /// The numerical horizon can be rebased, but a fresh private key has no
+    /// durability proof until its own state snapshot commits.
     pub fn rebase(&mut self) {
         self.ceiling = self.ceiling.map(|ceiling| ceiling.min(64));
+        self.committed = false;
+        self.incarnation = None;
+    }
+    pub fn requires_durable_commit(&self) -> bool {
+        !self.waived && self.ceiling.is_some() && !self.committed
     }
 }
 #[derive(Clone, PartialEq, Eq)]

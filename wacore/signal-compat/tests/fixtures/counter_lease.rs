@@ -430,11 +430,10 @@ fn first_send_raises_the_lease() {
     );
 }
 
-/// Steady-state ping-pong (every send is counter 0 of a freshly ratcheted
-/// chain) must never re-raise the lease: this is what removes the per-message
-/// synchronous flush from the hot send path.
+/// Ping-pong keeps the numerical lease bounded. Each fresh private key must
+/// pass its publication barrier before the peer receives that epoch.
 #[test]
-fn ping_pong_sends_stay_covered_by_the_lease() {
+fn ping_pong_sends_keep_the_lease_bounded_after_publication_barriers() {
     let mut alice = Peer::new("alice");
     let mut bob = Peer::new("bob");
     establish(&mut alice, &mut bob);
@@ -443,14 +442,21 @@ fn ping_pong_sends_stay_covered_by_the_lease() {
     for i in 0..20 {
         let reply = format!("b→a #{i}");
         let ct = send(&mut bob, &alice.address, reply.as_bytes());
+        if record_of(&bob, &alice.address).has_pending_reservation() {
+            ack_flush(&mut bob, &alice.address);
+        }
         receive(&mut alice, &bob.address, &ct).expect("decrypt reply");
 
         let msg = format!("a→b #{i}");
         let ct = send(&mut alice, &bob.address, msg.as_bytes());
-        assert!(
-            !record_of(&alice, &bob.address).has_pending_reservation(),
-            "ping-pong send #{i} is covered by the durable lease and must not re-flush"
+        assert_eq!(
+            record_of(&alice, &bob.address).reserved_sender_chain_index(),
+            SENDER_CHAIN_RESERVATION_BATCH
         );
+        if record_of(&alice, &bob.address).has_pending_reservation() {
+            ack_flush(&mut alice, &bob.address);
+        }
+        assert!(!record_of(&alice, &bob.address).has_pending_reservation());
         let pt = receive(&mut bob, &alice.address, &ct).expect("decrypt");
         assert_eq!(&pt[..], msg.as_bytes());
     }
@@ -522,28 +528,21 @@ fn crash_reload_never_reuses_a_counter_and_peer_decrypts_across_the_gap() {
     assert_eq!(&pt[..], b"after crash");
 }
 
-/// Crash after a DH ratchet whose new chain never reached storage: the
-/// snapshot's OLD chain resumes past its lease, the lost chain's keys are
-/// unrecoverable (fresh random ephemeral), and the peer still decrypts via
-/// its retained old receiver chain.
+/// A crash before a prepared fresh-ratchet packet is published can safely
+/// resume the snapshot's old chain. No peer has observed the lost private key.
 #[test]
-fn crash_reload_after_unflushed_ratchet_resumes_the_old_chain_safely() {
+fn crash_before_publishing_a_fresh_ratchet_resumes_the_old_chain_safely() {
     let mut alice = Peer::new("alice");
     let mut bob = Peer::new("bob");
     establish(&mut alice, &mut bob);
     let snapshot = ack_flush(&mut alice, &bob.address);
 
-    // Bob's reply DH-ratchets Alice onto a brand-new sender chain; her send
-    // on it is lease-covered (no flush) and the chain never gets persisted.
+    // Bob's reply creates a fresh private key. Prepare an output, then lose
+    // it before persistence/publication; never deliver this packet to Bob.
     let ct = send(&mut bob, &alice.address, b"reply");
     receive(&mut alice, &bob.address, &ct).expect("decrypt reply");
     let ct = send(&mut alice, &bob.address, b"on the lost chain");
     assert_eq!(wire_counter(&ct), 0, "fresh chain starts at 0");
-    assert!(
-        !record_of(&alice, &bob.address).has_pending_reservation(),
-        "the ratcheted chain send rides the record lease"
-    );
-    receive(&mut bob, &alice.address, &ct).expect("decrypt");
 
     crash_reload(&mut alice, &bob.address, &snapshot);
 
@@ -641,11 +640,10 @@ fn a_ratcheted_record_still_loads_after_a_restart() {
     );
 }
 
-/// Performance guard: rebasing must not cost the fresh chain its lease
-/// coverage. Dropping the ceiling to zero instead of one batch would put a
-/// synchronous durability flush in front of every reply in a ping-pong.
+/// A new sender private key must first become durable. After that single
+/// publication barrier, the rebased lease covers the whole first batch.
 #[test]
-fn the_rebased_lease_still_covers_the_fresh_chain_without_a_flush() {
+fn the_rebased_lease_covers_the_batch_after_new_key_publication_is_durable() {
     let mut alice = Peer::new("alice");
     let mut bob = Peer::new("bob");
     establish(&mut alice, &mut bob);
@@ -654,6 +652,10 @@ fn the_rebased_lease_still_covers_the_fresh_chain_without_a_flush() {
 
     let ct = send(&mut bob, &alice.address, b"reply");
     receive(&mut alice, &bob.address, &ct).expect("decrypt reply");
+
+    if record_of(&alice, &bob.address).has_pending_reservation() {
+        ack_flush(&mut alice, &bob.address);
+    }
 
     for counter in 0..SENDER_CHAIN_RESERVATION_BATCH {
         let ct = send(&mut alice, &bob.address, b"post-ratchet");

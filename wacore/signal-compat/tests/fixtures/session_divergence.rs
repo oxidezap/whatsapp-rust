@@ -1010,6 +1010,8 @@ fn a_replay_stays_quiet_when_a_sibling_candidate_session_fails_first() {
     ));
     bob.session_store.0.insert(alice.address.clone(), full);
 
+    // Exclude the deliberate current-only failure used as the control above.
+    let before_replay = announced::about(PEER).len();
     let verdict = replay(&mut bob, &alice.address, &ct);
     assert!(
         matches!(verdict, SignalProtocolError::DuplicatedMessage(_, _)),
@@ -1017,6 +1019,7 @@ fn a_replay_stays_quiet_when_a_sibling_candidate_session_fails_first() {
     );
 
     let records = announced::about(PEER);
+    let records = &records[before_replay..];
     assert!(
         records.iter().all(|(level, _)| *level > log::Level::Error),
         "a replay must stay out of the error log even when a sibling candidate fails; got {records:?}"

@@ -83,6 +83,7 @@ fn x3dh_double_ratchet_roundtrip_and_reordering() {
         let reply = engine.encrypt(&mut bob, b"reply").unwrap();
         assert_eq!(engine.decrypt(&mut alice, &reply).unwrap(), b"reply");
         reserve(&mut alice);
+        reserve(&mut alice);
         let a = engine.encrypt(&mut alice, b"a").unwrap();
         let b = engine.encrypt(&mut alice, b"b").unwrap();
         let c = engine.encrypt(&mut alice, b"c").unwrap();
@@ -300,4 +301,29 @@ fn existing_prekey_session_does_not_need_consumed_one_time_key() {
     p.local_one_time_pre_key = None;
     let second = e.encrypt(&mut a, b"second").unwrap();
     assert_eq!(e.decrypt_pre_key(&mut b, &second, &p).unwrap(), b"second");
+}
+
+#[test]
+fn fresh_dh_cannot_publish_with_the_previous_chain_commitment() {
+    let mut rng = Deterministic(0x1828_d002);
+    let mut engine = Engine::new(&RustCrypto, &mut rng);
+    let (mut alice, mut bob, parameters) = peers(&mut engine, false);
+    let first = engine.encrypt(&mut alice, b"init").unwrap();
+    engine
+        .decrypt_pre_key(&mut bob, &first, &parameters)
+        .unwrap();
+    reserve(&mut bob);
+    let reply = engine.encrypt(&mut bob, b"fresh peer ratchet").unwrap();
+    engine.decrypt(&mut alice, &reply).unwrap();
+    assert_eq!(alice.reservation.ceiling, Some(64));
+    assert!(alice.reservation.requires_durable_commit());
+    assert_eq!(alice.reservation.incarnation, None);
+    let snapshot = encode_session_record(&alice);
+    assert_eq!(
+        engine.encrypt(&mut alice, b"not durable"),
+        Err(Error::ReservationRequired)
+    );
+    assert_eq!(encode_session_record(&alice), snapshot);
+    alice.reservation.mark_committed();
+    assert!(engine.encrypt(&mut alice, b"durable private key").is_ok());
 }

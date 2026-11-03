@@ -2,6 +2,7 @@
 use super::error::Result;
 use super::*;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use wacore_signal_engine::{self as engine, CryptoProvider};
 use zeroize::{Zeroize, Zeroizing};
 pub(crate) fn raw_pair(pair: &KeyPair) -> engine::KeyPair {
@@ -331,12 +332,37 @@ impl SessionRecord {
     ) -> engine::Result<T> {
         // Move ownership through the engine without cloning active caches or
         // retaining a second inline Option<SessionState> in every stored record.
+        let previous_sender = self
+            .current
+            .as_ref()
+            .and_then(|state| state.inner.sender.as_ref())
+            .map(|chain| chain.ratchet);
+        let previous_root = self
+            .current
+            .as_ref()
+            .map(|state| Zeroizing::new(state.inner.root));
         let mut record = engine::SessionRecord {
             current: self.current.take().map(|s| s.inner),
             previous: core::mem::take(&mut self.inner.previous),
             reservation: core::mem::take(&mut self.inner.reservation),
         };
         let result = f(&mut record);
+        let selected_sender = record
+            .current
+            .as_ref()
+            .and_then(|state| state.sender.as_ref())
+            .map(|chain| chain.ratchet);
+        let root_changed = match (previous_root.as_deref(), record.current.as_ref()) {
+            (Some(previous), Some(current)) => !bool::from(previous.ct_eq(&current.root)),
+            (None, None) => false,
+            _ => true,
+        };
+        if result.is_ok()
+            && (previous_sender != selected_sender || root_changed)
+            && record.reservation.requires_durable_commit()
+        {
+            self.pending_reservation = true;
+        }
         self.current = record.current.take().map(|inner| SessionState { inner });
         self.inner.previous = core::mem::take(&mut record.previous);
         self.inner.reservation = core::mem::take(&mut record.reservation);
@@ -390,6 +416,7 @@ impl SessionRecord {
     }
     pub fn rebase_lease_after_sender_chain_reset(&mut self) {
         self.inner.reservation.rebase();
+        self.pending_reservation |= self.inner.reservation.requires_durable_commit();
     }
     pub fn set_session_state(&mut self, state: SessionState) {
         self.current = Some(state);
