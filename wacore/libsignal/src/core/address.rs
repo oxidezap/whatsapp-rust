@@ -179,14 +179,36 @@ impl fmt::Write for AddressBuf {
 /// one-shot construction and eliminates the copy in `reset_with()`. The buffer
 /// itself is inline up to 47 bytes, so the common address is a value
 /// with nothing behind it.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ProtocolAddress {
     buf: AddressBuf,
     name_len: usize,
     device_id: DeviceId,
 }
 
+impl fmt::Debug for ProtocolAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.observe(), f)
+    }
+}
+
 impl ProtocolAddress {
+    /// Correlate low-level diagnostics without formatting a phone-number name.
+    pub fn observe(&self) -> impl fmt::Display + '_ {
+        struct Observed<'a>(&'a ProtocolAddress);
+        impl fmt::Display for Observed<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(
+                    f,
+                    "peer#{:016x}.{}",
+                    wacore_binary::jid::observe_token(self.0.name()),
+                    self.0.device_id()
+                )
+            }
+        }
+        Observed(self)
+    }
+
     pub fn new(name: &str, device_id: DeviceId) -> Self {
         let mut address = Self::empty(device_id);
         address.reset_with(|buf| buf.push_str(name));
@@ -393,7 +415,7 @@ mod address_buffer_tests {
     /// The same guarantee one level up, since this is the type that actually
     /// reaches logs and error messages.
     #[test]
-    fn a_protocol_address_prints_only_its_own_name() {
+    fn a_protocol_address_debug_correlates_without_printing_either_name() {
         let mut addr = ProtocolAddress::new("5511999998888@s.whatsapp.net", 1.into());
         addr.reset_with(|buf| buf.push_str("55119@lid"));
 
@@ -403,8 +425,8 @@ mod address_buffer_tests {
             "a reused address must not print the previous peer: {shown}"
         );
         assert!(
-            shown.contains("55119@lid"),
-            "it must still print what it holds: {shown}"
+            shown.starts_with("peer#") && shown.ends_with(".1"),
+            "it must still correlate its current peer and device: {shown}"
         );
     }
     use super::*;

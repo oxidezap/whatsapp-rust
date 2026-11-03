@@ -301,7 +301,7 @@ async fn message_encrypt_inner(
     let their_identity_key = session_state.remote_identity_key()?.ok_or_else(|| {
         SignalProtocolError::InvalidState(
             "message_encrypt",
-            format!("no remote identity key for {remote_address}"),
+            format!("no remote identity key for {}", remote_address.observe()),
         )
     })?;
 
@@ -315,9 +315,8 @@ async fn message_encrypt_inner(
     .await?
     {
         log::warn!(
-            "Identity key {} is not trusted for remote address {}",
-            hex::encode(their_identity_key.public_key().public_key_bytes()),
-            remote_address,
+            "Identity key is not trusted for remote address {}",
+            remote_address.observe(),
         );
         return Err(SignalProtocolError::UntrustedIdentity(
             remote_address.clone(),
@@ -336,7 +335,10 @@ async fn message_encrypt_inner(
         buf.clear();
         aes_256_cbc_encrypt_into(ptext, message_keys.cipher_key(), message_keys.iv(), buf)
             .map_err(|_| {
-                log::error!("session state corrupt for {remote_address}");
+                log::error!(
+                    "session state corrupt for {peer}",
+                    peer = remote_address.observe()
+                );
                 SignalProtocolError::InvalidSessionStructure("invalid sender chain message keys")
             })?;
         let ctext = buf.as_slice();
@@ -346,7 +348,7 @@ async fn message_encrypt_inner(
 
             log::debug!(
                 "Building PreKeyWhisperMessage for: {} with preKeyId: {}",
-                remote_address,
+                remote_address.observe(),
                 items
                     .pre_key_id()
                     .map_or_else(|| "<none>".to_string(), |id| id.to_string()),
@@ -590,7 +592,7 @@ async fn message_decrypt_prekey_inner<R: Rng + CryptoRng>(
                     &errs,
                     session_record,
                     ciphertext.pre_key_message().message()
-                )?
+                )
             );
             let [e] = errs;
             return Err(e);
@@ -687,7 +689,7 @@ async fn message_decrypt_signal_inner<R: Rng + CryptoRng>(
         log::warn!(
             "Session record for {} exists but has no usable state (no current, 0 previous). \
              Treating as SessionNotFound.",
-            remote_address
+            remote_address.observe()
         );
         return Err(SignalProtocolError::SessionNotFound(remote_address.clone()));
     }
@@ -719,7 +721,7 @@ async fn message_decrypt_signal_inner<R: Rng + CryptoRng>(
     let identity_change = if decrypt.used_previous_session() {
         log::debug!(
             "Saving identity for {} from previous session (skipping trust check)",
-            remote_address,
+            remote_address.observe(),
         );
         // Re-saving an archived session's (older) identity for out-of-order
         // delivery is not the peer's current identity changing, so never report
@@ -742,9 +744,8 @@ async fn message_decrypt_signal_inner<R: Rng + CryptoRng>(
         .await?
         {
             log::warn!(
-                "Identity key {} is not trusted for remote address {}",
-                hex::encode(their_identity_key.public_key().public_key_bytes()),
-                remote_address,
+                "Identity key is not trusted for remote address {}",
+                remote_address.observe(),
             );
             return Err(SignalProtocolError::UntrustedIdentity(
                 remote_address.clone(),
@@ -770,95 +771,61 @@ fn take_key_agreement_failure(errs: &mut Vec<SignalProtocolError>) -> Option<Sig
     Some(errs.remove(at))
 }
 
-fn create_decryption_failure_log(
-    remote_address: &ProtocolAddress,
-    mut errs: &[SignalProtocolError],
-    record: &SessionRecord,
+struct DecryptionFailure<'a> {
+    peer: &'a ProtocolAddress,
+    errors: &'a [SignalProtocolError],
+    record: &'a SessionRecord,
+    counter: u32,
+}
+
+fn create_decryption_failure_log<'a>(
+    peer: &'a ProtocolAddress,
+    errors: &'a [SignalProtocolError],
+    record: &'a SessionRecord,
     ciphertext: &SignalMessage,
-) -> Result<String> {
-    fn append_session_summary(
-        lines: &mut Vec<String>,
-        idx: usize,
-        state: std::result::Result<&SessionState, crate::protocol::state::InvalidSessionError>,
-        err: Option<&SignalProtocolError>,
-    ) {
-        let chains = state.map(|state| state.all_receiver_chain_logging_info());
-        match (err, &chains) {
-            (Some(err), Ok(chains)) => {
-                lines.push(format!(
-                    "Candidate session {} failed with '{}', had {} receiver chains",
-                    idx,
-                    err,
-                    chains.len()
-                ));
+) -> DecryptionFailure<'a> {
+    DecryptionFailure {
+        peer,
+        errors,
+        record,
+        counter: ciphertext.counter(),
+    }
+}
+
+impl std::fmt::Display for DecryptionFailure<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn session(
+            f: &mut std::fmt::Formatter<'_>,
+            idx: usize,
+            state: std::result::Result<&SessionState, &crate::protocol::state::InvalidSessionError>,
+            error: Option<&SignalProtocolError>,
+        ) -> std::fmt::Result {
+            write!(f, "\nCandidate session {idx}")?;
+            if let Some(error) = error {
+                write!(f, " failed with '{error}'")?;
             }
-            (Some(err), Err(state_err)) => {
-                lines.push(format!(
-                    "Candidate session {idx} failed with '{err}'; cannot get receiver chain info ({state_err})",
-                ));
-            }
-            (None, Ok(chains)) => {
-                lines.push(format!(
-                    "Candidate session {} had {} receiver chains",
-                    idx,
-                    chains.len()
-                ));
-            }
-            (None, Err(state_err)) => {
-                lines.push(format!(
-                    "Candidate session {idx}: cannot get receiver chain info ({state_err})",
-                ));
+            match state {
+                Ok(state) => write!(f, "; had {} receiver chains", state.receiver_chain_count()),
+                Err(error) => write!(f, "; cannot get receiver chain info ({error})"),
             }
         }
-
-        if let Ok(chains) = chains {
-            for chain in chains {
-                let chain_idx = match chain.1 {
-                    Some(i) => i.to_string(),
-                    None => "missing in protobuf".to_string(),
-                };
-
-                lines.push(format!(
-                    "Receiver chain with sender ratchet public key {} chain key index {}",
-                    hex::encode(chain.0),
-                    chain_idx
-                ));
-            }
+        write!(
+            f,
+            "Message from {} failed to decrypt; message counter {}",
+            self.peer.observe(),
+            self.counter
+        )?;
+        let mut errors = self.errors.iter();
+        if let Some(state) = self.record.session_state() {
+            session(f, 0, Ok(state), errors.next())?;
+        } else {
+            f.write_str("\nNo current session")?;
         }
-    }
-
-    let mut lines = vec![];
-
-    lines.push(format!(
-        "Message from {} failed to decrypt; sender ratchet public key {} message counter {}",
-        remote_address,
-        hex::encode(ciphertext.sender_ratchet_key().public_key_bytes()),
-        ciphertext.counter()
-    ));
-
-    if let Some(current_session) = record.session_state() {
-        let err = errs.first();
-        if err.is_some() {
-            errs = &errs[1..];
+        for (idx, state) in self.record.previous_session_states().enumerate() {
+            session(f, idx + 1, state.as_ref(), errors.next())?;
         }
-        append_session_summary(&mut lines, 0, Ok(current_session), err);
-    } else {
-        lines.push("No current session".to_string());
+        Ok(())
     }
-
-    for (idx, (state, err)) in record
-        .previous_session_states()
-        .zip(errs.iter().map(Some).chain(std::iter::repeat(None)))
-        .enumerate()
-    {
-        let state = match state {
-            Ok(ref state) => Ok(state),
-            Err(err) => Err(err),
-        };
-        append_session_summary(&mut lines, idx + 1, state, err);
-    }
-
-    Ok(lines.join("\n"))
 }
 
 enum RecordDecryptState {
@@ -1021,33 +988,29 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
         original_message_type,
         CiphertextMessageType::Whisper | CiphertextMessageType::PreKey
     ));
-    let log_decryption_failure =
-        |message: &SignalMessage, state: &SessionState, error: &SignalProtocolError| {
-            // A warning rather than an error because we try multiple sessions:
-            // one candidate failing is not yet a verdict. A replay is not even
-            // a candidate failure — the chain was recognized and its counter is
-            // simply spent — so it drops another level, to match the verdict
-            // the tail of this function is about to reach.
-            let level = if matches!(error, SignalProtocolError::DuplicatedMessage(..)) {
-                log::Level::Debug
-            } else {
-                log::Level::Warn
-            };
-            log::log!(
-                level,
-                "Failed to decrypt {:?} message with ratchet key: {} and counter: {}. \
-             Session loaded for {}. Local session has base key: {} and counter: {}. {}",
-                original_message_type,
-                hex::encode(message.sender_ratchet_key().public_key_bytes()),
-                message.counter(),
-                remote_address,
-                state
-                    .sender_ratchet_key_for_logging()
-                    .unwrap_or_else(|e| format!("<error: {e}>")),
-                state.previous_counter(),
-                error
-            );
+    let log_decryption_failure = |message: &SignalMessage,
+                                  state: &SessionState,
+                                  error: &SignalProtocolError| {
+        // A warning rather than an error because we try multiple sessions:
+        // one candidate failing is not yet a verdict. A replay is not even
+        // a candidate failure — the chain was recognized and its counter is
+        // simply spent — so it drops another level, to match the verdict
+        // the tail of this function is about to reach.
+        let level = if matches!(error, SignalProtocolError::DuplicatedMessage(..)) {
+            log::Level::Debug
+        } else {
+            log::Level::Warn
         };
+        log::log!(
+            level,
+            "Failed to decrypt {:?} message with counter: {}. Session loaded for {}. Previous counter: {}. {}",
+            original_message_type,
+            message.counter(),
+            remote_address.observe(),
+            state.previous_counter(),
+            error
+        );
+    };
 
     let mut errs = vec![];
 
@@ -1065,12 +1028,9 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
         match result {
             Ok(result) => {
                 log::debug!(
-                    "decrypted {:?} message from {} with current session state (base key {})",
+                    "decrypted {:?} message from {} with current session state",
                     original_message_type,
-                    remote_address,
-                    current_state
-                        .sender_ratchet_key_for_logging()
-                        .expect("successful decrypt always has a valid base key"),
+                    remote_address.observe(),
                 );
                 record.set_session_state(current_state);
                 return match result.effect {
@@ -1138,7 +1098,7 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
                                 &errs,
                                 record,
                                 ciphertext.signal_message()
-                            )?
+                            )
                         );
                         if let Some(refused) = take_key_agreement_failure(&mut errs) {
                             return Err(refused);
@@ -1193,12 +1153,9 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
         match result {
             Ok(result) => {
                 log::debug!(
-                    "decrypted {:?} message from {} with PREVIOUS session state (base key {})",
+                    "decrypted {:?} message from {} with PREVIOUS session state",
                     original_message_type,
-                    remote_address,
-                    previous
-                        .sender_ratchet_key_for_logging()
-                        .expect("successful decrypt always has a valid base key"),
+                    remote_address.observe(),
                 );
                 return Ok(RecordDecrypt::Transaction(RecordDecryptTransaction {
                     record,
@@ -1265,30 +1222,21 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
         _ => None,
     }) {
         log::debug!(
-            "Replayed message from {remote_address}: chain recognized, counter {counter} already consumed (chain {chain}, {previous_state_count} previous states). Expected when a reconnect redelivers a message whose ack the server never saw."
+            "Replayed message from {peer}: chain recognized, counter {counter} already consumed (chain {chain}, {previous_state_count} previous states). Expected when a reconnect redelivers a message whose ack the server never saw.",
+            peer = remote_address.observe()
         );
         return Err(SignalProtocolError::DuplicatedMessage(chain, counter));
     }
 
-    if let Some(current_state) = record.session_state() {
-        log::error!(
-            "No valid session for recipient: {}, current session base key {}, number of previous states: {}",
-            remote_address,
-            current_state
-                .sender_ratchet_key_for_logging()
-                .unwrap_or_else(|e| format!("<error: {e}>")),
-            previous_state_count,
-        );
-    } else {
-        log::error!(
-            "No valid session for recipient: {}, (no current session state), number of previous states: {}",
-            remote_address,
-            previous_state_count,
-        );
-    }
+    log::error!(
+        "No valid session for recipient: {}, current state present: {}, number of previous states: {}",
+        remote_address.observe(),
+        record.session_state().is_some(),
+        previous_state_count,
+    );
     log::error!(
         "{}",
-        create_decryption_failure_log(remote_address, &errs, record, ciphertext.signal_message())?
+        create_decryption_failure_log(remote_address, &errs, record, ciphertext.signal_message())
     );
 
     if let Some(refused) = take_key_agreement_failure(&mut errs) {
@@ -1522,22 +1470,6 @@ fn decrypt_with_pending_state<R: Rng + CryptoRng>(
     Ok((plaintext, sender_chain_reset))
 }
 
-/// Hex-formats a byte slice at `Display` time rather than up front.
-///
-/// `hex::encode` returns a `String`, so passing one to a log macro allocates
-/// whether or not the record is ever emitted. This writes straight into the
-/// formatter instead.
-struct Hex<'a>(&'a [u8]);
-
-impl std::fmt::Display for Hex<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for byte in self.0 {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
-    }
-}
-
 fn decrypt_with_message_keys(
     current_or_previous: CurrentOrPrevious,
     state: &SessionState,
@@ -1564,29 +1496,11 @@ fn decrypt_with_message_keys(
     )?;
 
     if !mac_valid {
-        // A MAC failure here is not exceptional: the decrypt path probes the
-        // current session and then each archived one, and every miss lands
-        // exactly here. So this is a candidate diagnostic, not a verdict, and
-        // it is logged at the same level as the caller's per-candidate line —
-        // one session failing is not yet a failure, and a replay reaches this
-        // site for every sibling that shares the ratchet key before the
-        // archived state recognizes its spent counter. A genuine dead end
-        // still gets its `log::error!` from the verdict at the end of
-        // `decrypt_message_with_record`, so nothing is lost by not shouting
-        // here. Formatting through `Hex` defers the three allocations to the
-        // macro's own argument formatting, so a probe that the next candidate
-        // session goes on to satisfy pays nothing, and a build with the level
-        // filtered out pays nothing either.
+        // A failed candidate is not the final decrypt verdict. Never include
+        // identity, ratchet or symmetric key bytes, even with verbose logging.
         log::warn!(
-            "MAC verification failed for message from {}. \
-             Remote Identity: {}, \
-             Local Identity: {}, \
-             MAC Key Fingerprint: {}...",
-            remote_address,
-            Hex(their_identity_key.public_key().public_key_bytes()),
-            Hex(local_identity_key.public_key().public_key_bytes()),
-            // Four bytes render as the eight hex digits the message names.
-            Hex(&message_keys.mac_key()[..4]),
+            "MAC verification failed for message from {} ({current_or_previous} session)",
+            remote_address.observe(),
         );
         return Err(SignalProtocolError::BadMac(original_message_type));
     }
@@ -1594,7 +1508,10 @@ fn decrypt_with_message_keys(
     match ciphertext.decrypt(message_keys.cipher_key(), message_keys.iv()) {
         Ok(plaintext) => Ok(plaintext),
         Err(DecryptionErrorCrypto::BadKeyOrIv) => {
-            log::warn!("{current_or_previous} session state corrupt for {remote_address}",);
+            log::warn!(
+                "{current_or_previous} session state corrupt for {peer}",
+                peer = remote_address.observe()
+            );
             Err(SignalProtocolError::InvalidSessionStructure(
                 "invalid receiver chain message keys",
             ))
@@ -1650,7 +1567,10 @@ fn get_or_create_chain_key(
         None => {}
     }
 
-    log::debug!("{remote_address} creating new chains.");
+    log::debug!(
+        "{peer} creating new chains.",
+        peer = remote_address.observe()
+    );
 
     let root_key = state.root_key()?;
     let our_ephemeral = state.sender_ratchet_private_key()?;
@@ -1692,7 +1612,8 @@ fn get_or_create_message_key(
     let limit = forward_jump_limit(state.session_with_self()?);
     if jump > limit {
         log::error!(
-            "{remote_address} Exceeded future message limit: {limit}, index: {chain_index}, counter: {counter})"
+            "{peer} Exceeded future message limit: {limit}, index: {chain_index}, counter: {counter})",
+            peer = remote_address.observe()
         );
         return Err(SignalProtocolError::InvalidMessage(
             original_message_type,

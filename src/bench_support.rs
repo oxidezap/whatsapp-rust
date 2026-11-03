@@ -452,6 +452,10 @@ async fn establish_acknowledged_session(client: &Arc<Client>, peer: &Jid) -> Arc
             .await
             .expect("companion persistence manager"),
     );
+    // Fixed-width synthetic input, matching the connected fixture's contract.
+    peer_pm
+        .modify_device(|device| device.registration_id = 0x2345_6789)
+        .await;
     let (peer_client, _sync_rx) = Client::builder()
         .with_runtime(TokioRuntime)
         .with_persistence_manager(peer_pm)

@@ -15,6 +15,7 @@ pub mod client;
 pub mod client_profile;
 pub mod companion_reg;
 pub mod crypto;
+pub mod diagnostics;
 pub mod download;
 pub mod iq;
 pub mod protocol;
@@ -52,6 +53,7 @@ pub mod stats;
 pub mod sticker_pack;
 
 pub mod store;
+pub mod sync_engine;
 pub mod sync_marker;
 pub mod telemetry;
 pub mod time;

@@ -104,7 +104,7 @@ enum IqResponsePolicy {
 
 /// A rejection stanza kept for the caller, wrapping the node the receive path decoded.
 ///
-/// Exists for its `Debug`, which names the stanza instead of printing it: background IQ
+/// Exists for its `Debug`, which summarizes safe protocol context: background IQ
 /// failures are logged with `{e:?}` on the connect path, and an error stanza can carry a
 /// JID. Reading the contents is [`Deref`] away, but that is now the caller's choice.
 ///
@@ -140,28 +140,31 @@ impl std::ops::Deref for RejectionStanza {
 
 impl std::fmt::Debug for RejectionStanza {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "<{}>", self.0.tag())
+        std::fmt::Debug::fmt(
+            &wacore_binary::diagnostics::NodeSummary::from(self.0.get()),
+            f,
+        )
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum IqError {
     #[error("IQ request timed out")]
     Timeout,
     #[error("client is not connected")]
     NotConnected,
-    #[error("socket error")]
+    #[error("socket error: {0}")]
     Socket(#[from] SocketError),
-    #[error("encrypted send pipeline failed")]
+    #[error("encrypted send pipeline failed: {0}")]
     EncryptSend(#[from] EncryptSendError),
     // Boxed to break the `ClientError::Iq(IqError)` <-> `IqError::ClientState`
     // type cycle (both would otherwise be infinitely sized).
-    #[error("client state prevented send")]
+    #[error("client state prevented send: {0}")]
     ClientState(#[source] Box<ClientError>),
-    #[error("received disconnect node during IQ wait: {0:?}")]
+    #[error("received disconnect node during IQ wait: {}", wacore_binary::diagnostics::NodeSummary::from(.0.as_ref()))]
     Disconnected(Box<Node>),
-    #[error("received a server error response: code={code}, text='{text}'")]
+    #[error("received a server error response: code={code}, text={}, class={:?}, backoff={backoff:?}", wacore_binary::diagnostics::ProtocolText::new(.text), .error_type.as_deref().map(wacore_binary::diagnostics::ProtocolText::new))]
     ServerError {
         code: u16,
         text: String,
@@ -174,7 +177,7 @@ pub enum IqError {
         /// above does not replace it: unread attributes, children and bytes stay readable.
         response: RejectionStanza,
     },
-    #[error("received unexpected IQ response type: {got:?}")]
+    #[error("received unexpected IQ response type: {:?}", .got.as_deref().map(wacore_binary::diagnostics::ProtocolText::new))]
     UnexpectedResponseType { got: Option<String> },
     #[error("internal channel closed unexpectedly")]
     InternalChannelClosed,
@@ -185,12 +188,73 @@ pub enum IqError {
     /// in `wacore` before this facade learns its dedicated variant.
     #[error("unclassified IQ error: {0}")]
     Unclassified(#[source] wacore::request::IqError),
-    #[error("IQ request ID is already in flight: {0}")]
+    #[error("IQ request ID is already in flight: {}", wacore_binary::diagnostics::ObservedId::new(.0))]
     DuplicateRequestId(String),
-    #[error("failed to encode IQ request")]
+    #[error("failed to encode IQ request: {}", wacore::diagnostics::ErrorSummary(.0.as_ref()))]
     EncodeError(#[source] anyhow::Error),
-    #[error("failed to parse IQ response")]
+    #[error("failed to parse IQ response: {}", wacore::diagnostics::ErrorSummary(.0.as_ref()))]
     ParseError(#[from] anyhow::Error),
+}
+
+// The disconnect stanza stays on the public error for programmatic handling,
+// but IQ failures are routinely formatted by callers' warning/error logs.
+impl std::fmt::Debug for IqError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout => f.write_str("Timeout"),
+            Self::NotConnected => f.write_str("NotConnected"),
+            Self::InternalChannelClosed => f.write_str("InternalChannelClosed"),
+            Self::Disconnected(node) => f
+                .debug_tuple("Disconnected")
+                .field(&wacore_binary::diagnostics::NodeSummary::from(
+                    node.as_ref(),
+                ))
+                .finish(),
+            Self::UnexpectedResponseType { got } => f
+                .debug_struct("UnexpectedResponseType")
+                .field(
+                    "got",
+                    &got.as_deref()
+                        .map(wacore_binary::diagnostics::ProtocolText::new),
+                )
+                .finish(),
+            Self::Socket(value) => f.debug_tuple("Socket").field(value).finish(),
+            Self::EncryptSend(value) => f.debug_tuple("EncryptSend").field(value).finish(),
+            Self::ClientState(value) => f.debug_tuple("ClientState").field(value).finish(),
+            Self::Unclassified(value) => f.debug_tuple("Unclassified").field(value).finish(),
+            Self::DuplicateRequestId(value) => f
+                .debug_tuple("DuplicateRequestId")
+                .field(&wacore_binary::diagnostics::ObservedId::new(value))
+                .finish(),
+            Self::EncodeError(value) => f
+                .debug_tuple("EncodeError")
+                .field(&wacore::diagnostics::ErrorSummary(value.as_ref()))
+                .finish(),
+            Self::ParseError(value) => f
+                .debug_tuple("ParseError")
+                .field(&wacore::diagnostics::ErrorSummary(value.as_ref()))
+                .finish(),
+            Self::ServerError {
+                code,
+                text,
+                error_type,
+                backoff,
+                response,
+            } => f
+                .debug_struct("ServerError")
+                .field("code", code)
+                .field("text", &wacore_binary::diagnostics::ProtocolText::new(text))
+                .field(
+                    "error_type",
+                    &error_type
+                        .as_deref()
+                        .map(wacore_binary::diagnostics::ProtocolText::new),
+                )
+                .field("backoff", backoff)
+                .field("response", response)
+                .finish(),
+        }
+    }
 }
 
 impl IqError {
@@ -1023,12 +1087,18 @@ mod tests {
             Arc::ptr_eq(response.as_arc(), &delivered),
             "the rejection must carry the decoded node itself, not a copy of it"
         );
-        assert_eq!(
-            format!("{response:?}"),
-            "<iq>",
-            "Debug must name the stanza, not print it: background IQ failures are logged \
-             with {{e:?}} and an error stanza can carry a JID"
-        );
+        let summary = format!("{response:?}");
+        assert!(summary.starts_with("<iq id=id#"));
+        for context in [
+            "type=error",
+            "code=403",
+            "type=cancel",
+            "backoff=30",
+            "not-authorized",
+        ] {
+            assert!(summary.contains(context), "missing {context}: {summary}");
+        }
+        assert!(!summary.contains(&request_id));
 
         let response = response.get();
         assert_eq!(

@@ -28,11 +28,16 @@ stable_deref_trait = "1.2.1"
 yoke = { workspace = true }
 zlib-rs = { workspace = true }
 
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { workspace = true, features = ["wasm_js"] }
+siphasher = "1.0"
+
 [build-dependencies]
 serde = { workspace = true, features = ["alloc"] }
 serde_json = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
+siphasher = "1.0"
 divan = { workspace = true }
 flate2 = { workspace = true }
 proptest = "1.11.0"

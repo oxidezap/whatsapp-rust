@@ -878,6 +878,10 @@ mod announced {
         });
     }
 
+    pub fn all() -> Vec<(log::Level, String)> {
+        CAPTURE.records.lock().unwrap().clone()
+    }
+
     /// Every buffered record whose message names `peer`.
     pub fn about(peer: &str) -> Vec<(log::Level, String)> {
         CAPTURE
@@ -885,7 +889,12 @@ mod announced {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
-            .filter(|(_, message)| message.contains(peer))
+            .filter(|(_, message)| {
+                message.contains(&format!(
+                    "peer#{:016x}",
+                    wacore_binary::jid::observe_token(peer)
+                ))
+            })
             .cloned()
             .collect()
     }
@@ -998,4 +1007,65 @@ fn a_replay_stays_quiet_when_a_sibling_candidate_session_fails_first() {
         records.iter().all(|(level, _)| *level > log::Level::Error),
         "a replay must stay out of the error log even when a sibling candidate fails; got {records:?}"
     );
+}
+
+#[test]
+fn corrupt_mac_logs_never_include_keys_or_phone_numbers() {
+    use wacore_libsignal::protocol::SignalMessage;
+    announced::install();
+    const SENDER: &str = "19990000001";
+    let (mut alice, mut bob, _) = delivered_once(SENDER, "19990000002");
+    let state = alice
+        .session_store
+        .0
+        .get(&bob.address)
+        .unwrap()
+        .session_state()
+        .unwrap();
+    let message_keys = state
+        .get_sender_chain_key()
+        .unwrap()
+        .message_keys()
+        .generate_keys();
+    let mac_prefix = hex::encode(&message_keys.mac_key()[..4]);
+    let identity = hex::encode(
+        state
+            .local_identity_key()
+            .unwrap()
+            .public_key()
+            .public_key_bytes(),
+    );
+    let ciphertext = send(&mut alice, &bob.address, b"synthetic plaintext marker");
+    let message = SignalMessage::try_from(ciphertext.serialize()).unwrap();
+    let ratchet = hex::encode(message.sender_ratchet_key().public_key_bytes());
+    let mut bytes = ciphertext.serialize().to_vec();
+    let expected_mac = hex::encode(&bytes[bytes.len() - 8..]);
+    *bytes.last_mut().unwrap() ^= 0xff;
+    let received_mac = hex::encode(&bytes[bytes.len() - 8..]);
+    let corrupted =
+        CiphertextMessage::SignalMessage(SignalMessage::try_from(bytes.as_slice()).unwrap());
+    assert!(receive(&mut bob, &alice.address, &corrupted).is_err());
+    let records = announced::all();
+    assert!(
+        records
+            .iter()
+            .any(|(_, message)| message.contains("MAC verification failed"))
+    );
+    for (_, message) in records {
+        for marker in [
+            SENDER,
+            "19990000002",
+            &ratchet,
+            &mac_prefix,
+            &identity,
+            &expected_mac,
+            &received_mac,
+            "MAC Key Fingerprint",
+            "Remote Identity:",
+            "Local Identity:",
+            "synthetic plaintext marker",
+        ] {
+            assert!(!message.contains(marker), "sensitive signal value logged");
+        }
+    }
 }
