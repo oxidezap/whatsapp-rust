@@ -467,7 +467,8 @@ mod tests {
             .i32_store8(wasm_encoder::MemArg {
                 offset: 128,
                 align: 0,
-                memory_index: 0,
+                target: wasm_encoder::MemArgTarget::Memory(0),
+                ordering: None,
             })
             .end();
         code.function(&destructor);
