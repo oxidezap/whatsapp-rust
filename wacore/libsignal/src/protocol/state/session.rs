@@ -496,6 +496,10 @@ impl SessionState {
         Ok(true)
     }
 
+    pub(crate) fn receiver_chain_count(&self) -> usize {
+        self.session.receiver_chains.len()
+    }
+
     pub fn all_receiver_chain_logging_info(&self) -> Vec<(Vec<u8>, Option<u32>)> {
         let mut results = vec![];
         for chain in self.session.receiver_chains.iter() {
@@ -616,12 +620,7 @@ impl SessionState {
         // Using drain() for consistency, though with only 5 elements the difference is negligible.
         let len = self.session.receiver_chains.len();
         if len > consts::MAX_RECEIVER_CHAINS {
-            log::debug!(
-                "Trimming excessive receiver_chain for session with base key {}, chain count: {}",
-                self.sender_ratchet_key_for_logging()
-                    .unwrap_or_else(|e| format!("<error: {}>", e.0)),
-                len
-            );
+            log::debug!("Trimming excessive receiver_chain, chain count: {}", len);
             let excess = len - consts::MAX_RECEIVER_CHAINS;
             self.session.receiver_chains.drain(..excess);
             self.skipped.drain(..excess);

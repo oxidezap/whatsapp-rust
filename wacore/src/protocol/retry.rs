@@ -201,18 +201,10 @@ pub fn should_include_keys_with_policy(
     force_include_keys || is_stateless || retry_count >= MIN_RETRY_COUNT_FOR_KEYS
 }
 
-/// Whether a retry from a device that is not in our device registry must be
-/// dropped instead of resent.
-///
-/// WA Web (`WAWebHandleRetryRequest`) bails on an unknown device, but that is
-/// safe only because it keeps participant device lists fresh via a pre-send
-/// sync, so a legitimate requester is already known. When the retry carries a
-/// `<keys>` bundle the requester's ADV-signed identity and prekeys are in hand,
-/// so the session can be re-established and the message resent without a registry
-/// entry. whatsmeow builds the session straight from the receipt bundle the same
-/// way. Only drop when there is no bundle to recover from.
-pub fn should_drop_unknown_device_retry(keys_present: bool, device_known: bool) -> bool {
-    !keys_present && !device_known
+/// Reject unknown devices even when a retry carries its own keys. A bundle
+/// authenticates a key, not membership in the account's verified device list.
+pub fn should_drop_unknown_device_retry(_keys_present: bool, device_known: bool) -> bool {
+    !device_known
 }
 
 /// The `HID_FAILED_DECRYPT` bit of a receipt's `<meta mode>` bitmask.
@@ -476,10 +468,8 @@ mod tests {
     }
 
     #[test]
-    fn drop_unknown_device_retry_only_without_bundle() {
-        // The regression this guards: a retry that carries a <keys> bundle from a
-        // device missing from our registry must be recovered, not dropped.
-        assert!(!should_drop_unknown_device_retry(true, false));
+    fn drop_unknown_device_retry_even_with_a_bundle() {
+        assert!(should_drop_unknown_device_retry(true, false));
         // No bundle and unknown device: nothing to recover from, so drop.
         assert!(should_drop_unknown_device_retry(false, false));
         // A known device is always handled, bundle or not.

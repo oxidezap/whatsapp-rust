@@ -12,15 +12,33 @@ async fn test_deferred_delivery_receipt() -> anyhow::Result<()> {
 
     let jid_b = client_b.jid().await;
 
+    client_b.take_primary_offline().await?;
     client_b.disconnect().await;
     info!("Client B fully disconnected");
 
     let text = "Hello offline B!";
+    let requested_id = whatsapp_rust::MessageId::new("3EB0AABBCCDDEEFF00112233")?;
+    let ack = client_a
+        .client
+        .wait_for_node(whatsapp_rust::NodeFilter::tag("ack").attr("id", requested_id.to_string()));
     let msg_id = client_a
         .client
-        .send_message(jid_b.clone(), text_msg(text))
+        .send(
+            whatsapp_rust::SendRequest::new(&jid_b, text_msg(text))
+                .with_options(whatsapp_rust::SendOptions::default().with_message_id(requested_id)),
+        )
         .await?
         .message_id;
+    let ack = tokio::time::timeout(std::time::Duration::from_secs(10), ack).await??;
+    assert!(
+        ack.get_attr("class")
+            .is_some_and(|value| value.as_str() == "message"),
+        "a durably queued offline message must receive a successful server ACK"
+    );
+    assert!(
+        ack.get_attr("error").is_none(),
+        "a durably queued offline message must not receive an error ACK"
+    );
     info!("Client A sent message to offline B: {msg_id}");
 
     // Sender receipt (type="sender") IS expected — only check that no Delivered arrives.
@@ -108,6 +126,7 @@ async fn test_deferred_delivery_receipt_on_reconnect() -> anyhow::Result<()> {
 
     info!("B={jid_b}");
 
+    client_b.take_primary_offline().await?;
     client_b.go_offline().await?;
     info!("B is offline");
 
@@ -221,5 +240,38 @@ async fn test_offline_presence_coalescing() -> anyhow::Result<()> {
     client_a.disconnect().await;
     client_b.disconnect().await;
 
+    Ok(())
+}
+
+/// Pausing a companion alone does not stop the separate primary receiver.
+#[tokio::test]
+async fn test_online_primary_receipts_while_companion_is_offline() -> anyhow::Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let mut sender = TestClient::connect("e2e_primary_online_sender").await?;
+    let mut companion = TestClient::connect("e2e_primary_online_companion").await?;
+    let target = companion.jid().await;
+
+    // Only the companion goes offline; the primary remains independently online.
+    companion.go_offline().await?;
+    let text = "primary delivery preserves the companion copy";
+    let id = sender
+        .client
+        .send_message(target, text_msg(text))
+        .await?
+        .message_id;
+    sender
+        .wait_for_event(10, |event| {
+            matches!(event,
+                Event::Receipt(receipt) if receipt.message_ids.iter().any(|message_id| *message_id == id)
+                    && receipt.r#type == ReceiptType::Delivered
+            )
+        })
+        .await?;
+    assert!(!companion.client.is_socket_connected());
+
+    companion.come_back_online();
+    companion.wait_for_text(text, 30).await?;
+    sender.disconnect().await;
+    companion.disconnect().await;
     Ok(())
 }

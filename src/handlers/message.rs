@@ -765,6 +765,7 @@ mod tests {
 
         // 6. process_classified_message future
         let dummy_classified = crate::message::ClassifiedMessage {
+            device_identity: None,
             info: Arc::new(wacore::types::message::MessageInfo::default()),
             sender_encryption_jid: dummy_chat.clone(),
             session_payloads: Vec::new(),

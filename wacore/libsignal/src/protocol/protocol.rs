@@ -459,16 +459,7 @@ impl SignalMessage {
             &serialized[..serialized.len() - Self::MAC_LENGTH],
         )?;
         let their_mac = &serialized[serialized.len() - Self::MAC_LENGTH..];
-        let result: bool = our_mac.ct_eq(their_mac).into();
-        if !result {
-            // A warning instead of an error because we try multiple sessions.
-            log::warn!(
-                "Bad Mac! Their Mac: {} Our Mac: {}",
-                hex::encode(their_mac),
-                hex::encode(our_mac)
-            );
-        }
-        Ok(result)
+        Ok(our_mac.ct_eq(their_mac).into())
     }
 
     fn compute_mac(

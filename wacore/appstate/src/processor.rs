@@ -4,6 +4,8 @@
 //! All functions are synchronous and take callbacks for key lookup, making them
 //! suitable for use in both async and sync contexts.
 
+use subtle::ConstantTimeEq;
+
 use crate::AppStateError;
 use crate::decode::{Mutation, decode_record};
 use crate::hash::{HashState, generate_patch_mac, value_mac_tail};
@@ -336,7 +338,7 @@ where
         };
         let keys = get_keys(key_id)?;
         let computed = initial_state.generate_snapshot_mac(collection_name, &keys.snapshot_mac);
-        if computed != *mac_expected {
+        if !bool::from(computed.as_slice().ct_eq(mac_expected)) {
             // Two things can produce this, and they need opposite fixes: the key
             // we derived is wrong, or the ltHash we folded is. They are
             // indistinguishable from the MACs alone, and the MAC is checked
@@ -534,6 +536,24 @@ where
     // hash in a way that only surfaces later as MismatchingLTHash.
     for m in &patch.mutations {
         known_op(m.operation)?;
+    }
+
+    // Reject missing authentication material before changing the caller's state.
+    if validate_macs {
+        patch
+            .key_id
+            .id
+            .as_ref()
+            .filter(|id| !id.is_empty())
+            .ok_or(AppStateError::MissingKeyId)?;
+        patch
+            .patch_mac
+            .as_ref()
+            .ok_or(AppStateError::PatchMACMismatch)?;
+        patch
+            .snapshot_mac
+            .as_ref()
+            .ok_or(AppStateError::PatchSnapshotMACMismatch)?;
     }
 
     state.version = patch_version;
@@ -782,7 +802,7 @@ pub fn validate_patch_macs(
     state: &HashState,
     keys: &ExpandedAppStateKeys,
     collection_name: &str,
-    had_no_prior_state: bool,
+    _had_no_prior_state: bool,
     has_missing_remove: bool,
 ) -> Result<PatchMacVerdict, AppStateError> {
     match patch.patch_mac.as_ref() {
@@ -790,7 +810,7 @@ pub fn validate_patch_macs(
             let version = patch.version.version.unwrap_or(0);
             let computed_patch =
                 generate_patch_mac(patch, collection_name, &keys.patch_mac, version);
-            if computed_patch != *patch_mac {
+            if !bool::from(computed_patch.as_slice().ct_eq(patch_mac)) {
                 debug!(
                     target: "AppState",
                     "Patch {} v{} patchMAC MISMATCH, hasMissingRemove={}",
@@ -801,12 +821,11 @@ pub fn validate_patch_macs(
                 return Err(AppStateError::PatchMACMismatch);
             }
         }
-        // WA Web treats a missing patchMac as a failed comparison (fatal). A genesis
-        // patch that omits it is exactly the curated-baseline case, so reject rather
-        // than accept an unauthenticated record set. Non-genesis patches keep the
-        // prior lenient behavior (patchMac only enforced when present).
-        None if had_no_prior_state => return Err(AppStateError::PatchMACMismatch),
-        None => {}
+        None => return Err(AppStateError::PatchMACMismatch),
+    }
+
+    if patch.snapshot_mac.is_none() {
+        return Err(AppStateError::PatchSnapshotMACMismatch);
     }
 
     // Already known to be diverged: WA Web short-circuits before recomputing.
@@ -826,7 +845,7 @@ pub fn validate_patch_macs(
             hex::encode(&computed_snap),
             hex::encode(snap_mac)
         );
-        if computed_snap != *snap_mac {
+        if !bool::from(computed_snap.as_slice().ct_eq(snap_mac)) {
             debug!(
                 target: "AppState",
                 "Patch {} v{} snapshotMAC MISMATCH! ltHash=...{}, hasMissingRemove={}",
@@ -839,9 +858,8 @@ pub fn validate_patch_macs(
                 snapshot_mac_diverged: true,
             });
         }
-    } else if had_no_prior_state {
-        // A genesis patch that supplies patchMac but strips snapshotMac has no
-        // aggregate to anchor at all; that is omission, not divergence.
+    } else {
+        // Omission is not aggregate divergence; no patch may skip authentication.
         return Err(AppStateError::PatchSnapshotMACMismatch);
     }
 
@@ -906,7 +924,7 @@ pub fn validate_snapshot_mac(
         return Err(AppStateError::SnapshotMACMissing);
     };
     let computed = state.generate_snapshot_mac(collection_name, &keys.snapshot_mac);
-    if computed != *mac_expected {
+    if !bool::from(computed.as_slice().ct_eq(mac_expected)) {
         return Err(AppStateError::SnapshotMACMismatch);
     }
     Ok(())
@@ -1641,6 +1659,66 @@ mod tests {
         let err = validate_patch_macs(&patch, &state_at(1, 3), &keys, "regular", true, false)
             .expect_err("genesis patch without snapshotMAC must be rejected");
         assert!(matches!(err, AppStateError::PatchSnapshotMACMismatch));
+    }
+
+    #[test]
+    fn non_genesis_patch_requires_authentication_before_state_changes() {
+        let keys = expand_app_state_keys(&[7u8; 32]);
+        for missing in ["key", "patch", "snapshot"] {
+            let mut patch = wa::SyncdPatch::default();
+            patch.version = buffa::MessageField::some({
+                let mut v = wa::SyncdVersion::default();
+                v.version = Some(2);
+                v
+            });
+            patch.key_id = buffa::MessageField::some({
+                let mut v = wa::KeyId::default();
+                v.id = Some(vec![1]);
+                v
+            });
+            patch.patch_mac = Some(vec![0; 32]);
+            patch.snapshot_mac = Some(vec![0; 32]);
+            match missing {
+                "key" => patch.key_id = Default::default(),
+                "patch" => patch.patch_mac = None,
+                _ => patch.snapshot_mac = None,
+            }
+            let mut state = state_at(1, 3);
+            let hash = state.hash;
+            let result = process_patch(
+                &patch,
+                &mut state,
+                |_| Ok(Arc::new(keys.clone())),
+                |_| Ok(None),
+                true,
+                "regular",
+            );
+            assert!(result.is_err(), "missing {missing} must fail");
+            assert_eq!(state.version, 1);
+            assert_eq!(state.hash, hash);
+        }
+    }
+
+    #[test]
+    fn latched_non_genesis_patch_still_requires_macs() {
+        let keys = expand_app_state_keys(&[7u8; 32]);
+        let mut state = state_at(2, 3);
+        state.mac_mismatch_fatal = true;
+        let mut patch = wa::SyncdPatch::default();
+        patch.version = buffa::MessageField::some({
+            let mut v = wa::SyncdVersion::default();
+            v.version = Some(2);
+            v
+        });
+        assert!(matches!(
+            validate_patch_macs(&patch, &state, &keys, "regular", false, false),
+            Err(AppStateError::PatchMACMismatch)
+        ));
+        patch.patch_mac = Some(generate_patch_mac(&patch, "regular", &keys.patch_mac, 2));
+        assert!(matches!(
+            validate_patch_macs(&patch, &state, &keys, "regular", false, false),
+            Err(AppStateError::PatchSnapshotMACMismatch)
+        ));
     }
 
     #[test]

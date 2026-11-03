@@ -133,7 +133,9 @@ pub use quick_replies::QuickReplies;
 
 pub use status::{Status, StatusPrivacySetting, StatusSendOptions};
 
-pub use signal::{Signal, SignalError, SignalSessionInfo, SignalSessionMigration};
+pub use signal::{
+    SecurityCodeVersion, Signal, SignalError, SignalSessionInfo, SignalSessionMigration,
+};
 pub(crate) use stanza::required_stanza_attr;
 pub use stanza::{
     MessageRetransmission, NackReason, RetryReason, RetryRequestError, RetryRequestOptions,

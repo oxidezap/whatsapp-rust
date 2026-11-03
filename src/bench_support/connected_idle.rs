@@ -113,6 +113,8 @@ impl Drop for BackendFixture {
 pub const IDLE: Duration = Duration::from_secs(61);
 pub const LANES: usize = 32;
 pub const MESSAGES: usize = 256;
+/// One offline publication, then one live publication per remaining message.
+pub const COMMIT_BATCHES: usize = 1 + MESSAGES - LANES;
 pub const TEXT_BYTES: usize = 4096;
 pub const HISTORY_MESSAGES: usize = 256;
 /// Fixture-only sender-key/signature randomness, never for a shipping client.
@@ -124,6 +126,7 @@ struct Counts {
     messages: AtomicUsize,
     history: AtomicUsize,
     committed: AtomicUsize,
+    commit_batches: AtomicUsize,
 }
 
 impl EventHandler for Counts {
@@ -148,6 +151,7 @@ struct Commit(Arc<Counts>);
 impl InboundDurabilityHook for Commit {
     async fn on_messages(&self, _: Arc<Client>, batch: &[InboundMessage]) -> Result<()> {
         self.0.committed.fetch_add(batch.len(), Ordering::Relaxed);
+        self.0.commit_batches.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -167,6 +171,7 @@ pub struct Checkpoint {
     pub running_workers: usize,
     pub messages: usize,
     pub committed: usize,
+    pub commit_batches: usize,
     pub history: usize,
 }
 
@@ -183,6 +188,10 @@ impl Session {
     /// marker to `receive_activity`/`finish_control`. Requires a running Tokio runtime.
     pub async fn connect(backend: Arc<dyn Backend>) -> Result<Self> {
         let pm = Arc::new(PersistenceManager::new(backend).await?);
+        // A valid fixed-width synthetic registration ID. Random varint widths
+        // otherwise change the retained serialized Signal session by a byte.
+        pm.modify_device(|device| device.registration_id = 0x1234_5678)
+            .await;
         for command in [
             DeviceCommand::SetId(Some(Jid::new(super::OWN_USER, Server::Pn).with_device(1))),
             DeviceCommand::SetLid(Some(
@@ -209,6 +218,7 @@ impl Session {
             pongs: AtomicUsize::new(0),
             initialization_iqs: AtomicUsize::new(0),
             delivery_receipts: Mutex::new([false; MESSAGES]),
+            max_batch_frames: AtomicUsize::new(0),
         });
         let counts = Arc::new(Counts::default());
         let client = ClientBuilder::new()
@@ -291,11 +301,14 @@ impl Session {
             keys.push(key);
         }
         let text = "x".repeat(TEXT_BYTES);
-        let plaintext = wacore::messages::MessageUtils::encode_and_pad(&{
+        let mut plaintext = waproto::codec::message_to_vec(&{
             let mut proto_value = wa::Message::default();
             proto_value.conversation = Some(text.clone());
             proto_value
         });
+        // Fixed valid v2 padding keeps the AES scratch footprint identical.
+        // Production padding remains random; only this synthetic input is fixed.
+        plaintext.resize(plaintext.len() + 16, 16);
         let mut stanzas = Vec::with_capacity(MESSAGES);
         for i in 0..MESSAGES {
             let ciphertext = group_encrypt(
@@ -389,7 +402,8 @@ impl Session {
             self.client.bench_startup.pending_before_offline() == 0,
             "pre-offline startup entered activity measurement"
         );
-        for node in activity.stanzas {
+        let mut stanzas = activity.stanzas.into_iter();
+        for node in stanzas.by_ref().take(LANES) {
             self.wire.reply(node).await?;
         }
         // History input is intentionally at the task boundary, as in history_sync's
@@ -402,7 +416,28 @@ impl Session {
             .process_history_sync_task_tracked("IDLE-HISTORY".into(), history, &mut tracker)
             .await;
         drop(tracker);
-        self.finish_offline(MESSAGES).await?;
+        // Wire delivery only enqueues work on the chat lanes. Do not let the
+        // offline marker overtake decryption of the first wave. Only send the
+        // remaining waves after the transition, fixing both publication modes.
+        self.wait_until(|| {
+            self.client.inbound_commit_batch.pending_stats().0
+                + self.counts.committed.load(Ordering::Relaxed)
+                == LANES
+        })
+        .await
+        .context("activity did not reach the offline commit boundary")?;
+        ensure!(
+            self.counts.committed.load(Ordering::Relaxed) == 0,
+            "activity timed out into an early offline commit"
+        );
+        self.finish_offline(LANES).await?;
+        ensure!(
+            self.counts.commit_batches.load(Ordering::Relaxed) == 1,
+            "activity must publish one complete offline batch"
+        );
+        for node in stanzas {
+            self.wire.reply(node).await?;
+        }
         self.wait_until(|| self.counts.messages.load(Ordering::Relaxed) == MESSAGES)
             .await?;
         ensure!(
@@ -420,11 +455,59 @@ impl Session {
             .await
             .context("activity receipts did not finish pending-row cleanup")?;
         self.settle().await?;
+        ensure!(
+            self.counts.commit_batches.load(Ordering::Relaxed) == COMMIT_BATCHES,
+            "activity did not preserve its offline/live publication boundary"
+        );
         Ok(())
     }
 
     pub async fn finish_control(&self) -> Result<()> {
         self.finish_offline(0).await?;
+        self.settle().await
+    }
+
+    /// Exercise a fixed, completed IQ burst before native retention sampling.
+    /// Startup concurrency otherwise leaves variable capacities in the waiter
+    /// table and sender batch vector. Their metadata remains allocated and measured.
+    pub async fn prepare_retention(&self) -> Result<()> {
+        ensure!(
+            self.client.bench_startup.pending() == 0,
+            "startup must finish before preparing retention"
+        );
+        use std::future::Future;
+        const REQUESTS: usize = 16;
+        self.wire.max_batch_frames.store(0, Ordering::Relaxed);
+        let replies = futures::future::join_all((0..REQUESTS).map(|i| {
+            self.client.send_iq_node(
+                NodeBuilder::new("iq")
+                    .attr("id", format!("RETENTION-WARM-{i:02}"))
+                    .attr("type", "get")
+                    .attr("to", "s.whatsapp.net")
+                    .attr("xmlns", "w:p")
+                    .build(),
+                Some(DEADLINE),
+            )
+        }));
+        futures::pin_mut!(replies);
+        let mut peak = 0;
+        let replies = std::future::poll_fn(|cx| {
+            let result = replies.as_mut().poll(cx);
+            peak = peak.max(self.client.response_waiters_guard().len());
+            result
+        })
+        .await;
+        for reply in replies {
+            reply?;
+        }
+        ensure!(
+            peak == REQUESTS,
+            "metadata burst did not overlap all IQs: {peak}"
+        );
+        ensure!(
+            self.wire.max_batch_frames.load(Ordering::Relaxed) >= 8,
+            "metadata burst did not fill the sender's eight-slot queue"
+        );
         self.settle().await
     }
 
@@ -489,6 +572,7 @@ impl Session {
             running_workers,
             messages: self.counts.messages.load(Ordering::Relaxed),
             committed: self.counts.committed.load(Ordering::Relaxed),
+            commit_batches: self.counts.commit_batches.load(Ordering::Relaxed),
             history: self.counts.history.load(Ordering::Relaxed),
         }
     }
@@ -555,6 +639,55 @@ impl Session {
     /// `None` means a commit still owns the buffer.
     pub fn drain_encode_capacity(&self) -> Option<usize> {
         self.client.inbound_commit_batch.encode_arena_capacity()
+    }
+
+    /// Finish a normal keepalive exchange with an identical final wire frame.
+    /// The reader retains its last input buffer while waiting for the next frame;
+    /// random request-ID widths otherwise change requested heap by a few bytes.
+    /// This does not clear library state or replace the periodic keepalive check.
+    pub async fn retention_barrier(&self) -> Result<usize> {
+        // feed_received_data starts a fresh receive burst after a ten-second
+        // gap. A fixed ID alone is insufficient: appending it to an earlier
+        // burst can grow the decoder's accumulator by one CHUNK_SIZE.
+        let quiet = Duration::from_secs(11);
+        tokio::time::timeout(DEADLINE, async {
+            loop {
+                let last = self
+                    .client
+                    .stats
+                    .last_data_received()
+                    .context("retention checkpoint has no received frame")?;
+                let elapsed = self
+                    .client
+                    .runtime
+                    .monotonic_time()
+                    .saturating_duration_since(last);
+                if elapsed >= quiet {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                self.client.runtime.sleep(quiet - elapsed).await;
+            }
+        })
+        .await
+        .context("retention checkpoint did not reach a receive idle boundary")??;
+        let pongs = self.pongs();
+        self.client
+            .send_iq_node(
+                NodeBuilder::new("iq")
+                    .attr("id", "RETENTION-CHECKPOINT")
+                    .attr("type", "get")
+                    .attr("to", "s.whatsapp.net")
+                    .attr("xmlns", "w:p")
+                    .build(),
+                Some(DEADLINE),
+            )
+            .await?;
+        self.settle().await?;
+        ensure!(
+            self.pongs() == pongs + 1,
+            "another keepalive overlapped the retention checkpoint"
+        );
+        Ok(pongs + 1)
     }
 
     pub fn pongs(&self) -> usize {
@@ -647,6 +780,7 @@ struct Wire {
     pongs: AtomicUsize,
     initialization_iqs: AtomicUsize,
     delivery_receipts: Mutex<[bool; MESSAGES]>,
+    max_batch_frames: AtomicUsize,
 }
 
 impl Wire {
@@ -810,7 +944,9 @@ impl Transport for Wire {
         } else {
             &data
         };
+        let mut batch_frames = 0;
         while !remaining.is_empty() {
+            batch_frames += 1;
             ensure!(remaining.len() >= 3, "short fixture frame");
             let length = (usize::from(remaining[0]) << 16)
                 | (usize::from(remaining[1]) << 8)
@@ -866,6 +1002,8 @@ impl Transport for Wire {
                 }
             }
         }
+        self.max_batch_frames
+            .fetch_max(batch_frames, Ordering::Relaxed);
         Ok(())
     }
 
@@ -914,6 +1052,7 @@ mod tests {
             pongs: AtomicUsize::new(0),
             initialization_iqs: AtomicUsize::new(0),
             delivery_receipts: Mutex::new([false; MESSAGES]),
+            max_batch_frames: AtomicUsize::new(0),
         }
     }
 

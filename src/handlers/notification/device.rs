@@ -7,6 +7,7 @@ use wacore::stanza::devices::DeviceNotification;
 use wacore::store::traits::{DeviceInfo, DeviceListRecord};
 use wacore::types::events::{DeviceListUpdate, DeviceNotificationInfo};
 use wacore_binary::NodeRef;
+use wacore_binary::diagnostics::ObservedId;
 use wacore_binary::{Jid, JidExt};
 
 pub(crate) async fn handle_encrypt_notification(client: &Arc<Client>, nr: &NodeRef<'_>) {
@@ -262,6 +263,7 @@ pub(crate) async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<
     // than silently skip it, matching the old always-reset behavior. Collapsing
     // an Err into "no prior identity" would be a fail-open regression on a
     // session-deletion path (see the same explicit-match rule in lid_pn.rs).
+    let mut previous_identity_key = None;
     let mut had_prior_identity = false;
     for cand in &reset_addrs {
         match client
@@ -269,7 +271,8 @@ pub(crate) async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<
             .get_identity(cand, backend.as_ref())
             .await
         {
-            Ok(Some(_)) => {
+            Ok(Some(key)) => {
+                previous_identity_key = key.as_ref().try_into().ok();
                 had_prior_identity = true;
                 break;
             }
@@ -277,7 +280,7 @@ pub(crate) async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<
             Err(e) => {
                 warn!(
                     "Identity change: failed reading stored identity for {}: {e}; proceeding with reset",
-                    wacore::types::jid::observe_protocol_address(cand)
+                    cand.observe()
                 );
                 had_prior_identity = true;
                 break;
@@ -288,7 +291,7 @@ pub(crate) async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<
     if !had_prior_identity {
         info!(
             "Identity change for {} (had_prior_identity=false): device record cleared, skipping session reset",
-            from_jid.user
+            from_jid.observe()
         );
         return;
     }
@@ -298,7 +301,7 @@ pub(crate) async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<
     wacore::telemetry::identity_change();
     info!(
         "Identity change for {} (had_prior_identity=true): resetting session",
-        from_jid.user
+        from_jid.observe()
     );
 
     // Delete the session + identity at every candidate address (resolved + the
@@ -360,6 +363,7 @@ pub(crate) async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<
                     .user(from_jid.clone())
                     .maybe_lid_user(stanza_lid)
                     .implicit(false)
+                    .maybe_previous_identity_key(previous_identity_key)
                     .build(),
             )
         });
@@ -378,7 +382,7 @@ pub(crate) async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<
     if arrived_during_resume {
         debug!(
             "Identity change for {} arrived during offline resume; deferring session re-establishment to next send",
-            from_jid.user
+            from_jid.observe()
         );
     } else {
         let client_clone = client.clone();
@@ -410,7 +414,14 @@ pub(crate) async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<
 /// local `handleNewIdentity` omits those steps that only the server-push
 /// `handleE2eIdentityChange` performs.
 #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.notif.local_identity_change", level = "debug", skip_all, fields(sender = %sender.observe())))]
-pub(crate) async fn handle_local_identity_change(client: &Arc<Client>, sender: Jid) {
+pub(crate) async fn handle_local_identity_change(
+    client: &Arc<Client>,
+    sender: Jid,
+    keys: Option<(
+        wacore::libsignal::protocol::IdentityKey,
+        wacore::libsignal::protocol::IdentityKey,
+    )>,
+) {
     // Only a peer's primary-device identity change matters; companion devices
     // carry their own identities (WA Web ignores them on this path).
     if sender.device != 0 {
@@ -434,7 +445,7 @@ pub(crate) async fn handle_local_identity_change(client: &Arc<Client>, sender: J
 
     info!(
         "Local identity change detected for {}: clearing device record",
-        sender.user
+        sender.observe()
     );
 
     // Deletes non-primary sessions + all sender key device tracking.
@@ -461,6 +472,12 @@ pub(crate) async fn handle_local_identity_change(client: &Arc<Client>, sender: J
                     .user(sender)
                     .maybe_lid_user(None)
                     .implicit(true)
+                    .maybe_previous_identity_key(keys.and_then(|(previous, _)| {
+                        previous.public_key().public_key_bytes().try_into().ok()
+                    }))
+                    .maybe_current_identity_key(keys.and_then(|(_, current)| {
+                        current.public_key().public_key_bytes().try_into().ok()
+                    }))
                     .build(),
             )
         });
@@ -472,11 +489,17 @@ pub(crate) async fn handle_local_identity_change(client: &Arc<Client>, sender: J
 /// is nothing to refresh; WA Web equally gives up when its own lookup misses.
 async fn sync_hashed_contact(client: &Arc<Client>, wire_hash: Option<&str>) {
     let Some(hash) = wire_hash.and_then(wacore::crypto::parse_contact_notification_hash) else {
-        debug!("Device update with unusable contact hash {wire_hash:?}");
+        debug!(
+            "Device update with unusable contact hash (bytes={:?})",
+            wire_hash.map(str::len)
+        );
         return;
     };
     let Some(lid) = client.lid_pn_cache.lid_for_contact_hash(hash).await else {
-        debug!("Device update for an unknown contact hash {wire_hash:?}");
+        debug!(
+            "Device update for an unknown contact hash {:?}",
+            wire_hash.map(ObservedId::new)
+        );
         return;
     };
     // Mirrors WA Web: an in-progress offline resume batches the refresh
@@ -529,9 +552,12 @@ pub(crate) async fn handle_devices_notification(client: &Arc<Client>, node: &Nod
     let op = &notification.operation;
     debug!(
         "Device notification: user={}, type={:?}, devices={:?}",
-        notification.user(),
+        notification.from.observe(),
         op.operation_type,
-        op.device_ids()
+        std::fmt::from_fn(|f| f
+            .debug_list()
+            .entries(op.devices.iter().map(|device| device.device_id()))
+            .finish())
     );
 
     match op.operation_type {
@@ -666,8 +692,8 @@ pub(crate) async fn handle_account_sync_devices(
             target: "Client/AccountSync",
             "Received account_sync devices for non-self user: {} (our PN: {:?}, LID: {:?})",
             from_jid.observe(),
-            own_pn.map(|j| j.user.as_str()),
-            own_lid.map(|j| j.user.as_str())
+            own_pn.map(|j| j.observe()),
+            own_lid.map(|j| j.observe())
         );
         return;
     }
@@ -726,7 +752,7 @@ pub(crate) async fn handle_account_sync_devices(
         target: "Client/AccountSync",
         "Updated own device list from account_sync: {} devices (user: {})",
         devices.len(),
-        from_jid.user
+        from_jid.observe()
     );
 
     // Log individual devices at debug level
@@ -737,5 +763,47 @@ pub(crate) async fn handle_account_sync_devices(
             device.jid.observe(),
             device.key_index
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::log_capture;
+    use wacore_binary::builder::NodeBuilder;
+
+    #[tokio::test]
+    async fn hash_update_logs_only_shape_and_correlation() {
+        if log_capture::delegated_to_child(
+            "handlers::notification::device::tests::hash_update_logs_only_shape_and_correlation",
+        ) {
+            return;
+        }
+        let client =
+            crate::test_utils::create_test_client_with_name("device_hash_log_privacy").await;
+        let capture = log_capture::session();
+        for hash in ["synthetic-key-in-hash", "AQID"] {
+            let node = NodeBuilder::new("notification")
+                .attr("type", "devices")
+                .attr("from", "19990000046@s.whatsapp.net")
+                .children([NodeBuilder::new("update").attr("hash", hash).build()])
+                .build();
+            handle_devices_notification(&client, &node.as_node_ref()).await;
+        }
+        let records = capture.records_for("whatsapp_rust::handlers::notification::device");
+        for context in ["unusable contact hash", "unknown contact hash"] {
+            assert!(
+                records.iter().any(|(_, text)| text.contains(context)),
+                "missing {context}"
+            );
+        }
+        for (_, text) in records {
+            for marker in ["synthetic-key-in-hash", "AQID"] {
+                assert!(!text.contains(marker));
+            }
+            if !cfg!(feature = "tracing-pii") {
+                assert!(!text.contains("19990000046"));
+            }
+        }
     }
 }

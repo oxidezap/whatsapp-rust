@@ -9,9 +9,8 @@ use wacore::libsignal::crypto::DecryptionError;
 use wacore::libsignal::protocol::SenderKeyStore;
 use wacore::libsignal::protocol::group_decrypt_shared;
 use wacore::libsignal::protocol::{
-    CiphertextMessage, DecryptionResult, IdentityChange, OwnedCiphertextMessage,
-    PreKeySignalMessage, SignalMessage, SignalProtocolError, UsePQRatchet, message_decrypt,
-    message_decrypt_owned,
+    CiphertextMessage, DecryptionResult, OwnedCiphertextMessage, PreKeySignalMessage,
+    SignalMessage, SignalProtocolError, UsePQRatchet, message_decrypt, message_decrypt_owned,
 };
 use wacore::message_processing::EncType;
 use wacore::protocol::nack::NackReason;
@@ -164,6 +163,7 @@ impl EncPayload {
 /// Parsed and classified message ready for decryption. All data is owned --
 /// the original node tree is no longer borrowed.
 pub(crate) struct ClassifiedMessage {
+    pub device_identity: Option<bytes::Bytes>,
     pub info: Arc<MessageInfo>,
     pub sender_encryption_jid: Jid,
     pub session_payloads: Vec<EncPayload>,

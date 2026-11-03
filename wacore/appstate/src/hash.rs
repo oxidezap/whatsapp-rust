@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 use sha2::{Sha256, Sha512};
 use std::collections::HashMap;
+use subtle::ConstantTimeEq;
 use wacore_libsignal::crypto::CryptographicMac;
 use waproto::whatsapp as wa;
 
@@ -513,7 +514,11 @@ pub fn validate_index_mac(
     key: &[u8; 32],
 ) -> Result<(), AppStateError> {
     // Compare against the stack array: no heap allocation per validated record.
-    if index_mac_array(index_json_bytes, key) != expected_mac {
+    if !bool::from(
+        index_mac_array(index_json_bytes, key)
+            .as_slice()
+            .ct_eq(expected_mac),
+    ) {
         Err(AppStateError::MismatchingIndexMAC)
     } else {
         Ok(())

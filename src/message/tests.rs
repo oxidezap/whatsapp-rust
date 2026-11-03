@@ -754,6 +754,27 @@ impl AlicePeer {
         }
     }
 
+    fn adv_certificate(&self) -> Vec<u8> {
+        use buffa::Message;
+        let device = KeyPair::new(
+            *self.identity.kp.identity_key().public_key(),
+            self.identity.kp.private_key().clone(),
+        );
+        wacore::adv::test_util::signed_identity(
+            crate::test_utils::adv_test_account(),
+            &device,
+            b"\x18\x01",
+            &[6, 0],
+            Some(if self.jid.is_hosted() {
+                &[6, 6]
+            } else {
+                &[6, 1]
+            }),
+            true,
+        )
+        .encode_to_vec()
+    }
+
     async fn install_bob_session(&mut self, bob_addr: &ProtocolAddress, bundle: &PreKeyBundle) {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         process_prekey_bundle(
@@ -959,6 +980,165 @@ async fn submit_and_check_session(
         outcome.undecryptable,
         still,
     )
+}
+
+#[tokio::test]
+async fn identity_replacement_logs_keep_private_addresses_and_useful_context() {
+    use crate::test_utils::log_capture;
+    if log_capture::delegated_to_child(
+        "message::tests::identity_replacement_logs_keep_private_addresses_and_useful_context",
+    ) {
+        return;
+    }
+    let client = crate::test_utils::create_test_client_with_name("identity_log_privacy").await;
+    let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+    let bob_address = bob_jid.to_protocol_address();
+    let mut original = AlicePeer::new("19990000041@s.whatsapp.net").await;
+    original.install_bob_session(&bob_address, &bundle).await;
+    let first = original
+        .encrypt_text(&bob_address, "synthetic-initial-content")
+        .await;
+    assert!(
+        submit_and_check_session(&client, &original.jid, &first)
+            .await
+            .0
+    );
+    client
+        .flush_signal_cache()
+        .await
+        .expect("persist initial identity");
+
+    let (bundle, _) = bobs_prekey_bundle(&client).await;
+    let mut replacement = AlicePeer::new("19990000041@s.whatsapp.net").await;
+    replacement.install_bob_session(&bob_address, &bundle).await;
+    let encrypted = replacement
+        .encrypt_text(&bob_address, "synthetic-replacement-content")
+        .await;
+    let capture = log_capture::session();
+    assert!(
+        submit_and_check_session(&client, &replacement.jid, &encrypted)
+            .await
+            .0,
+        "real pre-key decryption must accept the new identity, like WhatsApp Web"
+    );
+    // The SDK's trust adapter always returns true. Exercise the actual
+    // ReplacedExisting reaction, not a synthetic strict-trust branch.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if capture
+                .records_for("whatsapp_rust::handlers::notification::device")
+                .iter()
+                .any(|(_, text)| text.contains("Local identity change detected"))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("real identity-change reaction must run");
+    let mut records = capture.records_for("whatsapp_rust::message::receive");
+    records.extend(capture.records_for("whatsapp_rust::handlers::notification::device"));
+    assert!(
+        records
+            .iter()
+            .any(|(_, text)| text.contains("Local identity change detected"))
+    );
+    for (_, text) in records {
+        if !cfg!(feature = "tracing-pii") {
+            assert!(!text.contains("19990000041"), "raw peer address in {text}");
+        }
+        assert!(!text.contains("synthetic-replacement-content"));
+    }
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
+#[tokio::test]
+async fn group_decrypt_logs_keep_private_addresses_and_useful_context() {
+    use crate::test_utils::log_capture;
+    if log_capture::delegated_to_child(
+        "message::tests::group_decrypt_logs_keep_private_addresses_and_useful_context",
+    ) {
+        return;
+    }
+    let (client, _) = capturing_client("group_log_privacy").await;
+    let mut alice = AlicePeer::new("19990000043@s.whatsapp.net").await;
+    let group: Jid = "19990000042-1700000000@g.us".parse().expect("legacy group");
+    let skdm = alice.create_group_skdm(&group).await;
+    let distribution = wacore::libsignal::protocol::SenderKeyDistributionMessage::try_from(
+        skdm.axolotl_sender_key_distribution_message
+            .as_deref()
+            .expect("distribution bytes"),
+    )
+    .expect("real distribution");
+    let name = make_sender_key_name(&group, &alice.jid.to_protocol_address());
+    let mut adapter = client.signal_adapter();
+    wacore::libsignal::protocol::process_sender_key_distribution_message(
+        &name,
+        &distribution,
+        &mut adapter.sender_key_store,
+    )
+    .await
+    .expect("install sender key");
+    let capture = log_capture::session();
+    for (i, mode) in [DecryptFailMode::Show, DecryptFailMode::Hide]
+        .into_iter()
+        .enumerate()
+    {
+        let mut ciphertext = alice
+            .encrypt_group_message(&group, b"synthetic-group-content")
+            .await;
+        *ciphertext.last_mut().expect("signature byte") ^= 1;
+        let info = group_message_info(
+            &format!("synthetic-group-id-{i}"),
+            &group,
+            &alice.jid,
+            false,
+        );
+        client
+            .clone()
+            .process_classified_message(
+                ClassifiedMessage {
+                    info,
+                    sender_encryption_jid: alice.jid.clone(),
+                    session_payloads: vec![],
+                    group_payloads: vec![skmsg_payload_from_bytes(ciphertext)],
+                    bot_payloads: vec![],
+                    device_identity: None,
+                    max_sender_retry_count: 0,
+                    decrypt_fail_mode: mode,
+                    ack_recipient: None,
+                },
+                client.connection_generation.load(Ordering::Acquire),
+            )
+            .await;
+    }
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    let records = capture.records_for("whatsapp_rust::message::receive");
+    for level in [log::Level::Warn, log::Level::Debug] {
+        assert!(
+            records
+                .iter()
+                .any(|(actual, text)| *actual == level
+                    && text.contains("Group batch decrypt failed")),
+            "missing decrypt failure at {level}"
+        );
+    }
+    assert!(
+        records
+            .iter()
+            .any(|(_, text)| text.contains("invalid signature"))
+    );
+    for (_, text) in records {
+        if !cfg!(feature = "tracing-pii") {
+            for marker in ["19990000042", "19990000043"] {
+                assert!(!text.contains(marker), "raw address in {text}");
+            }
+        }
+        for marker in ["synthetic-group-content", "synthetic-group-id-"] {
+            assert!(!text.contains(marker), "payload or opaque id in {text}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -5261,10 +5441,11 @@ fn receive_logs_for(
     session: &crate::test_utils::log_capture::Session,
     msg_id: &str,
 ) -> Vec<(log::Level, String)> {
+    let observed = wacore_binary::diagnostics::ObservedId::new(msg_id).to_string();
     session
         .records_for("whatsapp_rust::message::receive")
         .into_iter()
-        .filter(|(_, message)| message.contains(msg_id))
+        .filter(|(_, message)| message.contains(&observed))
         .collect()
 }
 
@@ -5331,6 +5512,7 @@ async fn undecryptable_receive_branch_stays_silent_when_batch_dispatched() {
         .clone()
         .process_classified_message(
             ClassifiedMessage {
+                device_identity: None,
                 info,
                 sender_encryption_jid: sender.clone(),
                 session_payloads: vec![payload],
@@ -5407,6 +5589,7 @@ async fn undecryptable_receive_branch_announces_the_dispatch_it_performs() {
         .clone()
         .process_classified_message(
             ClassifiedMessage {
+                device_identity: None,
                 info,
                 sender_encryption_jid: group,
                 session_payloads: vec![payload],
@@ -7678,11 +7861,14 @@ async fn status_broadcast_decrypt_failure_acks_to_chat() {
 /// Run a single session ciphertext through the full classify->process path.
 async fn process_session_ct(
     client: &Arc<Client>,
-    sender: &Jid,
+    sender: &AlicePeer,
     id: &str,
     ct: &wacore::libsignal::protocol::CiphertextMessage,
 ) {
     use wacore::libsignal::protocol::CiphertextMessage;
+    crate::test_utils::seed_adv_primary(client, &sender.jid).await;
+    let certificate = bytes::Bytes::from(sender.adv_certificate());
+    let sender = &sender.jid;
     let (enc_type, bytes) = match ct {
         CiphertextMessage::PreKeySignalMessage(m) => ("pkmsg", m.serialized().to_vec()),
         CiphertextMessage::SignalMessage(m) => ("msg", m.serialized().to_vec()),
@@ -7707,6 +7893,7 @@ async fn process_session_ct(
         .clone()
         .process_classified_message(
             ClassifiedMessage {
+                device_identity: Some(certificate),
                 info,
                 sender_encryption_jid: sender.clone(),
                 session_payloads: vec![payload],
@@ -7811,6 +7998,7 @@ async fn process_group_classified_with_payloads(
         .clone()
         .process_classified_message(
             ClassifiedMessage {
+                device_identity: None,
                 info,
                 sender_encryption_jid: sender.clone(),
                 session_payloads,
@@ -7892,6 +8080,7 @@ async fn encrypted_offline_peers_and_redelivered_duplicates_get_individual_recei
         .await;
     let (bundle, receiver) = bobs_prekey_bundle(&client).await;
     let mut phone = AlicePeer::new("777000000000081:7@lid").await;
+    crate::test_utils::seed_adv_primary(&client, &phone.jid).await;
     phone
         .install_bob_session(&receiver.to_protocol_address(), &bundle)
         .await;
@@ -7924,11 +8113,16 @@ async fn encrypted_offline_peers_and_redelivered_duplicates_get_individual_recei
                 .attr("category", "peer")
                 .attr("offline", "9")
                 .attr("t", wacore::time::now_secs().to_string())
-                .children([NodeBuilder::new("enc")
-                    .attr("type", "pkmsg")
-                    .attr("v", "2")
-                    .bytes(enc.ciphertext.to_vec())
-                    .build()])
+                .children([
+                    NodeBuilder::new("device-identity")
+                        .bytes(phone.adv_certificate())
+                        .build(),
+                    NodeBuilder::new("enc")
+                        .attr("type", "pkmsg")
+                        .attr("v", "2")
+                        .bytes(enc.ciphertext.to_vec())
+                        .build(),
+                ])
                 .build(),
         );
         let info = client.parse_message_info(stanza.get()).await.unwrap();
@@ -8892,7 +9086,7 @@ async fn duplicate_message_is_acked_with_delivery_receipt() {
     // Establish the session, then mark Alice's prekey acked so her next message
     // is a plain SignalMessage. Re-submitting it is a clean duplicate.
     let establish = alice.encrypt_text(&bob_addr, "establish").await;
-    process_session_ct(&client, &alice.jid, "EST", &establish).await;
+    process_session_ct(&client, &alice, "EST", &establish).await;
     if let Some(record) = alice.sessions.0.get_mut(&bob_addr)
         && let Some(state) = record.session_state_mut()
     {
@@ -8906,8 +9100,8 @@ async fn duplicate_message_is_acked_with_delivery_receipt() {
         proto
     });
     let msg = alice.encrypt(&bob_addr, &plaintext).await;
-    process_session_ct(&client, &alice.jid, "DUP", &msg).await; // success
-    process_session_ct(&client, &alice.jid, "DUP", &msg).await; // duplicate
+    process_session_ct(&client, &alice, "DUP", &msg).await; // success
+    process_session_ct(&client, &alice, "DUP", &msg).await; // duplicate
 
     let mut count = 0;
     for _ in 0..80 {
@@ -15189,6 +15383,7 @@ async fn a_group_enc_without_a_sender_key_reports_no_sender_key() {
         .clone()
         .process_classified_message(
             ClassifiedMessage {
+                device_identity: None,
                 info,
                 sender_encryption_jid: group,
                 session_payloads: vec![],
@@ -15238,6 +15433,7 @@ async fn a_skmsg_skipped_after_a_session_failure_reports_not_attempted() {
         .clone()
         .process_classified_message(
             ClassifiedMessage {
+                device_identity: None,
                 info,
                 sender_encryption_jid: participant,
                 session_payloads: vec![enc_payload_at("pkmsg", UNPARSEABLE_ENVELOPE.to_vec(), 0)],
@@ -15295,6 +15491,7 @@ async fn session_encs_from_a_group_sender_report_not_attempted() {
         .clone()
         .process_classified_message(
             ClassifiedMessage {
+                device_identity: None,
                 info,
                 sender_encryption_jid: group,
                 session_payloads: vec![enc_payload_at("msg", vec![0xFF, 0x00, 0x03], 0)],
@@ -15578,6 +15775,7 @@ async fn a_group_envelope_that_does_not_parse_reports_malformed_ciphertext() {
         .clone()
         .process_classified_message(
             ClassifiedMessage {
+                device_identity: None,
                 info,
                 sender_encryption_jid: group,
                 session_payloads: vec![],
@@ -15734,6 +15932,7 @@ async fn a_stanza_abandoned_by_a_teardown_reports_what_it_never_tried() {
         .clone()
         .process_classified_message(
             ClassifiedMessage {
+                device_identity: None,
                 info,
                 sender_encryption_jid: sender.clone(),
                 session_payloads: vec![enc_payload_at("msg", vec![1u8; 40], 1)],
@@ -15835,6 +16034,7 @@ async fn a_skmsg_skipped_beside_a_duplicate_is_still_reported() {
         .clone()
         .process_classified_message(
             ClassifiedMessage {
+                device_identity: None,
                 info: redelivered,
                 sender_encryption_jid: alice.jid.clone(),
                 session_payloads: vec![
@@ -16617,6 +16817,69 @@ mod pdo_alias_tests {
     }
 
     #[tokio::test]
+    async fn complete_publication_releases_owner_across_lookup_paths() {
+        for (admit_pdo, complete_pdo) in [(false, false), (true, false), (false, true)] {
+            let (client, _) = client().await;
+            let ordinary = info(Shape::Incoming);
+            let mut recovery = ordinary.clone();
+            let source = &mut Arc::make_mut(&mut recovery).source;
+            source.chat = PN.parse().unwrap();
+            source.sender = source.chat.clone();
+            source.sender_alt = None;
+            let admitted = if admit_pdo { &recovery } else { &ordinary };
+            let completed = if complete_pdo { &recovery } else { &ordinary };
+            let fingerprint = [0x46; 16];
+            let mut publication = PublicationGuard::default();
+            assert!(!client.admit_message_dispatch(
+                admitted,
+                admit_pdo,
+                Some(fingerprint),
+                true,
+                &mut publication,
+            ));
+            let owner = Arc::downgrade(&publication.owner());
+            let admitted_key = Client::dispatch_key(admitted);
+            let completed_key = Client::dispatch_key(completed);
+            assert_eq!(admitted_key == completed_key, !admit_pdo && !complete_pdo);
+            client.dispatched_messages.with_metadata(|cache| {
+                if admitted_key != completed_key {
+                    assert!(cache.get_mut(&completed_key).is_none());
+                }
+                let claim = cache.get_mut(&admitted_key).unwrap();
+                if complete_pdo {
+                    assert_eq!(claim.alias, Some(completed_key));
+                } else if admit_pdo {
+                    assert_eq!(
+                        completed.source.sender_alt.as_ref(),
+                        Some(&admitted.source.chat)
+                    );
+                }
+            });
+            assert!(owner.upgrade().is_some());
+            client.complete_dispatch_publication(publication, [completed], complete_pdo);
+            assert!(owner.upgrade().is_none());
+            client.dispatched_messages.with_metadata(|cache| {
+                let claim = cache.get_mut(&admitted_key).unwrap();
+                assert_eq!(claim.payloads.len(), 1);
+                assert!(matches!(
+                    claim.payloads[0].publication,
+                    CachedPublication::Complete
+                ));
+                assert!(claim.payloads[0].hook_committed);
+            });
+            let mut replay = PublicationGuard::default();
+            assert!(client.admit_message_dispatch(
+                admitted,
+                true,
+                Some(fingerprint),
+                true,
+                &mut replay,
+            ));
+            assert!(replay.owner.is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn pdo_publication_committed_ordinary_part_keeps_distinct_recovery() {
         for alias in [false, true] {
             let (client, events) = client().await;
@@ -17390,7 +17653,7 @@ impl PdoRetryFixture {
         let establish = device
             .encrypt_text(&receiver.to_protocol_address(), "establish device")
             .await;
-        process_session_ct(&client, &device.jid, "SYNTHETIC_DEVICE_SETUP", &establish).await;
+        process_session_ct(&client, &device, "SYNTHETIC_DEVICE_SETUP", &establish).await;
         device
             .sessions
             .0
@@ -17492,7 +17755,7 @@ impl PdoRetryFixture {
         let establish = phone
             .encrypt_text(&receiver.to_protocol_address(), "establish phone")
             .await;
-        process_session_ct(&client, &phone.jid, "SYNTHETIC_PHONE_SETUP", &establish).await;
+        process_session_ct(&client, &phone, "SYNTHETIC_PHONE_SETUP", &establish).await;
         phone
             .sessions
             .0
@@ -17638,13 +17901,7 @@ async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
             let establish = phone
                 .encrypt_text(&receiver.to_protocol_address(), "phone setup")
                 .await;
-            process_session_ct(
-                &client,
-                &phone.jid,
-                "COUNTERFACTUAL_PHONE_SETUP",
-                &establish,
-            )
-            .await;
+            process_session_ct(&client, &phone, "COUNTERFACTUAL_PHONE_SETUP", &establish).await;
             phone
                 .sessions
                 .0
@@ -17667,6 +17924,7 @@ async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
             }
             let group: Jid = "120363000000000073@g.us".parse().unwrap();
             let mut sender = AlicePeer::new("777000000000003:2@lid").await;
+            crate::test_utils::seed_adv_primary(&client, &sender.jid).await;
             let (bundle, _) = bobs_prekey_bundle(&client).await;
             sender
                 .install_bob_session(&receiver.to_protocol_address(), &bundle)
@@ -17794,6 +18052,9 @@ async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
                 let payload = enc_payload_from_ciphertext(&ct);
                 assert_eq!(payload.enc_type, EncType::PreKeyMessage);
                 let mut children = vec![
+                    NodeBuilder::new("device-identity")
+                        .bytes(sender.adv_certificate())
+                        .build(),
                     NodeBuilder::new("enc")
                         .attr("type", payload.enc_type.as_wire_str())
                         .attr("v", "2")
@@ -18756,6 +19017,8 @@ async fn pdo_retry_publication_holds_new_skdm_receipt(teardown: bool) {
     );
 
     let mut peer = AlicePeer::new("777000000000003:2@lid").await;
+    let certificate = peer.adv_certificate();
+    crate::test_utils::seed_adv_primary(&fixture.client, &peer.jid).await;
     let group: Jid = "120363000000000071@g.us".parse().unwrap();
     let (bundle, receiver) = bobs_prekey_bundle(&fixture.client).await;
     peer.install_bob_session(&receiver.to_protocol_address(), &bundle)
@@ -18784,11 +19047,16 @@ async fn pdo_retry_publication_holds_new_skdm_receipt(teardown: bool) {
                 .attr("offline", "1")
                 .attr("type", "text")
                 .attr("t", wacore::time::now_secs().to_string())
-                .children([NodeBuilder::new("enc")
-                    .attr("type", enc.enc_type.as_wire_str())
-                    .attr("v", "2")
-                    .bytes(enc.ciphertext.to_vec())
-                    .build()])
+                .children([
+                    NodeBuilder::new("enc")
+                        .attr("type", enc.enc_type.as_wire_str())
+                        .attr("v", "2")
+                        .bytes(enc.ciphertext.to_vec())
+                        .build(),
+                    NodeBuilder::new("device-identity")
+                        .bytes(certificate)
+                        .build(),
+                ])
                 .build(),
         ))
         .await;
@@ -19471,6 +19739,7 @@ async fn suppressed_resend_still_installs_the_sender_key_it_carries() {
     let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
     let bob_addr = bob_jid.to_protocol_address();
     let mut rotated = AlicePeer::new(sender_jid).await;
+    crate::test_utils::seed_adv_primary(&client, &rotated.jid).await;
     rotated.install_bob_session(&bob_addr, &bundle).await;
     let skdm = rotated.create_group_skdm(&group).await;
     let session_ct = rotated
@@ -19500,6 +19769,9 @@ async fn suppressed_resend_still_installs_the_sender_key_it_carries() {
                 crate::types::message::AddressingMode::Lid.as_str(),
             )
             .children(vec![
+                NodeBuilder::new("device-identity")
+                    .bytes(rotated.adv_certificate())
+                    .build(),
                 NodeBuilder::new("enc")
                     .attr("type", "pkmsg")
                     .attr("v", "2")
@@ -20556,6 +20828,7 @@ async fn raw_pending_real_stanza_failure_cannot_ack_successful_predecessor() {
         .clone()
         .process_classified_message(
             ClassifiedMessage {
+                device_identity: None,
                 info: info.clone(),
                 sender_encryption_jid: alice.jid.clone(),
                 session_payloads: vec![

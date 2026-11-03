@@ -4045,6 +4045,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
+name = "siphasher"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
+
+[[package]]
 name = "sketches-ddsketch"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4826,6 +4832,7 @@ dependencies = [
  "serde-big-array",
  "serde_json",
  "sha2 0.11.1",
+ "subtle",
  "thiserror 2.0.21",
  "wacore-binary",
  "wacore-libsignal",
@@ -4840,10 +4847,12 @@ dependencies = [
  "codspeed-divan-compat",
  "compact_str",
  "flate2",
+ "getrandom 0.4.3",
  "itoa",
  "proptest",
  "serde",
  "serde_json",
+ "siphasher",
  "smallvec",
  "smoothutf8",
  "stable_deref_trait",
@@ -4887,6 +4896,7 @@ dependencies = [
  "sha2 0.11.1",
  "subtle",
  "thiserror 2.0.21",
+ "wacore-binary",
  "wacore-derive",
  "waproto",
  "x25519-dalek",
