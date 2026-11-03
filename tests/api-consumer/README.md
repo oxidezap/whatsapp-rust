@@ -2,7 +2,7 @@
 
 One standalone manifest and lock verify downstream visibility without root
 workspace dev-dependencies. Run profiles separately with `cargo xt ci consumers
-run --lane native`; use `--lane msrv --toolchain 1.94.1` or `--lane wasm` for
+run --lane native`; use `--lane msrv --toolchain 1.95.0` or `--lane wasm` for
 published MSRV and browser linking. Add new contracts to the owning module,
 not a new crate. `tools/xtask/consumers.json` defines the executed profiles.
 

@@ -65,9 +65,9 @@ jobs:
           - lane: native
             toolchain: nightly-2026-06-16
           - lane: msrv
-            toolchain: 1.94.1
+            toolchain: 1.95.0
           - lane: wasm
-            toolchain: 1.94.1
+            toolchain: 1.95.0
     steps:
       - uses: actions/checkout@v7
         with:
@@ -78,7 +78,7 @@ jobs:
         with:
           toolchain: nightly-2026-06-16
           targets: wasm32-unknown-unknown
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: dtolnay/rust-toolchain@1.95.0
         if: matrix.lane != 'native'
         with:
           targets: wasm32-unknown-unknown
