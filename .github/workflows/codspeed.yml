@@ -17,7 +17,9 @@ permissions:
 
 concurrency:
   group: codspeed-${{ github.head_ref || github.run_id }}
-  cancel-in-progress: true
+  # Finish a measurement so successive fixes have a completed comparison.
+  # GitHub coalesces pending updates to the latest head in this group.
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: never
