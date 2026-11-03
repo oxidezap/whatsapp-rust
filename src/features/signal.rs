@@ -959,22 +959,26 @@ mod tests {
             Err(SignalError::InvalidInput(_))
         ));
         let peer = Jid::pn("15551234567");
-        client
-            .update_device_list(DeviceListRecord {
-                user: peer.user.clone().into(),
-                devices: [DeviceInfo::new(0, None)].into(),
-                timestamp: wacore::time::now_secs(),
-                phash: None,
-                raw_id: None,
-            })
-            .await
-            .unwrap();
-        assert!(
+        for user in ["15550001000", peer.user.as_str()] {
             client
-                .signal()
-                .security_code(&peer, SecurityCodeVersion::V3)
+                .update_device_list(DeviceListRecord {
+                    user: user.into(),
+                    devices: [DeviceInfo::new(0, None)].into(),
+                    timestamp: wacore::time::now_secs(),
+                    phash: None,
+                    raw_id: None,
+                })
                 .await
-                .is_err(),
+                .unwrap();
+        }
+        assert!(
+            matches!(
+                client
+                    .signal()
+                    .security_code(&peer, SecurityCodeVersion::V3)
+                    .await,
+                Err(SignalError::Internal(_))
+            ),
             "a cached primary-only record must not substitute for a failed authoritative refresh"
         );
     }
