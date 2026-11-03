@@ -543,10 +543,10 @@ mod tests {
     #[test]
     fn baseline_msrv_requires_a_package_and_valid_explicit_or_inherited_version() {
         let workspace: toml::Value =
-            toml::from_str("[workspace.package]\nrust-version = '1.94'").unwrap();
+            toml::from_str("[workspace.package]\nrust-version = '1.95'").unwrap();
         for (manifest, expected) in [
             ("[package]\nrust-version = '1.93'", "1.93"),
-            ("[package]\nrust-version.workspace = true", "1.94"),
+            ("[package]\nrust-version.workspace = true", "1.95"),
         ] {
             assert_eq!(
                 baseline_msrv(&toml::from_str(manifest).unwrap(), &workspace).unwrap(),

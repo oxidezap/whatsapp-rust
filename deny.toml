@@ -68,6 +68,15 @@ wildcards = "deny"
 allow-wildcard-paths = true
 
 skip = [
+    # scheduled-thread-pool 0.2.8 uses parking_lot 0.13. Tokio 1.54.1,
+    # r2d2 0.8.10 and dhat 0.3.3 still require the incompatible 0.12 line;
+    # changing our direct dependency cannot unify those upstream ranges.
+    # Keep only the exact older versions exempt until those parents migrate.
+    { name = "parking_lot", version = "=0.12.5" },
+    { name = "lock_api", version = "=0.4.14" },
+    { name = "parking_lot_core", version = "=0.9.12" },
+    { name = "redox_syscall", version = "=0.5.18" },
+
     # Current Wasmtime/Cranelift and OxiTLS sit on adjacent RustCrypto
     # generations. Both are host-tool-only and cannot be unified from this
     # workspace until their upstream dependency ranges converge.
