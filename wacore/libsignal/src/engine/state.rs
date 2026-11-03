@@ -287,7 +287,10 @@ impl Chain {
         index: u32,
         future_limit: u32,
     ) -> Result<ChainAdvance> {
-        if self.exhausted || index < self.index {
+        if self.exhausted && index >= self.index {
+            return Err(Error::ClosedChain);
+        }
+        if index < self.index {
             let position = self
                 .skipped
                 .iter()

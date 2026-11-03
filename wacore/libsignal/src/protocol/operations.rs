@@ -136,6 +136,9 @@ async fn message_encrypt_using<
     if !is_trusted_identity(identities, address, &remote, Direction::Sending).await? {
         return Err(SignalProtocolError::UntrustedIdentity(address.clone()));
     }
+    // Identity callbacks must succeed before advancing the owned sender state.
+    // A failed or cancelled save can then return the unchanged checkout.
+    save_identity(identities, address, &remote).await?;
     let record = checkout.record_mut();
     let index = record
         .session_state()

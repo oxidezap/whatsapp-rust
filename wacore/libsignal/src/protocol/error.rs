@@ -72,6 +72,9 @@ pub(crate) fn message_error(
             SignalProtocolError::BadMac(kind)
         }
         E::Duplicate => SignalProtocolError::DuplicatedMessage(chain, counter),
+        E::ClosedChain => {
+            SignalProtocolError::InvalidSessionStructure("receiver chain is closed".into())
+        }
         E::FutureMessage => {
             SignalProtocolError::InvalidMessage(kind, "message counter exceeds future limit")
         }

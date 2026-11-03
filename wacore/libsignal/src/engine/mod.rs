@@ -35,6 +35,8 @@ pub enum Error {
     InvalidCiphertext,
     #[error("message key already consumed or unavailable")]
     Duplicate,
+    #[error("receiver chain is closed")]
+    ClosedChain,
     #[error("message counter exceeds the permitted future gap")]
     FutureMessage,
     #[error("counter exhausted")]

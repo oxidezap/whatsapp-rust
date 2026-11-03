@@ -107,6 +107,32 @@ fn oversized_ciphertexts_do_not_publish_pairwise_or_group_state() {
     );
     assert_eq!(encode_sender_key_record(&group), before);
 }
+#[test]
+fn closed_receiver_keeps_skipped_keys_and_distinguishes_unreceived_counters() {
+    let mut chain = Chain::new([3; 32], None, [4; 32]);
+    chain.index = 5;
+    chain.exhausted = true;
+    chain.skipped.push_back(MessageKey::Seed {
+        index: 3,
+        seed: [5; 32],
+    });
+    let pending = chain.plan(&RustCrypto, 3, PEER_FUTURE_LIMIT).unwrap();
+    assert_eq!(pending.message.index(), 3);
+    pending.commit(&mut chain);
+    for index in [0, 3, 4] {
+        assert!(matches!(
+            chain.plan(&RustCrypto, index, PEER_FUTURE_LIMIT),
+            Err(Error::Duplicate)
+        ));
+    }
+    for index in [5, 6, u32::MAX] {
+        assert!(matches!(
+            chain.plan(&RustCrypto, index, PEER_FUTURE_LIMIT),
+            Err(Error::ClosedChain)
+        ));
+    }
+    assert_eq!(chain.index, 5);
+}
 struct Deterministic(u64);
 impl RandomSource for Deterministic {
     fn fill(&mut self, out: &mut [u8]) -> Result<()> {

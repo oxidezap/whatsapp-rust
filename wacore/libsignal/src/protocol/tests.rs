@@ -1297,3 +1297,103 @@ fn a_rebased_root_change_requires_persistence_even_if_the_public_key_repeats() {
         assert!(record.has_pending_reservation());
     })
 }
+
+#[test]
+fn sending_repairs_missing_and_stale_identity_rows() {
+    run(async {
+        for stale in [false, true] {
+            let mut f = established_signal_fixture(1201).await;
+            let remote = *f.b.pair.identity_key();
+            f.a.known.remove(&f.ba);
+            if stale {
+                f.a.known.insert(f.ba.clone(), *f.a.pair.identity_key());
+            }
+            f.a.only_trusted = Some(remote);
+            let calls = f.a.save_calls;
+            message_encrypt(b"repair identity", &f.ba, &mut f.a_sessions, &mut f.a)
+                .await
+                .unwrap();
+            assert_eq!(f.a.save_calls, calls + 1);
+            assert_eq!(f.a.known.get(&f.ba), Some(&remote));
+        }
+    })
+}
+#[test]
+fn sending_identity_save_failure_and_cancellation_restore_owned_checkout() {
+    run(async {
+        for cancel in [false, true] {
+            let mut f = established_signal_fixture(1202).await;
+            let before = f.a_sessions.0[&f.ba].serialize().unwrap();
+            let mut sessions = checkout_store();
+            *sessions.record.lock().unwrap() = f.a_sessions.0.remove(&f.ba);
+            f.a.fail_save = !cancel;
+            f.a.block_save = cancel;
+            let mut future = Box::pin(message_encrypt(
+                b"identity failure",
+                &f.ba,
+                &mut sessions,
+                &mut f.a,
+            ));
+            let result = future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()));
+            if cancel {
+                assert!(result.is_pending());
+            } else {
+                assert!(matches!(
+                    result,
+                    Poll::Ready(Err(SignalProtocolError::InvalidState("test", _)))
+                ));
+            }
+            drop(future);
+            assert_eq!(
+                sessions.queued.as_ref().unwrap().serialize().unwrap(),
+                before
+            );
+            sessions.complete_session_checkout().await;
+            assert_eq!(
+                sessions
+                    .record
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .serialize()
+                    .unwrap(),
+                before
+            );
+        }
+    })
+}
+#[test]
+fn persisted_closed_receiver_reports_unreceived_counter_as_retryable_failure() {
+    run(async {
+        let mut f = established_signal_fixture(1203).await;
+        let packet = message_encrypt(b"unreceived", &f.aa, &mut f.b_sessions, &mut f.b)
+            .await
+            .unwrap();
+        let CiphertextMessage::SignalMessage(message) = &packet else {
+            panic!("expected ordinary message");
+        };
+        let record = f.a_sessions.0.get_mut(&f.ba).unwrap();
+        for chain in &mut record.session_state_mut().unwrap().inner.receivers {
+            chain.exhausted = true;
+            chain.key = [0; 32];
+        }
+        let bytes = record.serialize().unwrap();
+        *record = SessionRecord::deserialize(&bytes).unwrap();
+        // Loading consumes the sender reservation before the receive attempt.
+        let bytes = record.serialize().unwrap();
+        let result =
+            message_decrypt_signal(message, &f.ba, &mut f.a_sessions, &mut f.a, &mut f.rng).await;
+        let Err(error) = result else {
+            panic!("closed receiver accepted a new counter")
+        };
+        assert!(
+            matches!(&error, SignalProtocolError::InvalidSessionStructure(reason) if reason == "receiver chain is closed"),
+            "{error}"
+        );
+        assert!(!error.is_stored_session_corruption());
+        assert_eq!(f.a_sessions.0[&f.ba].serialize().unwrap(), bytes);
+    })
+}
