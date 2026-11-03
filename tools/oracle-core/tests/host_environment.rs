@@ -327,7 +327,8 @@ mod wasi_fixture {
         MemArg {
             offset,
             align: 2,
-            memory_index: 0,
+            target: wasm_encoder::MemArgTarget::Memory(0),
+            ordering: None,
         }
     }
 
@@ -890,7 +891,8 @@ fn a_plain_main_receives_the_arguments_it_was_given() {
         MemArg {
             offset,
             align: 2,
-            memory_index: 0,
+            target: wasm_encoder::MemArgTarget::Memory(0),
+            ordering: None,
         }
     }
 
@@ -926,7 +928,8 @@ fn a_plain_main_receives_the_arguments_it_was_given() {
         f.local_get(1).i32_load(word(4)).i32_load8_u(MemArg {
             offset: 0,
             align: 0,
-            memory_index: 0,
+            target: wasm_encoder::MemArgTarget::Memory(0),
+            ordering: None,
         });
         f.end();
     }

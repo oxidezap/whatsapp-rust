@@ -1512,7 +1512,8 @@ mod tests {
         function.instruction(&Instruction::F32Store(wasm_encoder::MemArg {
             offset: 0,
             align: 2,
-            memory_index: 0,
+            target: wasm_encoder::MemArgTarget::Memory(0),
+            ordering: None,
         }));
         function.instruction(&Instruction::End);
         let mut code = CodeSection::new();

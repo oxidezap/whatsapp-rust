@@ -247,7 +247,8 @@ mod tests {
                     .i32_load8_u(MemArg {
                         offset: 662166,
                         align: 0,
-                        memory_index: 0,
+                        target: wasm_encoder::MemArgTarget::Memory(0),
+                        ordering: None,
                     })
                     .br_if(0)
                     .end()
