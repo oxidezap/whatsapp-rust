@@ -776,17 +776,42 @@ impl SenderKeyRecord {
     pub fn serialize(&self) -> Result<Vec<u8>> {
         Ok(engine::codec::encode_sender_key_record(&self.inner))
     }
-    pub(crate) fn prune_prepared_crypto(&self) {
-        if let Some(cache) = &self.group_crypto {
-            cache.retain(|public, private| {
-                self.inner.states.iter().any(|state| {
-                    state.signing_public == *public
-                        && group_crypto::private_keys_match(state.signing_private.as_ref(), private)
-                })
-            });
+    pub(crate) fn prune_prepared_crypto(&mut self) {
+        let states = &self.inner.states;
+        group_crypto::GroupCryptoCache::prune(&mut self.group_crypto, |public, private| {
+            states.iter().any(|state| {
+                state.signing_public == *public
+                    && (private.is_none()
+                        || group_crypto::private_keys_match(
+                            state.signing_private.as_ref(),
+                            private,
+                        ))
+            })
+        });
+    }
+    pub(crate) fn warm_current_signer(&mut self) {
+        self.prune_prepared_crypto();
+        if let Some(state) = self.inner.states.first()
+            && let Some(private) = &state.signing_private
+        {
+            group_crypto::GroupCryptoCache::prepare(
+                &mut self.group_crypto,
+                &state.signing_public,
+                Some(private),
+            );
         }
     }
-    pub(crate) fn prepared_crypto(
+    pub(crate) fn warm_current_verifier(&mut self) {
+        self.prune_prepared_crypto();
+        if let Some(state) = self.inner.states.first() {
+            group_crypto::GroupCryptoCache::prepare(
+                &mut self.group_crypto,
+                &state.signing_public,
+                None,
+            );
+        }
+    }
+    pub(crate) fn prepared_signer(
         &mut self,
         index: usize,
     ) -> Result<group_crypto::PreparedGroupProvider> {
@@ -796,10 +821,31 @@ impl SenderKeyRecord {
             .states
             .get(index)
             .ok_or(SignalProtocolError::InvalidSenderKeySession)?;
-        let cache = self
-            .group_crypto
-            .get_or_insert_with(|| Arc::new(group_crypto::GroupCryptoCache::default()));
-        Ok(cache.provider(&state.signing_public, state.signing_private.as_ref())?)
+        let private = state
+            .signing_private
+            .as_ref()
+            .ok_or(engine::Error::MissingKey)?;
+        Ok(group_crypto::GroupCryptoCache::prepare(
+            &mut self.group_crypto,
+            &state.signing_public,
+            Some(private),
+        ))
+    }
+    pub(crate) fn prepared_verifier(
+        &mut self,
+        index: usize,
+    ) -> Result<group_crypto::PreparedGroupProvider> {
+        self.prune_prepared_crypto();
+        let state = self
+            .inner
+            .states
+            .get(index)
+            .ok_or(SignalProtocolError::InvalidSenderKeySession)?;
+        Ok(group_crypto::GroupCryptoCache::prepare(
+            &mut self.group_crypto,
+            &state.signing_public,
+            None,
+        ))
     }
     pub fn serialize_for_store(&self, token: &[u8; 16]) -> Result<Vec<u8>> {
         Ok(engine::codec::encode_sender_key_record_for_store(
@@ -883,7 +929,11 @@ impl SenderKeyRecord {
                 self.mark_wire_gated();
             }
         }
-        self.prune_prepared_crypto();
+        if self.inner.states[0].signing_private.is_some() {
+            self.warm_current_signer();
+        } else {
+            self.warm_current_verifier();
+        }
         Ok(())
     }
     pub fn sender_key_state(&self) -> Result<SenderKeyState<'_>> {

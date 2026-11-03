@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: MIT
-//! Record-owned prepared XEdDSA contexts. Serialization never includes this cache.
-use crate::core::{PreparedSigningKey, PreparedVerifyingKey, PrivateKey, PublicKey};
+//! Record-owned, bounded prepared XEdDSA contexts; never serialized.
+use crate::core::{PreparedSigningKey, PreparedVerifyingKey, PublicKey};
 use crate::engine::{CryptoProvider, Error, RandomSource, Result, RustCrypto};
-use std::{
-    collections::VecDeque,
-    sync::{Arc, Mutex, MutexGuard},
-};
+use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-const MAX_CONTEXTS: usize = 5;
+const MAX_CONTEXTS: usize = crate::engine::MAX_SENDER_STATES;
 fn arc_allocation_bytes<T>() -> usize {
     let header = std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>();
     header
@@ -17,14 +14,20 @@ fn arc_allocation_bytes<T>() -> usize {
         .map(|(layout, _)| layout.pad_to_align().size())
         .unwrap_or(usize::MAX)
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct GroupCryptoCache {
-    entries: Mutex<VecDeque<Arc<PreparedContext>>>,
+    signing: [Option<Arc<SigningContext>>; MAX_CONTEXTS],
+    verifying: [Option<Arc<VerifyingContext>>; MAX_CONTEXTS],
+    next_signing: u8,
+    next_verifying: u8,
 }
-struct PreparedContext {
+struct SigningContext {
     public: [u8; 32],
-    private: Option<Zeroizing<[u8; 32]>>,
+    private: Zeroizing<[u8; 32]>,
     signing: Option<PreparedSigningKey>,
+}
+struct VerifyingContext {
+    public: [u8; 32],
     verifying: Option<PreparedVerifyingKey>,
 }
 pub(crate) fn private_keys_match(left: Option<&[u8; 32]>, right: Option<&[u8; 32]>) -> bool {
@@ -34,75 +37,153 @@ pub(crate) fn private_keys_match(left: Option<&[u8; 32]>, right: Option<&[u8; 32
         _ => false,
     }
 }
-impl PreparedContext {
-    fn matches(&self, public: &[u8; 32], private: Option<&[u8; 32]>) -> bool {
-        self.public == *public && private_keys_match(self.private.as_deref(), private)
-    }
-}
 impl GroupCryptoCache {
-    /// Retained heap storage, including the record's cache Arc allocation.
-    /// Prepared contexts contain no further heap allocations.
+    /// Heap referenced by a record, including this cache's Arc allocation.
     pub(crate) fn estimated_heap_bytes(&self) -> usize {
-        let entries = self.entries();
         arc_allocation_bytes::<Self>()
-            + entries.capacity() * size_of::<Arc<PreparedContext>>()
-            + entries.len() * arc_allocation_bytes::<PreparedContext>()
+            + self.signing.iter().flatten().count() * arc_allocation_bytes::<SigningContext>()
+            + self.verifying.iter().flatten().count() * arc_allocation_bytes::<VerifyingContext>()
     }
-
-    fn entries(&self) -> MutexGuard<'_, VecDeque<Arc<PreparedContext>>> {
-        self.entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    pub(crate) fn prepare(
+        cache: &mut Option<Arc<Self>>,
+        public: &[u8; 32],
+        private: Option<&[u8; 32]>,
+    ) -> PreparedGroupProvider {
+        if let Some(provider) = cache
+            .as_ref()
+            .and_then(|cache| cache.cached(public, private))
+        {
+            return provider;
+        }
+        let cache = cache.get_or_insert_with(|| Arc::new(Self::default()));
+        Arc::make_mut(cache).provider(public, private)
     }
-    pub(crate) fn provider(
+    fn cached(
         &self,
         public: &[u8; 32],
         private: Option<&[u8; 32]>,
-    ) -> Result<PreparedGroupProvider> {
-        let mut entries = self.entries();
-        if let Some(index) = entries
+    ) -> Option<PreparedGroupProvider> {
+        let context = if let Some(private) = private {
+            PreparedContext::Signing(Arc::clone(self.signing.iter().flatten().find(
+                |context| {
+                    context.public == *public
+                        && private_keys_match(Some(&context.private), Some(private))
+                },
+            )?))
+        } else {
+            PreparedContext::Verifying(Arc::clone(
+                self.verifying
+                    .iter()
+                    .flatten()
+                    .find(|context| context.public == *public)?,
+            ))
+        };
+        Some(PreparedGroupProvider { context })
+    }
+    pub(crate) fn prune(
+        cache: &mut Option<Arc<Self>>,
+        mut keep: impl FnMut(&[u8; 32], Option<&[u8; 32]>) -> bool,
+    ) {
+        let Some(cache) = cache else { return };
+        let stale = cache
+            .signing
             .iter()
-            .position(|entry| entry.matches(public, private))
-        {
-            // Move the shared handle, retaining the prepared context across checkout.
-            if let Some(context) = entries.remove(index) {
-                entries.push_back(Arc::clone(&context));
-                return Ok(PreparedGroupProvider { context });
+            .flatten()
+            .any(|context| !keep(&context.public, Some(&context.private)))
+            || cache
+                .verifying
+                .iter()
+                .flatten()
+                .any(|context| !keep(&context.public, None));
+        if stale {
+            Arc::make_mut(cache).retain(keep);
+        }
+    }
+    pub(crate) fn provider(
+        &mut self,
+        public: &[u8; 32],
+        private: Option<&[u8; 32]>,
+    ) -> PreparedGroupProvider {
+        let context = if let Some(private) = private {
+            if let Some(context) = self.signing.iter().flatten().find(|context| {
+                context.public == *public
+                    && private_keys_match(Some(&context.private), Some(private))
+            }) {
+                return PreparedGroupProvider {
+                    context: PreparedContext::Signing(Arc::clone(context)),
+                };
+            }
+            let context = Arc::new(SigningContext {
+                public: *public,
+                private: Zeroizing::new(*private),
+                signing: PreparedSigningKey::new_matching(private, public),
+            });
+            let index = self
+                .signing
+                .iter()
+                .position(Option::is_none)
+                .unwrap_or(usize::from(self.next_signing));
+            self.signing[index] = Some(Arc::clone(&context));
+            self.next_signing =
+                u8::try_from((index + 1) % MAX_CONTEXTS).expect("bounded cache index");
+            PreparedContext::Signing(context)
+        } else {
+            if let Some(context) = self
+                .verifying
+                .iter()
+                .flatten()
+                .find(|context| context.public == *public)
+            {
+                return PreparedGroupProvider {
+                    context: PreparedContext::Verifying(Arc::clone(context)),
+                };
+            }
+            let verifying = PublicKey::from_djb_public_key_bytes(public)
+                .ok()
+                .and_then(|key| PreparedVerifyingKey::new(&key).ok());
+            let context = Arc::new(VerifyingContext {
+                public: *public,
+                verifying,
+            });
+            let index = self
+                .verifying
+                .iter()
+                .position(Option::is_none)
+                .unwrap_or(usize::from(self.next_verifying));
+            self.verifying[index] = Some(Arc::clone(&context));
+            self.next_verifying =
+                u8::try_from((index + 1) % MAX_CONTEXTS).expect("bounded cache index");
+            PreparedContext::Verifying(context)
+        };
+        PreparedGroupProvider { context }
+    }
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&[u8; 32], Option<&[u8; 32]>) -> bool) {
+        for slot in &mut self.signing {
+            if slot
+                .as_ref()
+                .is_some_and(|context| !keep(&context.public, Some(&context.private)))
+            {
+                *slot = None;
             }
         }
-        let verifying = PublicKey::from_djb_public_key_bytes(public)
-            .ok()
-            .and_then(|key| PreparedVerifyingKey::new(&key).ok());
-        let signing = if let Some(private) = private {
-            PreparedSigningKey::new_matching(
-                &PrivateKey::deserialize(private).map_err(|_| Error::Crypto)?,
-                public,
-            )
-        } else {
-            None
-        };
-        let context = Arc::new(PreparedContext {
-            public: *public,
-            private: private.map(|key| Zeroizing::new(*key)),
-            signing,
-            verifying,
-        });
-        if entries.len() == MAX_CONTEXTS {
-            entries.pop_front();
+        for slot in &mut self.verifying {
+            if slot
+                .as_ref()
+                .is_some_and(|context| !keep(&context.public, None))
+            {
+                *slot = None;
+            }
         }
-        entries.push_back(Arc::clone(&context));
-        Ok(PreparedGroupProvider { context })
-    }
-    /// Remove contexts for pruned or replaced sender states. Existing in-flight
-    /// provider handles retain their own contexts until their operation completes.
-    pub(crate) fn retain(&self, mut keep: impl FnMut(&[u8; 32], Option<&[u8; 32]>) -> bool) {
-        self.entries()
-            .retain(|entry| keep(&entry.public, entry.private.as_deref()));
     }
 }
 #[derive(Clone)]
+enum PreparedContext {
+    Signing(Arc<SigningContext>),
+    Verifying(Arc<VerifyingContext>),
+}
+#[derive(Clone)]
 pub(crate) struct PreparedGroupProvider {
-    context: Arc<PreparedContext>,
+    context: PreparedContext,
 }
 impl CryptoProvider for PreparedGroupProvider {
     fn public_key(&self, private: &[u8; 32]) -> Result<[u8; 32]> {
@@ -117,16 +198,18 @@ impl CryptoProvider for PreparedGroupProvider {
         message: &[u8],
         random: &mut dyn RandomSource,
     ) -> Result<[u8; 64]> {
-        if let (Some(expected), Some(signing)) = (&self.context.private, &self.context.signing)
-            && bool::from(expected.as_ref().ct_eq(private))
+        if let PreparedContext::Signing(context) = &self.context
+            && bool::from(context.private.as_ref().ct_eq(private))
+            && let Some(signing) = &context.signing
         {
             return signing.calculate_signature_with_random_source(message, random);
         }
         RustCrypto.sign(private, message, random)
     }
     fn verify(&self, public: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> Result<()> {
-        if *public == self.context.public
-            && let Some(verifying) = &self.context.verifying
+        if let PreparedContext::Verifying(context) = &self.context
+            && *public == context.public
+            && let Some(verifying) = &context.verifying
         {
             return if verifying.verify_signature(message, signature) {
                 Ok(())
@@ -160,6 +243,21 @@ mod tests {
         create_sender_key_distribution_message, process_sender_key_distribution_message,
     };
     use super::*;
+    use crate::core::PrivateKey;
+    impl PreparedGroupProvider {
+        fn signer(&self) -> &Arc<SigningContext> {
+            let PreparedContext::Signing(context) = &self.context else {
+                panic!("expected signer")
+            };
+            context
+        }
+        fn verifier(&self) -> &Arc<VerifyingContext> {
+            let PreparedContext::Verifying(context) = &self.context else {
+                panic!("expected verifier")
+            };
+            context
+        }
+    }
     fn add_state(record: &mut SenderKeyRecord, id: u32, byte: u8, private: bool) {
         let key = PrivateKey::deserialize(&[byte; 32]).unwrap();
         let public = key.public_key().unwrap();
@@ -189,8 +287,8 @@ mod tests {
     fn adding_states_drops_evicted_private_context_immediately() {
         let mut record = SenderKeyRecord::new_empty();
         add_state(&mut record, 0, 7, true);
-        let provider = record.prepared_crypto(0).unwrap();
-        let weak = Arc::downgrade(&provider.context);
+        let provider = record.prepared_signer(0).unwrap();
+        let weak = Arc::downgrade(provider.signer());
         drop(provider);
         assert!(weak.upgrade().is_some());
         for id in 1..=5 {
@@ -202,8 +300,8 @@ mod tests {
     fn processing_replacement_distribution_drops_old_private_context_immediately() {
         let mut record = SenderKeyRecord::new_empty();
         add_state(&mut record, 7, 7, true);
-        let provider = record.prepared_crypto(0).unwrap();
-        let weak = Arc::downgrade(&provider.context);
+        let provider = record.prepared_signer(0).unwrap();
+        let weak = Arc::downgrade(provider.signer());
         drop(provider);
         let public = PrivateKey::deserialize(&[8; 32])
             .unwrap()
@@ -226,8 +324,8 @@ mod tests {
         for id in 1..5 {
             add_state(&mut record, id, id as u8 + 7, false);
         }
-        let provider = record.prepared_crypto(4).unwrap();
-        let weak = Arc::downgrade(&provider.context);
+        let provider = record.prepared_signer(4).unwrap();
+        let weak = Arc::downgrade(provider.signer());
         drop(provider);
         let name = SenderKeyName::from_parts("group.invalid@g.us", "sender.invalid:1");
         let mut store = Store(Some(record));
@@ -263,8 +361,8 @@ mod tests {
     fn prepared_signatures_match_standard_and_random_failures_propagate() {
         let private = [7; 32];
         let public = RustCrypto.public_key(&private).unwrap();
-        let cache = GroupCryptoCache::default();
-        let provider = cache.provider(&public, Some(&private)).unwrap();
+        let mut cache = GroupCryptoCache::default();
+        let provider = cache.provider(&public, Some(&private));
         let signature = provider
             .sign(&private, b"synthetic", &mut Seeded::new())
             .unwrap();
@@ -292,42 +390,45 @@ mod tests {
     }
     #[test]
     fn providers_share_contexts_cache_is_bounded_and_retention_drops_pruned_keys() {
-        let cache = Arc::new(GroupCryptoCache::default());
-        let clone = Arc::clone(&cache);
+        let mut cache = GroupCryptoCache::default();
         let empty_heap = cache.estimated_heap_bytes();
         assert!(empty_heap > 0);
         let private = [7; 32];
         let public = RustCrypto.public_key(&private).unwrap();
-        let first = cache.provider(&public, Some(&private)).unwrap();
-        let second = clone.provider(&public, Some(&private)).unwrap();
+        let first = cache.provider(&public, Some(&private));
+        assert!(cache.verifying.iter().all(Option::is_none));
+        let mut clone = cache.clone();
+        let second = clone.provider(&public, Some(&private));
         let third = first.clone();
-        assert!(Arc::ptr_eq(&first.context, &second.context));
-        assert!(Arc::ptr_eq(&first.context, &third.context));
-        assert_eq!(cache.entries().len(), 1);
+        assert!(Arc::ptr_eq(first.signer(), second.signer()));
+        assert!(Arc::ptr_eq(first.signer(), third.signer()));
+        assert_eq!(cache.signing.iter().flatten().count(), 1);
         assert!(cache.estimated_heap_bytes() > empty_heap);
-        let weak = Arc::downgrade(&first.context);
+        let weak = Arc::downgrade(first.signer());
         drop(first);
         drop(second);
         drop(third);
         cache.retain(|_, _| false);
+        assert!(weak.upgrade().is_some()); // The cloned record still owns its key.
+        clone.retain(|_, _| false);
         assert!(weak.upgrade().is_none());
         for byte in 0..9 {
             let private = [byte; 32];
             let public = RustCrypto.public_key(&private).unwrap();
-            cache.provider(&public, Some(&private)).unwrap();
-            assert!(cache.entries().len() <= MAX_CONTEXTS);
+            cache.provider(&public, Some(&private));
+            assert!(cache.signing.iter().flatten().count() <= MAX_CONTEXTS);
         }
         let private = [8; 32];
         let public = RustCrypto.public_key(&private).unwrap();
         cache.retain(|key, secret| *key == public && secret == Some(&private));
-        assert_eq!(cache.entries().len(), 1);
+        assert_eq!(cache.signing.iter().flatten().count(), 1);
         // Exact raw private bytes are part of the key even if clamping produces
         // the same scalar. A changed private key must not select the old tuple.
         let mut changed = private;
         changed[0] ^= 1;
-        let first = cache.provider(&public, Some(&private)).unwrap();
-        let second = cache.provider(&public, Some(&changed)).unwrap();
-        assert!(!Arc::ptr_eq(&first.context, &second.context));
+        let first = cache.provider(&public, Some(&private));
+        let second = cache.provider(&public, Some(&changed));
+        assert!(!Arc::ptr_eq(first.signer(), second.signer()));
     }
     #[test]
     fn mismatched_keys_and_invalid_public_use_standard_fallback() {
@@ -335,8 +436,8 @@ mod tests {
         let public = RustCrypto.public_key(&private).unwrap();
         let other = [8; 32];
         let other_public = RustCrypto.public_key(&other).unwrap();
-        let cache = GroupCryptoCache::default();
-        let provider = cache.provider(&public, Some(&private)).unwrap();
+        let mut cache = GroupCryptoCache::default();
+        let provider = cache.provider(&public, Some(&private));
         let signature = provider.sign(&other, b"synthetic", &mut Fixed(9)).unwrap();
         assert_eq!(
             signature,
@@ -347,26 +448,87 @@ mod tests {
         provider
             .verify(&other_public, b"synthetic", &signature)
             .unwrap();
-        let mismatched = cache.provider(&public, Some(&other)).unwrap();
-        assert!(mismatched.context.signing.is_none());
+        let mismatched = cache.provider(&public, Some(&other));
+        assert!(mismatched.signer().signing.is_none());
         assert_eq!(
             mismatched
                 .sign(&other, b"synthetic", &mut Fixed(9))
                 .unwrap(),
             signature
         );
-        let invalid = cache.provider(&[0; 32], None).unwrap();
-        assert!(invalid.context.verifying.is_none());
+        let invalid = cache.provider(&[0; 32], None);
+        assert!(invalid.verifier().verifying.is_none());
         assert_eq!(
             invalid.verify(&[0; 32], b"synthetic", &signature),
             RustCrypto.verify(&[0; 32], b"synthetic", &signature)
         );
     }
     #[test]
+    fn cache_hits_share_sidecars_and_pruning_detaches_only_the_changed_snapshot() {
+        let private = [7; 32];
+        let public = RustCrypto.public_key(&private).unwrap();
+        let mut owner = None;
+        let first = GroupCryptoCache::prepare(&mut owner, &public, Some(&private));
+        let mut sibling = owner.clone();
+        let second = GroupCryptoCache::prepare(&mut sibling, &public, Some(&private));
+        assert!(Arc::ptr_eq(
+            owner.as_ref().unwrap(),
+            sibling.as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(first.signer(), second.signer()));
+        let weak = Arc::downgrade(first.signer());
+        GroupCryptoCache::prune(&mut sibling, |_, _| false);
+        assert!(!Arc::ptr_eq(
+            owner.as_ref().unwrap(),
+            sibling.as_ref().unwrap()
+        ));
+        assert!(
+            sibling
+                .as_ref()
+                .unwrap()
+                .cached(&public, Some(&private))
+                .is_none()
+        );
+        assert!(
+            owner
+                .as_ref()
+                .unwrap()
+                .cached(&public, Some(&private))
+                .is_some()
+        );
+        drop(first);
+        drop(second);
+        assert!(weak.upgrade().is_some());
+        drop(owner);
+        assert!(weak.upgrade().is_none());
+    }
+    #[test]
+    fn ingestion_prepares_only_the_needed_role_and_preserves_storage_bytes() {
+        let mut own = SenderKeyRecord::new_empty();
+        add_state(&mut own, 1, 7, true);
+        let bytes = own.serialize().unwrap();
+        let signing_heap = own.estimated_heap_bytes();
+        own.prepared_signer(0).unwrap();
+        assert_eq!(own.estimated_heap_bytes(), signing_heap);
+        own.prepared_verifier(0).unwrap();
+        assert!(own.estimated_heap_bytes() > signing_heap);
+        assert_eq!(own.serialize().unwrap(), bytes);
+        let mut receiver = SenderKeyRecord::new_empty();
+        add_state(&mut receiver, 1, 7, false);
+        let bytes = receiver.serialize().unwrap();
+        let verifying_heap = receiver.estimated_heap_bytes();
+        receiver.prepared_verifier(0).unwrap();
+        assert_eq!(receiver.estimated_heap_bytes(), verifying_heap);
+        assert!(receiver.prepared_signer(0).is_err());
+        assert_eq!(receiver.estimated_heap_bytes(), verifying_heap);
+        assert_eq!(receiver.serialize().unwrap(), bytes);
+    }
+
+    #[test]
     fn historical_edwards_sign_bit_verifies_with_cached_context() {
         use curve25519_dalek::{edwards::EdwardsPoint, scalar::Scalar};
         use sha2::{Digest, Sha512};
-        let cache = GroupCryptoCache::default();
+        let mut cache = GroupCryptoCache::default();
         let mut signs = [false; 2];
         for byte in 0..32 {
             let private = [byte; 32];
@@ -389,7 +551,7 @@ mod tests {
             signature[..32].copy_from_slice(r.as_bytes());
             signature[32..].copy_from_slice(s.as_bytes());
             signature[63] |= encoded_public.as_bytes()[31] & 128;
-            let provider = cache.provider(&public, None).unwrap();
+            let provider = cache.provider(&public, None);
             provider.verify(&public, b"synthetic", &signature).unwrap();
             RustCrypto
                 .verify(&public, b"synthetic", &signature)

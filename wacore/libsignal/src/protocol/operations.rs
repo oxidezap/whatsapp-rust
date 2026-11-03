@@ -393,7 +393,7 @@ pub async fn create_sender_key_distribution_message<
     let mut random = RandomAdapter(rng);
     let bytes = engine::Engine::new(&engine::RustCrypto, &mut random)
         .create_sender_distribution(&mut record.inner)?;
-    record.prune_prepared_crypto();
+    record.warm_current_signer();
     if !already_sending {
         record.mark_wire_gated();
     }
@@ -413,7 +413,7 @@ pub async fn process_sender_key_distribution_message<S: SenderKeyStore + ?Sized>
         .unwrap_or_else(SenderKeyRecord::new_empty);
     engine::Engine::new(&engine::RustCrypto, &mut NoRandomSource)
         .process_sender_distribution(&mut record.inner, &message.bytes)?;
-    record.prune_prepared_crypto();
+    record.warm_current_verifier();
     store.store_sender_key(name, record).await
 }
 /// The caller must hold the store's stable sender-key lock across this operation,
@@ -485,10 +485,12 @@ async fn group_encrypt_using<
         record.mark_wire_gated();
     }
     record.inner.reservation.mark_committed();
-    let mut random = RandomAdapter(rng);
-    let crypto = prepare(record.prepared_crypto(0)?);
-    let bytes = engine::Engine::new(&crypto, &mut random)
-        .encrypt_sender_key(&mut record.inner, plaintext)?;
+    let bytes = {
+        let mut random = RandomAdapter(rng);
+        let crypto = prepare(record.prepared_signer(0)?);
+        engine::Engine::new(&crypto, &mut random)
+            .encrypt_sender_key(&mut record.inner, plaintext)?
+    };
     store.store_sender_key(name, record).await?;
     SenderKeyMessage::try_from(bytes.as_slice())
 }
@@ -539,19 +541,23 @@ async fn group_decrypt_shared_using<
         .iter()
         .position(|state| state.id == message.chain_id())
         .ok_or_else(|| SignalProtocolError::NoSenderKeyState(name.to_string()))?;
-    let crypto = prepare(record.prepared_crypto(index)?);
-    let plaintext = engine::Engine::new(&crypto, &mut NoRandomSource)
-        .decrypt_sender_key(&mut record.inner, &message.bytes)
-        .map_err(|error| match error {
-            engine::Error::Authentication => SignalProtocolError::SignatureValidationFailed,
-            engine::Error::MissingKey => SignalProtocolError::NoSenderKeyState(name.to_string()),
-            error => message_error(
-                error,
-                CiphertextMessageType::SenderKey,
-                0,
-                message.iteration(),
-            ),
-        })?;
+    let plaintext = {
+        let crypto = prepare(record.prepared_verifier(index)?);
+        engine::Engine::new(&crypto, &mut NoRandomSource)
+            .decrypt_sender_key(&mut record.inner, &message.bytes)
+            .map_err(|error| match error {
+                engine::Error::Authentication => SignalProtocolError::SignatureValidationFailed,
+                engine::Error::MissingKey => {
+                    SignalProtocolError::NoSenderKeyState(name.to_string())
+                }
+                error => message_error(
+                    error,
+                    CiphertextMessageType::SenderKey,
+                    0,
+                    message.iteration(),
+                ),
+            })?
+    };
     store.store_sender_key(name, record).await?;
     Ok(plaintext)
 }

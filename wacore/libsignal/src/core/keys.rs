@@ -269,8 +269,8 @@ impl IdentityKeyPair {
 /// Decompresses the public point once for repeated XEdDSA checks.
 #[derive(Clone, Debug)]
 pub struct PreparedVerifyingKey {
-    points: [curve25519_dalek::edwards::EdwardsPoint; 2],
-    encodings: [[u8; 32]; 2],
+    point: curve25519_dalek::edwards::EdwardsPoint,
+    encoding: [u8; 32],
 }
 impl PreparedVerifyingKey {
     pub fn new(public: &PublicKey) -> Result<Self> {
@@ -286,12 +286,9 @@ impl PreparedVerifyingKey {
         if public.0.iter().rev().cmp(prime.iter().rev()).is_ge() {
             return Err(CurveError::InvalidKey);
         }
-        let mut encoding = p0.compress().to_bytes();
-        let positive = encoding;
-        encoding[31] |= 128;
         Ok(Self {
-            points: [p0, -p0],
-            encodings: [positive, encoding],
+            point: p0,
+            encoding: p0.compress().to_bytes(),
         })
     }
     pub fn verify_signature(&self, message: &[u8], signature: &[u8]) -> bool {
@@ -307,11 +304,18 @@ impl PreparedVerifyingKey {
         if s[31] & 224 != 0 {
             return false;
         }
-        let sign = (sig[63] >> 7) as usize;
-        let point = &self.points[sign];
+        let negative;
+        let point = if sig[63] & 128 != 0 {
+            negative = -self.point;
+            &negative
+        } else {
+            &self.point
+        };
+        let mut encoding = self.encoding;
+        encoding[31] |= sig[63] & 128;
         let mut h = Sha512::new();
         h.update(&sig[..32]);
-        h.update(self.encodings[sign]);
+        h.update(encoding);
         h.update(message);
         let h = Scalar::from_bytes_mod_order_wide(&h.finalize().into());
         let r = EdwardsPoint::vartime_double_scalar_mul_basepoint(
@@ -341,18 +345,18 @@ impl std::fmt::Debug for PreparedSigningKey {
 }
 impl PreparedSigningKey {
     pub fn new(private: &PrivateKey) -> Self {
-        Self::prepare(private).0
+        Self::prepare(private.serialize()).0
     }
-    pub(crate) fn new_matching(private: &PrivateKey, expected: &[u8; 32]) -> Option<Self> {
+    pub(crate) fn new_matching(private: &[u8; 32], expected: &[u8; 32]) -> Option<Self> {
         use subtle::ConstantTimeEq;
         let (prepared, point) = Self::prepare(private);
         bool::from(point.to_montgomery().to_bytes().ct_eq(expected)).then_some(prepared)
     }
     #[inline]
-    fn prepare(private: &PrivateKey) -> (Self, curve25519_dalek::edwards::EdwardsPoint) {
+    fn prepare(private: &[u8; 32]) -> (Self, curve25519_dalek::edwards::EdwardsPoint) {
         use curve25519_dalek::{edwards::EdwardsPoint, scalar::Scalar};
         use subtle::{Choice, ConditionallySelectable};
-        let mut raw = zeroize::Zeroizing::new(*private.serialize());
+        let mut raw = zeroize::Zeroizing::new(*private);
         raw[0] &= 248;
         raw[31] = (raw[31] & 127) | 64;
         let scalar = zeroize::Zeroizing::new(Scalar::from_bytes_mod_order(*raw));
@@ -515,7 +519,7 @@ mod tests {
         for _ in 0..32 {
             let pair = KeyPair::generate(&mut random);
             let prepared = PreparedSigningKey::new_matching(
-                &pair.private_key,
+                pair.private_key.serialize(),
                 pair.public_key.public_key_bytes(),
             )
             .unwrap();
@@ -537,7 +541,7 @@ mod tests {
             let other = KeyPair::generate(&mut random);
             assert!(
                 PreparedSigningKey::new_matching(
-                    &pair.private_key,
+                    pair.private_key.serialize(),
                     other.public_key.public_key_bytes()
                 )
                 .is_none()
