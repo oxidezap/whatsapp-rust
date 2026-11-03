@@ -943,6 +943,13 @@ pub(crate) fn device_list_query(
 pub(crate) fn project_device_list_response(
     response: UsyncResponse,
 ) -> Result<DeviceListResponse, anyhow::Error> {
+    project_device_list_response_checked(response, false)
+}
+
+fn project_device_list_response_checked(
+    response: UsyncResponse,
+    require_complete: bool,
+) -> Result<DeviceListResponse, anyhow::Error> {
     const NON_DEVICE_PROTOCOLS: &[UsyncProtocolKind] = &[
         UsyncProtocolKind::Contact,
         UsyncProtocolKind::Lid,
@@ -1009,6 +1016,9 @@ pub(crate) fn project_device_list_response(
         let mut phash = device_list.hash.map(|hash| hash.to_string());
         let has_companion = parsed_devices.iter().any(|device| device.device != 0);
         if has_companion && key_index_bytes.is_none() {
+            if require_complete {
+                anyhow::bail!("device-list response has unvalidated companions for {user_jid}");
+            }
             parsed_devices.retain(|device| device.device == 0);
             if parsed_devices.is_empty() {
                 warn!(
@@ -1066,7 +1076,7 @@ impl IqSpec for CompleteDeviceListSpec {
     }
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
-        let parsed = self.0.parse_response(response)?;
+        let parsed = project_device_list_response_checked(parse_usync_response(response)?, true)?;
         for expected in &self.0.jids {
             let Some(returned) = parsed.device_lists.iter().find(|returned| {
                 device_list_identity_matches(&returned.user, expected, &parsed.lid_mappings)
@@ -1960,6 +1970,11 @@ mod tests {
             "the server's hash describes the devices it sent, not the ones kept: \
              persisting it would let a later query call this truncated list current"
         );
+        let error = spec
+            .require_complete_response()
+            .parse_response(&response.as_node_ref())
+            .expect_err("a successful response must not hide an unvalidated companion");
+        assert!(error.to_string().contains("unvalidated companions"));
     }
 
     /// The degradation above has a floor: a device list that does not even carry

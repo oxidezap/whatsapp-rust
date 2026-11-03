@@ -10,7 +10,8 @@ use portable_atomic::{AtomicBool, AtomicU64, Ordering};
 use rand::RngExt;
 
 use crate::libsignal::protocol::{
-    ProtocolAddress, SenderKeyRecord, SessionCheckoutKey, SessionCheckoutStoreResult, SessionRecord,
+    IdentityChange, IdentityKey, ProtocolAddress, PublicKey, SenderKeyRecord, SessionCheckoutKey,
+    SessionCheckoutStoreResult, SessionRecord, SignalProtocolError,
 };
 use crate::libsignal::store::sender_key_name::SenderKeyName;
 use crate::store::traits::SignalStore;
@@ -1669,6 +1670,69 @@ impl SignalStoreCache {
     }
 
     // === Identities ===
+
+    fn save_identity_locked(
+        &self,
+        state: &mut ByteStoreState,
+        address: &ProtocolAddress,
+        identity: &IdentityKey,
+    ) -> std::result::Result<IdentityChange, SignalProtocolError> {
+        let previous = state.cache.get(address.as_str()).and_then(Option::as_deref);
+        let change = match previous.filter(|bytes| !bytes.is_empty()) {
+            None => IdentityChange::NewOrUnchanged,
+            Some(bytes) => {
+                let previous = IdentityKey::new(PublicKey::from_djb_public_key_bytes(bytes)?);
+                if previous == *identity {
+                    IdentityChange::NewOrUnchanged
+                } else {
+                    IdentityChange::ReplacedExistingWithKeys {
+                        previous,
+                        current: *identity,
+                    }
+                }
+            }
+        };
+        let data = identity.public_key().public_key_bytes();
+        let _change = self.identity_write_change(state, address, data);
+        state.put_dedup(address.as_str(), data);
+        state.evict_if_needed(self.max_entries);
+        Ok(change)
+    }
+
+    /// Compare and replace under the same lock, including the reported old key.
+    /// A cold lookup or contention leaves the cache untouched for the async path.
+    pub fn try_save_identity(
+        &self,
+        address: &ProtocolAddress,
+        identity: &IdentityKey,
+    ) -> Option<std::result::Result<IdentityChange, SignalProtocolError>> {
+        let mut state = self.identities.try_lock()?;
+        state.cache.get(address.as_str())?;
+        Some(self.save_identity_locked(&mut state, address, identity))
+    }
+
+    /// The cold read shares the replacement lock, so another saver cannot
+    /// publish a key between the comparison and the write.
+    pub async fn save_identity(
+        &self,
+        address: &ProtocolAddress,
+        identity: &IdentityKey,
+        backend: &dyn SignalStore,
+    ) -> std::result::Result<IdentityChange, SignalProtocolError> {
+        let mut state = self.identities.lock().await;
+        if state.cache.get(address.as_str()).is_none() {
+            let previous = backend
+                .load_identity(address.as_str())
+                .await
+                .map_err(|error| {
+                    SignalProtocolError::BackendError("backend get_identity", Box::new(error))
+                })?;
+            state
+                .cache
+                .insert(Arc::from(address.as_str()), previous.map(Arc::from));
+        }
+        self.save_identity_locked(&mut state, address, identity)
+    }
 
     pub async fn get_identity(
         &self,

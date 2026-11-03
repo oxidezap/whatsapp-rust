@@ -80,7 +80,9 @@ fn identifier(version: SecurityCodeVersion, jid: &Jid) -> Result<String, Securit
                     &user[..n],
                     &user[user.len() - (user.len() - n).min(6)..]
                 ),
-                None => jid.to_non_ad().to_string(),
+                // WAWebWid normalizes s.whatsapp.net to c.us before p()'s
+                // full-Wid fallback. Rust JIDs retain the wire domain.
+                None => format!("{user}@c.us"),
             })
         }
         _ => Err(SecurityCodeError::InvalidIdentifier),
@@ -148,6 +150,12 @@ mod tests {
                 Jid::lid("100000000000002"),
                 "158788750905376650263214847873716600833018264479947487142264",
             ),
+            (
+                SecurityCodeVersion::V3,
+                Jid::pn("99999"),
+                Jid::pn("88888"),
+                "226217473565740873258669996370854715234157686617816285659630",
+            ),
         ] {
             assert_eq!(
                 numeric_security_code(version, &local, &[key(2), key(1)], &remote, &[key(3)])
@@ -214,7 +222,8 @@ mod tests {
             ("442079460001", "44460001"),
             ("9991234567", "999234567"),
             ("12345", "12345"),
-            ("1234", "1234@s.whatsapp.net"),
+            ("1234", "1234@c.us"),
+            ("99999", "99999@c.us"),
         ] {
             assert_eq!(
                 identifier(SecurityCodeVersion::V3, &Jid::pn(input)).unwrap(),
