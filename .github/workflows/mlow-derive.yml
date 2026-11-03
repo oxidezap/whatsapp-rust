@@ -13,7 +13,8 @@ permissions:
   contents: read
 
 jobs:
-  rederive:
+  tooling:
+    name: Oracle tooling checks
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -31,6 +32,7 @@ jobs:
           tool: protoc@3.25.3,cargo-nextest
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: rederive
           workspaces: . -> target
       - name: Lint oracle tooling
         run: cargo clippy --locked --release -p oracle-core -p oracle-cli -p whatsapp-oracle-task --all-targets -- -D warnings
@@ -38,6 +40,34 @@ jobs:
         run: cargo test --locked -p whatsapp-xtask -p xtask-support
       - name: Test oracle task utilities
         run: cargo test --release --locked -p whatsapp-oracle-task
+
+  rederive:
+    needs: tooling
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      # Preserve the existing required check when a prerequisite fails or skips.
+      - name: Require successful tooling checks
+        if: ${{ needs.tooling.result != 'success' }}
+        run: exit 1
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Record tested revision
+        run: git rev-parse HEAD
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@3.25.3,cargo-nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Reuse the tooling job's dependencies and the previous job's cache key.
+          shared-key: rederive
+          workspaces: . -> target
       - name: Run complete VoIP conformance gate with slow signaling
         run: cargo xt oracle conformance --slow
       - uses: actions/upload-artifact@v7
