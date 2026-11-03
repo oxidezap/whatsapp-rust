@@ -3,6 +3,86 @@ use std::sync::Arc;
 use crate::Client;
 use wacore_binary::{Jid, Node, OwnedNodeRef};
 
+pub(crate) mod crypto {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use wacore::libsignal::crypto::{
+        CryptoProviderError, RustCryptoProvider, SymmetricCryptoProvider,
+    };
+
+    #[derive(Default)]
+    pub(crate) struct CountingCrypto {
+        pub encrypts: AtomicUsize,
+        pub decrypts: AtomicUsize,
+        pub macs: AtomicUsize,
+        pub fail_encrypt: AtomicBool,
+        pub fail_mac: AtomicBool,
+    }
+    impl SymmetricCryptoProvider for CountingCrypto {
+        fn aes_256_cbc_encrypt(
+            &self,
+            key: &[u8; 32],
+            iv: &[u8; 16],
+            plaintext: &[u8],
+            out: &mut Vec<u8>,
+        ) -> Result<(), CryptoProviderError> {
+            self.encrypts.fetch_add(1, Ordering::Relaxed);
+            if self.fail_encrypt.load(Ordering::Relaxed) {
+                return Err(CryptoProviderError::BackendFailed);
+            }
+            RustCryptoProvider.aes_256_cbc_encrypt(key, iv, plaintext, out)
+        }
+        fn aes_256_cbc_decrypt(
+            &self,
+            key: &[u8; 32],
+            iv: &[u8; 16],
+            ciphertext: &[u8],
+            out: &mut Vec<u8>,
+        ) -> Result<(), CryptoProviderError> {
+            self.decrypts.fetch_add(1, Ordering::Relaxed);
+            RustCryptoProvider.aes_256_cbc_decrypt(key, iv, ciphertext, out)
+        }
+        fn aes_256_cbc_decrypt_in_place(
+            &self,
+            key: &[u8; 32],
+            iv: &[u8; 16],
+            buffer: &mut Vec<u8>,
+        ) -> Result<(), CryptoProviderError> {
+            self.decrypts.fetch_add(1, Ordering::Relaxed);
+            RustCryptoProvider.aes_256_cbc_decrypt_in_place(key, iv, buffer)
+        }
+        fn hmac_sha256(
+            &self,
+            key: &[u8],
+            parts: &[&[u8]],
+        ) -> Result<[u8; 32], CryptoProviderError> {
+            self.macs.fetch_add(1, Ordering::Relaxed);
+            if self.fail_mac.load(Ordering::Relaxed) {
+                return Err(CryptoProviderError::BackendFailed);
+            }
+            RustCryptoProvider.hmac_sha256(key, parts)
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn default_backend_authenticates_borrowed_chunks_without_payload_copies() {
+        struct AesBackend;
+        impl SymmetricCryptoProvider for AesBackend {}
+        let first = vec![3; 8192];
+        let second = vec![4; 65536];
+        let expected = wacore::libsignal::crypto::hmac_sha256_two_part(b"key", &first, &second);
+        let provider: &dyn SymmetricCryptoProvider = &AesBackend;
+        let (heap, actual) = crate::test_alloc::heap_sample(|| {
+            provider.hmac_sha256(b"key", &[&first, &[], &second])
+        });
+        assert_eq!(actual.unwrap(), expected);
+        assert_eq!(
+            heap.allocations, 0,
+            "multipart authentication must not concatenate the payload"
+        );
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn adv_test_account() -> &'static wacore::libsignal::protocol::KeyPair {
     static KEY: std::sync::OnceLock<wacore::libsignal::protocol::KeyPair> =

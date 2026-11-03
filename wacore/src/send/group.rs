@@ -1,6 +1,7 @@
 //! Group stanza preparation, phash/stale-device helpers and sender-key distribution.
 
 use super::*;
+use anyhow::Context as _;
 
 /// Retain devices that may receive a sender-key distribution. Reuses the
 /// caller's allocation and centralizes the exact-sender/hosted exclusions used
@@ -515,13 +516,26 @@ pub async fn prepare_group_stanza(
     // it (avoids head-of-line blocking a concurrent DM to a shared device).
     drop(session_guard);
 
-    let skmsg = encrypt_group_message(
-        stores.sender_key_store,
-        &sender_key_name,
-        &plaintext,
-        &mut rand::make_rng::<rand::rngs::StdRng>(),
-    )
-    .await?;
+    let crypto_provider = runtime.crypto_provider();
+    let skmsg = if let Some(provider) = crypto_provider {
+        crate::libsignal::protocol::group_encrypt_with_provider(
+            &*provider,
+            stores.sender_key_store,
+            &sender_key_name,
+            &plaintext,
+            &mut rand::make_rng::<rand::rngs::StdRng>(),
+        )
+        .await
+        .context("group encrypt failed")?
+    } else {
+        encrypt_group_message(
+            stores.sender_key_store,
+            &sender_key_name,
+            &plaintext,
+            &mut rand::make_rng::<rand::rngs::StdRng>(),
+        )
+        .await?
+    };
 
     // Release before the chain-independent stanza build.
     drop(chain_guard);

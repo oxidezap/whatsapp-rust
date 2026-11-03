@@ -2,6 +2,8 @@
 mod clocked;
 #[cfg(feature = "instance-clock")]
 pub use clocked::ClockedRuntime;
+mod crypto;
+pub use crypto::CryptoRuntime;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -18,6 +20,14 @@ use crate::sync_marker::{MaybeSend, MaybeSendSync};
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 pub trait Runtime: MaybeSendSync + 'static {
+    /// Optional caller-owned symmetric crypto backend. The default uses Rust.
+    /// Decorators must forward this port, just like the instance clock.
+    fn crypto_provider(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::libsignal::crypto::SymmetricCryptoProvider>> {
+        None
+    }
+
     /// An instance clock with a fixed domain for this runtime's lifetime.
     /// `None` preserves the existing process-wide providers.
     /// Decorators must forward this port to preserve the wrapped clock and its timers.
@@ -69,6 +79,14 @@ pub trait Runtime: MaybeSendSync + 'static {
 #[cfg(target_arch = "wasm32")]
 #[async_trait(?Send)]
 pub trait Runtime: MaybeSendSync + 'static {
+    /// Optional caller-owned symmetric crypto backend. The default uses Rust.
+    /// Decorators must forward this port, just like the instance clock.
+    fn crypto_provider(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::libsignal::crypto::SymmetricCryptoProvider>> {
+        None
+    }
+
     /// An instance clock with a fixed domain for this runtime's lifetime.
     /// `None` preserves the existing process-wide providers.
     /// Decorators must forward this port to preserve the wrapped clock and its timers.

@@ -303,8 +303,21 @@ async fn encrypt_one_device(
     session_store: &mut dyn crate::libsignal::protocol::SessionStore,
     identity_store: &mut dyn crate::libsignal::protocol::IdentityKeyStore,
     device_jid: Jid,
+    crypto_provider: Option<std::sync::Arc<dyn crate::libsignal::crypto::SymmetricCryptoProvider>>,
 ) -> (Jid, Result<Option<EncryptOneResult>>) {
-    match message_encrypt(plaintext, addr, session_store, identity_store).await {
+    let encrypted = if let Some(provider) = crypto_provider {
+        crate::libsignal::protocol::message_encrypt_with_provider(
+            &*provider,
+            plaintext,
+            addr,
+            session_store,
+            identity_store,
+        )
+        .await
+    } else {
+        message_encrypt(plaintext, addr, session_store, identity_store).await
+    };
+    match encrypted {
         Ok(encrypted_payload) => {
             let Some((enc_type, is_prekey, serialized_bytes)) =
                 extract_ciphertext(encrypted_payload)
@@ -1283,6 +1296,7 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
                 &mut *stores.session_store,
                 &mut *stores.identity_store,
                 device.clone(),
+                runtime.crypto_provider(),
             )
             .await;
             push_raw_result(
@@ -1328,6 +1342,7 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
             // clone_box shares the Arc-backed backend, so the sequential ratchet
             // advances persist despite one clone serving the whole chunk.
             let mut session_store = stores.session_store.clone_box();
+            let crypto_provider = runtime.crypto_provider();
             let mut identity_store = stores.identity_store.clone_box();
 
             // The chunk's countable size rides along so a chunk that never
@@ -1349,6 +1364,7 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
                             &mut *session_store,
                             &mut *identity_store,
                             device_jid,
+                            crypto_provider.clone(),
                         )
                         .await,
                     );

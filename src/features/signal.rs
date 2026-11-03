@@ -215,13 +215,25 @@ impl<'a> Signal<'a> {
         let lock = self.client.session_lock_for(address.as_str()).await;
         let _guard = lock.lock().await;
         let mut adapter = self.client.signal_adapter();
-        Ok(message_encrypt(
-            plaintext,
-            &address,
-            &mut adapter.session_store,
-            &mut adapter.identity_store,
-        )
-        .await?)
+        let encrypted = if let Some(provider) = self.client.runtime.crypto_provider() {
+            wacore::libsignal::protocol::message_encrypt_with_provider(
+                &*provider,
+                plaintext,
+                &address,
+                &mut adapter.session_store,
+                &mut adapter.identity_store,
+            )
+            .await?
+        } else {
+            message_encrypt(
+                plaintext,
+                &address,
+                &mut adapter.session_store,
+                &mut adapter.identity_store,
+            )
+            .await?
+        };
+        Ok(encrypted)
     }
 
     async fn decrypt_pairwise_at(
@@ -234,17 +246,32 @@ impl<'a> Signal<'a> {
         let _guard = lock.lock().await;
         let mut adapter = self.client.signal_adapter();
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-        let decrypted = message_decrypt(
-            parsed,
-            &address,
-            &mut adapter.session_store,
-            &mut adapter.identity_store,
-            &mut adapter.pre_key_store,
-            &adapter.signed_pre_key_store,
-            &mut rng,
-            UsePQRatchet::No,
-        )
-        .await?;
+        let decrypted = if let Some(provider) = self.client.runtime.crypto_provider() {
+            wacore::libsignal::protocol::message_decrypt_with_provider(
+                &*provider,
+                parsed,
+                &address,
+                &mut adapter.session_store,
+                &mut adapter.identity_store,
+                &mut adapter.pre_key_store,
+                &adapter.signed_pre_key_store,
+                &mut rng,
+                UsePQRatchet::No,
+            )
+            .await?
+        } else {
+            message_decrypt(
+                parsed,
+                &address,
+                &mut adapter.session_store,
+                &mut adapter.identity_store,
+                &mut adapter.pre_key_store,
+                &adapter.signed_pre_key_store,
+                &mut rng,
+                UsePQRatchet::No,
+            )
+            .await?
+        };
 
         // A pkmsg consumed prekey is reported, not deleted by the decrypt;
         // buffer it so the caller's flush removes it atomically with the
@@ -579,11 +606,21 @@ impl<'a> Signal<'a> {
             None
         };
 
-        let ciphertext = wacore::session_engine::publication::PreparedSignal::new(
+        let encrypted = if let Some(provider) = self.client.runtime.crypto_provider() {
+            wacore::libsignal::protocol::group_encrypt_with_provider(
+                &*provider,
+                &mut store,
+                &sender_key_name,
+                plaintext,
+                &mut rng,
+            )
+            .await?
+        } else {
             wacore::send::encrypt_group_message(&mut store, &sender_key_name, plaintext, &mut rng)
-                .await?,
-        )
-        .begin_commit();
+                .await?
+        };
+        let ciphertext =
+            wacore::session_engine::publication::PreparedSignal::new(encrypted).begin_commit();
 
         // The durability gate can need the processing permit, whose holder may
         // need this chain lock.
@@ -620,9 +657,18 @@ impl<'a> Signal<'a> {
         let chain_lock = store.sender_key_lock(&sender_key_name).await;
         let _chain_guard = chain_lock.lock().await;
 
-        let plaintext =
+        let plaintext = if let Some(provider) = self.client.runtime.crypto_provider() {
+            wacore::libsignal::protocol::group_decrypt_shared_with_provider(
+                &*provider,
+                bytes::Bytes::copy_from_slice(ciphertext),
+                &mut store,
+                &sender_key_name,
+            )
+            .await?
+        } else {
             wacore::libsignal::protocol::group_decrypt(ciphertext, &mut store, &sender_key_name)
-                .await?;
+                .await?
+        };
 
         drop(_chain_guard);
         self.client.flush_signal_cache_batch_safe().await?;
@@ -945,6 +991,160 @@ mod tests {
             )))
             .await;
         (client, backend)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn explicit_crypto_provider_executes_signal_callbacks_and_rolls_back_failures() {
+        use crate::test_utils::{create_test_client_with_runtime, crypto::CountingCrypto};
+        use wacore::libsignal::protocol::SessionStore;
+        use wacore::runtime::CryptoRuntime;
+        let first = Arc::new(CountingCrypto::default());
+        let second = Arc::new(CountingCrypto::default());
+        let alice = create_test_client_with_runtime(
+            "crypto-alice",
+            Arc::new(CryptoRuntime::new(
+                Arc::new(crate::TokioRuntime),
+                first.clone(),
+            )),
+        )
+        .await;
+        let bob = create_test_client_with_runtime(
+            "crypto-bob",
+            Arc::new(CryptoRuntime::new(
+                Arc::new(crate::TokioRuntime),
+                second.clone(),
+            )),
+        )
+        .await;
+        let alice_jid = Jid::new("15550003001", Server::Pn);
+        for (client, jid) in [
+            (&alice, alice_jid.clone()),
+            (&bob, Jid::new("15550003002", Server::Pn)),
+        ] {
+            client
+                .persistence_manager
+                .process_command(crate::store::commands::DeviceCommand::SetId(Some(jid)))
+                .await;
+        }
+        let peer = Jid::pn_device("15550003003", 1);
+        seed_peer_session(&alice, &peer).await;
+        alice
+            .signal()
+            .encrypt_message(&peer, &vec![7; 4096])
+            .await
+            .unwrap();
+        assert_eq!(first.encrypts.load(Ordering::Relaxed), 1);
+        assert!(first.macs.load(Ordering::Relaxed) > 0);
+        assert_eq!(second.encrypts.load(Ordering::Relaxed), 0);
+        let address = peer.to_protocol_address();
+        let before = alice
+            .signal_adapter()
+            .session_store
+            .load_session(&address)
+            .await
+            .unwrap()
+            .unwrap()
+            .serialize()
+            .unwrap();
+        first.fail_encrypt.store(true, Ordering::Relaxed);
+        assert!(
+            alice
+                .signal()
+                .encrypt_message(&peer, b"failed callback")
+                .await
+                .is_err()
+        );
+        let after = alice
+            .signal_adapter()
+            .session_store
+            .load_session(&address)
+            .await
+            .unwrap()
+            .unwrap()
+            .serialize()
+            .unwrap();
+        assert_eq!(before, after);
+        first.fail_encrypt.store(false, Ordering::Relaxed);
+        first.fail_mac.store(true, Ordering::Relaxed);
+        assert!(
+            alice
+                .signal()
+                .encrypt_message(&peer, b"failed MAC callback")
+                .await
+                .is_err()
+        );
+        let after = alice
+            .signal_adapter()
+            .session_store
+            .load_session(&address)
+            .await
+            .unwrap()
+            .unwrap()
+            .serialize()
+            .unwrap();
+        assert_eq!(before, after);
+        first.fail_mac.store(false, Ordering::Relaxed);
+        // Exercise checkout cancellation when the failed operation would have
+        // extended the durable reservation, not just a lease-covered index.
+        for _ in 1..wacore::libsignal::protocol::consts::SENDER_CHAIN_RESERVATION_BATCH {
+            alice
+                .signal()
+                .encrypt_message(&peer, b"advance to lease boundary")
+                .await
+                .unwrap();
+        }
+        let before_boundary = alice
+            .signal_adapter()
+            .session_store
+            .load_session(&address)
+            .await
+            .unwrap()
+            .unwrap()
+            .serialize()
+            .unwrap();
+        first.fail_mac.store(true, Ordering::Relaxed);
+        assert!(
+            alice
+                .signal()
+                .encrypt_message(&peer, b"failed reservation extension")
+                .await
+                .is_err()
+        );
+        let after_boundary = alice
+            .signal_adapter()
+            .session_store
+            .load_session(&address)
+            .await
+            .unwrap()
+            .unwrap()
+            .serialize()
+            .unwrap();
+        assert_eq!(before_boundary, after_boundary);
+        first.fail_mac.store(false, Ordering::Relaxed);
+        let group = Jid::new("120363000000000003", Server::Group);
+        let plaintext = vec![9; 4096];
+        let (distribution, ciphertext) = alice
+            .signal()
+            .encrypt_group_message(&group, &plaintext)
+            .await
+            .unwrap();
+        bob.signal()
+            .process_sender_key_distribution(&group, &alice_jid, &distribution.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            bob.signal()
+                .decrypt_group_message(&group, &alice_jid, &ciphertext)
+                .await
+                .unwrap(),
+            plaintext
+        );
+        assert_eq!(second.decrypts.load(Ordering::Relaxed), 1);
+        assert!(second.macs.load(Ordering::Relaxed) > 0);
+        assert_eq!(second.encrypts.load(Ordering::Relaxed), 0);
+        alice.signal_shutdown_sync();
+        bob.signal_shutdown_sync();
     }
 
     #[tokio::test]

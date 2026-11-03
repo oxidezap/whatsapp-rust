@@ -85,9 +85,38 @@ async fn decrypt_session_message(
     signal_address: &wacore::libsignal::protocol::ProtocolAddress,
     adapter: &mut crate::store::signal_adapter::SignalProtocolStoreAdapter,
     rng: &mut LazyStdRng,
+    crypto_provider: Option<Arc<dyn wacore::libsignal::crypto::SymmetricCryptoProvider>>,
 ) -> Result<DecryptionResult, SignalProtocolError> {
-    match message {
-        ParsedSessionMessage::Retained(message) => {
+    match (message, crypto_provider.as_deref()) {
+        (ParsedSessionMessage::Retained(message), Some(provider)) => {
+            wacore::libsignal::protocol::message_decrypt_with_provider(
+                provider,
+                message,
+                signal_address,
+                &mut adapter.session_store,
+                &mut adapter.identity_store,
+                &mut adapter.pre_key_store,
+                &adapter.signed_pre_key_store,
+                rng,
+                UsePQRatchet::No,
+            )
+            .await
+        }
+        (ParsedSessionMessage::Consumable(message), Some(provider)) => {
+            wacore::libsignal::protocol::message_decrypt_owned_with_provider(
+                provider,
+                message,
+                signal_address,
+                &mut adapter.session_store,
+                &mut adapter.identity_store,
+                &mut adapter.pre_key_store,
+                &adapter.signed_pre_key_store,
+                rng,
+                UsePQRatchet::No,
+            )
+            .await
+        }
+        (ParsedSessionMessage::Retained(message), None) => {
             message_decrypt(
                 message,
                 signal_address,
@@ -100,7 +129,7 @@ async fn decrypt_session_message(
             )
             .await
         }
-        ParsedSessionMessage::Consumable(message) => {
+        (ParsedSessionMessage::Consumable(message), None) => {
             message_decrypt_owned(
                 message,
                 signal_address,
@@ -1269,6 +1298,7 @@ impl Client {
                     &signal_address,
                     &mut adapter,
                     &mut rng,
+                    self.runtime.crypto_provider(),
                 );
                 #[cfg(feature = "tracing")]
                 let decrypt_res = tracing::Instrument::instrument(
@@ -1416,6 +1446,7 @@ impl Client {
                             &signal_address,
                             &mut adapter,
                             &mut rng,
+                            self.runtime.crypto_provider(),
                         )
                         .await;
 
@@ -1936,12 +1967,22 @@ impl Client {
                 let _chain_guard = chain_lock.lock().await;
                 // A refcount bump: the skmsg stays a slice of the frame buffer
                 // through parsing rather than being copied per message.
-                group_decrypt_shared(
-                    payload.ciphertext.clone(),
-                    &mut adapter.sender_key_store,
-                    &sender_key_name,
-                )
-                .await
+                if let Some(provider) = self.runtime.crypto_provider() {
+                    wacore::libsignal::protocol::group_decrypt_shared_with_provider(
+                        &*provider,
+                        payload.ciphertext.clone(),
+                        &mut adapter.sender_key_store,
+                        &sender_key_name,
+                    )
+                    .await
+                } else {
+                    group_decrypt_shared(
+                        payload.ciphertext.clone(),
+                        &mut adapter.sender_key_store,
+                        &sender_key_name,
+                    )
+                    .await
+                }
             };
 
             match decrypt_result {
@@ -2699,7 +2740,15 @@ impl Client {
             return MigrationDecryptResult::NotDecrypted(None);
         }
 
-        match decrypt_session_message(parsed_message, signal_address, adapter, rng).await {
+        match decrypt_session_message(
+            parsed_message,
+            signal_address,
+            adapter,
+            rng,
+            self.runtime.crypto_provider(),
+        )
+        .await
+        {
             // PN→LID migration re-addresses an existing peer; the LID address gets
             // the identity for the first time (NewOrUnchanged), so no local
             // identity-change reaction is warranted here.
