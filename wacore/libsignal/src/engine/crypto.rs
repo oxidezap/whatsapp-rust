@@ -19,7 +19,7 @@ pub trait CryptoProvider {
     ) -> Result<[u8; 64]>;
     fn verify(&self, public: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> Result<()>;
     fn sha256(&self, data: &[u8]) -> [u8; 32];
-    fn hmac_sha256(&self, key: &[u8], data: &[u8]) -> [u8; 32];
+    fn hmac_sha256(&self, key: &[u8], parts: &[&[u8]]) -> Result<[u8; 32]>;
     fn hkdf_sha256(&self, salt: &[u8], input: &[u8], info: &[u8], output: &mut [u8]) -> Result<()>;
     fn encrypt_cbc(&self, key: &[u8; 32], iv: &[u8; 16], plaintext: &[u8]) -> Result<Vec<u8>>;
     fn decrypt_cbc(&self, key: &[u8; 32], iv: &[u8; 16], ciphertext: &[u8]) -> Result<Vec<u8>>;

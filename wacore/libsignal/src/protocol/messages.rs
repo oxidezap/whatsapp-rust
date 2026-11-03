@@ -72,7 +72,8 @@ impl SignalMessage {
         authenticated.extend_from_slice(&sender.serialize());
         authenticated.extend_from_slice(&receiver.serialize());
         authenticated.extend_from_slice(&unsigned);
-        unsigned.extend_from_slice(&engine::RustCrypto.hmac_sha256(mac_key, &authenticated)[..8]);
+        unsigned
+            .extend_from_slice(&engine::RustCrypto.hmac_sha256_array(mac_key, &authenticated)[..8]);
         Self::try_from(Bytes::from(unsigned))
     }
     pub fn serialized(&self) -> &[u8] {
@@ -471,7 +472,7 @@ mod borrowed_tests {
             authenticated.extend_from_slice(&signal.serialized()[..signal.serialized().len() - 8]);
             assert_eq!(
                 &signal.serialized()[signal.serialized().len() - 8..],
-                &engine::RustCrypto.hmac_sha256(&[7; 32], &authenticated)[..8]
+                &engine::RustCrypto.hmac_sha256_array(&[7; 32], &authenticated)[..8]
             );
             let prekey =
                 PreKeySignalMessage::new(version, 5, None, 7.into(), public, identity, signal)

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 use super::error::Result;
 use super::*;
-use crate::engine::{self as engine, CryptoProvider};
+use crate::engine;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
@@ -51,13 +51,13 @@ impl ChainKey {
             .checked_add(1)
             .ok_or(engine::Error::CounterExhausted)?;
         Ok(Self {
-            key: engine::RustCrypto.hmac_sha256(&self.key, &[2]),
+            key: engine::RustCrypto.hmac_sha256_array(&self.key, &[2]),
             index,
         })
     }
     pub fn message_keys(&self) -> MessageKeyGenerator {
         MessageKeyGenerator {
-            seed: engine::RustCrypto.hmac_sha256(&self.key, &[1]),
+            seed: engine::RustCrypto.hmac_sha256_array(&self.key, &[1]),
             counter: self.index,
         }
     }
@@ -508,7 +508,7 @@ impl SessionRecord {
                 state.inner.sender = None;
             } else {
                 while sender.index < ceiling {
-                    sender.key = engine::RustCrypto.hmac_sha256(&sender.key, &[2]);
+                    sender.key = engine::RustCrypto.hmac_sha256_array(&sender.key, &[2]);
                     sender.index += 1;
                 }
             }
@@ -733,7 +733,7 @@ impl SenderKeyRecord {
                 );
             }
             while state.iteration < ceiling {
-                state.chain_key = engine::RustCrypto.hmac_sha256(&state.chain_key, &[2]);
+                state.chain_key = engine::RustCrypto.hmac_sha256_array(&state.chain_key, &[2]);
                 state.iteration += 1;
             }
         }
@@ -907,7 +907,7 @@ impl SenderChainKey {
         &self.seed
     }
     pub fn sender_message_key(&self) -> SenderMessageKey {
-        let seed = Zeroizing::new(engine::RustCrypto.hmac_sha256(&self.seed, &[1]));
+        let seed = Zeroizing::new(engine::RustCrypto.hmac_sha256_array(&self.seed, &[1]));
         let mut expanded = Zeroizing::new([0; 48]);
         hkdf::Hkdf::<sha2::Sha256>::new(None, seed.as_ref())
             .expand(b"WhisperGroup", expanded.as_mut())

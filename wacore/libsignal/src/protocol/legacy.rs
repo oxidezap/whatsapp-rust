@@ -2354,8 +2354,9 @@ mod tests {
         let seed = crate::engine::CryptoProvider::hmac_sha256(
             &crate::engine::RustCrypto,
             chain.key(),
-            &[1],
-        );
+            &[&[1]],
+        )
+        .unwrap();
         let message_key = MessageKeyGenerator::new_from_seed(&seed, chain.index());
         let next_chain = chain.next_chain_key().expect("counter has room");
         let generated = message_key.generate_keys();

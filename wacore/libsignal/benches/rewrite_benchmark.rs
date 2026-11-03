@@ -250,9 +250,9 @@ fn receive_fixture(
     for index in 0..backlog as u32 {
         receiver_state.skipped.push_back(new::SenderMessageKey {
             iteration: index,
-            seed: RustCrypto.hmac_sha256(&state.chain_key, &[1]),
+            seed: RustCrypto.hmac_sha256(&state.chain_key, &[&[1]]).unwrap(),
         });
-        state.chain_key = RustCrypto.hmac_sha256(&state.chain_key, &[2]);
+        state.chain_key = RustCrypto.hmac_sha256(&state.chain_key, &[&[2]]).unwrap();
     }
     state.iteration = backlog as u32;
     receiver_state.iteration = state.iteration;

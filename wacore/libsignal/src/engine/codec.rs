@@ -351,7 +351,7 @@ fn decode_sender_key_record_inner<C: CryptoProvider>(
             return Err(Error::Encoding("sender reservation burn exceeds limit"));
         }
         while state.iteration < ceiling {
-            state.chain_key = crypto.hmac_sha256(&state.chain_key, &[2]);
+            state.chain_key = crypto.hmac_sha256(&state.chain_key, &[&[2]])?;
             state.iteration = state
                 .iteration
                 .checked_add(1)

@@ -3,7 +3,7 @@
 use crate::engine::{
     CryptoProvider, Engine, Error, RandomSource, Result,
     state::*,
-    wire::{SenderKeyDistribution, SenderKeyMessage, SenderKeyMessageView},
+    wire::{self, SenderKeyDistribution, SenderKeyMessage, SenderKeyMessageView},
 };
 use zeroize::Zeroize;
 impl SenderKeyState {
@@ -12,12 +12,12 @@ impl SenderKeyState {
             .iteration
             .checked_add(1)
             .ok_or(Error::CounterExhausted)?;
-        let seed = crypto.hmac_sha256(&self.chain_key, &[1]);
+        let seed = crypto.hmac_sha256(&self.chain_key, &[&[1]])?;
         let key = SenderMessageKey {
             iteration: self.iteration,
             seed,
         };
-        self.chain_key = crypto.hmac_sha256(&self.chain_key, &[2]);
+        self.chain_key = crypto.hmac_sha256(&self.chain_key, &[&[2]])?;
         self.iteration = next;
         Ok(key)
     }
@@ -139,8 +139,13 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         message.signature = self
             .crypto
             .sign(&private, &message.unsigned(), self.random)?;
+        let output = message.encode();
+        // Match the decoder budget: exclude the version byte and signature.
+        if output.len() - 65 > wire::MAX_MESSAGE_SIZE {
+            return Err(Error::Encoding("protobuf size limit"));
+        }
         record.states[0] = state;
-        Ok(message.encode())
+        Ok(output)
     }
     pub fn decrypt_sender_key(
         &mut self,

@@ -2,7 +2,7 @@ use crate::error::{NoiseError, Result};
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use wacore_libsignal::crypto::{
-    GcmInPlaceBuffer, RustCryptoProvider, SignalCryptoProvider, TransportAead, aes_256_gcm_decrypt,
+    GcmInPlaceBuffer, RustCryptoProvider, TransportAead, TransportAeadFactory, aes_256_gcm_decrypt,
     aes_256_gcm_encrypt,
 };
 
@@ -38,7 +38,7 @@ impl NoiseCipher {
 
     /// Prepare a cipher with a caller-selected provider, without process-wide
     /// mutable configuration. The returned AEAD owns its key material.
-    pub fn with_provider(key: &[u8; 32], provider: &dyn SignalCryptoProvider) -> Result<Self> {
+    pub fn with_provider(key: &[u8; 32], provider: &dyn TransportAeadFactory) -> Result<Self> {
         Ok(Self {
             aead: provider.transport_aead(key).map_err(NoiseError::Encrypt)?,
         })

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use wacore::libsignal::crypto::{
-    CryptoProviderError, GcmInPlaceBuffer, SignalCryptoProvider, TransportAead,
+    CryptoProviderError, GcmInPlaceBuffer, TransportAead, TransportAeadFactory,
 };
 
 /// Grows the buffer by one byte less than the GCM tag, so the frame body ends
@@ -42,7 +42,7 @@ impl TransportAead for ShortTagAead {
 /// Selects the deliberately broken transport AEAD for this socket only.
 struct ShortTagProvider;
 
-impl SignalCryptoProvider for ShortTagProvider {
+impl TransportAeadFactory for ShortTagProvider {
     fn transport_aead(
         &self,
         _key: &[u8; 32],

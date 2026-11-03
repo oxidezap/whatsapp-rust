@@ -5,14 +5,6 @@ use async_trait::async_trait;
 use portable_atomic::AtomicBool;
 use std::sync::Arc;
 
-#[cfg(not(target_arch = "wasm32"))]
-pub trait ThreadSafe: Send + Sync {}
-#[cfg(not(target_arch = "wasm32"))]
-impl<T: Send + Sync + ?Sized> ThreadSafe for T {}
-#[cfg(target_arch = "wasm32")]
-pub trait ThreadSafe {}
-#[cfg(target_arch = "wasm32")]
-impl<T: ?Sized> ThreadSafe for T {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SessionCheckoutKey {
     generation: u64,

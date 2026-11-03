@@ -180,8 +180,12 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         authenticated.extend_from_slice(&message.unsigned_with_version(session.version as u8));
         message
             .mac
-            .copy_from_slice(&self.crypto.hmac_sha256(&mac, &authenticated)[..8]);
+            .copy_from_slice(&self.crypto.hmac_sha256(&mac, &[&authenticated])?[..8]);
         let mut output = message.encode_with_version(session.version as u8);
+        // Match the decoder budget: exclude the version byte and trailing MAC.
+        if output.len() - 9 > wire::MAX_MESSAGE_SIZE {
+            return Err(Error::Encoding("protobuf size limit"));
+        }
         if let Some(pending) = &session.pending_pre_key {
             if pending.kyber_pre_key_id.is_some() || pending.kyber_ciphertext.is_some() {
                 return Err(Error::Version);
@@ -195,6 +199,9 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
                 message: output,
             }
             .encode_with_version(session.version as u8);
+            if output.len() - 1 > wire::MAX_MESSAGE_SIZE {
+                return Err(Error::Encoding("protobuf size limit"));
+            }
         }
         record.current.as_mut().ok_or(Error::MissingKey)?.sender = Some(sender);
         Ok(output)
@@ -267,7 +274,7 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         authenticated.extend_from_slice(&wire::tagged_key(&session.local_identity));
         authenticated.extend_from_slice(&input[..input.len() - 8]);
         authenticate(
-            &self.crypto.hmac_sha256(&mac, &authenticated)[..8],
+            &self.crypto.hmac_sha256(&mac, &[&authenticated])?[..8],
             &message.mac,
         )?;
         let plaintext = self.crypto.decrypt_cbc(&cipher, &iv, message.ciphertext)?;
@@ -378,7 +385,7 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         authenticated.extend_from_slice(&wire::tagged_key(&session.local_identity));
         authenticated.extend_from_slice(&input[..input.len() - 8]);
         authenticate(
-            &self.crypto.hmac_sha256(&mac, &authenticated)[..8],
+            &self.crypto.hmac_sha256(&mac, &[&authenticated])?[..8],
             &message.mac,
         )?;
         let plaintext = self.crypto.decrypt_cbc(&cipher, &iv, message.ciphertext)?;

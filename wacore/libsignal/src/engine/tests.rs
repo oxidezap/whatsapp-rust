@@ -1,5 +1,112 @@
 // SPDX-License-Identifier: MIT
 use crate::engine::{codec::*, wire::*, *};
+struct FailingMac {
+    calls: std::sync::atomic::AtomicUsize,
+    fail_at: usize,
+}
+impl crate::crypto::SymmetricCryptoProvider for FailingMac {
+    fn hmac_sha256(
+        &self,
+        key: &[u8],
+        parts: &[&[u8]],
+    ) -> std::result::Result<[u8; 32], crate::crypto::CryptoProviderError> {
+        let call = self
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if call == self.fail_at {
+            return Err(crate::crypto::CryptoProviderError::BackendFailed);
+        }
+        Ok(RustCrypto.hmac_sha256_parts_array(key, parts))
+    }
+}
+impl FailingMac {
+    fn new(fail_at: usize) -> Self {
+        Self {
+            calls: Default::default(),
+            fail_at,
+        }
+    }
+}
+#[test]
+fn mac_failures_leave_ciphertext_preparation_and_reservation_burn_unpublished() {
+    let mut random = Deterministic(501);
+    let (session, _, _) = peers(&mut Engine::new(&RustCrypto, &mut random), true);
+    for fail_at in 1..=3 {
+        let mut record = session.clone();
+        let before = encode_session_record(&record);
+        let provider = FailingMac::new(fail_at);
+        let crypto = crate::crypto::ProviderCrypto::new(&provider);
+        assert_eq!(
+            Engine::new(&crypto, &mut random).encrypt(&mut record, b"synthetic"),
+            Err(Error::Crypto)
+        );
+        assert_eq!(encode_session_record(&record), before, "MAC call {fail_at}");
+    }
+    for fail_at in [1, 17, 64] {
+        let mut record = session.clone();
+        let before = encode_session_record(&record);
+        let provider = FailingMac::new(fail_at);
+        let crypto = crate::crypto::ProviderCrypto::new(&provider);
+        assert_eq!(record.materialize_reservation(&crypto), Err(Error::Crypto));
+        assert_eq!(
+            encode_session_record(&record),
+            before,
+            "burn MAC call {fail_at}"
+        );
+        record.materialize_reservation(&RustCrypto).unwrap();
+        assert_eq!(
+            record
+                .current
+                .as_ref()
+                .unwrap()
+                .sender
+                .as_ref()
+                .unwrap()
+                .index,
+            64
+        );
+    }
+    let mut group = SenderKeyRecord::default();
+    Engine::new(&RustCrypto, &mut random)
+        .create_sender_distribution(&mut group)
+        .unwrap();
+    reserve_group(&mut group);
+    for fail_at in 1..=2 {
+        let mut record = group.clone();
+        let before = encode_sender_key_record(&record);
+        let provider = FailingMac::new(fail_at);
+        let crypto = crate::crypto::ProviderCrypto::new(&provider);
+        assert_eq!(
+            Engine::new(&crypto, &mut random).encrypt_sender_key(&mut record, b"synthetic"),
+            Err(Error::Crypto)
+        );
+        assert_eq!(encode_sender_key_record(&record), before);
+    }
+}
+#[test]
+fn oversized_ciphertexts_do_not_publish_pairwise_or_group_state() {
+    let mut random = Deterministic(502);
+    let (mut session, _, _) = peers(&mut Engine::new(&RustCrypto, &mut random), true);
+    let plaintext = vec![0; MAX_MESSAGE_SIZE];
+    let before = encode_session_record(&session);
+    assert_eq!(
+        Engine::new(&RustCrypto, &mut random).encrypt(&mut session, &plaintext),
+        Err(Error::Encoding("protobuf size limit"))
+    );
+    assert_eq!(encode_session_record(&session), before);
+    let mut group = SenderKeyRecord::default();
+    Engine::new(&RustCrypto, &mut random)
+        .create_sender_distribution(&mut group)
+        .unwrap();
+    reserve_group(&mut group);
+    let before = encode_sender_key_record(&group);
+    assert_eq!(
+        Engine::new(&RustCrypto, &mut random).encrypt_sender_key(&mut group, &plaintext),
+        Err(Error::Encoding("protobuf size limit"))
+    );
+    assert_eq!(encode_sender_key_record(&group), before);
+}
 struct Deterministic(u64);
 impl RandomSource for Deterministic {
     fn fill(&mut self, out: &mut [u8]) -> Result<()> {

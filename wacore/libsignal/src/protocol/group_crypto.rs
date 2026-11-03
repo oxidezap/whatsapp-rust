@@ -142,8 +142,8 @@ impl CryptoProvider for PreparedGroupProvider {
     fn sha256(&self, data: &[u8]) -> [u8; 32] {
         RustCrypto.sha256(data)
     }
-    fn hmac_sha256(&self, key: &[u8], data: &[u8]) -> [u8; 32] {
-        RustCrypto.hmac_sha256(key, data)
+    fn hmac_sha256(&self, key: &[u8], parts: &[&[u8]]) -> Result<[u8; 32]> {
+        Ok(RustCrypto.hmac_sha256_parts_array(key, parts))
     }
     fn hkdf_sha256(&self, salt: &[u8], input: &[u8], info: &[u8], output: &mut [u8]) -> Result<()> {
         RustCrypto.hkdf_sha256(salt, input, info, output)

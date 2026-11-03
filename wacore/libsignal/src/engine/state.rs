@@ -272,12 +272,12 @@ impl Chain {
             return Err(Error::MissingKey);
         }
         let next = self.index.checked_add(1).ok_or(Error::CounterExhausted)?;
-        let seed = crypto.hmac_sha256(&self.key, &[1]);
+        let seed = crypto.hmac_sha256(&self.key, &[&[1]])?;
         let message = MessageKey::Seed {
             index: self.index,
             seed,
         };
-        self.key = crypto.hmac_sha256(&self.key, &[2]);
+        self.key = crypto.hmac_sha256(&self.key, &[&[2]])?;
         self.index = next;
         Ok(message)
     }
@@ -303,24 +303,24 @@ impl Chain {
             return Err(Error::FutureMessage);
         }
         let next_index = index.checked_add(1).ok_or(Error::CounterExhausted)?;
-        let mut next_key = self.key;
+        let mut next_key = zeroize::Zeroizing::new(self.key);
         let mut skipped = Vec::with_capacity((index - self.index) as usize);
         for counter in self.index..index {
             skipped.push(MessageKey::Seed {
                 index: counter,
-                seed: crypto.hmac_sha256(&next_key, &[1]),
+                seed: crypto.hmac_sha256(&*next_key, &[&[1]])?,
             });
-            next_key = crypto.hmac_sha256(&next_key, &[2]);
+            *next_key = crypto.hmac_sha256(&*next_key, &[&[2]])?;
         }
         let message = MessageKey::Seed {
             index,
-            seed: crypto.hmac_sha256(&next_key, &[1]),
+            seed: crypto.hmac_sha256(&*next_key, &[&[1]])?,
         };
-        next_key = crypto.hmac_sha256(&next_key, &[2]);
+        *next_key = crypto.hmac_sha256(&*next_key, &[&[2]])?;
         Ok(ChainAdvance {
             message,
             consumed: None,
-            advanced: Some((next_index, next_key, skipped)),
+            advanced: Some((next_index, *next_key, skipped)),
         })
     }
     fn push_skipped(&mut self, key: MessageKey) {
@@ -492,10 +492,14 @@ impl SessionRecord {
         if target - chain.index > PEER_FUTURE_LIMIT {
             return Err(Error::Encoding("reservation burn exceeds limit"));
         }
-        while chain.index < target {
-            chain.key = crypto.hmac_sha256(&chain.key, &[2]);
-            chain.index += 1;
+        // A backend can fail partway through a reservation burn. Publish the
+        // chain position only after every derivation succeeds.
+        let mut key = zeroize::Zeroizing::new(chain.key);
+        for _ in chain.index..target {
+            *key = crypto.hmac_sha256(&*key, &[&[2]])?;
         }
+        chain.key = *key;
+        chain.index = target;
         Ok(())
     }
     pub fn install(&mut self, state: SessionState) {

@@ -3,6 +3,7 @@
 //! Pairwise versions 3 and 4 use the classical fields here; post-quantum fields
 //! remain unsupported.
 use crate::engine::{Error, Result};
+pub(crate) const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 #[derive(Clone, Copy)]
 pub(crate) enum Value<'a> {
     Varint(u64),
@@ -15,7 +16,7 @@ pub(crate) struct Fields<'a> {
 }
 impl<'a> Fields<'a> {
     pub fn new(bytes: &'a [u8]) -> Result<Self> {
-        if bytes.len() > 16 * 1024 * 1024 {
+        if bytes.len() > MAX_MESSAGE_SIZE {
             return Err(Error::Encoding("protobuf size limit"));
         }
         Ok(Self { bytes })

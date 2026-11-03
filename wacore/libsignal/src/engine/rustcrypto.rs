@@ -13,6 +13,20 @@ use zeroize::Zeroizing;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RustCrypto;
 
+impl RustCrypto {
+    pub(crate) fn hmac_sha256_array(&self, key: &[u8], data: &[u8]) -> [u8; 32] {
+        self.hmac_sha256_parts_array(key, &[data])
+    }
+    pub(crate) fn hmac_sha256_parts_array(&self, key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key)
+            .expect("HMAC accepts keys of any length");
+        for part in parts {
+            mac.update(part);
+        }
+        mac.finalize().into_bytes().into()
+    }
+}
+
 fn scalar_hash(hash: Sha512) -> Scalar {
     let digest = Zeroizing::new(<[u8; 64]>::from(hash.finalize()));
     Scalar::from_bytes_mod_order_wide(&digest)
@@ -103,12 +117,10 @@ impl CryptoProvider for RustCrypto {
     fn sha256(&self, data: &[u8]) -> [u8; 32] {
         Sha256::digest(data).into()
     }
-    fn hmac_sha256(&self, key: &[u8], data: &[u8]) -> [u8; 32] {
-        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key)
-            .expect("HMAC accepts keys of any length");
-        mac.update(data);
-        mac.finalize().into_bytes().into()
+    fn hmac_sha256(&self, key: &[u8], parts: &[&[u8]]) -> Result<[u8; 32]> {
+        Ok(RustCrypto::hmac_sha256_parts_array(self, key, parts))
     }
+
     fn hkdf_sha256(&self, salt: &[u8], input: &[u8], info: &[u8], output: &mut [u8]) -> Result<()> {
         hkdf::Hkdf::<Sha256>::new(Some(salt), input)
             .expand(info, output)
@@ -220,7 +232,7 @@ mod tests {
     #[test]
     fn rfc4231_hmac_and_sha256() {
         assert_eq!(
-            RustCrypto.hmac_sha256(&[11; 20], b"Hi There"),
+            RustCrypto.hmac_sha256_array(&[11; 20], b"Hi There"),
             hex("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")
         );
         assert_eq!(

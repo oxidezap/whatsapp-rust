@@ -898,7 +898,7 @@ fn handoff(state: &mut engine::SessionState, ceiling: u32) {
         return;
     }
     while chain.index < ceiling {
-        chain.key = engine::RustCrypto.hmac_sha256(&chain.key, &[2]);
+        chain.key = engine::RustCrypto.hmac_sha256_array(&chain.key, &[2]);
         chain.index += 1;
     }
 }
@@ -981,7 +981,7 @@ impl SenderKeyRecord {
                 state.signing_private = None;
             } else {
                 while state.iteration < ceiling {
-                    state.chain_key = engine::RustCrypto.hmac_sha256(&state.chain_key, &[2]);
+                    state.chain_key = engine::RustCrypto.hmac_sha256_array(&state.chain_key, &[2]);
                     state.iteration += 1;
                 }
             }
