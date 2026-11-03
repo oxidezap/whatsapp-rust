@@ -18,5 +18,8 @@ thiserror.workspace = true
 subtle.workspace = true
 zeroize.workspace = true
 
+[dev-dependencies]
+syn = { version = "3.0", features = ["full", "visit"] }
+
 [lints]
 workspace = true
