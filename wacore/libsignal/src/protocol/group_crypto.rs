@@ -74,13 +74,10 @@ impl GroupCryptoCache {
             .ok()
             .and_then(|key| PreparedVerifyingKey::new(&key).ok());
         let signing = if let Some(private) = private {
-            if RustCrypto.public_key(private)? == *public {
-                Some(PreparedSigningKey::new(
-                    &PrivateKey::deserialize(private).map_err(|_| Error::Crypto)?,
-                ))
-            } else {
-                None
-            }
+            PreparedSigningKey::new_matching(
+                &PrivateKey::deserialize(private).map_err(|_| Error::Crypto)?,
+                public,
+            )
         } else {
             None
         };
