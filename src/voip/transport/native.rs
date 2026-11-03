@@ -382,7 +382,7 @@ impl RelayStack {
         if let Some((_, assoc)) = self.assoc.as_mut() {
             assoc
                 .stream(MEDIA_STREAM_ID)
-                .and_then(|mut s| s.close())
+                .and_then(|mut s| s.close(now))
                 .map_err(|e| StackError::Failed(format!("close media stream: {e}")))?;
         }
         self.pump(now)
