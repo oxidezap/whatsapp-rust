@@ -41,6 +41,7 @@ waproto = { workspace = true }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
 
 [dev-dependencies]
+wacore-signal-engine = { path = "../signal-engine" }
 divan = { workspace = true }
 futures = { workspace = true, features = ["executor"] }
 

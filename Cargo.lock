@@ -4898,6 +4898,7 @@ dependencies = [
  "thiserror 2.0.21",
  "wacore-binary",
  "wacore-derive",
+ "wacore-signal-engine",
  "waproto",
  "x25519-dalek",
 ]
@@ -4918,6 +4919,21 @@ dependencies = [
  "wacore-binary",
  "wacore-libsignal",
  "waproto",
+]
+
+[[package]]
+name = "wacore-signal-engine"
+version = "0.7.0"
+dependencies = [
+ "aes 0.9.3",
+ "cbc",
+ "curve25519-dalek",
+ "hkdf",
+ "hmac 0.13.0",
+ "sha2 0.11.1",
+ "subtle",
+ "thiserror 2.0.21",
+ "zeroize",
 ]
 
 [[package]]

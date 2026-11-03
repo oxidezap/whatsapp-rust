@@ -1,0 +1,21 @@
+[package]
+name = "wacore-signal-engine"
+version = "0.7.0"
+publish = false
+edition.workspace = true
+license = "MIT"
+rust-version.workspace = true
+
+[dependencies]
+aes.workspace = true
+cbc = { workspace = true, features = ["block-padding"] }
+curve25519-dalek = { version = "5.0.0", features = ["zeroize"] }
+sha2.workspace = true
+hmac.workspace = true
+hkdf.workspace = true
+thiserror.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true
