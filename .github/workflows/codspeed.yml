@@ -71,8 +71,8 @@ jobs:
           cp .retention-out/results/harness/fixture/bench_support.rs src/bench_support.rs
           cp .retention-out/results/harness/fixture/connected_idle.rs src/bench_support/connected_idle.rs
           cp .retention-out/results/harness/fixture/util.rs src/bench_support/connected_idle/util.rs
-          cargo add --offline -p whatsapp-rust --dev --target 'cfg(not(target_arch = "wasm32"))' parking_lot@=0.13.0
-          cargo add --offline -p whatsapp-rust --dev --target 'cfg(not(target_arch = "wasm32"))' --rename parking_lot_012 parking_lot@=0.12.5
+          cargo add -p whatsapp-rust --dev --target 'cfg(not(target_arch = "wasm32"))' parking_lot@=0.13.0
+          cargo add -p whatsapp-rust --dev --target 'cfg(not(target_arch = "wasm32"))' --rename parking_lot_012 parking_lot@=0.12.5
           git diff -- Cargo.toml Cargo.lock examples/connected_idle.rs examples/connected_idle/allocator.rs examples/connected_idle/process_locks.rs src/bench_support.rs src/bench_support/connected_idle.rs src/bench_support/connected_idle/util.rs > .retention-out/results/base-harness.patch
           cargo build --locked --release -p whatsapp-rust --no-default-features --features bench-harness,sqlite-storage-bundled --example connected_idle
           cp target/release/examples/connected_idle .retention-out/base
