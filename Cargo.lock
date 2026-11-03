@@ -4810,8 +4810,8 @@ dependencies = [
  "wacore-appstate",
  "wacore-binary",
  "wacore-derive",
- "wacore-libsignal",
  "wacore-noise",
+ "wacore-signal-runtime",
  "waproto",
  "zerocopy",
  "zeroize",
@@ -4835,7 +4835,7 @@ dependencies = [
  "subtle",
  "thiserror 2.0.21",
  "wacore-binary",
- "wacore-libsignal",
+ "wacore-signal-runtime",
  "waproto",
 ]
 
@@ -4880,6 +4880,7 @@ dependencies = [
  "bytes",
  "cbc",
  "chrono",
+ "ciborium",
  "codspeed-divan-compat",
  "ctr 0.10.1",
  "curve25519-dalek",
@@ -4892,6 +4893,7 @@ dependencies = [
  "portable-atomic",
  "rand 0.10.3",
  "serde",
+ "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.1",
  "subtle",
@@ -4899,6 +4901,7 @@ dependencies = [
  "wacore-binary",
  "wacore-derive",
  "wacore-signal-engine",
+ "wacore-signal-runtime",
  "waproto",
  "x25519-dalek",
 ]
@@ -4917,7 +4920,7 @@ dependencies = [
  "sha2 0.11.1",
  "thiserror 2.0.21",
  "wacore-binary",
- "wacore-libsignal",
+ "wacore-signal-runtime",
  "waproto",
 ]
 
@@ -4933,6 +4936,40 @@ dependencies = [
  "sha2 0.11.1",
  "subtle",
  "thiserror 2.0.21",
+ "zeroize",
+]
+
+[[package]]
+name = "wacore-signal-runtime"
+version = "0.7.0"
+dependencies = [
+ "aes 0.9.3",
+ "aes-gcm",
+ "async-lock",
+ "async-trait",
+ "buffa",
+ "bytes",
+ "cbc",
+ "chrono",
+ "ctr 0.10.1",
+ "curve25519-dalek",
+ "futures",
+ "hex",
+ "hkdf",
+ "hmac 0.13.0",
+ "log",
+ "portable-atomic",
+ "rand 0.10.3",
+ "serde",
+ "serde_json",
+ "sha1 0.11.0",
+ "sha2 0.11.1",
+ "subtle",
+ "thiserror 2.0.21",
+ "wacore-binary",
+ "wacore-derive",
+ "wacore-signal-engine",
+ "waproto",
  "zeroize",
 ]
 

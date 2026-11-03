@@ -502,7 +502,7 @@ mod tests {
     }
 
     fn id32(kp: &KeyPair) -> [u8; 32] {
-        kp.public_key.public_key_bytes().try_into().unwrap()
+        *kp.public_key.public_key_bytes()
     }
 
     #[test]

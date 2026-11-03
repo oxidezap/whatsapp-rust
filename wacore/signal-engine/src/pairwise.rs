@@ -5,7 +5,7 @@ use crate::{
     CryptoProvider, Engine, Error, RandomSource, Result,
     crypto::{authenticate, root_step},
     state::*,
-    wire::{self, PreKeySignalMessage, SignalMessage},
+    wire::{self, PreKeySignalMessage, PreKeySignalMessageView, SignalMessage, SignalMessageView},
 };
 use zeroize::Zeroize;
 #[derive(Clone)]
@@ -80,6 +80,7 @@ fn state(
         remote_registration,
         needs_refresh: false,
         alice_base_key: None,
+        alice_base_key_tagged: true,
         pending_key_exchange: None,
     }
 }
@@ -120,7 +121,7 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         session.alice_base_key = Some(p.base_key.public);
         session.pending_pre_key = Some(PendingPreKey {
             pre_key_id: p.remote_one_time_pre_key.as_ref().map(|(id, _)| *id),
-            signed_pre_key_id: p.remote_signed_pre_key_id as i32,
+            signed_pre_key_id: Some(p.remote_signed_pre_key_id as i32),
             base_key: p.base_key.public,
             kyber_pre_key_id: None,
             kyber_ciphertext: None,
@@ -185,7 +186,7 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
             output = PreKeySignalMessage {
                 registration: session.local_registration,
                 pre_key_id: pending.pre_key_id,
-                signed_pre_key_id: pending.signed_pre_key_id as u32,
+                signed_pre_key_id: pending.signed_pre_key_id.ok_or(Error::MissingKey)? as u32,
                 base_key: pending.base_key,
                 identity: session.local_identity,
                 message: output,
@@ -196,7 +197,7 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         Ok(output)
     }
     pub fn decrypt(&mut self, record: &mut SessionRecord, input: &[u8]) -> Result<Vec<u8>> {
-        let message = SignalMessage::decode(input)?;
+        let message = SignalMessageView::decode(input)?;
         let mut failure = Error::MissingKey;
         if let Some(current) = record.current.as_mut() {
             if let Some(index) = current
@@ -214,7 +215,7 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
                     Ok((plaintext, ratcheted)) => {
                         record.current = Some(candidate);
                         if ratcheted {
-                            record.reservation = Reservation::default();
+                            record.reservation.rebase();
                         }
                         return Ok(plaintext);
                     }
@@ -226,12 +227,13 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
             let mut candidate = record.previous[index].decode(self.crypto)?;
             match self.decrypt_state(&mut candidate, &message, input) {
                 Ok((plaintext, _)) => {
+                    record.materialize_reservation(self.crypto)?;
                     record.previous.remove(index);
                     record.install(candidate);
                     return Ok(plaintext);
                 }
                 Err(error) => {
-                    if failure == Error::MissingKey {
+                    if error == Error::Duplicate || failure == Error::MissingKey {
                         failure = error;
                     }
                 }
@@ -243,7 +245,7 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         &self,
         session: &mut SessionState,
         index: usize,
-        message: &SignalMessage,
+        message: &SignalMessageView<'_>,
         input: &[u8],
     ) -> Result<Vec<u8>> {
         let limit = if session.local_identity == session.remote_identity {
@@ -274,7 +276,7 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         input: &[u8],
         p: &ResponderParameters,
     ) -> Result<Vec<u8>> {
-        let wrapper = PreKeySignalMessage::decode(input)?;
+        let wrapper = PreKeySignalMessageView::decode(input)?;
         if wrapper.identity != p.remote_identity
             || wrapper.base_key != p.remote_base_key
             || wrapper.registration != p.remote_registration
@@ -309,6 +311,7 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
             return Err(Error::IdentityChanged);
         }
         let mut candidate = record.clone();
+        candidate.materialize_reservation(self.crypto)?;
         candidate.install(self.initialize_responder(p)?);
         let plaintext = self.decrypt(&mut candidate, &wrapper.message)?;
         *record = candidate;
@@ -317,7 +320,7 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
     fn decrypt_state(
         &mut self,
         session: &mut SessionState,
-        message: &SignalMessage,
+        message: &SignalMessageView<'_>,
         input: &[u8],
     ) -> Result<(Vec<u8>, bool)> {
         if session.version != 3 {

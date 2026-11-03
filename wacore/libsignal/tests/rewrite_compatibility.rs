@@ -449,3 +449,139 @@ fn duplicate_or_overflowing_counter_reservations_are_rejected_by_both_readers() 
         assert!(old::SessionRecord::deserialize(&input).is_err());
     }
 }
+
+#[test]
+fn historical_large_skipped_backlog_and_closed_chain_remain_usable() {
+    let (mut record, _, _, _) = pair();
+    let chain = &mut record.current.as_mut().unwrap().receivers[0];
+    chain.index = 3000;
+    chain.message_key_limit = Some(4000);
+    chain.skipped = (0..3000)
+        .map(|index| new::MessageKey::Seed {
+            index,
+            seed: [(index % 251) as u8; 32],
+        })
+        .collect();
+    let ratchet = chain.ratchet;
+    chain.exhausted = true;
+    chain.key = [0; 32];
+    let input = new::codec::encode_session_record(&record);
+    let mut old_record = old::SessionRecord::deserialize_for_store(&input, &INCARNATION).unwrap();
+    let state = old_record.session_state_mut().unwrap();
+    let public = old::PublicKey::from_djb_public_key_bytes(&ratchet).unwrap();
+    assert!(state.get_receiver_chain_key(&public).is_err());
+    let consumed = state.get_message_keys(&public, 2999).unwrap().unwrap();
+    assert_eq!(consumed.counter(), 2999);
+    let mut old_bytes = Vec::new();
+    old_record.serialize_into_for_store(&mut old_bytes, &INCARNATION);
+    let decoded =
+        new::codec::decode_session_record_live(&RustCrypto, &old_bytes, &INCARNATION).unwrap();
+    let chain = &decoded.current.as_ref().unwrap().receivers[0];
+    assert!(chain.exhausted);
+    assert_eq!(chain.index, 3000);
+    assert_eq!(chain.message_key_limit, Some(4000));
+    assert_eq!(chain.skipped.len(), 2999);
+    assert!(!chain.skipped.iter().any(|key| key.index() == 2999));
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn mixed_expanded_and_seed_message_keys_follow_historical_precedence() {
+    use buffa::Message as _;
+    use waproto::whatsapp::session_structure::chain::MessageKey;
+    let (record, _, _, _) = pair();
+    let mut proto = waproto::whatsapp::RecordStructure::decode_from_slice(
+        &new::codec::encode_session_record(&record),
+    )
+    .unwrap();
+    let chain = &mut proto
+        .current_session
+        .as_option_mut()
+        .unwrap()
+        .receiver_chains[0];
+    let mut key = MessageKey::default();
+    key.index = Some(9);
+    key.cipher_key = Some(bytes::Bytes::from_static(&[1; 32]));
+    key.mac_key = Some(bytes::Bytes::from_static(&[2; 32]));
+    key.iv = Some(bytes::Bytes::from_static(&[3; 16]));
+    key.seed = Some(bytes::Bytes::from_static(&[4; 32]));
+    chain.message_keys.push(key);
+    let bytes = proto.encode_to_vec();
+    let decoded = new::codec::decode_session_record(&RustCrypto, &bytes).unwrap();
+    assert!(
+        matches!(&decoded.current.as_ref().unwrap().receivers[0].skipped[0],new::MessageKey::Derived{index:9,cipher,..}if cipher==&[1;32])
+    );
+    let old = old::SessionRecord::deserialize(&bytes).unwrap();
+    let mut normalized = Vec::new();
+    old.serialize_into(&mut normalized);
+    let decoded = new::codec::decode_session_record(&RustCrypto, &normalized).unwrap();
+    assert!(
+        matches!(&decoded.current.as_ref().unwrap().receivers[0].skipped[0],new::MessageKey::Derived{index:9,mac,..}if mac==&[2;32])
+    );
+}
+
+#[test]
+fn archive_encoding_and_local_pending_fields_survive_crossed_storage() {
+    let (mut record, _, _, _) = pair();
+    let mut archived = record.current.as_ref().unwrap().clone();
+    archived.pending_key_exchange = Some(vec![8, 9]);
+    archived.pending_pre_key = Some(new::PendingPreKey {
+        pre_key_id: Some(73),
+        signed_pre_key_id: Some(-1),
+        base_key: [5; 32],
+        kyber_pre_key_id: Some(8),
+        kyber_ciphertext: Some(vec![7; 33]),
+    });
+    record.install(archived);
+    let old = old::SessionRecord::deserialize(&new::codec::encode_session_record(&record)).unwrap();
+    let decoded =
+        new::codec::decode_session_record(&RustCrypto, &old.serialize().unwrap()).unwrap();
+    assert_eq!(decoded.previous.len(), 1);
+    let state = decoded.current.as_ref().unwrap();
+    assert_eq!(state.pending_key_exchange, Some(vec![8, 9]));
+    let pending = state.pending_pre_key.as_ref().unwrap();
+    assert_eq!(pending.pre_key_id, Some(73));
+    assert_eq!(pending.signed_pre_key_id, Some(-1));
+    assert_eq!(pending.kyber_pre_key_id, Some(8));
+    assert_eq!(pending.kyber_ciphertext, Some(vec![7; 33]));
+    let bytes = new::codec::encode_session_record(&decoded);
+    let reread = new::codec::decode_session_record(&RustCrypto, &bytes).unwrap();
+    assert_eq!(reread.previous[0].encoded(), decoded.previous[0].encoded());
+}
+
+#[test]
+fn historical_json_and_binary_serde_keys_cross_read_without_conversion() {
+    let mut random = Random::seeded();
+    let key = new::Engine::new(&RustCrypto, &mut random)
+        .generate_key_pair()
+        .unwrap();
+    let legacy = old_key(&key);
+    let replacement = replacement::core::KeyPair::new(
+        replacement::core::PublicKey::from_djb_public_key_bytes(&key.public).unwrap(),
+        replacement::core::PrivateKey::deserialize(&key.private).unwrap(),
+    );
+    let json = serde_json::to_vec(&legacy).unwrap();
+    assert_eq!(json, serde_json::to_vec(&replacement).unwrap());
+    let reloaded: replacement::core::KeyPair = serde_json::from_slice(&json).unwrap();
+    assert_eq!(reloaded, replacement);
+    let old_reloaded: old::KeyPair =
+        serde_json::from_slice(&serde_json::to_vec(&replacement).unwrap()).unwrap();
+    assert_eq!(old_reloaded.public_key, legacy.public_key);
+    assert_eq!(
+        old_reloaded.private_key.serialize(),
+        legacy.private_key.serialize()
+    );
+    let mut binary = Vec::new();
+    ciborium::into_writer(&legacy, &mut binary).unwrap();
+    let reloaded: replacement::core::KeyPair = ciborium::from_reader(binary.as_slice()).unwrap();
+    assert_eq!(reloaded, replacement);
+    let mut replacement_binary = Vec::new();
+    ciborium::into_writer(&replacement, &mut replacement_binary).unwrap();
+    assert_eq!(binary, replacement_binary);
+    let old_reloaded: old::KeyPair = ciborium::from_reader(replacement_binary.as_slice()).unwrap();
+    assert_eq!(old_reloaded.public_key, legacy.public_key);
+    let identity: old::IdentityKeyPair = legacy.into();
+    let json = serde_json::to_vec(&identity).unwrap();
+    let reloaded: replacement::core::IdentityKeyPair = serde_json::from_slice(&json).unwrap();
+    assert_eq!(serde_json::to_vec(&reloaded).unwrap(), json);
+}

@@ -1,0 +1,570 @@
+// SPDX-License-Identifier: MIT
+//! Curve25519 key encodings and cached signing follow RFC 7748 and the public
+//! XEdDSA specification, <https://signal.org/docs/specifications/xeddsa/>.
+use rand::{CryptoRng, Rng};
+use serde::{Deserialize, Serialize};
+use wacore_signal_engine::{CryptoProvider, RandomSource, rustcrypto::RustCrypto};
+use zeroize::Zeroize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum CurveError {
+    #[error("missing public key type identifier")]
+    NoKeyTypeIdentifier,
+    #[error("invalid Curve25519 key encoding")]
+    InvalidKey,
+    #[error("Curve25519 cryptographic operation failed")]
+    Crypto,
+}
+type Result<T> = std::result::Result<T, CurveError>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PublicKey([u8; 32]);
+impl PublicKey {
+    pub const RAW_KEY_LEN: usize = 32;
+    pub const SERIALIZED_KEY_LEN: usize = 33;
+    pub fn from_djb_public_key_bytes(bytes: &[u8]) -> Result<Self> {
+        Ok(Self(bytes.try_into().map_err(|_| CurveError::InvalidKey)?))
+    }
+    pub fn deserialize(bytes: &[u8]) -> Result<Self> {
+        if bytes.is_empty() {
+            return Err(CurveError::NoKeyTypeIdentifier);
+        }
+        if bytes.len() != 33 || bytes[0] != 5 {
+            return Err(CurveError::InvalidKey);
+        }
+        Self::from_djb_public_key_bytes(&bytes[1..])
+    }
+    pub fn public_key_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+    pub fn serialize(&self) -> [u8; 33] {
+        let mut out = [0; 33];
+        out[0] = 5;
+        out[1..].copy_from_slice(&self.0);
+        out
+    }
+    pub fn verify_signature(&self, message: &[u8], signature: &[u8]) -> bool {
+        signature
+            .try_into()
+            .is_ok_and(|s| RustCrypto.verify(&self.0, message, s).is_ok())
+    }
+    pub fn prepare_verifying_key(&self) -> Result<PreparedVerifyingKey> {
+        PreparedVerifyingKey::new(self)
+    }
+}
+#[derive(Clone, PartialEq, Eq)]
+pub struct PrivateKey([u8; 32]);
+impl std::fmt::Debug for PrivateKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PrivateKey([redacted])")
+    }
+}
+impl Drop for PrivateKey {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+// Persisted key serde uses tagged public keys and raw private scalars. Arrays
+// would change both the human-readable representation and binary token kind.
+fn serialize_key<S: serde::Serializer>(
+    bytes: &[u8],
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    if serializer.is_human_readable() {
+        let text = zeroize::Zeroizing::new(hex::encode(bytes));
+        serializer.serialize_str(text.as_str())
+    } else {
+        serializer.serialize_bytes(bytes)
+    }
+}
+fn deserialize_key<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+    expected: usize,
+) -> std::result::Result<zeroize::Zeroizing<Vec<u8>>, D::Error> {
+    use serde::de::Error as _;
+    if deserializer.is_human_readable() {
+        let text = zeroize::Zeroizing::new(String::deserialize(deserializer)?);
+        if text.len() != expected * 2 {
+            return Err(D::Error::custom("invalid key length"));
+        }
+        return hex::decode(text.as_str())
+            .map(zeroize::Zeroizing::new)
+            .map_err(D::Error::custom);
+    }
+    struct KeyBytes(usize);
+    impl<'de> serde::de::Visitor<'de> for KeyBytes {
+        type Value = zeroize::Zeroizing<Vec<u8>>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "a {}-byte key", self.0)
+        }
+        fn visit_bytes<E: serde::de::Error>(
+            self,
+            bytes: &[u8],
+        ) -> std::result::Result<Self::Value, E> {
+            if bytes.len() != self.0 {
+                return Err(E::custom("invalid key length"));
+            }
+            Ok(zeroize::Zeroizing::new(bytes.to_vec()))
+        }
+        fn visit_byte_buf<E: serde::de::Error>(
+            self,
+            bytes: Vec<u8>,
+        ) -> std::result::Result<Self::Value, E> {
+            let bytes = zeroize::Zeroizing::new(bytes);
+            if bytes.len() != self.0 {
+                return Err(E::custom("invalid key length"));
+            }
+            Ok(bytes)
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(self.0));
+            while let Some(byte) = sequence.next_element::<u8>()? {
+                if bytes.len() == self.0 {
+                    return Err(A::Error::custom("invalid key length"));
+                }
+                bytes.push(byte);
+            }
+            if bytes.len() != self.0 {
+                return Err(A::Error::custom("invalid key length"));
+            }
+            Ok(bytes)
+        }
+    }
+    deserializer.deserialize_bytes(KeyBytes(expected))
+}
+impl Serialize for PublicKey {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serialize_key(&self.serialize(), serializer)
+    }
+}
+impl<'de> Deserialize<'de> for PublicKey {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let bytes = deserialize_key(deserializer, Self::SERIALIZED_KEY_LEN)?;
+        Self::deserialize(&bytes).map_err(serde::de::Error::custom)
+    }
+}
+impl Serialize for PrivateKey {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serialize_key(self.serialize(), serializer)
+    }
+}
+impl<'de> Deserialize<'de> for PrivateKey {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let bytes = deserialize_key(deserializer, 32)?;
+        Self::deserialize(&bytes).map_err(serde::de::Error::custom)
+    }
+}
+struct RandomAdapter<'a, R>(&'a mut R);
+impl<R: Rng + CryptoRng> RandomSource for RandomAdapter<'_, R> {
+    fn fill(&mut self, out: &mut [u8]) -> wacore_signal_engine::Result<()> {
+        self.0.fill_bytes(out);
+        Ok(())
+    }
+}
+impl PrivateKey {
+    pub fn deserialize(bytes: &[u8]) -> Result<Self> {
+        Ok(Self(bytes.try_into().map_err(|_| CurveError::InvalidKey)?))
+    }
+    pub fn serialize(&self) -> &[u8; 32] {
+        &self.0
+    }
+    pub fn public_key(&self) -> Result<PublicKey> {
+        RustCrypto
+            .public_key(&self.0)
+            .map(PublicKey)
+            .map_err(|_| CurveError::Crypto)
+    }
+    pub fn calculate_agreement(&self, public: &PublicKey) -> Result<[u8; 32]> {
+        RustCrypto
+            .agreement(&self.0, &public.0)
+            .map_err(|_| CurveError::Crypto)
+    }
+    pub fn calculate_signature<R: Rng + CryptoRng>(
+        &self,
+        message: &[u8],
+        rng: &mut R,
+    ) -> Result<[u8; 64]> {
+        RustCrypto
+            .sign(&self.0, message, &mut RandomAdapter(rng))
+            .map_err(|_| CurveError::Crypto)
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyPair {
+    pub public_key: PublicKey,
+    pub private_key: PrivateKey,
+}
+impl KeyPair {
+    pub fn new(public_key: PublicKey, private_key: PrivateKey) -> Self {
+        Self {
+            public_key,
+            private_key,
+        }
+    }
+    pub fn generate<R: Rng + CryptoRng>(rng: &mut R) -> Self {
+        let mut raw = zeroize::Zeroizing::new([0; 32]);
+        rng.fill_bytes(raw.as_mut_slice());
+        raw[0] &= 248;
+        raw[31] = (raw[31] & 127) | 64;
+        let public =
+            curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(*raw).to_bytes();
+        Self::new(PublicKey(public), PrivateKey(*raw))
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct IdentityKey(PublicKey);
+impl IdentityKey {
+    pub fn new(public: PublicKey) -> Self {
+        Self(public)
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        PublicKey::deserialize(bytes).map(Self)
+    }
+    pub fn public_key(&self) -> &PublicKey {
+        &self.0
+    }
+    pub fn serialize(&self) -> [u8; 33] {
+        self.0.serialize()
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityKeyPair {
+    identity_key: IdentityKey,
+    private_key: PrivateKey,
+}
+impl IdentityKeyPair {
+    pub fn new(identity_key: IdentityKey, private_key: PrivateKey) -> Self {
+        Self {
+            identity_key,
+            private_key,
+        }
+    }
+    pub fn generate<R: Rng + CryptoRng>(rng: &mut R) -> Self {
+        let pair = KeyPair::generate(rng);
+        Self::new(IdentityKey::new(pair.public_key), pair.private_key)
+    }
+    pub fn identity_key(&self) -> &IdentityKey {
+        &self.identity_key
+    }
+    pub fn public_key(&self) -> &PublicKey {
+        self.identity_key.public_key()
+    }
+    pub fn private_key(&self) -> &PrivateKey {
+        &self.private_key
+    }
+}
+/// Decompresses the public point once for repeated XEdDSA checks.
+#[derive(Clone, Debug)]
+pub struct PreparedVerifyingKey {
+    points: [curve25519_dalek::edwards::EdwardsPoint; 2],
+    encodings: [[u8; 32]; 2],
+}
+impl PreparedVerifyingKey {
+    pub fn new(public: &PublicKey) -> Result<Self> {
+        use curve25519_dalek::montgomery::MontgomeryPoint;
+        let point = MontgomeryPoint(public.0);
+        let p0 = point.to_edwards(0).ok_or(CurveError::InvalidKey)?;
+        if p0.is_small_order() {
+            return Err(CurveError::InvalidKey);
+        }
+        let mut prime = [255; 32];
+        prime[0] = 237;
+        prime[31] = 127;
+        if public.0.iter().rev().cmp(prime.iter().rev()).is_ge() {
+            return Err(CurveError::InvalidKey);
+        }
+        let mut encoding = p0.compress().to_bytes();
+        let positive = encoding;
+        encoding[31] |= 128;
+        Ok(Self {
+            points: [p0, -p0],
+            encodings: [positive, encoding],
+        })
+    }
+    pub fn verify_signature(&self, message: &[u8], signature: &[u8]) -> bool {
+        use curve25519_dalek::{edwards::EdwardsPoint, scalar::Scalar};
+        use sha2::{Digest, Sha512};
+        use subtle::ConstantTimeEq;
+        let Ok(sig) = <&[u8; 64]>::try_from(signature) else {
+            return false;
+        };
+        let mut s = [0; 32];
+        s.copy_from_slice(&sig[32..]);
+        s[31] &= 127;
+        if s[31] & 224 != 0 {
+            return false;
+        }
+        let sign = (sig[63] >> 7) as usize;
+        let point = &self.points[sign];
+        let mut h = Sha512::new();
+        h.update(&sig[..32]);
+        h.update(self.encodings[sign]);
+        h.update(message);
+        let h = Scalar::from_bytes_mod_order_wide(&h.finalize().into());
+        let r = EdwardsPoint::vartime_double_scalar_mul_basepoint(
+            &-h,
+            point,
+            &Scalar::from_bytes_mod_order(s),
+        )
+        .compress();
+        bool::from(r.as_bytes().ct_eq(&sig[..32]))
+    }
+}
+/// Keeps the normalized scalar and Edwards encoding for repeated signing.
+#[derive(Clone)]
+pub struct PreparedSigningKey {
+    scalar: curve25519_dalek::scalar::Scalar,
+    public: [u8; 32],
+}
+impl Drop for PreparedSigningKey {
+    fn drop(&mut self) {
+        self.scalar.zeroize()
+    }
+}
+impl std::fmt::Debug for PreparedSigningKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PreparedSigningKey([redacted])")
+    }
+}
+impl PreparedSigningKey {
+    pub fn new(private: &PrivateKey) -> Self {
+        use curve25519_dalek::{edwards::EdwardsPoint, scalar::Scalar};
+        use subtle::{Choice, ConditionallySelectable};
+        let mut raw = zeroize::Zeroizing::new(*private.serialize());
+        raw[0] &= 248;
+        raw[31] = (raw[31] & 127) | 64;
+        let scalar = zeroize::Zeroizing::new(Scalar::from_bytes_mod_order(*raw));
+        let mut public = EdwardsPoint::mul_base(&scalar).compress().to_bytes();
+        let scalar = Scalar::conditional_select(&scalar, &-*scalar, Choice::from(public[31] >> 7));
+        public[31] &= 127;
+        Self { scalar, public }
+    }
+    pub fn calculate_signature<R: Rng + CryptoRng>(
+        &self,
+        message: &[u8],
+        rng: &mut R,
+    ) -> Result<[u8; 64]> {
+        use curve25519_dalek::{edwards::EdwardsPoint, scalar::Scalar};
+        use sha2::{Digest, Sha512};
+        let mut random = zeroize::Zeroizing::new([0; 64]);
+        rng.fill_bytes(random.as_mut_slice());
+        let mut domain = [255; 32];
+        domain[0] = 254;
+        let mut h = Sha512::new();
+        h.update(domain);
+        h.update(self.scalar.as_bytes());
+        h.update(message);
+        h.update(random.as_slice());
+        let digest = zeroize::Zeroizing::new(<[u8; 64]>::from(h.finalize()));
+        let nonce = zeroize::Zeroizing::new(Scalar::from_bytes_mod_order_wide(&digest));
+        let r = EdwardsPoint::mul_base(&nonce).compress();
+        let mut h = Sha512::new();
+        h.update(r.as_bytes());
+        h.update(self.public);
+        h.update(message);
+        let challenge = Scalar::from_bytes_mod_order_wide(&h.finalize().into());
+        let s = *nonce + challenge * self.scalar;
+        let mut signature = [0; 64];
+        signature[..32].copy_from_slice(r.as_bytes());
+        signature[32..].copy_from_slice(s.as_bytes());
+        Ok(signature)
+    }
+}
+impl PrivateKey {
+    pub fn prepare_signing_key(&self) -> PreparedSigningKey {
+        PreparedSigningKey::new(self)
+    }
+}
+impl TryFrom<&[u8]> for IdentityKey {
+    type Error = CurveError;
+    fn try_from(bytes: &[u8]) -> Result<Self> {
+        Self::decode(bytes)
+    }
+}
+impl From<PublicKey> for IdentityKey {
+    fn from(public: PublicKey) -> Self {
+        Self::new(public)
+    }
+}
+impl From<KeyPair> for IdentityKeyPair {
+    fn from(pair: KeyPair) -> Self {
+        Self::new(pair.public_key.into(), pair.private_key)
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn key_encodings_and_cached_signatures() {
+        assert_eq!(
+            PublicKey::deserialize(&[]),
+            Err(CurveError::NoKeyTypeIdentifier)
+        );
+        assert_eq!(
+            IdentityKey::try_from(&[][..]),
+            Err(CurveError::NoKeyTypeIdentifier)
+        );
+        assert!(IdentityKey::try_from(&[5; 32][..]).is_err());
+        assert!(IdentityKey::try_from(&[6; 33][..]).is_err());
+        let tagged = PublicKey::from_djb_public_key_bytes(&[7; 32])
+            .unwrap()
+            .serialize();
+        assert_eq!(
+            IdentityKey::try_from(tagged.as_slice())
+                .unwrap()
+                .serialize(),
+            tagged
+        );
+
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::from_seed([7; 32]);
+        let pair = KeyPair::generate(&mut rng);
+        assert_eq!(pair.public_key.serialize()[0], 5);
+        assert_eq!(
+            PublicKey::deserialize(&pair.public_key.serialize()).unwrap(),
+            pair.public_key
+        );
+        assert_eq!(
+            PrivateKey::deserialize(pair.private_key.serialize()).unwrap(),
+            pair.private_key
+        );
+        assert_eq!(pair.private_key.public_key().unwrap(), pair.public_key);
+        let cached = pair.private_key.prepare_signing_key();
+        let verifier = pair.public_key.prepare_verifying_key().unwrap();
+        let mut first = rand::rngs::StdRng::from_seed([8; 32]);
+        let mut second = rand::rngs::StdRng::from_seed([8; 32]);
+        let signature = cached
+            .calculate_signature(b"synthetic", &mut first)
+            .unwrap();
+        assert_eq!(
+            signature,
+            pair.private_key
+                .calculate_signature(b"synthetic", &mut second)
+                .unwrap()
+        );
+        assert!(verifier.verify_signature(b"synthetic", &signature));
+        assert!(!verifier.verify_signature(b"modified", &signature));
+        assert!(pair.public_key.verify_signature(b"synthetic", &signature));
+        let mut transported = cached.clone();
+        transported.scalar = -transported.scalar;
+        transported.public[31] |= 128;
+        let mut signature = transported
+            .calculate_signature(b"sign bit", &mut rng)
+            .unwrap();
+        signature[63] |= 128;
+        assert!(verifier.verify_signature(b"sign bit", &signature));
+        assert!(pair.public_key.verify_signature(b"sign bit", &signature));
+
+        assert!(PublicKey::deserialize(pair.public_key.public_key_bytes()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod serde_tests {
+    use super::*;
+    struct BinaryBytes<'de>(&'de [u8]);
+    impl<'de> serde::Deserializer<'de> for BinaryBytes<'de> {
+        type Error = serde::de::value::Error;
+        fn is_human_readable(&self) -> bool {
+            false
+        }
+        fn deserialize_any<V: serde::de::Visitor<'de>>(
+            self,
+            visitor: V,
+        ) -> std::result::Result<V::Value, Self::Error> {
+            visitor.visit_borrowed_bytes(self.0)
+        }
+        serde::forward_to_deserialize_any! {bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string bytes byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map struct enum identifier ignored_any}
+    }
+    #[test]
+    fn binary_key_bytes_decode_tagged_public_and_raw_private() {
+        let public = PublicKey::from_djb_public_key_bytes(&[0xab; 32]).unwrap();
+        let encoded = public.serialize();
+        assert_eq!(
+            <PublicKey as Deserialize>::deserialize(BinaryBytes(&encoded)).unwrap(),
+            public
+        );
+        let raw = [0xcd; 32];
+        assert_eq!(
+            <PrivateKey as Deserialize>::deserialize(BinaryBytes(&raw))
+                .unwrap()
+                .serialize(),
+            &raw
+        );
+        assert!(<PublicKey as Deserialize>::deserialize(BinaryBytes(&raw)).is_err());
+        assert!(<PrivateKey as Deserialize>::deserialize(BinaryBytes(&encoded)).is_err());
+    }
+
+    #[test]
+    fn historical_key_json_encodings_and_field_names() {
+        let public = PublicKey::from_djb_public_key_bytes(&[0xab; 32]).unwrap();
+        let private = PrivateKey::deserialize(&[0xcd; 32]).unwrap();
+        let public_text = format!("05{}", "ab".repeat(32));
+        let private_text = "cd".repeat(32);
+        assert_eq!(
+            serde_json::to_string(&public).unwrap(),
+            format!("\"{public_text}\"")
+        );
+        assert_eq!(
+            serde_json::to_string(&private).unwrap(),
+            format!("\"{private_text}\"")
+        );
+        let pair = KeyPair::new(public, private);
+        let expected =
+            format!("{{\"public_key\":\"{public_text}\",\"private_key\":\"{private_text}\"}}");
+        assert_eq!(serde_json::to_string(&pair).unwrap(), expected);
+        assert_eq!(serde_json::from_str::<KeyPair>(&expected).unwrap(), pair);
+        let identity = IdentityKey::new(public);
+        assert_eq!(
+            serde_json::to_string(&identity).unwrap(),
+            format!("\"{public_text}\"")
+        );
+        let identity_pair = IdentityKeyPair::from(pair);
+        let expected =
+            format!("{{\"identity_key\":\"{public_text}\",\"private_key\":\"{private_text}\"}}");
+        assert_eq!(serde_json::to_string(&identity_pair).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_str::<IdentityKeyPair>(&expected).unwrap(),
+            identity_pair
+        );
+    }
+    #[test]
+    fn serde_rejects_invalid_key_lengths_tags_and_hex() {
+        for value in [
+            "",
+            "05",
+            &"00".repeat(32),
+            &"06".repeat(33),
+            &"gg".repeat(33),
+        ] {
+            let json = format!("\"{value}\"");
+            assert!(serde_json::from_str::<PublicKey>(&json).is_err());
+        }
+        for value in [
+            "",
+            "00",
+            &"cd".repeat(31),
+            &"cd".repeat(33),
+            &"gg".repeat(32),
+        ] {
+            let json = format!("\"{value}\"");
+            assert!(serde_json::from_str::<PrivateKey>(&json).is_err());
+        }
+        assert!(
+            serde_json::from_str::<PublicKey>(&format!("[{}]", vec!["0"; 32].join(","))).is_err()
+        );
+    }
+}

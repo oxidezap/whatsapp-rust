@@ -76,4 +76,13 @@ This is an unofficial client, not affiliated with WhatsApp or Meta. Using it may
 
 ## Acknowledgements
 
+The runtime uses `wacore-signal-engine` and `wacore-signal-runtime`, whose
+original code is MIT licensed. Existing Signal session, prekey and sender-key
+storage formats remain the compatibility boundary.
+
+`wacore/libsignal` contains the inherited AGPL-3.0-only implementation as an
+unpublished reference for differential tests and benchmarks. It is excluded
+from the SDK's normal dependency graph. Its notices remain in place; replacing
+the runtime does not relicense earlier releases.
+
 Inspired by [whatsmeow](https://github.com/tulir/whatsmeow) and [Baileys](https://github.com/WhiskeySockets/Baileys).

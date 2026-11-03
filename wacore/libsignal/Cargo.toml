@@ -4,7 +4,8 @@ version = "0.7.0"
 edition = "2024"
 rust-version.workspace = true
 authors = ["João Lucas <jlucaso@hotmail.com>"]
-license = "MIT"
+license = "AGPL-3.0-only"
+publish = false
 repository = "https://github.com/oxidezap/whatsapp-rust"
 description = "Signal Protocol implementation for the WhatsApp platform"
 
@@ -41,12 +42,19 @@ waproto = { workspace = true }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
 
 [dev-dependencies]
+replacement = { package = "wacore-signal-runtime", path = "../signal-compat" }
+ciborium = "0.2"
+serde_json.workspace = true
 wacore-signal-engine = { path = "../signal-engine" }
 divan = { workspace = true }
 futures = { workspace = true, features = ["executor"] }
 
 [[bench]]
 name = "libsignal_benchmark"
+harness = false
+
+[[bench]]
+name = "rewrite_benchmark"
 harness = false
 
 [lints]

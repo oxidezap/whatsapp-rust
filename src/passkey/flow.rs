@@ -802,7 +802,7 @@ mod tests {
 
         // primary's ephemeral identity
         let primary_kp = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
-        let primary_pub: [u8; 32] = primary_kp.public_key.public_key_bytes().try_into().unwrap();
+        let primary_pub: [u8; 32] = *primary_kp.public_key.public_key_bytes();
         let primary_nonce = [0x77u8; 32];
         let primary_bytes = {
             let mut proto = wa::PrimaryEphemeralIdentity::default();

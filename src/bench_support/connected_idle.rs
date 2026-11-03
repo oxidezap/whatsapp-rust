@@ -835,7 +835,7 @@ impl Wire {
                     .map_err(|_| anyhow::anyhow!("ephemeral length"))?;
                 let identity = KeyPair::generate(&mut rand::rng());
                 let ephemeral = KeyPair::generate(&mut rand::rng());
-                let identity_pub: [u8; 32] = identity.public_key.public_key_bytes().try_into()?;
+                let identity_pub: [u8; 32] = *identity.public_key.public_key_bytes();
                 let ephemeral_pub = ephemeral.public_key.public_key_bytes();
                 let mut noise = NoiseHandshake::new(NOISE_PATTERN_XX, &WA_CONN_HEADER)?;
                 noise.authenticate(&peer);

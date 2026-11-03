@@ -161,25 +161,7 @@ impl SignalMessage {
         out
     }
     pub fn decode(input: &[u8]) -> Result<Self> {
-        let (body, mac) = versioned(input, 8)?;
-        let mut fields = Fields::new(body)?;
-        let (mut ratchet, mut counter, mut previous, mut ciphertext) = (None, None, 0, None);
-        while let Some((n, v)) = fields.next()? {
-            match n {
-                1 => ratchet = Some(decode_public(as_bytes(v)?)?),
-                2 => counter = Some(as_u32(v)?),
-                3 => previous = as_u32(v)?,
-                4 => ciphertext = Some(as_bytes(v)?.to_vec()),
-                _ => {}
-            }
-        }
-        Ok(Self {
-            ratchet: ratchet.ok_or(Error::MissingKey)?,
-            counter: counter.ok_or(Error::Encoding("missing counter"))?,
-            previous_counter: previous,
-            ciphertext: ciphertext.ok_or(Error::Encoding("missing ciphertext"))?,
-            mac: array(mac)?,
-        })
+        Ok(SignalMessageView::decode(input)?.to_owned())
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -205,30 +187,7 @@ impl PreKeySignalMessage {
         out
     }
     pub fn decode(input: &[u8]) -> Result<Self> {
-        let (body, _) = versioned(input, 0)?;
-        let mut f = Fields::new(body)?;
-        let (mut registration, mut pre_key_id, mut signed, mut base, mut identity, mut message) =
-            (0, None, None, None, None, None);
-        while let Some((n, v)) = f.next()? {
-            match n {
-                1 => pre_key_id = Some(as_u32(v)?),
-                2 => base = Some(decode_public(as_bytes(v)?)?),
-                3 => identity = Some(decode_public(as_bytes(v)?)?),
-                4 => message = Some(as_bytes(v)?.to_vec()),
-                5 => registration = as_u32(v)?,
-                6 => signed = Some(as_u32(v)?),
-                7 | 8 => return Err(Error::Version),
-                _ => {}
-            }
-        }
-        Ok(Self {
-            registration,
-            pre_key_id,
-            signed_pre_key_id: signed.ok_or(Error::MissingKey)?,
-            base_key: base.ok_or(Error::MissingKey)?,
-            identity: identity.ok_or(Error::MissingKey)?,
-            message: message.ok_or(Error::MissingKey)?,
-        })
+        Ok(PreKeySignalMessageView::decode(input)?.to_owned())
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -289,6 +248,127 @@ impl SenderKeyMessage {
         out
     }
     pub fn decode(input: &[u8]) -> Result<Self> {
+        Ok(SenderKeyMessageView::decode(input)?.to_owned())
+    }
+}
+
+/// Validated fields borrowing the exact original wire encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SignalMessageView<'a> {
+    pub bytes: &'a [u8],
+    pub ratchet: [u8; 32],
+    pub counter: u32,
+    pub previous_counter: u32,
+    pub ciphertext: &'a [u8],
+    pub mac: [u8; 8],
+}
+impl<'a> SignalMessageView<'a> {
+    pub fn decode(input: &'a [u8]) -> Result<Self> {
+        let (body, mac) = versioned(input, 8)?;
+        let mut fields = Fields::new(body)?;
+        let (mut ratchet, mut counter, mut previous, mut ciphertext) = (None, None, 0, None);
+        while let Some((n, v)) = fields.next()? {
+            match n {
+                1 => ratchet = Some(decode_public(as_bytes(v)?)?),
+                2 => counter = Some(as_u32(v)?),
+                3 => previous = as_u32(v)?,
+                4 => ciphertext = Some(as_bytes(v)?),
+                _ => {}
+            }
+        }
+        Ok(Self {
+            bytes: input,
+            ratchet: ratchet.ok_or(Error::MissingKey)?,
+            counter: counter.ok_or(Error::Encoding("missing counter"))?,
+            previous_counter: previous,
+            ciphertext: ciphertext.ok_or(Error::Encoding("missing ciphertext"))?,
+            mac: array(mac)?,
+        })
+    }
+    pub fn serialized(&self) -> &'a [u8] {
+        self.bytes
+    }
+    pub fn to_owned(&self) -> SignalMessage {
+        SignalMessage {
+            ratchet: self.ratchet,
+            counter: self.counter,
+            previous_counter: self.previous_counter,
+            ciphertext: self.ciphertext.to_vec(),
+            mac: self.mac,
+        }
+    }
+    pub fn unsigned(&self) -> &'a [u8] {
+        &self.bytes[..self.bytes.len() - 8]
+    }
+}
+
+/// Validated fields borrowing the exact original wire encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreKeySignalMessageView<'a> {
+    pub bytes: &'a [u8],
+    pub registration: u32,
+    pub pre_key_id: Option<u32>,
+    pub signed_pre_key_id: u32,
+    pub base_key: [u8; 32],
+    pub identity: [u8; 32],
+    pub message: &'a [u8],
+}
+impl<'a> PreKeySignalMessageView<'a> {
+    pub fn decode(input: &'a [u8]) -> Result<Self> {
+        let (body, _) = versioned(input, 0)?;
+        let mut f = Fields::new(body)?;
+        let (mut registration, mut pre_key_id, mut signed, mut base, mut identity, mut message) =
+            (0, None, None, None, None, None);
+        while let Some((n, v)) = f.next()? {
+            match n {
+                1 => pre_key_id = Some(as_u32(v)?),
+                2 => base = Some(decode_public(as_bytes(v)?)?),
+                3 => identity = Some(decode_public(as_bytes(v)?)?),
+                4 => message = Some(as_bytes(v)?),
+                5 => registration = as_u32(v)?,
+                6 => signed = Some(as_u32(v)?),
+                7 | 8 => return Err(Error::Version),
+                _ => {}
+            }
+        }
+        let message = message.ok_or(Error::MissingKey)?;
+        SignalMessageView::decode(message)?;
+        Ok(Self {
+            bytes: input,
+            registration,
+            pre_key_id,
+            signed_pre_key_id: signed.ok_or(Error::MissingKey)?,
+            base_key: base.ok_or(Error::MissingKey)?,
+            identity: identity.ok_or(Error::MissingKey)?,
+            message,
+        })
+    }
+    pub fn serialized(&self) -> &'a [u8] {
+        self.bytes
+    }
+    pub fn to_owned(&self) -> PreKeySignalMessage {
+        PreKeySignalMessage {
+            registration: self.registration,
+            pre_key_id: self.pre_key_id,
+            signed_pre_key_id: self.signed_pre_key_id,
+            base_key: self.base_key,
+            identity: self.identity,
+            message: self.message.to_vec(),
+        }
+    }
+}
+
+/// Validated fields borrowing the exact original wire encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SenderKeyMessageView<'a> {
+    pub bytes: &'a [u8],
+    pub id: u32,
+    pub iteration: u32,
+    pub ciphertext: &'a [u8],
+    pub signature: [u8; 64],
+}
+impl<'a> SenderKeyMessageView<'a> {
+    pub fn decode(input: &'a [u8]) -> Result<Self> {
         let (body, sig) = versioned(input, 64)?;
         let mut f = Fields::new(body)?;
         let (mut id, mut iteration, mut ciphertext) = (None, None, None);
@@ -296,15 +376,105 @@ impl SenderKeyMessage {
             match n {
                 1 => id = Some(as_u32(v)?),
                 2 => iteration = Some(as_u32(v)?),
-                3 => ciphertext = Some(as_bytes(v)?.to_vec()),
+                3 => ciphertext = Some(as_bytes(v)?),
                 _ => {}
             }
         }
         Ok(Self {
+            bytes: input,
             id: id.ok_or(Error::MissingKey)?,
             iteration: iteration.ok_or(Error::MissingKey)?,
             ciphertext: ciphertext.ok_or(Error::MissingKey)?,
             signature: array(sig)?,
         })
+    }
+    pub fn serialized(&self) -> &'a [u8] {
+        self.bytes
+    }
+    pub fn to_owned(&self) -> SenderKeyMessage {
+        SenderKeyMessage {
+            id: self.id,
+            iteration: self.iteration,
+            ciphertext: self.ciphertext.to_vec(),
+            signature: self.signature,
+        }
+    }
+    pub fn unsigned(&self) -> &'a [u8] {
+        &self.bytes[..self.bytes.len() - 64]
+    }
+}
+
+#[cfg(test)]
+mod borrowed_tests {
+    use super::*;
+    fn inside(input: &[u8], part: &[u8]) -> bool {
+        let start = input.as_ptr() as usize;
+        let end = start + input.len();
+        let part_start = part.as_ptr() as usize;
+        part_start >= start && part_start + part.len() <= end
+    }
+    #[test]
+    fn borrowed_authentication_bytes_include_unknown_fields() {
+        let owned = SignalMessage {
+            ratchet: [9; 32],
+            counter: 7,
+            previous_counter: 2,
+            ciphertext: vec![3; 128],
+            mac: [4; 8],
+        };
+        let mut encoded = owned.unsigned();
+        encoded.extend_from_slice(&[0x78, 0x07]);
+        encoded.extend_from_slice(&owned.mac);
+        let view = SignalMessageView::decode(&encoded).unwrap();
+        assert!(inside(&encoded, view.ciphertext));
+        assert_eq!(view.ciphertext, owned.ciphertext);
+        assert_eq!(view.serialized().as_ptr(), encoded.as_ptr());
+        assert_eq!(view.unsigned(), &encoded[..encoded.len() - 8]);
+        assert_eq!(&view.unsigned()[view.unsigned().len() - 2..], &[0x78, 0x07]);
+        assert_eq!(view.to_owned(), owned);
+        let sender = SenderKeyMessage {
+            id: 3,
+            iteration: 4,
+            ciphertext: vec![6; 128],
+            signature: [7; 64],
+        };
+        let mut encoded = sender.unsigned();
+        encoded.extend_from_slice(&[0x78, 0x07]);
+        encoded.extend_from_slice(&sender.signature);
+        let view = SenderKeyMessageView::decode(&encoded).unwrap();
+        assert!(inside(&encoded, view.ciphertext));
+        assert_eq!(view.unsigned(), &encoded[..encoded.len() - 64]);
+        assert_eq!(view.to_owned(), sender);
+    }
+    #[test]
+    fn borrowed_prekey_validates_and_borrows_nested_message() {
+        let signal = SignalMessage {
+            ratchet: [9; 32],
+            counter: 0,
+            previous_counter: 0,
+            ciphertext: vec![3; 128],
+            mac: [4; 8],
+        };
+        let owned = PreKeySignalMessage {
+            registration: 5,
+            pre_key_id: Some(6),
+            signed_pre_key_id: 7,
+            base_key: [8; 32],
+            identity: [9; 32],
+            message: signal.encode(),
+        };
+        let mut encoded = owned.encode();
+        encoded.extend_from_slice(&[0x78, 0x07]);
+        let view = PreKeySignalMessageView::decode(&encoded).unwrap();
+        assert!(inside(&encoded, view.message));
+        assert_eq!(view.serialized(), encoded);
+        assert_eq!(view.to_owned(), owned);
+        assert!(inside(
+            &encoded,
+            SignalMessageView::decode(view.message).unwrap().ciphertext
+        ));
+        let mut invalid = owned;
+        invalid.message = vec![0x33];
+        assert!(PreKeySignalMessageView::decode(&invalid.encode()).is_err());
     }
 }

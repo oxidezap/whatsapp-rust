@@ -246,12 +246,7 @@ impl IdentityKeyStore for Device {
         let existing_identity_opt = self.get_identity(address).await?;
 
         self.backend
-            .put_identity(
-                address_str,
-                key_bytes.try_into().map_err(|_| {
-                    SignalProtocolError::InvalidArgument("Invalid key length".into())
-                })?,
-            )
+            .put_identity(address_str, *key_bytes)
             .await
             .map_err(|e| SignalProtocolError::BackendError("backend put_identity", Box::new(e)))?;
 
@@ -377,7 +372,8 @@ impl SignedPreKeyStore for Device {
                             .expect("clock implementation returned an invalid calendar time")
                             .wall_time_utc()
                     }),
-            );
+            )
+            .map_err(|error| Box::new(error) as StoreError)?;
             return Ok(Some(record));
         }
         // Rotated-out key: a prekey message minted against a previous signed
@@ -734,7 +730,8 @@ mod tests {
             &kp,
             [9u8; 64],
             wacore::time::now_utc(),
-        );
+        )
+        .unwrap();
         backend
             .store_signed_prekey(old_id, &record.encode_to_vec())
             .await
@@ -747,7 +744,7 @@ mod tests {
         assert_eq!(loaded.id, Some(old_id));
         assert_eq!(
             loaded.public_key.as_deref(),
-            Some(kp.public_key.public_key_bytes())
+            Some(kp.public_key.public_key_bytes().as_slice())
         );
 
         // A truly-unknown id still returns None.

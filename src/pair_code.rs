@@ -357,21 +357,12 @@ impl Client {
 
         // Get device state for noise key
         let device_snapshot = self.persistence_manager.get_device_snapshot();
-        let noise_static_pub: [u8; 32] = device_snapshot
-            .noise_key
-            .public_key
-            .public_key_bytes()
-            .try_into()
-            .expect("noise key is 32 bytes");
+        let noise_static_pub = *device_snapshot.noise_key.public_key.public_key_bytes();
 
         // Derive key and encrypt ephemeral pub (expensive PBKDF2 operation)
         // Run in spawn_blocking to avoid stalling the async runtime
         let code_clone = code.clone();
-        let ephemeral_pub: [u8; 32] = ephemeral_keypair
-            .public_key
-            .public_key_bytes()
-            .try_into()
-            .expect("ephemeral key is 32 bytes");
+        let ephemeral_pub = *ephemeral_keypair.public_key.public_key_bytes();
 
         let wrapped_ephemeral = wacore::runtime::blocking(&*self.runtime, move || {
             PairCodeUtils::encrypt_ephemeral_pub(&ephemeral_pub, &code_clone)
@@ -887,12 +878,7 @@ async fn run_stage_two(
         return;
     }
     let req_id = client.generate_request_id();
-    let identity_pub: [u8; 32] = device_snapshot
-        .identity_key
-        .public_key
-        .public_key_bytes()
-        .try_into()
-        .expect("identity key is 32 bytes");
+    let identity_pub = *device_snapshot.identity_key.public_key.public_key_bytes();
 
     let iq = PairCodeUtils::build_companion_finish_iq(
         &phone_jid,

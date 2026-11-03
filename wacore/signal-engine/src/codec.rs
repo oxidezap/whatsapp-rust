@@ -125,8 +125,8 @@ fn encode_chain(chain: &Chain) -> Vec<u8> {
 fn decode_pending(input: &[u8]) -> Result<PendingPreKey> {
     let f = fields(input)?;
     let signed = match one(&f, 3) {
-        Some(Value::Varint(n)) => n as i32,
-        None => 0,
+        Some(Value::Varint(n)) => Some(n as i32),
+        None => None,
         _ => return Err(Error::Encoding("signed prekey id")),
     };
     Ok(PendingPreKey {
@@ -143,7 +143,9 @@ fn encode_pending(key: &PendingPreKey) -> Vec<u8> {
         uint(&mut out, 1, id.into());
     }
     bytes(&mut out, 2, &tagged_key(&key.base_key));
-    uint(&mut out, 3, key.signed_pre_key_id as i64 as u64);
+    if let Some(id) = key.signed_pre_key_id {
+        uint(&mut out, 3, id as i64 as u64);
+    }
     if let Some(id) = key.kyber_pre_key_id {
         uint(&mut out, 4, id.into());
     }
@@ -175,7 +177,11 @@ pub fn encode_session_state(state: &SessionState) -> Vec<u8> {
     uint(&mut out, 11, state.local_registration.into());
     uint(&mut out, 12, u64::from(state.needs_refresh));
     if let Some(base) = state.alice_base_key {
-        bytes(&mut out, 13, &tagged_key(&base));
+        if state.alice_base_key_tagged {
+            bytes(&mut out, 13, &tagged_key(&base));
+        } else {
+            bytes(&mut out, 13, &base);
+        }
     }
     out
 }
@@ -212,14 +218,19 @@ pub fn decode_session_state<C: CryptoProvider>(_crypto: &C, input: &[u8]) -> Res
         local_registration: number(&f, 11)?,
         needs_refresh: number(&f, 12)? != 0,
         alice_base_key: data(&f, 13)?.map(decode_public).transpose()?,
+        alice_base_key_tagged: data(&f, 13)?.is_none_or(|bytes| bytes.len() == 33),
     })
 }
-fn encode_reservation(out: &mut Vec<u8>, r: &Reservation) {
+fn encode_reservation_with_incarnation(
+    out: &mut Vec<u8>,
+    r: &Reservation,
+    incarnation: Option<&[u8; 16]>,
+) {
     if let Some(ceiling) = r.ceiling {
         uint(out, 100, ceiling.into());
     }
-    if let Some(token) = r.incarnation {
-        bytes(out, 101, &token);
+    if let Some(token) = incarnation.or(r.incarnation.as_ref()) {
+        bytes(out, 101, token);
     }
 }
 fn decode_reservation(f: &Data<'_>, live: Option<&[u8; 16]>) -> Result<(Reservation, bool)> {
@@ -252,20 +263,47 @@ fn decode_reservation(f: &Data<'_>, live: Option<&[u8; 16]>) -> Result<(Reservat
             ceiling,
             incarnation,
             committed: trusted,
+            waived: false,
         },
         trusted,
     ))
 }
 pub fn encode_session_record(record: &SessionRecord) -> Vec<u8> {
+    encode_session_record_parts(
+        record.current.as_ref(),
+        &record.previous,
+        &record.reservation,
+        None,
+    )
+}
+
+/// Encode a host-owned current state without cloning its skipped-key backlog.
+pub fn encode_session_record_parts(
+    current: Option<&SessionState>,
+    previous: &[ArchivedSession],
+    reservation: &Reservation,
+    incarnation: Option<&[u8; 16]>,
+) -> Vec<u8> {
     let mut out = Vec::new();
-    if let Some(state) = &record.current {
-        bytes(&mut out, 1, &encode_session_state(state));
-    }
-    for archive in &record.previous {
-        bytes(&mut out, 2, &archive.bytes);
-    }
-    encode_reservation(&mut out, &record.reservation);
+    encode_session_record_parts_into(current, previous, reservation, incarnation, &mut out);
     out
+}
+
+/// Append a record to the host's reusable persistence buffer.
+pub fn encode_session_record_parts_into(
+    current: Option<&SessionState>,
+    previous: &[ArchivedSession],
+    reservation: &Reservation,
+    incarnation: Option<&[u8; 16]>,
+    out: &mut Vec<u8>,
+) {
+    if let Some(state) = current {
+        bytes(out, 1, &encode_session_state(state));
+    }
+    for archive in previous {
+        bytes(out, 2, &archive.bytes);
+    }
+    encode_reservation_with_incarnation(out, reservation, incarnation);
 }
 pub fn decode_session_record<C: CryptoProvider>(crypto: &C, input: &[u8]) -> Result<SessionRecord> {
     decode_session_record_inner(crypto, input, None)
@@ -365,11 +403,26 @@ fn decode_sender_state(input: &[u8]) -> Result<SenderKeyState> {
     })
 }
 pub fn encode_sender_key_record(record: &SenderKeyRecord) -> Vec<u8> {
+    encode_sender_key_record_with_incarnation(record, None)
+}
+
+/// Encode the same group state with the host cache's live incarnation token.
+pub fn encode_sender_key_record_for_store(
+    record: &SenderKeyRecord,
+    incarnation: &[u8; 16],
+) -> Vec<u8> {
+    encode_sender_key_record_with_incarnation(record, Some(incarnation))
+}
+
+fn encode_sender_key_record_with_incarnation(
+    record: &SenderKeyRecord,
+    incarnation: Option<&[u8; 16]>,
+) -> Vec<u8> {
     let mut out = Vec::new();
     for state in &record.states {
         bytes(&mut out, 1, &encode_sender_state(state));
     }
-    encode_reservation(&mut out, &record.reservation);
+    encode_reservation_with_incarnation(&mut out, &record.reservation, incarnation);
     out
 }
 pub fn decode_sender_key_record<C: CryptoProvider>(

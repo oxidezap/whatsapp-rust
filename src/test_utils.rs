@@ -887,3 +887,29 @@ pub(crate) async fn answer_iq(
     }
     delivered
 }
+
+/// A structurally valid session for tests of registration and address metadata.
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn synthetic_serialized_session(
+    remote_registration: u32,
+    base: Option<&[u8]>,
+) -> Vec<u8> {
+    use buffa::Message as _;
+    let mut session = waproto::whatsapp::SessionStructure::default();
+    session.session_version = Some(3);
+    let mut local = vec![5];
+    local.extend_from_slice(&[0x11; 32]);
+    let mut remote = vec![5];
+    remote.extend_from_slice(&[0x22; 32]);
+    session.local_identity_public = Some(local);
+    session.remote_identity_public = Some(remote);
+    session.root_key = Some(vec![0x33; 32]);
+    session.previous_counter = Some(0);
+    session.local_registration_id = Some(0);
+    session.remote_registration_id = Some(remote_registration);
+    session.alice_base_key = base.map(<[u8]>::to_vec);
+    let mut record = waproto::whatsapp::RecordStructure::default();
+    record.current_session = buffa::MessageField::some(session);
+    record.encode_to_vec()
+}

@@ -295,7 +295,7 @@ impl Client {
             })?;
             authenticated_primary_identity(bundle)?
         };
-        let key: [u8; 32] = identity.public_key().public_key_bytes().try_into()?;
+        let key = *identity.public_key().public_key_bytes();
         let backend = self.persistence_manager.backend();
         if !self
             .signal_cache
@@ -1249,7 +1249,7 @@ mod tests {
                 .await
                 .unwrap();
             if valid {
-                let key: [u8; 32] = account.public_key.public_key_bytes().try_into().unwrap();
+                let key: [u8; 32] = *account.public_key.public_key_bytes();
                 assert_eq!(result.unwrap(), key);
                 assert_eq!(persisted, Some(key));
                 let sent_before_warm_lookup = transport.sent_count();
@@ -1294,7 +1294,7 @@ mod tests {
             .persistence_manager
             .process_command(DeviceCommand::SetAccount(Some(certificate)))
             .await;
-        let key: [u8; 32] = account.public_key.public_key_bytes().try_into().unwrap();
+        let key: [u8; 32] = *account.public_key.public_key_bytes();
         assert_eq!(
             client
                 .ensure_adv_account_identity(&own.with_device(7))

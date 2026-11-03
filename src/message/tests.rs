@@ -16109,14 +16109,14 @@ fn a_backend_error_is_storage_not_a_signal_failure() {
     );
     assert_eq!(
         signal_error_reason(&SignalProtocolError::InvalidSessionStructure(
-            "cannot decrypt without remote identity key"
+            "cannot decrypt without remote identity key".into()
         )),
         EncDecryptFailureReason::StorageFailure,
         "a session record that decoded without usable state is our row too",
     );
     assert_eq!(
         signal_error_reason(&SignalProtocolError::InvalidSessionStructure(
-            "receiver chain is closed"
+            "receiver chain is closed".into()
         )),
         EncDecryptFailureReason::SignalError,
         "but a chain we closed is a fact about the message — libsignal's \

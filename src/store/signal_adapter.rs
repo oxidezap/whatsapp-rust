@@ -948,26 +948,23 @@ mod tests {
     }
 
     fn outbound_session() -> (SessionRecord, IdentityKeyPair) {
-        use wacore::libsignal::protocol::{
-            AliceSignalProtocolParameters, KeyPair, UsePQRatchet, initialize_alice_session_record,
-        };
+        use wacore::libsignal::protocol::{ChainKey, KeyPair, RootKey, SessionState};
 
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let local_identity = IdentityKeyPair::generate(&mut rng);
         let remote_identity = IdentityKeyPair::generate(&mut rng);
         let remote_signed_prekey = KeyPair::generate(&mut rng);
-        let parameters = AliceSignalProtocolParameters::new(
-            local_identity.clone(),
-            KeyPair::generate(&mut rng),
-            *remote_identity.identity_key(),
-            remote_signed_prekey.public_key,
-            remote_signed_prekey.public_key,
-            UsePQRatchet::No,
+        let mut state = SessionState::new(
+            3,
+            local_identity.identity_key(),
+            remote_identity.identity_key(),
+            &RootKey::new([0x41; 32]),
+            &remote_signed_prekey.public_key,
         );
-        (
-            initialize_alice_session_record(&parameters, &mut rng).expect("valid session"),
-            local_identity,
-        )
+        state
+            .set_sender_chain(&KeyPair::generate(&mut rng), &ChainKey::new([0x42; 32], 0))
+            .expect("valid synthetic sending chain");
+        (SessionRecord::new(state), local_identity)
     }
 
     async fn cancel_encrypt_after_checkout(seed_durable: bool) {

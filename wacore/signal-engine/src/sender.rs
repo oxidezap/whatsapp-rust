@@ -3,7 +3,7 @@
 use crate::{
     CryptoProvider, Engine, Error, RandomSource, Result,
     state::*,
-    wire::{SenderKeyDistribution, SenderKeyMessage},
+    wire::{SenderKeyDistribution, SenderKeyMessage, SenderKeyMessageView},
 };
 use std::collections::VecDeque;
 use zeroize::Zeroize;
@@ -77,7 +77,7 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
             };
             record.states.insert(0, state);
             record.states.truncate(MAX_SENDER_STATES);
-            record.reservation = Reservation::default();
+            record.reservation.reset_chain();
         }
         let state = record.states.first().ok_or(Error::MissingKey)?;
         Ok(SenderKeyDistribution {
@@ -94,31 +94,28 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         input: &[u8],
     ) -> Result<()> {
         let distribution = SenderKeyDistribution::decode(input)?;
-        if let Some(old) = record.states.iter().find(|s| s.id == distribution.id) {
-            if old.signing_public != distribution.signing_key {
-                return Err(Error::IdentityChanged);
-            }
-            // Replayed distributions cannot rewind a consumed chain or its keys.
-            if distribution.iteration <= old.iteration {
-                return Ok(());
-            }
-        }
-        let mut next = record.clone();
-        next.states.retain(|state| state.id != distribution.id);
-        next.states.insert(
-            0,
-            SenderKeyState {
-                id: distribution.id,
-                iteration: distribution.iteration,
-                chain_key: distribution.chain_key,
-                signing_public: distribution.signing_key,
-                signing_private: None,
-                skipped: VecDeque::new(),
-            },
-        );
-        next.states.truncate(MAX_SENDER_STATES);
-        next.reservation = Reservation::default();
-        *record = next;
+        // Preserve this client's established distribution policy: a repeated
+        // authenticated signing identity cannot discard its consumed position
+        // or skipped keys, even when the advertised iteration is newer.
+        let retained = record
+            .states
+            .iter()
+            .position(|state| {
+                state.id == distribution.id && state.signing_public == distribution.signing_key
+            })
+            .map(|index| record.states.remove(index));
+        record.states.retain(|state| state.id != distribution.id);
+        let state = retained.unwrap_or_else(|| SenderKeyState {
+            id: distribution.id,
+            iteration: distribution.iteration,
+            chain_key: distribution.chain_key,
+            signing_public: distribution.signing_key,
+            signing_private: None,
+            skipped: VecDeque::new(),
+        });
+        record.states.insert(0, state);
+        record.states.truncate(MAX_SENDER_STATES);
+        record.reservation.reset_chain();
         Ok(())
     }
     /// Prepared output must be published only after the caller persists the state.
@@ -151,7 +148,7 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         record: &mut SenderKeyRecord,
         input: &[u8],
     ) -> Result<Vec<u8>> {
-        let message = SenderKeyMessage::decode(input)?;
+        let message = SenderKeyMessageView::decode(input)?;
         let index = record
             .states
             .iter()

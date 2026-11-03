@@ -213,7 +213,7 @@ impl Drop for ChainAdvance {
 #[derive(Clone, PartialEq, Eq)]
 pub struct PendingPreKey {
     pub pre_key_id: Option<u32>,
-    pub signed_pre_key_id: i32,
+    pub signed_pre_key_id: Option<i32>,
     pub base_key: [u8; 32],
     pub kyber_pre_key_id: Option<u32>,
     pub kyber_ciphertext: Option<Vec<u8>>,
@@ -232,6 +232,8 @@ pub struct SessionState {
     pub remote_registration: u32,
     pub needs_refresh: bool,
     pub alice_base_key: Option<[u8; 32]>,
+    /// Retry collision records compare these bytes with a separately persisted key.
+    pub alice_base_key_tagged: bool,
     /// Retained opaque legacy key-exchange protobuf, unused by v3 sessions.
     pub pending_key_exchange: Option<Vec<u8>>,
 }
@@ -245,6 +247,7 @@ pub struct Reservation {
     pub ceiling: Option<u32>,
     pub incarnation: Option<[u8; 16]>,
     pub(crate) committed: bool,
+    pub(crate) waived: bool,
 }
 impl Reservation {
     pub fn prepare(&mut self, next_counter: u32, count: u32, incarnation: [u8; 16]) -> Result<u32> {
@@ -260,6 +263,7 @@ impl Reservation {
         self.ceiling = Some(ceiling);
         self.incarnation = Some(incarnation);
         self.committed = false;
+        self.waived = false;
         Ok(ceiling)
     }
     /// Call only after the bytes containing this reservation have durably committed.
@@ -267,7 +271,28 @@ impl Reservation {
         self.committed = true;
     }
     pub fn permits(&self, index: u32) -> bool {
-        self.committed && self.ceiling.is_some_and(|ceiling| index < ceiling)
+        self.waived || self.committed && self.ceiling.is_some_and(|ceiling| index < ceiling)
+    }
+    /// Opt out only when the host supplies its own persistence-before-publication
+    /// guarantee. Materialize any existing ceiling before calling this method.
+    pub fn waive(&mut self) {
+        self.ceiling = None;
+        self.incarnation = None;
+        self.committed = false;
+        self.waived = true;
+    }
+    pub fn is_waived(&self) -> bool {
+        self.waived
+    }
+    pub fn reset_chain(&mut self) {
+        let waived = self.waived;
+        *self = Self::default();
+        self.waived = waived;
+    }
+    /// A fresh DH chain has new key material. The existing record reservation
+    /// still covers its first batch; retaining that fact avoids a flush per reply.
+    pub fn rebase(&mut self) {
+        self.ceiling = self.ceiling.map(|ceiling| ceiling.min(64));
     }
 }
 #[derive(Clone, PartialEq, Eq)]
@@ -289,6 +314,28 @@ pub struct SessionRecord {
     pub reservation: Reservation,
 }
 impl SessionRecord {
+    /// Burn the current chain's unspent reservation before it becomes an archive.
+    pub fn materialize_reservation<C: CryptoProvider>(&mut self, crypto: &C) -> Result<()> {
+        let Some(chain) = self
+            .current
+            .as_mut()
+            .and_then(|state| state.sender.as_mut())
+        else {
+            return Ok(());
+        };
+        let target = self.reservation.ceiling.unwrap_or(0);
+        if chain.exhausted || chain.index >= target {
+            return Ok(());
+        }
+        if target - chain.index > PEER_FUTURE_LIMIT {
+            return Err(Error::Encoding("reservation burn exceeds limit"));
+        }
+        while chain.index < target {
+            chain.key = crypto.hmac_sha256(&chain.key, &[2]);
+            chain.index += 1;
+        }
+        Ok(())
+    }
     pub fn install(&mut self, state: SessionState) {
         if let Some(old) = self.current.replace(state) {
             self.previous.insert(
@@ -299,7 +346,7 @@ impl SessionRecord {
             );
             self.previous.truncate(MAX_ARCHIVED_SESSIONS);
         }
-        self.reservation = Reservation::default();
+        self.reservation.reset_chain();
     }
 }
 #[derive(Clone, PartialEq, Eq)]

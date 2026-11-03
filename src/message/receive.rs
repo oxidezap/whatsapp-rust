@@ -650,11 +650,7 @@ impl Client {
                 let Ok(message) = PreKeySignalMessage::try_from(payload.ciphertext.clone()) else {
                     continue;
                 };
-                let Ok(identity) =
-                    <[u8; 32]>::try_from(message.identity_key().public_key().public_key_bytes())
-                else {
-                    return;
-                };
+                let identity = *message.identity_key().public_key().public_key_bytes();
                 drop(message);
                 if self
                     .validate_incoming_companion_identity(
@@ -2918,7 +2914,7 @@ mod adv_tests {
         let device = wacore::libsignal::protocol::KeyPair::generate(&mut rand::make_rng::<
             rand::rngs::StdRng,
         >());
-        let identity: [u8; 32] = device.public_key.public_key_bytes().try_into().unwrap();
+        let identity: [u8; 32] = *device.public_key.public_key_bytes();
         assert!(
             client
                 .validate_incoming_companion_identity(&sender, None, &identity)
