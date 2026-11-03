@@ -198,6 +198,11 @@ impl RelayStack {
                 DtlsEndpointEvent::ApplicationData(sctp_packet) => {
                     self.feed_association(now, sctp_packet.freeze());
                 }
+                DtlsEndpointEvent::PeerClosed => {
+                    self.stopped = true;
+                    self.open = false;
+                    return Err(StackError::PeerClosed("close_notify".to_owned()));
+                }
                 // The event set is non-exhaustive by design, and a variant this transport has never
                 // heard of carries nothing it could act on.
                 _ => {}
@@ -1691,6 +1696,12 @@ mod stack {
             RelayDisconnectReason::from(e),
             RelayDisconnectReason::Closed
         ));
+        assert!(!pair.client.is_open());
+        assert!(
+            pair.client
+                .write_media(pair.now, &Bytes::from_static(b"closed"))
+                .is_err()
+        );
     }
 
     /// Garbage on the wire is one lost datagram, not a lost call: the socket is connected to the
