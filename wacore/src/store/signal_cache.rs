@@ -1746,17 +1746,13 @@ impl SignalStoreCache {
         if previous.as_deref().is_some_and(|known| known != data) {
             return Ok(false);
         }
-        if let Err(error) = backend.put_identity(address.as_str(), key).await {
-            // A host may report failure after committing. Do not retain a
-            // negative cache entry that could permit a different bootstrap key
-            // to overwrite that uncertain write on the next attempt.
-            if previous.is_none() {
-                state.cache.remove(address.as_str());
-            }
-            return Err(error.into());
-        }
+        // Pin the authenticated anchor before storage can commit. Dropping its
+        // waiter need not stop a host's write; keep this entry dirty on error
+        // or cancellation so another bootstrap cannot authorize a different key
+        // and a later flush can retry persistence. Dirty entries are not evicted.
         let _change = self.identity_write_change(&state, address, data);
         state.put_dedup(address.as_str(), data);
+        backend.put_identity(address.as_str(), key).await?;
         state.dirty.remove(address.as_str());
         state.deleted.remove(address.as_str());
         state.evict_if_needed(self.max_entries);
@@ -6231,6 +6227,8 @@ mod cold_read_race_tests {
         session: SyncMutex<Option<Vec<u8>>>,
         identity: SyncMutex<Option<[u8; 32]>>,
         fail_identity_after_write: AtomicBool,
+        pause_identity_write: AtomicBool,
+        pending_identity: SyncMutex<Option<[u8; 32]>>,
     }
 
     impl GatedColdRead {
@@ -6243,6 +6241,8 @@ mod cold_read_race_tests {
                 session: SyncMutex::new(None),
                 identity: SyncMutex::new(None),
                 fail_identity_after_write: AtomicBool::new(false),
+                pause_identity_write: AtomicBool::new(false),
+                pending_identity: SyncMutex::new(None),
             }
         }
 
@@ -6290,6 +6290,10 @@ mod cold_read_race_tests {
         }
 
         async fn put_identity(&self, _: &str, key: [u8; 32]) -> StoreResult<()> {
+            if self.pause_identity_write.load(Ordering::Relaxed) {
+                *self.pending_identity.lock().unwrap() = Some(key);
+                std::future::pending::<()>().await;
+            }
             *self.identity.lock().unwrap_or_else(|p| p.into_inner()) = Some(key);
             if self.fail_identity_after_write.load(Ordering::Relaxed) {
                 return Err(
@@ -6340,6 +6344,74 @@ mod cold_read_race_tests {
         async fn delete_sender_key(&self, _: &str) -> StoreResult<()> {
             unreachable!()
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_bootstrap_write_cannot_replace_a_saved_primary() {
+        let mut outcomes = Vec::new();
+        // Commit before cancellation, after it, or after the replacement attempt.
+        for commit_point in 0..3 {
+            let backend = GatedColdRead::new(0);
+            let cache = SignalStoreCache::new();
+            let address = ProtocolAddress::new("19990000071", 0.into());
+            assert!(
+                cache
+                    .get_identity(&address, &backend)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            backend.pause_identity_write.store(true, Ordering::Relaxed);
+            let mut write =
+                Box::pin(cache.persist_identity_if_absent_or_equal(&address, &[1; 32], &backend));
+            assert!(futures::poll!(write.as_mut()).is_pending());
+            let pending = backend.pending_identity.lock().unwrap().take().unwrap();
+            assert_eq!(pending, [1; 32]);
+            if commit_point == 0 {
+                *backend.identity.lock().unwrap() = Some(pending);
+            }
+            drop(write);
+            if commit_point == 1 {
+                // Detached storage work may finish after its waiter is gone.
+                *backend.identity.lock().unwrap() = Some(pending);
+            }
+            backend.pause_identity_write.store(false, Ordering::Relaxed);
+            let accepted = cache
+                .persist_identity_if_absent_or_equal(&address, &[2; 32], &backend)
+                .await
+                .unwrap();
+            if commit_point == 2 {
+                *backend.identity.lock().unwrap() = Some(pending);
+            }
+            outcomes.push((
+                accepted,
+                backend.load_identity(address.as_str()).await.unwrap(),
+                cache
+                    .get_identity(&address, &backend)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .to_vec(),
+            ));
+            {
+                let mut state = cache.identities.lock().await;
+                assert!(state.dirty.contains(address.as_str()));
+                state.evict_if_needed(0);
+                assert!(state.cache.get(address.as_str()).is_some());
+            }
+            cache.flush(&backend).await.unwrap();
+            cache.clear_after_flush().await;
+            assert_eq!(
+                cache
+                    .get_identity(&address, &backend)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .as_ref(),
+                &[1; 32]
+            );
+        }
+        assert_eq!(outcomes, vec![(false, Some([1; 32]), vec![1; 32]); 3]);
     }
 
     #[tokio::test]
