@@ -6727,6 +6727,22 @@ mod cold_read_race_tests {
             cache.try_get_identity(&address).unwrap().unwrap().as_ref(),
             &[3; 32]
         );
+        cache
+            .flush(&*backend)
+            .await
+            .expect("flush retried identity");
+        cache.drop_clean_identity_for_test(address.as_str()).await;
+        assert_eq!(
+            cache
+                .get_identity(&address, &*backend)
+                .await
+                .expect("cold reload")
+                .expect("identity present")
+                .as_ref(),
+            &[3; 32],
+            "the retried replacement must reload from the backend"
+        );
+        assert_eq!(backend.reads(), 3, "the final read must miss the cache");
     }
 
     /// `clear_after_flush` cannot name the keys it drops, so it takes the
