@@ -3645,9 +3645,9 @@ dependencies = [
 
 [[package]]
 name = "rtc-datachannel"
-version = "0.21.0-beta.2"
+version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0180e434128b3a3e9d8552ea958fd588839266cf08a2625741fbe65c292d1cb8"
+checksum = "8d93dd81014535ff0134c0f19dbccfbae4d5ceb6010cf917c1a6056ea2c0d9bb"
 dependencies = [
  "bytes",
  "log",
@@ -3658,9 +3658,9 @@ dependencies = [
 
 [[package]]
 name = "rtc-dtls"
-version = "0.21.0-beta.2"
+version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6cb87e1ec1b828914aace884307974a9ed40747e2f6ccaab93a4fff42528a73"
+checksum = "0a2fe5767d6caf61018d52189b3b8e37075799eeb81cd5ab452307c7e7ebd97e"
 dependencies = [
  "bytecheck",
  "byteorder",
@@ -3678,9 +3678,9 @@ dependencies = [
 
 [[package]]
 name = "rtc-sctp"
-version = "0.21.0-beta.2"
+version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d9dabdca726a7c5eed4d4ae5f3f9d4e9baf7a2ed53efaedaae35b4bcc24bc2a"
+checksum = "2eb430b379d90e7984306036d1646454a26b300c9c3256009eb8f7e0615e90b9"
 dependencies = [
  "bytes",
  "crc32c",

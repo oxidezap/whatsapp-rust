@@ -223,7 +223,7 @@ impl RelayStack {
         };
         assoc
             .stream(MEDIA_STREAM_ID)
-            .and_then(|mut s| s.write_chunk_with_ppi(data, ppi))
+            .and_then(|mut s| s.write_chunk_with_ppi(now, data, ppi))
             .map_err(|e| StackError::Failed(format!("media write: {e}")))?;
         self.pump(now)
     }
