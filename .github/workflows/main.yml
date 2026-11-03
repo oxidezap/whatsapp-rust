@@ -443,7 +443,7 @@ jobs:
       # ref, a Rust release that does not exist — and every pull request in the
       # repository failed at `rustup`, before a line was compiled. The
       # `dependabot.yml` entry beside this one is what keeps the pin ours.
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: dtolnay/rust-toolchain@1.95.0
       # The pre-built nextest binary is toolchain-independent — it drives this
       # MSRV cargo the same way it drives the nightly one.
       - name: Install protoc and cargo-nextest
@@ -464,7 +464,7 @@ jobs:
       # needed nightly. There is no SIMD in the tree any more and no feature
       # gating it, so this now runs what ships. One nextest invocation retains
       # one complete JUnit report and, unlike the host xtask, remains buildable
-      # by the published Rust 1.94 floor.
+      # by the published Rust 1.95 floor.
       - name: Test stable core crates
         run: cargo nextest run -p wacore-binary -p wacore-appstate -p wacore --lib
       # `rust-version` is published metadata for every member, but only the
@@ -479,7 +479,7 @@ jobs:
           -p whatsapp-rust-ureq-http-client
           -p whatsapp-rust-sqlite-storage -p whatsapp-rust-tokio-transport
       # Standalone API hosts run in consumers.yml through the central xtask
-      # registry; its driver uses nightly while each MSRV host uses 1.94.1.
+      # registry; its driver uses nightly while each MSRV host uses 1.95.0.
       - name: Publish test timings
         if: always()
         uses: actions/upload-artifact@v7

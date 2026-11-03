@@ -49,7 +49,7 @@ output directory; the original gate remains authoritative. Main measurements
 keep full attribution and LLVM-line metrics.
 
 `cargo xt ci consumers run --lane native` runs the standalone public API profiles
-in `tests/api-consumer`; `--lane msrv --toolchain 1.94.1` and `--lane wasm`
+in `tests/api-consumer`; `--lane msrv --toolchain 1.95.0` and `--lane wasm`
 select the other gates. The single lock is mandatory. Directed negatives share
 one validator for error code, message and primary source. There is no staging
 exemption for missing fixtures. Add new contracts to an existing domain module.

@@ -66,7 +66,7 @@ default-members = [
 edition = "2024"
 license = "MIT"
 publish = false
-rust-version = "1.94"
+rust-version = "1.95"
 
 [workspace.lints.clippy]
 # Force the wacore::time abstraction so WASM/deterministic-test builds don't
@@ -314,7 +314,7 @@ rtc-sctp = { version = "=0.21.0-beta.2", optional = true }
 # in public signatures and none of them re-exports it, so a caller that has to name a transport
 # protocol or tell a peer close apart from a corrupt datagram needs it directly. Adds no crate to
 # the tree; it is already there under the other three.
-rtc-shared = { version = "=0.21.0-beta.2", optional = true, default-features = false }
+rtc-shared = { version = "=0.21.1", optional = true, default-features = false }
 scopeguard = "1.2"
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }

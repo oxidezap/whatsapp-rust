@@ -33,12 +33,12 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      # xtask has a higher tooling floor than the published crates. Build the
-      # driver once with nightly, then it explicitly selects the host toolchain.
+      # Build the driver once with the pinned nightly, then it explicitly
+      # selects the host toolchain so MSRV checks use the declared floor.
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-16
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: dtolnay/rust-toolchain@1.95.0
         if: matrix.lane == 'msrv'
       - name: Install protoc and cargo-nextest
         uses: taiki-e/install-action@v2
@@ -66,4 +66,4 @@ jobs:
         if: matrix.lane == 'msrv'
         env:
           CARGO_BUILD_JOBS: "2"
-        run: target/debug/whatsapp-xtask ci consumers run --lane msrv --toolchain 1.94.1
+        run: target/debug/whatsapp-xtask ci consumers run --lane msrv --toolchain 1.95.0
