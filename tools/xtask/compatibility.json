@@ -7,6 +7,7 @@
     {"package":"whatsapp-rust","name":"plugins","defaults":false,"features":["plugins"],"wasm":true},
     {"package":"whatsapp-rust","name":"voip-control","defaults":false,"features":["voip-control"],"wasm":true},
     {"package":"whatsapp-rust","name":"voip-runtime","defaults":false,"features":["voip-runtime"],"wasm":true},
+    {"package":"whatsapp-rust","name":"voip-relay-native","defaults":false,"features":["voip-relay-native"],"wasm":false},
     {"package":"whatsapp-rust","name":"voip-mlow","defaults":false,"features":["voip-mlow"],"wasm":true},
     {"package":"wacore","name":"minimal","defaults":false,"features":[],"wasm":true},
     {"package":"wacore","name":"default","defaults":true,"features":[],"wasm":true},
