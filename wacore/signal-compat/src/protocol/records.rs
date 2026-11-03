@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 use super::error::Result;
 use super::*;
-use std::collections::VecDeque;
+use std::sync::Arc;
 use wacore_signal_engine::{self as engine, CryptoProvider};
 use zeroize::{Zeroize, Zeroizing};
 pub(crate) fn raw_pair(pair: &KeyPair) -> engine::KeyPair {
@@ -171,20 +171,14 @@ impl SessionState {
     pub fn remote_identity_key(&self) -> Result<Option<IdentityKey>> {
         Ok(Some(IdentityKey::new(public(&self.inner.remote_identity)?)))
     }
-    pub fn set_sender_chain(&mut self, key: &KeyPair, chain: &ChainKey) -> Result<()> {
-        self.inner.sender = Some(engine::Chain::new(
+    pub fn set_sender_chain(&mut self, key: &KeyPair, chain: &ChainKey) {
+        let mut sender = engine::Chain::new(
             *key.public_key.public_key_bytes(),
             Some(*key.private_key.serialize()),
             chain.key,
-        ));
-        self.inner
-            .sender
-            .as_mut()
-            .ok_or(SignalProtocolError::InvalidSessionStructure(
-                "sender absent".into(),
-            ))?
-            .index = chain.index;
-        Ok(())
+        );
+        sender.index = chain.index;
+        self.inner.sender = Some(sender);
     }
     pub fn get_sender_chain_key(&self) -> Result<ChainKey> {
         let chain =
@@ -523,7 +517,7 @@ impl SessionRecord {
                 .inner
                 .previous
                 .iter()
-                .map(|s| s.encoded().len())
+                .map(|s| s.encoded().len() + 2 * size_of::<usize>())
                 .sum::<usize>()
             + self.current.as_ref().map_or(0, |s| {
                 let state = &s.inner;
@@ -532,7 +526,14 @@ impl SessionRecord {
                         .receivers
                         .iter()
                         .chain(state.sender.iter())
-                        .map(|c| c.skipped.capacity() * size_of::<engine::MessageKey>())
+                        .map(|c| {
+                            c.skipped.allocation_overhead()
+                                + c.skipped.capacity() * size_of::<engine::MessageKey>()
+                                + c.skipped
+                                    .iter()
+                                    .map(engine::MessageKey::extra_heap_bytes)
+                                    .sum::<usize>()
+                        })
                         .sum::<usize>()
                     + state.pending_key_exchange.as_ref().map_or(0, Vec::capacity)
                     + state
@@ -686,6 +687,7 @@ impl GenericSignedPreKey for SignedPreKeyRecord {
 pub struct SenderKeyRecord {
     pub(crate) inner: engine::SenderKeyRecord,
     wire_gated: bool,
+    group_crypto: Option<Arc<group_crypto::GroupCryptoCache>>,
 }
 impl SenderKeyRecord {
     pub fn new_empty() -> Self {
@@ -713,16 +715,43 @@ impl SenderKeyRecord {
         Ok(Self {
             inner: engine::codec::decode_sender_key_record(&engine::RustCrypto, bytes)?,
             wire_gated: false,
+            group_crypto: None,
         })
     }
     pub fn deserialize_for_store(bytes: &[u8], token: &[u8; 16]) -> Result<Self> {
         Ok(Self {
             inner: engine::codec::decode_sender_key_record_live(&engine::RustCrypto, bytes, token)?,
             wire_gated: false,
+            group_crypto: None,
         })
     }
     pub fn serialize(&self) -> Result<Vec<u8>> {
         Ok(engine::codec::encode_sender_key_record(&self.inner))
+    }
+    pub(crate) fn prune_prepared_crypto(&self) {
+        if let Some(cache) = &self.group_crypto {
+            cache.retain(|public, private| {
+                self.inner.states.iter().any(|state| {
+                    state.signing_public == *public
+                        && group_crypto::private_keys_match(state.signing_private.as_ref(), private)
+                })
+            });
+        }
+    }
+    pub(crate) fn prepared_crypto(
+        &mut self,
+        index: usize,
+    ) -> Result<group_crypto::PreparedGroupProvider> {
+        self.prune_prepared_crypto();
+        let state = self
+            .inner
+            .states
+            .get(index)
+            .ok_or(SignalProtocolError::InvalidSenderKeySession)?;
+        let cache = self
+            .group_crypto
+            .get_or_insert_with(|| Arc::new(group_crypto::GroupCryptoCache::default()));
+        Ok(cache.provider(&state.signing_public, state.signing_private.as_ref())?)
     }
     pub fn serialize_for_store(&self, token: &[u8; 16]) -> Result<Vec<u8>> {
         Ok(engine::codec::encode_sender_key_record_for_store(
@@ -751,8 +780,15 @@ impl SenderKeyRecord {
                 .inner
                 .states
                 .iter()
-                .map(|s| s.skipped.capacity() * size_of::<engine::SenderMessageKey>())
+                .map(|s| {
+                    s.skipped.allocation_overhead()
+                        + s.skipped.capacity() * size_of::<engine::SenderMessageKey>()
+                })
                 .sum::<usize>()
+            + self
+                .group_crypto
+                .as_ref()
+                .map_or(0, |cache| cache.estimated_heap_bytes())
     }
     pub fn add_sender_key_state(
         &mut self,
@@ -778,10 +814,11 @@ impl SenderKeyRecord {
                     .map_err(|_| SignalProtocolError::InvalidSenderKeySession)?,
                 signing_public: *public.public_key_bytes(),
                 signing_private: private.map(|p| *p.serialize()),
-                skipped: VecDeque::new(),
+                skipped: engine::SharedDeque::new(),
             },
         );
         self.inner.states.truncate(engine::MAX_SENDER_STATES);
+        self.prune_prepared_crypto();
         Ok(())
     }
     pub fn sender_key_state(&self) -> Result<SenderKeyState<'_>> {

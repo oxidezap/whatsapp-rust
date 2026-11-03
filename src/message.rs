@@ -706,7 +706,13 @@ fn signal_error_reason(e: &SignalProtocolError) -> EncDecryptFailureReason {
         EncDecryptFailureReason::MalformedCiphertext
     } else if matches!(e, SignalProtocolError::BackendError(_, _)) {
         EncDecryptFailureReason::StorageFailure
-    } else if matches!(e, SignalProtocolError::KeyAgreementFailed(_)) {
+    } else if matches!(
+        e,
+        SignalProtocolError::KeyAgreementFailed(_)
+            | SignalProtocolError::Crypto(
+                wacore::libsignal::crypto::CryptoProviderError::BackendFailed
+            )
+    ) {
         // "the active crypto provider failed the key agreement" — our provider,
         // not the sender's bytes, which were never judged.
         EncDecryptFailureReason::LocalCryptoFailure

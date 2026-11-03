@@ -42,6 +42,9 @@ struct Identity {
     pair: IdentityKeyPair,
     known: HashMap<ProtocolAddress, IdentityKey>,
     fail_save: bool,
+    block_save: bool,
+    save_calls: usize,
+    only_trusted: Option<IdentityKey>,
 }
 #[async_trait]
 impl IdentityKeyStore for Identity {
@@ -56,6 +59,7 @@ impl IdentityKeyStore for Identity {
         address: &ProtocolAddress,
         identity: &IdentityKey,
     ) -> error::Result<IdentityChange> {
+        self.save_calls += 1;
         if self.fail_save {
             return Err(SignalProtocolError::InvalidState(
                 "test",
@@ -63,6 +67,9 @@ impl IdentityKeyStore for Identity {
             ));
         }
         let old = self.known.insert(address.clone(), *identity);
+        if self.block_save {
+            std::future::pending::<()>().await;
+        }
         Ok(match old {
             Some(previous) if previous != *identity => IdentityChange::ReplacedExistingWithKeys {
                 previous,
@@ -74,10 +81,10 @@ impl IdentityKeyStore for Identity {
     async fn is_trusted_identity(
         &self,
         _: &ProtocolAddress,
-        _: &IdentityKey,
+        identity: &IdentityKey,
         _: Direction,
     ) -> error::Result<bool> {
-        Ok(true)
+        Ok(self.only_trusted.is_none_or(|trusted| trusted == *identity))
     }
     async fn get_identity(&self, address: &ProtocolAddress) -> error::Result<Option<IdentityKey>> {
         Ok(self.known.get(address).copied())
@@ -127,11 +134,17 @@ fn setup(rng: &mut rand::rngs::StdRng) -> (Identity, Identity, PreKeyBundle, Key
         pair: IdentityKeyPair::generate(rng),
         known: HashMap::new(),
         fail_save: false,
+        block_save: false,
+        save_calls: 0,
+        only_trusted: None,
     };
     let b = Identity {
         pair: IdentityKeyPair::generate(rng),
         known: HashMap::new(),
         fail_save: false,
+        block_save: false,
+        save_calls: 0,
+        only_trusted: None,
     };
     let signed = KeyPair::generate(rng);
     let otp = KeyPair::generate(rng);
@@ -493,4 +506,333 @@ fn raw_base_key_storage_encoding_is_preserved_for_retry_side_table() {
         base.public_key.public_key_bytes()
     );
     assert_eq!(loaded.serialize().unwrap(), encoded);
+}
+
+struct SignalFixture {
+    a: Identity,
+    b: Identity,
+    a_sessions: Sessions,
+    b_sessions: Sessions,
+    keys: Keys,
+    bundle: PreKeyBundle,
+    aa: ProtocolAddress,
+    ba: ProtocolAddress,
+    rng: rand::rngs::StdRng,
+    late_prekey: CiphertextMessage,
+}
+async fn established_signal_fixture(seed: u64) -> SignalFixture {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let (mut a, mut b, bundle, keys) = setup(&mut rng);
+    let (mut a_sessions, mut b_sessions) = (Sessions::default(), Sessions::default());
+    let aa = ProtocolAddress::new("alice.invalid", 1.into());
+    let ba = ProtocolAddress::new("bob.invalid", 1.into());
+    process_prekey_bundle(
+        &ba,
+        &mut a_sessions,
+        &mut a,
+        &bundle,
+        &mut rng,
+        UsePQRatchet::No,
+    )
+    .await
+    .unwrap();
+    let first = message_encrypt(b"first", &ba, &mut a_sessions, &mut a)
+        .await
+        .unwrap();
+    message_decrypt(
+        &first,
+        &aa,
+        &mut b_sessions,
+        &mut b,
+        &mut keys.clone_for_prekey(),
+        &keys,
+        &mut rng,
+        UsePQRatchet::No,
+    )
+    .await
+    .unwrap();
+    let late_prekey = message_encrypt(b"delayed prekey", &ba, &mut a_sessions, &mut a)
+        .await
+        .unwrap();
+    let response = message_encrypt(b"response", &aa, &mut b_sessions, &mut b)
+        .await
+        .unwrap();
+    message_decrypt(
+        &response,
+        &ba,
+        &mut a_sessions,
+        &mut a,
+        &mut keys.clone_for_prekey(),
+        &keys,
+        &mut rng,
+        UsePQRatchet::No,
+    )
+    .await
+    .unwrap();
+    SignalFixture {
+        a,
+        b,
+        a_sessions,
+        b_sessions,
+        keys,
+        bundle,
+        aa,
+        ba,
+        rng,
+        late_prekey,
+    }
+}
+async fn replace_sending_identity(f: &mut SignalFixture) -> IdentityKey {
+    let (mut replacement, _, _, _) = setup(&mut f.rng);
+    let mut sessions = Sessions::default();
+    process_prekey_bundle(
+        &f.ba,
+        &mut sessions,
+        &mut replacement,
+        &f.bundle,
+        &mut f.rng,
+        UsePQRatchet::No,
+    )
+    .await
+    .unwrap();
+    let message = message_encrypt(
+        b"replacement identity",
+        &f.ba,
+        &mut sessions,
+        &mut replacement,
+    )
+    .await
+    .unwrap();
+    let result = message_decrypt(
+        &message,
+        &f.aa,
+        &mut f.b_sessions,
+        &mut f.b,
+        &mut f.keys.clone_for_prekey(),
+        &f.keys,
+        &mut f.rng,
+        UsePQRatchet::No,
+    )
+    .await
+    .unwrap();
+    assert!(result.identity_change.is_changed());
+    *replacement.pair.identity_key()
+}
+#[test]
+fn ordinary_signal_decrypt_promotes_persisted_archive_without_current() {
+    run(async {
+        let mut f = established_signal_fixture(910).await;
+        let packet = message_encrypt(b"archive only", &f.ba, &mut f.a_sessions, &mut f.a)
+            .await
+            .unwrap();
+        let record = f.b_sessions.0.get_mut(&f.aa).unwrap();
+        record.archive_current_state().unwrap();
+        let encoded = record.serialize().unwrap();
+        *record = SessionRecord::deserialize(&encoded).unwrap();
+        assert!(record.session_state().is_none());
+        f.b.known.remove(&f.aa);
+        let saves = f.b.save_calls;
+        let result = message_decrypt(
+            &packet,
+            &f.aa,
+            &mut f.b_sessions,
+            &mut f.b,
+            &mut f.keys.clone_for_prekey(),
+            &f.keys,
+            &mut f.rng,
+            UsePQRatchet::No,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.plaintext, b"archive only");
+        assert_eq!(result.identity_change, IdentityChange::NewOrUnchanged);
+        assert!(f.b_sessions.0[&f.aa].session_state().is_some());
+        assert_eq!(f.b.known.get(&f.aa), Some(f.a.pair.identity_key()));
+        assert_eq!(f.b.save_calls, saves + 1);
+    })
+}
+#[test]
+fn ordinary_archived_identity_is_selected_before_trust_and_saved_without_rotation_event() {
+    run(async {
+        let mut f = established_signal_fixture(911).await;
+        let packet = message_encrypt(
+            b"old authenticated identity",
+            &f.ba,
+            &mut f.a_sessions,
+            &mut f.a,
+        )
+        .await
+        .unwrap();
+        let replacement = replace_sending_identity(&mut f).await;
+        assert_eq!(f.b.known.get(&f.aa), Some(&replacement));
+        f.b.only_trusted = Some(*f.a.pair.identity_key());
+        let CiphertextMessage::SignalMessage(message) = &packet else {
+            panic!("expected ordinary message");
+        };
+        let result =
+            message_decrypt_signal(message, &f.aa, &mut f.b_sessions, &mut f.b, &mut f.rng)
+                .await
+                .unwrap();
+        assert_eq!(result.plaintext, b"old authenticated identity");
+        assert_eq!(result.identity_change, IdentityChange::NewOrUnchanged);
+        assert_eq!(f.b.known.get(&f.aa), Some(f.a.pair.identity_key()));
+        assert_eq!(
+            f.b_sessions.0[&f.aa]
+                .session_state()
+                .unwrap()
+                .remote_identity_key()
+                .unwrap(),
+            Some(*f.a.pair.identity_key())
+        );
+    })
+}
+#[test]
+fn ordinary_identity_save_error_keeps_full_record_and_packet_replayable() {
+    run(async {
+        let mut f = established_signal_fixture(912).await;
+        let packet = message_encrypt(b"save retry", &f.ba, &mut f.a_sessions, &mut f.a)
+            .await
+            .unwrap();
+        let before = f.b_sessions.0[&f.aa].serialize().unwrap();
+        f.b.fail_save = true;
+        let CiphertextMessage::SignalMessage(message) = &packet else {
+            panic!("expected ordinary message");
+        };
+        assert!(matches!(
+            message_decrypt_signal(message, &f.aa, &mut f.b_sessions, &mut f.b, &mut f.rng).await,
+            Err(SignalProtocolError::InvalidState("test", _))
+        ));
+        assert_eq!(f.b_sessions.0[&f.aa].serialize().unwrap(), before);
+        f.b.fail_save = false;
+        let result = message_decrypt(
+            &packet,
+            &f.aa,
+            &mut f.b_sessions,
+            &mut f.b,
+            &mut f.keys.clone_for_prekey(),
+            &f.keys,
+            &mut f.rng,
+            UsePQRatchet::No,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.plaintext, b"save retry");
+    })
+}
+#[test]
+fn cancelling_ordinary_identity_save_returns_original_checkout_and_packet_is_replayable() {
+    run(async {
+        let mut f = established_signal_fixture(913).await;
+        let packet = message_encrypt(b"cancel retry", &f.ba, &mut f.a_sessions, &mut f.a)
+            .await
+            .unwrap();
+        let before = f.b_sessions.0[&f.aa].serialize().unwrap();
+        let mut sessions = checkout_store();
+        *sessions.record.lock().unwrap() = f.b_sessions.0.remove(&f.aa);
+        f.b.block_save = true;
+        let CiphertextMessage::SignalMessage(message) = &packet else {
+            panic!("expected ordinary message");
+        };
+        let mut future = Box::pin(message_decrypt_signal(
+            message,
+            &f.aa,
+            &mut sessions,
+            &mut f.b,
+            &mut f.rng,
+        ));
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        drop(future);
+        assert_eq!(
+            sessions.queued.as_ref().unwrap().serialize().unwrap(),
+            before
+        );
+        assert_eq!(sessions.cancelled, 0);
+        sessions.complete_session_checkout().await;
+        assert_eq!(
+            sessions
+                .record
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .serialize()
+                .unwrap(),
+            before
+        );
+        f.b.block_save = false;
+        let result = message_decrypt_signal(message, &f.aa, &mut sessions, &mut f.b, &mut f.rng)
+            .await
+            .unwrap();
+        assert_eq!(result.plaintext, b"cancel retry");
+    })
+}
+#[test]
+fn delayed_archived_prekey_updates_identity_row_without_fresh_rotation_or_prekey_use() {
+    run(async {
+        let mut f = established_signal_fixture(914).await;
+        let replacement = replace_sending_identity(&mut f).await;
+        assert_eq!(f.b.known.get(&f.aa), Some(&replacement));
+        f.b.only_trusted = Some(*f.a.pair.identity_key());
+        let mut unavailable = f.keys.clone_for_prekey();
+        unavailable.prekey.inner.id = 900;
+        unavailable.signed.inner.id = 900;
+        let result = message_decrypt(
+            &f.late_prekey,
+            &f.aa,
+            &mut f.b_sessions,
+            &mut f.b,
+            &mut unavailable.clone_for_prekey(),
+            &unavailable,
+            &mut f.rng,
+            UsePQRatchet::No,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.plaintext, b"delayed prekey");
+        assert_eq!(result.identity_change, IdentityChange::NewOrUnchanged);
+        assert_eq!(result.consumed_prekey_id, None);
+        assert_eq!(f.b.known.get(&f.aa), Some(f.a.pair.identity_key()));
+    })
+}
+
+#[test]
+fn authenticated_bad_group_ciphertext_is_not_stored_state_corruption() {
+    run(async {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1828);
+        let mut sender = Groups::default();
+        let mut receiver = Groups::default();
+        let name = SenderKeyName::from_parts("synthetic-group@g.us", "synthetic-sender:1");
+        let distribution = create_sender_key_distribution_message(&name, &mut sender, &mut rng)
+            .await
+            .unwrap();
+        process_sender_key_distribution_message(&name, &distribution, &mut receiver)
+            .await
+            .unwrap();
+        let before = receiver.records[&name].serialize().unwrap();
+        let state = &sender.records[&name].inner.states[0];
+        let mut message = wacore_signal_engine::wire::SenderKeyMessage {
+            id: state.id,
+            iteration: 0,
+            ciphertext: vec![7],
+            signature: [0; 64],
+        };
+        let private = PrivateKey::deserialize(&state.signing_private.unwrap()).unwrap();
+        message.signature = private
+            .calculate_signature(&message.unsigned(), &mut rng)
+            .unwrap();
+        let error = group_decrypt(&message.encode(), &mut receiver, &name)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SignalProtocolError::InvalidMessage(CiphertextMessageType::SenderKey, _)
+        ));
+        assert!(!error.is_stored_session_corruption());
+        assert_eq!(receiver.records[&name].serialize().unwrap(), before);
+    });
 }

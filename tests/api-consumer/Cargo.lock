@@ -1807,8 +1807,8 @@ dependencies = [
  "wacore-appstate",
  "wacore-binary",
  "wacore-derive",
- "wacore-libsignal",
  "wacore-noise",
+ "wacore-signal-runtime",
  "waproto",
  "zerocopy",
  "zeroize",
@@ -1831,7 +1831,7 @@ dependencies = [
  "subtle",
  "thiserror",
  "wacore-binary",
- "wacore-libsignal",
+ "wacore-signal-runtime",
  "waproto",
 ]
 
@@ -1863,37 +1863,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wacore-libsignal"
-version = "0.7.0"
-dependencies = [
- "aes",
- "async-lock",
- "async-trait",
- "buffa",
- "bytes",
- "cbc",
- "chrono",
- "ctr",
- "curve25519-dalek",
- "ghash",
- "hex",
- "hkdf",
- "hmac",
- "log",
- "portable-atomic",
- "rand",
- "serde",
- "sha1",
- "sha2",
- "subtle",
- "thiserror",
- "wacore-binary",
- "wacore-derive",
- "waproto",
- "x25519-dalek",
-]
-
-[[package]]
 name = "wacore-noise"
 version = "0.7.0"
 dependencies = [
@@ -1906,8 +1875,54 @@ dependencies = [
  "sha2",
  "thiserror",
  "wacore-binary",
- "wacore-libsignal",
+ "wacore-signal-runtime",
  "waproto",
+]
+
+[[package]]
+name = "wacore-signal-engine"
+version = "0.7.0"
+dependencies = [
+ "aes",
+ "cbc",
+ "curve25519-dalek",
+ "hkdf",
+ "hmac",
+ "sha2",
+ "subtle",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
+name = "wacore-signal-runtime"
+version = "0.7.0"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "async-lock",
+ "async-trait",
+ "buffa",
+ "bytes",
+ "cbc",
+ "chrono",
+ "ctr",
+ "curve25519-dalek",
+ "hex",
+ "hkdf",
+ "hmac",
+ "log",
+ "portable-atomic",
+ "rand",
+ "serde",
+ "sha2",
+ "subtle",
+ "thiserror",
+ "wacore-binary",
+ "wacore-derive",
+ "wacore-signal-engine",
+ "waproto",
+ "zeroize",
 ]
 
 [[package]]
@@ -2249,17 +2264,6 @@ name = "winnow"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
-
-[[package]]
-name = "x25519-dalek"
-version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7e8131a03190127fb2263afc72b322ecadae46b6ff8c6f399ff5d02f5559af6"
-dependencies = [
- "curve25519-dalek",
- "rand_core",
- "zeroize",
-]
 
 [[package]]
 name = "yoke"

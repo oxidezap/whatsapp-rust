@@ -961,9 +961,7 @@ mod tests {
             &RootKey::new([0x41; 32]),
             &remote_signed_prekey.public_key,
         );
-        state
-            .set_sender_chain(&KeyPair::generate(&mut rng), &ChainKey::new([0x42; 32], 0))
-            .expect("valid synthetic sending chain");
+        state.set_sender_chain(&KeyPair::generate(&mut rng), &ChainKey::new([0x42; 32], 0));
         (SessionRecord::new(state), local_identity)
     }
 

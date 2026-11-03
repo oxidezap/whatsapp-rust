@@ -2,7 +2,7 @@
 //! Standard RustCrypto operations. Provider objects belong to their caller.
 use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
 use aes_gcm::{Aes256Gcm, KeyInit, aead::AeadInOut};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, HmacReset, Mac};
 use sha2::{Digest, Sha256};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CryptoProviderError {
@@ -296,6 +296,7 @@ pub fn hmac_sha256_two_part(key: &[u8], first: &[u8], second: &[u8]) -> [u8; 32]
     mac.update(second);
     mac.finalize().into_bytes().into()
 }
+/// Streaming SHA-256. Each finalizer resets the hash for the next message.
 #[derive(Clone)]
 pub struct CryptographicHash(Sha256);
 impl CryptographicHash {
@@ -308,37 +309,72 @@ impl CryptographicHash {
     pub fn update(&mut self, data: &[u8]) {
         self.0.update(data)
     }
-    pub fn finalize_sha256_array(&self) -> Result<[u8; 32], Error> {
-        Ok(self.0.clone().finalize().into())
+    pub fn finalize_sha256_array(&mut self) -> Result<[u8; 32], Error> {
+        Ok(self.0.finalize_reset().into())
     }
-    pub fn finalize(&self) -> Vec<u8> {
-        self.0.clone().finalize().to_vec()
+    pub fn finalize(&mut self) -> Vec<u8> {
+        self.0.finalize_reset().to_vec()
     }
 }
+/// Streaming HMAC-SHA256. Finalization resets the message while retaining the key.
 #[derive(Clone)]
-pub struct CryptographicMac(Hmac<Sha256>);
+pub struct CryptographicMac(HmacReset<Sha256>);
 impl CryptographicMac {
     pub fn new(algorithm: &str, key: &[u8]) -> Result<Self, Error> {
         if algorithm != "HmacSha256" {
             return Err(Error::UnknownAlgorithm("MAC", algorithm.into()));
         }
         Ok(Self(
-            <Hmac<Sha256> as KeyInit>::new_from_slice(key).map_err(|_| Error::BadKeyOrIv)?,
+            <HmacReset<Sha256> as KeyInit>::new_from_slice(key).map_err(|_| Error::BadKeyOrIv)?,
         ))
     }
     pub fn update(&mut self, data: &[u8]) {
         self.0.update(data)
     }
-    pub fn finalize_sha256_array(&self) -> Result<[u8; 32], Error> {
-        Ok(self.0.clone().finalize().into_bytes().into())
+    pub fn finalize_sha256_array(&mut self) -> Result<[u8; 32], Error> {
+        Ok(self.0.finalize_reset().into_bytes().into())
     }
-    pub fn finalize(&self) -> Vec<u8> {
-        self.0.clone().finalize().into_bytes().to_vec()
+    pub fn finalize(&mut self) -> Vec<u8> {
+        self.0.finalize_reset().into_bytes().to_vec()
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn finalization_resets_hash_and_keyed_mac_for_reuse() {
+        let key = b"synthetic key";
+        let mut mac = CryptographicMac::new("HmacSha256", key).unwrap();
+        mac.update(b"first");
+        assert_eq!(
+            mac.finalize_sha256_array().unwrap(),
+            hmac_sha256_two_part(key, b"first", b"")
+        );
+        mac.update(b"second");
+        assert_eq!(
+            mac.finalize(),
+            hmac_sha256_two_part(key, b"second", b"").to_vec()
+        );
+        assert_eq!(
+            mac.finalize_sha256_array().unwrap(),
+            hmac_sha256_two_part(key, b"", b"")
+        );
+        assert_eq!(mac.finalize(), hmac_sha256_two_part(key, b"", b"").to_vec());
+        let mut hash = CryptographicHash::new("SHA-256").unwrap();
+        hash.update(b"first");
+        assert_eq!(
+            hash.finalize_sha256_array().unwrap(),
+            <[u8; 32]>::from(Sha256::digest(b"first"))
+        );
+        hash.update(b"second");
+        assert_eq!(hash.finalize(), Sha256::digest(b"second").to_vec());
+        assert_eq!(
+            hash.finalize_sha256_array().unwrap(),
+            <[u8; 32]>::from(Sha256::digest(b""))
+        );
+        assert_eq!(hash.finalize(), Sha256::digest(b"").to_vec());
+    }
+
     #[test]
     fn cbc_append_and_padding_boundaries() {
         for len in [0, 1, 15, 16, 17, 32, 255] {

@@ -157,6 +157,9 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
     /// publishing it. A committed counter reservation must already cover its index.
     pub fn encrypt(&mut self, record: &mut SessionRecord, plaintext: &[u8]) -> Result<Vec<u8>> {
         let session = record.current.as_ref().ok_or(Error::MissingKey)?;
+        if !matches!(session.version, 3 | 4) {
+            return Err(Error::Version);
+        }
         let mut sender = session.sender.as_ref().ok_or(Error::MissingKey)?.clone();
         if !record.reservation.permits(sender.index) {
             return Err(Error::ReservationRequired);
@@ -174,11 +177,11 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         let mut authenticated = Vec::new();
         authenticated.extend_from_slice(&wire::tagged_key(&session.local_identity));
         authenticated.extend_from_slice(&wire::tagged_key(&session.remote_identity));
-        authenticated.extend_from_slice(&message.unsigned());
+        authenticated.extend_from_slice(&message.unsigned_with_version(session.version as u8));
         message
             .mac
             .copy_from_slice(&self.crypto.hmac_sha256(&mac, &authenticated)[..8]);
-        let mut output = message.encode();
+        let mut output = message.encode_with_version(session.version as u8);
         if let Some(pending) = &session.pending_pre_key {
             if pending.kyber_pre_key_id.is_some() || pending.kyber_ciphertext.is_some() {
                 return Err(Error::Version);
@@ -191,7 +194,7 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
                 identity: session.local_identity,
                 message: output,
             }
-            .encode();
+            .encode_with_version(session.version as u8);
         }
         record.current.as_mut().ok_or(Error::MissingKey)?.sender = Some(sender);
         Ok(output)
@@ -248,6 +251,10 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         message: &SignalMessageView<'_>,
         input: &[u8],
     ) -> Result<Vec<u8>> {
+        if !matches!(session.version, 3 | 4) || session.version != u32::from(message.bytes[0] >> 4)
+        {
+            return Err(Error::Version);
+        }
         let limit = if session.local_identity == session.remote_identity {
             SELF_FUTURE_LIMIT
         } else {
@@ -263,7 +270,7 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
             &self.crypto.hmac_sha256(&mac, &authenticated)[..8],
             &message.mac,
         )?;
-        let plaintext = self.crypto.decrypt_cbc(&cipher, &iv, &message.ciphertext)?;
+        let plaintext = self.crypto.decrypt_cbc(&cipher, &iv, message.ciphertext)?;
         plan.commit(&mut session.receivers[index]);
         session.pending_pre_key = None;
         Ok(plaintext)
@@ -284,12 +291,15 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
             return Err(Error::IdentityChanged);
         }
         let mut existing = record.current.as_ref().is_some_and(|s| {
-            s.alice_base_key == Some(wrapper.base_key) && s.remote_identity == wrapper.identity
+            s.version == u32::from(wrapper.bytes[0] >> 4)
+                && s.alice_base_key == Some(wrapper.base_key)
+                && s.remote_identity == wrapper.identity
         });
         if !existing {
             for archive in &record.previous {
                 let s = archive.decode(self.crypto)?;
-                if s.alice_base_key == Some(wrapper.base_key)
+                if s.version == u32::from(wrapper.bytes[0] >> 4)
+                    && s.alice_base_key == Some(wrapper.base_key)
                     && s.remote_identity == wrapper.identity
                 {
                     existing = true;
@@ -298,7 +308,7 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
             }
         }
         if existing {
-            return self.decrypt(record, &wrapper.message);
+            return self.decrypt(record, wrapper.message);
         }
         if wrapper.pre_key_id.is_some() != p.local_one_time_pre_key.is_some() {
             return Err(Error::MissingKey);
@@ -312,8 +322,10 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         }
         let mut candidate = record.clone();
         candidate.materialize_reservation(self.crypto)?;
-        candidate.install(self.initialize_responder(p)?);
-        let plaintext = self.decrypt(&mut candidate, &wrapper.message)?;
+        let mut state = self.initialize_responder(p)?;
+        state.version = u32::from(wrapper.bytes[0] >> 4);
+        candidate.install(state);
+        let plaintext = self.decrypt(&mut candidate, wrapper.message)?;
         *record = candidate;
         Ok(plaintext)
     }
@@ -323,7 +335,8 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         message: &SignalMessageView<'_>,
         input: &[u8],
     ) -> Result<(Vec<u8>, bool)> {
-        if session.version != 3 {
+        if !matches!(session.version, 3 | 4) || session.version != u32::from(message.bytes[0] >> 4)
+        {
             return Err(Error::Version);
         }
         let mut ratcheted = false;
@@ -368,7 +381,7 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
             &self.crypto.hmac_sha256(&mac, &authenticated)[..8],
             &message.mac,
         )?;
-        let plaintext = self.crypto.decrypt_cbc(&cipher, &iv, &message.ciphertext)?;
+        let plaintext = self.crypto.decrypt_cbc(&cipher, &iv, message.ciphertext)?;
         advance.commit(&mut session.receivers[index]);
         session.pending_pre_key = None;
         Ok((plaintext, ratcheted))

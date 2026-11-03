@@ -1,9 +1,10 @@
 [package]
 name = "wacore-signal-engine"
 version = "0.7.0"
-publish = false
 edition.workspace = true
 license = "MIT"
+repository = "https://github.com/oxidezap/whatsapp-rust"
+description = "Sans-I/O classic Signal session and sender-key state engine"
 rust-version.workspace = true
 
 [dependencies]

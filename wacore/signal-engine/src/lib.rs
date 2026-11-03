@@ -10,6 +10,7 @@
 
 pub mod codec;
 pub mod crypto;
+mod encode;
 pub mod pairwise;
 pub mod rustcrypto;
 pub use rustcrypto::RustCrypto;
@@ -30,6 +31,8 @@ pub enum Error {
     Crypto,
     #[error("authentication failed")]
     Authentication,
+    #[error("invalid ciphertext framing or padding")]
+    InvalidCiphertext,
     #[error("message key already consumed or unavailable")]
     Duplicate,
     #[error("message counter exceeds the permitted future gap")]

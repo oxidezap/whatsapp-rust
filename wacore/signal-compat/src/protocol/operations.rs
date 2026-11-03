@@ -74,6 +74,7 @@ pub async fn process_prekey_bundle<
     let mut checkout = SessionCheckout::load_or_fresh(sessions, address).await?;
     let change = save_identity(identities, address, &bundle.identity).await?;
     checkout.record_mut().operate(|record| {
+        record.materialize_reservation(&engine::RustCrypto)?;
         record.install(state);
         Ok(())
     })?;
@@ -146,98 +147,22 @@ pub async fn message_decrypt<
             "post-quantum ratchet unsupported".into(),
         ));
     }
-    let mut checkout = SessionCheckout::load_or_fresh(sessions, address).await?;
-    let mut consumed = None;
-    let mut change = IdentityChange::NewOrUnchanged;
-    let mut random = RandomAdapter(rng);
-    let mut engine = engine::Engine::new(&engine::RustCrypto, &mut random);
-    let plaintext = match message {
+    match message {
         CiphertextMessage::SignalMessage(message) => {
-            let remote = checkout
-                .record()
-                .session_state()
-                .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone()))?
-                .remote_identity_key()?
-                .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone()))?;
-            if !is_trusted_identity(identities, address, &remote, Direction::Receiving).await? {
-                return Err(SignalProtocolError::UntrustedIdentity(address.clone()));
-            }
-            checkout
-                .record_mut()
-                .operate(|record| engine.decrypt(record, &message.bytes))
-                .map_err(|error| {
-                    message_error(error, CiphertextMessageType::Whisper, 0, message.counter())
-                })?
+            message_decrypt_signal(message, address, sessions, identities, rng).await
         }
         CiphertextMessage::PreKeySignalMessage(message) => {
-            if !is_trusted_identity(
-                identities,
-                address,
-                message.identity_key(),
-                Direction::Receiving,
+            message_decrypt_prekey(
+                message, address, sessions, identities, prekeys, signed, rng, pq,
             )
-            .await?
-            {
-                return Err(SignalProtocolError::UntrustedIdentity(address.clone()));
-            }
-            let base = message.base_key();
-            let mut candidate = checkout.record().clone();
-            let existing = candidate.has_session_state(3, &base)?;
-            let plaintext = if existing {
-                candidate
-                    .operate(|record| engine.decrypt(record, message.message().serialized()))
-                    .map_err(|error| message_error(error, CiphertextMessageType::PreKey, 0, 0))?
-            } else {
-                let local = identities.get_identity_key_pair().await?;
-                let registration = identities.get_local_registration_id().await?;
-                let signed = signed
-                    .get_signed_pre_key(message.signed_pre_key_id())
-                    .await?;
-                let otp = if let Some(id) = message.pre_key_id() {
-                    Some(prekeys.get_pre_key(id).await?)
-                } else {
-                    None
-                };
-                let parameters = engine::ResponderParameters {
-                    local_identity: identity_pair(&local),
-                    local_registration: registration,
-                    local_signed_pre_key: signed.inner.key_pair.clone(),
-                    local_one_time_pre_key: otp.as_ref().map(|key| key.inner.key_pair.clone()),
-                    remote_identity: message.parsed.identity,
-                    remote_base_key: message.parsed.base_key,
-                    remote_registration: message.parsed.registration,
-                };
-                // Identity trust was checked above. The host permits verified
-                // rotations, so archive a different current identity first.
-                if candidate
-                    .session_state()
-                    .is_some_and(|state| state.inner.remote_identity != message.parsed.identity)
-                {
-                    candidate.archive_current_state()?;
-                }
-                let plaintext = candidate
-                    .operate(|record| engine.decrypt_pre_key(record, &message.bytes, &parameters))
-                    .map_err(|error| message_error(error, CiphertextMessageType::PreKey, 0, 0))?;
-                consumed = message.pre_key_id();
-                plaintext
-            };
-            change = save_identity(identities, address, message.identity_key()).await?;
-            *checkout.record_mut() = candidate;
-            plaintext
+            .await
         }
-        CiphertextMessage::SenderKeyMessage(_) => {
-            return Err(SignalProtocolError::InvalidArgument(
-                "sender-key message requires group decrypt".into(),
-            ));
-        }
-    };
-    checkout.commit().await?;
-    Ok(DecryptionResult {
-        plaintext,
-        consumed_prekey_id: consumed,
-        identity_change: change,
-    })
+        CiphertextMessage::SenderKeyMessage(_) => Err(SignalProtocolError::InvalidArgument(
+            "sender-key message requires group decrypt".into(),
+        )),
+    }
 }
+
 #[allow(clippy::too_many_arguments)]
 pub async fn message_decrypt_owned<
     S: SessionStore + ?Sized,
@@ -289,6 +214,7 @@ pub async fn create_sender_key_distribution_message<
     let mut random = RandomAdapter(rng);
     let bytes = engine::Engine::new(&engine::RustCrypto, &mut random)
         .create_sender_distribution(&mut record.inner)?;
+    record.prune_prepared_crypto();
     if !already_sending {
         record.mark_wire_gated();
     }
@@ -308,6 +234,7 @@ pub async fn process_sender_key_distribution_message<S: SenderKeyStore + ?Sized>
         .unwrap_or_else(SenderKeyRecord::new_empty);
     engine::Engine::new(&engine::RustCrypto, &mut NoRandomSource)
         .process_sender_distribution(&mut record.inner, &message.bytes)?;
+    record.prune_prepared_crypto();
     store.store_sender_key(name, record).await
 }
 /// The caller must hold the store's stable sender-key lock across this operation,
@@ -343,7 +270,8 @@ pub async fn group_encrypt<S: SenderKeyStore + ?Sized, R: rand::Rng + rand::Cryp
     }
     record.inner.reservation.mark_committed();
     let mut random = RandomAdapter(rng);
-    let bytes = engine::Engine::new(&engine::RustCrypto, &mut random)
+    let crypto = record.prepared_crypto(0)?;
+    let bytes = engine::Engine::new(&crypto, &mut random)
         .encrypt_sender_key(&mut record.inner, plaintext)?;
     store.store_sender_key(name, record).await?;
     SenderKeyMessage::try_from(bytes.as_slice())
@@ -360,12 +288,18 @@ pub async fn group_decrypt_shared<S: SenderKeyStore + ?Sized>(
         .load_sender_key(name)
         .await?
         .ok_or_else(|| SignalProtocolError::NoSenderKeyState(name.to_string()))?;
-    let plaintext = engine::Engine::new(&engine::RustCrypto, &mut NoRandomSource)
+    let index = record
+        .inner
+        .states
+        .iter()
+        .position(|state| state.id == message.chain_id())
+        .ok_or_else(|| SignalProtocolError::NoSenderKeyState(name.to_string()))?;
+    let crypto = record.prepared_crypto(index)?;
+    let plaintext = engine::Engine::new(&crypto, &mut NoRandomSource)
         .decrypt_sender_key(&mut record.inner, &message.bytes)
         .map_err(|error| match error {
             engine::Error::Authentication => SignalProtocolError::SignatureValidationFailed,
             engine::Error::MissingKey => SignalProtocolError::NoSenderKeyState(name.to_string()),
-            engine::Error::Crypto => SignalProtocolError::InvalidSenderKeySession,
             error => message_error(
                 error,
                 CiphertextMessageType::SenderKey,
@@ -400,8 +334,21 @@ pub async fn message_decrypt_signal<
     let mut checkout = SessionCheckout::load(sessions, address)
         .await?
         .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone()))?;
-    let remote = checkout
-        .record()
+    let mut candidate = checkout.record().clone();
+    if candidate.session_state().is_none() && candidate.previous_session_count() == 0 {
+        return Err(SignalProtocolError::SessionNotFound(address.clone()));
+    }
+    let mut random = RandomAdapter(rng);
+    let plaintext = candidate
+        .operate(|record| {
+            engine::Engine::new(&engine::RustCrypto, &mut random).decrypt(record, &message.bytes)
+        })
+        .map_err(|error| {
+            message_error(error, CiphertextMessageType::Whisper, 0, message.counter())
+        })?;
+    // Authentication selects the session first, including an archive-only
+    // record. Its selected identity governs trust and the identity row update.
+    let remote = candidate
         .session_state()
         .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone()))?
         .remote_identity_key()?
@@ -409,15 +356,10 @@ pub async fn message_decrypt_signal<
     if !is_trusted_identity(identities, address, &remote, Direction::Receiving).await? {
         return Err(SignalProtocolError::UntrustedIdentity(address.clone()));
     }
-    let mut random = RandomAdapter(rng);
-    let plaintext = checkout
-        .record_mut()
-        .operate(|record| {
-            engine::Engine::new(&engine::RustCrypto, &mut random).decrypt(record, &message.bytes)
-        })
-        .map_err(|error| {
-            message_error(error, CiphertextMessageType::Whisper, 0, message.counter())
-        })?;
+    save_identity(identities, address, &remote).await?;
+    // Identity storage may independently commit before this await completes.
+    // The original session remains recoverable until the identity step succeeds.
+    *checkout.record_mut() = candidate;
     checkout.commit().await?;
     Ok(DecryptionResult {
         plaintext,
@@ -425,6 +367,7 @@ pub async fn message_decrypt_signal<
         identity_change: IdentityChange::NewOrUnchanged,
     })
 }
+
 #[allow(clippy::too_many_arguments)]
 pub async fn message_decrypt_prekey<
     S: SessionStore + ?Sized,
@@ -442,15 +385,90 @@ pub async fn message_decrypt_prekey<
     rng: &mut R,
     pq: UsePQRatchet,
 ) -> Result<DecryptionResult> {
-    message_decrypt(
-        &CiphertextMessage::PreKeySignalMessage(message.clone()),
-        address,
-        sessions,
+    if pq == UsePQRatchet::Yes {
+        return Err(SignalProtocolError::InvalidArgument(
+            "post-quantum ratchet unsupported".into(),
+        ));
+    }
+    let mut checkout = SessionCheckout::load_or_fresh(sessions, address).await?;
+    let mut candidate = checkout.record().clone();
+    let existing =
+        candidate.has_session_state(u32::from(message.message_version()), message.base_key())?;
+    let mut random = RandomAdapter(rng);
+    let mut engine = engine::Engine::new(&engine::RustCrypto, &mut random);
+    let plaintext = if existing {
+        candidate
+            .operate(|record| engine.decrypt(record, message.message().serialized()))
+            .map_err(|error| {
+                message_error(
+                    error,
+                    CiphertextMessageType::PreKey,
+                    0,
+                    message.message().counter(),
+                )
+            })?
+    } else {
+        let local = identities.get_identity_key_pair().await?;
+        let registration = identities.get_local_registration_id().await?;
+        let signed = signed
+            .get_signed_pre_key(message.signed_pre_key_id())
+            .await?;
+        let otp = if let Some(id) = message.pre_key_id() {
+            Some(prekeys.get_pre_key(id).await?)
+        } else {
+            None
+        };
+        let parameters = engine::ResponderParameters {
+            local_identity: identity_pair(&local),
+            local_registration: registration,
+            local_signed_pre_key: signed.inner.key_pair.clone(),
+            local_one_time_pre_key: otp.as_ref().map(|key| key.inner.key_pair.clone()),
+            remote_identity: message.parsed.identity,
+            remote_base_key: message.parsed.base_key,
+            remote_registration: message.parsed.registration,
+        };
+        if candidate
+            .session_state()
+            .is_some_and(|state| state.inner.remote_identity != message.parsed.identity)
+        {
+            candidate.archive_current_state()?;
+        }
+        candidate
+            .operate(|record| engine.decrypt_pre_key(record, &message.bytes, &parameters))
+            .map_err(|error| {
+                message_error(
+                    error,
+                    CiphertextMessageType::PreKey,
+                    0,
+                    message.message().counter(),
+                )
+            })?
+    };
+    let selected_identity = candidate
+        .session_state()
+        .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone()))?
+        .remote_identity_key()?
+        .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone()))?;
+    if !is_trusted_identity(
         identities,
-        prekeys,
-        signed,
-        rng,
-        pq,
+        address,
+        &selected_identity,
+        Direction::Receiving,
     )
-    .await
+    .await?
+    {
+        return Err(SignalProtocolError::UntrustedIdentity(address.clone()));
+    }
+    let stored_change = save_identity(identities, address, &selected_identity).await?;
+    *checkout.record_mut() = candidate;
+    checkout.commit().await?;
+    Ok(DecryptionResult {
+        plaintext,
+        consumed_prekey_id: if existing { None } else { message.pre_key_id() },
+        identity_change: if existing {
+            IdentityChange::NewOrUnchanged
+        } else {
+            stored_change
+        },
+    })
 }

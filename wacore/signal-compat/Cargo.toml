@@ -16,7 +16,6 @@ aes.workspace = true
 aes-gcm.workspace = true
 cbc = { workspace = true, features = ["block-padding"] }
 ctr.workspace = true
-sha1.workspace = true
 sha2.workspace = true
 hmac.workspace = true
 hkdf.workspace = true

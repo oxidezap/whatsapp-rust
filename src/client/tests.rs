@@ -3788,6 +3788,11 @@ fn client_size_pins_runtime_cache_config_saving() {
         + size_of::<crate::handlers::call::pending_offers::PendingOffers>()
         + size_of::<Arc<std::sync::Mutex<crate::retry::HistoryPayloadRegistry>>>()
         + size_of::<Option<Arc<dyn crate::ConnectAdmission>>>();
+    // Device owns three keypairs. Prepared signing state now belongs to explicit
+    // provider contexts rather than each private key's former 136-byte pair.
+    expected = expected
+        .checked_add_signed(3 * (size_of::<wacore::libsignal::protocol::KeyPair>() as isize - 136))
+        .unwrap();
     // Coalesced reuploads add a 56 B map on x86_64. Moving the two waiter
     // mutex/Vec registries behind Arcs removes 48 inline bytes; their counters
     // stay one word each. Account for the net +8 B without changing the base.

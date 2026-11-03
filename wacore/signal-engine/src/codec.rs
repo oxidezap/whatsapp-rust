@@ -4,10 +4,17 @@
 use crate::{CryptoProvider, Error, Result, state::*, wire::*};
 use std::collections::VecDeque;
 type Data<'a> = Vec<(u32, Value<'a>)>;
+// The wire byte bound alone does not bound a table of two-byte scalar fields.
+// This independent per-message bound caps the table at 4 MiB on 64-bit hosts,
+// while allowing historical skipped-key backlogs well above the default 2000.
+const MAX_STORED_FIELDS: usize = 131_072;
 fn fields(bytes: &[u8]) -> Result<Data<'_>> {
-    let mut f = Fields::new(bytes)?;
+    let mut f = Fields::new_storage(bytes)?;
     let mut out = Vec::new();
     while let Some(field) = f.next()? {
+        if out.len() == MAX_STORED_FIELDS {
+            return Err(Error::Encoding("stored protobuf field budget exceeded"));
+        }
         out.push(field);
     }
     Ok(out)
@@ -42,30 +49,17 @@ fn message_key(input: &[u8]) -> Result<MessageKey> {
     {
         return Ok(MessageKey::Derived {
             index,
-            cipher: array(cipher)?,
-            mac: array(mac)?,
-            iv: array(iv)?,
+            material: Box::new(DerivedMessageKey {
+                cipher: array(cipher)?,
+                mac: array(mac)?,
+                iv: array(iv)?,
+            }),
         });
     }
     Ok(MessageKey::Seed {
         index,
         seed: raw(&f, 100)?,
     })
-}
-fn encode_message_key(key: &MessageKey) -> Vec<u8> {
-    let mut out = Vec::new();
-    uint(&mut out, 1, key.index().into());
-    match key {
-        MessageKey::Seed { seed, .. } => bytes(&mut out, 100, seed),
-        MessageKey::Derived {
-            cipher, mac, iv, ..
-        } => {
-            bytes(&mut out, 2, cipher);
-            bytes(&mut out, 3, mac);
-            bytes(&mut out, 4, iv);
-        }
-    }
-    out
 }
 fn decode_chain(input: &[u8]) -> Result<Chain> {
     let f = fields(input)?;
@@ -98,29 +92,9 @@ fn decode_chain(input: &[u8]) -> Result<Chain> {
             .transpose()?
             .flatten()
             .is_none(),
-        skipped,
+        skipped: skipped.into(),
         message_key_limit: one(&f, 100).map(as_u32).transpose()?,
     })
-}
-fn encode_chain(chain: &Chain) -> Vec<u8> {
-    let mut out = Vec::new();
-    bytes(&mut out, 1, &tagged_key(&chain.ratchet));
-    if let Some(private) = chain.private {
-        bytes(&mut out, 2, &private);
-    }
-    let mut ck = Vec::new();
-    uint(&mut ck, 1, chain.index.into());
-    if !chain.exhausted {
-        bytes(&mut ck, 2, &chain.key);
-    }
-    bytes(&mut out, 3, &ck);
-    for key in &chain.skipped {
-        bytes(&mut out, 4, &encode_message_key(key));
-    }
-    if let Some(limit) = chain.message_key_limit {
-        uint(&mut out, 100, limit.into());
-    }
-    out
 }
 fn decode_pending(input: &[u8]) -> Result<PendingPreKey> {
     let f = fields(input)?;
@@ -137,68 +111,22 @@ fn decode_pending(input: &[u8]) -> Result<PendingPreKey> {
         kyber_ciphertext: data(&f, 5)?.map(<[u8]>::to_vec),
     })
 }
-fn encode_pending(key: &PendingPreKey) -> Vec<u8> {
-    let mut out = Vec::new();
-    if let Some(id) = key.pre_key_id {
-        uint(&mut out, 1, id.into());
-    }
-    bytes(&mut out, 2, &tagged_key(&key.base_key));
-    if let Some(id) = key.signed_pre_key_id {
-        uint(&mut out, 3, id as i64 as u64);
-    }
-    if let Some(id) = key.kyber_pre_key_id {
-        uint(&mut out, 4, id.into());
-    }
-    if let Some(ciphertext) = &key.kyber_ciphertext {
-        bytes(&mut out, 5, ciphertext);
-    }
-    out
-}
 pub fn encode_session_state(state: &SessionState) -> Vec<u8> {
     let mut out = Vec::new();
-    uint(&mut out, 1, state.version.into());
-    bytes(&mut out, 2, &tagged_key(&state.local_identity));
-    bytes(&mut out, 3, &tagged_key(&state.remote_identity));
-    bytes(&mut out, 4, &state.root);
-    uint(&mut out, 5, state.previous_counter.into());
-    if let Some(sender) = &state.sender {
-        bytes(&mut out, 6, &encode_chain(sender));
-    }
-    for receiver in &state.receivers {
-        bytes(&mut out, 7, &encode_chain(receiver));
-    }
-    if let Some(exchange) = &state.pending_key_exchange {
-        bytes(&mut out, 8, exchange);
-    }
-    if let Some(pending) = &state.pending_pre_key {
-        bytes(&mut out, 9, &encode_pending(pending));
-    }
-    uint(&mut out, 10, state.remote_registration.into());
-    uint(&mut out, 11, state.local_registration.into());
-    uint(&mut out, 12, u64::from(state.needs_refresh));
-    if let Some(base) = state.alice_base_key {
-        if state.alice_base_key_tagged {
-            bytes(&mut out, 13, &tagged_key(&base));
-        } else {
-            bytes(&mut out, 13, &base);
-        }
-    }
+    crate::encode::append_session_state(state, &mut out);
     out
 }
 pub fn decode_session_state<C: CryptoProvider>(_crypto: &C, input: &[u8]) -> Result<SessionState> {
     let f = fields(input)?;
     let version = number(&f, 1)?;
-    if version != 3 {
-        return Err(Error::Version);
-    }
     let mut receivers = Vec::new();
     for (n, v) in &f {
         if *n == 7 {
+            if receivers.len() == MAX_RECEIVER_CHAINS {
+                return Err(Error::Encoding("too many receiver chains"));
+            }
             receivers.push(decode_chain(as_bytes(*v)?)?);
         }
-    }
-    if receivers.len() > MAX_RECEIVER_CHAINS {
-        return Err(Error::Encoding("too many receiver chains"));
     }
     let pending_key_exchange = data(&f, 8)?.map(<[u8]>::to_vec);
     if let Some(exchange) = &pending_key_exchange {
@@ -220,18 +148,6 @@ pub fn decode_session_state<C: CryptoProvider>(_crypto: &C, input: &[u8]) -> Res
         alice_base_key: data(&f, 13)?.map(decode_public).transpose()?,
         alice_base_key_tagged: data(&f, 13)?.is_none_or(|bytes| bytes.len() == 33),
     })
-}
-fn encode_reservation_with_incarnation(
-    out: &mut Vec<u8>,
-    r: &Reservation,
-    incarnation: Option<&[u8; 16]>,
-) {
-    if let Some(ceiling) = r.ceiling {
-        uint(out, 100, ceiling.into());
-    }
-    if let Some(token) = incarnation.or(r.incarnation.as_ref()) {
-        bytes(out, 101, token);
-    }
 }
 fn decode_reservation(f: &Data<'_>, live: Option<&[u8; 16]>) -> Result<(Reservation, bool)> {
     let mut ceiling = None;
@@ -297,13 +213,7 @@ pub fn encode_session_record_parts_into(
     incarnation: Option<&[u8; 16]>,
     out: &mut Vec<u8>,
 ) {
-    if let Some(state) = current {
-        bytes(out, 1, &encode_session_state(state));
-    }
-    for archive in previous {
-        bytes(out, 2, &archive.bytes);
-    }
-    encode_reservation_with_incarnation(out, reservation, incarnation);
+    crate::encode::append_session_parts(current, previous, reservation, incarnation, out);
 }
 pub fn decode_session_record<C: CryptoProvider>(crypto: &C, input: &[u8]) -> Result<SessionRecord> {
     decode_session_record_inner(crypto, input, None)
@@ -327,13 +237,12 @@ fn decode_session_record_inner<C: CryptoProvider>(
         .transpose()?;
     let mut previous = Vec::new();
     for (n, v) in &f {
-        if *n == 2 {
+        if *n == 2 && previous.len() < MAX_ARCHIVED_SESSIONS {
             let b = as_bytes(*v)?;
             decode_session_state(crypto, b)?;
-            previous.push(ArchivedSession { bytes: b.to_vec() });
+            previous.push(ArchivedSession { bytes: b.into() });
         }
     }
-    previous.truncate(MAX_ARCHIVED_SESSIONS);
     if !trusted
         && let (Some(ceiling), Some(chain)) = (
             reservation.ceiling,
@@ -353,27 +262,6 @@ fn decode_session_record_inner<C: CryptoProvider>(
         previous,
         reservation,
     })
-}
-fn encode_sender_state(state: &SenderKeyState) -> Vec<u8> {
-    let mut out = Vec::new();
-    uint(&mut out, 1, state.id.into());
-    let mut ck = Vec::new();
-    uint(&mut ck, 1, state.iteration.into());
-    bytes(&mut ck, 2, &state.chain_key);
-    bytes(&mut out, 2, &ck);
-    let mut signing = Vec::new();
-    bytes(&mut signing, 1, &tagged_key(&state.signing_public));
-    if let Some(private) = state.signing_private {
-        bytes(&mut signing, 2, &private);
-    }
-    bytes(&mut out, 3, &signing);
-    for key in &state.skipped {
-        let mut k = Vec::new();
-        uint(&mut k, 1, key.iteration.into());
-        bytes(&mut k, 2, &key.seed);
-        bytes(&mut out, 4, &k);
-    }
-    out
 }
 fn decode_sender_state(input: &[u8]) -> Result<SenderKeyState> {
     let f = fields(input)?;
@@ -399,7 +287,7 @@ fn decode_sender_state(input: &[u8]) -> Result<SenderKeyState> {
             .filter(|b| !b.is_empty())
             .map(array)
             .transpose()?,
-        skipped,
+        skipped: skipped.into(),
     })
 }
 pub fn encode_sender_key_record(record: &SenderKeyRecord) -> Vec<u8> {
@@ -419,10 +307,7 @@ fn encode_sender_key_record_with_incarnation(
     incarnation: Option<&[u8; 16]>,
 ) -> Vec<u8> {
     let mut out = Vec::new();
-    for state in &record.states {
-        bytes(&mut out, 1, &encode_sender_state(state));
-    }
-    encode_reservation_with_incarnation(&mut out, &record.reservation, incarnation);
+    crate::encode::append_sender_record(record, incarnation, &mut out);
     out
 }
 pub fn decode_sender_key_record<C: CryptoProvider>(
@@ -447,11 +332,10 @@ fn decode_sender_key_record_inner<C: CryptoProvider>(
     let (mut reservation, trusted) = decode_reservation(&f, live)?;
     let mut states = Vec::new();
     for (n, v) in &f {
-        if *n == 1 {
+        if *n == 1 && states.len() < MAX_SENDER_STATES {
             states.push(decode_sender_state(as_bytes(*v)?)?);
         }
     }
-    states.truncate(MAX_SENDER_STATES);
     if !trusted && let (Some(ceiling), Some(state)) = (reservation.ceiling, states.first_mut()) {
         if ceiling.saturating_sub(state.iteration) > 2000 {
             return Err(Error::Encoding("sender reservation burn exceeds limit"));
@@ -525,4 +409,140 @@ pub fn decode_identity_key_pair(input: &[u8]) -> Result<KeyPair> {
         public: public(&f, 1)?,
         private: raw(&f, 2)?,
     })
+}
+
+#[cfg(test)]
+mod parser_budget_tests {
+    use super::*;
+    use crate::RustCrypto;
+
+    fn session(registration: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        uint(&mut out, 1, 3);
+        bytes(&mut out, 2, &tagged_key(&[1; 32]));
+        bytes(&mut out, 3, &tagged_key(&[2; 32]));
+        bytes(&mut out, 4, &[3; 32]);
+        uint(&mut out, 10, registration.into());
+        out
+    }
+    fn receiver() -> Vec<u8> {
+        let mut out = Vec::new();
+        bytes(&mut out, 1, &tagged_key(&[4; 32]));
+        let mut position = Vec::new();
+        uint(&mut position, 1, 7);
+        bytes(&mut position, 2, &[5; 32]);
+        bytes(&mut out, 3, &position);
+        out
+    }
+    fn sender(id: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        uint(&mut out, 1, id.into());
+        let mut position = Vec::new();
+        uint(&mut position, 1, 9);
+        bytes(&mut position, 2, &[6; 32]);
+        bytes(&mut out, 2, &position);
+        let mut signing = Vec::new();
+        bytes(&mut signing, 1, &tagged_key(&[7; 32]));
+        bytes(&mut out, 3, &signing);
+        out
+    }
+
+    #[test]
+    fn tiny_unknown_fields_reject_at_a_finite_table_budget() {
+        assert!(MAX_STORED_FIELDS * size_of::<(u32, Value<'_>)>() <= 8 * 1024 * 1024);
+        let mut input = [0x78, 0].repeat(MAX_STORED_FIELDS);
+        let at_limit = fields(&input).unwrap();
+        assert_eq!(at_limit.len(), MAX_STORED_FIELDS);
+        assert!(at_limit.capacity() <= MAX_STORED_FIELDS);
+        drop(at_limit);
+        input.extend_from_slice(&[0x78, 0]);
+        assert!(matches!(
+            fields(&input),
+            Err(Error::Encoding("stored protobuf field budget exceeded"))
+        ));
+        assert!(matches!(
+            decode_session_record(&RustCrypto, &input),
+            Err(Error::Encoding("stored protobuf field budget exceeded"))
+        ));
+    }
+
+    #[test]
+    fn archives_outside_retained_prefix_are_not_decoded() {
+        let mut input = Vec::new();
+        for registration in 0..MAX_ARCHIVED_SESSIONS as u32 {
+            bytes(&mut input, 2, &session(registration));
+        }
+        bytes(&mut input, 2, &[0]);
+        let decoded = decode_session_record(&RustCrypto, &input).unwrap();
+        assert_eq!(decoded.previous.len(), MAX_ARCHIVED_SESSIONS);
+        for (index, archive) in decoded.previous.iter().enumerate() {
+            assert_eq!(
+                archive.decode(&RustCrypto).unwrap().remote_registration,
+                index as u32
+            );
+        }
+        let mut retained_invalid = Vec::new();
+        bytes(&mut retained_invalid, 2, &[0]);
+        assert!(decode_session_record(&RustCrypto, &retained_invalid).is_err());
+    }
+
+    #[test]
+    fn sender_states_outside_retained_prefix_are_not_decoded() {
+        let mut input = Vec::new();
+        for id in 0..MAX_SENDER_STATES as u32 {
+            bytes(&mut input, 1, &sender(id));
+        }
+        bytes(&mut input, 1, &[0]);
+        let decoded = decode_sender_key_record(&RustCrypto, &input).unwrap();
+        assert_eq!(decoded.states.len(), MAX_SENDER_STATES);
+        assert_eq!(
+            decoded
+                .states
+                .iter()
+                .map(|state| state.id)
+                .collect::<Vec<_>>(),
+            (0..MAX_SENDER_STATES as u32).collect::<Vec<_>>()
+        );
+        let mut retained_invalid = Vec::new();
+        bytes(&mut retained_invalid, 1, &[0]);
+        assert!(decode_sender_key_record(&RustCrypto, &retained_invalid).is_err());
+    }
+
+    #[test]
+    fn sixth_receiver_rejects_before_its_nested_payload_is_decoded() {
+        let mut input = session(0);
+        for _ in 0..MAX_RECEIVER_CHAINS {
+            bytes(&mut input, 7, &receiver());
+        }
+        assert_eq!(
+            decode_session_state(&RustCrypto, &input)
+                .unwrap()
+                .receivers
+                .len(),
+            MAX_RECEIVER_CHAINS
+        );
+        bytes(&mut input, 7, &[0]);
+        assert!(matches!(
+            decode_session_state(&RustCrypto, &input),
+            Err(Error::Encoding("too many receiver chains"))
+        ));
+    }
+
+    #[test]
+    fn field_budget_does_not_reduce_historical_skipped_key_retention_to_default() {
+        let mut chain = receiver();
+        uint(&mut chain, 100, 10_000);
+        for index in 0..4096u32 {
+            let mut key = Vec::new();
+            uint(&mut key, 1, index.into());
+            bytes(&mut key, 100, &[8; 32]);
+            bytes(&mut chain, 4, &key);
+        }
+        let mut input = session(0);
+        bytes(&mut input, 7, &chain);
+        let decoded = decode_session_state(&RustCrypto, &input).unwrap();
+        assert_eq!(decoded.receivers[0].skipped.len(), 4096);
+        assert_eq!(decoded.receivers[0].message_key_limit, Some(10_000));
+        assert_eq!(decoded.receivers[0].skipped[4095].index(), 4095);
+    }
 }

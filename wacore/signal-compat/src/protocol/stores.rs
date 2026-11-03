@@ -4,6 +4,15 @@ use super::*;
 use async_trait::async_trait;
 use portable_atomic::AtomicBool;
 use std::sync::Arc;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub trait ThreadSafe: Send + Sync {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync + ?Sized> ThreadSafe for T {}
+#[cfg(target_arch = "wasm32")]
+pub trait ThreadSafe {}
+#[cfg(target_arch = "wasm32")]
+impl<T: ?Sized> ThreadSafe for T {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SessionCheckoutKey {
     generation: u64,
@@ -30,7 +39,7 @@ pub enum SessionCheckoutStoreResult {
 }
 #[cfg_attr(target_arch="wasm32",async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-pub trait SessionStore: Send + Sync {
+pub trait SessionStore: ThreadSafe {
     async fn load_session(&self, address: &ProtocolAddress) -> Result<Option<SessionRecord>>;
     async fn store_session(
         &mut self,
@@ -80,7 +89,7 @@ pub trait SessionStore: Send + Sync {
 }
 #[cfg_attr(target_arch="wasm32",async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-pub trait IdentityKeyStore: Send + Sync {
+pub trait IdentityKeyStore: ThreadSafe {
     async fn get_identity_key_pair(&self) -> Result<IdentityKeyPair>;
     async fn get_local_registration_id(&self) -> Result<u32>;
     async fn save_identity(
@@ -113,14 +122,14 @@ pub trait IdentityKeyStore: Send + Sync {
 }
 #[cfg_attr(target_arch="wasm32",async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-pub trait PreKeyStore: Send + Sync {
+pub trait PreKeyStore: ThreadSafe {
     async fn get_pre_key(&self, id: PreKeyId) -> Result<PreKeyRecord>;
     async fn save_pre_key(&mut self, id: PreKeyId, record: &PreKeyRecord) -> Result<()>;
     async fn remove_pre_key(&mut self, id: PreKeyId) -> Result<()>;
 }
 #[cfg_attr(target_arch="wasm32",async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-pub trait SignedPreKeyStore: Send + Sync {
+pub trait SignedPreKeyStore: ThreadSafe {
     async fn get_signed_pre_key(&self, id: SignedPreKeyId) -> Result<SignedPreKeyRecord>;
     async fn save_signed_pre_key(
         &mut self,
@@ -130,7 +139,7 @@ pub trait SignedPreKeyStore: Send + Sync {
 }
 #[cfg_attr(target_arch="wasm32",async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-pub trait SenderKeyStore: Send + Sync {
+pub trait SenderKeyStore: ThreadSafe {
     async fn store_sender_key(
         &mut self,
         name: &SenderKeyName,
@@ -214,7 +223,7 @@ impl<'a, S: SessionStore + ?Sized> SessionCheckout<'a, S> {
             SessionCheckoutStoreResult::Rejected => {
                 self.checkout = None;
                 return Err(SignalProtocolError::InvalidState(
-                    "checkout",
+                    "SessionCheckout::commit",
                     "stale checkout".into(),
                 ));
             }

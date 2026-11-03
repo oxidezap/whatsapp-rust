@@ -234,11 +234,7 @@ async fn serve_noise_handshake(
     let server_static_pub = *server_static.public_key.public_key_bytes();
     let cert_chain = build_cert_chain_bytes(&server_static_pub);
     let server_eph = KeyPair::generate(&mut rand::rng());
-    let server_eph_pub: [u8; 32] = server_eph
-        .public_key
-        .public_key_bytes()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("invalid server ephemeral length"))?;
+    let server_eph_pub = *server_eph.public_key.public_key_bytes();
 
     let mut noise = NoiseHandshake::new(NOISE_PATTERN_XX, &WA_CONN_HEADER)?;
     noise.authenticate(&client_eph);

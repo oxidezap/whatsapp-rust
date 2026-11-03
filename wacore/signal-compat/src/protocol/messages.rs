@@ -13,7 +13,7 @@ fn validate_version(bytes: &[u8], group: bool, trailer: usize) -> Result<()> {
     if version < 3 {
         return Err(SignalProtocolError::LegacyCiphertextVersion(version));
     }
-    if version > 3 {
+    if version > if group { 3 } else { 4 } {
         return Err(if group {
             SignalProtocolError::UnrecognizedMessageVersion(version.into())
         } else {
@@ -57,7 +57,7 @@ impl SignalMessage {
         sender: &IdentityKey,
         receiver: &IdentityKey,
     ) -> Result<Self> {
-        if version != 3 {
+        if !matches!(version, 3 | 4) {
             return Err(SignalProtocolError::UnrecognizedCiphertextVersion(version));
         }
         let parsed = engine::wire::SignalMessage {
@@ -67,7 +67,7 @@ impl SignalMessage {
             ciphertext: ciphertext.to_vec(),
             mac: [0; 8],
         };
-        let mut unsigned = parsed.unsigned();
+        let mut unsigned = parsed.unsigned_with_version(version);
         let mut authenticated = Vec::with_capacity(66 + unsigned.len());
         authenticated.extend_from_slice(&sender.serialize());
         authenticated.extend_from_slice(&receiver.serialize());
@@ -152,7 +152,7 @@ impl PreKeySignalMessage {
         identity: IdentityKey,
         inner: SignalMessage,
     ) -> Result<Self> {
-        if version != 3 {
+        if !matches!(version, 3 | 4) {
             return Err(SignalProtocolError::UnrecognizedCiphertextVersion(version));
         }
         let parsed = engine::wire::PreKeySignalMessage {
@@ -163,7 +163,7 @@ impl PreKeySignalMessage {
             identity: *identity.public_key().public_key_bytes(),
             message: inner.serialized().to_vec(),
         };
-        Self::try_from(Bytes::from(parsed.encode()))
+        Self::try_from(Bytes::from(parsed.encode_with_version(version)))
     }
     pub fn serialized(&self) -> &[u8] {
         &self.bytes
@@ -228,11 +228,19 @@ impl TryFrom<&[u8]> for PreKeySignalMessage {
         Self::try_from(Bytes::copy_from_slice(bytes))
     }
 }
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SenderKeyDistributionMessage {
     pub(crate) bytes: Bytes,
     pub(crate) parsed: engine::wire::SenderKeyDistribution,
     signing_public: PublicKey,
+}
+impl core::fmt::Debug for SenderKeyDistributionMessage {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SenderKeyDistributionMessage")
+            .field("id", &self.parsed.id)
+            .field("iteration", &self.parsed.iteration)
+            .finish_non_exhaustive()
+    }
 }
 impl SenderKeyDistributionMessage {
     pub fn new(
@@ -424,6 +432,68 @@ impl OwnedCiphertextMessage {
 #[cfg(test)]
 mod borrowed_tests {
     use super::*;
+    #[test]
+    fn sender_distribution_debug_hides_encoded_and_parsed_chain_secret() {
+        let distribution = SenderKeyDistributionMessage::new(
+            3,
+            11,
+            23,
+            [167; 32],
+            PublicKey::from_djb_public_key_bytes(&[9; 32]).unwrap(),
+        )
+        .unwrap();
+        for debug in [
+            format!("{distribution:?}"),
+            format!("{:#?}", Some(&distribution)),
+        ] {
+            assert!(debug.contains("SenderKeyDistributionMessage"));
+            assert!(debug.contains("11"));
+            assert!(debug.contains("23"));
+            assert!(!debug.contains("167"));
+            assert!(!debug.contains("\\xa7"));
+        }
+    }
+
+    #[test]
+    fn pairwise_constructors_support_classic_version_four() {
+        let public = PublicKey::from_djb_public_key_bytes(&[9; 32]).unwrap();
+        let identity = IdentityKey::new(public);
+        for version in [3, 4] {
+            let signal = SignalMessage::new(
+                version, &[7; 32], public, 1, 0, &[2; 16], &identity, &identity,
+            )
+            .unwrap();
+            assert_eq!(signal.message_version(), version);
+            assert_eq!(signal.serialized()[0], (version << 4) | 3);
+            let mut authenticated = Vec::new();
+            authenticated.extend_from_slice(&identity.serialize());
+            authenticated.extend_from_slice(&identity.serialize());
+            authenticated.extend_from_slice(&signal.serialized()[..signal.serialized().len() - 8]);
+            assert_eq!(
+                &signal.serialized()[signal.serialized().len() - 8..],
+                &engine::RustCrypto.hmac_sha256(&[7; 32], &authenticated)[..8]
+            );
+            let prekey =
+                PreKeySignalMessage::new(version, 5, None, 7.into(), public, identity, signal)
+                    .unwrap();
+            assert_eq!(prekey.message_version(), version);
+            assert_eq!(prekey.message().message_version(), version);
+        }
+        assert!(
+            SignalMessage::new(5, &[7; 32], public, 1, 0, &[2; 16], &identity, &identity).is_err()
+        );
+        assert!(SenderKeyDistributionMessage::new(4, 1, 0, [7; 32], public).is_err());
+        let group = engine::wire::SenderKeyMessage {
+            id: 3,
+            iteration: 4,
+            ciphertext: vec![6; 16],
+            signature: [7; 64],
+        };
+        let mut encoded = group.encode();
+        encoded[0] = 0x43;
+        assert!(SenderKeyMessage::try_from(encoded.as_slice()).is_err());
+    }
+
     fn signal_bytes() -> Vec<u8> {
         let signal = engine::wire::SignalMessage {
             ratchet: [9; 32],

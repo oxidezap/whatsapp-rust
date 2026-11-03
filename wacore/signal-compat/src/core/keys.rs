@@ -357,10 +357,18 @@ impl PreparedSigningKey {
         message: &[u8],
         rng: &mut R,
     ) -> Result<[u8; 64]> {
+        self.calculate_signature_with_random_source(message, &mut RandomAdapter(rng))
+            .map_err(|_| CurveError::Crypto)
+    }
+    pub fn calculate_signature_with_random_source(
+        &self,
+        message: &[u8],
+        rng: &mut dyn RandomSource,
+    ) -> wacore_signal_engine::Result<[u8; 64]> {
         use curve25519_dalek::{edwards::EdwardsPoint, scalar::Scalar};
         use sha2::{Digest, Sha512};
         let mut random = zeroize::Zeroizing::new([0; 64]);
-        rng.fill_bytes(random.as_mut_slice());
+        rng.fill(random.as_mut_slice())?;
         let mut domain = [255; 32];
         domain[0] = 254;
         let mut h = Sha512::new();

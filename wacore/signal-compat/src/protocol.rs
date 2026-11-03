@@ -10,6 +10,7 @@ pub use components::*;
 mod legacy;
 #[cfg(feature = "legacy-session-interop")]
 pub use legacy::*;
+mod group_crypto;
 mod messages;
 mod operations;
 mod records;

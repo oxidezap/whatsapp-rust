@@ -59,6 +59,10 @@ fn signal_transitions_have_no_io_executor_clock_or_global_randomness() {
     for (name, source) in [
         ("lib", include_str!("../wacore/signal-engine/src/lib.rs")),
         (
+            "encode",
+            include_str!("../wacore/signal-engine/src/encode.rs"),
+        ),
+        (
             "codec",
             include_str!("../wacore/signal-engine/src/codec.rs"),
         ),

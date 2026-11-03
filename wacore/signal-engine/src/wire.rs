@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Wire field numbers follow the public protobuf data declarations.
+//! Pairwise versions 3 and 4 use the classical fields here; post-quantum fields
+//! remain unsupported.
 use crate::{Error, Result};
 #[derive(Clone, Copy)]
 pub(crate) enum Value<'a> {
@@ -15,6 +17,15 @@ impl<'a> Fields<'a> {
     pub fn new(bytes: &'a [u8]) -> Result<Self> {
         if bytes.len() > 16 * 1024 * 1024 {
             return Err(Error::Encoding("protobuf size limit"));
+        }
+        Ok(Self { bytes })
+    }
+    /// Stored records aggregate archived sessions and expanded historical keys.
+    /// They have a separate finite budget; network envelopes keep the 16 MiB gate.
+    pub(crate) fn new_storage(bytes: &'a [u8]) -> Result<Self> {
+        const STORAGE_PROTOBUF_LIMIT: usize = 128 * 1024 * 1024;
+        if bytes.len() > STORAGE_PROTOBUF_LIMIT {
+            return Err(Error::Encoding("stored protobuf size limit"));
         }
         Ok(Self { bytes })
     }
@@ -127,10 +138,21 @@ pub fn decode_public(bytes: &[u8]) -> Result<[u8; 32]> {
     }
 }
 pub(crate) fn versioned(bytes: &[u8], trailer: usize) -> Result<(&[u8], &[u8])> {
+    versioned_profile(bytes, trailer, false)
+}
+fn pairwise_versioned(bytes: &[u8], trailer: usize) -> Result<(&[u8], &[u8])> {
+    versioned_profile(bytes, trailer, true)
+}
+fn versioned_profile(bytes: &[u8], trailer: usize, pairwise: bool) -> Result<(&[u8], &[u8])> {
     let (&version, rest) = bytes
         .split_first()
         .ok_or(Error::Encoding("missing version"))?;
-    if version >> 4 != 3 || version & 15 < 3 {
+    let supported = if pairwise {
+        matches!(version >> 4, 3 | 4)
+    } else {
+        version >> 4 == 3
+    };
+    if !supported {
         return Err(Error::Version);
     }
     if rest.len() < trailer {
@@ -148,7 +170,10 @@ pub struct SignalMessage {
 }
 impl SignalMessage {
     pub fn unsigned(&self) -> Vec<u8> {
-        let mut out = vec![0x33];
+        self.unsigned_with_version(3)
+    }
+    pub fn unsigned_with_version(&self, version: u8) -> Vec<u8> {
+        let mut out = vec![(version << 4) | 3];
         bytes(&mut out, 1, &tagged_key(&self.ratchet));
         uint(&mut out, 2, self.counter.into());
         uint(&mut out, 3, self.previous_counter.into());
@@ -156,7 +181,10 @@ impl SignalMessage {
         out
     }
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = self.unsigned();
+        self.encode_with_version(3)
+    }
+    pub fn encode_with_version(&self, version: u8) -> Vec<u8> {
+        let mut out = self.unsigned_with_version(version);
         out.extend_from_slice(&self.mac);
         out
     }
@@ -175,7 +203,10 @@ pub struct PreKeySignalMessage {
 }
 impl PreKeySignalMessage {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = vec![0x33];
+        self.encode_with_version(3)
+    }
+    pub fn encode_with_version(&self, version: u8) -> Vec<u8> {
+        let mut out = vec![(version << 4) | 3];
         if let Some(id) = self.pre_key_id {
             uint(&mut out, 1, id.into());
         }
@@ -190,12 +221,20 @@ impl PreKeySignalMessage {
         Ok(PreKeySignalMessageView::decode(input)?.to_owned())
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SenderKeyDistribution {
     pub id: u32,
     pub iteration: u32,
     pub chain_key: [u8; 32],
     pub signing_key: [u8; 32],
+}
+impl core::fmt::Debug for SenderKeyDistribution {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SenderKeyDistribution")
+            .field("id", &self.id)
+            .field("iteration", &self.iteration)
+            .finish_non_exhaustive()
+    }
 }
 impl SenderKeyDistribution {
     pub fn encode(&self) -> Vec<u8> {
@@ -264,7 +303,7 @@ pub struct SignalMessageView<'a> {
 }
 impl<'a> SignalMessageView<'a> {
     pub fn decode(input: &'a [u8]) -> Result<Self> {
-        let (body, mac) = versioned(input, 8)?;
+        let (body, mac) = pairwise_versioned(input, 8)?;
         let mut fields = Fields::new(body)?;
         let (mut ratchet, mut counter, mut previous, mut ciphertext) = (None, None, 0, None);
         while let Some((n, v)) = fields.next()? {
@@ -315,7 +354,7 @@ pub struct PreKeySignalMessageView<'a> {
 }
 impl<'a> PreKeySignalMessageView<'a> {
     pub fn decode(input: &'a [u8]) -> Result<Self> {
-        let (body, _) = versioned(input, 0)?;
+        let (body, _) = pairwise_versioned(input, 0)?;
         let mut f = Fields::new(body)?;
         let (mut registration, mut pre_key_id, mut signed, mut base, mut identity, mut message) =
             (0, None, None, None, None, None);
@@ -407,6 +446,84 @@ impl<'a> SenderKeyMessageView<'a> {
 #[cfg(test)]
 mod borrowed_tests {
     use super::*;
+    #[test]
+    fn sender_distribution_debug_hides_chain_secret() {
+        let distribution = SenderKeyDistribution {
+            id: 11,
+            iteration: 23,
+            chain_key: [167; 32],
+            signing_key: [9; 32],
+        };
+        for debug in [
+            format!("{distribution:?}"),
+            format!("{:#?}", Some(&distribution)),
+        ] {
+            assert!(debug.contains("SenderKeyDistribution"));
+            assert!(debug.contains("11"));
+            assert!(debug.contains("23"));
+            assert!(!debug.contains("167"));
+            assert!(!debug.contains("\\xa7"));
+        }
+    }
+
+    #[test]
+    fn classic_pairwise_version_four_preserves_original_version_byte() {
+        let signal = SignalMessage {
+            ratchet: [9; 32],
+            counter: 7,
+            previous_counter: 2,
+            ciphertext: vec![3; 16],
+            mac: [4; 8],
+        };
+        let mut encoded = signal.encode_with_version(4);
+        assert_eq!(encoded[0], 0x43);
+        assert_eq!(
+            SignalMessageView::decode(&encoded).unwrap().to_owned(),
+            signal
+        );
+        assert_eq!(
+            signal.unsigned_with_version(4),
+            &encoded[..encoded.len() - 8]
+        );
+        for byte in [0x40, 0x43, 0x4f] {
+            encoded[0] = byte;
+            let view = SignalMessageView::decode(&encoded).unwrap();
+            assert_eq!(view.unsigned()[0], byte);
+            let prekey = PreKeySignalMessage {
+                registration: 5,
+                pre_key_id: None,
+                signed_pre_key_id: 7,
+                base_key: [8; 32],
+                identity: [9; 32],
+                message: encoded.clone(),
+            };
+            let mut outer = prekey.encode_with_version(4);
+            outer[0] = byte;
+            let view = PreKeySignalMessageView::decode(&outer).unwrap();
+            assert_eq!(view.bytes[0], byte);
+            assert_eq!(view.message, encoded);
+        }
+        assert_eq!(signal.encode()[0], 0x33);
+        let group = SenderKeyMessage {
+            id: 3,
+            iteration: 4,
+            ciphertext: vec![6; 16],
+            signature: [7; 64],
+        };
+        let mut encoded = group.encode();
+        encoded[0] = 0x43;
+        assert_eq!(SenderKeyMessageView::decode(&encoded), Err(Error::Version));
+        let distribution = SenderKeyDistribution {
+            id: 3,
+            iteration: 4,
+            chain_key: [6; 32],
+            signing_key: [7; 32],
+        };
+        let mut encoded = distribution.encode();
+        encoded[0] = 0x43;
+        assert_eq!(SenderKeyDistribution::decode(&encoded), Err(Error::Version));
+    }
+
     fn inside(input: &[u8], part: &[u8]) -> bool {
         let start = input.as_ptr() as usize;
         let end = start + input.len();

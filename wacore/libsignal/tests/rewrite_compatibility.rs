@@ -509,14 +509,14 @@ fn mixed_expanded_and_seed_message_keys_follow_historical_precedence() {
     let bytes = proto.encode_to_vec();
     let decoded = new::codec::decode_session_record(&RustCrypto, &bytes).unwrap();
     assert!(
-        matches!(&decoded.current.as_ref().unwrap().receivers[0].skipped[0],new::MessageKey::Derived{index:9,cipher,..}if cipher==&[1;32])
+        matches!(&decoded.current.as_ref().unwrap().receivers[0].skipped[0],new::MessageKey::Derived{index:9,material}if material.cipher==[1;32])
     );
     let old = old::SessionRecord::deserialize(&bytes).unwrap();
     let mut normalized = Vec::new();
     old.serialize_into(&mut normalized);
     let decoded = new::codec::decode_session_record(&RustCrypto, &normalized).unwrap();
     assert!(
-        matches!(&decoded.current.as_ref().unwrap().receivers[0].skipped[0],new::MessageKey::Derived{index:9,mac,..}if mac==&[2;32])
+        matches!(&decoded.current.as_ref().unwrap().receivers[0].skipped[0],new::MessageKey::Derived{index:9,material}if material.mac==[2;32])
     );
 }
 
@@ -584,4 +584,93 @@ fn historical_json_and_binary_serde_keys_cross_read_without_conversion() {
     let json = serde_json::to_vec(&identity).unwrap();
     let reloaded: replacement::core::IdentityKeyPair = serde_json::from_slice(&json).unwrap();
     assert_eq!(serde_json::to_vec(&reloaded).unwrap(), json);
+}
+
+#[test]
+fn classical_version_four_sessions_and_ciphertext_cross_both_engines() {
+    let (mut alice, mut bob, alice_key, bob_key) = pair();
+    alice.current.as_mut().unwrap().version = 4;
+    bob.current.as_mut().unwrap().version = 4;
+    let address = old::ProtocolAddress::new("synthetic-classic-v4", 1.into());
+    let mut random = Random::seeded();
+    let wire = new::Engine::new(&RustCrypto, &mut random)
+        .encrypt(&mut alice, b"classic-v4-new")
+        .unwrap();
+    assert_eq!(wire[0], 0x43);
+    let mut store = SessionStore(Some(legacy(&bob)));
+    let message = old::SignalMessage::try_from(wire.as_slice()).unwrap();
+    assert_eq!(
+        futures::executor::block_on(old::message_decrypt_signal(
+            &message,
+            &address,
+            &mut store,
+            &mut identities(&bob_key, &alice_key),
+            &mut random.0
+        ))
+        .unwrap()
+        .plaintext,
+        b"classic-v4-new"
+    );
+    let wire = futures::executor::block_on(old::message_encrypt(
+        b"classic-v4-old",
+        &address,
+        &mut store,
+        &mut identities(&bob_key, &alice_key),
+    ))
+    .unwrap();
+    assert_eq!(wire.serialize()[0], 0x43);
+    assert_eq!(
+        new::Engine::new(&RustCrypto, &mut random)
+            .decrypt(&mut alice, wire.serialize())
+            .unwrap(),
+        b"classic-v4-old"
+    );
+    let stored = new::codec::encode_session_record(&alice);
+    assert_eq!(
+        new::codec::decode_session_record_live(&RustCrypto, &stored, &INCARNATION)
+            .unwrap()
+            .current
+            .unwrap()
+            .version,
+        4
+    );
+}
+
+#[test]
+fn stored_history_has_a_bounded_budget_separate_from_network_envelopes() {
+    let (mut record, _, _, _) = pair();
+    record.current.as_mut().unwrap().pending_pre_key = Some(new::PendingPreKey {
+        pre_key_id: Some(73),
+        signed_pre_key_id: Some(5),
+        base_key: [4; 32],
+        kyber_pre_key_id: Some(8),
+        kyber_ciphertext: Some(vec![6; 16 * 1024 * 1024]),
+    });
+    let bytes = new::codec::encode_session_record(&record);
+    assert!(bytes.len() > 16 * 1024 * 1024);
+    assert!(old::SessionRecord::deserialize(&bytes).is_ok());
+    let decoded = new::codec::decode_session_record(&RustCrypto, &bytes).unwrap();
+    assert_eq!(
+        decoded
+            .current
+            .as_ref()
+            .unwrap()
+            .pending_pre_key
+            .as_ref()
+            .unwrap()
+            .kyber_ciphertext
+            .as_ref()
+            .unwrap()
+            .len(),
+        16 * 1024 * 1024
+    );
+    let oversized_wire = new::wire::SignalMessage {
+        ratchet: [1; 32],
+        counter: 0,
+        previous_counter: 0,
+        ciphertext: vec![7; 16 * 1024 * 1024],
+        mac: [0; 8],
+    }
+    .encode();
+    assert!(new::wire::SignalMessageView::decode(&oversized_wire).is_err());
 }

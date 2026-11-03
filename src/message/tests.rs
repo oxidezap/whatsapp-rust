@@ -23172,6 +23172,13 @@ fn live_admission_refusal_metrics_regression() {
 fn session_store_encoding_does_not_rebuild_skipped_key_arrays() {
     use buffa::{Message as _, MessageField};
     let mut chain = wa::session_structure::Chain::default();
+    let mut ratchet = vec![5];
+    ratchet.extend_from_slice(&[0x11; 32]);
+    chain.sender_ratchet_key = Some(ratchet.clone());
+    let mut chain_key = wa::session_structure::chain::ChainKey::default();
+    chain_key.index = Some(40);
+    chain_key.key = Some(bytes::Bytes::from_static(&[0x22; 32]));
+    chain.chain_key = MessageField::some(chain_key);
     for index in 0..40 {
         let mut key = wa::session_structure::chain::MessageKey::default();
         key.index = Some(index);
@@ -23180,6 +23187,13 @@ fn session_store_encoding_does_not_rebuild_skipped_key_arrays() {
     }
     let mut session = wa::SessionStructure::default();
     session.session_version = Some(3);
+    session.local_identity_public = Some(ratchet.clone());
+    session.remote_identity_public = Some(ratchet);
+    session.root_key = Some(vec![0x33; 32]);
+    session.previous_counter = Some(0);
+    session.local_registration_id = Some(0);
+    session.remote_registration_id = Some(0);
+    session.needs_refresh = Some(false);
     session.receiver_chains.push(chain);
     let mut record = wa::RecordStructure::default();
     record.current_session = MessageField::some(session);

@@ -2358,7 +2358,7 @@ mod tests {
             &[1],
         );
         let message_key = MessageKeyGenerator::new_from_seed(&seed, chain.index());
-        let next_chain = chain.next_chain_key();
+        let next_chain = chain.next_chain_key().expect("counter has room");
         let generated = message_key.generate_keys();
         assert_eq!(next_chain.index(), chain.index() + 1);
         assert_eq!(generated.cipher_key().len(), 32);

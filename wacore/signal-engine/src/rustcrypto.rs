@@ -121,7 +121,7 @@ impl CryptoProvider for RustCrypto {
     fn decrypt_cbc(&self, key: &[u8; 32], iv: &[u8; 16], ciphertext: &[u8]) -> Result<Vec<u8>> {
         cbc::Decryptor::<aes::Aes256>::new(key.into(), iv.into())
             .decrypt_padded_vec::<Pkcs7>(ciphertext)
-            .map_err(|_| Error::Crypto)
+            .map_err(|_| Error::InvalidCiphertext)
     }
 }
 

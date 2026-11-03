@@ -5,7 +5,6 @@ use crate::{
     state::*,
     wire::{SenderKeyDistribution, SenderKeyMessage, SenderKeyMessageView},
 };
-use std::collections::VecDeque;
 use zeroize::Zeroize;
 impl SenderKeyState {
     fn step<C: CryptoProvider>(&mut self, crypto: &C) -> Result<SenderMessageKey> {
@@ -73,7 +72,7 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
                 chain_key: key,
                 signing_public: signing.public,
                 signing_private: Some(signing.private),
-                skipped: VecDeque::new(),
+                skipped: SharedDeque::new(),
             };
             record.states.insert(0, state);
             record.states.truncate(MAX_SENDER_STATES);
@@ -111,7 +110,7 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
             chain_key: distribution.chain_key,
             signing_public: distribution.signing_key,
             signing_private: None,
-            skipped: VecDeque::new(),
+            skipped: SharedDeque::new(),
         });
         record.states.insert(0, state);
         record.states.truncate(MAX_SENDER_STATES);
@@ -162,7 +161,7 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         )?;
         let key = state.take(self.crypto, message.iteration)?;
         let (cipher, iv) = expand(self.crypto, &key.seed)?;
-        let plaintext = self.crypto.decrypt_cbc(&cipher, &iv, &message.ciphertext)?;
+        let plaintext = self.crypto.decrypt_cbc(&cipher, &iv, message.ciphertext)?;
         record.states[index] = state;
         Ok(plaintext)
     }
