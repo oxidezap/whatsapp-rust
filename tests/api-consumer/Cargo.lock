@@ -1848,7 +1848,7 @@ dependencies = [
  "wacore-binary",
  "wacore-derive",
  "wacore-noise",
- "wacore-signal-runtime",
+ "wacore-libsignal",
  "waproto",
  "zerocopy",
  "zeroize",
@@ -1871,7 +1871,7 @@ dependencies = [
  "subtle",
  "thiserror",
  "wacore-binary",
- "wacore-signal-runtime",
+ "wacore-libsignal",
  "waproto",
 ]
 
@@ -1915,27 +1915,12 @@ dependencies = [
  "sha2",
  "thiserror",
  "wacore-binary",
- "wacore-signal-runtime",
+ "wacore-libsignal",
  "waproto",
 ]
 
 [[package]]
-name = "wacore-signal-engine"
-version = "0.7.0"
-dependencies = [
- "aes",
- "cbc",
- "curve25519-dalek",
- "hkdf",
- "hmac",
- "sha2",
- "subtle",
- "thiserror",
- "zeroize",
-]
-
-[[package]]
-name = "wacore-signal-runtime"
+name = "wacore-libsignal"
 version = "0.7.0"
 dependencies = [
  "aes",
@@ -1960,7 +1945,6 @@ dependencies = [
  "thiserror",
  "wacore-binary",
  "wacore-derive",
- "wacore-signal-engine",
  "waproto",
  "zeroize",
 ]

@@ -4850,8 +4850,8 @@ dependencies = [
  "wacore-appstate",
  "wacore-binary",
  "wacore-derive",
+ "wacore-libsignal",
  "wacore-noise",
- "wacore-signal-runtime",
  "waproto",
  "zerocopy",
  "zeroize",
@@ -4875,7 +4875,7 @@ dependencies = [
  "subtle",
  "thiserror 2.0.21",
  "wacore-binary",
- "wacore-signal-runtime",
+ "wacore-libsignal",
  "waproto",
 ]
 
@@ -4914,6 +4914,7 @@ name = "wacore-libsignal"
 version = "0.7.0"
 dependencies = [
  "aes 0.9.3",
+ "aes-gcm",
  "async-lock",
  "async-trait",
  "buffa",
@@ -4925,7 +4926,6 @@ dependencies = [
  "ctr 0.10.1",
  "curve25519-dalek",
  "futures",
- "ghash",
  "hex",
  "hkdf",
  "hmac 0.13.0",
@@ -4934,16 +4934,14 @@ dependencies = [
  "rand 0.10.3",
  "serde",
  "serde_json",
- "sha1 0.11.0",
  "sha2 0.11.1",
  "subtle",
+ "syn 3.0.9",
  "thiserror 2.0.21",
  "wacore-binary",
  "wacore-derive",
- "wacore-signal-engine",
- "wacore-signal-runtime",
  "waproto",
- "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -4960,57 +4958,8 @@ dependencies = [
  "sha2 0.11.1",
  "thiserror 2.0.21",
  "wacore-binary",
- "wacore-signal-runtime",
+ "wacore-libsignal",
  "waproto",
-]
-
-[[package]]
-name = "wacore-signal-engine"
-version = "0.7.0"
-dependencies = [
- "aes 0.9.3",
- "cbc",
- "curve25519-dalek",
- "hkdf",
- "hmac 0.13.0",
- "sha2 0.11.1",
- "subtle",
- "syn 3.0.9",
- "thiserror 2.0.21",
- "zeroize",
-]
-
-[[package]]
-name = "wacore-signal-runtime"
-version = "0.7.0"
-dependencies = [
- "aes 0.9.3",
- "aes-gcm",
- "async-lock",
- "async-trait",
- "buffa",
- "bytes",
- "cbc",
- "chrono",
- "ctr 0.10.1",
- "curve25519-dalek",
- "futures",
- "hex",
- "hkdf",
- "hmac 0.13.0",
- "log",
- "portable-atomic",
- "rand 0.10.3",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "subtle",
- "thiserror 2.0.21",
- "wacore-binary",
- "wacore-derive",
- "wacore-signal-engine",
- "waproto",
- "zeroize",
 ]
 
 [[package]]
@@ -5857,17 +5806,6 @@ name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
-
-[[package]]
-name = "x25519-dalek"
-version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7e8131a03190127fb2263afc72b322ecadae46b6ff8c6f399ff5d02f5559af6"
-dependencies = [
- "curve25519-dalek",
- "rand_core 0.10.1",
- "zeroize",
-]
 
 [[package]]
 name = "x509-parser"

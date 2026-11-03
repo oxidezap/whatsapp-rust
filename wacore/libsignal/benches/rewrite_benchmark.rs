@@ -1,13 +1,12 @@
-//! Synthetic, matched fixtures for the independent engine and legacy test oracle.
+//! Standalone synthetic benchmarks for the protocol engine and public adapter.
 //! Run only through CodSpeed. Fixture construction is outside measured regions.
 //! `load` measures cold codec allocation; `clone_live` measures warm retained state.
 //! Allocation profiling describes native API allocations, not whole-process RSS.
 //! Cold/warm describes decoded-state availability, not hardware cache flushing.
 use divan::black_box;
 use rand::{RngExt as _, SeedableRng as _, rngs::StdRng};
-use replacement::protocol as sdk;
-use wacore_libsignal::protocol as old;
-use wacore_signal_engine::{self as new, RandomSource, RustCrypto};
+use wacore_libsignal::engine::{self as new, RandomSource, RustCrypto};
+use wacore_libsignal::protocol as sdk;
 
 #[global_allocator]
 static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
@@ -76,9 +75,6 @@ fn session(backlog: usize, archives: usize) -> new::SessionRecord {
 fn bytes(backlog: usize, archives: usize) -> Vec<u8> {
     new::codec::encode_session_record(&session(backlog, archives))
 }
-fn old_session(input: &[u8]) -> old::SessionRecord {
-    old::SessionRecord::deserialize_for_store(input, &INCARNATION).unwrap()
-}
 fn sdk_session(input: &[u8]) -> sdk::SessionRecord {
     sdk::SessionRecord::deserialize_for_store(input, &INCARNATION).unwrap()
 }
@@ -108,33 +104,14 @@ mod backlog {
         b.bench(|| black_box(black_box(&record).clone()));
     }
     #[divan::bench(args = [0, 128, 2000])]
-    fn legacy_load(b: divan::Bencher, keys: usize) {
-        let input = bytes(keys, 0);
-        b.bench(|| black_box(old_session(black_box(&input))));
-    }
-    #[divan::bench(args = [0, 128, 2000])]
     fn independent_load(b: divan::Bencher, keys: usize) {
         let input = bytes(keys, 0);
         b.bench(|| black_box(new_session(black_box(&input))));
     }
     #[divan::bench(args = [0, 128, 2000])]
-    fn legacy_save_fresh(b: divan::Bencher, keys: usize) {
-        let record = old_session(&bytes(keys, 0));
-        b.bench(|| {
-            let mut output = Vec::new();
-            record.serialize_into_for_store(&mut output, &INCARNATION);
-            black_box(output)
-        });
-    }
-    #[divan::bench(args = [0, 128, 2000])]
     fn independent_save_fresh(b: divan::Bencher, keys: usize) {
         let record = new_session(&bytes(keys, 0));
         b.bench(|| black_box(new::codec::encode_session_record(black_box(&record))));
-    }
-    #[divan::bench(args = [0, 128, 2000])]
-    fn legacy_clone_live(b: divan::Bencher, keys: usize) {
-        let record = old_session(&bytes(keys, 0));
-        b.bench(|| black_box(black_box(&record).clone()));
     }
     #[divan::bench(args = [0, 128, 2000])]
     fn independent_clone_live(b: divan::Bencher, keys: usize) {
@@ -165,33 +142,14 @@ mod archive {
     }
     // Each archived state has 128 compact skipped keys. The current state does too.
     #[divan::bench(args = [1, 10, 40])]
-    fn legacy_load(b: divan::Bencher, count: usize) {
-        let input = bytes(128, count);
-        b.bench(|| black_box(old_session(black_box(&input))));
-    }
-    #[divan::bench(args = [1, 10, 40])]
     fn independent_load(b: divan::Bencher, count: usize) {
         let input = bytes(128, count);
         b.bench(|| black_box(new_session(black_box(&input))));
     }
     #[divan::bench(args = [1, 10, 40])]
-    fn legacy_save_fresh(b: divan::Bencher, count: usize) {
-        let record = old_session(&bytes(128, count));
-        b.bench(|| {
-            let mut output = Vec::new();
-            record.serialize_into_for_store(&mut output, &INCARNATION);
-            black_box(output)
-        });
-    }
-    #[divan::bench(args = [1, 10, 40])]
     fn independent_save_fresh(b: divan::Bencher, count: usize) {
         let record = new_session(&bytes(128, count));
         b.bench(|| black_box(new::codec::encode_session_record(black_box(&record))));
-    }
-    #[divan::bench(args = [1, 10, 40])]
-    fn legacy_clone_live(b: divan::Bencher, count: usize) {
-        let record = old_session(&bytes(128, count));
-        b.bench(|| black_box(black_box(&record).clone()));
     }
     #[divan::bench(args = [1, 10, 40])]
     fn independent_clone_live(b: divan::Bencher, count: usize) {
@@ -200,27 +158,6 @@ mod archive {
     }
 }
 
-struct SenderStore(Option<old::SenderKeyRecord>);
-#[async_trait::async_trait]
-impl old::SenderKeyStore for SenderStore {
-    async fn load_sender_key(
-        &self,
-        _: &old::SenderKeyName,
-    ) -> old::error::Result<Option<old::SenderKeyRecord>> {
-        Ok(self.0.clone())
-    }
-    async fn store_sender_key(
-        &mut self,
-        _: &old::SenderKeyName,
-        record: old::SenderKeyRecord,
-    ) -> old::error::Result<()> {
-        self.0 = Some(record);
-        Ok(())
-    }
-}
-fn sender_name() -> old::SenderKeyName {
-    old::SenderKeyName::from_parts("synthetic-group@g.us", "synthetic-sender:1@s.whatsapp.net")
-}
 fn sender_pair() -> (new::SenderKeyRecord, new::SenderKeyRecord) {
     let mut random = Random::seeded();
     let mut engine = new::Engine::new(&RustCrypto, &mut random);
@@ -234,37 +171,10 @@ fn sender_pair() -> (new::SenderKeyRecord, new::SenderKeyRecord) {
     sender.reservation.mark_committed();
     (sender, receiver)
 }
-fn old_sender(record: &new::SenderKeyRecord) -> SenderStore {
-    SenderStore(Some(
-        old::SenderKeyRecord::deserialize_for_store(
-            &new::codec::encode_sender_key_record(record),
-            &INCARNATION,
-        )
-        .unwrap(),
-    ))
-}
 mod sender_key {
     use super::*;
     // Legacy measurements include its async in-memory store interface and clone.
     // Independent measurements use the engine's direct mutable-state API.
-    #[divan::bench(args = [32, 1024])]
-    fn legacy_encrypt(b: divan::Bencher, size: usize) {
-        let (sender, _) = sender_pair();
-        let payload = vec![0x75; size];
-        let name = sender_name();
-        b.with_inputs(|| (old_sender(&sender), Random::seeded()))
-            .bench_refs(|(store, random)| {
-                black_box(
-                    futures::executor::block_on(old::group_encrypt(
-                        store,
-                        &name,
-                        &payload,
-                        &mut random.0,
-                    ))
-                    .unwrap(),
-                );
-            });
-    }
     #[divan::bench(args = [32, 1024])]
     fn independent_encrypt(b: divan::Bencher, size: usize) {
         let (sender, _) = sender_pair();
@@ -277,19 +187,6 @@ mod sender_key {
                         .unwrap(),
                 );
             });
-    }
-    #[divan::bench(args = [32, 1024])]
-    fn legacy_decrypt(b: divan::Bencher, size: usize) {
-        let (mut sender, receiver) = sender_pair();
-        let wire = new::Engine::new(&RustCrypto, &mut Random::seeded())
-            .encrypt_sender_key(&mut sender, &vec![0x75; size])
-            .unwrap();
-        let name = sender_name();
-        b.with_inputs(|| old_sender(&receiver)).bench_refs(|store| {
-            black_box(
-                futures::executor::block_on(old::group_decrypt(&wire, store, &name)).unwrap(),
-            );
-        });
     }
     #[divan::bench(args = [32, 1024])]
     fn independent_decrypt(b: divan::Bencher, size: usize) {
@@ -421,50 +318,6 @@ mod sender_sdk {
             });
     }
     #[divan::bench(args = [32, 1024])]
-    fn legacy_decrypt_cold_shared(b: divan::Bencher, size: usize) {
-        let (receiver, wire, _) = receive_fixture(size, 0);
-        let record = old_sender(&receiver).0.unwrap();
-        let name = sender_name();
-        b.with_inputs(|| SenderStore(Some(record.clone())))
-            .bench_refs(|store| {
-                black_box(
-                    futures::executor::block_on(old::group_decrypt_shared(
-                        wire.clone(),
-                        store,
-                        &name,
-                    ))
-                    .unwrap(),
-                );
-            });
-    }
-    #[divan::bench(args = [32, 1024])]
-    fn legacy_encrypt_warm(b: divan::Bencher, size: usize) {
-        let (sender, _) = sender_pair();
-        let mut store = old_sender(&sender);
-        let name = sender_name();
-        let payload = vec![0x75; size];
-        futures::executor::block_on(old::group_encrypt(
-            &mut store,
-            &name,
-            &payload,
-            &mut Random::seeded().0,
-        ))
-        .unwrap();
-        let record = store.0.unwrap();
-        b.with_inputs(|| (SenderStore(Some(record.clone())), Random::seeded()))
-            .bench_refs(|(store, random)| {
-                black_box(
-                    futures::executor::block_on(old::group_encrypt(
-                        store,
-                        &name,
-                        &payload,
-                        &mut random.0,
-                    ))
-                    .unwrap(),
-                );
-            });
-    }
-    #[divan::bench(args = [32, 1024])]
     fn runtime_encrypt_warm(b: divan::Bencher, size: usize) {
         let (sender, _) = sender_pair();
         let mut store = runtime_sender(&sender);
@@ -492,25 +345,6 @@ mod sender_sdk {
             });
     }
     #[divan::bench(args = [32, 1024])]
-    fn legacy_decrypt_warm(b: divan::Bencher, size: usize) {
-        let (receiver, first, second) = receive_fixture(size, 0);
-        let mut store = old_sender(&receiver);
-        let name = sender_name();
-        futures::executor::block_on(old::group_decrypt_shared(first, &mut store, &name)).unwrap();
-        let record = store.0.unwrap();
-        b.with_inputs(|| SenderStore(Some(record.clone())))
-            .bench_refs(|store| {
-                black_box(
-                    futures::executor::block_on(old::group_decrypt_shared(
-                        second.clone(),
-                        store,
-                        &name,
-                    ))
-                    .unwrap(),
-                );
-            });
-    }
-    #[divan::bench(args = [32, 1024])]
     fn runtime_decrypt_warm(b: divan::Bencher, size: usize) {
         let (receiver, first, second) = receive_fixture(size, 0);
         let mut store = runtime_sender(&receiver);
@@ -528,15 +362,6 @@ mod sender_sdk {
                     .unwrap(),
                 );
             });
-    }
-    #[divan::bench(args = [0, 128, 2000])]
-    fn legacy_clone_warm_backlog(b: divan::Bencher, keys: usize) {
-        let (receiver, first, _) = receive_fixture(32, keys);
-        let mut store = old_sender(&receiver);
-        futures::executor::block_on(old::group_decrypt_shared(first, &mut store, &sender_name()))
-            .unwrap();
-        let record = store.0.unwrap();
-        b.bench(|| black_box(black_box(&record).clone()));
     }
     #[divan::bench(args = [0, 128, 2000])]
     fn runtime_clone_warm_backlog(b: divan::Bencher, keys: usize) {

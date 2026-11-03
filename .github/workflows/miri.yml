@@ -69,9 +69,9 @@ jobs:
             args: -p wacore-noise --lib
           # Exercise address ownership in the production Signal runtime. Its
           # safe formatter replaces the inherited inline-buffer implementation.
-          - name: wacore-signal-runtime (address)
+          - name: wacore-libsignal (address)
             cache-key: signal-runtime-address
-            args: -p wacore-signal-runtime --lib address
+            args: -p wacore-libsignal --lib address
           # Scoped allocation ownership must survive cross-thread frees, TLS
           # teardown and unwinding without recursing through the allocator.
           - name: whatsapp-rust (test_alloc)

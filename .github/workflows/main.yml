@@ -286,7 +286,7 @@ jobs:
         env:
           NEXTEST_PROFILE: ci
           TEST_TIMINGS_DIR: ${{ runner.temp }}/test-timings
-        run: cargo xt ci test-feature-packages wacore wacore-signal-runtime wacore-signal-engine whatsapp-rust
+        run: cargo xt ci test-feature-packages wacore wacore-libsignal whatsapp-rust
       - name: Publish test timings
         if: always()
         uses: actions/upload-artifact@v7
@@ -475,7 +475,7 @@ jobs:
       - name: Check the remaining published crates at MSRV
         run: >
           cargo check --no-default-features --verbose
-          -p whatsapp-rust -p wacore-derive -p wacore-signal-runtime -p wacore-signal-engine -p wacore-noise -p waproto
+          -p whatsapp-rust -p wacore-derive -p wacore-libsignal -p wacore-noise -p waproto
           -p whatsapp-rust-ureq-http-client
           -p whatsapp-rust-sqlite-storage -p whatsapp-rust-tokio-transport
       # Standalone API hosts run in consumers.yml through the central xtask
