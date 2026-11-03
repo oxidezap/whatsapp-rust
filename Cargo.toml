@@ -343,7 +343,9 @@ getrandom = { workspace = true, features = ["wasm_js"] }
 send_wrapper = { version = "0.6", features = ["futures"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-parking_lot = "=0.12.5"
+parking_lot = "=0.13.0"
+# Warm both process-global tables retained by the native dependency graph.
+parking_lot_012 = { package = "parking_lot", version = "=0.12.5" }
 
 [dev-dependencies]
 aes = { workspace = true }
