@@ -1847,8 +1847,8 @@ dependencies = [
  "wacore-appstate",
  "wacore-binary",
  "wacore-derive",
- "wacore-noise",
  "wacore-libsignal",
+ "wacore-noise",
  "waproto",
  "zerocopy",
  "zeroize",
@@ -1903,23 +1903,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wacore-noise"
-version = "0.7.0"
-dependencies = [
- "anyhow",
- "buffa",
- "bytes",
- "hkdf",
- "log",
- "rand",
- "sha2",
- "thiserror",
- "wacore-binary",
- "wacore-libsignal",
- "waproto",
-]
-
-[[package]]
 name = "wacore-libsignal"
 version = "0.7.0"
 dependencies = [
@@ -1936,6 +1919,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "itoa",
  "log",
  "portable-atomic",
  "rand",
@@ -1947,6 +1931,23 @@ dependencies = [
  "wacore-derive",
  "waproto",
  "zeroize",
+]
+
+[[package]]
+name = "wacore-noise"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "buffa",
+ "bytes",
+ "hkdf",
+ "log",
+ "rand",
+ "sha2",
+ "thiserror",
+ "wacore-binary",
+ "wacore-libsignal",
+ "waproto",
 ]
 
 [[package]]
