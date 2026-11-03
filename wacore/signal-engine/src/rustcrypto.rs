@@ -128,6 +128,44 @@ impl CryptoProvider for RustCrypto {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rfc7748_low_order_aliases_reject_and_valid_high_bit_alias_agrees() {
+        // RFC 7748 sections 5 and 6.1 define masking, field reduction and the
+        // all-zero shared-secret check. Torsion points are public Dalek constants.
+        let private = hex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+        let mut p = [255; 32];
+        p[0] = 237;
+        p[31] = 127;
+        let mut p_plus_one = p;
+        p_plus_one[0] += 1;
+        let mut minus_one = p;
+        minus_one[0] -= 1;
+        let mut one = [0; 32];
+        one[0] = 1;
+        let mut low_order = vec![[0; 32], one, minus_one, p, p_plus_one];
+        low_order.extend(
+            curve25519_dalek::constants::EIGHT_TORSION
+                .iter()
+                .map(|point| point.to_montgomery().to_bytes()),
+        );
+        for public in low_order {
+            let mut alias = public;
+            alias[31] |= 128;
+            for encoded in [public, alias] {
+                assert!(
+                    RustCrypto.agreement(&private, &encoded).is_err(),
+                    "{encoded:02x?}"
+                );
+            }
+        }
+        let public = hex("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f");
+        let mut alias = public;
+        alias[31] |= 128;
+        let expected = hex("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
+        assert_eq!(RustCrypto.agreement(&private, &public).unwrap(), expected);
+        assert_eq!(RustCrypto.agreement(&private, &alias).unwrap(), expected);
+    }
+
     fn hex<const N: usize>(s: &str) -> [u8; N] {
         assert_eq!(s.len(), N * 2);
         core::array::from_fn(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap())

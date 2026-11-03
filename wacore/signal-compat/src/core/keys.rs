@@ -415,6 +415,89 @@ impl From<KeyPair> for IdentityKeyPair {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn signed_fixture() -> (PublicKey, [u8; 64]) {
+        use rand::SeedableRng;
+        let private = PrivateKey::deserialize(&[7; 32]).unwrap();
+        let public = private.public_key().unwrap();
+        let signature = private
+            .calculate_signature(b"synthetic", &mut rand::rngs::StdRng::from_seed([9; 32]))
+            .unwrap();
+        (public, signature)
+    }
+    fn field_modulus() -> [u8; 32] {
+        let mut p = [255; 32];
+        p[0] = 237;
+        p[31] = 127;
+        p
+    }
+    #[test]
+    fn ordinary_and_prepared_reject_noncanonical_and_low_order_public_keys() {
+        let (public, signature) = signed_fixture();
+        assert!(public.verify_signature(b"synthetic", &signature));
+        let p = field_modulus();
+        let mut p_plus_one = p;
+        p_plus_one[0] += 1;
+        let mut minus_one = p;
+        minus_one[0] -= 1;
+        let mut one = [0; 32];
+        one[0] = 1;
+        let mut high_bit = *public.public_key_bytes();
+        high_bit[31] |= 128;
+        let mut invalid = vec![p, p_plus_one, high_bit, [0; 32], one, minus_one];
+        invalid.extend(
+            curve25519_dalek::constants::EIGHT_TORSION
+                .iter()
+                .map(|point| point.to_montgomery().to_bytes()),
+        );
+        for raw in invalid {
+            let public = PublicKey::from_djb_public_key_bytes(&raw).unwrap();
+            assert!(
+                !public.verify_signature(b"synthetic", &signature),
+                "{raw:02x?}"
+            );
+            assert!(PreparedVerifyingKey::new(&public).is_err(), "{raw:02x?}");
+        }
+    }
+    #[test]
+    fn ordinary_and_prepared_signature_boundaries_preserve_xeddsa_unreduced_s() {
+        let (public, signature) = signed_fixture();
+        let prepared = public.prepare_verifying_key().unwrap();
+        assert!(prepared.verify_signature(b"synthetic", &signature));
+        let p = field_modulus();
+        let mut p_plus_one = p;
+        p_plus_one[0] += 1;
+        let mut invalid = Vec::new();
+        for y in [p, p_plus_one] {
+            let mut changed = signature;
+            changed[..32].copy_from_slice(&y);
+            invalid.push(changed);
+        }
+        for bit in [0x20, 0x40, 0x80] {
+            let mut changed = signature;
+            changed[63] ^= bit;
+            invalid.push(changed);
+        }
+        for changed in invalid {
+            assert!(!public.verify_signature(b"synthetic", &changed));
+            assert!(!prepared.verify_signature(b"synthetic", &changed));
+        }
+        // XEdDSA section 5 permits unreduced S below 2^253. L is the
+        // Ed25519 subgroup order specified in RFC 8032 section 5.1.
+        let order = hex::decode("edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010")
+            .unwrap();
+        let mut unreduced = signature;
+        let mut carry = 0u16;
+        for (byte, addend) in unreduced[32..].iter_mut().zip(order) {
+            let sum = u16::from(*byte) + u16::from(addend) + carry;
+            *byte = sum as u8;
+            carry = sum >> 8;
+        }
+        assert_eq!(carry, 0);
+        assert_eq!(unreduced[63] & 0xe0, 0);
+        assert!(public.verify_signature(b"synthetic", &unreduced));
+        assert!(prepared.verify_signature(b"synthetic", &unreduced));
+    }
+
     #[test]
     fn key_encodings_and_cached_signatures() {
         assert_eq!(
