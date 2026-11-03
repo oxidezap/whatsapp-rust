@@ -917,6 +917,15 @@ pub struct IdentityChange {
     /// decrypt (mirrors WA Web `saveIdentity` -> `handleNewIdentity`), `false`
     /// when triggered by the server's `<identity/>` notification.
     pub implicit: bool,
+    /// Previous raw Curve25519 public identity key, without the Signal type byte.
+    /// Absent when a custom store reports a change without retaining the keys,
+    /// or a storage error prevented reading the prior key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_identity_key: Option<[u8; 32]>,
+    /// Replacement raw public key. Server identity notifications contain no new
+    /// key, so this is absent until a subsequent key fetch or local replacement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_identity_key: Option<[u8; 32]>,
 }
 
 /// Type of business status update.
@@ -4030,5 +4039,33 @@ mod tests {
         assert_eq!(receiver.len(), 1);
         assert_eq!(handler.stats().enqueued, 1);
         assert_eq!(handler.stats().dropped_full, 1);
+    }
+
+    #[test]
+    fn identity_change_serializes_existing_fields_before_keys() {
+        let event = IdentityChange::builder()
+            .user(Jid::pn("15550001000"))
+            .lid_user(Jid::lid("100000000000001"))
+            .implicit(true)
+            .previous_identity_key([11; 32])
+            .current_identity_key([22; 32])
+            .build();
+        let ciborium::Value::Map(fields) = ciborium::Value::serialized(&event).unwrap() else {
+            panic!("event must serialize as a struct");
+        };
+        let names: Vec<_> = fields
+            .iter()
+            .map(|(name, _)| name.as_text().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "user",
+                "lid_user",
+                "implicit",
+                "previous_identity_key",
+                "current_identity_key"
+            ]
+        );
     }
 }

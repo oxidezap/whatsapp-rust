@@ -2,6 +2,7 @@ use crate::store::Device;
 use async_lock::Mutex;
 use async_trait::async_trait;
 use rand::RngExt;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 use wacore::libsignal::protocol::error::Result as SignalResult;
 use wacore::libsignal::protocol::{
@@ -24,6 +25,16 @@ fn unsupported_device_store_operation(operation: &'static str) -> StoreError {
 }
 
 type DirectStoreIncarnation = [u8; 16];
+
+// Device clones can share a backend without sharing their outer wrapper lock.
+// Fixed stripes bound coordination memory and cover the whole read/write pair.
+fn identity_write_lock(device: &Device, address: &ProtocolAddress) -> &'static Mutex<()> {
+    static LOCKS: [Mutex<()>; 64] = [const { Mutex::new(()) }; 64];
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    (Arc::as_ptr(&device.backend) as *const ()).hash(&mut hash);
+    address.as_str().hash(&mut hash);
+    &LOCKS[hash.finish() as usize % LOCKS.len()]
+}
 
 // Synchronous direct writes make process restart the only unsafe reload boundary.
 fn direct_store_incarnation() -> &'static DirectStoreIncarnation {
@@ -229,6 +240,7 @@ impl IdentityKeyStore for Device {
         address: &ProtocolAddress,
         identity_key: &IdentityKey,
     ) -> SignalResult<IdentityChange> {
+        let _guard = identity_write_lock(self, address).lock().await;
         let address_str = address.as_str();
         let key_bytes = identity_key.public_key().public_key_bytes();
         let existing_identity_opt = self.get_identity(address).await?;
@@ -246,7 +258,10 @@ impl IdentityKeyStore for Device {
         match existing_identity_opt {
             None => Ok(IdentityChange::NewOrUnchanged),
             Some(existing) if &existing == identity_key => Ok(IdentityChange::NewOrUnchanged),
-            Some(_) => Ok(IdentityChange::ReplacedExisting),
+            Some(previous) => Ok(IdentityChange::ReplacedExistingWithKeys {
+                previous,
+                current: *identity_key,
+            }),
         }
     }
 

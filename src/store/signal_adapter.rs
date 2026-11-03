@@ -265,33 +265,6 @@ impl SessionStore for SessionAdapter {
     }
 }
 
-impl IdentityAdapter {
-    /// The cache-hit half of [`IdentityKeyStore::save_identity`], shared with
-    /// its sync hook so the two cannot drift.
-    ///
-    /// `None` means the caller must take the async path: either the previous
-    /// value was not cached, or a concurrent flush owns the entry. A parse
-    /// failure of the cached bytes is reported here rather than swallowed,
-    /// matching the async path in erroring BEFORE any write.
-    fn save_identity_cached(
-        &self,
-        address: &ProtocolAddress,
-        identity: &IdentityKey,
-    ) -> Option<Result<IdentityChange, SignalProtocolError>> {
-        let prev = self.0.cache.try_get_identity(address)?;
-        let change = match parse_cached_identity(prev) {
-            Ok(None) => IdentityChange::NewOrUnchanged,
-            Ok(Some(existing)) if &existing == identity => IdentityChange::NewOrUnchanged,
-            Ok(Some(_)) => IdentityChange::ReplacedExisting,
-            Err(e) => return Some(Err(e)),
-        };
-        self.0
-            .cache
-            .try_put_identity(address, identity.public_key().public_key_bytes())
-            .then_some(Ok(change))
-    }
-}
-
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl IdentityKeyStore for IdentityAdapter {
@@ -323,26 +296,14 @@ impl IdentityKeyStore for IdentityAdapter {
         'life2: 'async_trait,
         Self: 'async_trait,
     {
-        if let Some(answer) = self.save_identity_cached(address, identity) {
+        if let Some(answer) = self.0.cache.try_save_identity(address, identity) {
             return Box::pin(ready(answer));
         }
         Box::pin(async move {
-            let existing_identity = self.get_identity(address).await?;
-
-            // Cache-first: write to cache only. The cache flushes to the backend
-            // during flush_signal_cache(). This avoids a synchronous backend write
-            // on every encrypt/decrypt. is_trusted_identity always returns true
-            // (matching WA Web), so the Device-level save is redundant.
             self.0
                 .cache
-                .put_identity(address, identity.public_key().public_key_bytes())
-                .await;
-
-            match existing_identity {
-                None => Ok(IdentityChange::NewOrUnchanged),
-                Some(existing) if &existing == identity => Ok(IdentityChange::NewOrUnchanged),
-                Some(_) => Ok(IdentityChange::ReplacedExisting),
-            }
+                .save_identity(address, identity, self.0.device().backend.as_ref())
+                .await
         })
     }
 
@@ -362,7 +323,7 @@ impl IdentityKeyStore for IdentityAdapter {
         address: &ProtocolAddress,
         identity: &IdentityKey,
     ) -> Option<Result<IdentityChange, SignalProtocolError>> {
-        self.save_identity_cached(address, identity)
+        self.0.cache.try_save_identity(address, identity)
     }
 
     async fn is_trusted_identity(
@@ -822,6 +783,92 @@ mod tests {
         SignalProtocolStoreAdapter::new(device.clone(), Arc::new(SignalStoreCache::new()))
     }
 
+    async fn assert_serialized_identity_writes(
+        mut first: impl IdentityKeyStore,
+        mut second: impl IdentityKeyStore,
+        entered: async_channel::Receiver<()>,
+        release: async_channel::Sender<()>,
+        overlapping_reads: bool,
+    ) {
+        let address = ProtocolAddress::new("15550009999", 0.into());
+        let key = |value| {
+            IdentityKey::new(
+                wacore::libsignal::protocol::PublicKey::from_djb_public_key_bytes(&[value; 32])
+                    .unwrap(),
+            )
+        };
+        let before = key(11);
+        let middle = key(22);
+        let after = key(33);
+        let first_write = first.save_identity(&address, &middle);
+        let second_write = second.save_identity(&address, &after);
+        futures::pin_mut!(first_write, second_write);
+
+        assert!(futures::poll!(&mut first_write).is_pending());
+        entered.recv().await.unwrap();
+        assert!(futures::poll!(&mut second_write).is_pending());
+        if overlapping_reads {
+            entered
+                .try_recv()
+                .expect("both cold reads must run outside the cache lock");
+        } else {
+            assert!(
+                entered.try_recv().is_err(),
+                "a direct saver must serialize the backend read/write pair"
+            );
+        }
+        release.send(()).await.unwrap();
+        assert_eq!(first_write.await.unwrap().keys(), Some((before, middle)));
+        // A direct store reads again; a cached adapter already has the new key.
+        release.send(()).await.unwrap();
+        assert_eq!(second_write.await.unwrap().keys(), Some((middle, after)));
+    }
+
+    async fn gated_identity_backend() -> (
+        Arc<dyn crate::store::Backend>,
+        async_channel::Receiver<()>,
+        async_channel::Sender<()>,
+    ) {
+        let (mut backend, _) = crate::store::release::tests::ProbeBackend::new();
+        backend
+            .backend
+            .put_identity("15550009999.0", [11; 32])
+            .await
+            .unwrap();
+        let (entered_tx, entered_rx) = async_channel::unbounded();
+        let (release_tx, release_rx) = async_channel::unbounded();
+        backend.gate_method = "after:load_identity";
+        backend.entered = Some(entered_tx);
+        backend.gate = Some(release_rx);
+        (Arc::new(backend), entered_rx, release_tx)
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_adapters_report_the_key_they_replace() {
+        let (backend, entered, release) = gated_identity_backend().await;
+        let pm = test_persistence_manager(backend).await;
+        let cache = Arc::new(SignalStoreCache::new());
+        let first = SignalProtocolStoreAdapter::new(pm.clone(), cache.clone());
+        let second = SignalProtocolStoreAdapter::new(pm, cache);
+        assert_serialized_identity_writes(
+            first.identity_store,
+            second.identity_store,
+            entered,
+            release,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_direct_stores_report_the_key_they_replace() {
+        let (backend, entered, release) = gated_identity_backend().await;
+        let pm = test_persistence_manager(backend).await;
+        let first = pm.get_device_snapshot().as_ref().clone();
+        let second = first.clone();
+        assert_serialized_identity_writes(first, second, entered, release, false).await;
+    }
+
     #[tokio::test]
     async fn signed_pre_key_save_reports_unsupported_and_preserves_current_key() {
         let mut adapter = test_adapter().await;
@@ -1113,7 +1160,10 @@ mod tests {
                 .save_identity(&addr, &second)
                 .await
                 .unwrap(),
-            IdentityChange::ReplacedExisting,
+            IdentityChange::ReplacedExistingWithKeys {
+                previous: first,
+                current: second
+            },
             "a different key must be ReplacedExisting"
         );
         assert_eq!(
@@ -1126,6 +1176,64 @@ mod tests {
             second,
             "get_identity must observe the fast-path write"
         );
+    }
+    #[tokio::test]
+    async fn cold_identity_replacement_retains_keys_and_corruption_is_not_overwritten() {
+        let mut adapter = test_adapter().await;
+        let addr = ProtocolAddress::new("15551234567", 0.into());
+        let previous = IdentityKey::new(
+            wacore::libsignal::protocol::PublicKey::from_djb_public_key_bytes(&[11; 32]).unwrap(),
+        );
+        let current = IdentityKey::new(
+            wacore::libsignal::protocol::PublicKey::from_djb_public_key_bytes(&[22; 32]).unwrap(),
+        );
+        adapter
+            .identity_store
+            .0
+            .device()
+            .backend
+            .put_identity(addr.as_str(), [11; 32])
+            .await
+            .unwrap();
+        assert!(
+            adapter
+                .identity_store
+                .0
+                .cache
+                .try_get_identity(&addr)
+                .is_none()
+        );
+        let change = adapter
+            .identity_store
+            .save_identity(&addr, &current)
+            .await
+            .unwrap();
+        assert!(change.is_changed());
+        assert_eq!(change.keys(), Some((previous, current)));
+        adapter
+            .identity_store
+            .0
+            .cache
+            .put_identity(&addr, &[11; 31])
+            .await;
+        assert!(matches!(
+            adapter.identity_store.save_identity(&addr, &current).await,
+            Err(SignalProtocolError::BackendError("stored record", _))
+        ));
+        assert_eq!(
+            adapter
+                .identity_store
+                .0
+                .cache
+                .try_get_identity(&addr)
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            &[11; 31]
+        );
+        assert!(IdentityChange::ReplacedExisting.is_changed());
+        assert_eq!(IdentityChange::ReplacedExisting.keys(), None);
+        assert!(!IdentityChange::NewOrUnchanged.is_changed());
     }
 }
 
@@ -1223,7 +1331,7 @@ mod hook_alloc_tests {
         assert!(
             matches!(
                 adapter.identity_store.try_save_identity(&address, &second),
-                Some(Ok(IdentityChange::ReplacedExisting))
+                Some(Ok(IdentityChange::ReplacedExistingWithKeys { previous, current })) if previous == first && current == second
             ),
             "a different key must report ReplacedExisting, or an identity change goes unnoticed"
         );

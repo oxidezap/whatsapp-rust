@@ -17,6 +17,7 @@ pub mod companion_reg;
 pub mod crypto;
 pub mod diagnostics;
 pub mod download;
+pub mod identity_verification;
 pub mod iq;
 pub mod protocol;
 pub use wacore_noise::framing;

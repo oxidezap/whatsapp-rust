@@ -1311,11 +1311,12 @@ impl Client {
                             .buffer_consumed_prekey(prekey_id, &signal_address)
                             .await;
                     }
-                    if decrypted.identity_change == IdentityChange::ReplacedExisting
-                        && !local_identity_reacted
-                    {
+                    if decrypted.identity_change.is_changed() && !local_identity_reacted {
                         local_identity_reacted = true;
-                        self.react_to_local_identity_change(sender_encryption_jid);
+                        self.react_to_local_identity_change(
+                            sender_encryption_jid,
+                            decrypted.identity_change,
+                        );
                     }
                     // Decrypt succeeded (the ratchet advanced); defer the
                     // plaintext handling until the lock is dropped.
@@ -1446,11 +1447,13 @@ impl Client {
                                 // identity was deleted+flushed before the retry),
                                 // but mirror the main-decode gate so a concurrent
                                 // re-save can't drop the signal.
-                                if decrypted.identity_change == IdentityChange::ReplacedExisting
-                                    && !local_identity_reacted
+                                if decrypted.identity_change.is_changed() && !local_identity_reacted
                                 {
                                     local_identity_reacted = true;
-                                    self.react_to_local_identity_change(sender_encryption_jid);
+                                    self.react_to_local_identity_change(
+                                        sender_encryption_jid,
+                                        decrypted.identity_change,
+                                    );
                                 }
                                 // Decrypt succeeded after the identity retry;
                                 // defer plaintext handling until the lock drops.
