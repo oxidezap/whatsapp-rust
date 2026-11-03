@@ -1324,8 +1324,7 @@ fn required_component<T>(
 mod tests {
     use super::*;
 
-    // Test adapter for the original corpus: expansion stays in the independent
-    // provider, with no inherited ratchet implementation linked here.
+    // Expand compact seeds through the protocol's crypto provider.
     struct MessageKeyGenerator([u8; 32]);
     struct Expanded([u8; 32], [u8; 32], [u8; 16]);
     impl Expanded {

@@ -73,14 +73,3 @@ Browse GitHub's indexed public dependents for the [crates.io package](https://gi
 ## Disclaimer
 
 This is an unofficial client, not affiliated with WhatsApp or Meta. Using it may violate Meta's Terms of Service and could result in account suspension.
-
-## Acknowledgements
-
-The runtime uses the published MIT-licensed `wacore-libsignal` crate, which
-contains the sans-I/O Signal engine and runtime adapters. Existing Signal
-session, prekey and sender-key storage formats remain the compatibility boundary.
-
-The inherited AGPL-3.0-only implementation has been removed. Replacing the
-runtime does not relicense earlier releases.
-
-Inspired by [whatsmeow](https://github.com/tulir/whatsmeow) and [Baileys](https://github.com/WhiskeySockets/Baileys).

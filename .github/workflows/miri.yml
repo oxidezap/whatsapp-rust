@@ -67,8 +67,7 @@ jobs:
           - name: wacore-noise
             cache-key: noise
             args: -p wacore-noise --lib
-          # Exercise address ownership in the production Signal runtime. Its
-          # safe formatter replaces the inherited inline-buffer implementation.
+          # Exercise address ownership in the production Signal runtime.
           - name: wacore-libsignal (address)
             cache-key: signal-runtime-address
             args: -p wacore-libsignal --lib address

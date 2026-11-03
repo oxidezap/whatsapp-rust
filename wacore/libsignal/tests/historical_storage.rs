@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Synthetic storage/ciphertext captured from the historical writer at the
-//! recorded commit. These tests need no inherited implementation or external fixtures.
+//! recorded commit. The vectors are included in this test package.
 use rand::{RngExt as _, SeedableRng as _, rngs::StdRng};
 use serde_json::Value;
 use wacore_libsignal::{
