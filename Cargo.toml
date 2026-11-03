@@ -300,16 +300,16 @@ log = { workspace = true }
 opus = { version = "0.4", optional = true }
 portable-atomic = { workspace = true }
 rand = { workspace = true }
-# The sans-IO media stack for `voip`. Pinned exactly: 0.21 is a pre-1.0 beta, so a minor bump
-# may be breaking, and a `cargo update` that silently moved it would break a call at runtime rather
-# than at compile time. Revisit the pin when 0.21.0 goes stable. `crypto-ring` (the default) rather
+# The sans-IO media stack for `voip`. Keep these exact pins on the same release: the crates share
+# public types, and a `cargo update` that silently moved the stack could break a call at runtime
+# rather than at compile time. `crypto-ring` (the default) rather
 # than aws-lc-rs because `ring` is already compiled here for rustls, via the websocket transport and
 # the HTTP client, so the media stack costs no new crypto crate.
-rtc-datachannel = { version = "=0.21.0-beta.2", optional = true }
-rtc-dtls = { version = "=0.21.0-beta.2", optional = true, default-features = false, features = [
+rtc-datachannel = { version = "=0.21.1", optional = true }
+rtc-dtls = { version = "=0.21.1", optional = true, default-features = false, features = [
     "crypto-ring",
 ] }
-rtc-sctp = { version = "=0.21.0-beta.2", optional = true }
+rtc-sctp = { version = "=0.21.1", optional = true }
 # The vocabulary crate of the three above: they take and return its `TransportProtocol` and `Error`
 # in public signatures and none of them re-exports it, so a caller that has to name a transport
 # protocol or tell a peer close apart from a corrupt datagram needs it directly. Adds no crate to
@@ -343,7 +343,9 @@ getrandom = { workspace = true, features = ["wasm_js"] }
 send_wrapper = { version = "0.6", features = ["futures"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-parking_lot = "=0.12.5"
+parking_lot = "=0.13.0"
+# Warm both process-global tables retained by the native dependency graph.
+parking_lot_012 = { package = "parking_lot", version = "=0.12.5" }
 
 [dev-dependencies]
 aes = { workspace = true }
