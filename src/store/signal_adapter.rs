@@ -788,6 +788,7 @@ mod tests {
         mut second: impl IdentityKeyStore,
         entered: async_channel::Receiver<()>,
         release: async_channel::Sender<()>,
+        overlapping_reads: bool,
     ) {
         let address = ProtocolAddress::new("15550009999", 0.into());
         let key = |value| {
@@ -806,10 +807,16 @@ mod tests {
         assert!(futures::poll!(&mut first_write).is_pending());
         entered.recv().await.unwrap();
         assert!(futures::poll!(&mut second_write).is_pending());
-        assert!(
-            entered.try_recv().is_err(),
-            "a second saver must not sample the old identity while its replacement is pending"
-        );
+        if overlapping_reads {
+            entered
+                .try_recv()
+                .expect("both cold reads must run outside the cache lock");
+        } else {
+            assert!(
+                entered.try_recv().is_err(),
+                "a direct saver must serialize the backend read/write pair"
+            );
+        }
         release.send(()).await.unwrap();
         assert_eq!(first_write.await.unwrap().keys(), Some((before, middle)));
         // A direct store reads again; a cached adapter already has the new key.
@@ -848,6 +855,7 @@ mod tests {
             second.identity_store,
             entered,
             release,
+            true,
         )
         .await;
     }
@@ -858,7 +866,7 @@ mod tests {
         let pm = test_persistence_manager(backend).await;
         let first = pm.get_device_snapshot().as_ref().clone();
         let second = first.clone();
-        assert_serialized_identity_writes(first, second, entered, release).await;
+        assert_serialized_identity_writes(first, second, entered, release, false).await;
     }
 
     #[tokio::test]

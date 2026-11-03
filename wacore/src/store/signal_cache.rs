@@ -1718,25 +1718,45 @@ impl SignalStoreCache {
         Some(self.save_identity_locked(&mut state, address, identity))
     }
 
-    /// The cold read shares the replacement lock, so another saver cannot
-    /// publish a key between the comparison and the write.
+    /// Load cold rows outside the cache lock, then compare and replace under
+    /// that lock. Removal stamps prevent a flushed and evicted write from
+    /// being mistaken for the old row returned by an in-flight read.
     pub async fn save_identity(
         &self,
         address: &ProtocolAddress,
         identity: &IdentityKey,
         backend: &dyn SignalStore,
     ) -> std::result::Result<IdentityChange, SignalProtocolError> {
+        let key = address.as_str();
+        for _ in 0..UNLOCKED_COLD_READ_ATTEMPTS {
+            let since = {
+                let mut state = self.identities.lock().await;
+                if state.cache.get(key).is_some() {
+                    return self.save_identity_locked(&mut state, address, identity);
+                }
+                state.cache.removal_seq()
+            };
+            let previous = backend.load_identity(key).await;
+            let mut state = self.identities.lock().await;
+            if state.cache.get(key).is_some() {
+                return self.save_identity_locked(&mut state, address, identity);
+            }
+            if state.cache.removed_since(key, since) {
+                continue;
+            }
+            let previous = previous.map_err(|error| {
+                SignalProtocolError::BackendError("backend get_identity", Box::new(error))
+            })?;
+            state.cache.insert(Arc::from(key), previous.map(Arc::from));
+            return self.save_identity_locked(&mut state, address, identity);
+        }
+        // Bound retries under repeated removals, as on the cold read path.
         let mut state = self.identities.lock().await;
-        if state.cache.get(address.as_str()).is_none() {
-            let previous = backend
-                .load_identity(address.as_str())
-                .await
-                .map_err(|error| {
-                    SignalProtocolError::BackendError("backend get_identity", Box::new(error))
-                })?;
-            state
-                .cache
-                .insert(Arc::from(address.as_str()), previous.map(Arc::from));
+        if state.cache.get(key).is_none() {
+            let previous = backend.load_identity(key).await.map_err(|error| {
+                SignalProtocolError::BackendError("backend get_identity", Box::new(error))
+            })?;
+            state.cache.insert(Arc::from(key), previous.map(Arc::from));
         }
         self.save_identity_locked(&mut state, address, identity)
     }
@@ -6640,6 +6660,73 @@ mod cold_read_race_tests {
             .expect("identity present");
         assert_eq!(cached.as_ref(), &[2u8; 32], "stale bytes reached the cache");
         assert_eq!(backend.reads(), reads, "the install must serve later reads");
+    }
+
+    #[tokio::test]
+    async fn a_cold_identity_save_does_not_block_another_identity() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = Arc::new(GatedColdRead::new(1));
+        let address = Arc::new(signal_address("19995553021"));
+        let other = signal_address("19995553022");
+        commit_and_drop_identity(&cache, &backend, &address, [1; 32]).await;
+        cache.put_identity(&other, &[8; 32]).await;
+        let key =
+            |value| IdentityKey::new(PublicKey::from_djb_public_key_bytes(&[value; 32]).unwrap());
+        let saver = tokio::spawn({
+            let (cache, backend, address) = (cache.clone(), backend.clone(), address.clone());
+            async move { cache.save_identity(&address, &key(2), &*backend).await }
+        });
+
+        backend.arrived.wait().await;
+        assert_eq!(
+            cache
+                .try_save_identity(&other, &key(9))
+                .unwrap()
+                .unwrap()
+                .keys(),
+            Some((key(8), key(9))),
+            "a parked cold save must not block a different identity"
+        );
+        let read = cache.get_identity(&other, &*backend);
+        futures::pin_mut!(read);
+        assert!(
+            matches!(futures::poll!(&mut read), std::task::Poll::Ready(Ok(Some(bytes))) if bytes.as_ref() == [9; 32])
+        );
+        backend.release.wait().await;
+        assert_eq!(saver.await.unwrap().unwrap().keys(), Some((key(1), key(2))));
+    }
+
+    #[tokio::test]
+    async fn a_cold_identity_save_reloads_after_a_flush_and_eviction() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = Arc::new(GatedColdRead::new(1));
+        let address = Arc::new(signal_address("19995553023"));
+        commit_and_drop_identity(&cache, &backend, &address, [1; 32]).await;
+        let key =
+            |value| IdentityKey::new(PublicKey::from_djb_public_key_bytes(&[value; 32]).unwrap());
+        let saver = tokio::spawn({
+            let (cache, backend, address) = (cache.clone(), backend.clone(), address.clone());
+            async move { cache.save_identity(&address, &key(3), &*backend).await }
+        });
+
+        backend.arrived.wait().await;
+        assert!(
+            cache.try_put_identity(&address, &[2; 32]),
+            "a parked cold save must release the cache lock"
+        );
+        cache.flush(&*backend).await.expect("flush newer identity");
+        cache.drop_clean_identity_for_test(address.as_str()).await;
+        backend.release.wait().await;
+        assert_eq!(saver.await.unwrap().unwrap().keys(), Some((key(2), key(3))));
+        assert_eq!(
+            backend.reads(),
+            2,
+            "the superseded cold read must be retried"
+        );
+        assert_eq!(
+            cache.try_get_identity(&address).unwrap().unwrap().as_ref(),
+            &[3; 32]
+        );
     }
 
     /// `clear_after_flush` cannot name the keys it drops, so it takes the
