@@ -1094,6 +1094,99 @@ fn raw_base_key_storage_encoding_is_preserved_for_retry_side_table() {
     assert_eq!(loaded.serialize().unwrap(), encoded);
 }
 
+fn check_reused_session_buffer(for_store: bool, reserved: bool) {
+    fn record(marker: u8) -> SessionRecord {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(u64::from(marker));
+        let pair = KeyPair::generate(&mut rng);
+        let identity = IdentityKey::new(pair.public_key);
+        let mut state = SessionState::new(
+            3,
+            &identity,
+            &identity,
+            &RootKey::new([marker; 32]),
+            &pair.public_key,
+        );
+        state.set_sender_chain(&pair, &ChainKey::new([marker; 32], u32::from(marker)));
+        SessionRecord::new(state)
+    }
+    let token = [42; 16];
+    let write = |record: &SessionRecord, bytes: &mut Vec<u8>| {
+        if for_store {
+            record.serialize_into_for_store(bytes, &token);
+        } else {
+            record.serialize_into(bytes);
+        }
+    };
+    let mut obsolete = record(1);
+    obsolete.archive_current_state().unwrap();
+    obsolete.set_session_state(record(2).current.take().unwrap());
+    let mut current = record(3);
+    if reserved {
+        obsolete.reserve_sender_chain_counters(2);
+        current.reserve_sender_chain_counters(3);
+    }
+    let mut expected = Vec::new();
+    write(&current, &mut expected);
+    let mut reused = Vec::with_capacity(4096);
+    let capacity = reused.capacity();
+    write(&obsolete, &mut reused);
+    for _ in 0..2 {
+        write(&current, &mut reused);
+        let loaded = if for_store {
+            SessionRecord::deserialize_for_store(&reused, &token)
+        } else {
+            SessionRecord::deserialize(&reused)
+        }
+        .expect("a reused buffer must contain one loadable session record");
+        assert_eq!(
+            loaded.previous_session_count(),
+            0,
+            "old archives survived a flush"
+        );
+        assert_eq!(loaded.session_state().unwrap().inner.root, [3; 32]);
+        assert_eq!(reused, expected, "a flush must replace the previous bytes");
+        if reserved {
+            let restarted = SessionRecord::deserialize_for_store(&reused, &[43; 16]).unwrap();
+            assert_eq!(
+                restarted
+                    .session_state()
+                    .unwrap()
+                    .get_sender_chain_key()
+                    .unwrap()
+                    .index(),
+                current.reserved_sender_chain_index()
+            );
+        }
+    }
+    let empty = SessionRecord::new_fresh();
+    let mut expected_empty = Vec::new();
+    write(&empty, &mut expected_empty);
+    write(&empty, &mut reused);
+    assert_eq!(reused, expected_empty);
+    assert_eq!(
+        reused.capacity(),
+        capacity,
+        "reuse must preserve the allocation"
+    );
+}
+
+#[test]
+fn session_serialize_into_replaces_archives_in_reused_buffer() {
+    check_reused_session_buffer(false, false);
+}
+#[test]
+fn session_serialize_into_for_store_replaces_archives_in_reused_buffer() {
+    check_reused_session_buffer(true, false);
+}
+#[test]
+fn session_serialize_into_replaces_reservations_in_reused_buffer() {
+    check_reused_session_buffer(false, true);
+}
+#[test]
+fn session_serialize_into_for_store_replaces_reservations_in_reused_buffer() {
+    check_reused_session_buffer(true, true);
+}
+
 struct SignalFixture {
     a: Identity,
     b: Identity,

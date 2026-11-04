@@ -517,7 +517,9 @@ impl SessionRecord {
     pub fn serialize(&self) -> Result<Vec<u8>> {
         Ok(self.encode_with_token(None))
     }
+    /// Replace the buffer with this record while retaining its allocation.
     pub fn serialize_into(&self, out: &mut Vec<u8>) {
+        out.clear();
         engine::codec::encode_session_record_parts_into(
             self.current.as_ref().map(|s| &s.inner),
             &self.inner.previous,
@@ -526,7 +528,9 @@ impl SessionRecord {
             out,
         );
     }
+    /// Replace the buffer with the record and its live cache incarnation.
     pub fn serialize_into_for_store(&self, out: &mut Vec<u8>, incarnation: &[u8; 16]) {
+        out.clear();
         engine::codec::encode_session_record_parts_into(
             self.current.as_ref().map(|s| &s.inner),
             &self.inner.previous,
