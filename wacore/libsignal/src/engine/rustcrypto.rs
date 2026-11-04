@@ -5,7 +5,7 @@
 use crate::engine::{CryptoProvider, Error, RandomSource, Result};
 use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
 use curve25519_dalek::{edwards::EdwardsPoint, montgomery::MontgomeryPoint, scalar::Scalar};
-use hmac::{Hmac, KeyInit, Mac};
+use hmac::{Hmac, HmacReset, KeyInit, Mac};
 use sha2::{Digest, Sha256, Sha512};
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 use zeroize::Zeroizing;
@@ -121,6 +121,15 @@ impl CryptoProvider for RustCrypto {
         Ok(RustCrypto::hmac_sha256_parts_array(self, key, parts))
     }
 
+    fn chain_step(&self, key: &[u8; 32]) -> Result<([u8; 32], [u8; 32])> {
+        let mut mac = <HmacReset<Sha256> as KeyInit>::new_from_slice(key)
+            .expect("HMAC accepts keys of any length");
+        mac.update(&[1]);
+        let seed = mac.finalize_reset().into_bytes().into();
+        mac.update(&[2]);
+        Ok((seed, mac.finalize().into_bytes().into()))
+    }
+
     fn hkdf_sha256(&self, salt: &[u8], input: &[u8], info: &[u8], output: &mut [u8]) -> Result<()> {
         hkdf::Hkdf::<Sha256>::new(Some(salt), input)
             .expand(info, output)
@@ -140,6 +149,20 @@ impl CryptoProvider for RustCrypto {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn paired_chain_hmac_matches_independent_messages() {
+        for seed in 0u8..32 {
+            let key = std::array::from_fn(|index| seed.wrapping_mul(17) ^ index as u8);
+            assert_eq!(
+                RustCrypto.chain_step(&key).unwrap(),
+                (
+                    RustCrypto.hmac_sha256_array(&key, &[1]),
+                    RustCrypto.hmac_sha256_array(&key, &[2]),
+                )
+            );
+        }
+    }
+
     #[test]
     fn rfc7748_low_order_aliases_reject_and_valid_high_bit_alias_agrees() {
         // RFC 7748 sections 5 and 6.1 define masking, field reduction and the

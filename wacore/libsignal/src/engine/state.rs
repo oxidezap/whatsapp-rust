@@ -272,12 +272,12 @@ impl Chain {
             return Err(Error::MissingKey);
         }
         let next = self.index.checked_add(1).ok_or(Error::CounterExhausted)?;
-        let seed = crypto.hmac_sha256(&self.key, &[&[1]])?;
+        let (seed, next_key) = crypto.chain_step(&self.key)?;
         let message = MessageKey::Seed {
             index: self.index,
             seed,
         };
-        self.key = crypto.hmac_sha256(&self.key, &[&[2]])?;
+        self.key = next_key;
         self.index = next;
         Ok(message)
     }
@@ -309,17 +309,16 @@ impl Chain {
         let mut next_key = zeroize::Zeroizing::new(self.key);
         let mut skipped = Vec::with_capacity((index - self.index) as usize);
         for counter in self.index..index {
+            let (seed, advanced) = crypto.chain_step(&next_key)?;
             skipped.push(MessageKey::Seed {
                 index: counter,
-                seed: crypto.hmac_sha256(&*next_key, &[&[1]])?,
+                seed,
             });
-            *next_key = crypto.hmac_sha256(&*next_key, &[&[2]])?;
+            *next_key = advanced;
         }
-        let message = MessageKey::Seed {
-            index,
-            seed: crypto.hmac_sha256(&*next_key, &[&[1]])?,
-        };
-        *next_key = crypto.hmac_sha256(&*next_key, &[&[2]])?;
+        let (seed, advanced) = crypto.chain_step(&next_key)?;
+        let message = MessageKey::Seed { index, seed };
+        *next_key = advanced;
         Ok(ChainAdvance {
             message,
             consumed: None,

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 use crate::engine::{Error, Result};
 use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 pub trait RandomSource {
     fn fill(&mut self, destination: &mut [u8]) -> Result<()>;
@@ -20,6 +21,12 @@ pub trait CryptoProvider {
     fn verify(&self, public: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> Result<()>;
     fn sha256(&self, data: &[u8]) -> [u8; 32];
     fn hmac_sha256(&self, key: &[u8], parts: &[&[u8]]) -> Result<[u8; 32]>;
+    /// Return the message seed and next chain key through the selected HMAC backend.
+    fn chain_step(&self, key: &[u8; 32]) -> Result<([u8; 32], [u8; 32])> {
+        let seed = Zeroizing::new(self.hmac_sha256(key, &[&[1]])?);
+        let next = self.hmac_sha256(key, &[&[2]])?;
+        Ok((*seed, next))
+    }
     fn hkdf_sha256(&self, salt: &[u8], input: &[u8], info: &[u8], output: &mut [u8]) -> Result<()>;
     fn encrypt_cbc(&self, key: &[u8; 32], iv: &[u8; 16], plaintext: &[u8]) -> Result<Vec<u8>>;
     fn decrypt_cbc(&self, key: &[u8; 32], iv: &[u8; 16], ciphertext: &[u8]) -> Result<Vec<u8>>;

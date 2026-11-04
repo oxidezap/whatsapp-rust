@@ -613,6 +613,41 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn paired_chain_derivation_keeps_selected_callbacks_and_failure_rollback() {
+        struct FailAt {
+            call: AtomicUsize,
+            fail_at: usize,
+        }
+        impl SymmetricCryptoProvider for FailAt {
+            fn hmac_sha256(
+                &self,
+                key: &[u8],
+                parts: &[&[u8]],
+            ) -> Result<[u8; 32], CryptoProviderError> {
+                let call = self.call.fetch_add(1, Ordering::SeqCst) + 1;
+                assert_eq!(parts, &[&[call as u8][..]]);
+                if call == self.fail_at {
+                    Err(CryptoProviderError::BackendFailed)
+                } else {
+                    RustCryptoProvider.hmac_sha256(key, parts)
+                }
+            }
+        }
+        for fail_at in [1, 2] {
+            let provider = FailAt {
+                call: AtomicUsize::new(0),
+                fail_at,
+            };
+            let crypto = ProviderCrypto::new(&provider);
+            let mut chain = crate::engine::Chain::new([1; 32], Some([2; 32]), [3; 32]);
+            let before = chain.clone();
+            assert!(chain.step(&crypto).is_err());
+            assert!(chain == before);
+            assert_eq!(provider.call.load(Ordering::SeqCst), fail_at);
+        }
+    }
+
     #[derive(Default)]
     struct ObservedProvider {
         cbc: AtomicUsize,

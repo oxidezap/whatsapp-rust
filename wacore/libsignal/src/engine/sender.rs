@@ -12,12 +12,12 @@ impl SenderKeyState {
             .iteration
             .checked_add(1)
             .ok_or(Error::CounterExhausted)?;
-        let seed = crypto.hmac_sha256(&self.chain_key, &[&[1]])?;
+        let (seed, next_key) = crypto.chain_step(&self.chain_key)?;
         let key = SenderMessageKey {
             iteration: self.iteration,
             seed,
         };
-        self.chain_key = crypto.hmac_sha256(&self.chain_key, &[&[2]])?;
+        self.chain_key = next_key;
         self.iteration = next;
         Ok(key)
     }
