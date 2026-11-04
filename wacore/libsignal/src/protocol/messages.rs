@@ -127,6 +127,23 @@ impl SignalMessage {
         unsigned.extend_from_slice(&mac[..8]);
         Self::try_from(Bytes::from(unsigned))
     }
+    fn decode<T: AsRef<[u8]>>(input: T, take_bytes: impl FnOnce(T) -> Bytes) -> Result<Self> {
+        let bytes = input.as_ref();
+        validate_version(bytes, false, 8)?;
+        let parsed = engine::wire::SignalMessageView::decode(bytes)
+            .map_err(|e| error::message_error(e, CiphertextMessageType::Whisper, 0, 0))?;
+        let ratchet = public(&parsed.ratchet)?;
+        let counter = parsed.counter;
+        let previous_counter = parsed.previous_counter;
+        let ciphertext = range_of(bytes, parsed.ciphertext);
+        Ok(Self {
+            bytes: take_bytes(input),
+            ratchet,
+            counter,
+            previous_counter,
+            ciphertext,
+        })
+    }
     pub fn serialized(&self) -> &[u8] {
         &self.bytes
     }
@@ -155,26 +172,13 @@ impl SignalMessage {
 impl TryFrom<Bytes> for SignalMessage {
     type Error = SignalProtocolError;
     fn try_from(bytes: Bytes) -> Result<Self> {
-        validate_version(&bytes, false, 8)?;
-        let parsed = engine::wire::SignalMessageView::decode(&bytes)
-            .map_err(|e| error::message_error(e, CiphertextMessageType::Whisper, 0, 0))?;
-        let ratchet = public(&parsed.ratchet)?;
-        let counter = parsed.counter;
-        let previous_counter = parsed.previous_counter;
-        let ciphertext = range_of(&bytes, parsed.ciphertext);
-        Ok(Self {
-            bytes,
-            ratchet,
-            counter,
-            previous_counter,
-            ciphertext,
-        })
+        Self::decode(bytes, std::convert::identity)
     }
 }
 impl TryFrom<&[u8]> for SignalMessage {
     type Error = SignalProtocolError;
     fn try_from(bytes: &[u8]) -> Result<Self> {
-        Self::try_from(Bytes::copy_from_slice(bytes))
+        Self::decode(bytes, Bytes::copy_from_slice)
     }
 }
 #[derive(Clone, Debug)]
@@ -637,6 +641,60 @@ mod borrowed_tests {
         encoded.extend_from_slice(&[0x78, 0x07]);
         encoded.extend_from_slice(&signal.mac);
         encoded
+    }
+    #[test]
+    fn borrowed_signal_input_preserves_owned_validation_and_offsets() {
+        let encoded = signal_bytes();
+        let mut variants = vec![encoded.clone()];
+        variants.extend((0..encoded.len()).map(|end| encoded[..end].to_vec()));
+        variants.extend((0..encoded.len()).map(|index| {
+            let mut changed = encoded.clone();
+            changed[index] ^= 0xff;
+            changed
+        }));
+        for version in [0x23, 0x33, 0x43, 0x53] {
+            let mut changed = encoded.clone();
+            changed[0] = version;
+            variants.push(changed);
+        }
+        for input in variants {
+            let borrowed = SignalMessage::try_from(input.as_slice());
+            let mut backing = vec![0xa5; 17];
+            backing.extend_from_slice(&input);
+            backing.push(0x5a);
+            let owned = SignalMessage::try_from(Bytes::from(backing).slice(17..17 + input.len()));
+            match (borrowed, owned) {
+                (Ok(left), Ok(right)) => {
+                    assert_eq!(left.serialized(), input);
+                    assert_eq!(left.serialized(), right.serialized());
+                    assert_eq!(left.sender_ratchet_key(), right.sender_ratchet_key());
+                    assert_eq!(left.counter(), right.counter());
+                    assert_eq!(left.previous_counter(), right.previous_counter());
+                    assert_eq!(left.message_version(), right.message_version());
+                    assert_eq!(left.body(), right.body());
+                }
+                (Err(left), Err(right)) => assert_eq!(format!("{left:?}"), format!("{right:?}")),
+                _ => panic!("borrowed and owned input disagree"),
+            }
+        }
+    }
+    #[test]
+    fn rejected_signal_input_never_requests_owned_storage() {
+        let prekey = engine::wire::PreKeySignalMessage {
+            registration: 1,
+            pre_key_id: Some(2),
+            signed_pre_key_id: 3,
+            base_key: [4; 32],
+            identity: [5; 32],
+            message: signal_bytes(),
+        }
+        .encode();
+        for input in [&[][..], &[0x33][..], prekey.as_slice()] {
+            assert!(
+                SignalMessage::decode(input, |_| panic!("rejected input requested ownership"))
+                    .is_err()
+            );
+        }
     }
     #[test]
     fn consumed_messages_reuse_unique_storage_and_isolate_shared_views() {
