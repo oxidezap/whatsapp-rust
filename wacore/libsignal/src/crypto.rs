@@ -318,6 +318,28 @@ pub struct ProviderCrypto<'a, C = crate::engine::RustCrypto> {
     crypto: C,
     provider: &'a dyn SymmetricCryptoProvider,
 }
+// A provider can fail or unwind after writing plaintext. Roll back only the
+// uncommitted suffix, preserving append semantics without a scratch allocation.
+struct CbcAppendRollback<'a> {
+    output: &'a mut Vec<u8>,
+    prefix: usize,
+    complete: bool,
+}
+impl Drop for CbcAppendRollback<'_> {
+    fn drop(&mut self) {
+        if self.complete {
+            return;
+        }
+        if let Some(appended) = self.output.get_mut(self.prefix..) {
+            zeroize::Zeroize::zeroize(appended);
+            self.output.truncate(self.prefix);
+        } else {
+            // Also scrub output from a backend that violated append semantics.
+            zeroize::Zeroize::zeroize(self.output.as_mut_slice());
+            self.output.clear();
+        }
+    }
+}
 impl<'a> ProviderCrypto<'a> {
     pub fn new(provider: &'a dyn SymmetricCryptoProvider) -> Self {
         Self::with_crypto(crate::engine::RustCrypto, provider)
@@ -390,20 +412,40 @@ impl<C: crate::engine::CryptoProvider> crate::engine::CryptoProvider for Provide
         iv: &[u8; 16],
         plaintext: &[u8],
     ) -> crate::engine::Result<Vec<u8>> {
-        let expected = plaintext
-            .len()
-            .checked_div(16)
-            .and_then(|n| n.checked_add(1))
-            .and_then(|n| n.checked_mul(16))
-            .ok_or(crate::engine::Error::Crypto)?;
         let mut out = zeroize::Zeroizing::new(Vec::new());
-        self.provider
-            .aes_256_cbc_encrypt(key, iv, plaintext, &mut out)
-            .map_err(engine_provider_error)?;
-        if out.len() != expected {
-            return Err(crate::engine::Error::Crypto);
-        }
+        self.encrypt_cbc_into(key, iv, plaintext, &mut out)?;
         Ok(std::mem::take(&mut *out))
+    }
+    fn encrypt_cbc_into(
+        &self,
+        key: &[u8; 32],
+        iv: &[u8; 16],
+        plaintext: &[u8],
+        output: &mut Vec<u8>,
+    ) -> crate::engine::Result<()> {
+        let start = output.len();
+        let end = crate::engine::crypto::cbc_ciphertext_len(plaintext.len())?
+            .checked_add(start)
+            .ok_or(crate::engine::Error::Crypto)?;
+        let mut append = CbcAppendRollback {
+            output,
+            prefix: start,
+            complete: false,
+        };
+        // The selected port already promises append semantics. Forward the
+        // destination rather than allocating a second ciphertext buffer, and
+        // retain the same backend/error selection and strict length check.
+        let result = self
+            .provider
+            .aes_256_cbc_encrypt(key, iv, plaintext, append.output)
+            .map_err(engine_provider_error)
+            .and_then(|()| {
+                (append.output.len() == end)
+                    .then_some(())
+                    .ok_or(crate::engine::Error::Crypto)
+            });
+        append.complete = result.is_ok();
+        result
     }
     fn decrypt_cbc(
         &self,
@@ -714,6 +756,115 @@ mod tests {
             self.hmac.fetch_add(1, Ordering::Relaxed);
             RustCryptoProvider.hmac_sha256(key, parts)
         }
+    }
+    #[test]
+    fn selected_cbc_provider_receives_the_reserved_destination() {
+        use crate::engine::CryptoProvider;
+        struct Append {
+            prefix: Vec<u8>,
+            calls: AtomicUsize,
+        }
+        impl SymmetricCryptoProvider for Append {
+            fn aes_256_cbc_encrypt(
+                &self,
+                key: &[u8; 32],
+                iv: &[u8; 16],
+                plaintext: &[u8],
+                out: &mut Vec<u8>,
+            ) -> Result<(), CryptoProviderError> {
+                assert_eq!(*out, self.prefix);
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                RustCryptoProvider.aes_256_cbc_encrypt(key, iv, plaintext, out)
+            }
+        }
+        for len in [0, 1, 15, 16, 17, 127, 128, 129, 512, 8192] {
+            let plaintext = vec![7; len];
+            let expected = crate::engine::RustCrypto
+                .encrypt_cbc(&[3; 32], &[4; 16], &plaintext)
+                .unwrap();
+            for prefix_len in [0, 1, 16, 47, 129] {
+                let provider = Append {
+                    prefix: vec![9; prefix_len],
+                    calls: AtomicUsize::new(0),
+                };
+                let mut output = Vec::with_capacity(prefix_len + expected.len());
+                output.extend_from_slice(&provider.prefix);
+                let pointer = output.as_ptr();
+                ProviderCrypto::new(&provider)
+                    .encrypt_cbc_into(&[3; 32], &[4; 16], &plaintext, &mut output)
+                    .unwrap();
+                assert_eq!(&output[..prefix_len], provider.prefix);
+                assert_eq!(&output[prefix_len..], expected);
+                assert_eq!(output.as_ptr(), pointer);
+                assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+            }
+        }
+    }
+    #[test]
+    fn selected_cbc_append_failure_retains_prefix_without_native_fallback() {
+        use crate::engine::CryptoProvider;
+        struct FailedAppend {
+            fail: bool,
+        }
+        impl SymmetricCryptoProvider for FailedAppend {
+            fn aes_256_cbc_encrypt(
+                &self,
+                _: &[u8; 32],
+                _: &[u8; 16],
+                plaintext: &[u8],
+                out: &mut Vec<u8>,
+            ) -> Result<(), CryptoProviderError> {
+                // A backend may leave partial output before reporting failure.
+                out.extend_from_slice(plaintext);
+                if self.fail {
+                    Err(CryptoProviderError::BackendFailed)
+                } else {
+                    Ok(()) // Deliberately missing PKCS#7 padding.
+                }
+            }
+        }
+        for fail in [false, true] {
+            let provider = FailedAppend { fail };
+            let mut output = vec![9; 47];
+            assert_eq!(
+                ProviderCrypto::new(&provider).encrypt_cbc_into(
+                    &[3; 32],
+                    &[4; 16],
+                    b"partial plaintext",
+                    &mut output,
+                ),
+                Err(crate::engine::Error::Crypto)
+            );
+            assert_eq!(output, [9; 47]);
+        }
+    }
+    #[test]
+    fn selected_cbc_append_unwind_discards_partial_plaintext() {
+        use crate::engine::CryptoProvider;
+        struct PanicAppend;
+        impl SymmetricCryptoProvider for PanicAppend {
+            fn aes_256_cbc_encrypt(
+                &self,
+                _: &[u8; 32],
+                _: &[u8; 16],
+                plaintext: &[u8],
+                out: &mut Vec<u8>,
+            ) -> Result<(), CryptoProviderError> {
+                out.extend_from_slice(plaintext);
+                panic!("synthetic provider unwind");
+            }
+        }
+        let mut output = vec![9; 47];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ProviderCrypto::new(&PanicAppend).encrypt_cbc_into(
+                &[3; 32],
+                &[4; 16],
+                b"partial plaintext",
+                &mut output,
+            )
+        }));
+        assert!(result.is_err());
+        assert_eq!(output, [9; 47]);
     }
     #[test]
     fn caller_owned_providers_execute_callbacks_and_remain_isolated() {
