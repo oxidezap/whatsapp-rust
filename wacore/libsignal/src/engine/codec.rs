@@ -159,28 +159,30 @@ pub fn decode_session_state<C: CryptoProvider>(_crypto: &C, input: &[u8]) -> Res
     if let Some(exchange) = &pending_key_exchange {
         fields(exchange)?;
     }
+    let metadata = SessionMetadata {
+        version,
+        local_identity: public(&f, 2)?,
+        remote_identity: public(&f, 3)?,
+        root: raw(&f, 4)?,
+        previous_counter: number(&f, 5)?,
+        pending_key_exchange,
+        remote_registration: number(&f, 10)?,
+        local_registration: number(&f, 11)?,
+        needs_refresh: number(&f, 12)? != 0,
+        alice_base_key: data(&f, 13)?.map(decode_public).transpose()?,
+        alice_base_key_tagged: data(&f, 13)?.is_none_or(|bytes| bytes.len() == 33),
+    };
+    let sender = data(&f, 6)?
+        .map(|bytes| decode_chain(bytes, StoredChainRole::Sender))
+        .transpose()?;
+    let pending_pre_key = data(&f, 9)?.map(decode_pending).transpose()?;
+    // Release the parser table before allocating the shared session snapshots.
+    drop(f);
     Ok(SessionState {
-        metadata: std::sync::Arc::new(SessionMetadata {
-            version,
-            local_identity: public(&f, 2)?,
-            remote_identity: public(&f, 3)?,
-            root: raw(&f, 4)?,
-            previous_counter: number(&f, 5)?,
-            pending_key_exchange,
-            remote_registration: number(&f, 10)?,
-            local_registration: number(&f, 11)?,
-            needs_refresh: number(&f, 12)? != 0,
-            alice_base_key: data(&f, 13)?.map(decode_public).transpose()?,
-            alice_base_key_tagged: data(&f, 13)?.is_none_or(|bytes| bytes.len() == 33),
-        }),
-        sender: data(&f, 6)?
-            .map(|bytes| decode_chain(bytes, StoredChainRole::Sender))
-            .transpose()?,
+        metadata: std::sync::Arc::new(metadata),
+        sender,
         receivers,
-        pending_pre_key: data(&f, 9)?
-            .map(decode_pending)
-            .transpose()?
-            .map(std::sync::Arc::new),
+        pending_pre_key: pending_pre_key.map(std::sync::Arc::new),
     })
 }
 fn decode_reservation(f: &Data<'_>, live: Option<&[u8; 16]>) -> Result<(Reservation, bool)> {
