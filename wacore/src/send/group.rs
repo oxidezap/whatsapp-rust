@@ -157,11 +157,6 @@ pub async fn prepare_group_stanza(
         None => generate_reporting_token(message, request_id, to_jid, to_jid, existing_secret),
     };
 
-    // The reporting token's MessageContextInfo (message_secret + version) is spliced
-    // onto the encoded plaintext instead of deep-cloning the whole message via
-    // prepare_message_with_context just to attach two fields.
-    let reporting_context = reporting_result.as_ref().map(reporting_context_info);
-
     let own_base_jid = own_sending_jid.to_non_ad();
 
     let mut message_children: Vec<Node> = Vec::new();
@@ -374,11 +369,16 @@ pub async fn prepare_group_stanza(
 
     // Padding is chain-independent; compute it before the lock so the
     // per-(group,sender) serialization point covers only the ratchet steps.
-    let plaintext = match &shared_content {
-        Some(content) => {
-            MessageUtils::pad_with_context_from_encoded(content, reporting_context.as_ref())
+    let plaintext = {
+        // The splice context is needed only while constructing plaintext. Keep
+        // it out of the device-resolution and sender-key futures.
+        let reporting_context = reporting_result.as_ref().map(reporting_context_info);
+        match &shared_content {
+            Some(content) => {
+                MessageUtils::pad_with_context_from_encoded(content, reporting_context.as_ref())
+            }
+            None => MessageUtils::encode_and_pad_with_context(message, reporting_context.as_ref()),
         }
-        None => MessageUtils::encode_and_pad_with_context(message, reporting_context.as_ref()),
     };
 
     // The lock spans SKDM creation, the pairwise SKDM fan-out, and the skmsg
@@ -537,8 +537,11 @@ pub async fn prepare_group_stanza(
         .await?
     };
 
-    // Release before the chain-independent stanza build.
+    // Release before buffer cleanup and the chain-independent stanza build.
     drop(chain_guard);
+    // The ciphertext owns its bytes. Release input buffers outside the locks.
+    drop(plaintext);
+    drop(shared_content);
 
     let skmsg_ciphertext = skmsg.into_serialized();
 
