@@ -49,28 +49,38 @@ impl AddressBuf {
     pub fn empty() -> Self {
         Self(AddressStorage::Inline(arrayvec::ArrayString::new()))
     }
+    #[inline]
     pub fn clear(&mut self) {
         match &mut self.0 {
             AddressStorage::Inline(text) => text.clear(),
             AddressStorage::Heap(text) => text.clear(),
         }
     }
+    #[inline(always)]
     pub fn push_str(&mut self, s: &str) {
         match &mut self.0 {
             AddressStorage::Inline(inline) => {
                 if inline.try_push_str(s).is_err() {
-                    let mut text = String::with_capacity((inline.len() + s.len()).max(64));
-                    text.push_str(inline.as_str());
-                    text.push_str(s);
-                    self.0 = AddressStorage::Heap(text);
+                    self.spill(s);
                 }
             }
             AddressStorage::Heap(text) => text.push_str(s),
         }
     }
+    // Long names are uncommon; keep allocation and copying out of short writers.
+    #[cold]
+    #[inline(never)]
+    fn spill(&mut self, s: &str) {
+        let mut text = String::with_capacity((self.as_str().len() + s.len()).max(64));
+        text.push_str(self.as_str());
+        text.push_str(s);
+        self.0 = AddressStorage::Heap(text);
+    }
+    #[inline]
     pub fn push(&mut self, c: char) {
         self.push_str(c.encode_utf8(&mut [0; 4]));
     }
+    #[inline]
     pub fn as_str(&self) -> &str {
         match &self.0 {
             AddressStorage::Inline(text) => text.as_str(),
