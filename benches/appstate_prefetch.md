@@ -20,8 +20,8 @@ Establish a fresh baseline; do not call a difference from the old uncoordinated
 series a production regression or improvement. Correctness tests retain both
 uncoordinated and aligned concurrent execution and check release of the byte
 budget. The gate's scheduling and synchronization overhead is included in CPU
-and walltime results. Walltime describes this controlled workload, not natural
-network latency.
+simulation results. Simulation excludes syscall costs and cannot rule out a
+real runtime or scheduling change.
 
 Compare repeated CodSpeed runs at the same commit with the same Rust toolchain,
 instrument versions, flags, allocator settings and host environment. Inspect
@@ -30,15 +30,8 @@ Report total allocated bytes separately from peak live heap. Also keep RSS
 separate: allocator-retained pages and process residency are different metrics.
 The gate stabilizes overlap, not allocator or runtime bookkeeping.
 
-The current walltime job uses shared GitHub runners. Record the CPU model and
-treat cross-host walltime differences as diagnostic evidence, not proof of a
-code effect. CPU simulation excludes syscall costs and cannot rule out a real
-runtime or scheduling change. Do not raise thresholds to compensate for a
-changing machine.
-
-[CodSpeed's dedicated Macro Runners](https://codspeed.io/docs/integrations/ci/github-actions/macro-runners)
-are the supported stable walltime environment. The [current pricing](https://codspeed.io/pricing)
-includes 600 minutes per month on the Free plan. Verify this repository's actual
-plan, remaining allowance and runner access before switching CI; the published
-allowance does not establish this organization's availability or prevent paid
-overage on another plan. Keep build caches separate across runner architectures.
+CI runs this workload with CPU simulation and memory instrumentation. Walltime
+is not uploaded from shared GitHub runners because changes in host hardware and
+scheduling make cross-run comparisons unreliable. Native timing investigations
+need matched base/head measurements in a controlled environment; do not raise
+thresholds to compensate for a changing machine.
