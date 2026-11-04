@@ -2920,6 +2920,12 @@ mod datagram_dialer {
             );
 
             gate.release();
+            let goodbye = tokio::time::timeout(Duration::from_secs(1), next_packet(&relay)).await;
+            assert_eq!(
+                goodbye.expect("the relay hears the goodbye once the flow takes it"),
+                None,
+                "the relay sees the channel close after the held goodbye"
+            );
             hang_up.await.unwrap();
             relay.driver.abort();
         };
