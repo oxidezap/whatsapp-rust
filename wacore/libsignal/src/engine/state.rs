@@ -471,10 +471,69 @@ impl ArchivedSession {
         crate::engine::codec::decode_session_state(crypto, &self.bytes)
     }
 }
+/// Archive snapshots share their immutable handle list until a session is promoted.
+/// A fresh session does not allocate an empty list.
+#[derive(Clone, Default)]
+pub struct ArchivedSessions(Option<Arc<Vec<ArchivedSession>>>);
+impl ArchivedSessions {
+    pub fn capacity(&self) -> usize {
+        self.0.as_ref().map_or(0, |items| items.capacity())
+    }
+    pub fn allocation_overhead(&self) -> usize {
+        self.0.as_ref().map_or(0, |_| {
+            size_of::<Vec<ArchivedSession>>() + 2 * size_of::<usize>()
+        })
+    }
+    pub fn insert(&mut self, index: usize, value: ArchivedSession) {
+        Arc::make_mut(self.0.get_or_insert_with(|| Arc::new(Vec::new()))).insert(index, value);
+    }
+    pub fn remove(&mut self, index: usize) -> ArchivedSession {
+        let value = Arc::make_mut(self.0.as_mut().expect("archive index must exist")).remove(index);
+        if self.is_empty() {
+            self.0 = None;
+        }
+        value
+    }
+    pub fn truncate(&mut self, length: usize) {
+        if length == 0 {
+            self.0 = None;
+        } else if self.len() > length {
+            Arc::make_mut(self.0.as_mut().expect("nonempty archive list")).truncate(length);
+        }
+    }
+}
+impl std::ops::Deref for ArchivedSessions {
+    type Target = [ArchivedSession];
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().map_or(&[], |items| items.as_slice())
+    }
+}
+impl PartialEq for ArchivedSessions {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+impl Eq for ArchivedSessions {}
+impl From<Vec<ArchivedSession>> for ArchivedSessions {
+    fn from(items: Vec<ArchivedSession>) -> Self {
+        if items.is_empty() {
+            Self::default()
+        } else {
+            Self(Some(Arc::new(items)))
+        }
+    }
+}
+impl<'a> IntoIterator for &'a ArchivedSessions {
+    type Item = &'a ArchivedSession;
+    type IntoIter = std::slice::Iter<'a, ArchivedSession>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct SessionRecord {
     pub current: Option<SessionState>,
-    pub previous: Vec<ArchivedSession>,
+    pub previous: ArchivedSessions,
     pub reservation: Reservation,
 }
 impl SessionRecord {
@@ -678,5 +737,55 @@ mod shared_storage_tests {
         let cloned = archive.clone();
         assert!(Arc::ptr_eq(&archive.bytes, &cloned.bytes));
         assert_eq!(archive.encoded(), cloned.encoded());
+    }
+
+    #[test]
+    fn archive_snapshots_detach_only_when_the_ordered_history_changes() {
+        let make = |tag| ArchivedSession {
+            bytes: Arc::from([8u8, tag].as_slice()),
+        };
+        let empty = ArchivedSessions::default();
+        assert_eq!(empty.capacity(), 0);
+        assert_eq!(empty.allocation_overhead(), 0);
+        let original = ArchivedSessions::from(vec![make(1), make(2), make(3)]);
+        let mut sibling = original.clone();
+        let shared = Arc::downgrade(original.0.as_ref().unwrap());
+        sibling.truncate(3);
+        assert!(Arc::ptr_eq(
+            original.0.as_ref().unwrap(),
+            sibling.0.as_ref().unwrap()
+        ));
+        let removed = sibling.remove(1);
+        assert_eq!(removed.encoded(), &[8, 2]);
+        assert!(!Arc::ptr_eq(
+            original.0.as_ref().unwrap(),
+            sibling.0.as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(&original[0].bytes, &sibling[0].bytes));
+        sibling.insert(0, make(4));
+        sibling.truncate(2);
+        assert_eq!(
+            original
+                .iter()
+                .map(|item| item.encoded()[1])
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert_eq!(
+            sibling
+                .iter()
+                .map(|item| item.encoded()[1])
+                .collect::<Vec<_>>(),
+            [4, 1]
+        );
+        drop(original);
+        assert!(shared.upgrade().is_none());
+        sibling.truncate(0);
+        assert!(sibling == empty);
+        assert_eq!(sibling.allocation_overhead(), 0);
+        sibling.insert(0, make(5));
+        assert_eq!(sibling.remove(0).encoded(), &[8, 5]);
+        assert!(sibling == empty);
+        assert_eq!(sibling.capacity(), 0);
     }
 }

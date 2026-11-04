@@ -868,7 +868,7 @@ impl SessionRecord {
             .collect::<Result<Vec<_>>>()?;
         let mut result = Self::new_fresh();
         result.current = current;
-        result.inner.previous = previous;
+        result.inner.previous = previous.into();
         Ok(result)
     }
     /// Consume protocol components after burning all reserved sending counters.

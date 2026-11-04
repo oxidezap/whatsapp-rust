@@ -288,7 +288,7 @@ fn decode_session_record_inner<C: CryptoProvider>(
     }
     Ok(SessionRecord {
         current,
-        previous,
+        previous: previous.into(),
         reservation,
     })
 }

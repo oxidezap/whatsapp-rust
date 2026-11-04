@@ -288,7 +288,7 @@ pub struct UnacknowledgedPreKeyMessageItems {
 }
 #[derive(Clone, Default)]
 pub(crate) struct RecordMetadata {
-    pub previous: Vec<engine::ArchivedSession>,
+    pub previous: engine::ArchivedSessions,
     pub reservation: engine::Reservation,
 }
 #[derive(Clone, Default)]
@@ -539,7 +539,8 @@ impl SessionRecord {
         self.pending_reservation = false;
     }
     pub fn estimated_heap_bytes(&self) -> usize {
-        self.inner.previous.capacity() * size_of::<engine::ArchivedSession>()
+        self.inner.previous.allocation_overhead()
+            + self.inner.previous.capacity() * size_of::<engine::ArchivedSession>()
             + self
                 .inner
                 .previous
