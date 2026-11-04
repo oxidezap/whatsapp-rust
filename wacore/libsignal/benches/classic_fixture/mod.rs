@@ -301,6 +301,8 @@ impl PreparedGroups {
 impl SenderKeyStore for PreparedGroups {
     async fn load_sender_key(&self, _: &SenderKeyName) -> Result<Option<SenderKeyRecord>> {
         let mut record = SenderKeyRecord::from_components(self.components.clone())?;
+        // Isolate prepared crypto from reservation materialization on export.
+        record.waive_counter_lease()?;
         access::restore_crypto(&mut record, &self.context);
         Ok(Some(record))
     }
@@ -771,6 +773,12 @@ impl Fixture {
             #[cfg(feature = "bench-internals")]
             Case::PreparedRebuildEncrypt | Case::PreparedRebuildDecrypt => {
                 let distribution = this.initialize_group();
+                this.sender
+                    .0
+                    .get_mut(&this.name)
+                    .unwrap()
+                    .waive_counter_lease()
+                    .unwrap();
                 block_on(process_sender_key_distribution_message(
                     &this.name,
                     &distribution,
@@ -1302,6 +1310,18 @@ impl Fixture {
     }
     #[cfg(all(test, feature = "bench-internals"))]
     pub fn check_cached_key_postconditions(&mut self, case: Case) {
+        if matches!(
+            case,
+            Case::PreparedRebuildEncrypt | Case::PreparedRebuildDecrypt
+        ) {
+            assert_eq!(
+                self.prepared.as_ref().unwrap().components.states[0]
+                    .chain_key
+                    .iteration,
+                2,
+                "one prepared operation must advance the warmed chain once"
+            );
+        }
         if matches!(
             case,
             Case::ColdLookup2000
