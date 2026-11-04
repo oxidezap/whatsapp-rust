@@ -15,17 +15,7 @@ trait Sink {
     fn raw(&mut self, bytes: &[u8]);
     fn message<M: Encodable + ?Sized>(&mut self, field: u32, message: &M);
 
-    fn varint(&mut self, mut value: u64) {
-        let mut encoded = [0; 10];
-        let mut used = 0;
-        while value >= 128 {
-            encoded[used] = (value as u8 & 127) | 128;
-            used += 1;
-            value >>= 7;
-        }
-        encoded[used] = value as u8;
-        self.raw(&encoded[..=used]);
-    }
+    fn varint(&mut self, value: u64);
 
     fn uint(&mut self, field: u32, value: u64) {
         self.varint(u64::from(field) << 3);
@@ -62,6 +52,15 @@ impl Sink for CountSink {
         self.0 += bytes.len();
     }
 
+    #[inline]
+    fn varint(&mut self, value: u64) {
+        self.0 += if value < 128 {
+            1
+        } else {
+            (u64::BITS - value.leading_zeros()).div_ceil(7) as usize
+        };
+    }
+
     fn message<M: Encodable + ?Sized>(&mut self, field: u32, message: &M) {
         let length = encoded_len(message);
         self.varint((u64::from(field) << 3) | 2);
@@ -75,6 +74,23 @@ struct VecSink<'a>(&'a mut Vec<u8>);
 impl Sink for VecSink<'_> {
     fn raw(&mut self, bytes: &[u8]) {
         self.0.extend_from_slice(bytes);
+    }
+
+    #[inline]
+    fn varint(&mut self, mut value: u64) {
+        if value < 128 {
+            self.0.push(value as u8);
+            return;
+        }
+        let mut encoded = [0; 10];
+        let mut used = 0;
+        while value >= 128 {
+            encoded[used] = (value as u8 & 127) | 128;
+            used += 1;
+            value >>= 7;
+        }
+        encoded[used] = value as u8;
+        self.raw(&encoded[..=used]);
     }
 
     fn message<M: Encodable + ?Sized>(&mut self, field: u32, message: &M) {
@@ -329,6 +345,25 @@ mod tests {
     use super::*;
     use crate::engine::{RustCrypto, codec};
     use std::collections::VecDeque;
+
+    #[test]
+    fn varint_sinks_match_the_schema_reference_at_all_boundaries() {
+        let mut values = vec![0, 1, u64::MAX];
+        for shift in (7..64).step_by(7) {
+            let boundary = 1_u64 << shift;
+            values.extend([boundary - 1, boundary, boundary + 1]);
+        }
+        for value in values {
+            let mut expected = vec![0x51, 0xa2];
+            buffa::encoding::encode_varint(value, &mut expected);
+            let mut actual = vec![0x51, 0xa2];
+            VecSink(&mut actual).varint(value);
+            assert_eq!(actual, expected, "value={value}");
+            let mut count = CountSink(2);
+            count.varint(value);
+            assert_eq!(count.0, expected.len(), "value={value}");
+        }
+    }
 
     #[test]
     #[allow(clippy::disallowed_methods)]
