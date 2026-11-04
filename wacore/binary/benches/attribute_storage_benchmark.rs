@@ -66,6 +66,42 @@ fn inline_three(bencher: divan::Bencher, count: usize) {
     });
 }
 
+// The decoder knows the count before reading pairs. Match its preallocated
+// push loop as well as FromIterator: SmallVec's collect uses reserve, which
+// rounds spilled capacity up, whereas with_capacity reserves the exact count.
+#[divan::bench(args = [0, 1, 2, 3, 4, 8, 9])]
+fn boxed_known_count(bencher: divan::Bencher, count: usize) {
+    measure(bencher, count, |n| {
+        let mut attrs = Vec::with_capacity(n);
+        for entry in entries(n) {
+            attrs.push(entry);
+        }
+        AttrsRef::from_vec(attrs)
+    });
+}
+
+#[divan::bench(args = [0, 1, 2, 3, 4, 8, 9])]
+fn inline_one_known_count(bencher: divan::Bencher, count: usize) {
+    measure(bencher, count, |n| {
+        let mut attrs = SmallVec::<[(NodeStr<'static>, ValueRef<'static>); 1]>::with_capacity(n);
+        for entry in entries(n) {
+            attrs.push(entry);
+        }
+        attrs
+    });
+}
+
+#[divan::bench(args = [0, 1, 2, 3, 4, 8, 9])]
+fn inline_three_known_count(bencher: divan::Bencher, count: usize) {
+    measure(bencher, count, |n| {
+        let mut attrs = SmallVec::<[(NodeStr<'static>, ValueRef<'static>); 3]>::with_capacity(n);
+        for entry in entries(n) {
+            attrs.push(entry);
+        }
+        attrs
+    });
+}
+
 fn main() {
     divan::main();
 }
