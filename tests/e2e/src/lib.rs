@@ -102,6 +102,7 @@ pub fn scenario_push_name(prefix: &str, flags: &[&str]) -> String {
 pub struct TestClient {
     pub client: Arc<whatsapp_rust::client::Client>,
     pub event_rx: async_channel::Receiver<Arc<Event>>,
+    event_handler: Arc<ChannelEventHandler>,
     pub run_handle: whatsapp_rust::bot::BotHandle,
     /// The concrete backend, retained for its test hooks
     /// (`session_batch_write_count`, `set_fail_session_writes`).
@@ -233,7 +234,7 @@ impl TestClient {
         if push_name_pre_seeded {
             client.set_force_active_delivery_receipts(true);
         }
-        client.subscribe_handler(event_handler).detach();
+        client.subscribe_handler(event_handler.clone()).detach();
 
         // The mock server no longer auto-pairs (legacy timer is off by
         // default). Spawn an out-of-process "phone" that POSTs the first
@@ -252,7 +253,7 @@ impl TestClient {
         // a notifier, so it does not race event arrival order or fall back to an
         // orthogonal signal — the earlier flake, where a fixed 30s wait for
         // `Connected` timed out under CI load. PairSuccess/Connected still land
-        // in the unbounded `event_rx`; the predicate-filtered `wait_for_event`
+        // in the bounded `event_rx`; the predicate-filtered `wait_for_event`
         // discards them.
         if let Err(e) = client
             .wait_for_session_ready(tokio::time::Duration::from_secs(60))
@@ -286,6 +287,7 @@ impl TestClient {
         Ok(Self {
             client,
             event_rx,
+            event_handler,
             run_handle,
             backend,
         })
@@ -386,17 +388,42 @@ impl TestClient {
         F: FnMut(&Event) -> bool,
     {
         let timeout = tokio::time::Duration::from_secs(timeout_secs);
-        tokio::time::timeout(timeout, async {
+        // Record only event kinds, never message bodies, identities or tokens.
+        // Preserve the same receiver, predicate and deadline while distinguishing
+        // missing delivery from a full/closed event mailbox on a timeout.
+        let mut observed = Vec::new();
+        let result = tokio::time::timeout(timeout, async {
             loop {
                 match self.event_rx.recv().await {
-                    Ok(event) if predicate(&event) => return Ok(event),
-                    Ok(_) => continue,
+                    Ok(event) => {
+                        let kind = event.kind();
+                        if let Some((_, count)) =
+                            observed.iter_mut().find(|(seen, _)| *seen == kind)
+                        {
+                            *count += 1_u64;
+                        } else {
+                            observed.push((kind, 1_u64));
+                        }
+                        if predicate(&event) {
+                            return Ok(event);
+                        }
+                    }
                     Err(e) => return Err(anyhow::anyhow!("Event channel closed: {e}")),
                 }
             }
         })
-        .await
-        .map_err(|_| anyhow::anyhow!("Timed out waiting for event"))?
+        .await;
+        match result {
+            Ok(result) => result,
+            Err(_) => {
+                let stats = self.event_handler.stats();
+                let diagnostics = connect_diagnostics(&self.client, &self.backend).await;
+                Err(anyhow::anyhow!(
+                    "Timed out waiting for event: observed={observed:?}, queued={}, channel={stats:?}, {diagnostics}",
+                    self.event_rx.len()
+                ))
+            }
+        }
     }
 
     /// Wait for a text message with specific content.
