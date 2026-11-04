@@ -30,3 +30,4 @@ file:memdb_*.snapshot-*
 
 /.retention-out
 /.prefetch-pair-out
+/.signal-pair-out

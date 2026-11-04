@@ -34,7 +34,7 @@ env:
 
 jobs:
   prefetch-pair:
-    name: Prefetch, addresses and SDK sends against base on the same host
+    name: Prefetch, addresses and SDK CPU and memory against base
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -63,12 +63,14 @@ jobs:
           install -m 755 target/debug/whatsapp-xtask "$RUNNER_TEMP/prefetch-compare"
           "$RUNNER_TEMP/prefetch-compare" ci prefetch-pair-prepare --base-revision "$BASE_REVISION" --head-revision "$HEAD_REVISION"
           lscpu > .prefetch-pair-out/results/host.txt
-      # The head's harness explicitly measures base and head artifacts. Names
-      # include the role/repetition; no git/CI metadata or baseline is replaced.
-      - name: Measure alternating base/head samples with CodSpeed
+      # Both instruments measure immutable base/head workloads under distinct names.
+      # No git/CI metadata or baseline is replaced.
+      - name: Measure alternating base/head CPU and allocation samples
         uses: CodSpeedHQ/action@61efe07e57e55bedeab750c434504de272a56e8c # v5.6.1
         with:
-          mode: walltime
+          mode: simulation,memory
+          disable-memory-capture-stack: "false"
+          disable-memory-track-physical: "false"
           runner-version: "5.4.2"
           run: '"$RUNNER_TEMP/prefetch-compare" ci prefetch-pair-measure'
       - name: Preserve exact sources, registration patches and measurement provenance
@@ -77,6 +79,62 @@ jobs:
         with:
           name: prefetch-pair
           path: .prefetch-pair-out/results
+  signal-pair:
+    name: Classic Signal CPU and allocations against base on the same host
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@${{ env.PROTOC_VERSION }},cargo-codspeed@5.0.2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: classic-signal-pair
+          cache-targets: "false"
+      - name: Key the libc6-dbg cache on the installed libc6
+        id: libc6
+        run: cargo xt ci workflow libc-version
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/libc6-dbg
+          key: libc6-dbg-${{ runner.arch }}-${{ steps.libc6.outputs.version }}
+      - name: Bound apt and pre-install libc6-dbg
+        env:
+          LIBC6_VERSION: ${{ steps.libc6.outputs.version }}
+        run: cargo xt ci workflow install-libc-debug
+      - name: Build matched classic workloads and preserve the API adapter differences
+        env:
+          BASE_REVISION: ${{ github.event.pull_request.base.sha }}
+          HEAD_REVISION: ${{ github.event.pull_request.head.sha }}
+        run: |
+          cargo build --locked -p whatsapp-xtask
+          install -m 755 target/debug/whatsapp-xtask "$RUNNER_TEMP/signal-compare"
+          "$RUNNER_TEMP/signal-compare" ci signal-pair-prepare --base-revision "$BASE_REVISION" --head-revision "$HEAD_REVISION"
+          lscpu > .signal-pair-out/results/host.txt
+      - name: Measure both immutable libraries through CodSpeed
+        uses: CodSpeedHQ/action@61efe07e57e55bedeab750c434504de272a56e8c # v5.6.1
+        with:
+          mode: simulation,memory
+          runner-version: "5.4.2"
+          disable-memory-capture-stack: "false"
+          disable-memory-track-physical: "false"
+          run: '"$RUNNER_TEMP/signal-compare" ci signal-pair-measure'
+      - name: Preserve workload and port sources, hashes, flags and revisions
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: classic-signal-pair
+          path: .signal-pair-out/results
+
   connected-retention:
     name: Connected retention against PR base
     if: github.event_name == 'pull_request'
@@ -144,69 +202,6 @@ jobs:
           path: .retention-out/results
           retention-days: 14
 
-  signal-walltime:
-    name: Signal protocol walltime
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2026-06-16
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: protoc@${{ env.PROTOC_VERSION }},cargo-codspeed@5.0.2
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: signal-rewrite-walltime
-          cache-targets: "false"
-      - name: Build matched Signal benchmarks
-        run: cargo codspeed build -m walltime -p wacore-libsignal --bench rewrite_benchmark
-      - name: Measure native Signal transitions and storage
-        uses: CodSpeedHQ/action@61efe07e57e55bedeab750c434504de272a56e8c # v5.6.1
-        with:
-          mode: walltime
-          runner-version: "5.4.2"
-          run: cargo codspeed run -p wacore-libsignal --bench rewrite_benchmark
-
-  prefetch-walltime:
-    name: Prefetch walltime (shared-host diagnostic)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2026-06-16
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: protoc@${{ env.PROTOC_VERSION }},cargo-codspeed@5.0.2
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: prefetch-walltime
-          cache-targets: "false"
-      - name: Record measured source and host
-        run: |
-          git rev-parse HEAD
-          rustc -Vv
-          lscpu
-      - name: Build native prefetch benchmarks
-        run: cargo codspeed build -m walltime -p whatsapp-rust --features bench-harness --bench appstate_prefetch
-      # Simulation omits syscall and scheduling costs. Keep native results
-      # separately visible; a shared runner does not establish equivalence.
-      - name: Measure native prefetch
-        uses: CodSpeedHQ/action@61efe07e57e55bedeab750c434504de272a56e8c # v5.6.1
-        with:
-          mode: walltime
-          runner-version: "5.4.2"
-          run: cargo codspeed run -p whatsapp-rust --bench appstate_prefetch
-
   benchmarks:
     name: Run CodSpeed benchmarks (${{ matrix.shard.name }})
     runs-on: ubuntu-24.04
@@ -234,7 +229,7 @@ jobs:
           - name: proto-signal
             packages: -p wacore-binary -p wacore-libsignal -p wacore-appstate -p whatsapp-rust-sqlite-storage
             # Persisted-state import benchmarks are feature-gated.
-            features: --features wacore-libsignal/legacy-session-interop
+            features: --features wacore-libsignal/legacy-session-interop,wacore-libsignal/bench-internals
           # The client crate's own benchmarks. Its fixture needs crate-private
           # internals a bench target cannot otherwise reach, so it builds with
           # the non-default `bench-harness` feature. Its own shard rather than a

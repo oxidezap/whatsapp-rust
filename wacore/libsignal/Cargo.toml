@@ -10,6 +10,7 @@ description = "Storage-compatible Signal protocol with a sans-I/O state engine"
 
 [features]
 legacy-session-interop = []
+bench-internals = []
 
 [dependencies]
 arrayvec = { version = "0.7.8", default-features = false }
@@ -51,4 +52,8 @@ workspace = true
 
 [[bench]]
 name = "rewrite_benchmark"
+harness = false
+
+[[bench]]
+name = "classic_benchmark"
 harness = false

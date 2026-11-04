@@ -325,7 +325,7 @@ impl Chain {
             advanced: Some((next_index, *next_key, skipped)),
         })
     }
-    fn push_skipped(&mut self, key: MessageKey) {
+    pub(crate) fn push_skipped(&mut self, key: MessageKey) {
         let budget = self
             .message_key_limit
             .map(|n| n as usize)

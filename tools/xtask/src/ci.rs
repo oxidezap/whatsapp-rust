@@ -8,7 +8,21 @@ use xtask_support::{capture, write};
 
 #[derive(Subcommand)]
 pub enum Task {
-    /// Build immutable base/head prefetch workloads for a same-host CodSpeed comparison.
+    /// Build the same synthetic classic Signal workloads against immutable revisions.
+    SignalPairPrepare {
+        #[arg(long)]
+        base_revision: String,
+        #[arg(long)]
+        head_revision: String,
+        #[arg(long, default_value = ".signal-pair-out")]
+        out_dir: PathBuf,
+    },
+    /// Measure the recorded Signal artifacts with the enclosing CodSpeed instruments.
+    SignalPairMeasure {
+        #[arg(long, default_value = ".signal-pair-out")]
+        out_dir: PathBuf,
+    },
+    /// Build immutable base/head prefetch and SDK workloads for CPU/allocation comparison.
     PrefetchPairPrepare {
         #[arg(long)]
         base_revision: String,
@@ -239,6 +253,16 @@ fn timed_report(
 
 pub fn run(root: &Path, task: Task) -> Result<u8> {
     match task {
+        Task::SignalPairPrepare {
+            base_revision,
+            head_revision,
+            out_dir,
+        } => {
+            super::signal_pair::prepare(root, &base_revision, &head_revision, &out_dir)?;
+        }
+        Task::SignalPairMeasure { out_dir } => {
+            super::signal_pair::measure(root, &out_dir)?;
+        }
         Task::PrefetchPairPrepare {
             base_revision,
             head_revision,

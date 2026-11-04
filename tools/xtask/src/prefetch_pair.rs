@@ -45,14 +45,15 @@ struct Manifest {
     address_benchmark_sha256: String,
     sdk_benchmark_sha256: [String; 2],
     sdk_fixture_sha256: String,
-    expected_walltime_results: usize,
+    instruments: [String; 2],
+    expected_results: usize,
     order: Vec<(String, usize)>,
     revisions: Vec<Revision>,
     rustc: String,
     cargo_codspeed: String,
 }
 
-fn revision(root: &Path) -> Result<String> {
+pub(super) fn revision(root: &Path) -> Result<String> {
     Ok(String::from_utf8(
         capture(
             Command::new("git")
@@ -64,7 +65,7 @@ fn revision(root: &Path) -> Result<String> {
     .trim()
     .to_owned())
 }
-fn full_sha(sha: &str) -> Result<()> {
+pub(super) fn full_sha(sha: &str) -> Result<()> {
     ensure!(
         sha.len() == 40 && sha.bytes().all(|c| c.is_ascii_hexdigit()),
         "expected an immutable full revision"
@@ -87,7 +88,7 @@ fn version_response(code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> Result<S
     );
     Ok(text.trim().to_owned())
 }
-fn cargo_codspeed_version() -> Result<String> {
+pub(super) fn cargo_codspeed_version() -> Result<String> {
     let output = Command::new("cargo")
         .args(["codspeed", "--version"])
         .output()?;
@@ -397,7 +398,9 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
                 "codspeed",
                 "build",
                 "-m",
-                "walltime",
+                "simulation",
+                "-m",
+                "memory",
                 "-p",
                 "whatsapp-rust",
                 "--features",
@@ -413,14 +416,15 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
     write_json(
         &output.join("results/manifest.json"),
         &Manifest {
-            schema_version: 3,
+            schema_version: 4,
             measured_driver_revision: head.to_owned(),
             benchmark_sha256: sha256(&inputs[0].0),
             fixture_sha256: sha256(&inputs[0].1),
             address_benchmark_sha256: sha256(&inputs[0].2),
             sdk_benchmark_sha256: [sha256(&inputs[0].3), sha256(&inputs[0].4)],
             sdk_fixture_sha256: sha256(&inputs[0].5),
-            expected_walltime_results: 112,
+            instruments: ["Simulation".to_owned(), "Memory".to_owned()],
+            expected_results: 224,
             order: ORDER
                 .iter()
                 .map(|(role, round)| ((*role).to_owned(), *round))
@@ -437,8 +441,12 @@ pub fn measure(root: &Path, output: &Path) -> Result<()> {
     let manifest: Manifest =
         serde_json::from_slice(&std::fs::read(output.join("results/manifest.json"))?)?;
     ensure!(
-        manifest.schema_version == 3 && revision(root)? == manifest.measured_driver_revision,
+        manifest.schema_version == 4 && revision(root)? == manifest.measured_driver_revision,
         "measurement driver changed after preparation"
+    );
+    ensure!(
+        manifest.instruments == ["Simulation", "Memory"] && manifest.expected_results == 224,
+        "paired CPU/allocation measurement contract changed"
     );
     ensure!(
         manifest.order

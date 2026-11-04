@@ -6,6 +6,7 @@ mod consumers;
 mod package_consumers;
 mod prefetch_pair;
 mod session_retention;
+mod signal_pair;
 mod size;
 mod size_baseline;
 mod workflow;
