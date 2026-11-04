@@ -379,14 +379,20 @@ pub struct PendingPreKey {
 }
 #[derive(Clone, PartialEq, Eq)]
 pub struct SessionState {
+    pub metadata: Arc<SessionMetadata>,
+    pub sender: Option<Chain>,
+    pub receivers: Vec<Chain>,
+    pub pending_pre_key: Option<Arc<PendingPreKey>>,
+}
+/// Session identity and ratchet metadata change at setup or a DH transition,
+/// while message-counter updates keep sharing the same immutable snapshot.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SessionMetadata {
     pub version: u32,
     pub local_identity: [u8; 32],
     pub remote_identity: [u8; 32],
     pub root: [u8; 32],
     pub previous_counter: u32,
-    pub sender: Option<Chain>,
-    pub receivers: Vec<Chain>,
-    pub pending_pre_key: Option<Arc<PendingPreKey>>,
     pub local_registration: u32,
     pub remote_registration: u32,
     pub needs_refresh: bool,
@@ -396,7 +402,18 @@ pub struct SessionState {
     /// Retained opaque legacy key-exchange protobuf, unused by v3 sessions.
     pub pending_key_exchange: Option<Vec<u8>>,
 }
-impl Drop for SessionState {
+impl std::ops::Deref for SessionState {
+    type Target = SessionMetadata;
+    fn deref(&self) -> &Self::Target {
+        &self.metadata
+    }
+}
+impl std::ops::DerefMut for SessionState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.metadata)
+    }
+}
+impl Drop for SessionMetadata {
     fn drop(&mut self) {
         self.root.zeroize();
     }

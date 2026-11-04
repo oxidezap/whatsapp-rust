@@ -160,25 +160,27 @@ pub fn decode_session_state<C: CryptoProvider>(_crypto: &C, input: &[u8]) -> Res
         fields(exchange)?;
     }
     Ok(SessionState {
-        version,
-        local_identity: public(&f, 2)?,
-        remote_identity: public(&f, 3)?,
-        root: raw(&f, 4)?,
-        previous_counter: number(&f, 5)?,
+        metadata: std::sync::Arc::new(SessionMetadata {
+            version,
+            local_identity: public(&f, 2)?,
+            remote_identity: public(&f, 3)?,
+            root: raw(&f, 4)?,
+            previous_counter: number(&f, 5)?,
+            pending_key_exchange,
+            remote_registration: number(&f, 10)?,
+            local_registration: number(&f, 11)?,
+            needs_refresh: number(&f, 12)? != 0,
+            alice_base_key: data(&f, 13)?.map(decode_public).transpose()?,
+            alice_base_key_tagged: data(&f, 13)?.is_none_or(|bytes| bytes.len() == 33),
+        }),
         sender: data(&f, 6)?
             .map(|bytes| decode_chain(bytes, StoredChainRole::Sender))
             .transpose()?,
         receivers,
-        pending_key_exchange,
         pending_pre_key: data(&f, 9)?
             .map(decode_pending)
             .transpose()?
             .map(std::sync::Arc::new),
-        remote_registration: number(&f, 10)?,
-        local_registration: number(&f, 11)?,
-        needs_refresh: number(&f, 12)? != 0,
-        alice_base_key: data(&f, 13)?.map(decode_public).transpose()?,
-        alice_base_key_tagged: data(&f, 13)?.is_none_or(|bytes| bytes.len() == 33),
     })
 }
 fn decode_reservation(f: &Data<'_>, live: Option<&[u8; 16]>) -> Result<(Reservation, bool)> {

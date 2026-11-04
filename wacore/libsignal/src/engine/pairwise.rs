@@ -68,20 +68,22 @@ fn state(
     root: [u8; 32],
 ) -> SessionState {
     SessionState {
-        version: 3,
-        local_identity: local.public,
-        remote_identity: remote,
-        root,
-        previous_counter: 0,
+        metadata: std::sync::Arc::new(SessionMetadata {
+            version: 3,
+            local_identity: local.public,
+            remote_identity: remote,
+            root,
+            previous_counter: 0,
+            local_registration,
+            remote_registration,
+            needs_refresh: false,
+            alice_base_key: None,
+            alice_base_key_tagged: true,
+            pending_key_exchange: None,
+        }),
         sender: None,
         receivers: Vec::new(),
         pending_pre_key: None,
-        local_registration,
-        remote_registration,
-        needs_refresh: false,
-        alice_base_key: None,
-        alice_base_key_tagged: true,
-        pending_key_exchange: None,
     }
 }
 impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {

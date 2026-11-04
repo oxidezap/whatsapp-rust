@@ -335,11 +335,19 @@ mod tests {
         receiver.index = u32::MAX;
         receiver.exhausted = true;
         SessionState {
-            version: 3,
-            local_identity: [1; 32],
-            remote_identity: [2; 32],
-            root: [3; 32],
-            previous_counter: u32::MAX,
+            metadata: std::sync::Arc::new(crate::engine::SessionMetadata {
+                version: 3,
+                local_identity: [1; 32],
+                remote_identity: [2; 32],
+                root: [3; 32],
+                previous_counter: u32::MAX,
+                local_registration: 0,
+                remote_registration: u32::MAX,
+                needs_refresh: true,
+                alice_base_key: Some([12; 32]),
+                alice_base_key_tagged: false,
+                pending_key_exchange: Some(vec![8, 127]),
+            }),
             sender: Some(sender),
             receivers: vec![receiver],
             pending_pre_key: Some(std::sync::Arc::new(PendingPreKey {
@@ -349,13 +357,38 @@ mod tests {
                 kyber_pre_key_id: Some(0),
                 kyber_ciphertext: Some(vec![11; 130]),
             })),
-            local_registration: 0,
-            remote_registration: u32::MAX,
-            needs_refresh: true,
-            alice_base_key: Some([12; 32]),
-            alice_base_key_tagged: false,
-            pending_key_exchange: Some(vec![8, 127]),
         }
+    }
+
+    #[test]
+    fn session_snapshots_share_metadata_until_a_ratchet_field_changes() {
+        let original = state();
+        let expected = codec::encode_session_state(&original);
+        let mut sibling = original.clone();
+        let shared = std::sync::Arc::downgrade(&original.metadata);
+        sibling.sender.as_mut().unwrap().index += 1;
+        assert!(std::sync::Arc::ptr_eq(
+            &original.metadata,
+            &sibling.metadata
+        ));
+        sibling.root = [19; 32];
+        assert!(!std::sync::Arc::ptr_eq(
+            &original.metadata,
+            &sibling.metadata
+        ));
+        assert_eq!(original.root, [3; 32]);
+        assert_eq!(sibling.root, [19; 32]);
+        assert_eq!(codec::encode_session_state(&original), expected);
+        assert_ne!(codec::encode_session_state(&sibling), expected);
+        drop(original);
+        assert!(shared.upgrade().is_none());
+        assert!(size_of::<SessionState>() <= 176);
+        println!(
+            "session metadata allocation: {} B; hot state: {} B; record: {} B",
+            size_of::<crate::engine::SessionMetadata>() + 2 * size_of::<usize>(),
+            size_of::<SessionState>(),
+            size_of::<crate::protocol::SessionRecord>(),
+        );
     }
 
     #[test]

@@ -133,20 +133,22 @@ impl SessionState {
     ) -> Self {
         Self {
             inner: engine::SessionState {
-                version,
-                local_identity: *local.public_key().public_key_bytes(),
-                remote_identity: *remote.public_key().public_key_bytes(),
-                root: root.0,
-                previous_counter: 0,
+                metadata: Arc::new(engine::SessionMetadata {
+                    version,
+                    local_identity: *local.public_key().public_key_bytes(),
+                    remote_identity: *remote.public_key().public_key_bytes(),
+                    root: root.0,
+                    previous_counter: 0,
+                    local_registration: 0,
+                    remote_registration: 0,
+                    needs_refresh: false,
+                    alice_base_key: Some(*base.public_key_bytes()),
+                    alice_base_key_tagged: true,
+                    pending_key_exchange: None,
+                }),
                 sender: None,
                 receivers: Vec::new(),
                 pending_pre_key: None,
-                local_registration: 0,
-                remote_registration: 0,
-                needs_refresh: false,
-                alice_base_key: Some(*base.public_key_bytes()),
-                alice_base_key_tagged: true,
-                pending_key_exchange: None,
             },
         }
     }
@@ -549,7 +551,9 @@ impl SessionRecord {
                 .sum::<usize>()
             + self.current.as_ref().map_or(0, |s| {
                 let state = &s.inner;
-                state.receivers.capacity() * size_of::<engine::Chain>()
+                size_of::<engine::SessionMetadata>()
+                    + 2 * size_of::<usize>()
+                    + state.receivers.capacity() * size_of::<engine::Chain>()
                     + state
                         .receivers
                         .iter()

@@ -45,11 +45,19 @@ fn session(backlog: usize, archives: usize) -> new::SessionRecord {
         })
         .collect();
     let state = new::SessionState {
-        version: 3,
-        local_identity: local.public,
-        remote_identity: remote.public,
-        root: [0x42; 32],
-        previous_counter: 0,
+        metadata: std::sync::Arc::new(new::SessionMetadata {
+            version: 3,
+            local_identity: local.public,
+            remote_identity: remote.public,
+            root: [0x42; 32],
+            previous_counter: 0,
+            local_registration: 11,
+            remote_registration: 22,
+            needs_refresh: false,
+            alice_base_key: Some([0x61; 32]),
+            alice_base_key_tagged: true,
+            pending_key_exchange: None,
+        }),
         sender: Some(new::Chain::new(
             ratchet.public,
             Some(ratchet.private),
@@ -57,12 +65,6 @@ fn session(backlog: usize, archives: usize) -> new::SessionRecord {
         )),
         receivers: vec![chain],
         pending_pre_key: None,
-        local_registration: 11,
-        remote_registration: 22,
-        needs_refresh: false,
-        alice_base_key: Some([0x61; 32]),
-        alice_base_key_tagged: true,
-        pending_key_exchange: None,
     };
     let mut record = new::SessionRecord::default();
     for _ in 0..=archives {
