@@ -273,11 +273,10 @@ pub(crate) fn append_session_parts(
             incarnation,
         },
     };
-    // Archived bytes dominate large snapshots. Size a fresh or undersized
-    // buffer once instead of repeatedly copying its already-written history.
-    // Reused buffers and sessions without archives keep the direct write path.
+    // Size fresh buffers once, including sessions without history. Reused
+    // buffers keep the direct path unless their archived bytes cannot fit.
     let history_bytes: usize = previous.iter().map(|state| state.encoded().len()).sum();
-    if history_bytes > out.capacity() - out.len() {
+    if out.capacity() == 0 || history_bytes > out.capacity() - out.len() {
         out.reserve(encoded_len(&message));
     }
     message.encode(&mut VecSink(out));
