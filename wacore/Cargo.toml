@@ -17,6 +17,8 @@ autobenches = false
 ignored = ["getrandom"]
 
 [features]
+# Runtime- and I/O-independent experimental mobile configuration/workflow.
+mobile = []
 instance-clock = []
 session-simulator = []
 debug-snapshots = []

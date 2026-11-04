@@ -30,6 +30,7 @@ members = [
     "tests/bench-integration",
     "tests/e2e",
     "tools/whatspec-codegen",
+    "tools/mobile-oracle",
     "tools/oracle-cli",
     "tools/oracle-core",
     "tools/xtask",
@@ -170,6 +171,10 @@ zerocopy = { version = "0.8.55", default-features = false, features = ["derive"]
 zlib-rs = { version = "0.6.6", default-features = false, features = ["std", "rust-allocator"] }
 
 [features]
+# Pure mobile contracts, without a runtime, HTTP backend or native socket.
+mobile-core = ["wacore/mobile"]
+# Optional native adapter; browser/embedded hosts supply their own transport.
+mobile-transport-native = ["mobile-core", "tokio-transport", "whatsapp-rust-tokio-transport/tcp"]
 instance-clock = ["wacore/instance-clock", "whatsapp-rust-sqlite-storage?/instance-clock"]
 # Source-qualified group parsing requires explicit effective account facts.
 # Kept opt-in to preserve the default runtime footprint.

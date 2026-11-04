@@ -250,3 +250,6 @@ pub mod mock {
         }
     }
 }
+
+#[cfg(feature = "mobile-transport-native")]
+pub use whatsapp_rust_tokio_transport::{TokioTcpTransportFactory, from_byte_stream};

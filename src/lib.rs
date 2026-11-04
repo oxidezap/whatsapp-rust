@@ -578,6 +578,8 @@ pub mod media;
 pub mod session;
 pub mod socket;
 pub mod store;
+#[cfg(feature = "mobile-core")]
+pub use wacore::mobile;
 pub mod transport;
 pub mod upload;
 #[cfg(feature = "voip-control")]
