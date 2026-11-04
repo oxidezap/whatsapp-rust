@@ -311,8 +311,58 @@ pub(crate) enum SessionMatch {
 struct SessionOperation<'a> {
     target: &'a mut SessionRecord,
     record: engine::SessionRecord,
+    previous_sender: Option<[u8; 32]>,
+    previous_root: Option<Zeroizing<[u8; 32]>>,
+}
+impl<'a> SessionOperation<'a> {
+    // Ownership transfer and durability checks do not depend on the operation's
+    // closure or result type. Share them across the specialized crypto paths.
+    #[inline(never)]
+    fn new(target: &'a mut SessionRecord) -> Self {
+        let previous_sender = target
+            .current
+            .as_ref()
+            .and_then(|state| state.inner.sender.as_ref())
+            .map(|chain| chain.ratchet);
+        let previous_root = target
+            .current
+            .as_ref()
+            .map(|state| Zeroizing::new(state.inner.root));
+        let record = engine::SessionRecord {
+            current: target.current.take().map(|s| s.inner),
+            previous: core::mem::take(&mut target.inner.previous),
+            reservation: core::mem::take(&mut target.inner.reservation),
+        };
+        Self {
+            target,
+            record,
+            previous_sender,
+            previous_root,
+        }
+    }
+    #[inline(never)]
+    fn complete(&mut self, success: bool) {
+        let selected_sender = self
+            .record
+            .current
+            .as_ref()
+            .and_then(|state| state.sender.as_ref())
+            .map(|chain| chain.ratchet);
+        let root_changed = match (self.previous_root.as_deref(), self.record.current.as_ref()) {
+            (Some(previous), Some(current)) => !bool::from(previous.ct_eq(&current.root)),
+            (None, None) => false,
+            _ => true,
+        };
+        if success
+            && (self.previous_sender != selected_sender || root_changed)
+            && self.record.reservation.requires_durable_commit()
+        {
+            self.target.pending_reservation = true;
+        }
+    }
 }
 impl Drop for SessionOperation<'_> {
+    #[inline(never)]
     fn drop(&mut self) {
         self.target.current = self
             .record
@@ -358,42 +408,9 @@ impl SessionRecord {
     ) -> engine::Result<T> {
         // Move ownership through the engine without cloning active caches or
         // retaining a second inline Option<SessionState> in every stored record.
-        let previous_sender = self
-            .current
-            .as_ref()
-            .and_then(|state| state.inner.sender.as_ref())
-            .map(|chain| chain.ratchet);
-        let previous_root = self
-            .current
-            .as_ref()
-            .map(|state| Zeroizing::new(state.inner.root));
-        let record = engine::SessionRecord {
-            current: self.current.take().map(|s| s.inner),
-            previous: core::mem::take(&mut self.inner.previous),
-            reservation: core::mem::take(&mut self.inner.reservation),
-        };
-        let mut operation = SessionOperation {
-            target: self,
-            record,
-        };
+        let mut operation = SessionOperation::new(self);
         let result = f(&mut operation.record);
-        let selected_sender = operation
-            .record
-            .current
-            .as_ref()
-            .and_then(|state| state.sender.as_ref())
-            .map(|chain| chain.ratchet);
-        let root_changed = match (previous_root.as_deref(), operation.record.current.as_ref()) {
-            (Some(previous), Some(current)) => !bool::from(previous.ct_eq(&current.root)),
-            (None, None) => false,
-            _ => true,
-        };
-        if result.is_ok()
-            && (previous_sender != selected_sender || root_changed)
-            && operation.record.reservation.requires_durable_commit()
-        {
-            operation.target.pending_reservation = true;
-        }
+        operation.complete(result.is_ok());
         result
     }
     pub fn alice_base_key(&self) -> Result<Vec<u8>> {
