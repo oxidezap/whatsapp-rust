@@ -130,16 +130,15 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         let private = state.signing_private.ok_or(Error::MissingKey)?;
         let key = state.step(self.crypto)?;
         let (cipher, iv) = expand(self.crypto, &key.seed)?;
-        let mut message = SenderKeyMessage {
+        let message = SenderKeyMessage {
             id: state.id,
             iteration: key.iteration,
             ciphertext: self.crypto.encrypt_cbc(&cipher, &iv, plaintext)?,
             signature: [0; 64],
         };
-        message.signature = self
-            .crypto
-            .sign(&private, &message.unsigned(), self.random)?;
-        let output = message.encode();
+        let mut output = message.unsigned();
+        let signature = self.crypto.sign(&private, &output, self.random)?;
+        output.extend_from_slice(&signature);
         // Match the decoder budget: exclude the version byte and signature.
         if output.len() - 65 > wire::MAX_MESSAGE_SIZE {
             return Err(Error::Encoding("protobuf size limit"));

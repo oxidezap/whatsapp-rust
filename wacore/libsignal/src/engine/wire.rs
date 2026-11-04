@@ -94,6 +94,20 @@ pub(crate) fn varint(out: &mut Vec<u8>, mut value: u64) {
     }
     out.push(value as u8);
 }
+fn varint_len(mut value: u64) -> usize {
+    let mut len = 1;
+    while value >= 128 {
+        len += 1;
+        value >>= 7;
+    }
+    len
+}
+fn uint_len(number: u32, value: u32) -> usize {
+    varint_len(u64::from(number) << 3) + varint_len(u64::from(value))
+}
+fn bytes_len(number: u32, len: usize) -> usize {
+    varint_len((u64::from(number) << 3) | 2) + varint_len(len as u64) + len
+}
 pub(crate) fn uint(out: &mut Vec<u8>, number: u32, value: u64) {
     varint(out, u64::from(number) << 3);
     varint(out, value);
@@ -174,7 +188,14 @@ impl SignalMessage {
         self.unsigned_with_version(3)
     }
     pub fn unsigned_with_version(&self, version: u8) -> Vec<u8> {
-        let mut out = vec![(version << 4) | 3];
+        let mut out = Vec::with_capacity(
+            1 + bytes_len(1, 33)
+                + uint_len(2, self.counter)
+                + uint_len(3, self.previous_counter)
+                + bytes_len(4, self.ciphertext.len())
+                + self.mac.len(),
+        );
+        out.push((version << 4) | 3);
         bytes(&mut out, 1, &tagged_key(&self.ratchet));
         uint(&mut out, 2, self.counter.into());
         uint(&mut out, 3, self.previous_counter.into());
@@ -207,7 +228,15 @@ impl PreKeySignalMessage {
         self.encode_with_version(3)
     }
     pub fn encode_with_version(&self, version: u8) -> Vec<u8> {
-        let mut out = vec![(version << 4) | 3];
+        let mut out = Vec::with_capacity(
+            1 + self.pre_key_id.map_or(0, |id| uint_len(1, id))
+                + bytes_len(2, 33)
+                + bytes_len(3, 33)
+                + bytes_len(4, self.message.len())
+                + uint_len(5, self.registration)
+                + uint_len(6, self.signed_pre_key_id),
+        );
+        out.push((version << 4) | 3);
         if let Some(id) = self.pre_key_id {
             uint(&mut out, 1, id.into());
         }
@@ -239,7 +268,13 @@ impl core::fmt::Debug for SenderKeyDistribution {
 }
 impl SenderKeyDistribution {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = vec![0x33];
+        let mut out = Vec::with_capacity(
+            1 + uint_len(1, self.id)
+                + uint_len(2, self.iteration)
+                + bytes_len(3, self.chain_key.len())
+                + bytes_len(4, 33),
+        );
+        out.push(0x33);
         uint(&mut out, 1, self.id.into());
         uint(&mut out, 2, self.iteration.into());
         bytes(&mut out, 3, &self.chain_key);
@@ -276,7 +311,13 @@ pub struct SenderKeyMessage {
 }
 impl SenderKeyMessage {
     pub fn unsigned(&self) -> Vec<u8> {
-        let mut out = vec![0x33];
+        let mut out = Vec::with_capacity(
+            1 + uint_len(1, self.id)
+                + uint_len(2, self.iteration)
+                + bytes_len(3, self.ciphertext.len())
+                + self.signature.len(),
+        );
+        out.push(0x33);
         uint(&mut out, 1, self.id.into());
         uint(&mut out, 2, self.iteration.into());
         bytes(&mut out, 3, &self.ciphertext);
@@ -447,6 +488,94 @@ impl<'a> SenderKeyMessageView<'a> {
 #[cfg(test)]
 mod borrowed_tests {
     use super::*;
+    #[test]
+    fn wire_serialization_contract_across_varint_boundaries() {
+        use crate::core::{IdentityKey, PublicKey};
+        use sha2::{Digest, Sha256};
+
+        let sender = IdentityKey::new(PublicKey::from_djb_public_key_bytes(&[1; 32]).unwrap());
+        let receiver = IdentityKey::new(PublicKey::from_djb_public_key_bytes(&[2; 32]).unwrap());
+        let mut hashes = Vec::new();
+        for version in [3, 4] {
+            for (counter, size) in [
+                (0, 0),
+                (127, 16),
+                (128, 127),
+                (16383, 128),
+                (16384, 129),
+                (u32::MAX, 1024),
+            ] {
+                let signal = SignalMessage {
+                    ratchet: [9; 32],
+                    counter,
+                    previous_counter: counter,
+                    ciphertext: vec![3; size],
+                    mac: [4; 8],
+                };
+                let authenticated = crate::protocol::SignalMessage::new(
+                    version,
+                    &[5; 32],
+                    PublicKey::from_djb_public_key_bytes(&signal.ratchet).unwrap(),
+                    counter,
+                    counter,
+                    &signal.ciphertext,
+                    &sender,
+                    &receiver,
+                )
+                .unwrap();
+                let prekey = PreKeySignalMessage {
+                    registration: counter,
+                    pre_key_id: (!counter.is_multiple_of(2)).then_some(counter),
+                    signed_pre_key_id: counter,
+                    base_key: [8; 32],
+                    identity: [9; 32],
+                    message: signal.encode_with_version(version),
+                };
+                let group = SenderKeyMessage {
+                    id: counter,
+                    iteration: counter,
+                    ciphertext: vec![6; size],
+                    signature: [7; 64],
+                };
+                let distribution = SenderKeyDistribution {
+                    id: counter,
+                    iteration: counter,
+                    chain_key: [6; 32],
+                    signing_key: [7; 32],
+                };
+                let mut digest = Sha256::new();
+                for encoded in [
+                    signal.encode_with_version(version),
+                    authenticated.serialized().to_vec(),
+                    prekey.encode_with_version(version),
+                    group.encode(),
+                    distribution.encode(),
+                ] {
+                    digest.update(u64::try_from(encoded.len()).unwrap().to_le_bytes());
+                    digest.update(encoded);
+                }
+                hashes.push(hex::encode(digest.finalize()));
+            }
+        }
+        // Pin complete encodings and MAC bytes independently of buffer sizing.
+        assert_eq!(
+            hashes,
+            [
+                "6770df5338c9c8c81af1c6e6113de8b3700a46eb4b3221f25aec6dd09a717cd2",
+                "8702d7e40ac2c35e2296557694df1c78d50256c07f967d104ab067deea7df184",
+                "32466210c4041e5863eae19b3b65309407c89a080121bb3e4849c8b271f4873d",
+                "f7a082107fe8aa914cdfa76afd03a9fb4795ca97d429cc26090b9d42021f4d84",
+                "ae209121a9782dee8535fe7fc417eab957d187edc4e1fba1354dcd5e2dcca7ce",
+                "02f66851cc91cc20f8591d4f4301677da21ded2421485bc33e1d7341d43c2f43",
+                "21baeec75662e976c7b97060fca8819e96b1d7f48b0660abebc7dfe2a5461a78",
+                "4b3965a38402a84731ff2a4c54ca708012385e6bb35ec2890ae110dbc07f94a0",
+                "b454fdaac61ca88b62cd81425689e5f9ea79bf84272729cd84e4df85e65e5358",
+                "44e34687d8c0bdb855c574f783003479930d63cac284c690c7e82e57e438cecd",
+                "3fbe64b45a1d279de4a5837a2c8f76af1cc2f2c2508b80e8feec7533fa8e31a7",
+                "bfc4888b9768cf69bf52c712f4161262202dd521677a92dbe99d40fede0bb7a9",
+            ]
+        );
+    }
     #[test]
     fn sender_distribution_debug_hides_chain_secret() {
         let distribution = SenderKeyDistribution {

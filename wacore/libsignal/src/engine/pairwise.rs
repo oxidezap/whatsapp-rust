@@ -167,21 +167,23 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         let key = sender.step(self.crypto)?;
         let (cipher, mac, iv) = key.expanded(self.crypto)?;
         let ciphertext = self.crypto.encrypt_cbc(&cipher, &iv, plaintext)?;
-        let mut message = SignalMessage {
+        let message = SignalMessage {
             ratchet: sender.ratchet,
             counter: key.index(),
             previous_counter: session.previous_counter,
             ciphertext,
             mac: [0; 8],
         };
-        let mut authenticated = Vec::new();
-        authenticated.extend_from_slice(&wire::tagged_key(&session.local_identity));
-        authenticated.extend_from_slice(&wire::tagged_key(&session.remote_identity));
-        authenticated.extend_from_slice(&message.unsigned_with_version(session.version as u8));
-        message
-            .mac
-            .copy_from_slice(&self.crypto.hmac_sha256(&mac, &[&authenticated])?[..8]);
-        let mut output = message.encode_with_version(session.version as u8);
+        let mut output = message.unsigned_with_version(session.version as u8);
+        let authentication = self.crypto.hmac_sha256(
+            &mac,
+            &[
+                &wire::tagged_key(&session.local_identity),
+                &wire::tagged_key(&session.remote_identity),
+                &output,
+            ],
+        )?;
+        output.extend_from_slice(&authentication[..8]);
         // Match the decoder budget: exclude the version byte and trailing MAC.
         if output.len() - 9 > wire::MAX_MESSAGE_SIZE {
             return Err(Error::Encoding("protobuf size limit"));

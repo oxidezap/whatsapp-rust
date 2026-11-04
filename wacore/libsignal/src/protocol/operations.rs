@@ -168,10 +168,11 @@ async fn message_encrypt_using<
             return Err(error.into());
         }
     };
+    let bytes = bytes::Bytes::from(bytes);
     let message = if prekey {
-        CiphertextMessage::PreKeySignalMessage(PreKeySignalMessage::try_from(bytes.as_slice())?)
+        CiphertextMessage::PreKeySignalMessage(PreKeySignalMessage::try_from(bytes)?)
     } else {
-        CiphertextMessage::SignalMessage(SignalMessage::try_from(bytes.as_slice())?)
+        CiphertextMessage::SignalMessage(SignalMessage::try_from(bytes)?)
     };
     checkout.commit().await?;
     Ok(message)
@@ -398,7 +399,7 @@ pub async fn create_sender_key_distribution_message<
         record.mark_wire_gated();
     }
     store.store_sender_key(name, record).await?;
-    SenderKeyDistributionMessage::try_from(bytes.as_slice())
+    SenderKeyDistributionMessage::try_from(bytes::Bytes::from(bytes))
 }
 /// The caller must hold the store's stable sender-key lock across this operation,
 /// including a related distribution and encryption when they share a chain.
@@ -492,7 +493,7 @@ async fn group_encrypt_using<
             .encrypt_sender_key(&mut record.inner, plaintext)?
     };
     store.store_sender_key(name, record).await?;
-    SenderKeyMessage::try_from(bytes.as_slice())
+    SenderKeyMessage::try_from(bytes::Bytes::from(bytes))
 }
 /// The caller must hold the store's stable sender-key lock across this operation,
 /// including a related distribution and encryption when they share a chain.

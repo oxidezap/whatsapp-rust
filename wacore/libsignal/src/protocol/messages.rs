@@ -68,12 +68,11 @@ impl SignalMessage {
             mac: [0; 8],
         };
         let mut unsigned = parsed.unsigned_with_version(version);
-        let mut authenticated = Vec::with_capacity(66 + unsigned.len());
-        authenticated.extend_from_slice(&sender.serialize());
-        authenticated.extend_from_slice(&receiver.serialize());
-        authenticated.extend_from_slice(&unsigned);
-        unsigned
-            .extend_from_slice(&engine::RustCrypto.hmac_sha256_array(mac_key, &authenticated)[..8]);
+        let mac = engine::RustCrypto.hmac_sha256_parts_array(
+            mac_key,
+            &[&sender.serialize(), &receiver.serialize(), &unsigned],
+        );
+        unsigned.extend_from_slice(&mac[..8]);
         Self::try_from(Bytes::from(unsigned))
     }
     pub fn serialized(&self) -> &[u8] {
@@ -83,7 +82,7 @@ impl SignalMessage {
         self.bytes.to_vec()
     }
     pub fn into_serialized(self) -> Box<[u8]> {
-        self.bytes.to_vec().into_boxed_slice()
+        Vec::from(self.bytes).into_boxed_slice()
     }
     pub fn counter(&self) -> u32 {
         self.counter
@@ -173,7 +172,10 @@ impl PreKeySignalMessage {
         self.bytes.to_vec()
     }
     pub fn into_serialized(self) -> Box<[u8]> {
-        self.bytes.to_vec().into_boxed_slice()
+        let Self { bytes, inner, .. } = self;
+        // Release the nested view before recovering the outer allocation.
+        drop(inner);
+        Vec::from(bytes).into_boxed_slice()
     }
     pub fn identity_key(&self) -> &IdentityKey {
         &self.identity
@@ -275,7 +277,7 @@ impl SenderKeyDistributionMessage {
         self.bytes.to_vec()
     }
     pub fn into_serialized(self) -> Box<[u8]> {
-        self.bytes.to_vec().into_boxed_slice()
+        Vec::from(self.bytes).into_boxed_slice()
     }
     pub fn id(&self) -> u32 {
         self.parsed.id
@@ -333,16 +335,17 @@ impl SenderKeyMessage {
                 version.into(),
             ));
         }
-        let mut parsed = engine::wire::SenderKeyMessage {
+        let parsed = engine::wire::SenderKeyMessage {
             id,
             iteration,
             ciphertext: ciphertext.into_vec(),
             signature: [0; 64],
         };
         let mut random = RandomAdapter(rng);
-        parsed.signature =
-            engine::RustCrypto.sign(private.serialize(), &parsed.unsigned(), &mut random)?;
-        Self::try_from(Bytes::from(parsed.encode()))
+        let mut encoded = parsed.unsigned();
+        let signature = engine::RustCrypto.sign(private.serialize(), &encoded, &mut random)?;
+        encoded.extend_from_slice(&signature);
+        Self::try_from(Bytes::from(encoded))
     }
     pub fn serialized(&self) -> &[u8] {
         &self.bytes
@@ -351,7 +354,7 @@ impl SenderKeyMessage {
         self.bytes.to_vec()
     }
     pub fn into_serialized(self) -> Box<[u8]> {
-        self.bytes.to_vec().into_boxed_slice()
+        Vec::from(self.bytes).into_boxed_slice()
     }
     pub fn chain_id(&self) -> u32 {
         self.id
@@ -507,6 +510,51 @@ mod borrowed_tests {
         encoded.extend_from_slice(&[0x78, 0x07]);
         encoded.extend_from_slice(&signal.mac);
         encoded
+    }
+    #[test]
+    fn consumed_messages_reuse_unique_storage_and_isolate_shared_views() {
+        let encoded = signal_bytes();
+        let input = encoded.clone().into_boxed_slice();
+        let pointer = input.as_ptr();
+        let message = SignalMessage::try_from(Bytes::from(input)).unwrap();
+        let consumed = message.into_serialized();
+        assert_eq!(&*consumed, encoded);
+        assert_eq!(consumed.as_ptr(), pointer);
+
+        let mut backing = vec![0xa5; 17];
+        backing.extend_from_slice(&encoded);
+        backing.push(0x5a);
+        let backing = Bytes::from(backing);
+        let message = SignalMessage::try_from(backing.slice(17..17 + encoded.len())).unwrap();
+        let snapshot = message.clone();
+        let mut consumed = message.into_serialized();
+        assert_eq!(&*consumed, encoded);
+        consumed.fill(0);
+        assert_eq!(snapshot.serialized(), encoded);
+        assert_eq!(&backing[17..17 + encoded.len()], encoded);
+
+        let outer = engine::wire::PreKeySignalMessage {
+            registration: 5,
+            pre_key_id: Some(6),
+            signed_pre_key_id: 7,
+            base_key: [8; 32],
+            identity: [9; 32],
+            message: encoded.clone(),
+        }
+        .encode();
+        let input = outer.clone().into_boxed_slice();
+        let pointer = input.as_ptr();
+        let message = PreKeySignalMessage::try_from(Bytes::from(input)).unwrap();
+        let consumed = message.into_serialized();
+        assert_eq!(&*consumed, outer);
+        assert_eq!(consumed.as_ptr(), pointer);
+
+        let message = PreKeySignalMessage::try_from(Bytes::from(outer.clone())).unwrap();
+        let nested = message.message().clone();
+        let mut consumed = message.into_serialized();
+        assert_eq!(&*consumed, outer);
+        consumed.fill(0);
+        assert_eq!(nested.serialized(), encoded);
     }
     #[test]
     fn signal_and_sender_parse_share_input_storage() {
