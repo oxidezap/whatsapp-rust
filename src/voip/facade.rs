@@ -8170,6 +8170,92 @@ mod tests {
         );
     }
 
+    /// Records the relays it is asked for and refuses each, so a test can see the native factory
+    /// dial through it without anything reaching the network.
+    #[cfg(feature = "voip-relay-native")]
+    #[derive(Default)]
+    struct RefusingDialer {
+        dialed: Mutex<Vec<SocketAddr>>,
+    }
+
+    #[cfg(feature = "voip-relay-native")]
+    #[async_trait]
+    impl crate::voip::transport::DatagramDialer for RefusingDialer {
+        async fn dial(
+            &self,
+            relay: SocketAddr,
+        ) -> anyhow::Result<crate::voip::transport::BoxedDatagram> {
+            self.dialed.lock().unwrap().push(relay);
+            anyhow::bail!("refused {relay}")
+        }
+    }
+
+    /// The client's datagram dialer reaches the native factory it hands the call: connecting dials
+    /// every candidate through it, and its refusal fails the connect rather than going direct.
+    #[tokio::test]
+    #[cfg(feature = "voip-relay-native")]
+    async fn an_installed_datagram_dialer_carries_the_native_relay_dial() {
+        let client = make_client().await;
+        let dialer = Arc::new(RefusingDialer::default());
+        client.set_relay_datagram_dialer(dialer.clone());
+
+        let addr: SocketAddr = "203.0.113.7:3478".parse().expect("addr");
+        let endpoint = wacore::voip_control::transport::RelayEndpointParams {
+            addr,
+            ice_ufrag: String::new(),
+            ice_pwd: String::new(),
+        };
+        let Ok(factory) = client.relay_transport_factory(&endpoint).await else {
+            panic!("a native build always has a factory");
+        };
+        // Bounded well inside the connect timeout: a refusal is immediate, so only a direct dial
+        // to the unanswering documentation address could still be running.
+        let error = match tokio::time::timeout(Duration::from_secs(5), factory.connect())
+            .await
+            .expect("a refused dial fails at once")
+        {
+            Ok(_) => panic!("a refusing dialer must not yield a channel"),
+            Err(error) => error.to_string(),
+        };
+        assert_eq!(
+            dialer.dialed.lock().unwrap().as_slice(),
+            &[addr, "203.0.113.7:3480".parse().expect("addr")],
+            "both raced ports are dialled through the installed dialer"
+        );
+        assert!(error.contains("refused 203.0.113.7:3478"), "got: {error}");
+    }
+
+    /// A provider replaces the native transport outright, so an installed dialer is not consulted.
+    #[tokio::test]
+    #[cfg(feature = "voip-relay-native")]
+    async fn an_installed_provider_wins_over_the_datagram_dialer() {
+        let client = make_client().await;
+        let dialer = Arc::new(RefusingDialer::default());
+        client.set_relay_datagram_dialer(dialer.clone());
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        client.set_relay_transport_provider(Arc::new(RecordingProvider {
+            asked: asked.clone(),
+        }));
+
+        let endpoint = wacore::voip_control::transport::RelayEndpointParams {
+            addr: "203.0.113.7:3478".parse().expect("addr"),
+            ice_ufrag: String::new(),
+            ice_pwd: String::new(),
+        };
+        let Ok(factory) = client.relay_transport_factory(&endpoint).await else {
+            panic!("the installed provider answers");
+        };
+        assert!(
+            factory.connect().await.is_ok(),
+            "the provider's factory connects"
+        );
+        assert_eq!(asked.lock().unwrap().len(), 1, "the provider was asked");
+        assert!(
+            dialer.dialed.lock().unwrap().is_empty(),
+            "the dialer must not be consulted while a provider is installed"
+        );
+    }
+
     // The bridge: connects via the injected factory, registers the call, emits the STUN allocate,
     // and tears down (registry empties, handle.wait_ended resolves) when the relay disconnects.
     #[tokio::test]
