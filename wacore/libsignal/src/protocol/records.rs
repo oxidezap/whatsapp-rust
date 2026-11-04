@@ -299,6 +299,23 @@ pub struct SessionRecord {
     pub(crate) current: Option<SessionState>,
     pending_reservation: bool,
 }
+// Provider callbacks can unwind. Return moved state before the outer checkout
+// hands the record back to its store, without cloning caches on the hot path.
+struct SessionOperation<'a> {
+    target: &'a mut SessionRecord,
+    record: engine::SessionRecord,
+}
+impl Drop for SessionOperation<'_> {
+    fn drop(&mut self) {
+        self.target.current = self
+            .record
+            .current
+            .take()
+            .map(|inner| SessionState { inner });
+        self.target.inner.previous = core::mem::take(&mut self.record.previous);
+        self.target.inner.reservation = core::mem::take(&mut self.record.reservation);
+    }
+}
 impl core::fmt::Debug for SessionRecord {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SessionRecord")
@@ -343,31 +360,33 @@ impl SessionRecord {
             .current
             .as_ref()
             .map(|state| Zeroizing::new(state.inner.root));
-        let mut record = engine::SessionRecord {
+        let record = engine::SessionRecord {
             current: self.current.take().map(|s| s.inner),
             previous: core::mem::take(&mut self.inner.previous),
             reservation: core::mem::take(&mut self.inner.reservation),
         };
-        let result = f(&mut record);
-        let selected_sender = record
+        let mut operation = SessionOperation {
+            target: self,
+            record,
+        };
+        let result = f(&mut operation.record);
+        let selected_sender = operation
+            .record
             .current
             .as_ref()
             .and_then(|state| state.sender.as_ref())
             .map(|chain| chain.ratchet);
-        let root_changed = match (previous_root.as_deref(), record.current.as_ref()) {
+        let root_changed = match (previous_root.as_deref(), operation.record.current.as_ref()) {
             (Some(previous), Some(current)) => !bool::from(previous.ct_eq(&current.root)),
             (None, None) => false,
             _ => true,
         };
         if result.is_ok()
             && (previous_sender != selected_sender || root_changed)
-            && record.reservation.requires_durable_commit()
+            && operation.record.reservation.requires_durable_commit()
         {
-            self.pending_reservation = true;
+            operation.target.pending_reservation = true;
         }
-        self.current = record.current.take().map(|inner| SessionState { inner });
-        self.inner.previous = core::mem::take(&mut record.previous);
-        self.inner.reservation = core::mem::take(&mut record.reservation);
         result
     }
     pub fn alice_base_key(&self) -> Result<Vec<u8>> {

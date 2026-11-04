@@ -426,6 +426,151 @@ fn checkout_store() -> CheckoutStore {
     }
 }
 #[test]
+fn pairwise_provider_panic_restores_checkout_and_survives_reload() {
+    use crate::crypto::{CryptoProviderError, RustCryptoProvider, SymmetricCryptoProvider};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    struct Panicking(bool);
+    impl SymmetricCryptoProvider for Panicking {
+        fn aes_256_cbc_encrypt(
+            &self,
+            _: &[u8; 32],
+            _: &[u8; 16],
+            _: &[u8],
+            output: &mut Vec<u8>,
+        ) -> Result<(), CryptoProviderError> {
+            output.extend_from_slice(&[77; 17]);
+            panic!("synthetic CBC provider panic");
+        }
+        fn hmac_sha256(
+            &self,
+            key: &[u8],
+            parts: &[&[u8]],
+        ) -> Result<[u8; 32], CryptoProviderError> {
+            assert!(!self.0, "synthetic HMAC provider panic");
+            RustCryptoProvider.hmac_sha256(key, parts)
+        }
+    }
+    for hmac in [false, true] {
+        for owned in [false, true] {
+            let mut f = run(established_signal_fixture(184260));
+            let late = run(message_encrypt(
+                b"delayed",
+                &f.aa,
+                &mut f.b_sessions,
+                &mut f.b,
+            ))
+            .unwrap();
+            let later = run(message_encrypt(
+                b"later",
+                &f.aa,
+                &mut f.b_sessions,
+                &mut f.b,
+            ))
+            .unwrap();
+            run(message_decrypt(
+                &later,
+                &f.ba,
+                &mut f.a_sessions,
+                &mut f.a,
+                &mut f.keys.clone_for_prekey(),
+                &f.keys,
+                &mut f.rng,
+                UsePQRatchet::No,
+            ))
+            .unwrap();
+            let mut record = f.a_sessions.0.remove(&f.ba).unwrap();
+            let current = record.session_state().unwrap().clone();
+            record.archive_current_state().unwrap();
+            record.set_session_state(current);
+            let counter = record
+                .session_state()
+                .unwrap()
+                .get_sender_chain_key()
+                .unwrap()
+                .index();
+            record.reserve_sender_chain_counters(counter);
+            record.inner.reservation.mark_committed();
+            let before = record.serialize().unwrap();
+            let mut store = checkout_store();
+            *store.record.lock().unwrap() = Some(record);
+            let panic = catch_unwind(AssertUnwindSafe(|| {
+                if owned {
+                    run(message_encrypt_serialized_with_provider(
+                        &Panicking(hmac),
+                        b"never published",
+                        &f.ba,
+                        &mut store,
+                        &mut f.a,
+                    ))
+                    .map(|_| ())
+                } else {
+                    run(message_encrypt_with_provider(
+                        &Panicking(hmac),
+                        b"never published",
+                        &f.ba,
+                        &mut store,
+                        &mut f.a,
+                    ))
+                    .map(|_| ())
+                }
+            }));
+            assert!(panic.is_err());
+            let returned = store
+                .queued
+                .as_ref()
+                .expect("checkout restored during unwind");
+            assert!(
+                returned.session_state().is_some(),
+                "panic erased current session"
+            );
+            assert_eq!(returned.previous_session_count(), 1);
+            assert_eq!(returned.serialize().unwrap(), before);
+            run(store.complete_session_checkout());
+            assert_eq!(store.cancelled, 0);
+            let persisted = store
+                .record
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .serialize()
+                .unwrap();
+            *store.record.lock().unwrap() = Some(SessionRecord::deserialize(&persisted).unwrap());
+            store
+                .completion
+                .store(false, portable_atomic::Ordering::Release);
+            let retry = run(message_encrypt(b"after panic", &f.ba, &mut store, &mut f.a)).unwrap();
+            let decrypted = run(message_decrypt(
+                &retry,
+                &f.aa,
+                &mut f.b_sessions,
+                &mut f.b,
+                &mut f.keys.clone_for_prekey(),
+                &f.keys,
+                &mut f.rng,
+                UsePQRatchet::No,
+            ))
+            .unwrap();
+            assert_eq!(decrypted.plaintext, b"after panic");
+            store
+                .completion
+                .store(false, portable_atomic::Ordering::Release);
+            let delayed = run(message_decrypt(
+                &late,
+                &f.ba,
+                &mut store,
+                &mut f.a,
+                &mut f.keys.clone_for_prekey(),
+                &f.keys,
+                &mut f.rng,
+                UsePQRatchet::No,
+            ))
+            .unwrap();
+            assert_eq!(delayed.plaintext, b"delayed");
+        }
+    }
+}
+#[test]
 fn dropping_checkout_returns_owned_record() {
     let mut store = checkout_store();
     let address = ProtocolAddress::new("test.invalid", 1.into());
