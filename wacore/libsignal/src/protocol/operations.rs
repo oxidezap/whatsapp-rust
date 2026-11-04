@@ -38,7 +38,9 @@ pub async fn process_prekey_bundle<
         ));
     }
     if !is_trusted_identity(identities, address, &bundle.identity, Direction::Sending).await? {
-        return Err(SignalProtocolError::UntrustedIdentity(address.clone()));
+        return Err(SignalProtocolError::UntrustedIdentity(
+            address.clone().into(),
+        ));
     }
     let local = identities.get_identity_key_pair().await?;
     let registration = identities.get_local_registration_id().await?;
@@ -126,15 +128,17 @@ async fn message_encrypt_using<
 ) -> Result<CiphertextMessage> {
     let mut checkout = SessionCheckout::load(sessions, address)
         .await?
-        .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone()))?;
+        .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone().into()))?;
     let remote = checkout
         .record()
         .session_state()
-        .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone()))?
+        .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone().into()))?
         .remote_identity_key()?
-        .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone()))?;
+        .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone().into()))?;
     if !is_trusted_identity(identities, address, &remote, Direction::Sending).await? {
-        return Err(SignalProtocolError::UntrustedIdentity(address.clone()));
+        return Err(SignalProtocolError::UntrustedIdentity(
+            address.clone().into(),
+        ));
     }
     // Identity callbacks must succeed before advancing the owned sender state.
     // A failed or cancelled save can then return the unchanged checkout.
@@ -142,7 +146,7 @@ async fn message_encrypt_using<
     let record = checkout.record_mut();
     let index = record
         .session_state()
-        .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone()))?
+        .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone().into()))?
         .get_sender_chain_key()?
         .index();
     let previous_reservation = record.inner.reservation.clone();
@@ -633,10 +637,10 @@ async fn message_decrypt_signal_using<
 ) -> Result<DecryptionResult> {
     let mut checkout = SessionCheckout::load(sessions, address)
         .await?
-        .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone()))?;
+        .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone().into()))?;
     let mut candidate = checkout.record().clone();
     if candidate.session_state().is_none() && candidate.previous_session_count() == 0 {
-        return Err(SignalProtocolError::SessionNotFound(address.clone()));
+        return Err(SignalProtocolError::SessionNotFound(address.clone().into()));
     }
     let mut random = RandomAdapter(rng);
     let plaintext = candidate
@@ -648,11 +652,13 @@ async fn message_decrypt_signal_using<
     // record. Its selected identity governs trust and the identity row update.
     let remote = candidate
         .session_state()
-        .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone()))?
+        .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone().into()))?
         .remote_identity_key()?
-        .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone()))?;
+        .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone().into()))?;
     if !is_trusted_identity(identities, address, &remote, Direction::Receiving).await? {
-        return Err(SignalProtocolError::UntrustedIdentity(address.clone()));
+        return Err(SignalProtocolError::UntrustedIdentity(
+            address.clone().into(),
+        ));
     }
     save_identity(identities, address, &remote).await?;
     // Identity storage may independently commit before this await completes.
@@ -808,9 +814,9 @@ async fn message_decrypt_prekey_using<
     };
     let selected_identity = candidate
         .session_state()
-        .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone()))?
+        .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone().into()))?
         .remote_identity_key()?
-        .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone()))?;
+        .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone().into()))?;
     if !is_trusted_identity(
         identities,
         address,
@@ -819,7 +825,9 @@ async fn message_decrypt_prekey_using<
     )
     .await?
     {
-        return Err(SignalProtocolError::UntrustedIdentity(address.clone()));
+        return Err(SignalProtocolError::UntrustedIdentity(
+            address.clone().into(),
+        ));
     }
     let stored_change = save_identity(identities, address, &selected_identity).await?;
     *checkout.record_mut() = candidate;

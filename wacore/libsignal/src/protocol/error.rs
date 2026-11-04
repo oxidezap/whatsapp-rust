@@ -21,9 +21,9 @@ pub enum SignalProtocolError {
     #[error("unknown signed prekey")]
     InvalidSignedPreKeyId,
     #[error("no session for {}", .0.observe())]
-    SessionNotFound(ProtocolAddress),
+    SessionNotFound(Box<ProtocolAddress>),
     #[error("untrusted identity {}", .0.observe())]
-    UntrustedIdentity(ProtocolAddress),
+    UntrustedIdentity(Box<ProtocolAddress>),
     #[error("authentication failed for {0:?}")]
     BadMac(CiphertextMessageType),
     #[error("invalid {0:?}: {1}")]
@@ -97,5 +97,21 @@ impl SignalProtocolError {
 impl core::fmt::Debug for SignalProtocolError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         core::fmt::Display::fmt(self, f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn protocol_errors_do_not_inflate_every_result_and_async_frame() {
+        assert!(
+            size_of::<SignalProtocolError>() <= 48,
+            "protocol errors occupy {} bytes",
+            size_of::<SignalProtocolError>()
+        );
+        assert!(size_of::<Result<()>>() <= 48);
     }
 }

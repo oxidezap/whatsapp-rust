@@ -16221,7 +16221,7 @@ fn a_migrated_session_reports_the_retry_failure_not_the_one_that_opened_it() {
     let address: Jid = "12025550101@s.whatsapp.net".parse().unwrap();
     assert_eq!(
         session_error_reason(&SignalProtocolError::SessionNotFound(
-            address.to_protocol_address()
+            address.to_protocol_address().into()
         )),
         EncDecryptFailureReason::NoSession,
         "and the error that opened the migration still maps to itself",
