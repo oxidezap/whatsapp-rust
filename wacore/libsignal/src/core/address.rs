@@ -124,12 +124,17 @@ impl<'de> Deserialize<'de> for AddressBuf {
         }
     }
 }
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ProtocolAddress {
     text: AddressBuf,
     device: DeviceId,
     // The decimal device suffix fits in 11 bytes; serde retains the name_len field.
     suffix_len: u8,
+}
+impl std::fmt::Debug for ProtocolAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.observe(), f)
+    }
 }
 struct AddressWriter<'a>(&'a mut ProtocolAddress);
 impl Drop for AddressWriter<'_> {
@@ -284,6 +289,16 @@ impl std::fmt::Debug for ObservedAddress<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn diagnostic_addresses_and_errors_redact_the_name() {
+        let address = ProtocolAddress::new("15550001234", 7.into());
+        let observed = address.observe().to_string();
+        assert!(!observed.contains(address.name()));
+        assert_eq!(format!("{address:?}"), observed);
+        assert_eq!(format!("{address:#?}"), observed);
+        let error = crate::protocol::SignalProtocolError::SessionNotFound(address.into());
+        assert!(!format!("{error:?}").contains("15550001234"));
+    }
     #[test]
     fn a_panicking_writer_leaves_a_serializable_canonical_address() {
         let mut address = ProtocolAddress::new("previous", u32::MAX.into());
