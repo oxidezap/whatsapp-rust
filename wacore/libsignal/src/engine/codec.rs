@@ -143,7 +143,7 @@ pub fn encode_session_state(state: &SessionState) -> Vec<u8> {
     crate::engine::encode::append_session_state(state, &mut out);
     out
 }
-pub fn decode_session_state<C: CryptoProvider>(_crypto: &C, input: &[u8]) -> Result<SessionState> {
+pub fn decode_session_state(input: &[u8]) -> Result<SessionState> {
     let f = fields(input)?;
     let version = number(&f, 1)?;
     let mut receivers = Vec::new();
@@ -268,14 +268,12 @@ fn decode_session_record_inner<C: CryptoProvider>(
 ) -> Result<SessionRecord> {
     let f = fields(input)?;
     let (mut reservation, trusted) = decode_reservation(&f, live)?;
-    let mut current = data(&f, 1)?
-        .map(|b| decode_session_state(crypto, b))
-        .transpose()?;
+    let mut current = data(&f, 1)?.map(decode_session_state).transpose()?;
     let mut previous = Vec::new();
     for (n, v) in &f {
         if *n == 2 && previous.len() < MAX_ARCHIVED_SESSIONS {
             let b = as_bytes(*v)?;
-            decode_session_state(crypto, b)?;
+            decode_session_state(b)?;
             previous.push(ArchivedSession { bytes: b.into() });
         }
     }
@@ -512,10 +510,7 @@ mod parser_budget_tests {
         let decoded = decode_session_record(&RustCrypto, &input).unwrap();
         assert_eq!(decoded.previous.len(), MAX_ARCHIVED_SESSIONS);
         for (index, archive) in decoded.previous.iter().enumerate() {
-            assert_eq!(
-                archive.decode(&RustCrypto).unwrap().remote_registration,
-                index as u32
-            );
+            assert_eq!(archive.decode().unwrap().remote_registration, index as u32);
         }
         let mut retained_invalid = Vec::new();
         bytes(&mut retained_invalid, 2, &[0]);
@@ -551,15 +546,12 @@ mod parser_budget_tests {
             bytes(&mut input, 7, &receiver());
         }
         assert_eq!(
-            decode_session_state(&RustCrypto, &input)
-                .unwrap()
-                .receivers
-                .len(),
+            decode_session_state(&input).unwrap().receivers.len(),
             MAX_RECEIVER_CHAINS
         );
         bytes(&mut input, 7, &[0]);
         assert!(matches!(
-            decode_session_state(&RustCrypto, &input),
+            decode_session_state(&input),
             Err(Error::Encoding("too many receiver chains"))
         ));
     }
@@ -576,7 +568,7 @@ mod parser_budget_tests {
         }
         let mut input = session(0);
         bytes(&mut input, 7, &chain);
-        let decoded = decode_session_state(&RustCrypto, &input).unwrap();
+        let decoded = decode_session_state(&input).unwrap();
         assert_eq!(decoded.receivers[0].skipped.len(), 4096);
         assert_eq!(decoded.receivers[0].message_key_limit, Some(10_000));
         assert_eq!(decoded.receivers[0].skipped[4095].index(), 4095);

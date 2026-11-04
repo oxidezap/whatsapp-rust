@@ -809,15 +809,11 @@ fn state_from_components(
     // at a time here so typed storage handoff does not silently discard them.
     proto.session_version = Some(3);
     let chains = std::mem::take(&mut proto.receiver_chains);
-    let mut state =
-        engine::codec::decode_session_state(&engine::RustCrypto, &encode_session_proto(&proto))?;
+    let mut state = engine::codec::decode_session_state(&encode_session_proto(&proto))?;
     for mut chain in chains {
         chain.message_key_limit = limit;
         proto.receiver_chains.push(chain);
-        let mut decoded = engine::codec::decode_session_state(
-            &engine::RustCrypto,
-            &encode_session_proto(&proto),
-        )?;
+        let mut decoded = engine::codec::decode_session_state(&encode_session_proto(&proto))?;
         state.receivers.append(&mut decoded.receivers);
         proto.receiver_chains.clear();
     }
@@ -887,7 +883,7 @@ impl SessionRecord {
             .previous
             .iter()
             .map(|archived| {
-                let mut state = archived.decode(&engine::RustCrypto)?;
+                let mut state = archived.decode()?;
                 handoff(&mut state, ceiling);
                 project_state(&state)
             })

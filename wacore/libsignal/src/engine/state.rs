@@ -490,8 +490,8 @@ impl ArchivedSession {
     pub fn encoded(&self) -> &[u8] {
         &self.bytes
     }
-    pub fn decode<C: CryptoProvider>(&self, crypto: &C) -> Result<SessionState> {
-        crate::engine::codec::decode_session_state(crypto, &self.bytes)
+    pub fn decode(&self) -> Result<SessionState> {
+        crate::engine::codec::decode_session_state(&self.bytes)
     }
 }
 /// Archive snapshots share their immutable handle list until a session is promoted.

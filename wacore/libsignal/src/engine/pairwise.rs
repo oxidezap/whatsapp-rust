@@ -270,7 +270,7 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
             }
         }
         for index in 0..record.previous.len() {
-            let mut candidate = record.previous[index].decode(self.crypto)?;
+            let mut candidate = record.previous[index].decode()?;
             if !matches(&candidate) {
                 continue;
             }
@@ -372,7 +372,7 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         });
         if !existing {
             for archive in &record.previous {
-                let s = archive.decode(self.crypto)?;
+                let s = archive.decode()?;
                 if s.version == u32::from(wrapper.bytes[0] >> 4)
                     && s.alice_base_key == Some(wrapper.base_key)
                     && s.remote_identity == wrapper.identity

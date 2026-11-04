@@ -437,7 +437,7 @@ impl SessionRecord {
     pub fn previous_session_states(&self) -> impl Iterator<Item = Result<SessionState>> + '_ {
         self.inner.previous.iter().map(|archive| {
             archive
-                .decode(&engine::RustCrypto)
+                .decode()
                 .map(|inner| SessionState { inner })
                 .map_err(Into::into)
         })
@@ -619,7 +619,7 @@ impl SessionRecord {
             return Ok(Some(SessionMatch::Current));
         }
         for (index, archive) in self.inner.previous.iter().enumerate() {
-            let state = archive.decode(&engine::RustCrypto)?;
+            let state = archive.decode()?;
             if state.version == version
                 && state.alice_base_key == Some(*base_key.public_key_bytes())
             {

@@ -434,13 +434,13 @@ mod tests {
             assert_eq!(&out[..2], &[0xaa, 0xbb]);
             assert_eq!(out.len(), length + 2);
             assert_eq!(out.capacity(), capacity);
-            let decoded = codec::decode_session_state(&RustCrypto, &out[2..]).unwrap();
+            let decoded = codec::decode_session_state(&out[2..]).unwrap();
             assert!(decoded == state);
         }
         std::sync::Arc::make_mut(state.pending_pre_key.as_mut().unwrap()).signed_pre_key_id = None;
         let mut out = Vec::new();
         append_session_state(&state, &mut out);
-        assert!(codec::decode_session_state(&RustCrypto, &out).unwrap() == state);
+        assert!(codec::decode_session_state(&out).unwrap() == state);
     }
 
     #[test]

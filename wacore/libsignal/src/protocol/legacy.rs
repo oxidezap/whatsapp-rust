@@ -1847,11 +1847,7 @@ mod tests {
         stored.mac_key = Some(Bytes::copy_from_slice(expected.mac_key()));
         stored.iv = Some(Bytes::copy_from_slice(expected.iv()));
         let state = super::super::SessionState {
-            inner: crate::engine::codec::decode_session_state(
-                &crate::engine::RustCrypto,
-                &persisted.encode_to_vec(),
-            )
-            .unwrap(),
+            inner: crate::engine::codec::decode_session_state(&persisted.encode_to_vec()).unwrap(),
         };
         let native = SessionRecord::new(state);
         let native = SessionRecord::deserialize(&native.serialize().unwrap()).unwrap();
