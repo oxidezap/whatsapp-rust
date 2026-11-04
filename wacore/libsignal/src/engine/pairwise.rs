@@ -276,9 +276,7 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
             }
             match self.decrypt_state(&mut candidate, &message, input) {
                 Ok((plaintext, _)) => {
-                    record.materialize_reservation(self.crypto)?;
-                    record.previous.remove(index);
-                    record.install(candidate);
+                    self.promote_archive(record, index, candidate)?;
                     return Ok(plaintext);
                 }
                 Err(error) => {
@@ -294,6 +292,29 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
             }
         }
         Err(failure)
+    }
+    pub(crate) fn decrypt_archived_pre_key(
+        &mut self,
+        record: &mut SessionRecord,
+        input: &[u8],
+        index: usize,
+        mut candidate: SessionState,
+    ) -> Result<Vec<u8>> {
+        let message = SignalMessageView::decode(input)?;
+        let (plaintext, _) = self.decrypt_state(&mut candidate, &message, input)?;
+        self.promote_archive(record, index, candidate)?;
+        Ok(plaintext)
+    }
+    fn promote_archive(
+        &self,
+        record: &mut SessionRecord,
+        index: usize,
+        candidate: SessionState,
+    ) -> Result<()> {
+        record.materialize_reservation(self.crypto)?;
+        record.previous.remove(index);
+        record.install(candidate);
+        Ok(())
     }
     fn decrypt_known_chain(
         &self,

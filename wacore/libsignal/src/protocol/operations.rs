@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 use super::error::{Result, message_error};
+use super::records::SessionMatch;
 use super::*;
 use crate::engine::{self as engine, RandomSource};
 pub(crate) struct RandomAdapter<'a, R>(pub &'a mut R);
@@ -854,6 +855,43 @@ pub async fn message_decrypt_prekey_with_provider<
     )
     .await
 }
+// Keep the decoded archive local to a synchronous operation, rather than
+// retaining its full state across identity/prekey storage awaits.
+fn decrypt_existing_prekey<C: engine::CryptoProvider, R: RandomSource>(
+    candidate: &mut SessionRecord,
+    engine: &mut engine::Engine<'_, C, R>,
+    message: &PreKeySignalMessage,
+) -> Result<Option<Vec<u8>>> {
+    let version = u32::from(message.message_version());
+    let Some(selected) = candidate.matching_session(version, message.base_key())? else {
+        return Ok(None);
+    };
+    candidate
+        .operate(|record| match selected {
+            SessionMatch::Current => engine.decrypt_existing_pre_key(
+                record,
+                message.message().serialized(),
+                version,
+                message.parsed.base_key,
+            ),
+            SessionMatch::Archived { index, state } => engine.decrypt_archived_pre_key(
+                record,
+                message.message().serialized(),
+                index,
+                state,
+            ),
+        })
+        .map(Some)
+        .map_err(|error| {
+            message_error(
+                error,
+                CiphertextMessageType::PreKey,
+                0,
+                message.message().counter(),
+            )
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn message_decrypt_prekey_using<
     C: engine::CryptoProvider,
@@ -880,28 +918,12 @@ async fn message_decrypt_prekey_using<
     }
     let mut checkout = SessionCheckout::load_or_fresh(sessions, address).await?;
     let mut candidate = checkout.record().clone();
-    let existing =
-        candidate.has_session_state(u32::from(message.message_version()), message.base_key())?;
     let mut random = RandomAdapter(rng);
     let mut engine = engine::Engine::new(&crypto, &mut random);
-    let plaintext = if existing {
-        candidate
-            .operate(|record| {
-                engine.decrypt_existing_pre_key(
-                    record,
-                    message.message().serialized(),
-                    u32::from(message.message_version()),
-                    message.parsed.base_key,
-                )
-            })
-            .map_err(|error| {
-                message_error(
-                    error,
-                    CiphertextMessageType::PreKey,
-                    0,
-                    message.message().counter(),
-                )
-            })?
+    let decrypted = decrypt_existing_prekey(&mut candidate, &mut engine, message)?;
+    let existing = decrypted.is_some();
+    let plaintext = if let Some(plaintext) = decrypted {
+        plaintext
     } else {
         let local = identities.get_identity_key_pair().await?;
         let registration = identities.get_local_registration_id().await?;

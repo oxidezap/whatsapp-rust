@@ -1676,6 +1676,35 @@ fn selected_prekey_failure_never_retries_an_older_copy_of_the_same_session() {
 }
 
 #[test]
+fn prekey_archive_decode_failure_preserves_its_error_and_checkout() {
+    run(async {
+        for entrypoint in 0..3 {
+            let mut f = established_signal_fixture(0x1828_d005).await;
+            let record = f.b_sessions.0.get_mut(&f.aa).unwrap();
+            record.current.as_mut().unwrap().inner.alice_base_key = None;
+            record.inner.previous = vec![crate::engine::ArchivedSession {
+                bytes: Arc::from([0u8].as_slice()),
+            }]
+            .into();
+            let before = record.serialize().unwrap();
+            let saves = f.b.save_calls;
+            let packet = f.late_prekey.clone();
+            let keys = f.keys.clone_for_prekey();
+            let error = decrypt_receiver_entrypoint(entrypoint, &packet, &mut f, &keys)
+                .await
+                .err()
+                .expect("an invalid archive must reject the lookup");
+            assert!(matches!(
+                error,
+                SignalProtocolError::Engine(crate::engine::Error::Encoding("invalid field number"))
+            ));
+            assert_eq!(f.b_sessions.0[&f.aa].serialize().unwrap(), before);
+            assert_eq!(f.b.save_calls, saves);
+        }
+    })
+}
+
+#[test]
 fn authenticated_bad_group_ciphertext_is_not_stored_state_corruption() {
     run(async {
         let mut rng = rand::rngs::StdRng::seed_from_u64(1828);

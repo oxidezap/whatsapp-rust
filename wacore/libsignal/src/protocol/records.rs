@@ -299,6 +299,13 @@ pub struct SessionRecord {
     pub(crate) current: Option<SessionState>,
     pending_reservation: bool,
 }
+pub(crate) enum SessionMatch {
+    Current,
+    Archived {
+        index: usize,
+        state: engine::SessionState,
+    },
+}
 // Provider callbacks can unwind. Return moved state before the outer checkout
 // hands the record back to its store, without cloning caches on the hot path.
 struct SessionOperation<'a> {
@@ -598,21 +605,28 @@ impl SessionRecord {
         size_of::<Self>() + self.estimated_heap_bytes()
     }
     pub fn has_session_state(&self, version: u32, base_key: &PublicKey) -> Result<bool> {
+        Ok(self.matching_session(version, base_key)?.is_some())
+    }
+    pub(crate) fn matching_session(
+        &self,
+        version: u32,
+        base_key: &PublicKey,
+    ) -> Result<Option<SessionMatch>> {
         if self.current.as_ref().is_some_and(|s| {
             s.inner.version == version
                 && s.inner.alice_base_key == Some(*base_key.public_key_bytes())
         }) {
-            return Ok(true);
+            return Ok(Some(SessionMatch::Current));
         }
-        for archive in &self.inner.previous {
+        for (index, archive) in self.inner.previous.iter().enumerate() {
             let state = archive.decode(&engine::RustCrypto)?;
             if state.version == version
                 && state.alice_base_key == Some(*base_key.public_key_bytes())
             {
-                return Ok(true);
+                return Ok(Some(SessionMatch::Archived { index, state }));
             }
         }
-        Ok(false)
+        Ok(None)
     }
 }
 fn put_varint(out: &mut Vec<u8>, mut value: u64) {
