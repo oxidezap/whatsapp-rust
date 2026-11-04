@@ -61,6 +61,28 @@ fn full_sha(sha: &str) -> Result<()> {
     );
     Ok(())
 }
+fn version_response(code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> Result<String> {
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(stdout),
+        String::from_utf8_lossy(stderr)
+    );
+    // cargo-codspeed 5.0.2 prints its version on stderr and exits 1. This
+    // exception applies only to the exact pinned version response, not builds
+    // or measurements, whose exit status must still be successful.
+    ensure!(
+        matches!(code, Some(0 | 1)) && text.trim() == "cargo-codspeed 5.0.2",
+        "unexpected cargo-codspeed version response (status {code:?}): {}",
+        text.trim()
+    );
+    Ok(text.trim().to_owned())
+}
+fn cargo_codspeed_version() -> Result<String> {
+    let output = Command::new("cargo")
+        .args(["codspeed", "--version"])
+        .output()?;
+    version_response(output.status.code(), &output.stdout, &output.stderr)
+}
 fn workload(source: &str) -> Result<String> {
     let attributes: Vec<_> = source
         .lines()
@@ -113,6 +135,7 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
         revision(root)? == head,
         "measurement driver must be checked out at the declared head"
     );
+    let cargo_codspeed = cargo_codspeed_version()?;
     let output = root.join(output);
     ensure!(
         !output.exists(),
@@ -216,9 +239,7 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
                 .collect(),
             revisions,
             rustc: String::from_utf8(capture(Command::new("rustc").arg("-Vv"))?.stdout)?,
-            cargo_codspeed: String::from_utf8(
-                capture(Command::new("cargo").args(["codspeed", "--version"]))?.stdout,
-            )?,
+            cargo_codspeed,
         },
     )
 }
@@ -281,6 +302,15 @@ pub fn measure(root: &Path, output: &Path) -> Result<()> {
 mod tests {
     use super::*;
     const SOURCE: &str = include_str!("../../../benches/appstate_prefetch.rs");
+    #[test]
+    fn version_probe_accepts_only_the_pinned_response() {
+        assert!(version_response(Some(0), b"cargo-codspeed 5.0.2\n", b"").is_ok());
+        assert!(version_response(Some(1), b"", b"cargo-codspeed 5.0.2\n").is_ok());
+        assert!(version_response(Some(2), b"", b"cargo-codspeed 5.0.2\n").is_err());
+        assert!(version_response(None, b"", b"cargo-codspeed 5.0.2\n").is_err());
+        assert!(version_response(Some(1), b"", b"network failure\n").is_err());
+        assert!(version_response(Some(0), b"cargo-codspeed 5.0.3\n", b"").is_err());
+    }
     #[test]
     fn forwards_existing_workload_and_rejects_changed_sampling() {
         let forwarded = workload(SOURCE).unwrap();
