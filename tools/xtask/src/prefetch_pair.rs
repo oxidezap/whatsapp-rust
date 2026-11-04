@@ -7,6 +7,8 @@ use xtask_support::{capture, run, sha256, write, write_json};
 
 const BENCH: &str = "benches/appstate_prefetch.rs";
 const FIXTURE: &str = "src/client/app_state/prefetch_bench.rs";
+const ADDRESS_BENCH: &str = "benches/client_usync.rs";
+const ADDRESS_ATTRIBUTE: &str = "#[divan::bench(args = USER_COUNTS)]";
 const ATTRIBUTE: &str =
     "#[divan::bench(args = [65536, 1048576], sample_count = 1000, sample_size = 1)]";
 // Each role/repetition has a distinct benchmark URI. No sample overwrites another.
@@ -28,6 +30,7 @@ struct Revision {
     checkout: PathBuf,
     target: PathBuf,
     bench: String,
+    address_bench: String,
 }
 #[derive(Serialize, Deserialize)]
 struct Manifest {
@@ -35,6 +38,7 @@ struct Manifest {
     measured_driver_revision: String,
     benchmark_sha256: String,
     fixture_sha256: String,
+    address_benchmark_sha256: String,
     expected_walltime_results: usize,
     order: Vec<(String, usize)>,
     revisions: Vec<Revision>,
@@ -84,16 +88,37 @@ fn cargo_codspeed_version() -> Result<String> {
     version_response(output.status.code(), &output.stdout, &output.stderr)
 }
 fn workload(source: &str) -> Result<String> {
+    forward_workload(
+        source,
+        ATTRIBUTE,
+        2,
+        &["main", "four_external_blobs", "eight_clients"],
+    )
+}
+fn address_workload(source: &str) -> Result<String> {
+    forward_workload(
+        source,
+        ADDRESS_ATTRIBUTE,
+        5,
+        &["main", "protocol_address_per_device"],
+    )
+}
+fn forward_workload(
+    source: &str,
+    attribute: &str,
+    count: usize,
+    functions: &[&str],
+) -> Result<String> {
     let attributes: Vec<_> = source
         .lines()
         .filter(|line| line.trim_start().starts_with("#[divan::bench"))
         .collect();
     ensure!(
-        attributes == [ATTRIBUTE, ATTRIBUTE],
-        "prefetch registration changed; review the paired workload before measuring"
+        attributes.len() == count && attributes.iter().all(|found| *found == attribute),
+        "benchmark registration changed; review the paired workload before measuring"
     );
-    let mut output = source.replace(ATTRIBUTE, "");
-    for name in ["main", "four_external_blobs", "eight_clients"] {
+    let mut output = source.replace(attribute, "");
+    for name in functions {
         let definition = format!("fn {name}(");
         ensure!(
             output.matches(&definition).count() == 1,
@@ -102,6 +127,23 @@ fn workload(source: &str) -> Result<String> {
         output = output.replace(&definition, &format!("pub(super) fn {name}("));
     }
     Ok(output)
+}
+fn address_wrapper() -> String {
+    r#"#[path = "address_pair_workload/mod.rs"]
+#[allow(dead_code)]
+mod workload;
+fn main() { workload::main(); }
+const CASES: &[&str] = &[
+    "32_round0", "128_round0", "512_round0", "32_round1", "128_round1", "512_round1",
+    "32_round2", "128_round2", "512_round2", "32_round3", "128_round3", "512_round3",
+];
+#[divan::bench(args = CASES)]
+fn protocol_address_per_device(bencher: divan::Bencher, case: &str) {
+    let width = case.split_once('_').expect("fixed sample label").0.parse().expect("fixed width");
+    workload::protocol_address_per_device(bencher, width);
+}
+"#
+    .to_owned()
 }
 fn wrapper() -> String {
     // The forwarded benchmark retains its original fixture, timed closure,
@@ -156,6 +198,7 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
         inputs.push((
             std::fs::read(checkout.join(BENCH))?,
             std::fs::read(checkout.join(FIXTURE))?,
+            std::fs::read(checkout.join(ADDRESS_BENCH))?,
         ));
         revisions.push(Revision {
             role: role.to_owned(),
@@ -163,6 +206,7 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
             checkout,
             target: output.join("target").join(role),
             bench: format!("prefetch_pair_{role}"),
+            address_bench: format!("address_pair_{role}"),
         });
     }
     ensure!(
@@ -171,11 +215,24 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
     );
     let source = String::from_utf8(inputs[0].0.clone())?;
     let rewritten = workload(&source)?;
+    let addresses = address_workload(std::str::from_utf8(&inputs[0].2)?)?;
     write(
         &output.join("results/original_benchmark.rs"),
         source.as_bytes(),
     )?;
     write(&output.join("results/original_fixture.rs"), &inputs[0].1)?;
+    write(
+        &output.join("results/original_address_benchmark.rs"),
+        &inputs[0].2,
+    )?;
+    write(
+        &output.join("results/forwarded_addresses.rs"),
+        addresses.as_bytes(),
+    )?;
+    write(
+        &output.join("results/address_wrapper.rs"),
+        address_wrapper().as_bytes(),
+    )?;
     write(
         &output.join("results/forwarded_workload.rs"),
         rewritten.as_bytes(),
@@ -185,6 +242,16 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
         wrapper().as_bytes(),
     )?;
     for item in &revisions {
+        write(
+            &item.checkout.join("benches/address_pair_workload/mod.rs"),
+            addresses.as_bytes(),
+        )?;
+        write(
+            &item
+                .checkout
+                .join(format!("benches/{}.rs", item.address_bench)),
+            address_wrapper().as_bytes(),
+        )?;
         write(
             &item.checkout.join("benches/prefetch_pair_workload/mod.rs"),
             rewritten.as_bytes(),
@@ -198,6 +265,10 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
         manifest.push_str(&format!(
             "\n[[bench]]\nname = {:?}\nharness = false\nrequired-features = [\"bench-harness\"]\n",
             item.bench
+        ));
+        manifest.push_str(&format!(
+            "\n[[bench]]\nname = {:?}\nharness = false\nrequired-features = [\"bench-harness\"]\n",
+            item.address_bench
         ));
         write(&path, manifest.as_bytes())?;
         let patch = capture(Command::new("git").current_dir(&item.checkout).args([
@@ -223,16 +294,19 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
                 "bench-harness",
                 "--bench",
                 &item.bench,
+                "--bench",
+                &item.address_bench,
             ]))?;
     }
     write_json(
         &output.join("results/manifest.json"),
         &Manifest {
-            schema_version: 1,
+            schema_version: 2,
             measured_driver_revision: head.to_owned(),
             benchmark_sha256: sha256(&inputs[0].0),
             fixture_sha256: sha256(&inputs[0].1),
-            expected_walltime_results: 32,
+            address_benchmark_sha256: sha256(&inputs[0].2),
+            expected_walltime_results: 56,
             order: ORDER
                 .iter()
                 .map(|(role, round)| ((*role).to_owned(), *round))
@@ -249,7 +323,7 @@ pub fn measure(root: &Path, output: &Path) -> Result<()> {
     let manifest: Manifest =
         serde_json::from_slice(&std::fs::read(output.join("results/manifest.json"))?)?;
     ensure!(
-        manifest.schema_version == 1 && revision(root)? == manifest.measured_driver_revision,
+        manifest.schema_version == 2 && revision(root)? == manifest.measured_driver_revision,
         "measurement driver changed after preparation"
     );
     ensure!(
@@ -278,6 +352,11 @@ pub fn measure(root: &Path, output: &Path) -> Result<()> {
             sha256(&std::fs::read(item.checkout.join(FIXTURE))?) == manifest.fixture_sha256,
             "prefetch fixture changed after building"
         );
+        ensure!(
+            sha256(&std::fs::read(item.checkout.join(ADDRESS_BENCH))?)
+                == manifest.address_benchmark_sha256,
+            "address workload changed after building"
+        );
         println!(
             "CodSpeed paired prefetch: {role} {}, repetition {round}",
             item.sha
@@ -290,8 +369,6 @@ pub fn measure(root: &Path, output: &Path) -> Result<()> {
                 "run",
                 "-p",
                 "whatsapp-rust",
-                "--bench",
-                &item.bench,
                 &format!("round{round}"),
             ]))?;
     }
@@ -320,6 +397,23 @@ mod tests {
             SOURCE.replace(ATTRIBUTE, "")
         );
         assert!(workload(&SOURCE.replace("sample_count = 1000", "sample_count = 999")).is_err());
+    }
+    #[test]
+    fn forwards_address_work_without_changing_sampling_or_batch_size() {
+        const ADDRESSES: &str = include_str!("../../../benches/client_usync.rs");
+        let forwarded = address_workload(ADDRESSES).unwrap();
+        assert_eq!(
+            forwarded.replace("pub(super) fn ", "fn "),
+            ADDRESSES.replace(ADDRESS_ATTRIBUTE, "")
+        );
+        assert!(address_workload(&ADDRESSES.replace("args = USER_COUNTS", "args = [32]")).is_err());
+        assert!(
+            address_workload(&ADDRESSES.replace(
+                "fn protocol_address_per_device(",
+                "fn renamed_address_work("
+            ))
+            .is_err()
+        );
     }
     #[test]
     fn alternates_roles_without_reusing_sample_uris() {

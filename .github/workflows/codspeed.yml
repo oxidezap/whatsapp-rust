@@ -34,7 +34,7 @@ env:
 
 jobs:
   prefetch-pair:
-    name: Prefetch base/head on the same host
+    name: Prefetch and addresses against base on the same host
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -54,7 +54,7 @@ jobs:
         with:
           prefix-key: prefetch-pair
           cache-targets: "false"
-      - name: Build immutable revisions and identical prefetch workloads
+      - name: Build immutable revisions and identical benchmark workloads
         env:
           BASE_REVISION: ${{ github.event.pull_request.base.sha }}
           HEAD_REVISION: ${{ github.event.pull_request.head.sha }}
