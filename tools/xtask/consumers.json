@@ -163,7 +163,7 @@
         "mode": "build",
         "features": ["mobile-core", "js"],
         "no_default_features": true,
-        "lib": true,
+        "bin": "mobile_probe",
         "release": true
       },
       {

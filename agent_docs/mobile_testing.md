@@ -96,13 +96,15 @@ without an executor. Reproduce the focused profiles with:
 cargo test --manifest-path tests/api-consumer/Cargo.toml --locked --no-default-features --features mobile-core --lib
 cargo test --manifest-path tests/api-consumer/Cargo.toml --locked --no-default-features --features mobile-transport-native --lib
 cargo test --manifest-path tests/api-consumer/Cargo.toml --locked --no-default-features --features native-default,mobile-core --lib
-RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo build --manifest-path tests/api-consumer/Cargo.toml --locked --no-default-features --features mobile-core,js --target wasm32-unknown-unknown --release --lib
+RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo build --manifest-path tests/api-consumer/Cargo.toml --locked --no-default-features --features mobile-core,js --target wasm32-unknown-unknown --release --bin mobile_probe
 ```
 
 The registered WASM lane also sets its required getrandom backend configuration;
 use `cargo xt ci consumers run --lane wasm` for the complete maintained command.
-A passing WASM build is a link check, not browser mobile execution. The optional
-native transport profile is intentionally not a WASM profile.
+The registered WASM command builds the `mobile_probe` binary, producing a final
+`.wasm` link rather than only an rlib. A passing build is not browser mobile
+execution. The optional native transport profile is intentionally not a WASM
+profile.
 
 ESP32 remains experimental until an explicit supported target, allocator/runtime,
 transport and persistence adapter can build and execute representative scenarios.

@@ -39,7 +39,8 @@ feature combinations live in `tools/xtask/consumers.json`.
 `mobile-core` exposes runtime-independent configuration, environment/identity
 binding and local registration workflow policy. It does not implement telephone
 registration, primary-device login or companion hosting. Its isolated consumer
-profiles run with defaults disabled, including a WASM link profile. Those checks
+profiles run with defaults disabled, including a WASM binary link profile using
+`mobile_probe`, which produces a final `.wasm` rather than only an rlib. Those checks
 establish compilation and local state behavior, not authenticated mobile support.
 
 `mobile-transport-native` adds the optional Tokio TCP adapter. It is not required

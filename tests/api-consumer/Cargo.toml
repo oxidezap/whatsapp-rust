@@ -173,3 +173,8 @@ required-features = ["event-fixtures"]
 name = "local_runtime"
 path = "tests/local_runtime.rs"
 required-features = ["runtime-execution"]
+
+[[bin]]
+name = "mobile_probe"
+path = "src/mobile_probe.rs"
+required-features = ["mobile-core"]
