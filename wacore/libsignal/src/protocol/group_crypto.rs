@@ -439,6 +439,40 @@ mod tests {
         assert!(!Arc::ptr_eq(first.signer(), second.signer()));
     }
     #[test]
+    fn signing_matches_private_key_backend_for_all_public_metadata() {
+        struct FailedRandom;
+        impl RandomSource for FailedRandom {
+            fn fill(&mut self, _: &mut [u8]) -> Result<()> {
+                Err(Error::Crypto)
+            }
+        }
+        let mut cache = GroupCryptoCache::default();
+        for byte in 0u8..32 {
+            let private = [byte; 32];
+            let matching = RustCrypto.public_key(&private).unwrap();
+            let other = RustCrypto.public_key(&[byte.wrapping_add(1); 32]).unwrap();
+            let expected = RustCrypto
+                .sign(&private, b"synthetic private signer", &mut Fixed(byte))
+                .unwrap();
+            for public in [matching, other, [0; 32], [255; 32]] {
+                let provider = cache.provider(&public, Some(&private));
+                let actual = provider
+                    .sign(&private, b"synthetic private signer", &mut Fixed(byte))
+                    .unwrap();
+                assert_eq!(actual, expected);
+                assert_eq!(
+                    provider.verify(&public, b"synthetic private signer", &actual),
+                    RustCrypto.verify(&public, b"synthetic private signer", &expected)
+                );
+                assert_eq!(
+                    provider.sign(&private, b"synthetic private signer", &mut FailedRandom),
+                    Err(Error::Crypto)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn mismatched_keys_and_invalid_public_use_standard_fallback() {
         let private = [7; 32];
         let public = RustCrypto.public_key(&private).unwrap();
