@@ -175,6 +175,11 @@ async fn test_read_receipt_queued_for_offline_sender() -> anyhow::Result<()> {
     client_b.wait_for_text("Read while I'm away", 15).await?;
     info!("B received message");
 
+    let mut raw_read = client_a.client.wait_for_node(
+        NodeFilter::tag("receipt")
+            .attr("id", msg_id.to_string())
+            .attr("type", "read"),
+    );
     // Drain A's delivery receipt before going offline
     let _ = client_a
         .wait_for_event(10, |e| {
@@ -189,6 +194,17 @@ async fn test_read_receipt_queued_for_offline_sender() -> anyhow::Result<()> {
     client_a.go_offline().await?;
     info!("A is offline");
 
+    let mut sent_read = client_b.client.wait_for_sent_node(
+        NodeFilter::tag("receipt")
+            .attr("id", msg_id.to_string())
+            .attr("type", "read"),
+    );
+    let mut read_ack = client_b.client.wait_for_node(
+        NodeFilter::tag("ack")
+            .attr("class", "receipt")
+            .attr("id", msg_id.to_string())
+            .attr("type", "read"),
+    );
     client_b
         .client
         .mark_as_read(&jid_a, None, &[msg_id.as_str()])
@@ -197,8 +213,19 @@ async fn test_read_receipt_queued_for_offline_sender() -> anyhow::Result<()> {
 
     // A reconnects and gets the queued read receipt
     client_a.come_back_online();
-    client_a
+    let mut target_receipts = [0_u64; 3];
+    let result = client_a
         .wait_for_event(30, |e| {
+            if let Event::Receipt(receipt) = e
+                && receipt.message_ids.iter().any(|id| *id == msg_id)
+            {
+                match receipt.r#type {
+                    ReceiptType::Delivered => target_receipts[0] += 1,
+                    ReceiptType::Read => target_receipts[1] += 1,
+                    ReceiptType::ReadSelf => target_receipts[2] += 1,
+                    _ => {}
+                }
+            }
             matches!(
                 e,
                 Event::Receipt(r)
@@ -206,7 +233,19 @@ async fn test_read_receipt_queued_for_offline_sender() -> anyhow::Result<()> {
                     && r.r#type == ReceiptType::Read
             )
         })
-        .await?;
+        .await;
+    if let Err(error) = result {
+        return Err(error.context(format!(
+            "offline read trace: sent_read={}, typed_ack={}, raw_read={}, \
+             target_delivered={}, target_read={}, target_read_self={}",
+            sent_read.try_recv().ok().flatten().is_some(),
+            read_ack.try_recv().ok().flatten().is_some(),
+            raw_read.try_recv().ok().flatten().is_some(),
+            target_receipts[0],
+            target_receipts[1],
+            target_receipts[2]
+        )));
+    }
     info!("A received queued read receipt after reconnect");
 
     client_a.disconnect().await;
