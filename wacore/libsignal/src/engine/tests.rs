@@ -216,6 +216,49 @@ fn closed_receiver_keeps_skipped_keys_and_distinguishes_unreceived_counters() {
     }
     assert_eq!(chain.index, 5);
 }
+#[test]
+fn delayed_key_consumption_preserves_duplicate_selection_and_sibling_state() {
+    let mut chain = Chain::new([3; 32], None, [4; 32]);
+    chain.index = 4;
+    for (index, seed) in [(1, [11; 32]), (0, [10; 32]), (3, [13; 32]), (0, [12; 32])] {
+        chain.skipped.push_back(MessageKey::Seed { index, seed });
+    }
+    let sibling = chain.clone();
+    let remaining: &[&[u32]] = &[&[0, 0, 3], &[3, 0], &[3], &[]];
+    for ((index, seed), remaining) in [(1, [11; 32]), (0, [12; 32]), (0, [10; 32]), (3, [13; 32])]
+        .into_iter()
+        .zip(remaining)
+    {
+        let plan = chain.plan(&RustCrypto, index, PEER_FUTURE_LIMIT).unwrap();
+        assert!(
+            plan.message.expanded(&RustCrypto).unwrap()
+                == MessageKey::Seed { index, seed }
+                    .expanded(&RustCrypto)
+                    .unwrap()
+        );
+        plan.commit(&mut chain);
+        assert_eq!(
+            chain
+                .skipped
+                .iter()
+                .map(MessageKey::index)
+                .collect::<Vec<_>>(),
+            *remaining
+        );
+        assert_eq!(
+            sibling
+                .skipped
+                .iter()
+                .map(MessageKey::index)
+                .collect::<Vec<_>>(),
+            [1, 0, 3, 0]
+        );
+    }
+    assert!(matches!(
+        chain.plan(&RustCrypto, 0, PEER_FUTURE_LIMIT),
+        Err(Error::Duplicate)
+    ));
+}
 struct Deterministic(u64);
 impl RandomSource for Deterministic {
     fn fill(&mut self, out: &mut [u8]) -> Result<()> {

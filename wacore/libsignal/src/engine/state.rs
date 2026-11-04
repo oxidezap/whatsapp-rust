@@ -85,6 +85,12 @@ impl<T: Clone> SharedDeque<T> {
         }
         Arc::make_mut(self.inner.as_mut()?).remove(index)
     }
+    pub(crate) fn swap_remove_back(&mut self, index: usize) -> Option<T> {
+        if index >= self.len() {
+            return None;
+        }
+        Arc::make_mut(self.inner.as_mut()?).swap_remove_back(index)
+    }
     pub fn pop_front(&mut self) -> Option<T> {
         if self.is_empty() {
             return None;
@@ -349,7 +355,7 @@ pub(crate) struct ChainAdvance {
 impl ChainAdvance {
     pub fn commit(mut self, chain: &mut Chain) {
         if let Some(position) = self.consumed {
-            chain.skipped.remove(position);
+            chain.skipped.swap_remove_back(position);
         }
         if let Some((index, mut key, skipped)) = self.advanced.take() {
             chain.index = index;
