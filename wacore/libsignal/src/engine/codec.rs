@@ -152,6 +152,31 @@ fn decode_pending(input: &[u8]) -> Result<PendingPreKey> {
         kyber_ciphertext: data(&f, 5)?.map(<[u8]>::to_vec),
     })
 }
+fn check_component_size(size: usize) -> Result<usize> {
+    if size > MAX_STORAGE_SIZE {
+        return Err(Error::Encoding("stored protobuf size limit"));
+    }
+    Ok(size)
+}
+
+pub(crate) fn component_session_size(state: &SessionState, omitted_bytes: usize) -> Result<usize> {
+    let size = crate::engine::encode::session_state_size(state)
+        .checked_sub(omitted_bytes)
+        .ok_or(Error::Encoding("component size accounting"))?;
+    check_component_size(size)
+}
+
+pub(crate) fn check_component_receiver_size(
+    base_size: usize,
+    chain: &Chain,
+    omitted_bytes: usize,
+) -> Result<()> {
+    let size = crate::engine::encode::receiver_field_size(chain, omitted_bytes)
+        .ok_or(Error::Encoding("component size accounting"))?;
+    check_component_size(base_size.saturating_add(size))?;
+    Ok(())
+}
+
 pub fn encode_session_state(state: &SessionState) -> Vec<u8> {
     let mut out = Vec::new();
     crate::engine::encode::append_session_state(state, &mut out);

@@ -12,7 +12,6 @@
 
 use std::fmt;
 
-use buffa::MessageField;
 use bytes::Bytes;
 
 use super::{SenderKeyRecord, SessionRecord, SessionState};
@@ -80,9 +79,8 @@ pub struct SessionMessageKeyComponents {
 
 /// Secret material used by a skipped session message key.
 ///
-/// `Seed` is the compact form: importing it expands the derived keys with the
-/// protocol's canonical derivation, and exporting a record that retained the
-/// seed returns it. `Derived` is what remains when there is no seed to return,
+/// `Seed` is the compact form: the engine derives its keys when it consumes
+/// the message key, and exporting a record that retained the seed returns it. `Derived` is what remains when there is no seed to return,
 /// which is the case for keys persisted before the seed was retained.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SessionMessageKeyMaterial {
@@ -321,30 +319,6 @@ fn required_key_material<const N: usize>(
 }
 
 impl SessionMessageKeyComponents {
-    fn into_structure(self) -> session_structure::chain::MessageKey {
-        match self.material {
-            SessionMessageKeyMaterial::Seed(seed) => {
-                let mut value = session_structure::chain::MessageKey::default();
-                value.index = Some(self.index);
-                value.seed = Some(Bytes::copy_from_slice(&seed));
-                value
-            }
-            SessionMessageKeyMaterial::Derived {
-                cipher_key,
-                mac_key,
-                iv,
-            } => {
-                let mut proto = session_structure::chain::MessageKey::default();
-                proto.index = Some(self.index);
-                proto.cipher_key = Some(Bytes::copy_from_slice(&cipher_key));
-                proto.mac_key = Some(Bytes::copy_from_slice(&mac_key));
-                proto.iv = Some(Bytes::copy_from_slice(&iv));
-                proto.seed = None;
-                proto
-            }
-        }
-    }
-
     fn from_structure(mut value: session_structure::chain::MessageKey) -> Result<Self> {
         let index = value
             .index
@@ -386,16 +360,6 @@ impl SessionMessageKeyComponents {
 }
 
 impl SessionChainKeyComponents {
-    fn into_structure(self) -> Result<session_structure::chain::ChainKey> {
-        Ok({
-            let mut proto = session_structure::chain::ChainKey::default();
-            proto.index = self.index;
-            proto.key = optional_exact_bytes(self.key, SYMMETRIC_KEY_BYTES, "session chain key")?
-                .map(Bytes::from);
-            proto
-        })
-    }
-
     fn from_structure(value: session_structure::chain::ChainKey) -> Result<Self> {
         Ok(Self {
             index: value.index,
@@ -404,22 +368,6 @@ impl SessionChainKeyComponents {
                 SYMMETRIC_KEY_BYTES,
                 "session chain key",
             )?,
-        })
-    }
-
-    fn into_required_structure(self) -> Result<session_structure::chain::ChainKey> {
-        Ok({
-            let mut proto = session_structure::chain::ChainKey::default();
-            proto.index = Some(
-                self.index
-                    .ok_or_else(|| invalid("sender chain-key index", "present"))?,
-            );
-            proto.key = Some(Bytes::from(required_exact_bytes(
-                self.key,
-                SYMMETRIC_KEY_BYTES,
-                "sender chain key",
-            )?));
-            proto
         })
     }
 
@@ -440,59 +388,6 @@ impl SessionChainKeyComponents {
 }
 
 impl SessionChainComponents {
-    fn into_sender_structure(self) -> Result<session_structure::Chain> {
-        Ok({
-            let mut proto = session_structure::Chain::default();
-            proto.sender_ratchet_key = Some(required_public_key(
-                self.sender_ratchet_key,
-                "sender ratchet public key",
-            )?);
-            proto.sender_ratchet_key_private = Some(required_exact_bytes(
-                self.sender_ratchet_key_private,
-                PRIVATE_KEY_BYTES,
-                "sender ratchet private key",
-            )?);
-            proto.chain_key = MessageField::some(
-                self.chain_key
-                    .ok_or_else(|| invalid("sender chain key", "present"))?
-                    .into_required_structure()?,
-            );
-            proto.message_keys = self
-                .message_keys
-                .into_iter()
-                .map(SessionMessageKeyComponents::into_structure)
-                .collect();
-            proto
-        })
-    }
-
-    fn into_receiver_structure(self) -> Result<session_structure::Chain> {
-        if self.sender_ratchet_key_private.is_some() {
-            return Err(invalid(
-                "receiver ratchet private key",
-                "absent from receiver chains",
-            ));
-        }
-
-        Ok({
-            let mut proto = session_structure::Chain::default();
-            proto.sender_ratchet_key =
-                optional_public_key(self.sender_ratchet_key, "receiver ratchet public key")?;
-            proto.sender_ratchet_key_private = None;
-            proto.chain_key = self
-                .chain_key
-                .map(SessionChainKeyComponents::into_structure)
-                .transpose()?
-                .into();
-            proto.message_keys = self
-                .message_keys
-                .into_iter()
-                .map(SessionMessageKeyComponents::into_structure)
-                .collect();
-            proto
-        })
-    }
-
     fn from_sender_structure(mut value: session_structure::Chain) -> Result<Self> {
         Ok(Self {
             sender_ratchet_key: Some(required_public_key(
@@ -606,18 +501,6 @@ impl PendingKeyExchangeComponents {
 }
 
 impl PendingPreKeyComponents {
-    fn into_structure(self) -> Result<session_structure::PendingPreKey> {
-        Ok({
-            let mut proto = session_structure::PendingPreKey::default();
-            proto.pre_key_id = self.pre_key_id;
-            proto.signed_pre_key_id = self.signed_pre_key_id;
-            proto.base_key = optional_public_key(self.base_key, "pending pre-key base key")?;
-            proto.kyber_pre_key_id = self.kyber_pre_key_id;
-            proto.kyber_ciphertext = self.kyber_ciphertext;
-            proto
-        })
-    }
-
     fn from_structure(value: session_structure::PendingPreKey) -> Result<Self> {
         Ok(Self {
             pre_key_id: value.pre_key_id,
@@ -627,48 +510,6 @@ impl PendingPreKeyComponents {
             kyber_ciphertext: value.kyber_ciphertext,
         })
     }
-}
-
-pub(crate) fn session_structure_from_components(
-    value: SessionComponents,
-) -> Result<SessionStructure> {
-    Ok({
-        let mut proto = SessionStructure::default();
-        proto.session_version = value.session_version;
-        proto.local_identity_public =
-            optional_public_key(value.local_identity_public, "local identity public key")?;
-        proto.remote_identity_public =
-            optional_public_key(value.remote_identity_public, "remote identity public key")?;
-        proto.root_key =
-            optional_exact_bytes(value.root_key, SYMMETRIC_KEY_BYTES, "session root key")?;
-        proto.previous_counter = value.previous_counter;
-        proto.sender_chain = value
-            .sender_chain
-            .map(SessionChainComponents::into_sender_structure)
-            .transpose()?
-            .into();
-        proto.receiver_chains = value
-            .receiver_chains
-            .into_iter()
-            .map(SessionChainComponents::into_receiver_structure)
-            .collect::<Result<_>>()?;
-        proto.pending_key_exchange = value
-            .pending_key_exchange
-            .map(PendingKeyExchangeComponents::into_structure)
-            .transpose()?
-            .into();
-        proto.pending_pre_key = value
-            .pending_pre_key
-            .map(PendingPreKeyComponents::into_structure)
-            .transpose()?
-            .into();
-        proto.remote_registration_id = value.remote_registration_id;
-        proto.local_registration_id = value.local_registration_id;
-        proto.needs_refresh = value.needs_refresh;
-        proto.alice_base_key =
-            optional_public_key(value.alice_base_key, "session base public key")?;
-        proto
-    })
 }
 
 pub(crate) fn session_components_from_structure(
@@ -785,12 +626,6 @@ pub(crate) fn derived_keys(seed: &[u8; 32]) -> Result<([u8; 32], [u8; 32], [u8; 
     Ok((cipher, mac, iv))
 }
 
-// SessionStructure has no shared waproto codec entry point. These two
-// functions keep the bridge's protobuf tree instantiation in one location.
-#[allow(clippy::disallowed_methods)]
-fn encode_session_proto(value: &SessionStructure) -> Vec<u8> {
-    value.encode_to_vec()
-}
 #[allow(clippy::disallowed_methods)]
 fn decode_session_proto(
     bytes: &[u8],
@@ -798,26 +633,203 @@ fn decode_session_proto(
     SessionStructure::decode_from_slice(bytes)
 }
 
+fn import_public(value: Option<Vec<u8>>, field: &'static str) -> Result<[u8; 32]> {
+    let value = value.ok_or(engine::Error::Encoding("missing required field"))?;
+    Ok(*component_public_key(&value, field)?.public_key_bytes())
+}
+
+fn chain_from_components(
+    value: SessionChainComponents,
+    sender: bool,
+    limit: Option<u32>,
+) -> Result<engine::Chain> {
+    let fixed_fields = usize::from(value.sender_ratchet_key.is_some())
+        + usize::from(value.sender_ratchet_key_private.is_some())
+        + usize::from(value.chain_key.is_some())
+        + usize::from(!sender && limit.is_some());
+    if value.message_keys.len() > engine::codec::MAX_STORED_FIELDS - fixed_fields {
+        return Err(engine::Error::Encoding("stored protobuf field budget exceeded").into());
+    }
+    let private = if sender {
+        Some(key_material(
+            value
+                .sender_ratchet_key_private
+                .ok_or_else(|| invalid("sender ratchet private key", "present"))?,
+            "sender ratchet private key",
+        )?)
+    } else {
+        if value.sender_ratchet_key_private.is_some() {
+            return Err(invalid(
+                "receiver ratchet private key",
+                "absent from receiver chains",
+            ));
+        }
+        None
+    };
+    let position = if sender {
+        Some(
+            value
+                .chain_key
+                .ok_or_else(|| invalid("sender chain key", "present"))?,
+        )
+    } else {
+        value.chain_key
+    };
+    let (index, key, exhausted) = match position {
+        Some(position) if sender => (
+            position
+                .index
+                .ok_or_else(|| invalid("sender chain-key index", "present"))?,
+            key_material(
+                position
+                    .key
+                    .ok_or_else(|| invalid("sender chain key", "present"))?,
+                "sender chain key",
+            )?,
+            false,
+        ),
+        Some(position) => {
+            let exhausted = position.key.is_none();
+            (
+                position.index.unwrap_or(0),
+                position
+                    .key
+                    .map(|key| key_material(key, "session chain key"))
+                    .transpose()?
+                    .unwrap_or([0; 32]),
+                exhausted,
+            )
+        }
+        None => (0, [0; 32], true),
+    };
+    Ok(engine::Chain {
+        ratchet: import_public(
+            value.sender_ratchet_key,
+            if sender {
+                "sender ratchet public key"
+            } else {
+                "receiver ratchet public key"
+            },
+        )?,
+        private,
+        index,
+        key,
+        exhausted,
+        skipped: value
+            .message_keys
+            .into_iter()
+            .map(|key| match key.material {
+                SessionMessageKeyMaterial::Seed(seed) => engine::MessageKey::Seed {
+                    index: key.index,
+                    seed,
+                },
+                SessionMessageKeyMaterial::Derived {
+                    cipher_key,
+                    mac_key,
+                    iv,
+                } => engine::MessageKey::Derived {
+                    index: key.index,
+                    material: Box::new(engine::DerivedMessageKey {
+                        cipher: cipher_key,
+                        mac: mac_key,
+                        iv,
+                    }),
+                },
+            })
+            .collect(),
+        message_key_limit: if sender { None } else { limit },
+    })
+}
+
+#[allow(clippy::disallowed_methods)]
+fn import_exchange(value: PendingKeyExchangeComponents) -> Result<Vec<u8>> {
+    Ok(value.into_structure()?.encode_to_vec())
+}
+
+// Count absent default-valued fields separately to retain the typed handoff
+// wire budget, including closed receiver chains.
+fn omitted_component_bytes(value: &SessionComponents) -> usize {
+    let absent = usize::from(value.previous_counter.is_none())
+        + usize::from(value.remote_registration_id.is_none())
+        + usize::from(value.local_registration_id.is_none())
+        + usize::from(value.needs_refresh.is_none());
+    let version_bytes = (u32::BITS - value.session_version.unwrap_or(3).leading_zeros())
+        .div_ceil(7)
+        .max(1) as usize;
+    absent * 2 + version_bytes - 1
+}
+
+fn omitted_chain_bytes(value: &SessionChainComponents) -> usize {
+    match &value.chain_key {
+        None => 4,
+        Some(position) => usize::from(position.index.is_none()) * 2,
+    }
+}
+
 fn state_from_components(
     value: SessionComponents,
     limit: Option<u32>,
 ) -> Result<engine::SessionState> {
-    let mut proto = session_structure_from_components(value)?;
-    let version = proto.session_version.unwrap_or(3);
-    // Projection accepts future version metadata and oversized receiver history;
-    // the engine rejects either at its operational boundary. Decode chains one
-    // at a time here so typed storage handoff does not silently discard them.
-    proto.session_version = Some(3);
-    let chains = std::mem::take(&mut proto.receiver_chains);
-    let mut state = engine::codec::decode_session_state(&encode_session_proto(&proto))?;
-    for mut chain in chains {
-        chain.message_key_limit = limit;
-        proto.receiver_chains.push(chain);
-        let mut decoded = engine::codec::decode_session_state(&encode_session_proto(&proto))?;
-        state.receivers.append(&mut decoded.receivers);
-        proto.receiver_chains.clear();
+    let omitted_bytes = omitted_component_bytes(&value);
+    let metadata = engine::SessionMetadata {
+        version: value.session_version.unwrap_or(3),
+        local_identity: import_public(value.local_identity_public, "local identity public key")?,
+        remote_identity: import_public(value.remote_identity_public, "remote identity public key")?,
+        root: key_material(
+            value
+                .root_key
+                .ok_or(engine::Error::Encoding("missing required field"))?,
+            "session root key",
+        )?,
+        previous_counter: value.previous_counter.unwrap_or(0),
+        pending_key_exchange: value
+            .pending_key_exchange
+            .map(import_exchange)
+            .transpose()?,
+        remote_registration: value.remote_registration_id.unwrap_or(0),
+        local_registration: value.local_registration_id.unwrap_or(0),
+        needs_refresh: value.needs_refresh.unwrap_or(false),
+        alice_base_key: value
+            .alice_base_key
+            .map(|key| {
+                Ok::<_, SignalProtocolError>(
+                    *component_public_key(&key, "session base public key")?.public_key_bytes(),
+                )
+            })
+            .transpose()?,
+        alice_base_key_tagged: true,
+    };
+    let pending_pre_key = value
+        .pending_pre_key
+        .map(|pending| {
+            Ok::<_, SignalProtocolError>(engine::PendingPreKey {
+                pre_key_id: pending.pre_key_id,
+                base_key: import_public(pending.base_key, "pending pre-key base key")?,
+                signed_pre_key_id: pending.signed_pre_key_id,
+                kyber_pre_key_id: pending.kyber_pre_key_id,
+                kyber_ciphertext: pending.kyber_ciphertext,
+            })
+        })
+        .transpose()?;
+    let mut state = engine::SessionState {
+        metadata: std::sync::Arc::new(metadata),
+        sender: value
+            .sender_chain
+            .map(|chain| chain_from_components(chain, true, None))
+            .transpose()?,
+        receivers: Vec::with_capacity(value.receiver_chains.len()),
+        pending_pre_key: pending_pre_key.map(std::sync::Arc::new),
+    };
+    // Handoff preserves future versions and receiver histories beyond the engine's
+    // operational limit. Retain the persisted reader's finite budget for the
+    // metadata plus each receiver without materializing intermediate protobufs.
+    let base_size = engine::codec::component_session_size(&state, omitted_bytes)?;
+    for receiver in value.receiver_chains {
+        let omitted_bytes = omitted_chain_bytes(&receiver);
+        let chain = chain_from_components(receiver, false, limit)?;
+        engine::codec::check_component_receiver_size(base_size, &chain, omitted_bytes)?;
+        state.receivers.push(chain);
     }
-    state.version = version;
     Ok(state)
 }
 fn archive(state: engine::SessionState) -> engine::ArchivedSession {
@@ -1138,6 +1150,175 @@ mod tests {
             previous_sessions: vec![state],
         }
     }
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn typed_import_matches_the_stored_reader_for_synthetic_schema_values() {
+        for counter in [0, 127, 128, 16_383, 16_384, u32::MAX] {
+            for closed in [false, true] {
+                let mut proto = SessionStructure::default();
+                proto.session_version = Some(3);
+                proto.local_identity_public = Some(key(1));
+                proto.remote_identity_public = Some(vec![2; 32]);
+                proto.root_key = Some(vec![3; 32]);
+                proto.previous_counter = Some(counter);
+                proto.remote_registration_id = Some(counter);
+                proto.local_registration_id = Some(counter);
+                proto.needs_refresh = Some(counter != 0);
+                proto.alice_base_key = Some(key(4));
+                let mut position = session_structure::chain::ChainKey::default();
+                position.index = Some(counter);
+                position.key = Some(Bytes::from_static(&[5; 32]));
+                let mut sender = session_structure::Chain::default();
+                sender.sender_ratchet_key = Some(vec![6; 32]);
+                sender.sender_ratchet_key_private = Some(vec![7; 32]);
+                sender.chain_key = Some(position.clone()).into();
+                let mut seed = session_structure::chain::MessageKey::default();
+                seed.index = Some(counter);
+                seed.seed = Some(Bytes::from_static(&[8; 32]));
+                let mut derived = session_structure::chain::MessageKey::default();
+                derived.index = Some(counter);
+                derived.cipher_key = Some(Bytes::from_static(&[9; 32]));
+                derived.mac_key = Some(Bytes::from_static(&[10; 32]));
+                derived.iv = Some(Bytes::from_static(&[11; 16]));
+                // Duplicate indices and insertion order are part of handoff.
+                sender.message_keys = vec![derived, seed];
+                proto.sender_chain = Some(sender.clone()).into();
+                sender.sender_ratchet_key = Some(key(12));
+                sender.sender_ratchet_key_private = None;
+                if closed {
+                    position.key = None;
+                    sender.chain_key = Some(position).into();
+                }
+                proto.receiver_chains = vec![sender];
+                let mut pending = session_structure::PendingPreKey::default();
+                pending.pre_key_id = Some(counter);
+                pending.base_key = Some(vec![13; 32]);
+                pending.signed_pre_key_id = Some(counter as i32);
+                pending.kyber_pre_key_id = Some(counter);
+                pending.kyber_ciphertext = Some(vec![14; 37]);
+                proto.pending_pre_key = Some(pending).into();
+                let mut exchange = session_structure::PendingKeyExchange::default();
+                exchange.sequence = Some(counter);
+                exchange.local_base_key = Some(key(15));
+                exchange.local_base_key_private = Some(vec![16; 32]);
+                exchange.local_ratchet_key = Some(key(17));
+                exchange.local_ratchet_key_private = Some(vec![18; 32]);
+                exchange.local_identity_key = Some(key(19));
+                exchange.local_identity_key_private = Some(vec![20; 32]);
+                proto.pending_key_exchange = Some(exchange).into();
+                for limit in [None, Some(0), Some(8192)] {
+                    proto.receiver_chains[0].message_key_limit = limit;
+                    let expected =
+                        engine::codec::decode_session_state(&proto.encode_to_vec()).unwrap();
+                    let input = session_components_from_structure(proto.clone()).unwrap();
+                    let actual = state_from_components(input, limit).unwrap();
+                    assert!(
+                        actual == expected,
+                        "counter={counter}, closed={closed}, limit={limit:?}"
+                    );
+                    assert_eq!(
+                        engine::codec::encode_session_state(&actual),
+                        engine::codec::encode_session_state(&expected)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn typed_import_size_accounts_for_absent_defaults_and_future_versions() {
+        for mask in 0..16 {
+            for version in [0, 3, 999, u32::MAX] {
+                let mut proto = SessionStructure::default();
+                proto.session_version = Some(version);
+                proto.local_identity_public = Some(key(1));
+                proto.remote_identity_public = Some(key(2));
+                proto.root_key = Some(vec![3; 32]);
+                proto.previous_counter = (mask & 1 != 0).then_some(u32::MAX);
+                proto.remote_registration_id = (mask & 2 != 0).then_some(1 << 29);
+                proto.local_registration_id = (mask & 4 != 0).then_some(1 << 21);
+                proto.needs_refresh = (mask & 8 != 0).then_some(false);
+                let components = session_components_from_structure(proto.clone()).unwrap();
+                let omitted = omitted_component_bytes(&components);
+                let imported = state_from_components(components, None).unwrap();
+                // Handoff retains future version metadata but counts the
+                // version-3 storage representation for its size budget.
+                proto.session_version = Some(3);
+                assert_eq!(
+                    engine::codec::component_session_size(&imported, omitted).unwrap(),
+                    proto.encode_to_vec().len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn typed_import_preserves_closed_chains_future_metadata_and_extended_history() {
+        let mut input = record().current_session.unwrap();
+        input.session_version = Some(999);
+        input.receiver_chains[0].chain_key = None;
+        input
+            .receiver_chains
+            .resize(7, input.receiver_chains[0].clone());
+        let imported = state_from_components(input, Some(4096)).unwrap();
+        assert_eq!(imported.version, 999);
+        assert_eq!(imported.receivers.len(), 7);
+        for receiver in &imported.receivers {
+            assert!(receiver.exhausted);
+            assert_eq!(receiver.index, 0);
+            assert_eq!(receiver.message_key_limit, Some(4096));
+            assert_eq!(receiver.skipped.len(), 1);
+        }
+    }
+
+    #[test]
+    fn typed_pairwise_import_keeps_the_stored_field_budget() {
+        for sender in [false, true] {
+            for limit in [None, Some(4096)] {
+                let mut input = record().current_session.unwrap();
+                let chain = if sender {
+                    input.sender_chain.take().unwrap()
+                } else {
+                    input.receiver_chains.remove(0)
+                };
+                let fixed = if sender || limit.is_some() { 3 } else { 2 };
+                let mut chain = SessionChainComponents {
+                    message_keys: vec![
+                        SessionMessageKeyComponents {
+                            index: 0,
+                            material: SessionMessageKeyMaterial::Seed([1; 32]),
+                        };
+                        engine::codec::MAX_STORED_FIELDS - fixed
+                    ],
+                    ..chain
+                };
+                assert!(chain_from_components(chain.clone(), sender, limit).is_ok());
+                chain.message_keys.push(SessionMessageKeyComponents {
+                    index: 1,
+                    material: SessionMessageKeyMaterial::Seed([2; 32]),
+                });
+                assert!(chain_from_components(chain, sender, limit).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_typed_prekey_payload_is_rejected_before_serialization() {
+        let mut input = record().current_session.unwrap();
+        input.pending_pre_key = Some(PendingPreKeyComponents {
+            base_key: Some(key(21)),
+            kyber_ciphertext: Some(vec![0; engine::wire::MAX_STORAGE_SIZE]),
+            ..Default::default()
+        });
+        assert!(matches!(
+            state_from_components(input, None),
+            Err(SignalProtocolError::Engine(engine::Error::Encoding(
+                "stored protobuf size limit"
+            )))
+        ));
+    }
+
     #[test]
     fn component_storage_roundtrip_preserves_seed_and_archive() {
         let expected = record();

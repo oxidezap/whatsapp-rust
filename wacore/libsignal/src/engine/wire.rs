@@ -3,6 +3,7 @@
 //! Pairwise versions 3 and 4 use the classical fields here; post-quantum fields
 //! remain unsupported.
 use crate::engine::{Error, Result};
+pub(crate) const MAX_STORAGE_SIZE: usize = 128 * 1024 * 1024;
 pub(crate) const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 #[derive(Clone, Copy)]
 pub(crate) enum Value<'a> {
@@ -24,8 +25,7 @@ impl<'a> Fields<'a> {
     /// Stored records aggregate archived sessions and expanded historical keys.
     /// They have a separate finite budget; network envelopes keep the 16 MiB gate.
     pub(crate) fn new_storage(bytes: &'a [u8]) -> Result<Self> {
-        const STORAGE_PROTOBUF_LIMIT: usize = 128 * 1024 * 1024;
-        if bytes.len() > STORAGE_PROTOBUF_LIMIT {
+        if bytes.len() > MAX_STORAGE_SIZE {
             return Err(Error::Encoding("stored protobuf size limit"));
         }
         Ok(Self { bytes })

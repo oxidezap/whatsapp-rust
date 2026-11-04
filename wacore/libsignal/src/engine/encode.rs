@@ -308,6 +308,18 @@ pub(crate) fn append_sender_record(
     message.encode(&mut VecSink(out));
 }
 
+pub(crate) fn session_state_size(state: &SessionState) -> usize {
+    encoded_len(state)
+}
+
+pub(crate) fn receiver_field_size(chain: &Chain, omitted_bytes: usize) -> Option<usize> {
+    let length = encoded_len(chain).checked_sub(omitted_bytes)?;
+    let mut sink = CountSink::default();
+    sink.varint((7 << 3) | 2);
+    sink.varint(length as u64);
+    Some(sink.0 + length)
+}
+
 pub(crate) fn append_session_state(state: &SessionState, out: &mut Vec<u8>) {
     state.encode(&mut VecSink(out));
 }
@@ -317,6 +329,51 @@ mod tests {
     use super::*;
     use crate::engine::{RustCrypto, codec};
     use std::collections::VecDeque;
+
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn imported_receiver_size_preserves_nested_length_prefix_boundaries() {
+        use buffa::Message as _;
+        use waproto::whatsapp::{SessionStructure, session_structure};
+        for count in [0, 1, 2, 3, 416, 417, 418, 419] {
+            for presence in 0..3 {
+                let mut chain = Chain::new([7; 32], None, [0; 32]);
+                chain.exhausted = true;
+                chain.message_key_limit = Some(8192);
+                chain.skipped = (0..count)
+                    .map(|_| MessageKey::Seed {
+                        index: u32::MAX,
+                        seed: [8; 32],
+                    })
+                    .collect();
+                let mut proto = session_structure::Chain::default();
+                proto.sender_ratchet_key =
+                    Some(crate::engine::wire::tagged_key(&chain.ratchet).to_vec());
+                proto.message_key_limit = chain.message_key_limit;
+                if presence > 0 {
+                    let mut position = session_structure::chain::ChainKey::default();
+                    position.index = (presence == 2).then_some(0);
+                    proto.chain_key = Some(position).into();
+                }
+                proto.message_keys = (0..count)
+                    .map(|_| {
+                        let mut key = session_structure::chain::MessageKey::default();
+                        key.index = Some(u32::MAX);
+                        key.seed = Some(bytes::Bytes::from_static(&[8; 32]));
+                        key
+                    })
+                    .collect();
+                let mut session = SessionStructure::default();
+                session.receiver_chains = vec![proto];
+                let omitted = [4, 2, 0][presence];
+                assert_eq!(
+                    receiver_field_size(&chain, omitted).unwrap(),
+                    session.encode_to_vec().len(),
+                    "count={count}, presence={presence}"
+                );
+            }
+        }
+    }
 
     fn state() -> SessionState {
         let mut sender = Chain::new([4; 32], Some([5; 32]), [6; 32]);
