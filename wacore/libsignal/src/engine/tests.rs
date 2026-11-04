@@ -331,6 +331,42 @@ fn forged_pairwise_message_never_consumes_state() {
     assert_eq!(e.decrypt(&mut b, &wrapper.message).unwrap(), b"next");
 }
 #[test]
+fn unauthenticated_ratchet_does_not_require_or_consume_randomness() {
+    struct UnavailableRandom;
+    impl RandomSource for UnavailableRandom {
+        fn fill(&mut self, _: &mut [u8]) -> Result<()> {
+            Err(Error::Crypto)
+        }
+    }
+
+    let mut random = Deterministic(0x1828_d003);
+    let mut engine = Engine::new(&RustCrypto, &mut random);
+    let (mut alice, mut bob, parameters) = peers(&mut engine, true);
+    let first = engine.encrypt(&mut alice, b"initial").unwrap();
+    engine
+        .decrypt_pre_key(&mut bob, &first, &parameters)
+        .unwrap();
+    reserve(&mut bob);
+    let reply = engine.encrypt(&mut bob, b"authenticated ratchet").unwrap();
+    let before = encode_session_record(&alice);
+    let mut forged = reply.clone();
+    *forged.last_mut().unwrap() ^= 1;
+    let mut unavailable_random = UnavailableRandom;
+    let mut unavailable = Engine::new(&RustCrypto, &mut unavailable_random);
+    assert_eq!(
+        unavailable.decrypt(&mut alice, &forged),
+        Err(Error::Authentication)
+    );
+    assert_eq!(encode_session_record(&alice), before);
+    assert_eq!(unavailable.decrypt(&mut alice, &reply), Err(Error::Crypto));
+    assert_eq!(encode_session_record(&alice), before);
+    assert_eq!(
+        engine.decrypt(&mut alice, &reply).unwrap(),
+        b"authenticated ratchet"
+    );
+    assert!(alice.reservation.requires_durable_commit());
+}
+#[test]
 fn reservations_gate_and_burn_without_reusing_counters() {
     let mut rng = Deterministic(7);
     let mut e = Engine::new(&RustCrypto, &mut rng);

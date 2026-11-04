@@ -358,32 +358,27 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         {
             return Err(Error::Version);
         }
-        let mut ratcheted = false;
-        let index = if let Some(index) = session
+        let (index, receiving_root) = if let Some(index) = session
             .receivers
             .iter()
             .position(|c| c.ratchet == message.ratchet)
         {
-            index
+            (index, None)
         } else {
             let old = session.sender.as_ref().ok_or(Error::MissingKey)?;
             let private = old.private.ok_or(Error::MissingKey)?;
             let (root, receiving) =
                 root_step(self.crypto, &session.root, &private, &message.ratchet)?;
-            let fresh = self.generate_key_pair()?;
-            let (next_root, sending) =
-                root_step(self.crypto, &root, &fresh.private, &message.ratchet)?;
-            session.previous_counter = old.index.saturating_sub(1);
-            session.root = next_root;
-            session.sender = Some(Chain::new(fresh.public, Some(fresh.private), sending));
             session
                 .receivers
                 .push(Chain::new(message.ratchet, None, receiving));
             if session.receivers.len() > MAX_RECEIVER_CHAINS {
                 session.receivers.remove(0);
             }
-            ratcheted = true;
-            session.receivers.len() - 1
+            (
+                session.receivers.len() - 1,
+                Some(zeroize::Zeroizing::new(root)),
+            )
         };
         let limit = if session.local_identity == session.remote_identity {
             SELF_FUTURE_LIMIT
@@ -403,6 +398,22 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
             )?[..8],
             &message.mac,
         )?;
+        let ratcheted = receiving_root.is_some();
+        if let Some(root) = receiving_root {
+            // Failed archive candidates do not need a fresh reply key or a
+            // second DH calculation. Authenticate before preparing either.
+            let fresh = self.generate_key_pair()?;
+            let (next_root, sending) =
+                root_step(self.crypto, &root, &fresh.private, &message.ratchet)?;
+            session.previous_counter = session
+                .sender
+                .as_ref()
+                .ok_or(Error::MissingKey)?
+                .index
+                .saturating_sub(1);
+            session.root = next_root;
+            session.sender = Some(Chain::new(fresh.public, Some(fresh.private), sending));
+        }
         let plaintext = self.crypto.decrypt_cbc(&cipher, &iv, message.ciphertext)?;
         advance.commit(&mut session.receivers[index]);
         session.pending_pre_key = None;
