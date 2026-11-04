@@ -43,11 +43,17 @@ impl AddressBuf {
         &self.0
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ProtocolAddress {
     text: AddressBuf,
     name_len: usize,
     device: DeviceId,
+}
+impl std::hash::Hash for ProtocolAddress {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // The rendered address already includes the device suffix and name boundary.
+        std::hash::Hash::hash(self.as_str(), state);
+    }
 }
 impl ProtocolAddress {
     pub fn new(name: &str, device: DeviceId) -> Self {
