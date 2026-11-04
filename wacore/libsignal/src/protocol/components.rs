@@ -1003,6 +1003,136 @@ impl SenderKeyRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn sender_components() -> SenderKeyRecordComponents {
+        SenderKeyRecordComponents {
+            states: [0, 127, 128, u32::MAX]
+                .into_iter()
+                .enumerate()
+                .map(|(index, iteration)| SenderKeyStateComponents {
+                    key_id: iteration,
+                    chain_key: SenderChainKeyComponents {
+                        iteration,
+                        seed: vec![index as u8 + 1; 32],
+                    },
+                    signing_key: SenderSigningKeyComponents {
+                        public: if index.is_multiple_of(2) {
+                            vec![index as u8 + 2; 32]
+                        } else {
+                            key(index as u8 + 2)
+                        },
+                        private: index.is_multiple_of(2).then(|| vec![9; 32]),
+                    },
+                    message_keys: [128, 0, 128, u32::MAX]
+                        .into_iter()
+                        .map(|iteration| SenderMessageKeyComponents {
+                            iteration,
+                            seed: vec![7; 32],
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn sender_component_handoff_preserves_order_duplicates_and_canonical_keys() {
+        let input = sender_components();
+        let mut expected = input.clone();
+        for state in &mut expected.states {
+            if state.signing_key.public.len() == 32 {
+                state.signing_key.public.insert(0, 5);
+            }
+        }
+        let record = SenderKeyRecord::from_components(input).unwrap();
+        let bytes = record.serialize().unwrap();
+        let mut digest = sha2::Sha256::new();
+        use sha2::Digest;
+        digest.update(&bytes);
+        assert_eq!(
+            hex::encode(digest.finalize()),
+            "cd58fc7d88e3de26e5767d02e6d54723e6feb9a76a4a5870b8dea6b08ee801da"
+        );
+        assert_eq!(record.clone().into_components().unwrap(), expected);
+        let reloaded = SenderKeyRecord::deserialize(&bytes).unwrap();
+        assert_eq!(reloaded.into_components().unwrap(), expected);
+        assert_eq!(
+            SenderKeyRecord::from_components(expected)
+                .unwrap()
+                .serialize()
+                .unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn sender_component_import_validates_retained_states_before_handoff() {
+        for length in [0, 31, 33] {
+            let mut input = sender_components();
+            input.states[0].chain_key.seed = vec![1; length];
+            assert!(SenderKeyRecord::from_components(input).is_err());
+            let mut input = sender_components();
+            input.states[0].signing_key.private = Some(vec![1; length]);
+            assert!(SenderKeyRecord::from_components(input).is_err());
+            let mut input = sender_components();
+            input.states[0].message_keys[0].seed = vec![1; length];
+            assert!(SenderKeyRecord::from_components(input).is_err());
+        }
+        for public in [vec![], vec![1; 31], vec![4; 33], vec![5; 34]] {
+            let mut input = sender_components();
+            input.states[0].signing_key.public = public;
+            assert!(SenderKeyRecord::from_components(input).is_err());
+        }
+        let mut input = sender_components();
+        input.states.push(input.states[0].clone());
+        let expected = SenderKeyRecord::from_components(input.clone())
+            .unwrap()
+            .into_components()
+            .unwrap();
+        let mut ignored = input.states[0].clone();
+        ignored.chain_key.seed.clear();
+        input.states.push(ignored);
+        assert_eq!(
+            SenderKeyRecord::from_components(input)
+                .unwrap()
+                .into_components()
+                .unwrap(),
+            expected
+        );
+        assert_eq!(expected.states.len(), 5);
+        assert!(
+            SenderKeyRecord::from_components(SenderKeyRecordComponents::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn sender_component_import_keeps_the_persisted_field_budget() {
+        let mut input = sender_components();
+        input.states.truncate(1);
+        input.states[0].message_keys = vec![
+            SenderMessageKeyComponents {
+                iteration: 0,
+                seed: vec![7; 32],
+            };
+            131_069
+        ];
+        let record = SenderKeyRecord::from_components(input.clone()).unwrap();
+        assert_eq!(
+            record.into_components().unwrap().states[0]
+                .message_keys
+                .len(),
+            131_069
+        );
+        input.states[0]
+            .message_keys
+            .push(SenderMessageKeyComponents {
+                iteration: 1,
+                seed: vec![8; 32],
+            });
+        assert!(SenderKeyRecord::from_components(input).is_err());
+    }
+
     fn key(seed: u8) -> Vec<u8> {
         let mut key = vec![seed; 33];
         key[0] = 5;
