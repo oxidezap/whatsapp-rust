@@ -827,9 +827,30 @@ fn archive(state: engine::SessionState) -> engine::ArchivedSession {
     temporary.previous.remove(0)
 }
 fn project_state(state: &engine::SessionState) -> Result<SessionComponents> {
-    let proto = decode_session_proto(&engine::codec::encode_session_state(state))
+    let mut proto = decode_session_proto(&engine::codec::encode_session_state(state))
         .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
+    if let (Some(source), Some(target)) = (&state.sender, proto.sender_chain.as_option_mut()) {
+        project_stored_keys(source, target);
+    }
+    for (source, target) in state.receivers.iter().zip(&mut proto.receiver_chains) {
+        project_stored_keys(source, target);
+    }
     session_components_from_structure(proto)
+}
+fn project_stored_keys(source: &engine::Chain, target: &mut session_structure::Chain) {
+    for (source, target) in source.skipped.iter().zip(&mut target.message_keys) {
+        if !matches!(source, engine::MessageKey::Stored { .. }) {
+            continue;
+        }
+        if source.retained_seed().is_some() {
+            // Canonical projection retains a validated seed without deriving it twice.
+            target.cipher_key = None;
+            target.mac_key = None;
+            target.iv = None;
+        } else {
+            target.seed = None;
+        }
+    }
 }
 fn handoff(state: &mut engine::SessionState, ceiling: u32) {
     let Some(chain) = state.sender.as_mut() else {
@@ -1123,6 +1144,51 @@ mod tests {
         let record = SessionRecord::from_components(expected.clone()).unwrap();
         let loaded = SessionRecord::deserialize(&record.serialize().unwrap()).unwrap();
         assert_eq!(loaded.into_components().unwrap(), expected);
+    }
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn expanded_storage_roundtrip_validates_seeds_only_for_canonical_projection() {
+        let (cipher_key, mac_key, iv) = derived_keys(&[9; 32]).unwrap();
+        for inconsistent in [false, true] {
+            let mut expected = record();
+            let native = SessionRecord::from_components(expected.clone()).unwrap();
+            let mut proto =
+                waproto::whatsapp::RecordStructure::decode_from_slice(&native.serialize().unwrap())
+                    .unwrap();
+            for session in proto
+                .current_session
+                .as_option_mut()
+                .into_iter()
+                .chain(&mut proto.previous_sessions)
+            {
+                let key = &mut session.receiver_chains[0].message_keys[0];
+                key.cipher_key = Some(Bytes::copy_from_slice(&cipher_key));
+                key.mac_key = Some(Bytes::copy_from_slice(&mac_key));
+                key.iv = Some(Bytes::copy_from_slice(&iv));
+                if inconsistent {
+                    key.seed = Some(Bytes::from_static(&[44; 32]));
+                }
+            }
+            if inconsistent {
+                for session in expected
+                    .current_session
+                    .iter_mut()
+                    .chain(&mut expected.previous_sessions)
+                {
+                    session.receiver_chains[0].message_keys[0].material =
+                        SessionMessageKeyMaterial::Derived {
+                            cipher_key,
+                            mac_key,
+                            iv,
+                        };
+                }
+            }
+            let stored = proto.encode_to_vec();
+            let loaded = SessionRecord::deserialize(&stored).unwrap();
+            assert_eq!(loaded.serialize().unwrap(), stored);
+            assert_eq!(loaded.clone().into_components().unwrap(), expected);
+            assert_eq!(loaded.serialize().unwrap(), stored);
+        }
     }
     #[test]
     fn receiver_private_import_is_rejected_and_sender_must_be_complete() {

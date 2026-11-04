@@ -3,8 +3,8 @@
 //! `waproto/signal-storage.snapshot`. A counting sink computes nested lengths;
 //! the writing sink then appends those messages to the caller's buffer.
 use crate::engine::state::{
-    ArchivedSession, Chain, MessageKey, PendingPreKey, Reservation, SenderKeyRecord,
-    SenderKeyState, SenderMessageKey, SessionState,
+    ArchivedSession, Chain, DerivedMessageKey, MessageKey, PendingPreKey, Reservation,
+    SenderKeyRecord, SenderKeyState, SenderMessageKey, SessionState,
 };
 
 trait Encodable {
@@ -85,15 +85,23 @@ impl Sink for VecSink<'_> {
     }
 }
 
+impl Encodable for DerivedMessageKey {
+    fn encode<S: Sink>(&self, sink: &mut S) {
+        sink.bytes(2, &self.cipher);
+        sink.bytes(3, &self.mac);
+        sink.bytes(4, &self.iv);
+    }
+}
+
 impl Encodable for MessageKey {
     fn encode<S: Sink>(&self, sink: &mut S) {
         sink.uint(1, self.index().into());
         match self {
             Self::Seed { seed, .. } => sink.bytes(100, seed),
-            Self::Derived { material, .. } => {
-                sink.bytes(2, &material.cipher);
-                sink.bytes(3, &material.mac);
-                sink.bytes(4, &material.iv);
+            Self::Derived { material, .. } => material.encode(sink),
+            Self::Stored { material, .. } => {
+                material.material.encode(sink);
+                sink.bytes(100, &material.seed);
             }
         }
     }
@@ -323,7 +331,7 @@ mod tests {
             } else {
                 MessageKey::Derived {
                     index,
-                    material: Box::new(crate::engine::state::DerivedMessageKey {
+                    material: Box::new(DerivedMessageKey {
                         cipher: [index as u8; 32],
                         mac: [8; 32],
                         iv: [9; 16],

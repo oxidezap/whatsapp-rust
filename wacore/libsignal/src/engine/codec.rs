@@ -69,32 +69,24 @@ fn message_key(input: &[u8]) -> Result<MessageKey> {
         && mac.len() == 32
         && iv.len() == 16
     {
-        // A redundant seed is useful for operational export only when it
-        // reproduces the authoritative expanded fields exactly.
+        let material = DerivedMessageKey {
+            cipher: array(cipher)?,
+            mac: array(mac)?,
+            iv: array(iv)?,
+        };
+        // Keep the authoritative material ready for consumption. Checking a
+        // redundant seed is needed only for canonical seed-based export.
         if let Some(Value::Bytes(seed)) = one(&f, 100)
             && seed.len() == 32
         {
-            use subtle::ConstantTimeEq;
-            let candidate = MessageKey::Seed {
+            return Ok(MessageKey::Stored {
                 index,
-                seed: array(seed)?,
-            };
-            let expanded = zeroize::Zeroizing::new(candidate.expanded(&crate::engine::RustCrypto)?);
-            if bool::from(
-                expanded.0.as_slice().ct_eq(cipher)
-                    & expanded.1.as_slice().ct_eq(mac)
-                    & expanded.2.as_slice().ct_eq(iv),
-            ) {
-                return Ok(candidate);
-            }
+                material: std::sync::Arc::new(StoredMessageKey::new(material, array(seed)?)),
+            });
         }
         return Ok(MessageKey::Derived {
             index,
-            material: Box::new(DerivedMessageKey {
-                cipher: array(cipher)?,
-                mac: array(mac)?,
-                iv: array(iv)?,
-            }),
+            material: Box::new(material),
         });
     }
     Ok(MessageKey::Seed {
@@ -663,7 +655,7 @@ mod message_key_tests {
                 _ => bytes(&mut wire, 100, &stored_seed),
             }
             let key = message_key(&wire).unwrap();
-            assert_eq!(matches!(key, MessageKey::Seed { .. }), variant == 0);
+            assert_eq!(key.retained_seed().is_some(), variant == 0);
             assert_eq!(
                 key.expanded(&crate::engine::RustCrypto).unwrap(),
                 (cipher, mac, iv)

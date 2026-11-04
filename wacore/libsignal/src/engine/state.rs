@@ -5,8 +5,9 @@ use std::{
     fmt,
     iter::FusedIterator,
     ops::Index,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
+use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 pub const MAX_SKIPPED: usize = 2000;
 pub const MAX_RECEIVER_CHAINS: usize = 5;
@@ -194,7 +195,53 @@ impl Drop for DerivedMessageKey {
         self.iv.zeroize();
     }
 }
-#[derive(Clone, PartialEq, Eq)]
+/// Expanded storage material remains authoritative. Its redundant seed is
+/// checked only when a caller requests a seed-based projection.
+pub struct StoredMessageKey {
+    pub(crate) material: DerivedMessageKey,
+    pub(crate) seed: [u8; 32],
+    valid_seed: OnceLock<bool>,
+}
+impl StoredMessageKey {
+    pub(crate) fn new(material: DerivedMessageKey, seed: [u8; 32]) -> Self {
+        Self {
+            material,
+            seed,
+            valid_seed: OnceLock::new(),
+        }
+    }
+    fn retained_seed(&self) -> Option<&[u8; 32]> {
+        self.valid_seed
+            .get_or_init(|| {
+                let candidate = MessageKey::Seed {
+                    index: 0,
+                    seed: self.seed,
+                };
+                let expanded = zeroize::Zeroizing::new(
+                    candidate
+                        .expanded(&crate::engine::RustCrypto)
+                        .expect("80 bytes are within the SHA-256 HKDF output limit"),
+                );
+                bool::from(
+                    expanded.0.ct_eq(&self.material.cipher)
+                        & expanded.1.ct_eq(&self.material.mac)
+                        & expanded.2.ct_eq(&self.material.iv),
+                )
+            })
+            .then_some(&self.seed)
+    }
+}
+impl Drop for StoredMessageKey {
+    fn drop(&mut self) {
+        self.seed.zeroize();
+    }
+}
+#[derive(PartialEq, Eq)]
+enum MessageMaterialRef<'a> {
+    Seed(&'a [u8; 32]),
+    Derived(&'a DerivedMessageKey),
+}
+#[derive(Clone)]
 pub enum MessageKey {
     Seed {
         index: u32,
@@ -204,7 +251,22 @@ pub enum MessageKey {
         index: u32,
         material: Box<DerivedMessageKey>,
     },
+    Stored {
+        index: u32,
+        material: Arc<StoredMessageKey>,
+    },
 }
+impl PartialEq for MessageKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.index() == other.index()
+            && (matches!(
+                (self, other),
+                (Self::Stored { material: a, .. }, Self::Stored { material: b, .. })
+                    if Arc::ptr_eq(a, b)
+            ) || self.canonical_material() == other.canonical_material())
+    }
+}
+impl Eq for MessageKey {}
 impl Drop for MessageKey {
     fn drop(&mut self) {
         if let Self::Seed { seed, .. } = self {
@@ -215,13 +277,32 @@ impl Drop for MessageKey {
 impl MessageKey {
     pub fn index(&self) -> u32 {
         match self {
-            Self::Seed { index, .. } | Self::Derived { index, .. } => *index,
+            Self::Seed { index, .. } | Self::Derived { index, .. } | Self::Stored { index, .. } => {
+                *index
+            }
         }
     }
     pub fn extra_heap_bytes(&self) -> usize {
         match self {
             Self::Seed { .. } => 0,
             Self::Derived { .. } => size_of::<DerivedMessageKey>(),
+            Self::Stored { .. } => size_of::<StoredMessageKey>() + 2 * size_of::<usize>(),
+        }
+    }
+    fn canonical_material(&self) -> MessageMaterialRef<'_> {
+        match self {
+            Self::Seed { seed, .. } => MessageMaterialRef::Seed(seed),
+            Self::Derived { material, .. } => MessageMaterialRef::Derived(material),
+            Self::Stored { material, .. } => match material.retained_seed() {
+                Some(seed) => MessageMaterialRef::Seed(seed),
+                None => MessageMaterialRef::Derived(&material.material),
+            },
+        }
+    }
+    pub(crate) fn retained_seed(&self) -> Option<&[u8; 32]> {
+        match self.canonical_material() {
+            MessageMaterialRef::Seed(seed) => Some(seed),
+            MessageMaterialRef::Derived(_) => None,
         }
     }
     pub(crate) fn expanded<C: CryptoProvider>(
@@ -230,6 +311,11 @@ impl MessageKey {
     ) -> Result<([u8; 32], [u8; 32], [u8; 16])> {
         match self {
             Self::Derived { material, .. } => Ok((material.cipher, material.mac, material.iv)),
+            Self::Stored { material, .. } => Ok((
+                material.material.cipher,
+                material.material.mac,
+                material.material.iv,
+            )),
             Self::Seed { seed, .. } => {
                 let mut material = [0; 80];
                 crypto.hkdf_sha256_zero_salt(seed, b"WhisperMessageKeys", &mut material)?;
@@ -749,6 +835,42 @@ mod shared_storage_tests {
         assert_eq!(
             derived.expanded(&crate::engine::RustCrypto).unwrap(),
             ([3; 32], [4; 32], [5; 16])
+        );
+    }
+
+    #[test]
+    fn stored_key_equality_preserves_canonical_material_and_counter() {
+        let seed = MessageKey::Seed {
+            index: 7,
+            seed: [2; 32],
+        };
+        let (cipher, mac, iv) = seed.expanded(&crate::engine::RustCrypto).unwrap();
+        let material = DerivedMessageKey { cipher, mac, iv };
+        let stored = MessageKey::Stored {
+            index: 7,
+            material: Arc::new(StoredMessageKey::new(material.clone(), [2; 32])),
+        };
+        assert!(stored == seed);
+        assert!(stored.clone() == stored);
+        assert!(stored.extra_heap_bytes() >= size_of::<StoredMessageKey>());
+        assert!(
+            stored
+                != MessageKey::Seed {
+                    index: 8,
+                    seed: [2; 32]
+                }
+        );
+        let inconsistent = MessageKey::Stored {
+            index: 7,
+            material: Arc::new(StoredMessageKey::new(material.clone(), [3; 32])),
+        };
+        assert!(inconsistent != seed);
+        assert!(
+            inconsistent
+                == MessageKey::Derived {
+                    index: 7,
+                    material: Box::new(material),
+                }
         );
     }
 

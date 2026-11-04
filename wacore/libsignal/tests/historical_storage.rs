@@ -412,8 +412,27 @@ fn historical_expanded_keys_take_precedence_over_seed_fields() {
         .message_keys
         .push(key);
     let decoded = engine::codec::decode_session_record(&RustCrypto, &raw.encode_to_vec()).unwrap();
+    let expected = engine::MessageKey::Derived {
+        index: 9,
+        material: Box::new(engine::DerivedMessageKey {
+            cipher: [1; 32],
+            mac: [2; 32],
+            iv: [3; 16],
+        }),
+    };
+    assert!(decoded.current.as_ref().unwrap().receivers[0].skipped[0] == expected);
+    let stored = engine::codec::encode_session_record(&decoded);
+    let components = wacore_libsignal::protocol::SessionRecord::deserialize(&stored)
+        .unwrap()
+        .into_components()
+        .unwrap();
     assert!(
-        matches!(&decoded.current.as_ref().unwrap().receivers[0].skipped[0],engine::MessageKey::Derived{index:9,material} if material.cipher==[1;32] && material.mac==[2;32] && material.iv==[3;16])
+        components.current_session.unwrap().receiver_chains[0].message_keys[0].material
+            == wacore_libsignal::protocol::SessionMessageKeyMaterial::Derived {
+                cipher_key: [1; 32],
+                mac_key: [2; 32],
+                iv: [3; 16],
+            }
     );
 }
 
