@@ -12,6 +12,7 @@ description = "Storage-compatible Signal protocol with a sans-I/O state engine"
 legacy-session-interop = []
 
 [dependencies]
+arrayvec = { version = "0.7.8", default-features = false }
 aes.workspace = true
 aes-gcm.workspace = true
 cbc = { workspace = true, features = ["block-padding"] }

@@ -24,30 +24,177 @@ impl std::fmt::Display for DeviceId {
         self.0.fmt(f)
     }
 }
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct AddressBuf(String);
-impl AddressBuf {
-    pub fn empty() -> Self {
-        Self(String::with_capacity(64))
-    }
-    pub fn clear(&mut self) {
-        self.0.clear()
-    }
-    pub fn push_str(&mut self, s: &str) {
-        self.0.push_str(s)
-    }
-    pub fn push(&mut self, c: char) {
-        self.0.push(c)
-    }
-    pub fn as_str(&self) -> &str {
-        &self.0
+const INLINE_ADDRESS_BYTES: usize = 47;
+
+#[derive(Clone)]
+enum AddressStorage {
+    Inline(arrayvec::ArrayString<INLINE_ADDRESS_BYTES>),
+    Heap(String),
+}
+
+pub struct AddressBuf(AddressStorage);
+impl Clone for AddressBuf {
+    // Keep the inline/heap clone branches out of every async caller.
+    #[inline(never)]
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+impl Default for AddressBuf {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+impl AddressBuf {
+    pub fn empty() -> Self {
+        Self(AddressStorage::Inline(arrayvec::ArrayString::new()))
+    }
+    pub fn clear(&mut self) {
+        match &mut self.0 {
+            AddressStorage::Inline(text) => text.clear(),
+            AddressStorage::Heap(text) => text.clear(),
+        }
+    }
+    pub fn push_str(&mut self, s: &str) {
+        match &mut self.0 {
+            AddressStorage::Inline(inline) => {
+                if inline.try_push_str(s).is_err() {
+                    let mut text = String::with_capacity((inline.len() + s.len()).max(64));
+                    text.push_str(inline.as_str());
+                    text.push_str(s);
+                    self.0 = AddressStorage::Heap(text);
+                }
+            }
+            AddressStorage::Heap(text) => text.push_str(s),
+        }
+    }
+    pub fn push(&mut self, c: char) {
+        self.push_str(c.encode_utf8(&mut [0; 4]));
+    }
+    pub fn as_str(&self) -> &str {
+        match &self.0 {
+            AddressStorage::Inline(text) => text.as_str(),
+            AddressStorage::Heap(text) => text,
+        }
+    }
+}
+impl std::fmt::Debug for AddressBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("AddressBuf").field(&self.as_str()).finish()
+    }
+}
+impl PartialEq for AddressBuf {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+impl Eq for AddressBuf {}
+impl PartialOrd for AddressBuf {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for AddressBuf {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+impl std::hash::Hash for AddressBuf {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(self.as_str(), state);
+    }
+}
+impl Serialize for AddressBuf {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_newtype_struct("AddressBuf", self.as_str())
+    }
+}
+impl<'de> Deserialize<'de> for AddressBuf {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename = "AddressBuf")]
+        struct Text(String);
+        let Text(text) = Text::deserialize(deserializer)?;
+        if text.len() > INLINE_ADDRESS_BYTES {
+            Ok(Self(AddressStorage::Heap(text)))
+        } else {
+            let mut out = Self::empty();
+            out.push_str(&text);
+            Ok(out)
+        }
+    }
+}
+#[derive(Clone, Debug)]
 pub struct ProtocolAddress {
     text: AddressBuf,
-    name_len: usize,
     device: DeviceId,
+    // The decimal device suffix fits in 11 bytes; serde retains the name_len field.
+    suffix_len: u8,
+}
+struct AddressWriter<'a>(&'a mut ProtocolAddress);
+impl Drop for AddressWriter<'_> {
+    fn drop(&mut self) {
+        self.0.append_device_suffix();
+    }
+}
+impl PartialEq for ProtocolAddress {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+    }
+}
+impl Eq for ProtocolAddress {}
+impl PartialOrd for ProtocolAddress {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ProtocolAddress {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.text.cmp(&other.text)
+    }
+}
+impl Serialize for ProtocolAddress {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut out = serializer.serialize_struct("ProtocolAddress", 3)?;
+        out.serialize_field("text", &self.text)?;
+        out.serialize_field(
+            "name_len",
+            &(self.as_str().len() - usize::from(self.suffix_len)),
+        )?;
+        out.serialize_field("device", &self.device)?;
+        out.end()
+    }
+}
+impl<'de> Deserialize<'de> for ProtocolAddress {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename = "ProtocolAddress")]
+        struct Fields {
+            text: AddressBuf,
+            name_len: usize,
+            device: DeviceId,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        let mut digits = itoa::Buffer::new();
+        let device = digits.format(fields.device.0);
+        if fields
+            .text
+            .as_str()
+            .get(fields.name_len..)
+            .and_then(|suffix| suffix.strip_prefix('.'))
+            != Some(device)
+        {
+            return Err(serde::de::Error::custom(
+                "inconsistent protocol address fields",
+            ));
+        }
+        Ok(Self {
+            text: fields.text,
+            device: fields.device,
+            suffix_len: device.len() as u8 + 1,
+        })
+    }
 }
 impl std::hash::Hash for ProtocolAddress {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -59,8 +206,8 @@ impl ProtocolAddress {
     pub fn new(name: &str, device: DeviceId) -> Self {
         let mut out = Self {
             text: AddressBuf::empty(),
-            name_len: 0,
             device,
+            suffix_len: 0,
         };
         out.reset_with(|buf| buf.push_str(name));
         out
@@ -68,22 +215,39 @@ impl ProtocolAddress {
     pub fn empty(device: DeviceId) -> Self {
         let mut out = Self {
             text: AddressBuf::empty(),
-            name_len: 0,
             device,
+            suffix_len: 0,
         };
         out.reset_with(|_| {});
         out
     }
+    // Share each writer's formatting and unwind cleanup across callers.
+    #[inline(never)]
     pub fn reset_with(&mut self, write: impl FnOnce(&mut AddressBuf)) {
         self.text.clear();
-        write(&mut self.text);
-        self.name_len = self.text.0.len();
+        // Complete the canonical key even when the caller's writer unwinds.
+        let writer = AddressWriter(self);
+        write(&mut writer.0.text);
+    }
+    fn append_device_suffix(&mut self) {
+        if self.device.0 == 0 {
+            self.text.push_str(".0");
+            self.suffix_len = 2;
+        } else {
+            self.append_nonzero_device_suffix();
+        }
+    }
+    // Share decimal formatting across address constructors and async callers.
+    #[inline(never)]
+    fn append_nonzero_device_suffix(&mut self) {
+        let mut digits = itoa::Buffer::new();
+        let device = digits.format(self.device.0);
         self.text.push('.');
-        self.text
-            .push_str(itoa::Buffer::new().format(self.device.0));
+        self.text.push_str(device);
+        self.suffix_len = device.len() as u8 + 1;
     }
     pub fn name(&self) -> &str {
-        &self.text.0[..self.name_len]
+        &self.as_str()[..self.as_str().len() - usize::from(self.suffix_len)]
     }
     pub fn device_id(&self) -> DeviceId {
         self.device
@@ -122,6 +286,66 @@ impl std::fmt::Debug for ObservedAddress<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_panicking_writer_leaves_a_serializable_canonical_address() {
+        let mut address = ProtocolAddress::new("previous", u32::MAX.into());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                address.reset_with(|out| {
+                    out.push_str("partial-λ");
+                    panic!("synthetic writer failure");
+                });
+            }))
+            .is_err()
+        );
+        assert_eq!(address.name(), "partial-λ");
+        assert_eq!(address.as_str(), "partial-λ.4294967295");
+        assert_eq!(
+            serde_json::from_slice::<ProtocolAddress>(&serde_json::to_vec(&address).unwrap())
+                .unwrap(),
+            address
+        );
+    }
+
+    #[test]
+    fn inline_addresses_fit_the_layout_budget_and_reuse_overflow_storage() {
+        assert!(size_of::<ProtocolAddress>() <= 64);
+        let mut buffer = AddressBuf::empty();
+        buffer.push_str(&"λ".repeat(23));
+        buffer.push('x');
+        assert_eq!(buffer.as_str().len(), 47);
+        assert!(matches!(buffer.0, AddressStorage::Inline(_)));
+        buffer.push('🦀');
+        assert_eq!(buffer.as_str(), format!("{}x🦀", "λ".repeat(23)));
+        assert!(matches!(buffer.0, AddressStorage::Heap(_)));
+        let pointer = buffer.as_str().as_ptr();
+        buffer.clear();
+        buffer.push_str("short");
+        assert_eq!(buffer.as_str(), "short");
+        assert_eq!(buffer.as_str().as_ptr(), pointer);
+        for (length, device) in [(45, 0), (36, u32::MAX)] {
+            let address = ProtocolAddress::new(&"a".repeat(length), device.into());
+            assert!(matches!(address.text.0, AddressStorage::Inline(_)));
+        }
+    }
+
+    #[test]
+    fn deserialization_rejects_inconsistent_cached_name_boundaries() {
+        for (text, name_len, device) in [
+            ("λ.0", 1, 0),
+            ("a.0", usize::MAX, 0),
+            ("a.1", 1, 0),
+            ("a", 1, 0),
+        ] {
+            assert!(
+                serde_json::from_value::<ProtocolAddress>(serde_json::json!({
+                    "text": text, "name_len": name_len, "device": device,
+                }))
+                .is_err()
+            );
+        }
+    }
+
     #[test]
     fn address_text_and_serde_contract_across_utf8_and_storage_boundaries() {
         use sha2::{Digest, Sha256};
