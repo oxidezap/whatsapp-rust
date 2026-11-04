@@ -102,6 +102,46 @@ fn inline_three_known_count(bencher: divan::Bencher, count: usize) {
     });
 }
 
+// One attribute pool per decoded tree: nodes keep a (start, len) range into a
+// shared Vec instead of owning a per-node allocation. The pool grows
+// geometrically because the decoder does not know the total count up front.
+// This removes per-node malloc/free and shrinks the record (8 B range vs 16 B
+// boxed slice), at the cost of amortized pool reallocation.
+#[divan::bench(args = [0, 1, 2, 3, 4, 8, 9])]
+fn pooled(bencher: divan::Bencher, count: usize) {
+    measure_pooled(bencher, count, 0);
+}
+
+// Upper bound for a chunked arena (e.g. bumpalo) that never copies on growth:
+// the pool is sized once for the whole batch.
+#[divan::bench(args = [0, 1, 2, 3, 4, 8, 9])]
+fn pooled_presized(bencher: divan::Bencher, count: usize) {
+    let total = (0..NODES)
+        .map(|i| if count == 9 { i % 9 } else { count })
+        .sum();
+    measure_pooled(bencher, count, total);
+}
+
+fn measure_pooled(bencher: divan::Bencher, count: usize, capacity: usize) {
+    bencher.bench_local(|| {
+        let mut pool: Vec<(NodeStr<'static>, ValueRef<'static>)> =
+            Vec::with_capacity(black_box(capacity));
+        let nodes: Vec<_> = (0..NODES)
+            .map(|i| {
+                let count = black_box(if count == 9 { i % 9 } else { count });
+                let start = pool.len() as u32;
+                pool.extend(entries(count));
+                StoredNode {
+                    _tag: NodeStr::Borrowed("message"),
+                    _attrs: (start, count as u32),
+                    _content: None,
+                }
+            })
+            .collect();
+        black_box((&nodes, &pool));
+    });
+}
+
 fn main() {
     divan::main();
 }
