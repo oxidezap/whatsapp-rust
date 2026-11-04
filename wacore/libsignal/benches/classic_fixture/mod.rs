@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Synthetic workloads through public protocol ports. No timing or old engine dependency.
 use async_trait::async_trait;
+#[cfg(feature = "bench-internals")]
 use buffa::Message as _;
 use futures::executor::block_on;
 use rand::{SeedableRng, rngs::StdRng};
