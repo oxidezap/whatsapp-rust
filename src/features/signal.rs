@@ -995,6 +995,75 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
+    async fn serialized_signal_output_uses_the_provider_and_rolls_back_failed_callbacks() {
+        use crate::test_utils::{create_test_client_with_runtime, crypto::CountingCrypto};
+        use wacore::libsignal::protocol::{SessionStore, message_encrypt_serialized_with_provider};
+        use wacore::runtime::CryptoRuntime;
+        let provider = Arc::new(CountingCrypto::default());
+        let client = create_test_client_with_runtime(
+            "serialized-crypto",
+            Arc::new(CryptoRuntime::new(
+                Arc::new(crate::TokioRuntime),
+                provider.clone(),
+            )),
+        )
+        .await;
+        let peer = Jid::pn_device("15550003004", 1);
+        seed_peer_session(&client, &peer).await;
+        let address = peer.to_protocol_address();
+        let mut stores = client.signal_adapter();
+        let output = message_encrypt_serialized_with_provider(
+            &*provider,
+            &[7; 4096],
+            &address,
+            &mut stores.session_store,
+            &mut stores.identity_store,
+        )
+        .await
+        .unwrap();
+        assert!(!output.serialized().is_empty());
+        assert_eq!(provider.encrypts.load(Ordering::Relaxed), 1);
+        assert!(provider.macs.load(Ordering::Relaxed) > 0);
+        let before = stores
+            .session_store
+            .load_session(&address)
+            .await
+            .unwrap()
+            .unwrap()
+            .serialize()
+            .unwrap();
+        for fail_mac in [false, true] {
+            provider.fail_encrypt.store(!fail_mac, Ordering::Relaxed);
+            provider.fail_mac.store(fail_mac, Ordering::Relaxed);
+            assert!(
+                message_encrypt_serialized_with_provider(
+                    &*provider,
+                    b"failed callback",
+                    &address,
+                    &mut stores.session_store,
+                    &mut stores.identity_store
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                stores
+                    .session_store
+                    .load_session(&address)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .serialize()
+                    .unwrap(),
+                before
+            );
+        }
+        provider.fail_encrypt.store(false, Ordering::Relaxed);
+        provider.fail_mac.store(false, Ordering::Relaxed);
+        client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
     async fn explicit_crypto_provider_executes_signal_callbacks_and_rolls_back_failures() {
         use crate::test_utils::{create_test_client_with_runtime, crypto::CountingCrypto};
         use wacore::libsignal::protocol::SessionStore;

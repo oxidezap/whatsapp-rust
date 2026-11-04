@@ -33,6 +33,49 @@ pub enum CiphertextMessageType {
     SenderKey,
     Plaintext,
 }
+/// Owned outbound bytes, without shared-buffer bookkeeping or parsed message views.
+/// The host must satisfy the same durable reservation gate as for typed messages.
+pub struct SerializedCiphertext {
+    kind: CiphertextMessageType,
+    bytes: Vec<u8>,
+}
+impl SerializedCiphertext {
+    pub fn message_type(&self) -> CiphertextMessageType {
+        self.kind
+    }
+    pub fn serialized(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub fn into_serialized(self) -> Vec<u8> {
+        self.bytes
+    }
+    pub(crate) fn from_pairwise(bytes: Vec<u8>, prekey: bool) -> Result<Self> {
+        // Validate before the adapter commits, exactly as the typed output path
+        // does, while keeping ownership of the original allocation.
+        let inner = if prekey {
+            validate_version(&bytes, false, 0)?;
+            let view = engine::wire::PreKeySignalMessageView::decode(&bytes)
+                .map_err(|e| error::message_error(e, CiphertextMessageType::PreKey, 0, 0))?;
+            public(&view.identity)?;
+            public(&view.base_key)?;
+            view.message
+        } else {
+            bytes.as_slice()
+        };
+        validate_version(inner, false, 8)?;
+        let view = engine::wire::SignalMessageView::decode(inner)
+            .map_err(|e| error::message_error(e, CiphertextMessageType::Whisper, 0, 0))?;
+        public(&view.ratchet)?;
+        Ok(Self {
+            kind: if prekey {
+                CiphertextMessageType::PreKey
+            } else {
+                CiphertextMessageType::Whisper
+            },
+            bytes,
+        })
+    }
+}
 #[derive(Clone, Debug)]
 pub struct SignalMessage {
     pub(crate) bytes: Bytes,
@@ -436,6 +479,48 @@ impl OwnedCiphertextMessage {
 #[cfg(test)]
 mod borrowed_tests {
     use super::*;
+    #[test]
+    fn serialized_output_validation_matches_typed_decoders_for_mutated_envelopes() {
+        let key = PublicKey::from_djb_public_key_bytes(&[9; 32]).unwrap();
+        let identity = IdentityKey::new(key);
+        for version in [3, 4] {
+            let signal =
+                SignalMessage::new(version, &[7; 32], key, 1, 0, &[2; 16], &identity, &identity)
+                    .unwrap();
+            let prekey = PreKeySignalMessage::new(
+                version,
+                5,
+                Some(4.into()),
+                7.into(),
+                key,
+                identity,
+                signal.clone(),
+            )
+            .unwrap();
+            for (encoded, is_prekey) in [(signal.serialize(), false), (prekey.serialize(), true)] {
+                let mut variants = vec![encoded.clone()];
+                variants.extend((0..encoded.len()).map(|end| encoded[..end].to_vec()));
+                variants.extend((0..encoded.len()).map(|index| {
+                    let mut changed = encoded.clone();
+                    changed[index] ^= 0x80;
+                    changed
+                }));
+                for bytes in variants {
+                    let typed = if is_prekey {
+                        PreKeySignalMessage::try_from(bytes.as_slice()).map(|_| ())
+                    } else {
+                        SignalMessage::try_from(bytes.as_slice()).map(|_| ())
+                    };
+                    let serialized =
+                        SerializedCiphertext::from_pairwise(bytes, is_prekey).map(|_| ());
+                    assert_eq!(
+                        serialized.map_err(|e| e.to_string()),
+                        typed.map_err(|e| e.to_string())
+                    );
+                }
+            }
+        }
+    }
     #[test]
     fn sender_distribution_debug_hides_encoded_and_parsed_chain_secret() {
         let distribution = SenderKeyDistributionMessage::new(

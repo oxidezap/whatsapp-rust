@@ -306,7 +306,7 @@ async fn encrypt_one_device(
     crypto_provider: Option<std::sync::Arc<dyn crate::libsignal::crypto::SymmetricCryptoProvider>>,
 ) -> (Jid, Result<Option<EncryptOneResult>>) {
     let encrypted = if let Some(provider) = crypto_provider {
-        crate::libsignal::protocol::message_encrypt_with_provider(
+        crate::libsignal::protocol::message_encrypt_serialized_with_provider(
             &*provider,
             plaintext,
             addr,
@@ -315,22 +315,31 @@ async fn encrypt_one_device(
         )
         .await
     } else {
-        message_encrypt(plaintext, addr, session_store, identity_store).await
+        crate::libsignal::protocol::message_encrypt_serialized(
+            plaintext,
+            addr,
+            session_store,
+            identity_store,
+        )
+        .await
     };
     match encrypted {
         Ok(encrypted_payload) => {
-            let Some((enc_type, is_prekey, serialized_bytes)) =
-                extract_ciphertext(encrypted_payload)
-            else {
-                return (device_jid, Ok(None));
+            let (enc_type, is_prekey) = match encrypted_payload.message_type() {
+                crate::libsignal::protocol::CiphertextMessageType::Whisper => {
+                    (stanza::ENC_TYPE_MSG, false)
+                }
+                crate::libsignal::protocol::CiphertextMessageType::PreKey => {
+                    (stanza::ENC_TYPE_PKMSG, true)
+                }
+                _ => return (device_jid, Ok(None)),
             };
             (
                 device_jid,
                 Ok(Some(EncryptOneResult {
                     enc_type,
                     is_prekey,
-                    // Box<[u8]> -> Vec<u8> reuses the allocation (no copy).
-                    ciphertext: serialized_bytes.into(),
+                    ciphertext: encrypted_payload.into_serialized(),
                 })),
             )
         }

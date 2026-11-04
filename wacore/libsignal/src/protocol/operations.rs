@@ -91,7 +91,15 @@ pub async fn message_encrypt<S: SessionStore + ?Sized, I: IdentityKeyStore + ?Si
     sessions: &mut S,
     identities: &mut I,
 ) -> Result<CiphertextMessage> {
-    message_encrypt_using(engine::RustCrypto, plaintext, address, sessions, identities).await
+    message_encrypt_using(
+        engine::RustCrypto,
+        plaintext,
+        address,
+        sessions,
+        identities,
+        parse_encrypted_message,
+    )
+    .await
 }
 /// Run this operation with a caller-owned symmetric crypto backend.
 #[allow(clippy::too_many_arguments)]
@@ -111,6 +119,57 @@ pub async fn message_encrypt_with_provider<
         address,
         sessions,
         identities,
+        parse_encrypted_message,
+    )
+    .await
+}
+fn parse_encrypted_message(bytes: Vec<u8>, prekey: bool) -> Result<CiphertextMessage> {
+    let bytes = bytes::Bytes::from(bytes);
+    if prekey {
+        Ok(CiphertextMessage::PreKeySignalMessage(
+            PreKeySignalMessage::try_from(bytes)?,
+        ))
+    } else {
+        Ok(CiphertextMessage::SignalMessage(SignalMessage::try_from(
+            bytes,
+        )?))
+    }
+}
+/// Encrypt directly into owned wire bytes, preserving checkout and durability semantics.
+pub async fn message_encrypt_serialized<S: SessionStore + ?Sized, I: IdentityKeyStore + ?Sized>(
+    plaintext: &[u8],
+    address: &ProtocolAddress,
+    sessions: &mut S,
+    identities: &mut I,
+) -> Result<SerializedCiphertext> {
+    message_encrypt_using(
+        engine::RustCrypto,
+        plaintext,
+        address,
+        sessions,
+        identities,
+        SerializedCiphertext::from_pairwise,
+    )
+    .await
+}
+/// Encrypt owned wire bytes with an explicit symmetric crypto provider.
+pub async fn message_encrypt_serialized_with_provider<
+    S: SessionStore + ?Sized,
+    I: IdentityKeyStore + ?Sized,
+>(
+    provider: &dyn crate::crypto::SymmetricCryptoProvider,
+    plaintext: &[u8],
+    address: &ProtocolAddress,
+    sessions: &mut S,
+    identities: &mut I,
+) -> Result<SerializedCiphertext> {
+    message_encrypt_using(
+        crate::crypto::ProviderCrypto::new(provider),
+        plaintext,
+        address,
+        sessions,
+        identities,
+        SerializedCiphertext::from_pairwise,
     )
     .await
 }
@@ -119,13 +178,15 @@ async fn message_encrypt_using<
     C: engine::CryptoProvider,
     S: SessionStore + ?Sized,
     I: IdentityKeyStore + ?Sized,
+    T,
 >(
     crypto: C,
     plaintext: &[u8],
     address: &ProtocolAddress,
     sessions: &mut S,
     identities: &mut I,
-) -> Result<CiphertextMessage> {
+    finish: impl FnOnce(Vec<u8>, bool) -> Result<T>,
+) -> Result<T> {
     let mut checkout = SessionCheckout::load(sessions, address)
         .await?
         .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone().into()))?;
@@ -172,12 +233,7 @@ async fn message_encrypt_using<
             return Err(error.into());
         }
     };
-    let bytes = bytes::Bytes::from(bytes);
-    let message = if prekey {
-        CiphertextMessage::PreKeySignalMessage(PreKeySignalMessage::try_from(bytes)?)
-    } else {
-        CiphertextMessage::SignalMessage(SignalMessage::try_from(bytes)?)
-    };
+    let message = finish(bytes, prekey)?;
     checkout.commit().await?;
     Ok(message)
 }

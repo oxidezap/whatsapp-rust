@@ -19,7 +19,7 @@ fn run<F: Future>(future: F) -> F::Output {
         }
     }
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Sessions(HashMap<ProtocolAddress, SessionRecord>);
 #[async_trait]
 impl SessionStore for Sessions {
@@ -38,6 +38,7 @@ impl SessionStore for Sessions {
         Ok(())
     }
 }
+#[derive(Clone)]
 struct Identity {
     pair: IdentityKeyPair,
     known: HashMap<ProtocolAddress, IdentityKey>,
@@ -168,6 +169,65 @@ fn setup(rng: &mut rand::rngs::StdRng) -> (Identity, Identity, PreKeyBundle, Key
         signed: SignedPreKeyRecord::new(3.into(), 123u64, &signed, &signature).unwrap(),
     };
     (a, b, bundle, keys)
+}
+#[test]
+fn serialized_and_typed_encrypt_preserve_bytes_state_and_message_kind() {
+    run(async {
+        for version in [3, 4] {
+            for prekey in [false, true] {
+                let mut rng = rand::rngs::StdRng::seed_from_u64(184275);
+                let (mut identity, _, bundle, _) = setup(&mut rng);
+                let address = ProtocolAddress::new("serialized.invalid", 1.into());
+                let mut typed_sessions = Sessions::default();
+                process_prekey_bundle(
+                    &address,
+                    &mut typed_sessions,
+                    &mut identity,
+                    &bundle,
+                    &mut rng,
+                    UsePQRatchet::No,
+                )
+                .await
+                .unwrap();
+                let state = typed_sessions
+                    .0
+                    .get_mut(&address)
+                    .unwrap()
+                    .session_state_mut()
+                    .unwrap();
+                state.inner.version = version;
+                if !prekey {
+                    state.clear_unacknowledged_pre_key_message();
+                }
+                let mut serialized_sessions = typed_sessions.clone();
+                let mut serialized_identity = identity.clone();
+                for len in [0, 1, 15, 16, 17, 1024] {
+                    let plaintext = vec![len as u8; len];
+                    let typed =
+                        message_encrypt(&plaintext, &address, &mut typed_sessions, &mut identity)
+                            .await
+                            .unwrap();
+                    let serialized = message_encrypt_serialized(
+                        &plaintext,
+                        &address,
+                        &mut serialized_sessions,
+                        &mut serialized_identity,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(serialized.serialized(), typed.serialized());
+                    assert_eq!(serialized.message_type(), typed.message_type());
+                    assert_eq!(
+                        serialized_sessions.0[&address].serialize().unwrap(),
+                        typed_sessions.0[&address].serialize().unwrap()
+                    );
+                    let pointer = serialized.serialized().as_ptr();
+                    let output = serialized.into_serialized();
+                    assert_eq!(output.as_ptr(), pointer);
+                }
+            }
+        }
+    })
 }
 #[test]
 fn host_roundtrip_leases_and_consumed_prekey_reporting() {
@@ -1321,19 +1381,24 @@ fn sending_repairs_missing_and_stale_identity_rows() {
 #[test]
 fn sending_identity_save_failure_and_cancellation_restore_owned_checkout() {
     run(async {
-        for cancel in [false, true] {
+        for (cancel, serialized) in [(false, false), (true, false), (false, true), (true, true)] {
             let mut f = established_signal_fixture(1202).await;
             let before = f.a_sessions.0[&f.ba].serialize().unwrap();
             let mut sessions = checkout_store();
             *sessions.record.lock().unwrap() = f.a_sessions.0.remove(&f.ba);
             f.a.fail_save = !cancel;
             f.a.block_save = cancel;
-            let mut future = Box::pin(message_encrypt(
-                b"identity failure",
-                &f.ba,
-                &mut sessions,
-                &mut f.a,
-            ));
+            let mut future = Box::pin(async {
+                if serialized {
+                    message_encrypt_serialized(b"identity failure", &f.ba, &mut sessions, &mut f.a)
+                        .await
+                        .map(|_| ())
+                } else {
+                    message_encrypt(b"identity failure", &f.ba, &mut sessions, &mut f.a)
+                        .await
+                        .map(|_| ())
+                }
+            });
             let result = future
                 .as_mut()
                 .poll(&mut Context::from_waker(Waker::noop()));
