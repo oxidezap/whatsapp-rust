@@ -273,12 +273,15 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         };
         let plan = session.receivers[index].plan(self.crypto, message.counter, limit)?;
         let (cipher, mac, iv) = plan.message.expanded(self.crypto)?;
-        let mut authenticated = Vec::with_capacity(input.len() + 66);
-        authenticated.extend_from_slice(&wire::tagged_key(&session.remote_identity));
-        authenticated.extend_from_slice(&wire::tagged_key(&session.local_identity));
-        authenticated.extend_from_slice(&input[..input.len() - 8]);
         authenticate(
-            &self.crypto.hmac_sha256(&mac, &[&authenticated])?[..8],
+            &self.crypto.hmac_sha256(
+                &mac,
+                &[
+                    &wire::tagged_key(&session.remote_identity),
+                    &wire::tagged_key(&session.local_identity),
+                    &input[..input.len() - 8],
+                ],
+            )?[..8],
             &message.mac,
         )?;
         let plaintext = self.crypto.decrypt_cbc(&cipher, &iv, message.ciphertext)?;
@@ -384,12 +387,15 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         };
         let advance = session.receivers[index].plan(self.crypto, message.counter, limit)?;
         let (cipher, mac, iv) = advance.message.expanded(self.crypto)?;
-        let mut authenticated = Vec::with_capacity(input.len() + 66);
-        authenticated.extend_from_slice(&wire::tagged_key(&session.remote_identity));
-        authenticated.extend_from_slice(&wire::tagged_key(&session.local_identity));
-        authenticated.extend_from_slice(&input[..input.len() - 8]);
         authenticate(
-            &self.crypto.hmac_sha256(&mac, &[&authenticated])?[..8],
+            &self.crypto.hmac_sha256(
+                &mac,
+                &[
+                    &wire::tagged_key(&session.remote_identity),
+                    &wire::tagged_key(&session.local_identity),
+                    &input[..input.len() - 8],
+                ],
+            )?[..8],
             &message.mac,
         )?;
         let plaintext = self.crypto.decrypt_cbc(&cipher, &iv, message.ciphertext)?;
