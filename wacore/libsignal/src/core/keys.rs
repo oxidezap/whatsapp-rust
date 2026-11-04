@@ -4,6 +4,7 @@
 use crate::engine::{CryptoProvider, RandomSource, rustcrypto::RustCrypto};
 use rand::{CryptoRng, Rng};
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 use zeroize::Zeroize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -51,8 +52,19 @@ impl PublicKey {
         PreparedVerifyingKey::new(self)
     }
 }
-#[derive(Clone, PartialEq, Eq)]
-pub struct PrivateKey([u8; 32]);
+/// Raw scalar with a lazy inline signing context. Equality and serialization
+/// depend only on the scalar, including after signing or cloning a warm key.
+#[derive(Clone)]
+pub struct PrivateKey {
+    key: [u8; 32],
+    signing: OnceLock<PreparedSigningKey>,
+}
+impl PartialEq for PrivateKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+impl Eq for PrivateKey {}
 impl std::fmt::Debug for PrivateKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("PrivateKey([redacted])")
@@ -60,7 +72,7 @@ impl std::fmt::Debug for PrivateKey {
 }
 impl Drop for PrivateKey {
     fn drop(&mut self) {
-        self.0.zeroize();
+        self.key.zeroize();
     }
 }
 // Persisted key serde uses tagged public keys and raw private scalars. Arrays
@@ -174,21 +186,29 @@ impl<R: Rng + CryptoRng> RandomSource for RandomAdapter<'_, R> {
     }
 }
 impl PrivateKey {
+    fn from_raw(key: [u8; 32]) -> Self {
+        Self {
+            key,
+            signing: OnceLock::new(),
+        }
+    }
     pub fn deserialize(bytes: &[u8]) -> Result<Self> {
-        Ok(Self(bytes.try_into().map_err(|_| CurveError::InvalidKey)?))
+        Ok(Self::from_raw(
+            bytes.try_into().map_err(|_| CurveError::InvalidKey)?,
+        ))
     }
     pub fn serialize(&self) -> &[u8; 32] {
-        &self.0
+        &self.key
     }
     pub fn public_key(&self) -> Result<PublicKey> {
         RustCrypto
-            .public_key(&self.0)
+            .public_key(&self.key)
             .map(PublicKey)
             .map_err(|_| CurveError::Crypto)
     }
     pub fn calculate_agreement(&self, public: &PublicKey) -> Result<[u8; 32]> {
         RustCrypto
-            .agreement(&self.0, &public.0)
+            .agreement(&self.key, &public.0)
             .map_err(|_| CurveError::Crypto)
     }
     pub fn calculate_signature<R: Rng + CryptoRng>(
@@ -196,9 +216,9 @@ impl PrivateKey {
         message: &[u8],
         rng: &mut R,
     ) -> Result<[u8; 64]> {
-        RustCrypto
-            .sign(&self.0, message, &mut RandomAdapter(rng))
-            .map_err(|_| CurveError::Crypto)
+        self.signing
+            .get_or_init(|| PreparedSigningKey::prepare(&self.key))
+            .calculate_signature(message, rng)
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,7 +240,7 @@ impl KeyPair {
         raw[31] = (raw[31] & 127) | 64;
         let public =
             curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(*raw).to_bytes();
-        Self::new(PublicKey(public), PrivateKey(*raw))
+        Self::new(PublicKey(public), PrivateKey::from_raw(*raw))
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -535,6 +555,53 @@ mod tests {
                     .public_key
                     .verify_signature(b"synthetic matching pair", &signature)
             );
+        }
+    }
+
+    #[test]
+    fn retained_private_keys_match_uncached_signing_without_changing_storage() {
+        use rand::SeedableRng;
+        for byte in [0, 1, 37, 128, 255] {
+            let private = PrivateKey::deserialize(&[byte; 32]).unwrap();
+            let cold_copy = private.clone();
+            let encoded = serde_json::to_vec(&private).unwrap();
+            let mut binary = Vec::new();
+            ciborium::ser::into_writer(&private, &mut binary).unwrap();
+            let mut cached_random = rand::rngs::StdRng::from_seed([byte; 32]);
+            let mut direct_random = rand::rngs::StdRng::from_seed([byte; 32]);
+            let mut copy_random = rand::rngs::StdRng::from_seed([byte; 32]);
+            for message in [&b""[..], &b"synthetic"[..], &[0; 129][..]] {
+                let signature = private
+                    .calculate_signature(message, &mut cached_random)
+                    .unwrap();
+                let direct = RustCrypto
+                    .sign(
+                        private.serialize(),
+                        message,
+                        &mut RandomAdapter(&mut direct_random),
+                    )
+                    .unwrap();
+                assert_eq!(signature, direct);
+                assert_eq!(
+                    private
+                        .clone()
+                        .calculate_signature(message, &mut copy_random)
+                        .unwrap(),
+                    direct
+                );
+                assert_eq!(private, cold_copy);
+                assert_eq!(private.serialize(), &[byte; 32]);
+                assert_eq!(serde_json::to_vec(&private).unwrap(), encoded);
+                let mut warm_binary = Vec::new();
+                ciborium::ser::into_writer(&private, &mut warm_binary).unwrap();
+                assert_eq!(warm_binary, binary);
+                assert!(
+                    private
+                        .public_key()
+                        .unwrap()
+                        .verify_signature(message, &signature)
+                );
+            }
         }
     }
 
