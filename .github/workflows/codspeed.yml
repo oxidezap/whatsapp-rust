@@ -33,6 +33,50 @@ env:
   MALLOC_TOP_PAD_: "131072"
 
 jobs:
+  prefetch-pair:
+    name: Prefetch base/head on the same host
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@${{ env.PROTOC_VERSION }},cargo-codspeed@5.0.2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: prefetch-pair
+          cache-targets: "false"
+      - name: Build immutable revisions and identical prefetch workloads
+        env:
+          BASE_REVISION: ${{ github.event.pull_request.base.sha }}
+          HEAD_REVISION: ${{ github.event.pull_request.head.sha }}
+        run: |
+          cargo build --locked -p whatsapp-xtask
+          install -m 755 target/debug/whatsapp-xtask "$RUNNER_TEMP/prefetch-compare"
+          "$RUNNER_TEMP/prefetch-compare" ci prefetch-pair-prepare --base-revision "$BASE_REVISION" --head-revision "$HEAD_REVISION"
+          lscpu > .prefetch-pair-out/results/host.txt
+      # The head's harness explicitly measures base and head artifacts. Names
+      # include the role/repetition; no git/CI metadata or baseline is replaced.
+      - name: Measure alternating base/head samples with CodSpeed
+        uses: CodSpeedHQ/action@61efe07e57e55bedeab750c434504de272a56e8c # v5.6.1
+        with:
+          mode: walltime
+          runner-version: "5.4.2"
+          run: '"$RUNNER_TEMP/prefetch-compare" ci prefetch-pair-measure'
+      - name: Preserve exact sources, registration patches and measurement provenance
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: prefetch-pair
+          path: .prefetch-pair-out/results
   connected-retention:
     name: Connected retention against PR base
     if: github.event_name == 'pull_request'

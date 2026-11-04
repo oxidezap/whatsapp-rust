@@ -4,6 +4,7 @@ mod ci;
 mod compatibility;
 mod consumers;
 mod package_consumers;
+mod prefetch_pair;
 mod session_retention;
 mod size;
 mod size_baseline;

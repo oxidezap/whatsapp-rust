@@ -8,6 +8,20 @@ use xtask_support::{capture, write};
 
 #[derive(Subcommand)]
 pub enum Task {
+    /// Build immutable base/head prefetch workloads for a same-host CodSpeed comparison.
+    PrefetchPairPrepare {
+        #[arg(long)]
+        base_revision: String,
+        #[arg(long)]
+        head_revision: String,
+        #[arg(long, default_value = ".prefetch-pair-out")]
+        out_dir: PathBuf,
+    },
+    /// Run uniquely named base/head samples under the enclosing CodSpeed instrument.
+    PrefetchPairMeasure {
+        #[arg(long, default_value = ".prefetch-pair-out")]
+        out_dir: PathBuf,
+    },
     /// Compare process-isolated connected retention against matched baseline executables.
     SessionRetention {
         #[arg(long)]
@@ -225,6 +239,16 @@ fn timed_report(
 
 pub fn run(root: &Path, task: Task) -> Result<u8> {
     match task {
+        Task::PrefetchPairPrepare {
+            base_revision,
+            head_revision,
+            out_dir,
+        } => {
+            super::prefetch_pair::prepare(root, &base_revision, &head_revision, &out_dir)?;
+        }
+        Task::PrefetchPairMeasure { out_dir } => {
+            super::prefetch_pair::measure(root, &out_dir)?;
+        }
         Task::SessionRetention {
             base_executable,
             head_executable,
