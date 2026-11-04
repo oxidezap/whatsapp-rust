@@ -18,7 +18,7 @@ pub async fn encrypt_group_message<S, R>(
     sender_key_name: &SenderKeyName,
     plaintext: &[u8],
     csprng: &mut R,
-) -> Result<SenderKeyMessage>
+) -> Result<SerializedCiphertext>
 where
     S: SenderKeyStore + ?Sized,
     R: Rng + CryptoRng,
@@ -28,9 +28,14 @@ where
     // the concrete SignalProtocolError as the source, so callers can still
     // downcast NoSenderKeyState to clear stale tracking and retry with SKDM
     // redistribution.
-    crate::libsignal::protocol::group_encrypt(sender_key_store, sender_key_name, plaintext, csprng)
-        .await
-        .context("group encrypt failed")
+    crate::libsignal::protocol::group_encrypt_serialized(
+        sender_key_store,
+        sender_key_name,
+        plaintext,
+        csprng,
+    )
+    .await
+    .context("group encrypt failed")
 }
 
 /// Object-safe `SessionStore` that can clone itself into an owned box. The

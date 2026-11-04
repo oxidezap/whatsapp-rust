@@ -511,6 +511,298 @@ impl SenderKeyStore for Groups {
     }
 }
 #[test]
+fn prepared_group_context_preserves_state_and_rejects_unrelated_keys() {
+    run(async {
+        let name = SenderKeyName::from_parts("prepared.invalid@g.us", "sender.invalid:1");
+        let mut random = rand::rngs::StdRng::seed_from_u64(184259);
+        let mut first = Groups::default();
+        create_sender_key_distribution_message(&name, &mut first, &mut random)
+            .await
+            .unwrap();
+        let record = first.records.get_mut(&name).unwrap();
+        let before = record.serialize().unwrap();
+        let components = record.clone().into_components().unwrap();
+        let context = record.prepare_crypto_context();
+        assert_eq!(record.serialize().unwrap(), before);
+        let mut rebuilt = SenderKeyRecord::from_components(components).unwrap();
+        let rebuilt_before = rebuilt.serialize().unwrap();
+        rebuilt.restore_crypto_context(&context);
+        assert_eq!(rebuilt.serialize().unwrap(), rebuilt_before);
+        assert_eq!(record.reserved_iteration(), rebuilt.reserved_iteration());
+        let mut prepared = Groups::default();
+        prepared.records.insert(name.clone(), rebuilt);
+        let mut cold = Groups::default();
+        cold.records.insert(
+            name.clone(),
+            SenderKeyRecord::from_components(record.clone().into_components().unwrap()).unwrap(),
+        );
+        for _ in 0..3 {
+            let left = group_encrypt(
+                &mut cold,
+                &name,
+                b"matching",
+                &mut rand::rngs::StdRng::seed_from_u64(11),
+            )
+            .await
+            .unwrap();
+            let right = group_encrypt(
+                &mut prepared,
+                &name,
+                b"matching",
+                &mut rand::rngs::StdRng::seed_from_u64(11),
+            )
+            .await
+            .unwrap();
+            assert_eq!(left.serialized(), right.serialized());
+            assert_eq!(
+                cold.records[&name].serialize().unwrap(),
+                prepared.records[&name].serialize().unwrap()
+            );
+        }
+        let mut second = Groups::default();
+        let distribution = create_sender_key_distribution_message(&name, &mut second, &mut random)
+            .await
+            .unwrap();
+        let mut wrong = Groups {
+            records: second.records.clone(),
+            ..Default::default()
+        };
+        wrong
+            .records
+            .get_mut(&name)
+            .unwrap()
+            .restore_crypto_context(&context);
+        let mut receiver = Groups::default();
+        process_sender_key_distribution_message(&name, &distribution, &mut receiver)
+            .await
+            .unwrap();
+        let normal = group_encrypt(
+            &mut second,
+            &name,
+            b"different key",
+            &mut rand::rngs::StdRng::seed_from_u64(12),
+        )
+        .await
+        .unwrap();
+        let restored = group_encrypt(
+            &mut wrong,
+            &name,
+            b"different key",
+            &mut rand::rngs::StdRng::seed_from_u64(12),
+        )
+        .await
+        .unwrap();
+        assert_eq!(normal.serialized(), restored.serialized());
+        assert_eq!(
+            second.records[&name].serialize().unwrap(),
+            wrong.records[&name].serialize().unwrap()
+        );
+        receiver
+            .records
+            .get_mut(&name)
+            .unwrap()
+            .restore_crypto_context(&context);
+        assert_eq!(
+            group_decrypt(restored.serialized(), &mut receiver, &name)
+                .await
+                .unwrap(),
+            b"different key"
+        );
+        let mut changed = first.records[&name].clone().into_components().unwrap();
+        changed.states[0].signing_key.private = second.records[&name]
+            .clone()
+            .into_components()
+            .unwrap()
+            .states[0]
+            .signing_key
+            .private
+            .clone();
+        let mut cold = Groups::default();
+        cold.records.insert(
+            name.clone(),
+            SenderKeyRecord::from_components(changed.clone()).unwrap(),
+        );
+        let mut restored = SenderKeyRecord::from_components(changed).unwrap();
+        restored.restore_crypto_context(&context);
+        let mut warm = Groups::default();
+        warm.records.insert(name.clone(), restored);
+        let left = group_encrypt(
+            &mut cold,
+            &name,
+            b"changed private",
+            &mut rand::rngs::StdRng::seed_from_u64(13),
+        )
+        .await
+        .unwrap();
+        let right = group_encrypt(
+            &mut warm,
+            &name,
+            b"changed private",
+            &mut rand::rngs::StdRng::seed_from_u64(13),
+        )
+        .await
+        .unwrap();
+        assert_eq!(left.serialized(), right.serialized());
+        assert_eq!(
+            cold.records[&name].serialize().unwrap(),
+            warm.records[&name].serialize().unwrap()
+        );
+    });
+}
+#[test]
+fn owned_group_output_preserves_bytes_state_provider_and_store_failure() {
+    use crate::crypto::{CryptoProviderError, RustCryptoProvider, SymmetricCryptoProvider};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Selected(AtomicUsize);
+    impl SymmetricCryptoProvider for Selected {
+        fn aes_256_cbc_encrypt(
+            &self,
+            key: &[u8; 32],
+            iv: &[u8; 16],
+            input: &[u8],
+            output: &mut Vec<u8>,
+        ) -> Result<(), CryptoProviderError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            RustCryptoProvider.aes_256_cbc_encrypt(key, iv, input, output)
+        }
+    }
+    run(async {
+        let name = SenderKeyName::from_parts("owned-output.invalid@g.us", "sender.invalid:1");
+        let mut random = rand::rngs::StdRng::seed_from_u64(184257);
+        let fresh_random = || rand::rngs::StdRng::seed_from_u64(184258);
+        let mut initial = Groups::default();
+        let distribution = create_sender_key_distribution_message(&name, &mut initial, &mut random)
+            .await
+            .unwrap();
+        for selected in [false, true] {
+            for length in [0, 1, 15, 16, 17, 127, 128, 1024] {
+                let mut typed_store = Groups {
+                    records: initial.records.clone(),
+                    ..Default::default()
+                };
+                let mut owned_store = Groups {
+                    records: initial.records.clone(),
+                    ..Default::default()
+                };
+                let snapshot = owned_store.records[&name].serialize().unwrap();
+                let payload = vec![93; length];
+                let provider = Selected(AtomicUsize::new(0));
+                owned_store.fail_store = true;
+                assert!(
+                    group_encrypt_serialized(
+                        &mut owned_store,
+                        &name,
+                        &payload,
+                        &mut fresh_random()
+                    )
+                    .await
+                    .is_err()
+                );
+                assert_eq!(owned_store.records[&name].serialize().unwrap(), snapshot);
+                owned_store.fail_store = false;
+                let typed = if selected {
+                    group_encrypt_with_provider(
+                        &provider,
+                        &mut typed_store,
+                        &name,
+                        &payload,
+                        &mut fresh_random(),
+                    )
+                    .await
+                } else {
+                    group_encrypt(&mut typed_store, &name, &payload, &mut fresh_random()).await
+                }
+                .unwrap();
+                let owned = if selected {
+                    group_encrypt_serialized_with_provider(
+                        &provider,
+                        &mut owned_store,
+                        &name,
+                        &payload,
+                        &mut fresh_random(),
+                    )
+                    .await
+                } else {
+                    group_encrypt_serialized(&mut owned_store, &name, &payload, &mut fresh_random())
+                        .await
+                }
+                .unwrap();
+                assert_eq!(owned.message_type(), CiphertextMessageType::SenderKey);
+                assert_eq!(owned.serialized(), typed.serialized());
+                assert_eq!(
+                    owned_store.records[&name].serialize().unwrap(),
+                    typed_store.records[&name].serialize().unwrap()
+                );
+                assert_eq!(
+                    provider.0.load(Ordering::Relaxed),
+                    if selected { 2 } else { 0 }
+                );
+                let mut receiver = Groups::default();
+                process_sender_key_distribution_message(&name, &distribution, &mut receiver)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    group_decrypt(owned.serialized(), &mut receiver, &name)
+                        .await
+                        .unwrap(),
+                    payload
+                );
+            }
+        }
+    });
+}
+#[test]
+fn owned_group_output_provider_faults_do_not_persist_state() {
+    use crate::crypto::{CryptoProviderError, SymmetricCryptoProvider};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    struct Broken(u8);
+    impl SymmetricCryptoProvider for Broken {
+        fn aes_256_cbc_encrypt(
+            &self,
+            _: &[u8; 32],
+            _: &[u8; 16],
+            _: &[u8],
+            output: &mut Vec<u8>,
+        ) -> Result<(), CryptoProviderError> {
+            output.extend_from_slice(&[0xad; 3]);
+            match self.0 {
+                0 => Err(CryptoProviderError::BackendFailed),
+                1 => Ok(()),
+                _ => panic!("synthetic provider unwind"),
+            }
+        }
+    }
+    let name = SenderKeyName::from_parts("provider-fault.invalid@g.us", "sender.invalid:1");
+    for mode in 0..3 {
+        let mut random = rand::rngs::StdRng::seed_from_u64(184259);
+        let mut sender = Groups::default();
+        run(create_sender_key_distribution_message(
+            &name,
+            &mut sender,
+            &mut random,
+        ))
+        .unwrap();
+        let before = sender.records[&name].serialize().unwrap();
+        let writes = sender.writes;
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            run(group_encrypt_serialized_with_provider(
+                &Broken(mode),
+                &mut sender,
+                &name,
+                &[84; 128],
+                &mut random,
+            ))
+        }));
+        if mode == 2 {
+            assert!(result.is_err());
+        } else {
+            assert!(result.is_ok_and(|output| output.is_err()));
+        }
+        assert_eq!(sender.writes, writes);
+        assert_eq!(sender.records[&name].serialize().unwrap(), before);
+    }
+}
+#[test]
 fn existing_sender_distribution_is_read_only_even_from_cold_storage() {
     run(async {
         let mut rng = rand::rngs::StdRng::seed_from_u64(137);

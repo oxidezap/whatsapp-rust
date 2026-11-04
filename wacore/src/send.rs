@@ -1,6 +1,6 @@
 use crate::client::context::{GroupRoutingInfo, SendContextResolver};
 use crate::libsignal::protocol::{
-    CiphertextMessage, IdentityChange, ProtocolAddress, SenderKeyMessage, SenderKeyStore,
+    CiphertextMessage, IdentityChange, ProtocolAddress, SenderKeyStore, SerializedCiphertext,
     UsePQRatchet, message_encrypt, process_prekey_bundle,
 };
 use crate::libsignal::store::sender_key_name::SenderKeyName;

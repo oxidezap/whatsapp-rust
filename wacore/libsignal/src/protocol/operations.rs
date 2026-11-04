@@ -490,7 +490,15 @@ pub async fn group_encrypt<S: SenderKeyStore + ?Sized, R: rand::Rng + rand::Cryp
     plaintext: &[u8],
     rng: &mut R,
 ) -> Result<SenderKeyMessage> {
-    group_encrypt_using(std::convert::identity, store, name, plaintext, rng).await
+    group_encrypt_using(
+        std::convert::identity,
+        store,
+        name,
+        plaintext,
+        rng,
+        parse_sender_key_message,
+    )
+    .await
 }
 /// Run this operation with a caller-owned symmetric crypto backend.
 #[allow(clippy::too_many_arguments)]
@@ -510,6 +518,54 @@ pub async fn group_encrypt_with_provider<
         name,
         plaintext,
         rng,
+        parse_sender_key_message,
+    )
+    .await
+}
+fn parse_sender_key_message(bytes: Vec<u8>) -> Result<SenderKeyMessage> {
+    SenderKeyMessage::try_from(bytes::Bytes::from(bytes))
+}
+/// Encrypt group output into owned wire bytes.
+/// The caller must hold the store's stable sender-key lock across this operation
+/// and any related distribution, as with [`group_encrypt`].
+pub async fn group_encrypt_serialized<
+    S: SenderKeyStore + ?Sized,
+    R: rand::Rng + rand::CryptoRng,
+>(
+    store: &mut S,
+    name: &SenderKeyName,
+    plaintext: &[u8],
+    rng: &mut R,
+) -> Result<SerializedCiphertext> {
+    group_encrypt_using(
+        std::convert::identity,
+        store,
+        name,
+        plaintext,
+        rng,
+        SerializedCiphertext::from_sender_key,
+    )
+    .await
+}
+/// Encrypt owned group wire bytes with a caller-owned symmetric crypto backend.
+/// The locking contract is the same as [`group_encrypt_serialized`].
+pub async fn group_encrypt_serialized_with_provider<
+    S: SenderKeyStore + ?Sized,
+    R: rand::Rng + rand::CryptoRng,
+>(
+    provider: &dyn crate::crypto::SymmetricCryptoProvider,
+    store: &mut S,
+    name: &SenderKeyName,
+    plaintext: &[u8],
+    rng: &mut R,
+) -> Result<SerializedCiphertext> {
+    group_encrypt_using(
+        |crypto| crate::crypto::ProviderCrypto::with_crypto(crypto, provider),
+        store,
+        name,
+        plaintext,
+        rng,
+        SerializedCiphertext::from_sender_key,
     )
     .await
 }
@@ -519,13 +575,15 @@ async fn group_encrypt_using<
     F: FnOnce(group_crypto::PreparedGroupProvider) -> C,
     S: SenderKeyStore + ?Sized,
     R: rand::Rng + rand::CryptoRng,
+    T,
 >(
     prepare: F,
     store: &mut S,
     name: &SenderKeyName,
     plaintext: &[u8],
     rng: &mut R,
-) -> Result<SenderKeyMessage> {
+    output: impl FnOnce(Vec<u8>) -> Result<T>,
+) -> Result<T> {
     let mut record = store
         .load_sender_key(name)
         .await?
@@ -557,8 +615,9 @@ async fn group_encrypt_using<
         engine::Engine::new(&crypto, &mut random)
             .encrypt_sender_key(&mut record.inner, plaintext)?
     };
+    let message = output(bytes)?;
     store.store_sender_key(name, record).await?;
-    SenderKeyMessage::try_from(bytes::Bytes::from(bytes))
+    Ok(message)
 }
 /// The caller must hold the store's stable sender-key lock across this operation,
 /// including a related distribution and encryption when they share a chain.

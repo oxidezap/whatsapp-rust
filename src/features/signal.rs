@@ -607,7 +607,7 @@ impl<'a> Signal<'a> {
         };
 
         let encrypted = if let Some(provider) = self.client.runtime.crypto_provider() {
-            wacore::libsignal::protocol::group_encrypt_with_provider(
+            wacore::libsignal::protocol::group_encrypt_serialized_with_provider(
                 &*provider,
                 &mut store,
                 &sender_key_name,
@@ -635,7 +635,7 @@ impl<'a> Signal<'a> {
                 .await;
         }
 
-        Ok((skdm_bytes, ciphertext.into_serialized().into_vec()))
+        Ok((skdm_bytes, ciphertext.into_serialized()))
     }
 
     /// Decrypt a group (sender-key) message.

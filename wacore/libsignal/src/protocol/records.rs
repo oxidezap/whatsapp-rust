@@ -715,6 +715,14 @@ impl GenericSignedPreKey for SignedPreKeyRecord {
         Ok(engine::codec::encode_signed_pre_key(&self.inner))
     }
 }
+/// Caller-owned prepared group crypto, independent of the stored record format.
+/// Retain it with one logical sender-key cache entry and drop it when that entry
+/// is evicted. It can retain private signing material, is bounded to the sender
+/// history limit, and deliberately has no serialization or diagnostic formatter.
+#[derive(Clone, Default)]
+pub struct SenderKeyCryptoContext {
+    inner: Option<Arc<group_crypto::GroupCryptoCache>>,
+}
 #[derive(Clone, Default)]
 pub struct SenderKeyRecord {
     pub(crate) inner: engine::SenderKeyRecord,
@@ -724,6 +732,24 @@ pub struct SenderKeyRecord {
 impl SenderKeyRecord {
     pub fn new_empty() -> Self {
         Self::default()
+    }
+    /// Retain prepared crypto across component-backed store handoffs.
+    pub fn crypto_context(&self) -> SenderKeyCryptoContext {
+        SenderKeyCryptoContext {
+            inner: self.group_crypto.clone(),
+        }
+    }
+    /// Prepare the current state's roles without advancing any protocol state.
+    pub fn prepare_crypto_context(&mut self) -> SenderKeyCryptoContext {
+        self.warm_current_signer();
+        self.warm_current_verifier();
+        self.crypto_context()
+    }
+    /// Reuse prepared work for matching keys, discarding unrelated cached keys.
+    /// No counters, message keys, wire gate or reservation state are restored.
+    pub fn restore_crypto_context(&mut self, context: &SenderKeyCryptoContext) {
+        self.group_crypto = context.inner.clone();
+        self.prune_prepared_crypto();
     }
     /// Opt out of reservations for this in-memory record after consuming its
     /// current lease. The waiver is deliberately not serialized.

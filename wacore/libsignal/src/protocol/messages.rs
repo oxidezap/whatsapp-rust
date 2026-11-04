@@ -49,6 +49,15 @@ impl SerializedCiphertext {
     pub fn into_serialized(self) -> Vec<u8> {
         self.bytes
     }
+    pub(crate) fn from_sender_key(bytes: Vec<u8>) -> Result<Self> {
+        validate_version(&bytes, true, 64)?;
+        engine::wire::SenderKeyMessageView::decode(&bytes)
+            .map_err(|e| error::message_error(e, CiphertextMessageType::SenderKey, 0, 0))?;
+        Ok(Self {
+            kind: CiphertextMessageType::SenderKey,
+            bytes,
+        })
+    }
     pub(crate) fn from_pairwise(bytes: Vec<u8>, prekey: bool) -> Result<Self> {
         // Validate before the adapter commits, exactly as the typed output path
         // does, while keeping ownership of the original allocation.
@@ -479,6 +488,39 @@ impl OwnedCiphertextMessage {
 #[cfg(test)]
 mod borrowed_tests {
     use super::*;
+    #[test]
+    fn owned_group_output_matches_typed_validation_for_mutated_envelopes() {
+        use rand::SeedableRng as _;
+        let mut random = rand::rngs::StdRng::seed_from_u64(1842);
+        let key = KeyPair::generate(&mut random);
+        for counter in [0, 127, 128, 16384, u32::MAX] {
+            let encoded = SenderKeyMessage::new(
+                3,
+                17,
+                counter,
+                vec![67; 16].into_boxed_slice(),
+                &mut random,
+                &key.private_key,
+            )
+            .unwrap()
+            .serialize();
+            let mut variants = vec![encoded.clone()];
+            variants.extend((0..encoded.len()).map(|end| encoded[..end].to_vec()));
+            variants.extend((0..encoded.len()).map(|index| {
+                let mut changed = encoded.clone();
+                changed[index] ^= 0x80;
+                changed
+            }));
+            for bytes in variants {
+                let typed = SenderKeyMessage::try_from(bytes.as_slice()).map(|_| ());
+                let owned = SerializedCiphertext::from_sender_key(bytes).map(|_| ());
+                assert_eq!(
+                    owned.map_err(|e| e.to_string()),
+                    typed.map_err(|e| e.to_string())
+                );
+            }
+        }
+    }
     #[test]
     fn serialized_output_validation_matches_typed_decoders_for_mutated_envelopes() {
         let key = PublicKey::from_djb_public_key_bytes(&[9; 32]).unwrap();

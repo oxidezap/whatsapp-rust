@@ -518,7 +518,7 @@ pub async fn prepare_group_stanza(
 
     let crypto_provider = runtime.crypto_provider();
     let skmsg = if let Some(provider) = crypto_provider {
-        crate::libsignal::protocol::group_encrypt_with_provider(
+        crate::libsignal::protocol::group_encrypt_serialized_with_provider(
             &*provider,
             stores.sender_key_store,
             &sender_key_name,
