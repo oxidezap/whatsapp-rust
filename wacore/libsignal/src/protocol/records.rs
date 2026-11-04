@@ -265,13 +265,13 @@ impl SessionState {
         signed_pre_key_id: SignedPreKeyId,
         base: &PublicKey,
     ) {
-        self.inner.pending_pre_key = Some(engine::PendingPreKey {
+        self.inner.pending_pre_key = Some(Arc::new(engine::PendingPreKey {
             pre_key_id: pre_key_id.map(Into::into),
             signed_pre_key_id: Some(signed_pre_key_id.0 as i32),
             base_key: *base.public_key_bytes(),
             kyber_pre_key_id: None,
             kyber_ciphertext: None,
-        });
+        }));
     }
     pub fn clear_unacknowledged_pre_key_message(&mut self) {
         self.inner.pending_pre_key = None;
@@ -564,11 +564,11 @@ impl SessionRecord {
                         })
                         .sum::<usize>()
                     + state.pending_key_exchange.as_ref().map_or(0, Vec::capacity)
-                    + state
-                        .pending_pre_key
-                        .as_ref()
-                        .and_then(|p| p.kyber_ciphertext.as_ref())
-                        .map_or(0, Vec::capacity)
+                    + state.pending_pre_key.as_ref().map_or(0, |pending| {
+                        size_of::<engine::PendingPreKey>()
+                            + 2 * size_of::<usize>()
+                            + pending.kyber_ciphertext.as_ref().map_or(0, Vec::capacity)
+                    })
             })
     }
     pub fn estimated_size(&self) -> usize {

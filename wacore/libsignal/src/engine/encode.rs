@@ -160,7 +160,7 @@ impl Encodable for SessionState {
         if let Some(exchange) = &self.pending_key_exchange {
             sink.bytes(8, exchange);
         }
-        if let Some(pending) = &self.pending_pre_key {
+        if let Some(pending) = self.pending_pre_key.as_deref() {
             sink.message(9, pending);
         }
         sink.uint(10, self.remote_registration.into());
@@ -342,13 +342,13 @@ mod tests {
             previous_counter: u32::MAX,
             sender: Some(sender),
             receivers: vec![receiver],
-            pending_pre_key: Some(PendingPreKey {
+            pending_pre_key: Some(std::sync::Arc::new(PendingPreKey {
                 pre_key_id: Some(u32::MAX),
                 signed_pre_key_id: Some(-1),
                 base_key: [10; 32],
                 kyber_pre_key_id: Some(0),
                 kyber_ciphertext: Some(vec![11; 130]),
-            }),
+            })),
             local_registration: 0,
             remote_registration: u32::MAX,
             needs_refresh: true,
@@ -356,6 +356,35 @@ mod tests {
             alice_base_key_tagged: false,
             pending_key_exchange: Some(vec![8, 127]),
         }
+    }
+
+    #[test]
+    fn pending_prekey_snapshots_share_metadata_and_isolate_changes() {
+        let original = state();
+        let expected = codec::encode_session_state(&original);
+        let mut sibling = original.clone();
+        assert!(std::sync::Arc::ptr_eq(
+            original.pending_pre_key.as_ref().unwrap(),
+            sibling.pending_pre_key.as_ref().unwrap()
+        ));
+        std::sync::Arc::make_mut(sibling.pending_pre_key.as_mut().unwrap()).signed_pre_key_id =
+            Some(17);
+        assert_eq!(codec::encode_session_state(&original), expected);
+        assert_ne!(codec::encode_session_state(&sibling), expected);
+        sibling.pending_pre_key = None;
+        assert!(original.pending_pre_key.is_some());
+        assert_eq!(codec::encode_session_state(&original), expected);
+        assert_eq!(
+            size_of::<Option<std::sync::Arc<PendingPreKey>>>(),
+            size_of::<usize>()
+        );
+        println!(
+            "session state: {} B; record: {} B; optional prekey inline: {} B; allocated prekey: {} B",
+            size_of::<SessionState>(),
+            size_of::<crate::protocol::SessionRecord>(),
+            size_of::<Option<std::sync::Arc<PendingPreKey>>>(),
+            size_of::<PendingPreKey>() + 2 * size_of::<usize>(),
+        );
     }
 
     #[test]
@@ -375,7 +404,7 @@ mod tests {
             let decoded = codec::decode_session_state(&RustCrypto, &out[2..]).unwrap();
             assert!(decoded == state);
         }
-        state.pending_pre_key.as_mut().unwrap().signed_pre_key_id = None;
+        std::sync::Arc::make_mut(state.pending_pre_key.as_mut().unwrap()).signed_pre_key_id = None;
         let mut out = Vec::new();
         append_session_state(&state, &mut out);
         assert!(codec::decode_session_state(&RustCrypto, &out).unwrap() == state);

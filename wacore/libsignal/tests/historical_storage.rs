@@ -422,14 +422,16 @@ fn stored_history_keeps_its_budget_separate_from_network_envelopes() {
     let all = vectors();
     let mut record =
         engine::codec::decode_session_record(&RustCrypto, &bytes(&all, "pending_archive")).unwrap();
-    record
-        .current
-        .as_mut()
-        .unwrap()
-        .pending_pre_key
-        .as_mut()
-        .unwrap()
-        .kyber_ciphertext = Some(vec![6; 16 * 1024 * 1024]);
+    std::sync::Arc::make_mut(
+        record
+            .current
+            .as_mut()
+            .unwrap()
+            .pending_pre_key
+            .as_mut()
+            .unwrap(),
+    )
+    .kyber_ciphertext = Some(vec![6; 16 * 1024 * 1024]);
     let input = engine::codec::encode_session_record(&record);
     assert!(input.len() > 16 * 1024 * 1024);
     let decoded = engine::codec::decode_session_record(&RustCrypto, &input).unwrap();

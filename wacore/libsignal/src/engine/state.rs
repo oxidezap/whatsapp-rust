@@ -386,7 +386,7 @@ pub struct SessionState {
     pub previous_counter: u32,
     pub sender: Option<Chain>,
     pub receivers: Vec<Chain>,
-    pub pending_pre_key: Option<PendingPreKey>,
+    pub pending_pre_key: Option<Arc<PendingPreKey>>,
     pub local_registration: u32,
     pub remote_registration: u32,
     pub needs_refresh: bool,

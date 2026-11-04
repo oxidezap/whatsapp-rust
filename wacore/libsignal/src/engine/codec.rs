@@ -170,7 +170,10 @@ pub fn decode_session_state<C: CryptoProvider>(_crypto: &C, input: &[u8]) -> Res
             .transpose()?,
         receivers,
         pending_key_exchange,
-        pending_pre_key: data(&f, 9)?.map(decode_pending).transpose()?,
+        pending_pre_key: data(&f, 9)?
+            .map(decode_pending)
+            .transpose()?
+            .map(std::sync::Arc::new),
         remote_registration: number(&f, 10)?,
         local_registration: number(&f, 11)?,
         needs_refresh: number(&f, 12)? != 0,

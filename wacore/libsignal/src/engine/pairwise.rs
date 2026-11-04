@@ -119,13 +119,13 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
             .push(Chain::new(p.remote_signed_pre_key, None, initial_chain));
         session.sender = Some(Chain::new(ratchet.public, Some(ratchet.private), sending));
         session.alice_base_key = Some(p.base_key.public);
-        session.pending_pre_key = Some(PendingPreKey {
+        session.pending_pre_key = Some(std::sync::Arc::new(PendingPreKey {
             pre_key_id: p.remote_one_time_pre_key.as_ref().map(|(id, _)| *id),
             signed_pre_key_id: Some(p.remote_signed_pre_key_id as i32),
             base_key: p.base_key.public,
             kyber_pre_key_id: None,
             kyber_ciphertext: None,
-        });
+        }));
         Ok(session)
     }
     pub fn initialize_responder(&mut self, p: &ResponderParameters) -> Result<SessionState> {
