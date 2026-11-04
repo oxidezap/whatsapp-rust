@@ -177,6 +177,21 @@ fn register_original_benchmarks(
     Ok(originals)
 }
 
+fn benchmark_targets<'a>(
+    bench: &'a str,
+    originals: &'a [OriginalBenchmark],
+) -> std::collections::BTreeMap<&'a str, Vec<&'a str>> {
+    let mut targets = std::collections::BTreeMap::new();
+    targets.insert("wacore-libsignal", vec![bench]);
+    for original in originals {
+        targets
+            .entry(original.package.as_str())
+            .or_default()
+            .push(original.bench.as_str());
+    }
+    targets
+}
+
 pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()> {
     full_sha(base)?;
     full_sha(head)?;
@@ -247,12 +262,11 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
             &patch.stdout,
         )?;
         let target = output.join("target").join(role);
-        for (owner, target_bench) in std::iter::once(("wacore-libsignal", bench.as_str())).chain(
-            originals
-                .iter()
-                .map(|original| (original.package.as_str(), original.bench.as_str())),
-        ) {
-            run(Command::new("cargo")
+        // A CodSpeed build replaces that package's executable catalog. Build
+        // every target for a package together so later builds cannot erase it.
+        for (owner, benches) in benchmark_targets(&bench, &originals) {
+            let mut command = Command::new("cargo");
+            command
                 .current_dir(&checkout)
                 .env("CARGO_TARGET_DIR", &target)
                 .args([
@@ -266,9 +280,11 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
                     owner,
                     "--features",
                     "wacore-libsignal/legacy-session-interop,wacore-libsignal/bench-internals",
-                    "--bench",
-                    target_bench,
-                ]))?;
+                ]);
+            for target_bench in benches {
+                command.args(["--bench", target_bench]);
+            }
+            run(&mut command)?;
         }
         artifacts.push(Artifact {
             role: role.to_owned(),
@@ -431,6 +447,16 @@ mod tests {
             assert_eq!(original.source_sha256, sha256(SOURCE));
         }
         assert!(signal_manifest.contains("original_signal_base"));
+        let targets = benchmark_targets("classic_pair_base", &originals);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(
+            targets["wacore-libsignal"],
+            ["classic_pair_base", "original_signal_base"]
+        );
+        assert_eq!(targets["wacore"], ["original_consumer_base"]);
+        let head_targets = benchmark_targets("classic_pair_head", &[]);
+        assert_eq!(head_targets.len(), 1);
+        assert_eq!(head_targets["wacore-libsignal"], ["classic_pair_head"]);
         assert_eq!(originals[1].filter.as_deref(), Some("prewarmed_record"));
         assert!(
             std::fs::read_to_string(checkout.path().join("wacore/Cargo.toml"))
