@@ -21,6 +21,33 @@ pub struct DecryptionResult {
     pub consumed_prekey_id: Option<PreKeyId>,
     pub identity_change: IdentityChange,
 }
+// Shared by ordinary and prekey receives, independently of the crypto provider.
+// Keep this storage transition out of their otherwise specialized state machines.
+#[inline(never)]
+async fn commit_received_session<S: SessionStore + ?Sized, I: IdentityKeyStore + ?Sized>(
+    mut checkout: SessionCheckout<'_, S>,
+    candidate: SessionRecord,
+    address: &ProtocolAddress,
+    identities: &mut I,
+) -> Result<IdentityChange> {
+    // Authentication selects the session, including an archive-only record.
+    // Its identity governs trust and the identity row update.
+    let remote = candidate
+        .session_state()
+        .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone().into()))?
+        .remote_identity_key()?
+        .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone().into()))?;
+    if !is_trusted_identity(identities, address, &remote, Direction::Receiving).await? {
+        return Err(SignalProtocolError::UntrustedIdentity(
+            address.clone().into(),
+        ));
+    }
+    let change = save_identity(identities, address, &remote).await?;
+    // The original session remains recoverable until the identity step succeeds.
+    *checkout.record_mut() = candidate;
+    checkout.commit().await?;
+    Ok(change)
+}
 pub async fn process_prekey_bundle<
     S: SessionStore + ?Sized,
     I: IdentityKeyStore + ?Sized,
@@ -756,7 +783,7 @@ async fn message_decrypt_signal_using<
     identities: &mut I,
     rng: &mut R,
 ) -> Result<DecryptionResult> {
-    let mut checkout = SessionCheckout::load(sessions, address)
+    let checkout = SessionCheckout::load(sessions, address)
         .await?
         .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone().into()))?;
     let mut candidate = checkout.record().clone();
@@ -769,23 +796,7 @@ async fn message_decrypt_signal_using<
         .map_err(|error| {
             message_error(error, CiphertextMessageType::Whisper, 0, message.counter())
         })?;
-    // Authentication selects the session first, including an archive-only
-    // record. Its selected identity governs trust and the identity row update.
-    let remote = candidate
-        .session_state()
-        .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone().into()))?
-        .remote_identity_key()?
-        .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone().into()))?;
-    if !is_trusted_identity(identities, address, &remote, Direction::Receiving).await? {
-        return Err(SignalProtocolError::UntrustedIdentity(
-            address.clone().into(),
-        ));
-    }
-    save_identity(identities, address, &remote).await?;
-    // Identity storage may independently commit before this await completes.
-    // The original session remains recoverable until the identity step succeeds.
-    *checkout.record_mut() = candidate;
-    checkout.commit().await?;
+    commit_received_session(checkout, candidate, address, identities).await?;
     Ok(DecryptionResult {
         plaintext,
         consumed_prekey_id: None,
@@ -916,7 +927,7 @@ async fn message_decrypt_prekey_using<
             "post-quantum ratchet unsupported".into(),
         ));
     }
-    let mut checkout = SessionCheckout::load_or_fresh(sessions, address).await?;
+    let checkout = SessionCheckout::load_or_fresh(sessions, address).await?;
     let mut candidate = checkout.record().clone();
     let mut random = RandomAdapter(rng);
     let mut engine = engine::Engine::new(&crypto, &mut random);
@@ -961,26 +972,7 @@ async fn message_decrypt_prekey_using<
                 )
             })?
     };
-    let selected_identity = candidate
-        .session_state()
-        .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone().into()))?
-        .remote_identity_key()?
-        .ok_or_else(|| SignalProtocolError::SessionNotFound(address.clone().into()))?;
-    if !is_trusted_identity(
-        identities,
-        address,
-        &selected_identity,
-        Direction::Receiving,
-    )
-    .await?
-    {
-        return Err(SignalProtocolError::UntrustedIdentity(
-            address.clone().into(),
-        ));
-    }
-    let stored_change = save_identity(identities, address, &selected_identity).await?;
-    *checkout.record_mut() = candidate;
-    checkout.commit().await?;
+    let stored_change = commit_received_session(checkout, candidate, address, identities).await?;
     Ok(DecryptionResult {
         plaintext,
         consumed_prekey_id: if existing { None } else { message.pre_key_id() },
