@@ -286,7 +286,10 @@ jobs:
         env:
           NEXTEST_PROFILE: ci
           TEST_TIMINGS_DIR: ${{ runner.temp }}/test-timings
-        run: cargo xt ci test-feature-packages wacore wacore-libsignal whatsapp-rust
+        # wacore/mobile and transport/tcp are off by default. Include both
+        # owners here so their unit tests execute, rather than only compiling
+        # through all-features or constructing a factory in an API consumer.
+        run: cargo xt ci test-feature-packages wacore wacore-libsignal whatsapp-rust whatsapp-rust-tokio-transport
       - name: Publish test timings
         if: always()
         uses: actions/upload-artifact@v7

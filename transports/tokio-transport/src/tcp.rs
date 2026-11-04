@@ -126,7 +126,12 @@ impl<W: AsyncWrite + Unpin + Send> Transport for ByteStreamTransport<W> {
         tokio::select! {
             biased;
             _ = shutdown.changed() => bail!("TCP transport closed during write"),
-            result = writer.write_all(&data) => result.context("TCP write failed")?,
+            result = async {
+                writer.write_all(&data).await.context("TCP write failed")?;
+                // Dialers may return buffered streams. A completed send must
+                // reach the underlying stream before retirement is disarmed.
+                writer.flush().await.context("TCP flush failed")
+            } => result?,
         }
         retirement.armed = false;
         Ok(())
@@ -294,15 +299,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_error_releases_stream_without_explicit_disconnect() {
+    async fn write_and_flush_errors_release_stream_without_explicit_disconnect() {
         use std::{
             pin::Pin,
             task::{Context, Poll},
         };
-        struct FailingStream(Option<tokio::sync::oneshot::Sender<()>>);
+        struct FailingStream {
+            on_drop: Option<tokio::sync::oneshot::Sender<()>>,
+            fail_flush: bool,
+        }
         impl Drop for FailingStream {
             fn drop(&mut self) {
-                if let Some(sender) = self.0.take() {
+                if let Some(sender) = self.on_drop.take() {
                     let _ = sender.send(());
                 }
             }
@@ -320,14 +328,23 @@ mod tests {
             fn poll_write(
                 self: Pin<&mut Self>,
                 _: &mut Context<'_>,
-                _: &[u8],
+                bytes: &[u8],
             ) -> Poll<std::io::Result<usize>> {
+                if self.fail_flush {
+                    return Poll::Ready(Ok(bytes.len()));
+                }
                 Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "synthetic write failure",
                 )))
             }
             fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                if self.fail_flush {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "synthetic flush failure",
+                    )));
+                }
                 Poll::Ready(Ok(()))
             }
             fn poll_shutdown(
@@ -337,17 +354,67 @@ mod tests {
                 Poll::Ready(Ok(()))
             }
         }
-        let (dropped, observed) = tokio::sync::oneshot::channel();
-        let (transport, _events) = from_byte_stream(FailingStream(Some(dropped)));
-        assert!(
-            transport
-                .send(Bytes::from_static(b"fail"))
+        for fail_flush in [false, true] {
+            let (dropped, observed) = tokio::sync::oneshot::channel();
+            let (transport, _events) = from_byte_stream(FailingStream {
+                on_drop: Some(dropped),
+                fail_flush,
+            });
+            let expected = if fail_flush {
+                "TCP flush failed"
+            } else {
+                "TCP write failed"
+            };
+            assert!(
+                transport
+                    .send(Bytes::from_static(b"fail"))
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected)
+            );
+            timeout(DEADLINE, observed).await.unwrap().unwrap();
+            assert!(
+                transport
+                    .send(Bytes::from_static(b"retired"))
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_stream_sends_are_flushed_before_success() {
+        let (stream, mut peer) = tokio::io::duplex(1024);
+        let (transport, _events) = from_byte_stream(tokio::io::BufStream::new(stream));
+        transport.send(Bytes::from_static(b"hello")).await.unwrap();
+        let mut bytes = [0; 5];
+        timeout(DEADLINE, peer.read_exact(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&bytes, b"hello");
+    }
+
+    #[tokio::test]
+    async fn cancelled_buffer_flush_retires_connection() {
+        let (stream, mut peer) = tokio::io::duplex(1);
+        let (transport, _events) = from_byte_stream(tokio::io::BufStream::new(stream));
+        let mut send = Box::pin(transport.send(Bytes::from_static(b"ab")));
+        tokio::select! {
+            biased;
+            result = &mut send => panic!("flush unexpectedly completed: {result:?}"),
+            result = peer.read_u8() => assert_eq!(result.unwrap(), b'a'),
+        }
+        drop(send);
+        assert_eq!(
+            timeout(DEADLINE, peer.read_u8())
                 .await
+                .unwrap()
                 .unwrap_err()
-                .to_string()
-                .contains("TCP write failed")
+                .kind(),
+            std::io::ErrorKind::UnexpectedEof
         );
-        timeout(DEADLINE, observed).await.unwrap().unwrap();
         assert!(
             transport
                 .send(Bytes::from_static(b"retired"))

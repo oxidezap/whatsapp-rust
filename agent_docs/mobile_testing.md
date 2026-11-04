@@ -121,3 +121,10 @@ actually exercise. None of these categories substitutes for the others.
 Do not mark the future mobile mock gate validated until its required capabilities
 exist and the scenarios execute. Do not require that future server work to land
 before testing the pure core and optional native transport offline.
+
+Registration checkpoints bind both the selected environment and the account's
+identity/Noise public-key digest. Restore rejects a different binding. These
+hashes prevent accidental mixing; they do not authenticate untrusted storage or
+detect rollback to an older database. Semantic response inputs must come from a
+qualified parser. Local `confirm_persisted` records the host's durability
+confirmation; it does not perform or independently prove a database write.
