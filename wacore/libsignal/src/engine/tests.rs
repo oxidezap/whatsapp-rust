@@ -1,5 +1,88 @@
 // SPDX-License-Identifier: MIT
 use crate::engine::{codec::*, wire::*, *};
+#[test]
+fn direct_cbc_envelopes_match_selected_provider_bytes_and_persisted_state() {
+    let provider = crate::crypto::RustCryptoProvider;
+    let fallback = crate::crypto::ProviderCrypto::new(&provider);
+    let mut random = Deterministic(184276);
+    let (session, _, _) = peers(&mut Engine::new(&RustCrypto, &mut random), true);
+    let mut group = SenderKeyRecord::default();
+    Engine::new(&RustCrypto, &mut random)
+        .create_sender_distribution(&mut group)
+        .unwrap();
+    reserve_group(&mut group);
+    for len in [0, 1, 15, 16, 17, 31, 32, 33, 127, 128, 129, 1024] {
+        let plaintext = vec![len as u8; len];
+        let (mut native, mut selected) = (session.clone(), session.clone());
+        assert_eq!(
+            Engine::new(&RustCrypto, &mut Deterministic(71))
+                .encrypt(&mut native, &plaintext)
+                .unwrap(),
+            Engine::new(&fallback, &mut Deterministic(71))
+                .encrypt(&mut selected, &plaintext)
+                .unwrap()
+        );
+        assert_eq!(
+            encode_session_record(&native),
+            encode_session_record(&selected)
+        );
+        let (mut native, mut selected) = (group.clone(), group.clone());
+        assert_eq!(
+            Engine::new(&RustCrypto, &mut Deterministic(72))
+                .encrypt_sender_key(&mut native, &plaintext)
+                .unwrap(),
+            Engine::new(&fallback, &mut Deterministic(72))
+                .encrypt_sender_key(&mut selected, &plaintext)
+                .unwrap()
+        );
+        assert_eq!(
+            encode_sender_key_record(&native),
+            encode_sender_key_record(&selected)
+        );
+    }
+}
+
+#[test]
+fn malformed_selected_cbc_lengths_do_not_advance_pairwise_or_group_state() {
+    struct BadCbc(usize);
+    impl crate::crypto::SymmetricCryptoProvider for BadCbc {
+        fn aes_256_cbc_encrypt(
+            &self,
+            _: &[u8; 32],
+            _: &[u8; 16],
+            _: &[u8],
+            output: &mut Vec<u8>,
+        ) -> std::result::Result<(), crate::crypto::CryptoProviderError> {
+            output.extend(std::iter::repeat_n(0, self.0));
+            Ok(())
+        }
+    }
+    let mut random = Deterministic(184277);
+    let (session, _, _) = peers(&mut Engine::new(&RustCrypto, &mut random), true);
+    let mut group = SenderKeyRecord::default();
+    Engine::new(&RustCrypto, &mut random)
+        .create_sender_distribution(&mut group)
+        .unwrap();
+    reserve_group(&mut group);
+    for len in [0, 1, 15, 17, 31, 33] {
+        let provider = BadCbc(len);
+        let crypto = crate::crypto::ProviderCrypto::new(&provider);
+        let mut record = session.clone();
+        let before = encode_session_record(&record);
+        assert_eq!(
+            Engine::new(&crypto, &mut random).encrypt(&mut record, b"synthetic"),
+            Err(Error::Crypto)
+        );
+        assert_eq!(encode_session_record(&record), before);
+        let mut record = group.clone();
+        let before = encode_sender_key_record(&record);
+        assert_eq!(
+            Engine::new(&crypto, &mut random).encrypt_sender_key(&mut record, b"synthetic"),
+            Err(Error::Crypto)
+        );
+        assert_eq!(encode_sender_key_record(&record), before);
+    }
+}
 struct FailingMac {
     calls: std::sync::atomic::AtomicUsize,
     fail_at: usize,

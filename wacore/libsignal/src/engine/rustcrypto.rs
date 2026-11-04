@@ -172,6 +172,17 @@ impl CryptoProvider for RustCrypto {
         Ok(cbc::Encryptor::<aes::Aes256>::new(key.into(), iv.into())
             .encrypt_padded_vec::<Pkcs7>(plaintext))
     }
+    fn encrypt_cbc_into(
+        &self,
+        key: &[u8; 32],
+        iv: &[u8; 16],
+        plaintext: &[u8],
+        output: &mut Vec<u8>,
+    ) -> Result<()> {
+        output.reserve(super::crypto::cbc_ciphertext_len(plaintext.len())?);
+        crate::crypto::aes_256_cbc_encrypt_into(plaintext, key, iv, output)
+            .map_err(|_| Error::Crypto)
+    }
     fn decrypt_cbc(&self, key: &[u8; 32], iv: &[u8; 16], ciphertext: &[u8]) -> Result<Vec<u8>> {
         cbc::Decryptor::<aes::Aes256>::new(key.into(), iv.into())
             .decrypt_padded_vec::<Pkcs7>(ciphertext)
@@ -182,6 +193,28 @@ impl CryptoProvider for RustCrypto {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cbc_append_preserves_prefix_allocation_and_standard_ciphertext() {
+        for len in [0, 1, 15, 16, 17, 31, 32, 33, 127, 128, 129, 1024] {
+            let plaintext = vec![len as u8; len];
+            let expected = RustCrypto
+                .encrypt_cbc(&[3; 32], &[4; 16], &plaintext)
+                .unwrap();
+            for prefix_len in [0, 1, 15, 16, 47, 64, 129] {
+                let prefix = vec![9; prefix_len];
+                let mut output = Vec::with_capacity(prefix_len + expected.len() + 8);
+                output.extend_from_slice(&prefix);
+                let pointer = output.as_ptr();
+                RustCrypto
+                    .encrypt_cbc_into(&[3; 32], &[4; 16], &plaintext, &mut output)
+                    .unwrap();
+                assert_eq!(&output[..prefix_len], prefix);
+                assert_eq!(&output[prefix_len..], expected);
+                assert_eq!(output.as_ptr(), pointer);
+            }
+        }
+        assert!(super::super::crypto::cbc_ciphertext_len(usize::MAX).is_err());
+    }
     #[test]
     fn public_zero_salt_prefixes_match_the_hash_state_format() {
         for (pad, expected) in [(0x36, ZERO_SALT_IPAD), (0x5c, ZERO_SALT_OPAD)] {

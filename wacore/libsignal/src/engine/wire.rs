@@ -188,18 +188,36 @@ impl SignalMessage {
         self.unsigned_with_version(3)
     }
     pub fn unsigned_with_version(&self, version: u8) -> Vec<u8> {
+        let mut out = Self::prefix(
+            version,
+            &self.ratchet,
+            self.counter,
+            self.previous_counter,
+            self.ciphertext.len(),
+        );
+        out.extend_from_slice(&self.ciphertext);
+        out
+    }
+    pub(crate) fn prefix(
+        version: u8,
+        ratchet: &[u8; 32],
+        counter: u32,
+        previous_counter: u32,
+        ciphertext_len: usize,
+    ) -> Vec<u8> {
         let mut out = Vec::with_capacity(
             1 + bytes_len(1, 33)
-                + uint_len(2, self.counter)
-                + uint_len(3, self.previous_counter)
-                + bytes_len(4, self.ciphertext.len())
-                + self.mac.len(),
+                + uint_len(2, counter)
+                + uint_len(3, previous_counter)
+                + bytes_len(4, ciphertext_len)
+                + 8,
         );
         out.push((version << 4) | 3);
-        bytes(&mut out, 1, &tagged_key(&self.ratchet));
-        uint(&mut out, 2, self.counter.into());
-        uint(&mut out, 3, self.previous_counter.into());
-        bytes(&mut out, 4, &self.ciphertext);
+        bytes(&mut out, 1, &tagged_key(ratchet));
+        uint(&mut out, 2, counter.into());
+        uint(&mut out, 3, previous_counter.into());
+        varint(&mut out, (4 << 3) | 2);
+        varint(&mut out, ciphertext_len as u64);
         out
     }
     pub fn encode(&self) -> Vec<u8> {
@@ -311,16 +329,19 @@ pub struct SenderKeyMessage {
 }
 impl SenderKeyMessage {
     pub fn unsigned(&self) -> Vec<u8> {
+        let mut out = Self::prefix(self.id, self.iteration, self.ciphertext.len());
+        out.extend_from_slice(&self.ciphertext);
+        out
+    }
+    pub(crate) fn prefix(id: u32, iteration: u32, ciphertext_len: usize) -> Vec<u8> {
         let mut out = Vec::with_capacity(
-            1 + uint_len(1, self.id)
-                + uint_len(2, self.iteration)
-                + bytes_len(3, self.ciphertext.len())
-                + self.signature.len(),
+            1 + uint_len(1, id) + uint_len(2, iteration) + bytes_len(3, ciphertext_len) + 64,
         );
         out.push(0x33);
-        uint(&mut out, 1, self.id.into());
-        uint(&mut out, 2, self.iteration.into());
-        bytes(&mut out, 3, &self.ciphertext);
+        uint(&mut out, 1, id.into());
+        uint(&mut out, 2, iteration.into());
+        varint(&mut out, (3 << 3) | 2);
+        varint(&mut out, ciphertext_len as u64);
         out
     }
     pub fn encode(&self) -> Vec<u8> {

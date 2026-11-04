@@ -130,13 +130,14 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         let private = state.signing_private.ok_or(Error::MissingKey)?;
         let key = state.step(self.crypto)?;
         let (cipher, iv) = expand(self.crypto, &key.seed)?;
-        let message = SenderKeyMessage {
-            id: state.id,
-            iteration: key.iteration,
-            ciphertext: self.crypto.encrypt_cbc(&cipher, &iv, plaintext)?,
-            signature: [0; 64],
-        };
-        let mut output = message.unsigned();
+        let ciphertext_len = super::crypto::cbc_ciphertext_len(plaintext.len())?;
+        let mut output = SenderKeyMessage::prefix(state.id, key.iteration, ciphertext_len);
+        let prefix_len = output.len();
+        self.crypto
+            .encrypt_cbc_into(&cipher, &iv, plaintext, &mut output)?;
+        if output.len().checked_sub(prefix_len) != Some(ciphertext_len) {
+            return Err(Error::Crypto);
+        }
         let signature = self.crypto.sign(&private, &output, self.random)?;
         output.extend_from_slice(&signature);
         // Match the decoder budget: exclude the version byte and signature.

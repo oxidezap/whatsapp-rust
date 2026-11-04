@@ -168,15 +168,20 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         }
         let key = sender.step(self.crypto)?;
         let (cipher, mac, iv) = key.expanded(self.crypto)?;
-        let ciphertext = self.crypto.encrypt_cbc(&cipher, &iv, plaintext)?;
-        let message = SignalMessage {
-            ratchet: sender.ratchet,
-            counter: key.index(),
-            previous_counter: session.previous_counter,
-            ciphertext,
-            mac: [0; 8],
-        };
-        let mut output = message.unsigned_with_version(session.version as u8);
+        let ciphertext_len = super::crypto::cbc_ciphertext_len(plaintext.len())?;
+        let mut output = SignalMessage::prefix(
+            session.version as u8,
+            &sender.ratchet,
+            key.index(),
+            session.previous_counter,
+            ciphertext_len,
+        );
+        let prefix_len = output.len();
+        self.crypto
+            .encrypt_cbc_into(&cipher, &iv, plaintext, &mut output)?;
+        if output.len().checked_sub(prefix_len) != Some(ciphertext_len) {
+            return Err(Error::Crypto);
+        }
         let authentication = self.crypto.hmac_sha256(
             &mac,
             &[

@@ -244,6 +244,15 @@ impl CryptoProvider for PreparedGroupProvider {
     fn encrypt_cbc(&self, key: &[u8; 32], iv: &[u8; 16], plaintext: &[u8]) -> Result<Vec<u8>> {
         RustCrypto.encrypt_cbc(key, iv, plaintext)
     }
+    fn encrypt_cbc_into(
+        &self,
+        key: &[u8; 32],
+        iv: &[u8; 16],
+        plaintext: &[u8],
+        output: &mut Vec<u8>,
+    ) -> Result<()> {
+        RustCrypto.encrypt_cbc_into(key, iv, plaintext, output)
+    }
     fn decrypt_cbc(&self, key: &[u8; 32], iv: &[u8; 16], ciphertext: &[u8]) -> Result<Vec<u8>> {
         RustCrypto.decrypt_cbc(key, iv, ciphertext)
     }

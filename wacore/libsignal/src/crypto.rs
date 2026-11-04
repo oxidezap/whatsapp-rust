@@ -519,6 +519,7 @@ pub fn aes_256_cbc_encrypt_into(
         .encrypt_padded::<Pkcs7>(&mut out[start..], plaintext.len())
         .is_err()
     {
+        zeroize::Zeroize::zeroize(&mut out[start..]);
         out.truncate(start);
         return Err(Error::Provider(CryptoProviderError::BackendFailed));
     }

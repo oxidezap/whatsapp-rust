@@ -33,7 +33,24 @@ pub trait CryptoProvider {
         self.hkdf_sha256(&[0; 32], input, info, output)
     }
     fn encrypt_cbc(&self, key: &[u8; 32], iv: &[u8; 16], plaintext: &[u8]) -> Result<Vec<u8>>;
+    /// Append PKCS#7 ciphertext while preserving the destination's existing prefix.
+    /// Providers can override this to avoid an intermediate ciphertext allocation.
+    fn encrypt_cbc_into(
+        &self,
+        key: &[u8; 32],
+        iv: &[u8; 16],
+        plaintext: &[u8],
+        output: &mut Vec<u8>,
+    ) -> Result<()> {
+        output.extend_from_slice(&self.encrypt_cbc(key, iv, plaintext)?);
+        Ok(())
+    }
     fn decrypt_cbc(&self, key: &[u8; 32], iv: &[u8; 16], ciphertext: &[u8]) -> Result<Vec<u8>>;
+}
+pub(crate) fn cbc_ciphertext_len(plaintext_len: usize) -> Result<usize> {
+    plaintext_len
+        .checked_add(16 - plaintext_len % 16)
+        .ok_or(Error::Encoding("ciphertext length overflow"))
 }
 pub(crate) fn authenticate(expected: &[u8], actual: &[u8]) -> Result<()> {
     if bool::from(expected.ct_eq(actual)) {
