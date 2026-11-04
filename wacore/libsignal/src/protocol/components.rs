@@ -833,10 +833,9 @@ fn state_from_components(
     Ok(state)
 }
 fn archive(state: engine::SessionState) -> engine::ArchivedSession {
-    let mut temporary = engine::SessionRecord::default();
-    temporary.install(state.clone());
-    temporary.install(state);
-    temporary.previous.remove(0)
+    engine::ArchivedSession {
+        bytes: engine::codec::encode_session_state(&state).into(),
+    }
 }
 fn project_state(state: &engine::SessionState) -> Result<SessionComponents> {
     let mut proto = decode_session_proto(&engine::codec::encode_session_state(state))
