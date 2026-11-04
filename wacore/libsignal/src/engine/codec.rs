@@ -356,10 +356,9 @@ fn decode_sender_state(input: &[u8]) -> Result<SenderKeyState> {
         iteration: number(&ck, 1)?,
         chain_key: raw(&ck, 2)?,
         signing_public: public(&signing, 1)?,
-        signing_private: data(&signing, 2)?
-            .filter(|b| !b.is_empty())
-            .map(array)
-            .transpose()?,
+        // Receiving uses only the signing public key. Historical records can
+        // retain unusable private bytes; they must not block delayed messages.
+        signing_private: data(&signing, 2)?.and_then(|bytes| array(bytes).ok()),
         skipped: skipped.into(),
     })
 }
