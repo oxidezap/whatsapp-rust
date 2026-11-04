@@ -208,13 +208,14 @@ impl RegistrationWorkflow {
             | RegistrationStage::OutcomeUnknown { token, operation } => Some((token, operation)),
             _ => None,
         };
-        if let Some((token, operation)) = pending {
-            if token.0 == 0
+        if pending.is_some_and(|(token, operation)| {
+            token.0 == 0
                 || token.0 != checkpoint.attempts
                 || !allows(checkpoint.retry_stage, operation)
-            {
-                return Err(RegistrationError::InvalidCheckpoint);
-            }
+        }) {
+            return Err(RegistrationError::InvalidCheckpoint);
+        }
+        if let Some((token, operation)) = pending {
             checkpoint.stage = RegistrationStage::OutcomeUnknown { token, operation };
         }
         Ok(Self { checkpoint })

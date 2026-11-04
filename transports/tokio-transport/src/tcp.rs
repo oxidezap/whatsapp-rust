@@ -294,6 +294,7 @@ mod tests {
         let send_transport = transport.clone();
         let pending =
             tokio::spawn(async move { send_transport.send(Bytes::from(vec![0; 1024])).await });
+        assert_eq!(timeout(DEADLINE, peer.read_u8()).await.unwrap().unwrap(), 0);
         timeout(DEADLINE, transport.disconnect()).await.unwrap();
         assert!(timeout(DEADLINE, pending).await.unwrap().unwrap().is_err());
     }
