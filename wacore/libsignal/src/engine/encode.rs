@@ -287,14 +287,17 @@ pub(crate) fn append_sender_record(
     incarnation: Option<&[u8; 16]>,
     out: &mut Vec<u8>,
 ) {
-    SenderRecord {
+    let message = SenderRecord {
         record,
         metadata: ReservationFields {
             reservation: &record.reservation,
             incarnation,
         },
+    };
+    if out.capacity() == 0 {
+        out.reserve(encoded_len(&message));
     }
-    .encode(&mut VecSink(out));
+    message.encode(&mut VecSink(out));
 }
 
 pub(crate) fn append_session_state(state: &SessionState, out: &mut Vec<u8>) {
