@@ -53,6 +53,16 @@ struct Artifact {
     target: PathBuf,
     bench: String,
     port_sha256: String,
+    originals: Vec<OriginalBenchmark>,
+}
+#[derive(Serialize, Deserialize)]
+struct OriginalBenchmark {
+    package: String,
+    bench: String,
+    source: PathBuf,
+    source_sha256: String,
+    filter: Option<String>,
+    cases: usize,
 }
 #[derive(Serialize, Deserialize)]
 struct Manifest {
@@ -104,6 +114,69 @@ fn baseline_port(package: &Path, cargo: &mut String) -> Result<Vec<u8>> {
     *cargo = cargo.replacen("[features]\n", "[features]\nbench-internals = []\n", 1);
     Ok(BASE_ACCESS.as_bytes().to_vec())
 }
+fn register_original_benchmarks(
+    checkout: &Path,
+    signal_manifest: &mut String,
+) -> Result<Vec<OriginalBenchmark>> {
+    if !checkout
+        .join(PACKAGE)
+        .join("benches/libsignal_benchmark.rs")
+        .is_file()
+    {
+        return Ok(Vec::new());
+    }
+    let mut originals = Vec::new();
+    // Benchmark sources stay in their baseline checkout with their licensing.
+    // Distinct target names keep their results separate from the head's results.
+    for (package, directory, original, bench, filter, cases) in [
+        (
+            "wacore-libsignal",
+            PACKAGE,
+            "libsignal_benchmark",
+            "original_signal_base",
+            None,
+            36,
+        ),
+        (
+            "wacore",
+            "wacore",
+            "sender_key_derivation_benchmark",
+            "original_consumer_base",
+            Some("prewarmed_record"),
+            2,
+        ),
+    ] {
+        let source = PathBuf::from(directory).join(format!("benches/{bench}.rs"));
+        let original = checkout
+            .join(directory)
+            .join(format!("benches/{original}.rs"));
+        std::fs::copy(&original, checkout.join(&source)).with_context(|| {
+            format!(
+                "original baseline benchmark missing: {}",
+                original.display()
+            )
+        })?;
+        let registration = format!("\n[[bench]]\nname = {bench:?}\nharness = false\n");
+        if directory == PACKAGE {
+            signal_manifest.push_str(&registration);
+        } else {
+            let path = checkout.join(directory).join("Cargo.toml");
+            let mut cargo = std::fs::read_to_string(&path)?;
+            cargo.push_str(&registration);
+            write(&path, cargo.as_bytes())?;
+        }
+        originals.push(OriginalBenchmark {
+            package: package.to_owned(),
+            bench: bench.to_owned(),
+            source,
+            source_sha256: sha256(&std::fs::read(original)?),
+            filter: filter.map(str::to_owned),
+            cases,
+        });
+    }
+    Ok(originals)
+}
+
 pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()> {
     full_sha(base)?;
     full_sha(head)?;
@@ -157,34 +230,46 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
         let bench = format!("classic_pair_{role}");
         write(&package.join(format!("benches/{bench}.rs")), &benchmark)?;
         cargo.push_str(&format!("\n[[bench]]\nname = {bench:?}\nharness = false\n"));
+        let originals = if role == "base" {
+            register_original_benchmarks(&checkout, &mut cargo)?
+        } else {
+            Vec::new()
+        };
         write(&manifest_path, cargo.as_bytes())?;
         let patch = capture(Command::new("git").current_dir(&checkout).args([
             "diff",
             "--",
             "wacore/libsignal/Cargo.toml",
+            "wacore/Cargo.toml",
         ]))?;
         write(
             &output.join(format!("results/{role}-registration.patch")),
             &patch.stdout,
         )?;
         let target = output.join("target").join(role);
-        run(Command::new("cargo")
-            .current_dir(&checkout)
-            .env("CARGO_TARGET_DIR", &target)
-            .args([
-                "codspeed",
-                "build",
-                "-m",
-                "simulation",
-                "-m",
-                "memory",
-                "-p",
-                "wacore-libsignal",
-                "--features",
-                "legacy-session-interop,bench-internals",
-                "--bench",
-                &bench,
-            ]))?;
+        for (owner, target_bench) in std::iter::once(("wacore-libsignal", bench.as_str())).chain(
+            originals
+                .iter()
+                .map(|original| (original.package.as_str(), original.bench.as_str())),
+        ) {
+            run(Command::new("cargo")
+                .current_dir(&checkout)
+                .env("CARGO_TARGET_DIR", &target)
+                .args([
+                    "codspeed",
+                    "build",
+                    "-m",
+                    "simulation",
+                    "-m",
+                    "memory",
+                    "-p",
+                    owner,
+                    "--features",
+                    "wacore-libsignal/legacy-session-interop,wacore-libsignal/bench-internals",
+                    "--bench",
+                    target_bench,
+                ]))?;
+        }
         artifacts.push(Artifact {
             role: role.to_owned(),
             revision: sha.to_owned(),
@@ -192,17 +277,23 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
             target,
             bench,
             port_sha256: sha256(&port),
+            originals,
         });
     }
     write_json(
         &output.join("results/manifest.json"),
         &Manifest {
-            schema_version: 1,
+            schema_version: 2,
             driver_revision: head.to_owned(),
             workload_sha256: sha256(&workload),
             benchmark_sha256: sha256(&benchmark),
             cases,
-            expected_results: cases * 4,
+            expected_results: cases * 4
+                + artifacts
+                    .iter()
+                    .flat_map(|artifact| &artifact.originals)
+                    .map(|original| original.cases * 2)
+                    .sum::<usize>(),
             instruments: ["Simulation".to_owned(), "Memory".to_owned()],
             rustc: String::from_utf8(capture(Command::new("rustc").arg("-Vv"))?.stdout)?,
             cargo_codspeed: version,
@@ -215,11 +306,19 @@ pub fn measure(root: &Path, output: &Path) -> Result<()> {
         root.join(output).join("results/manifest.json"),
     )?)?;
     ensure!(
-        manifest.schema_version == 1 && revision(root)? == manifest.driver_revision,
+        manifest.schema_version == 2 && revision(root)? == manifest.driver_revision,
         "Signal measurement driver changed after preparation"
     );
     ensure!(
-        manifest.artifacts.len() == 2 && manifest.expected_results == manifest.cases * 4,
+        manifest.artifacts.len() == 2
+            && manifest.expected_results
+                == manifest.cases * 4
+                    + manifest
+                        .artifacts
+                        .iter()
+                        .flat_map(|artifact| &artifact.originals)
+                        .map(|original| original.cases * 2)
+                        .sum::<usize>(),
         "Signal measurement catalog changed"
     );
     for artifact in manifest.artifacts {
@@ -258,12 +357,88 @@ pub fn measure(root: &Path, output: &Path) -> Result<()> {
                 "--bench",
                 &artifact.bench,
             ]))?;
+        ensure!(
+            artifact.role == "base" || artifact.originals.is_empty(),
+            "original catalogs must use the baseline revision"
+        );
+        for original in artifact.originals {
+            ensure!(
+                sha256(&std::fs::read(artifact.checkout.join(&original.source))?)
+                    == original.source_sha256,
+                "original baseline benchmark changed"
+            );
+            let mut command = Command::new("cargo");
+            command
+                .current_dir(&artifact.checkout)
+                .env("CARGO_TARGET_DIR", &artifact.target)
+                .args([
+                    "codspeed",
+                    "run",
+                    "-p",
+                    &original.package,
+                    "--bench",
+                    &original.bench,
+                ]);
+            if let Some(filter) = &original.filter {
+                command.arg(filter);
+            }
+            run(&mut command)?;
+        }
     }
     Ok(())
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn original_catalogs_preserve_sources_and_register_only_the_baseline() {
+        let checkout = tempfile::tempdir().unwrap();
+        let mut signal_manifest = "[package]\nname=\"wacore-libsignal\"\n".to_owned();
+        let unchanged = signal_manifest.clone();
+        assert!(
+            register_original_benchmarks(checkout.path(), &mut signal_manifest)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(signal_manifest, unchanged);
+        const SOURCE: &[u8] =
+            b"// SPDX-License-Identifier: MIT\n// Synthetic benchmark catalog marker.\n";
+        for path in [
+            "wacore/libsignal/benches/libsignal_benchmark.rs",
+            "wacore/benches/sender_key_derivation_benchmark.rs",
+        ] {
+            write(&checkout.path().join(path), SOURCE).unwrap();
+        }
+        write(
+            &checkout.path().join("wacore/Cargo.toml"),
+            b"[package]\nname=\"wacore\"\n",
+        )
+        .unwrap();
+        let originals =
+            register_original_benchmarks(checkout.path(), &mut signal_manifest).unwrap();
+        assert_eq!(
+            originals
+                .iter()
+                .map(|original| original.cases)
+                .sum::<usize>(),
+            38
+        );
+        for original in &originals {
+            assert_eq!(
+                std::fs::read(checkout.path().join(&original.source)).unwrap(),
+                SOURCE
+            );
+            assert_eq!(original.source_sha256, sha256(SOURCE));
+        }
+        assert!(signal_manifest.contains("original_signal_base"));
+        assert_eq!(originals[1].filter.as_deref(), Some("prewarmed_record"));
+        assert!(
+            std::fs::read_to_string(checkout.path().join("wacore/Cargo.toml"))
+                .unwrap()
+                .contains("original_consumer_base")
+        );
+    }
+
     #[test]
     fn counts_the_full_feature_catalog_and_rejects_missing_registration() {
         const SOURCE: &str =
