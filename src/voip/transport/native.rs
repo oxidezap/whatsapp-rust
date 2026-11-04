@@ -166,6 +166,20 @@ impl RelayStack {
         self.open
     }
 
+    /// Whether media written to the open channel is still waiting for the relay to acknowledge it.
+    /// A hang-up waits for this to clear before [`Self::close`]: SCTP's SHUTDOWN only retransmits
+    /// what is already in flight, so media still queued behind the congestion window would never
+    /// leave.
+    fn has_unacked_media(&mut self) -> bool {
+        self.open
+            && self.assoc.as_mut().is_some_and(|(_, assoc)| {
+                assoc
+                    .stream(MEDIA_STREAM_ID)
+                    .and_then(|s| s.buffered_amount())
+                    .is_ok_and(|n| n > 0)
+            })
+    }
+
     /// Feed one datagram off the relay socket.
     fn handle_datagram(&mut self, now: Instant, data: &[u8]) -> Result<(), StackError> {
         if self.stopped {
@@ -1063,7 +1077,10 @@ async fn relay_driver<S: DialDatagram>(
     let mut announced = false;
     // Media discarded under backpressure since the last report. See `deliver`.
     let mut dropped_inbound = 0u32;
+    // `hung_up` is the outbound queue closing; `said_goodbye` is the close that follows once the
+    // media taken off it has been acknowledged.
     let mut hung_up = false;
+    let mut said_goodbye = false;
     // The datagram the flow could not take yet. A dialled flow may push back (a proxy, a tunnel),
     // so waiting for it is a branch of the select below rather than a block in front of it: reads
     // and timers keep running. Nothing is flushed past it, so wire order holds, and nothing more is
@@ -1100,9 +1117,15 @@ async fn relay_driver<S: DialDatagram>(
             // of `connect_relay_media`.
             let _ = events.try_send(RelayTransportEvent::Connected);
         }
-        // A goodbye held behind a datagram is still owed: keep going until the flow takes it, which
-        // `disconnect`'s deadline bounds.
-        if hung_up && unsent.is_none() {
+        // Media taken off the queue and a goodbye held behind a datagram are both still owed: keep
+        // going until the relay has the one and the flow takes the other, which `disconnect`'s
+        // deadline bounds.
+        if hung_up && !said_goodbye && unsent.is_none() && !stack.has_unacked_media() {
+            stack.close(now());
+            said_goodbye = true;
+            continue; // the top of the loop flushes the goodbye
+        }
+        if said_goodbye && unsent.is_none() {
             // `try_send`, unlike the terminal send in `finish`, because this close was asked for
             // locally: the call already knows, and by the time `disconnect` runs it has left its
             // receive loop, so nothing is draining this channel. Awaiting a slot that only the
@@ -1123,12 +1146,11 @@ async fn relay_driver<S: DialDatagram>(
                 // went away is noticed rather than waited out.
                 Err(e) => Err(StackError::Failed(format!("relay socket recv: {e}"))),
             },
-            queued = outbound.recv(), if unsent.is_none() => match queued {
+            queued = outbound.recv(), if unsent.is_none() && !hung_up => match queued {
                 Ok(packet) => stack.write_media(now(), &packet),
-                // `disconnect` closed the queue: say goodbye on the wire, then let the top of the
-                // loop flush it before ending.
+                // `disconnect` closed the queue and it is now empty: the top of the loop says
+                // goodbye once the relay has acknowledged the media.
                 Err(_) => {
-                    stack.close(now());
                     hung_up = true;
                     Ok(())
                 }
@@ -2628,6 +2650,287 @@ mod datagram_dialer {
         );
     }
 
+    /// Counts how many of one kind of thing were made and how many are still alive: an [`Alive`]
+    /// guard is made with each and dropped with it.
+    #[derive(Default)]
+    struct Census {
+        started: AtomicUsize,
+        live: AtomicUsize,
+    }
+
+    impl Census {
+        fn started(&self) -> usize {
+            self.started.load(Ordering::SeqCst)
+        }
+
+        fn live(&self) -> usize {
+            self.live.load(Ordering::SeqCst)
+        }
+    }
+
+    /// One live instance on a [`Census`], for as long as it is held.
+    struct Alive(Arc<Census>);
+
+    impl Alive {
+        fn new(census: &Arc<Census>) -> Self {
+            census.started.fetch_add(1, Ordering::SeqCst);
+            census.live.fetch_add(1, Ordering::SeqCst);
+            Self(census.clone())
+        }
+    }
+
+    impl Drop for Alive {
+        fn drop(&mut self) {
+            self.0.live.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// How [`InstrumentedDialer`] answers a dial for one address.
+    #[derive(Clone, Copy, Debug)]
+    enum Answer {
+        /// The dial never completes.
+        Never,
+        /// The dial opens a flow that takes every datagram and never yields one: a relay that does
+        /// not answer.
+        Silently,
+        /// The dial opens a real UDP flow to this loopback address.
+        Via(SocketAddr),
+    }
+
+    /// The flow [`Answer::Silently`] opens.
+    struct SilentFlow {
+        _alive: Alive,
+    }
+
+    impl DialDatagram for SilentFlow {
+        fn poll_send(
+            &self,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_recv(
+            &self,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(SocketAddr::from(([127, 0, 0, 1], 9)))
+        }
+    }
+
+    /// The flow [`Answer::Via`] opens: a connected UDP socket, counted while it lives.
+    struct LiveFlow {
+        socket: UdpSocket,
+        _alive: Alive,
+    }
+
+    impl DialDatagram for LiveFlow {
+        fn poll_send(
+            &self,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.socket.poll_send(cx, buf)
+        }
+
+        fn poll_recv(
+            &self,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.socket.poll_recv(cx, buf)
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            self.socket.local_addr()
+        }
+    }
+
+    /// Answers each address as told, and counts the dial futures and the flows it makes and how many
+    /// of each are still alive, so a test can see what a race or a timeout left behind.
+    struct InstrumentedDialer {
+        answers: HashMap<SocketAddr, Answer>,
+        dials: Arc<Census>,
+        flows: Arc<Census>,
+    }
+
+    impl InstrumentedDialer {
+        fn answering(answers: impl IntoIterator<Item = (SocketAddr, Answer)>) -> Arc<Self> {
+            Arc::new(Self {
+                answers: answers.into_iter().collect(),
+                dials: Arc::default(),
+                flows: Arc::default(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl DatagramDialer for InstrumentedDialer {
+        async fn dial(&self, relay: SocketAddr) -> Result<BoxedDatagram> {
+            // Lives exactly as long as this future: dropped when the dial returns or is cancelled.
+            let _dialing = Alive::new(&self.dials);
+            match self.answers.get(&relay).copied() {
+                None => bail!("no route to {relay}"),
+                Some(Answer::Never) => std::future::pending().await,
+                Some(Answer::Silently) => Ok(Box::new(SilentFlow {
+                    _alive: Alive::new(&self.flows),
+                })),
+                Some(Answer::Via(to)) => {
+                    let socket = UdpSocket::bind("127.0.0.1:0").await?;
+                    socket.connect(to).await?;
+                    Ok(Box::new(LiveFlow {
+                        socket,
+                        _alive: Alive::new(&self.flows),
+                    }))
+                }
+            }
+        }
+    }
+
+    /// The race lets go of whatever the losing candidate still holds once it stops mattering: a dial
+    /// that is still pending, or a flow it opened that never answered. Run from both sides of the
+    /// race -- the web-client port winning outright, and the advertised port winning once the grace
+    /// for the web-client port runs out -- so both places the race drops a loser are covered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_losing_candidate_leaves_no_dial_or_flow_behind() {
+        let body = async {
+            let advertised: SocketAddr = "192.0.2.1:3478".parse().unwrap();
+            let web_client = SocketAddr::new(advertised.ip(), WEB_CLIENT_RELAY_PORT);
+            for (loser, answer) in [
+                (advertised, Answer::Never),
+                (advertised, Answer::Silently),
+                (web_client, Answer::Never),
+                (web_client, Answer::Silently),
+            ] {
+                let winner = if loser == advertised {
+                    web_client
+                } else {
+                    advertised
+                };
+                let (relay_addr, relay_task) = spawn_relay().await;
+                let dialer = InstrumentedDialer::answering([
+                    (winner, Answer::Via(relay_addr)),
+                    (loser, answer),
+                ]);
+
+                let (chan, events) = RelayMediaChannelFactory::new(
+                    advertised,
+                    Arc::new(crate::runtime_impl::TokioRuntime),
+                )
+                .with_dialer(dialer.clone())
+                .connect()
+                .await
+                .expect("relay connect with the losing candidate left hanging");
+                let (_, relay) = relay_task.await.unwrap();
+
+                assert_eq!(dialer.dials.started(), 2, "both candidates are dialled");
+                assert_eq!(
+                    dialer.dials.live(),
+                    0,
+                    "no dial future outlives the race; the loser {loser} answered {answer:?}"
+                );
+                let opened = 1 + usize::from(matches!(answer, Answer::Silently));
+                assert_eq!(
+                    dialer.flows.started(),
+                    opened,
+                    "every candidate that completed its dial opened a flow"
+                );
+                // A loser's flow lives in its driver task, which the race aborts rather than drops in
+                // place, so the abort gets its turn before the count is read.
+                loopback_relay::wait_for(
+                    || dialer.flows.live() == 1,
+                    "every flow but the winner's to be dropped",
+                )
+                .await;
+                // And the one left alive is the winner's.
+                round_trip(&*chan, &events, &relay).await;
+
+                chan.disconnect().await;
+                loopback_relay::wait_for(
+                    || dialer.flows.live() == 0,
+                    "the winner's flow to be dropped after the hang-up",
+                )
+                .await;
+                relay.driver.abort();
+            }
+        };
+
+        tokio::time::timeout(Duration::from_secs(30), body)
+            .await
+            .expect("the cancelled-candidate races must complete within the bound");
+    }
+
+    /// A connect that no candidate ever answers -- one dial that never completes, one flow that never
+    /// hears back -- fails at `RELAY_CONNECT_TIMEOUT` rather than parking the caller, and leaves
+    /// neither the dial nor the flow running. Real time, not a paused clock: the stack's own timers
+    /// read the std clock, which a paused Tokio clock does not move.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connect_timeout_drops_every_pending_dial_and_flow() {
+        let body = async {
+            let advertised: SocketAddr = "192.0.2.1:3478".parse().unwrap();
+            let dialer = InstrumentedDialer::answering([
+                (advertised, Answer::Never),
+                (
+                    SocketAddr::new(advertised.ip(), WEB_CLIENT_RELAY_PORT),
+                    Answer::Silently,
+                ),
+            ]);
+
+            let started = tokio::time::Instant::now();
+            let factory = RelayMediaChannelFactory::new(
+                advertised,
+                Arc::new(crate::runtime_impl::TokioRuntime),
+            )
+            .with_dialer(dialer.clone());
+            let outcome = tokio::time::timeout(
+                RELAY_CONNECT_TIMEOUT + Duration::from_secs(3),
+                factory.connect(),
+            )
+            .await
+            .expect("connect must give up at its own timeout, not park the caller");
+            let took = started.elapsed();
+            let error = match outcome {
+                Ok(_) => panic!("a connect nothing answered must not yield a channel"),
+                Err(error) => error.to_string(),
+            };
+
+            assert!(
+                error.contains("relay connect timed out"),
+                "the connect ends on its timeout, got: {error}"
+            );
+            assert!(
+                took >= RELAY_CONNECT_TIMEOUT,
+                "the connect gave up after {took:?}, before its {RELAY_CONNECT_TIMEOUT:?} timeout"
+            );
+            assert_eq!(dialer.dials.started(), 2, "both candidates are dialled");
+            assert_eq!(
+                dialer.flows.started(),
+                1,
+                "the web-client candidate opened its silent flow"
+            );
+            assert_eq!(
+                dialer.dials.live(),
+                0,
+                "the dial that never completed is dropped with the connect"
+            );
+            loopback_relay::wait_for(
+                || dialer.flows.live() == 0,
+                "the silent flow to be dropped after the timeout",
+            )
+            .await;
+        };
+
+        tokio::time::timeout(Duration::from_secs(30), body)
+            .await
+            .expect("the timed-out connect must complete within the bound");
+    }
+
     /// Lets a test hold a flow's sends back, the way a proxy under pressure answers `Pending`.
     #[derive(Default)]
     struct SendGate {
@@ -2821,6 +3124,113 @@ mod datagram_dialer {
         tokio::time::timeout(Duration::from_secs(30), body)
             .await
             .expect("the held-queue check must complete within the bound");
+    }
+
+    /// A hang-up that lands while the flow holds a datagram and the outbound queue behind it is full
+    /// still delivers all of that media before the goodbye: once the flow takes the held datagram,
+    /// the driver drains the closed queue in order, then closes, and `disconnect` returns inside its
+    /// deadline. Closing the queue is how `disconnect` asks for the hang-up, so it must not cost the
+    /// media already accepted into it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hang_up_behind_held_media_drains_the_queue_before_goodbye() {
+        let body = async {
+            let (relay_addr, relay_task) = spawn_relay().await;
+            let gate = Arc::new(SendGate::default());
+            let dialer = Arc::new(GatedDialer {
+                to: relay_addr,
+                gate: gate.clone(),
+            });
+            let (chan, _events) = connect_relay_media_via(
+                "192.0.2.1:3480".parse().unwrap(),
+                Arc::new(crate::runtime_impl::TokioRuntime),
+                Some(dialer),
+            )
+            .await
+            .expect("relay connect through the dialer");
+            let chan = Arc::new(chan);
+            let (_, relay) = relay_task.await.unwrap();
+            // Read the relay side as it arrives: its event queue is no deeper than the outbound one,
+            // so leaving it unread would drop media at the relay and blame the client for it.
+            let received = tokio::spawn(async move {
+                let mut got = Vec::new();
+                while let Some(packet) = next_packet(&relay).await {
+                    got.push(packet);
+                }
+                relay.driver.abort();
+                got
+            });
+            let media = |n: u16| {
+                let [hi, lo] = n.to_be_bytes();
+                Bytes::from(vec![0x90, 0x78, hi, lo])
+            };
+
+            gate.hold();
+            chan.send(media(0))
+                .await
+                .expect("client writes into the open channel");
+            loopback_relay::wait_for(
+                || gate.held.load(Ordering::SeqCst) > 0,
+                "the driver to offer its datagram to the held flow",
+            )
+            .await;
+            for n in 1..=RELAY_SEND_CAP as u16 {
+                chan.send(media(n))
+                    .await
+                    .expect("the queue takes media up to its bound");
+            }
+            assert_eq!(
+                chan.outbound.len(),
+                RELAY_SEND_CAP,
+                "the outbound queue is full behind the held datagram"
+            );
+
+            let started = tokio::time::Instant::now();
+            let hang_up = tokio::spawn({
+                let chan = chan.clone();
+                async move { chan.disconnect().await }
+            });
+            loopback_relay::wait_for(
+                || chan.outbound.is_closed(),
+                "disconnect to close the outbound queue",
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                !hang_up.is_finished(),
+                "disconnect waits for the held media rather than abandoning it"
+            );
+            assert_eq!(
+                chan.outbound.len(),
+                RELAY_SEND_CAP,
+                "closing the queue for the hang-up keeps the media already in it"
+            );
+
+            gate.release();
+            let got = tokio::time::timeout(RELAY_DISCONNECT_TIMEOUT, received)
+                .await
+                .expect("the relay sees the channel close once the queue has drained")
+                .unwrap();
+            let expected: Vec<Bytes> = (0..=RELAY_SEND_CAP as u16).map(media).collect();
+            assert_eq!(
+                got.len(),
+                expected.len(),
+                "the relay reads the held datagram and every queued packet before the close"
+            );
+            assert!(
+                got == expected,
+                "the relay reads the held datagram first, then the queued packets in order"
+            );
+            hang_up.await.unwrap();
+            assert!(
+                started.elapsed() < RELAY_DISCONNECT_TIMEOUT,
+                "disconnect returns once the queue has drained and the goodbye is out, not at its \
+                 deadline"
+            );
+        };
+
+        tokio::time::timeout(Duration::from_secs(30), body)
+            .await
+            .expect("the hang-up behind held media must complete within the bound");
     }
 
     /// A hang-up whose goodbye the flow holds back still reaches the relay once the flow takes it,
