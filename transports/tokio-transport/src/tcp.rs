@@ -31,11 +31,22 @@ pub struct TokioTcpTransportFactory {
 impl TokioTcpTransportFactory {
     pub fn new(host: impl Into<String>, port: u16) -> anyhow::Result<Self> {
         let host = host.into();
+        // Portable configuration may retain URI brackets, while stream dialers
+        // and Tokio's (host, port) resolver expect an unbracketed IPv6 literal.
+        let host = if host.starts_with('[') || host.ends_with(']') {
+            host.strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+                .and_then(|value| value.parse::<std::net::Ipv6Addr>().ok())
+                .context("invalid bracketed IPv6 TCP host")?
+                .to_string()
+        } else {
+            host
+        };
         if host.is_empty()
-            || host
-                .chars()
-                .any(|c| c.is_whitespace() || matches!(c, '/' | '\\' | '@' | '?' | '#'))
-            || host.contains("://")
+            || host.chars().any(|c| {
+                c.is_whitespace() || c.is_control() || matches!(c, '/' | '\\' | '@' | '?' | '#')
+            })
+            || (host.contains(':') && host.parse::<std::net::Ipv6Addr>().is_err())
             || port == 0
         {
             bail!("TCP destination requires a host without URL syntax and a nonzero port");
@@ -129,6 +140,18 @@ impl<W: AsyncWrite + Unpin + Send> Transport for ByteStreamTransport<W> {
     }
 }
 
+fn handoff_read(buffer: &mut BytesMut) -> Bytes {
+    if buffer.len() < crate::ADOPT_THRESHOLD {
+        // A one-byte TCP fragment must not retain a whole 16 KiB read allocation
+        // in the event queue. Keep that allocation reusable for the next read.
+        let data = Bytes::copy_from_slice(buffer);
+        buffer.clear();
+        data
+    } else {
+        buffer.split().freeze()
+    }
+}
+
 /// Adapts an owned stream without adding framing, TLS or certificate bypasses.
 ///
 /// Reads are bounded and delivered through a bounded event queue. Disconnect,
@@ -148,6 +171,7 @@ where
         shutdown,
     });
     let signal = transport.shutdown.clone();
+    let weak_transport = Arc::downgrade(&transport);
     let _ = tx.try_send(TransportEvent::Connected);
     tokio::spawn(async move {
         let mut buffer = BytesMut::with_capacity(READ_CAPACITY);
@@ -163,7 +187,7 @@ where
             match result {
                 Ok(0) => break DisconnectReason::StreamEnded,
                 Ok(_) => {
-                    let data = buffer.split().freeze();
+                    let data = handoff_read(&mut buffer);
                     tokio::select! {
                         biased;
                         _ = stop.changed() => break DisconnectReason::Unknown,
@@ -180,6 +204,11 @@ where
         };
         drop(reader);
         let _ = signal.send(true);
+        // Retirement must release both halves even when the caller retains the
+        // transport. Signalling first interrupts a writer waiting on the peer.
+        if let Some(transport) = weak_transport.upgrade() {
+            transport.writer.lock().await.take();
+        }
         // A full, unconsumed queue must not keep the task or socket alive.
         // The eventual channel closure also reports termination to the owner.
         let _ = tx.try_send(TransportEvent::Disconnected(reason));
@@ -243,7 +272,6 @@ mod tests {
         }
         drop(pending);
         assert!(transport.send(Bytes::from_static(b"c")).await.is_err());
-        timeout(DEADLINE, transport.disconnect()).await.unwrap();
         assert_eq!(
             timeout(DEADLINE, actual_peer.read_u8())
                 .await
@@ -256,7 +284,7 @@ mod tests {
 
     #[tokio::test]
     async fn disconnect_interrupts_a_stalled_write() {
-        let (stream, _peer) = tokio::io::duplex(1);
+        let (stream, mut peer) = tokio::io::duplex(1);
         let (transport, _events) = from_byte_stream(stream);
         let send_transport = transport.clone();
         let pending =
@@ -266,19 +294,107 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_transport_stops_a_backpressured_reader() {
-        let (stream, mut peer) = tokio::io::duplex(READ_CAPACITY);
-        let (transport, _events) = from_byte_stream(stream);
-        let filling = tokio::spawn(async move {
-            let data = vec![0; READ_CAPACITY];
-            loop {
-                if peer.write_all(&data).await.is_err() {
-                    break;
+    async fn write_error_releases_stream_without_explicit_disconnect() {
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+        };
+        struct FailingStream(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for FailingStream {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
                 }
             }
+        }
+        impl AsyncRead for FailingStream {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                _: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Pending
+            }
+        }
+        impl AsyncWrite for FailingStream {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                _: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "synthetic write failure",
+                )))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let (dropped, observed) = tokio::sync::oneshot::channel();
+        let (transport, _events) = from_byte_stream(FailingStream(Some(dropped)));
+        assert!(
+            transport
+                .send(Bytes::from_static(b"fail"))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("TCP write failed")
+        );
+        timeout(DEADLINE, observed).await.unwrap().unwrap();
+        assert!(
+            transport
+                .send(Bytes::from_static(b"retired"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_transport_stops_a_backpressured_reader() {
+        let (stream, mut peer) = tokio::io::duplex(1);
+        let (transport, events) = from_byte_stream(stream);
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            TransportEvent::Connected
+        ));
+        let (filled_tx, filled_rx) = tokio::sync::oneshot::channel();
+        let filling = tokio::spawn(async move {
+            // One byte per read: a full queue, one read waiting for queue space,
+            // and one byte left in the duplex stream, without timing assumptions.
+            peer.write_all(&[0; EVENT_CAPACITY + 2]).await.unwrap();
+            filled_tx.send(()).unwrap();
+            assert_eq!(
+                peer.read_u8().await.unwrap_err().kind(),
+                std::io::ErrorKind::UnexpectedEof
+            );
         });
+        timeout(DEADLINE, filled_rx).await.unwrap().unwrap();
+        assert_eq!(events.len(), EVENT_CAPACITY);
         drop(transport);
         timeout(DEADLINE, filling).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_receiver_closes_stream_while_transport_is_retained() {
+        let (stream, mut peer) = tokio::io::duplex(1);
+        let (transport, events) = from_byte_stream(stream);
+        drop(events);
+        assert_eq!(
+            timeout(DEADLINE, peer.read_u8())
+                .await
+                .unwrap()
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        assert!(transport.send(Bytes::from_static(b"closed")).await.is_err());
     }
 
     #[tokio::test]
@@ -313,6 +429,53 @@ mod tests {
                 .kind(),
             std::io::ErrorKind::UnexpectedEof
         );
+    }
+
+    #[test]
+    fn short_reads_reuse_the_read_allocation_without_retaining_it_in_events() {
+        let mut buffer = BytesMut::with_capacity(READ_CAPACITY);
+        let allocation = buffer.as_ptr();
+        buffer.extend_from_slice(b"a");
+        let first = handoff_read(&mut buffer);
+        buffer.reserve(READ_CAPACITY);
+        assert_eq!(buffer.as_ptr(), allocation);
+        buffer.extend_from_slice(b"b");
+        let second = handoff_read(&mut buffer);
+        assert_eq!(buffer.as_ptr(), allocation);
+        assert_eq!(buffer.capacity(), READ_CAPACITY);
+        assert_eq!(&first[..], b"a");
+        assert_eq!(&second[..], b"b");
+    }
+
+    #[test]
+    fn normalizes_ipv6_for_native_and_custom_dialers() {
+        assert_eq!(
+            TokioTcpTransportFactory::new("[::1]", 443).unwrap().host,
+            "::1"
+        );
+        assert_eq!(
+            TokioTcpTransportFactory::new("::1", 443).unwrap().host,
+            "::1"
+        );
+        assert!(TokioTcpTransportFactory::new("127.0.0.1:443", 443).is_err());
+        assert!(TokioTcpTransportFactory::new("host\0", 443).is_err());
+    }
+
+    #[tokio::test]
+    async fn custom_dialer_receives_destination_and_errors_never_fall_back() {
+        struct RejectDialer;
+        #[async_trait]
+        impl StreamDialer for RejectDialer {
+            async fn dial(&self, host: &str, port: u16) -> anyhow::Result<crate::BoxedStream> {
+                assert_eq!((host, port), ("::1", 1234));
+                bail!("synthetic dial failure")
+            }
+        }
+        let factory = TokioTcpTransportFactory::new("[::1]", 1234)
+            .unwrap()
+            .with_dialer(RejectDialer);
+        let result = factory.create_transport().await;
+        assert!(matches!(result, Err(error) if error.to_string() == "synthetic dial failure"));
     }
 
     #[test]
