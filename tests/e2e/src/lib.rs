@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use anyhow::Context as _;
 use wacore::net::{HttpClient, HttpRequest};
 use wacore::store::InMemoryBackend;
 use wacore::store::traits::{AppSyncStore, TcTokenEntry};
@@ -18,6 +19,27 @@ use whatsapp_rust::bot::Bot;
 use whatsapp_rust::waproto::whatsapp as wa;
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
+
+async fn wait_for_initial_prekeys(
+    client: &whatsapp_rust::Client,
+    timeout: tokio::time::Duration,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(timeout, async {
+        let mut tick = tokio::time::interval(tokio::time::Duration::from_millis(20));
+        loop {
+            if client
+                .persistence_manager()
+                .get_device_snapshot()
+                .server_has_prekeys
+            {
+                return;
+            }
+            tick.tick().await;
+        }
+    })
+    .await
+    .context("initial prekey upload was not acknowledged")
+}
 
 /// Returns the mock server WebSocket URL from env, or the default.
 pub fn mock_server_url() -> String {
@@ -149,6 +171,7 @@ async fn collect_connect_diagnostics(
     let primary_lid = snapshot.lid.as_ref().map(|jid| jid.to_non_ad());
     let has_pn = snapshot.pn.is_some();
     let has_lid = snapshot.lid.is_some();
+    let prekeys_uploaded = snapshot.server_has_prekeys;
     drop(snapshot);
 
     let (primary_pn_session, primary_lid_session) = futures::join!(
@@ -159,12 +182,13 @@ async fn collect_connect_diagnostics(
     let report = client.memory_report().await;
 
     format!(
-        "socket_connected={}, logged_in={}, has_pn={}, has_lid={}, sync_keys={}, \
+        "socket_connected={}, logged_in={}, has_pn={}, has_lid={}, prekeys_uploaded={}, sync_keys={}, \
          primary_pn_session={}, primary_lid_session={}, app_state_requests={}, app_state_syncs={}",
         client.is_socket_connected(),
         client.is_logged_in(),
         has_pn,
         has_lid,
+        prekeys_uploaded,
         sync_keys,
         primary_pn_session,
         primary_lid_session,
@@ -174,8 +198,7 @@ async fn collect_connect_diagnostics(
 }
 
 impl TestClient {
-    /// Create a client, connect to the mock server, and wait for PairSuccess + Connected.
-    /// Returns the connected TestClient with its JID available via `client.pn()`.
+    /// Connect, wait for readiness and initial prekey publication, then drain startup sync.
     pub async fn connect(prefix: &str) -> anyhow::Result<Self> {
         Self::connect_inner(prefix, Some(unique_push_name(prefix))).await
     }
@@ -255,32 +278,27 @@ impl TestClient {
         // `Connected` timed out under CI load. PairSuccess/Connected still land
         // in the bounded `event_rx`; the predicate-filtered `wait_for_event`
         // discards them.
-        if let Err(e) = client
-            .wait_for_session_ready(tokio::time::Duration::from_secs(60))
-            .await
-        {
-            let diagnostics = connect_diagnostics(&client, &backend).await;
-            let _ = client.shutdown().await;
-            drop(run_handle);
-            return Err(anyhow::anyhow!(
-                "{prefix}: client never became ready after pairing ({diagnostics}): {e}"
-            ));
+        let startup = async {
+            client
+                .wait_for_session_ready(tokio::time::Duration::from_secs(60))
+                .await
+                .context("client did not become ready after pairing")?;
+            // Ready/offline-sync completion does not wait for key publication.
+            // A new companion cannot receive its first peer message until the
+            // server acknowledges this upload. Check state, not elapsed time.
+            wait_for_initial_prekeys(&client, tokio::time::Duration::from_secs(30)).await?;
+            client
+                .wait_for_startup_sync(tokio::time::Duration::from_secs(30))
+                .await
+                .context("startup sync did not settle")
         }
-
-        // Drain the initial startup sync (offline messages + history) so tests
-        // start from a quiescent state. This is a hard requirement, not
-        // best-effort: a timeout here means a real startup hang or a mid-sync
-        // client that would make assertions race changing state, so it fails
-        // the connect.
-        if let Err(e) = client
-            .wait_for_startup_sync(tokio::time::Duration::from_secs(30))
-            .await
-        {
+        .await;
+        if let Err(e) = startup {
             let diagnostics = connect_diagnostics(&client, &backend).await;
             let _ = client.shutdown().await;
             drop(run_handle);
             return Err(anyhow::anyhow!(
-                "{prefix}: startup sync did not settle ({diagnostics}): {e}"
+                "{prefix}: startup did not settle ({diagnostics}): {e:#}"
             ));
         }
 
@@ -735,4 +753,61 @@ pub async fn send_and_expect_text(
     let result = sender.send_message(to.clone(), text_msg(text)).await?;
     receiver.wait_for_text(text, timeout_secs).await?;
     Ok(result.message_id.into_string())
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    async fn unconnected_client() -> Arc<whatsapp_rust::Client> {
+        Bot::builder()
+            .with_backend_arc(Arc::new(InMemoryBackend::new()))
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(UreqHttpClient::new())
+            .with_runtime(whatsapp_rust::TokioRuntime)
+            .build()
+            .await
+            .unwrap()
+            .client()
+    }
+
+    #[tokio::test]
+    async fn initial_prekey_barrier_waits_for_acknowledged_upload() {
+        let client = unconnected_client().await;
+        assert!(
+            !client
+                .persistence_manager()
+                .get_device_snapshot()
+                .server_has_prekeys
+        );
+        let mut waiting = Box::pin(wait_for_initial_prekeys(
+            &client,
+            tokio::time::Duration::from_secs(5),
+        ));
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        client
+            .persistence_manager()
+            .modify_device(|device| device.server_has_prekeys = true)
+            .await;
+        waiting.await.unwrap();
+        wait_for_initial_prekeys(&client, tokio::time::Duration::ZERO)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn initial_prekey_barrier_fails_without_publishing_the_flag() {
+        let client = unconnected_client().await;
+        assert!(
+            wait_for_initial_prekeys(&client, tokio::time::Duration::ZERO)
+                .await
+                .is_err()
+        );
+        assert!(
+            !client
+                .persistence_manager()
+                .get_device_snapshot()
+                .server_has_prekeys
+        );
+    }
 }

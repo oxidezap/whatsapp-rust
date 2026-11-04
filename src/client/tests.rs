@@ -9266,6 +9266,34 @@ async fn wait_for_startup_sync_succeeds_when_history_tasks_finish() {
         .expect("an idle activity tracker is a completed startup sync");
 }
 
+#[tokio::test]
+async fn session_readiness_and_startup_sync_can_precede_initial_prekey_upload() {
+    let client = offline_resume_test_client().await;
+    client.set_connected_for_test(true);
+    client.set_logged_in_for_test(true, Ordering::Relaxed);
+    client.set_ready_for_test(true, Ordering::Relaxed);
+    client.offline_sync_completed.store(true, Ordering::Release);
+    client
+        .persistence_manager
+        .modify_device(|device| device.server_has_prekeys = false)
+        .await;
+
+    let guard = client.prekey_upload_lock.lock().await;
+    let mut upload = std::pin::pin!(client.upload_pre_keys_at_login());
+    assert!(futures::poll!(upload.as_mut()).is_pending());
+
+    client.wait_for_session_ready(Duration::ZERO).await.unwrap();
+    client.wait_for_startup_sync(Duration::ZERO).await.unwrap();
+    assert!(
+        !client
+            .persistence_manager
+            .get_device_snapshot()
+            .server_has_prekeys
+    );
+    assert!(futures::poll!(upload.as_mut()).is_pending());
+    drop(guard);
+}
+
 /// A chat lane whose receiver the test owns: it decides when — or whether —
 /// the queued messages are processed, which is the only way to hold a resume's
 /// gate closed on purpose.
