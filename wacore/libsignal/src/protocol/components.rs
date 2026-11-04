@@ -20,9 +20,7 @@ use crate::core::PublicKey;
 use crate::engine::{self as engine, CryptoProvider};
 use crate::protocol::error::{Result, SignalProtocolError};
 use buffa::Message as _;
-use waproto::whatsapp::{
-    SenderKeyStateStructure, SessionStructure, sender_key_state_structure, session_structure,
-};
+use waproto::whatsapp::{SessionStructure, session_structure};
 
 const PRIVATE_KEY_BYTES: usize = 32;
 const SYMMETRIC_KEY_BYTES: usize = 32;
@@ -248,15 +246,19 @@ fn invalid(field: &'static str, expectation: &'static str) -> SignalProtocolErro
     SignalProtocolError::InvalidArgument(format!("{field} must be {expectation}"))
 }
 
-fn normalize_public_key(mut value: Vec<u8>, field: &'static str) -> Result<Vec<u8>> {
-    let key = match value.len() {
-        PublicKey::RAW_KEY_LEN => PublicKey::from_djb_public_key_bytes(&value),
-        PublicKey::SERIALIZED_KEY_LEN => PublicKey::deserialize(&value),
+fn component_public_key(value: &[u8], field: &'static str) -> Result<PublicKey> {
+    match value.len() {
+        PublicKey::RAW_KEY_LEN => PublicKey::from_djb_public_key_bytes(value),
+        PublicKey::SERIALIZED_KEY_LEN => PublicKey::deserialize(value),
         _ => {
             return Err(invalid(field, "a raw or canonically serialized public key"));
         }
     }
-    .map_err(|_| invalid(field, "a valid public key"))?;
+    .map_err(|_| invalid(field, "a valid public key"))
+}
+
+fn normalize_public_key(mut value: Vec<u8>, field: &'static str) -> Result<Vec<u8>> {
+    let key = component_public_key(&value, field)?;
 
     value.clear();
     value.extend_from_slice(&key.serialize());
@@ -305,9 +307,8 @@ fn required_exact_bytes(
     )
 }
 
-/// Fixed-width key material, copied out of the persisted `Bytes` without
-/// allocating.
-fn key_material<const N: usize>(value: Bytes, field: &'static str) -> Result<[u8; N]> {
+/// Copy fixed-width key material from owned input without allocating.
+fn key_material<const N: usize>(value: impl AsRef<[u8]>, field: &'static str) -> Result<[u8; N]> {
     <[u8; N]>::try_from(value.as_ref())
         .map_err(|_| SignalProtocolError::InvalidArgument(format!("{field} must be {N} bytes")))
 }
@@ -712,117 +713,62 @@ pub(crate) fn session_components_from_structure(
     })
 }
 
-pub(crate) fn sender_state_structure_from_components(
-    value: SenderKeyStateComponents,
-) -> Result<SenderKeyStateStructure> {
-    let chain_seed = exact_bytes(
-        value.chain_key.seed,
-        SYMMETRIC_KEY_BYTES,
-        "sender chain seed",
-    )?;
-    let signing_public =
-        normalize_public_key(value.signing_key.public, "sender signing public key")?;
-    let signing_private = optional_exact_bytes(
-        value.signing_key.private,
-        PRIVATE_KEY_BYTES,
-        "sender signing private key",
-    )?;
-    Ok({
-        let mut proto = SenderKeyStateStructure::default();
-        proto.sender_key_id = Some(value.key_id);
-        proto.sender_chain_key = MessageField::some({
-            let mut proto = sender_key_state_structure::SenderChainKey::default();
-            proto.iteration = Some(value.chain_key.iteration);
-            proto.seed = Some(Bytes::from(chain_seed));
-            proto
-        });
-        proto.sender_signing_key = MessageField::some({
-            let mut proto = sender_key_state_structure::SenderSigningKey::default();
-            proto.public = Some(Bytes::from(signing_public));
-            proto.private = signing_private.map(Bytes::from);
-            proto
-        });
-        proto.sender_message_keys = value
+fn sender_state_from_components(value: SenderKeyStateComponents) -> Result<engine::SenderKeyState> {
+    // Keep the persisted reader's per-state budget without constructing its
+    // protobuf field table. The three fixed fields precede the skipped keys.
+    if value.message_keys.len() > engine::codec::MAX_STORED_FIELDS - 3 {
+        return Err(engine::Error::Encoding("stored protobuf field budget exceeded").into());
+    }
+    Ok(engine::SenderKeyState {
+        id: value.key_id,
+        iteration: value.chain_key.iteration,
+        chain_key: key_material(value.chain_key.seed, "sender chain seed")?,
+        signing_public: *component_public_key(
+            &value.signing_key.public,
+            "sender signing public key",
+        )?
+        .public_key_bytes(),
+        signing_private: value
+            .signing_key
+            .private
+            .map(|private| key_material(private, "sender signing private key"))
+            .transpose()?,
+        skipped: value
             .message_keys
             .into_iter()
             .map(|key| {
-                Ok({
-                    let mut proto = sender_key_state_structure::SenderMessageKey::default();
-                    proto.iteration = Some(key.iteration);
-                    proto.seed = Some(Bytes::from(exact_bytes(
-                        key.seed,
-                        SYMMETRIC_KEY_BYTES,
-                        "sender message-key seed",
-                    )?));
-                    proto
-                })
-            })
-            .collect::<Result<_>>()?;
-        proto
-    })
-}
-
-pub(crate) fn sender_state_components_from_structure(
-    mut value: SenderKeyStateStructure,
-) -> Result<SenderKeyStateComponents> {
-    let chain = value
-        .sender_chain_key
-        .take()
-        .ok_or_else(|| invalid("sender chain key", "present"))?;
-    let signing = value
-        .sender_signing_key
-        .take()
-        .ok_or_else(|| invalid("sender signing key", "present"))?;
-    Ok(SenderKeyStateComponents {
-        key_id: value
-            .sender_key_id
-            .ok_or_else(|| invalid("sender key id", "present"))?,
-        chain_key: SenderChainKeyComponents {
-            iteration: chain
-                .iteration
-                .ok_or_else(|| invalid("sender chain iteration", "present"))?,
-            seed: exact_bytes(
-                chain
-                    .seed
-                    .ok_or_else(|| invalid("sender chain seed", "present"))?
-                    .to_vec(),
-                SYMMETRIC_KEY_BYTES,
-                "sender chain seed",
-            )?,
-        },
-        signing_key: SenderSigningKeyComponents {
-            public: normalize_public_key(
-                signing
-                    .public
-                    .ok_or_else(|| invalid("sender signing public key", "present"))?
-                    .to_vec(),
-                "sender signing public key",
-            )?,
-            private: optional_exact_bytes(
-                signing.private.map(|value| value.to_vec()),
-                PRIVATE_KEY_BYTES,
-                "sender signing private key",
-            )?,
-        },
-        message_keys: value
-            .sender_message_keys
-            .into_iter()
-            .map(|key| {
-                Ok(SenderMessageKeyComponents {
-                    iteration: key
-                        .iteration
-                        .ok_or_else(|| invalid("sender message-key iteration", "present"))?,
-                    seed: exact_bytes(
-                        key.seed
-                            .ok_or_else(|| invalid("sender message-key seed", "present"))?
-                            .to_vec(),
-                        SYMMETRIC_KEY_BYTES,
-                        "sender message-key seed",
-                    )?,
+                Ok(engine::SenderMessageKey {
+                    iteration: key.iteration,
+                    seed: key_material(key.seed, "sender message-key seed")?,
                 })
             })
             .collect::<Result<_>>()?,
     })
+}
+
+fn sender_state_components(value: &engine::SenderKeyState) -> SenderKeyStateComponents {
+    SenderKeyStateComponents {
+        key_id: value.id,
+        chain_key: SenderChainKeyComponents {
+            iteration: value.iteration,
+            seed: value.chain_key.to_vec(),
+        },
+        signing_key: SenderSigningKeyComponents {
+            public: engine::wire::tagged_key(&value.signing_public).to_vec(),
+            private: value
+                .signing_private
+                .as_ref()
+                .map(|private| private.to_vec()),
+        },
+        message_keys: value
+            .skipped
+            .iter()
+            .map(|key| SenderMessageKeyComponents {
+                iteration: key.iteration,
+                seed: key.seed.to_vec(),
+            })
+            .collect(),
+    }
 }
 
 /// Expand a compact skipped-key seed through the independent crypto provider.
@@ -962,14 +908,15 @@ impl From<&SessionState> for SessionStructure {
 }
 impl SenderKeyRecord {
     pub fn from_components(value: SenderKeyRecordComponents) -> Result<Self> {
-        let mut proto = waproto::whatsapp::SenderKeyRecordStructure::default();
-        proto.sender_key_states = value
+        let states = value
             .states
             .into_iter()
             .take(engine::MAX_SENDER_STATES)
-            .map(sender_state_structure_from_components)
+            .map(sender_state_from_components)
             .collect::<Result<_>>()?;
-        Self::deserialize(&waproto::codec::sender_key_record_to_vec(&proto))
+        let mut record = Self::default();
+        record.inner.states = states;
+        Ok(record)
     }
     pub fn into_components(mut self) -> Result<SenderKeyRecordComponents> {
         // A reservation belongs only to the current sending chain. Historical
@@ -986,16 +933,13 @@ impl SenderKeyRecord {
                 }
             }
         }
-        let proto = waproto::codec::sender_key_record_decode(
-            &engine::codec::encode_sender_key_record(&self.inner),
-        )
-        .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
         Ok(SenderKeyRecordComponents {
-            states: proto
-                .sender_key_states
-                .into_iter()
-                .map(sender_state_components_from_structure)
-                .collect::<Result<_>>()?,
+            states: self
+                .inner
+                .states
+                .iter()
+                .map(sender_state_components)
+                .collect(),
         })
     }
 }

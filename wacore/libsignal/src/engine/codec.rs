@@ -7,7 +7,7 @@ type Data<'a> = Vec<(u32, Value<'a>)>;
 // The wire byte bound alone does not bound a table of two-byte scalar fields.
 // This independent per-message bound caps the table at 4 MiB on 64-bit hosts,
 // while allowing historical skipped-key backlogs well above the default 2000.
-const MAX_STORED_FIELDS: usize = 131_072;
+pub(crate) const MAX_STORED_FIELDS: usize = 131_072;
 fn fields(bytes: &[u8]) -> Result<Data<'_>> {
     let mut f = Fields::new_storage(bytes)?;
     let mut out = Vec::new();
