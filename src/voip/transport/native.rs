@@ -354,7 +354,14 @@ impl RelayStack {
     /// When [`Self::handle_timeout`] next needs calling. DTLS handshake retransmission and SCTP's
     /// retransmission, ack and heartbeat timers both live here, so the driver arms one timer for
     /// the pair instead of racing two.
+    ///
+    /// None once the stack has stopped: [`Self::handle_timeout`] ignores a stopped stack, so a
+    /// deadline still pending inside it (SCTP's shutdown timer after [`Self::close`]) would never
+    /// clear, and a driver waiting out a held goodbye would wake on it in a busy loop.
     fn poll_timeout(&self) -> Option<Instant> {
+        if self.stopped {
+            return None;
+        }
         let dtls = self.dtls.poll_timeout(&self.remote);
         let sctp = self.assoc.as_ref().and_then(|(_, a)| a.poll_timeout());
         match (dtls, sctp) {
@@ -1862,6 +1869,15 @@ mod stack {
         assert!(!pair.client.is_open());
     }
 
+    /// A closed stack asks for no more timer wakeups. `handle_timeout` ignores a stopped stack, so a
+    /// deadline left over from the close (SCTP's shutdown timer) would never move on.
+    #[test]
+    fn a_closed_stack_wants_no_timer() {
+        let mut pair = Pair::connected();
+        pair.client.close(pair.now);
+        assert_eq!(pair.client.poll_timeout(), None);
+    }
+
     /// A relay that hangs up properly (SCTP SHUTDOWN, then DTLS close_notify) is reported as a clean
     /// close, not as a read error the call would surface as a failure.
     #[test]
@@ -2862,6 +2878,55 @@ mod datagram_dialer {
         tokio::time::timeout(Duration::from_secs(30), body)
             .await
             .expect("the held-goodbye hang-up must complete within the bound");
+    }
+
+    /// A goodbye held past the close's own timers (SCTP's shutdown timer is due after 1 s) must not
+    /// turn the wait into a busy loop: the driver offers the held datagram again only when woken,
+    /// not on every pass of a timer that already fired.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_goodbye_does_not_spin_the_driver() {
+        let body = async {
+            let (relay_addr, relay_task) = spawn_relay().await;
+            let gate = Arc::new(SendGate::default());
+            let (chan, _events) = RelayMediaChannelFactory::new(
+                "192.0.2.1:3480".parse().unwrap(),
+                Arc::new(crate::runtime_impl::TokioRuntime),
+            )
+            .with_dialer(Arc::new(GatedDialer {
+                to: relay_addr,
+                gate: gate.clone(),
+            }))
+            .connect()
+            .await
+            .expect("relay connect through the dialer");
+            let (_, relay) = relay_task.await.unwrap();
+
+            gate.hold();
+            let hang_up = tokio::spawn({
+                let chan = chan.clone();
+                async move { chan.disconnect().await }
+            });
+            loopback_relay::wait_for(
+                || gate.held.load(Ordering::SeqCst) > 0,
+                "the driver to offer its goodbye to the held flow",
+            )
+            .await;
+            // Past the shutdown timer, inside `disconnect`'s deadline.
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let offers = gate.held.load(Ordering::SeqCst);
+            assert!(
+                offers < 50,
+                "the held goodbye was offered {offers} times: the driver is spinning"
+            );
+
+            gate.release();
+            hang_up.await.unwrap();
+            relay.driver.abort();
+        };
+
+        tokio::time::timeout(Duration::from_secs(30), body)
+            .await
+            .expect("the held-goodbye wait must complete within the bound");
     }
 }
 
