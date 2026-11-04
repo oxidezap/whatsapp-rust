@@ -87,6 +87,23 @@ fn case_count(source: &str) -> Result<usize> {
     ensure!(count > 0, "empty classic case catalog");
     Ok(count)
 }
+fn baseline_port(package: &Path, cargo: &mut String) -> Result<Vec<u8>> {
+    let parsed: toml::Value = toml::from_str(cargo)?;
+    let features = parsed
+        .get("features")
+        .and_then(toml::Value::as_table)
+        .context("baseline feature table missing")?;
+    if features.contains_key("bench-internals") {
+        return std::fs::read(package.join(ACCESS))
+            .context("baseline declares bench-internals but has no matching benchmark API port");
+    }
+    ensure!(
+        cargo.matches("[features]\n").count() == 1,
+        "baseline feature table changed"
+    );
+    *cargo = cargo.replacen("[features]\n", "[features]\nbench-internals = []\n", 1);
+    Ok(BASE_ACCESS.as_bytes().to_vec())
+}
 pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()> {
     full_sha(base)?;
     full_sha(head)?;
@@ -111,7 +128,6 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
         ("workload.rs", workload.as_slice()),
         ("benchmark.rs", benchmark.as_slice()),
         ("head-api-port.rs", head_port.as_slice()),
-        ("base-api-port.rs", BASE_ACCESS.as_bytes()),
     ] {
         write(&output.join("results").join(name), contents)?;
     }
@@ -128,28 +144,18 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
             "unexpected comparison revision"
         );
         let package = checkout.join(PACKAGE);
-        let port = if role == "base" {
-            BASE_ACCESS.as_bytes()
-        } else {
-            head_port.as_slice()
-        };
-        write(&package.join(WORKLOAD), &workload)?;
-        write(&package.join(ACCESS), port)?;
-        let bench = format!("classic_pair_{role}");
-        write(&package.join(format!("benches/{bench}.rs")), &benchmark)?;
         let manifest_path = package.join("Cargo.toml");
         let mut cargo = std::fs::read_to_string(&manifest_path)?;
-        if role == "base" {
-            ensure!(
-                !cargo.contains("bench-internals"),
-                "baseline benchmark feature requires review"
-            );
-            ensure!(
-                cargo.matches("[features]\n").count() == 1,
-                "baseline feature table changed"
-            );
-            cargo = cargo.replacen("[features]\n", "[features]\nbench-internals = []\n", 1);
-        }
+        let port = if role == "base" {
+            baseline_port(&package, &mut cargo)?
+        } else {
+            head_port.clone()
+        };
+        write(&output.join(format!("results/{role}-api-port.rs")), &port)?;
+        write(&package.join(WORKLOAD), &workload)?;
+        write(&package.join(ACCESS), &port)?;
+        let bench = format!("classic_pair_{role}");
+        write(&package.join(format!("benches/{bench}.rs")), &benchmark)?;
         cargo.push_str(&format!("\n[[bench]]\nname = {bench:?}\nharness = false\n"));
         write(&manifest_path, cargo.as_bytes())?;
         let patch = capture(Command::new("git").current_dir(&checkout).args([
@@ -185,7 +191,7 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
             checkout,
             target,
             bench,
-            port_sha256: sha256(port),
+            port_sha256: sha256(&port),
         });
     }
     write_json(
@@ -264,5 +270,43 @@ mod tests {
             include_str!("../../../wacore/libsignal/benches/classic_fixture/mod.rs");
         assert_eq!(case_count(SOURCE).unwrap(), 41);
         assert!(case_count("const OTHER: &[Case] = &[];").is_err());
+    }
+    #[test]
+    fn rewritten_base_keeps_its_feature_and_own_port() {
+        let package = tempfile::tempdir().unwrap();
+        let original = include_str!("../../../wacore/libsignal/Cargo.toml");
+        let expected =
+            include_bytes!("../../../wacore/libsignal/benches/classic_fixture/access.rs");
+        write(&package.path().join(ACCESS), expected).unwrap();
+        let mut cargo = original.to_owned();
+        assert_eq!(baseline_port(package.path(), &mut cargo).unwrap(), expected);
+        assert_eq!(cargo, original);
+    }
+    #[test]
+    fn historical_base_gets_only_the_missing_feature_and_public_api_port() {
+        let package = tempfile::tempdir().unwrap();
+        let mut cargo =
+            "# bench-internals is not declared here\n[features]\nlegacy-session-interop = []\n"
+                .to_owned();
+        assert_eq!(
+            baseline_port(package.path(), &mut cargo).unwrap(),
+            BASE_ACCESS.as_bytes()
+        );
+        let parsed: toml::Value = toml::from_str(&cargo).unwrap();
+        assert!(
+            parsed["features"]["bench-internals"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(parsed["features"].get("legacy-session-interop").is_some());
+    }
+    #[test]
+    fn rewritten_base_without_its_port_does_not_fall_back_to_retired_methods() {
+        let package = tempfile::tempdir().unwrap();
+        let original = "[features]\nbench-internals = []\n";
+        let mut cargo = original.to_owned();
+        assert!(baseline_port(package.path(), &mut cargo).is_err());
+        assert_eq!(cargo, original);
     }
 }
