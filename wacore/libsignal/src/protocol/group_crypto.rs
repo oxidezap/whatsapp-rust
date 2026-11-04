@@ -30,6 +30,8 @@ struct VerifyingContext {
     public: [u8; 32],
     verifying: Option<PreparedVerifyingKey>,
 }
+// Share the constant-time comparison across the unrolled cache scans.
+#[inline(never)]
 pub(crate) fn private_keys_match(left: Option<&[u8; 32]>, right: Option<&[u8; 32]>) -> bool {
     match (left, right) {
         (None, None) => true,
