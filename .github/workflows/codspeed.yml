@@ -34,7 +34,7 @@ env:
 
 jobs:
   prefetch-pair:
-    name: Prefetch and addresses against base on the same host
+    name: Prefetch, addresses and SDK sends against base on the same host
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 45

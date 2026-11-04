@@ -9,6 +9,9 @@ const BENCH: &str = "benches/appstate_prefetch.rs";
 const FIXTURE: &str = "src/client/app_state/prefetch_bench.rs";
 const ADDRESS_BENCH: &str = "benches/client_usync.rs";
 const ADDRESS_ATTRIBUTE: &str = "#[divan::bench(args = USER_COUNTS)]";
+const DM_BENCH: &str = "benches/client_dm_send.rs";
+const GROUP_BENCH: &str = "benches/client_group_send.rs";
+const SDK_FIXTURE: &str = "src/bench_support.rs";
 const ATTRIBUTE: &str =
     "#[divan::bench(args = [65536, 1048576], sample_count = 1000, sample_size = 1)]";
 // Each role/repetition has a distinct benchmark URI. No sample overwrites another.
@@ -31,6 +34,7 @@ struct Revision {
     target: PathBuf,
     bench: String,
     address_bench: String,
+    sdk_bench: String,
 }
 #[derive(Serialize, Deserialize)]
 struct Manifest {
@@ -39,6 +43,8 @@ struct Manifest {
     benchmark_sha256: String,
     fixture_sha256: String,
     address_benchmark_sha256: String,
+    sdk_benchmark_sha256: [String; 2],
+    sdk_fixture_sha256: String,
     expected_walltime_results: usize,
     order: Vec<(String, usize)>,
     revisions: Vec<Revision>,
@@ -101,6 +107,38 @@ fn address_workload(source: &str) -> Result<String> {
         ADDRESS_ATTRIBUTE,
         5,
         &["main", "protocol_address_per_device"],
+    )
+}
+fn sdk_workload(source: &str, group: bool) -> Result<String> {
+    ensure!(
+        group || source.contains("const PEER_DEVICES: &[usize] = &[1, 2, 5];"),
+        "SDK device widths changed; review the paired workload"
+    );
+    for constant in ["SAMPLE_COUNT", "SAMPLE_SIZE"] {
+        ensure!(
+            source
+                .matches(&format!("const {constant}: u32 = 20;"))
+                .count()
+                == 1,
+            "SDK benchmark sampling changed; review the paired workload"
+        );
+    }
+    let attribute = format!(
+        "#[divan::bench(args = {}, sample_count = SAMPLE_COUNT, sample_size = SAMPLE_SIZE)]",
+        if group { "GROUP_SIZES" } else { "PEER_DEVICES" }
+    );
+    forward_workload(
+        source,
+        &attribute,
+        if group { 4 } else { 2 },
+        &[
+            "main",
+            if group {
+                "warm_group_send"
+            } else {
+                "warm_dm_send_lid"
+            },
+        ],
     )
 }
 fn forward_workload(
@@ -170,6 +208,38 @@ fn eight_clients(bencher: divan::Bencher, case: &str) {
     .to_owned()
 }
 
+fn sdk_wrapper() -> &'static str {
+    r#"#[path = "sdk_dm_pair_workload/mod.rs"]
+#[allow(dead_code, unused_imports)]
+mod dm;
+#[path = "sdk_group_pair_workload/mod.rs"]
+#[allow(dead_code, unused_imports)]
+mod group;
+fn main() { divan::main(); }
+const DM_CASES: &[&str] = &[
+    "1_round0", "2_round0", "5_round0", "1_round1", "2_round1", "5_round1",
+    "1_round2", "2_round2", "5_round2", "1_round3", "2_round3", "5_round3",
+];
+const GROUP_CASES: &[&str] = &[
+    "8_round0", "32_round0", "128_round0", "512_round0",
+    "8_round1", "32_round1", "128_round1", "512_round1",
+    "8_round2", "32_round2", "128_round2", "512_round2",
+    "8_round3", "32_round3", "128_round3", "512_round3",
+];
+fn width(case: &str) -> usize {
+    case.split_once('_').expect("fixed sample label").0.parse().expect("fixed width")
+}
+#[divan::bench(args = DM_CASES, sample_count = 20, sample_size = 20)]
+fn warm_dm_send_lid(bencher: divan::Bencher, case: &str) {
+    dm::warm_dm_send_lid(bencher, width(case));
+}
+#[divan::bench(args = GROUP_CASES, sample_count = 20, sample_size = 20)]
+fn warm_group_send(bencher: divan::Bencher, case: &str) {
+    group::warm_group_send(bencher, width(case));
+}
+"#
+}
+
 pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()> {
     full_sha(base)?;
     full_sha(head)?;
@@ -199,6 +269,9 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
             std::fs::read(checkout.join(BENCH))?,
             std::fs::read(checkout.join(FIXTURE))?,
             std::fs::read(checkout.join(ADDRESS_BENCH))?,
+            std::fs::read(checkout.join(DM_BENCH))?,
+            std::fs::read(checkout.join(GROUP_BENCH))?,
+            std::fs::read(checkout.join(SDK_FIXTURE))?,
         ));
         revisions.push(Revision {
             role: role.to_owned(),
@@ -207,15 +280,36 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
             target: output.join("target").join(role),
             bench: format!("prefetch_pair_{role}"),
             address_bench: format!("address_pair_{role}"),
+            sdk_bench: format!("sdk_pair_{role}"),
         });
     }
     ensure!(
         inputs[0] == inputs[1],
-        "base/head prefetch workloads differ; do not compare different fixtures"
+        "base/head paired workloads differ; do not compare different fixtures"
     );
     let source = String::from_utf8(inputs[0].0.clone())?;
     let rewritten = workload(&source)?;
     let addresses = address_workload(std::str::from_utf8(&inputs[0].2)?)?;
+    let sdk_dm = sdk_workload(std::str::from_utf8(&inputs[0].3)?, false)?;
+    let sdk_group = sdk_workload(std::str::from_utf8(&inputs[0].4)?, true)?;
+    ensure!(
+        std::str::from_utf8(&inputs[0].5)?
+            .contains("pub const GROUP_SIZES: &[usize] = &[8, 32, 128, 512];"),
+        "SDK group widths changed; review the paired workload"
+    );
+    for (name, source) in [
+        ("original_sdk_dm.rs", inputs[0].3.as_slice()),
+        ("original_sdk_group.rs", inputs[0].4.as_slice()),
+        ("original_sdk_fixture.rs", inputs[0].5.as_slice()),
+        ("forwarded_sdk_dm.rs", sdk_dm.as_bytes()),
+        ("forwarded_sdk_group.rs", sdk_group.as_bytes()),
+    ] {
+        write(&output.join("results").join(name), source)?;
+    }
+    write(
+        &output.join("results/sdk_wrapper.rs"),
+        sdk_wrapper().as_bytes(),
+    )?;
     write(
         &output.join("results/original_benchmark.rs"),
         source.as_bytes(),
@@ -242,6 +336,18 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
         wrapper().as_bytes(),
     )?;
     for item in &revisions {
+        write(
+            &item.checkout.join("benches/sdk_dm_pair_workload/mod.rs"),
+            sdk_dm.as_bytes(),
+        )?;
+        write(
+            &item.checkout.join("benches/sdk_group_pair_workload/mod.rs"),
+            sdk_group.as_bytes(),
+        )?;
+        write(
+            &item.checkout.join(format!("benches/{}.rs", item.sdk_bench)),
+            sdk_wrapper().as_bytes(),
+        )?;
         write(
             &item.checkout.join("benches/address_pair_workload/mod.rs"),
             addresses.as_bytes(),
@@ -270,6 +376,10 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
             "\n[[bench]]\nname = {:?}\nharness = false\nrequired-features = [\"bench-harness\"]\n",
             item.address_bench
         ));
+        manifest.push_str(&format!(
+            "\n[[bench]]\nname = {:?}\nharness = false\nrequired-features = [\"bench-harness\"]\n",
+            item.sdk_bench
+        ));
         write(&path, manifest.as_bytes())?;
         let patch = capture(Command::new("git").current_dir(&item.checkout).args([
             "diff",
@@ -296,17 +406,21 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
                 &item.bench,
                 "--bench",
                 &item.address_bench,
+                "--bench",
+                &item.sdk_bench,
             ]))?;
     }
     write_json(
         &output.join("results/manifest.json"),
         &Manifest {
-            schema_version: 2,
+            schema_version: 3,
             measured_driver_revision: head.to_owned(),
             benchmark_sha256: sha256(&inputs[0].0),
             fixture_sha256: sha256(&inputs[0].1),
             address_benchmark_sha256: sha256(&inputs[0].2),
-            expected_walltime_results: 56,
+            sdk_benchmark_sha256: [sha256(&inputs[0].3), sha256(&inputs[0].4)],
+            sdk_fixture_sha256: sha256(&inputs[0].5),
+            expected_walltime_results: 112,
             order: ORDER
                 .iter()
                 .map(|(role, round)| ((*role).to_owned(), *round))
@@ -323,7 +437,7 @@ pub fn measure(root: &Path, output: &Path) -> Result<()> {
     let manifest: Manifest =
         serde_json::from_slice(&std::fs::read(output.join("results/manifest.json"))?)?;
     ensure!(
-        manifest.schema_version == 2 && revision(root)? == manifest.measured_driver_revision,
+        manifest.schema_version == 3 && revision(root)? == manifest.measured_driver_revision,
         "measurement driver changed after preparation"
     );
     ensure!(
@@ -357,8 +471,18 @@ pub fn measure(root: &Path, output: &Path) -> Result<()> {
                 == manifest.address_benchmark_sha256,
             "address workload changed after building"
         );
+        for (path, hash) in [
+            (DM_BENCH, &manifest.sdk_benchmark_sha256[0]),
+            (GROUP_BENCH, &manifest.sdk_benchmark_sha256[1]),
+            (SDK_FIXTURE, &manifest.sdk_fixture_sha256),
+        ] {
+            ensure!(
+                sha256(&std::fs::read(item.checkout.join(path))?) == *hash,
+                "SDK workload changed after building: {path}"
+            );
+        }
         println!(
-            "CodSpeed paired prefetch: {role} {}, repetition {round}",
+            "CodSpeed paired workloads: {role} {}, repetition {round}",
             item.sha
         );
         run(Command::new("cargo")
@@ -414,6 +538,41 @@ mod tests {
             ))
             .is_err()
         );
+    }
+    #[test]
+    fn forwards_sdk_work_without_changing_sampling_or_fixtures() {
+        for (source, group) in [
+            (include_str!("../../../benches/client_dm_send.rs"), false),
+            (include_str!("../../../benches/client_group_send.rs"), true),
+        ] {
+            let forwarded = sdk_workload(source, group).unwrap();
+            let original = source
+                .lines()
+                .filter(|line| !line.starts_with("#[divan::bench"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let unchanged = forwarded
+                .replace("pub(super) fn ", "fn ")
+                .lines()
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(
+                unchanged,
+                original
+                    .lines()
+                    .filter(|line| !line.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            assert!(
+                sdk_workload(
+                    &source.replace("SAMPLE_SIZE: u32 = 20", "SAMPLE_SIZE: u32 = 21"),
+                    group
+                )
+                .is_err()
+            );
+        }
     }
     #[test]
     fn alternates_roles_without_reusing_sample_uris() {
