@@ -204,22 +204,20 @@ impl std::hash::Hash for ProtocolAddress {
 }
 impl ProtocolAddress {
     pub fn new(name: &str, device: DeviceId) -> Self {
+        Self::from_writer(device, |buf| buf.push_str(name))
+    }
+    /// Construct the canonical address with one pass through its name writer.
+    pub fn from_writer(device: DeviceId, write: impl FnOnce(&mut AddressBuf)) -> Self {
         let mut out = Self {
             text: AddressBuf::empty(),
             device,
             suffix_len: 0,
         };
-        out.reset_with(|buf| buf.push_str(name));
+        out.reset_with(write);
         out
     }
     pub fn empty(device: DeviceId) -> Self {
-        let mut out = Self {
-            text: AddressBuf::empty(),
-            device,
-            suffix_len: 0,
-        };
-        out.reset_with(|_| {});
-        out
+        Self::from_writer(device, |_| {})
     }
     // Share each writer's formatting and unwind cleanup across callers.
     #[inline(never)]
