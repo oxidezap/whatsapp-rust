@@ -345,15 +345,10 @@ impl std::fmt::Debug for PreparedSigningKey {
 }
 impl PreparedSigningKey {
     pub fn new(private: &PrivateKey) -> Self {
-        Self::prepare(private.serialize()).0
-    }
-    pub(crate) fn new_matching(private: &[u8; 32], expected: &[u8; 32]) -> Option<Self> {
-        use subtle::ConstantTimeEq;
-        let (prepared, point) = Self::prepare(private);
-        bool::from(point.to_montgomery().to_bytes().ct_eq(expected)).then_some(prepared)
+        Self::prepare(private.serialize())
     }
     #[inline]
-    fn prepare(private: &[u8; 32]) -> (Self, curve25519_dalek::edwards::EdwardsPoint) {
+    fn prepare(private: &[u8; 32]) -> Self {
         use curve25519_dalek::{edwards::EdwardsPoint, scalar::Scalar};
         use subtle::{Choice, ConditionallySelectable};
         let mut raw = zeroize::Zeroizing::new(*private);
@@ -364,7 +359,7 @@ impl PreparedSigningKey {
         let mut public = point.compress().to_bytes();
         let scalar = Scalar::conditional_select(&scalar, &-*scalar, Choice::from(public[31] >> 7));
         public[31] &= 127;
-        (Self { scalar, public }, point)
+        Self { scalar, public }
     }
     pub fn calculate_signature<R: Rng + CryptoRng>(
         &self,
@@ -513,16 +508,12 @@ mod tests {
     }
 
     #[test]
-    fn matched_signing_preparation_preserves_public_keys_and_signature_bytes() {
+    fn signing_preparation_preserves_public_keys_and_signature_bytes() {
         use rand::SeedableRng;
         let mut random = rand::rngs::StdRng::from_seed([21; 32]);
         for _ in 0..32 {
             let pair = KeyPair::generate(&mut random);
-            let prepared = PreparedSigningKey::new_matching(
-                pair.private_key.serialize(),
-                pair.public_key.public_key_bytes(),
-            )
-            .unwrap();
+            let prepared = PreparedSigningKey::new(&pair.private_key);
             let mut first = rand::rngs::StdRng::from_seed([22; 32]);
             let mut second = rand::rngs::StdRng::from_seed([22; 32]);
             let signature = prepared
@@ -540,11 +531,9 @@ mod tests {
             );
             let other = KeyPair::generate(&mut random);
             assert!(
-                PreparedSigningKey::new_matching(
-                    pair.private_key.serialize(),
-                    other.public_key.public_key_bytes()
-                )
-                .is_none()
+                !other
+                    .public_key
+                    .verify_signature(b"synthetic matching pair", &signature)
             );
         }
     }

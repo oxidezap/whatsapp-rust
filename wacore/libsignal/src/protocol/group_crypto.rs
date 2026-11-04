@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Record-owned, bounded prepared XEdDSA contexts; never serialized.
-use crate::core::{PreparedSigningKey, PreparedVerifyingKey, PublicKey};
+use crate::core::{PreparedSigningKey, PreparedVerifyingKey, PrivateKey, PublicKey};
 use crate::engine::{CryptoProvider, Error, RandomSource, Result, RustCrypto};
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
@@ -24,7 +24,7 @@ pub(crate) struct GroupCryptoCache {
 struct SigningContext {
     public: [u8; 32],
     private: Zeroizing<[u8; 32]>,
-    signing: Option<PreparedSigningKey>,
+    signing: PreparedSigningKey,
 }
 struct VerifyingContext {
     public: [u8; 32],
@@ -118,7 +118,11 @@ impl GroupCryptoCache {
             let context = Arc::new(SigningContext {
                 public: *public,
                 private: Zeroizing::new(*private),
-                signing: PreparedSigningKey::new_matching(private, public),
+                // Signing uses the supplied private key even when the record's
+                // public metadata differs. Verification keeps its public-key checks.
+                signing: PreparedSigningKey::new(
+                    &PrivateKey::deserialize(private).expect("fixed private key length"),
+                ),
             });
             let index = self
                 .signing
@@ -202,9 +206,10 @@ impl CryptoProvider for PreparedGroupProvider {
     ) -> Result<[u8; 64]> {
         if let PreparedContext::Signing(context) = &self.context
             && bool::from(context.private.as_ref().ct_eq(private))
-            && let Some(signing) = &context.signing
         {
-            return signing.calculate_signature_with_random_source(message, random);
+            return context
+                .signing
+                .calculate_signature_with_random_source(message, random);
         }
         RustCrypto.sign(private, message, random)
     }
@@ -473,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_keys_and_invalid_public_use_standard_fallback() {
+    fn mismatched_keys_and_invalid_public_preserve_backend_behavior() {
         let private = [7; 32];
         let public = RustCrypto.public_key(&private).unwrap();
         let other = [8; 32];
@@ -491,7 +496,11 @@ mod tests {
             .verify(&other_public, b"synthetic", &signature)
             .unwrap();
         let mismatched = cache.provider(&public, Some(&other));
-        assert!(mismatched.signer().signing.is_none());
+        assert!(
+            mismatched
+                .verify(&public, b"synthetic", &signature)
+                .is_err()
+        );
         assert_eq!(
             mismatched
                 .sign(&other, b"synthetic", &mut Fixed(9))
