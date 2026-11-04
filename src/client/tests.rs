@@ -3779,20 +3779,17 @@ fn client_size_pins_runtime_cache_config_saving() {
     // table (32 inline bytes on this target); its count remains one pointer.
     // Every size-varying attachment is measured in this same build and stacked
     // on top, so only an unaccounted layout move trips the assert.
-    // CoreClient owns Device and its ClientProfile inline. The fixed base
-    // includes the old 152 B profile; selecting a web subplatform makes that
-    // profile 160 B on x86_64. Measure the attachment, as with the others.
-    let mut expected = (4288 - 152)
-        + size_of::<wacore::client_profile::ClientProfile>()
+    // CoreClient owns Device inline. The original fixed base included a
+    // 1032 B Device with a 152 B ClientProfile. Measure the whole attachment:
+    // three keypairs shrinking by 4 B each reduce Device by 16 B, including
+    // its padding. Adding their individual deltas would overcount by 4 B.
+    // With the current 160 B profile, main's Device is 1040 B and ours is 1024 B.
+    let mut expected = (4288 - 1032)
+        + size_of::<wacore::store::Device>()
         + size_of::<subsystem::Subsystems>()
         + size_of::<crate::handlers::call::pending_offers::PendingOffers>()
         + size_of::<Arc<std::sync::Mutex<crate::retry::HistoryPayloadRegistry>>>()
         + size_of::<Option<Arc<dyn crate::ConnectAdmission>>>();
-    // Device owns three keypairs. Prepared signing state now belongs to explicit
-    // provider contexts rather than each private key's former 136-byte pair.
-    expected = expected
-        .checked_add_signed(3 * (size_of::<wacore::libsignal::protocol::KeyPair>() as isize - 136))
-        .unwrap();
     // Coalesced reuploads add a 56 B map on x86_64. Moving the two waiter
     // mutex/Vec registries behind Arcs removes 48 inline bytes; their counters
     // stay one word each. Account for the net +8 B without changing the base.
