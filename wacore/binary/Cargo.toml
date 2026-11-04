@@ -57,3 +57,7 @@ workspace = true
 [[bench]]
 name = "group_fanout_benchmark"
 harness = false
+
+[[bench]]
+name = "attribute_storage_benchmark"
+harness = false
