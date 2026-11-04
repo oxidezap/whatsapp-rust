@@ -13,15 +13,18 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Poll, ready};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use log::debug;
+use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
 
 use rtc_datachannel::data_channel::DataChannel;
@@ -495,6 +498,100 @@ fn drain_media_stream(assoc: &mut Association, inbound: &mut VecDeque<Bytes>) {
     }
 }
 
+/// A datagram flow to one relay, as a [`DatagramDialer`] hands it over.
+///
+/// It must behave like a connected UDP socket: everything sent goes to the relay it was dialled
+/// for, and everything received is taken to have come from it, so the driver never names an
+/// address per datagram. Boundaries matter: one `poll_send` is one whole datagram and one
+/// `poll_recv` yields one whole datagram, because a DTLS record that arrives split or merged fails
+/// its MAC and is dropped. How the datagrams travel (a SOCKS5 UDP association, a tunnel, a socket
+/// bound to a particular interface) is the implementation's business.
+pub trait DialDatagram: Send + Sync {
+    /// Send one datagram, with [`UdpSocket::poll_send`]'s contract.
+    fn poll_send(&self, cx: &mut std::task::Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>>;
+    /// Receive one datagram into `buf`, with [`UdpSocket::poll_recv`]'s contract.
+    fn poll_recv(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>>;
+    /// The local end the DTLS and SCTP endpoints are keyed on. It never reaches the relay, so a
+    /// proxied flow may report the proxy-side socket it actually holds.
+    fn local_addr(&self) -> io::Result<SocketAddr>;
+}
+
+impl DialDatagram for UdpSocket {
+    fn poll_send(&self, cx: &mut std::task::Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        UdpSocket::poll_send(self, cx, buf)
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        UdpSocket::poll_recv(self, cx, buf)
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        UdpSocket::local_addr(self)
+    }
+}
+
+impl<T: DialDatagram + ?Sized> DialDatagram for Box<T> {
+    fn poll_send(&self, cx: &mut std::task::Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        (**self).poll_send(cx, buf)
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        (**self).poll_recv(cx, buf)
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        (**self).local_addr()
+    }
+}
+
+/// Type-erased datagram flow returned by a [`DatagramDialer`].
+pub type BoxedDatagram = Box<dyn DialDatagram>;
+
+/// Supplies the datagram flow the native relay transport runs DTLS/SCTP over, in place of the
+/// UDP socket it would otherwise bind and connect itself -- the media-plane counterpart of the
+/// chat socket's `StreamDialer`.
+///
+/// `relay` is the endpoint to reach. It is called once per dial candidate (the advertised port and
+/// the web-client port are raced, see `dial_candidates`) and again on every reconnect, so one
+/// installed dialer carries the whole call. An error fails that candidate; there is no fallback to
+/// a direct socket, because a silent direct dial is exactly what a dialer is installed to prevent.
+///
+/// The future is awaited inside the relay connect timeout. Cancellation drops it (and any flow it
+/// owns), which happens to the losing candidate of every race; implementations must not leave
+/// detached tasks running.
+#[async_trait]
+pub trait DatagramDialer: Send + Sync {
+    async fn dial(&self, relay: SocketAddr) -> Result<BoxedDatagram>;
+}
+
+/// Send one datagram on `socket`.
+async fn send_datagram<S: DialDatagram + ?Sized>(socket: &S, buf: &[u8]) -> io::Result<usize> {
+    std::future::poll_fn(|cx| socket.poll_send(cx, buf)).await
+}
+
+/// Receive one datagram from `socket`, returning its length. Cancel-safe, like
+/// [`UdpSocket::recv`]: nothing is consumed until the poll completes.
+async fn recv_datagram<S: DialDatagram + ?Sized>(socket: &S, buf: &mut [u8]) -> io::Result<usize> {
+    std::future::poll_fn(|cx| {
+        let mut read = ReadBuf::new(&mut *buf);
+        ready!(socket.poll_recv(cx, &mut read))?;
+        Poll::Ready(Ok(read.filled().len()))
+    })
+    .await
+}
+
 /// An open relay media channel: STUN/RTP/RTCP travel as binary DataChannel messages.
 ///
 /// A handle onto `relay_driver`, which owns the socket and the whole protocol stack; everything
@@ -514,6 +611,9 @@ pub struct RelayMediaChannel {
     driver: std::sync::Mutex<Option<AbortHandle>>,
     /// Kept so `reconnect` can dial the next relay on the runtime the call runs on.
     runtime: Arc<dyn Runtime>,
+    /// Kept so `reconnect` dials through the same hook; dropping it would send the rest of the
+    /// call direct.
+    dialer: Option<Arc<dyn DatagramDialer>>,
 }
 
 impl RelayMediaChannel {
@@ -536,6 +636,27 @@ pub async fn connect_relay_media(
     RelayMediaChannel,
     async_channel::Receiver<RelayTransportEvent>,
 )> {
+    connect_relay_media_via(relay_addr, runtime, None).await
+}
+
+/// [`connect_relay_media`] over the flow `dialer` supplies, or a direct UDP socket without one.
+async fn connect_relay_media_via(
+    relay_addr: SocketAddr,
+    runtime: Arc<dyn Runtime>,
+    dialer: Option<Arc<dyn DatagramDialer>>,
+) -> Result<(
+    RelayMediaChannel,
+    async_channel::Receiver<RelayTransportEvent>,
+)> {
+    if let Some(dialer) = dialer {
+        // `{e:#}`: the candidate error is flattened to one line upstream, and the dialer's own
+        // reason is the part worth keeping.
+        let flow = dialer
+            .dial(relay_addr)
+            .await
+            .map_err(|e| anyhow!("datagram dialer: {e:#}"))?;
+        return start_relay_media(flow, relay_addr, runtime, Some(dialer)).await;
+    }
     // Bind in the relay's address family so an IPv6 relay is reachable (WA relays are IPv4 today,
     // but the unspecified bind must match to connect).
     let bind_addr = if relay_addr.is_ipv6() {
@@ -548,6 +669,22 @@ pub async fn connect_relay_media(
         .connect(relay_addr)
         .await
         .context("connect udp to relay")?;
+    start_relay_media(socket, relay_addr, runtime, None).await
+}
+
+/// Run the media stack over an already connected `socket` until the channel opens.
+///
+/// Generic rather than boxed so the default path drives the bare `UdpSocket`; only a dialled flow
+/// pays for dynamic dispatch.
+async fn start_relay_media<S: DialDatagram + 'static>(
+    socket: S,
+    relay_addr: SocketAddr,
+    runtime: Arc<dyn Runtime>,
+    dialer: Option<Arc<dyn DatagramDialer>>,
+) -> Result<(
+    RelayMediaChannel,
+    async_channel::Receiver<RelayTransportEvent>,
+)> {
     let local_addr = socket.local_addr().context("local udp addr")?;
     let stack = RelayStack::connect(local_addr, relay_addr, now())?;
 
@@ -569,6 +706,7 @@ pub async fn connect_relay_media(
         finished: finished_rx,
         driver: std::sync::Mutex::new(Some(driver)),
         runtime,
+        dialer,
     };
 
     // The driver reports the open channel here and, separately, as the `Connected` event the call
@@ -626,9 +764,13 @@ impl RelayTransport for RelayMediaChannel {
         Arc<dyn RelayTransport>,
         async_channel::Receiver<RelayTransportEvent>,
     )> {
-        RelayMediaChannelFactory::new(endpoint, self.runtime.clone())
-            .connect()
-            .await
+        RelayMediaChannelFactory {
+            addr: endpoint,
+            runtime: self.runtime.clone(),
+            dialer: self.dialer.clone(),
+        }
+        .connect()
+        .await
     }
 }
 
@@ -664,11 +806,23 @@ const RELAY_DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_
 pub struct RelayMediaChannelFactory {
     addr: SocketAddr,
     runtime: Arc<dyn Runtime>,
+    dialer: Option<Arc<dyn DatagramDialer>>,
 }
 
 impl RelayMediaChannelFactory {
     pub fn new(addr: SocketAddr, runtime: Arc<dyn Runtime>) -> Self {
-        Self { addr, runtime }
+        Self {
+            addr,
+            runtime,
+            dialer: None,
+        }
+    }
+
+    /// Dial every candidate, and every later reconnect of the channel this returns, through
+    /// `dialer` instead of a direct UDP socket. See [`DatagramDialer`].
+    pub fn with_dialer(mut self, dialer: Arc<dyn DatagramDialer>) -> Self {
+        self.dialer = Some(dialer);
+        self
     }
 }
 
@@ -829,8 +983,9 @@ impl RelayTransportFactory for RelayMediaChannelFactory {
             .iter()
             .map(|&addr| {
                 let runtime = self.runtime.clone();
+                let dialer = self.dialer.clone();
                 Box::pin(async move {
-                    match connect_relay_media(addr, runtime).await {
+                    match connect_relay_media_via(addr, runtime, dialer).await {
                         Ok((chan, events)) => Ok((addr, chan, events)),
                         Err(e) => Err(anyhow!("{addr}: {e}")),
                     }
@@ -886,8 +1041,8 @@ impl RelayTransportFactory for RelayMediaChannelFactory {
 ///
 /// It ends when the relay closes, the socket errors, the outbound queue closes (a local hang-up), or
 /// the call drops its event receiver.
-async fn relay_driver(
-    socket: UdpSocket,
+async fn relay_driver<S: DialDatagram>(
+    socket: S,
     mut stack: RelayStack,
     outbound: async_channel::Receiver<Bytes>,
     events: async_channel::Sender<RelayTransportEvent>,
@@ -895,7 +1050,9 @@ async fn relay_driver(
     open: async_channel::Sender<Result<(), String>>,
 ) {
     let mut buf = vec![0u8; RELAY_DATAGRAM_BUF];
-    let mut tally = InboundTally::new(socket.peer_addr().ok());
+    // The stack's remote, not the flow's peer: behind a dialer the flow may be connected to a
+    // proxy, and the relay is the endpoint this channel is about.
+    let mut tally = InboundTally::new(Some(stack.remote));
     let mut announced = false;
     // Media discarded under backpressure since the last report. See `deliver`.
     let mut dropped_inbound = 0u32;
@@ -904,7 +1061,7 @@ async fn relay_driver(
         // Flush, deliver, announce: everything the stack produced since the last wakeup, before
         // parking on the next one.
         while let Some(datagram) = stack.poll_transmit() {
-            if let Err(e) = socket.send(&datagram).await {
+            if let Err(e) = send_datagram(&socket, &datagram).await {
                 let reason = RelayDisconnectReason::ReadError(format!("relay socket send: {e}"));
                 finish(&events, &open, announced, dropped_inbound, reason).await;
                 return;
@@ -938,7 +1095,7 @@ async fn relay_driver(
 
         let deadline = stack.poll_timeout();
         let step = tokio::select! {
-            read = socket.recv(&mut buf) => match read {
+            read = recv_datagram(&socket, &mut buf) => match read {
                 Ok(n) => stack.handle_datagram(now(), &buf[..n]),
                 // A connected UDP socket surfaces ICMP unreachable here, which is how a relay that
                 // went away is noticed rather than waited out.
@@ -2143,6 +2300,294 @@ mod relay_failures {
         tokio::time::timeout(Duration::from_secs(30), body)
             .await
             .expect("the vanished-relay round-trip must complete within the bound");
+    }
+}
+
+/// The datagram dialer hook: every dial the native transport makes -- each raced candidate and every
+/// reconnect -- has to go through an installed [`DatagramDialer`], and a dialer that refuses must
+/// fail the dial rather than let it go direct. The advertised relays are documentation addresses
+/// (RFC 5737) that nothing answers on, so a dial that bypassed the hook could only time out.
+#[cfg(test)]
+mod datagram_dialer {
+    use super::loopback_relay::{accept_relay, next_packet};
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// A real UDP socket that counts the datagrams that cross it in each direction.
+    struct CountingFlow {
+        socket: UdpSocket,
+        sent: Arc<AtomicUsize>,
+        received: Arc<AtomicUsize>,
+    }
+
+    impl DialDatagram for CountingFlow {
+        fn poll_send(
+            &self,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let sent = ready!(self.socket.poll_send(cx, buf));
+            if sent.is_ok() {
+                self.sent.fetch_add(1, Ordering::SeqCst);
+            }
+            Poll::Ready(sent)
+        }
+
+        fn poll_recv(
+            &self,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let received = ready!(self.socket.poll_recv(cx, buf));
+            if received.is_ok() {
+                self.received.fetch_add(1, Ordering::SeqCst);
+            }
+            Poll::Ready(received)
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            self.socket.local_addr()
+        }
+    }
+
+    /// Connects each requested relay to the loopback socket `routes` maps it to, and refuses the
+    /// rest. Records what it was asked for and the local address of every flow it opened.
+    #[derive(Default)]
+    struct RoutingDialer {
+        routes: Mutex<HashMap<SocketAddr, SocketAddr>>,
+        dialed: Mutex<Vec<SocketAddr>>,
+        locals: Mutex<Vec<SocketAddr>>,
+        sent: Arc<AtomicUsize>,
+        received: Arc<AtomicUsize>,
+    }
+
+    impl RoutingDialer {
+        fn route(&self, relay: SocketAddr, to: SocketAddr) {
+            self.routes.lock().unwrap().insert(relay, to);
+        }
+
+        fn dialed(&self) -> Vec<SocketAddr> {
+            self.dialed.lock().unwrap().clone()
+        }
+
+        fn locals(&self) -> Vec<SocketAddr> {
+            self.locals.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl DatagramDialer for RoutingDialer {
+        async fn dial(&self, relay: SocketAddr) -> Result<BoxedDatagram> {
+            self.dialed.lock().unwrap().push(relay);
+            let Some(to) = self.routes.lock().unwrap().get(&relay).copied() else {
+                bail!("no route to {relay}");
+            };
+            let socket = UdpSocket::bind("127.0.0.1:0").await?;
+            socket.connect(to).await?;
+            self.locals.lock().unwrap().push(socket.local_addr()?);
+            Ok(Box::new(CountingFlow {
+                socket,
+                sent: self.sent.clone(),
+                received: self.received.clone(),
+            }))
+        }
+    }
+
+    /// A loopback relay that accepts the first client to write to it, reporting where that client
+    /// wrote from.
+    async fn spawn_relay() -> (
+        SocketAddr,
+        tokio::task::JoinHandle<(SocketAddr, loopback_relay::AcceptedRelay)>,
+    ) {
+        let relay_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_udp.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut peek = [0u8; RELAY_DATAGRAM_BUF];
+            let (_, client) = relay_udp.peek_from(&mut peek).await.unwrap();
+            relay_udp.connect(client).await.unwrap();
+            (client, accept_relay(relay_udp).await)
+        });
+        (relay_addr, task)
+    }
+
+    /// One media packet each way over an open channel.
+    async fn round_trip(
+        chan: &dyn RelayTransport,
+        events: &async_channel::Receiver<RelayTransportEvent>,
+        relay: &loopback_relay::AcceptedRelay,
+    ) {
+        chan.send(Bytes::from_static(&[0x90, 0x78, 1, 1]))
+            .await
+            .expect("client writes into the open channel");
+        assert_eq!(
+            next_packet(relay).await.as_deref(),
+            Some(&[0x90, 0x78, 1, 1][..]),
+            "the relay reads what the client wrote"
+        );
+        relay
+            .outbound
+            .send(Bytes::from_static(&[0x90, 0x78, 2, 2]))
+            .await
+            .expect("relay writes into the open channel");
+        loop {
+            match events.recv().await.expect("client event stream open") {
+                RelayTransportEvent::PacketReceived(p) => {
+                    assert_eq!(
+                        &p[..],
+                        &[0x90, 0x78, 2, 2],
+                        "the client reads what the relay wrote"
+                    );
+                    break;
+                }
+                RelayTransportEvent::Disconnected(reason) => {
+                    panic!("channel ended before the relay's packet arrived: {reason:?}")
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Both raced candidates are offered to the dialer, the one it routes carries the whole
+    /// handshake and the media, and the relay sees only the dialer's socket.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_candidate_and_all_media_go_through_the_dialer() {
+        let body = async {
+            let (relay_addr, relay_task) = spawn_relay().await;
+            let advertised: SocketAddr = "192.0.2.1:3478".parse().unwrap();
+            let dialer = Arc::new(RoutingDialer::default());
+            // Only the advertised port is routed: the web-client candidate is refused, which must
+            // fail that candidate alone and leave the other to win.
+            dialer.route(advertised, relay_addr);
+
+            let (chan, events) = RelayMediaChannelFactory::new(
+                advertised,
+                Arc::new(crate::runtime_impl::TokioRuntime),
+            )
+            .with_dialer(dialer.clone())
+            .connect()
+            .await
+            .expect("relay connect through the dialer");
+            let (client_seen, relay) = relay_task.await.unwrap();
+
+            assert_eq!(
+                dialer.dialed(),
+                dial_candidates(advertised),
+                "both candidates are dialled through the hook, advertised port first"
+            );
+            assert_eq!(
+                dialer.locals(),
+                vec![client_seen],
+                "the relay only ever hears from the socket the dialer opened"
+            );
+            round_trip(&*chan, &events, &relay).await;
+            assert!(
+                dialer.sent.load(Ordering::SeqCst) > 0,
+                "nothing was sent through the dialer"
+            );
+            assert!(
+                dialer.received.load(Ordering::SeqCst) > 0,
+                "nothing was received through the dialer"
+            );
+
+            chan.disconnect().await;
+            relay.driver.abort();
+        };
+
+        tokio::time::timeout(Duration::from_secs(30), body)
+            .await
+            .expect("the dialled round-trip must complete within the bound");
+    }
+
+    /// A reconnect is a new dial, and it has to reach the same dialer: losing it here would put the
+    /// rest of the call on a direct socket without anyone having asked for that.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconnect_dials_the_new_relay_through_the_same_dialer() {
+        let body = async {
+            let (first_addr, first_task) = spawn_relay().await;
+            let (second_addr, second_task) = spawn_relay().await;
+            // Both on the web-client port, so each connect is a single dial and the record below
+            // is exactly one address per connect.
+            let first: SocketAddr = "192.0.2.1:3480".parse().unwrap();
+            let second: SocketAddr = "192.0.2.2:3480".parse().unwrap();
+            let dialer = Arc::new(RoutingDialer::default());
+            dialer.route(first, first_addr);
+            dialer.route(second, second_addr);
+
+            let (chan, _events) =
+                RelayMediaChannelFactory::new(first, Arc::new(crate::runtime_impl::TokioRuntime))
+                    .with_dialer(dialer.clone())
+                    .connect()
+                    .await
+                    .expect("first relay connect");
+            let (_, first_relay) = first_task.await.unwrap();
+
+            let sent_before = dialer.sent.load(Ordering::SeqCst);
+            let received_before = dialer.received.load(Ordering::SeqCst);
+            let (moved, moved_events) = chan
+                .reconnect(second)
+                .await
+                .expect("reconnect through the dialer");
+            let (client_seen, second_relay) = second_task.await.unwrap();
+
+            assert_eq!(dialer.dialed(), vec![first, second]);
+            assert_eq!(
+                dialer.locals().last(),
+                Some(&client_seen),
+                "the new relay only hears from the dialer's new socket"
+            );
+            round_trip(&*moved, &moved_events, &second_relay).await;
+            assert!(dialer.sent.load(Ordering::SeqCst) > sent_before);
+            assert!(dialer.received.load(Ordering::SeqCst) > received_before);
+
+            chan.disconnect().await;
+            moved.disconnect().await;
+            first_relay.driver.abort();
+            second_relay.driver.abort();
+        };
+
+        tokio::time::timeout(Duration::from_secs(30), body)
+            .await
+            .expect("the reconnect round-trip must complete within the bound");
+    }
+
+    /// Fail closed: a dialer that refuses every candidate fails the connect at once, naming the
+    /// relay and the dialer's reason, and nothing reaches the relay directly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusing_dialer_fails_the_connect_without_a_direct_dial() {
+        let relay_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_udp.local_addr().unwrap();
+        let dialer = Arc::new(RoutingDialer::default());
+
+        let factory =
+            RelayMediaChannelFactory::new(relay_addr, Arc::new(crate::runtime_impl::TokioRuntime))
+                .with_dialer(dialer.clone());
+        let connect = factory.connect();
+        // Far inside `RELAY_CONNECT_TIMEOUT`: a refusal is immediate, so only a fallback dial
+        // could still be running.
+        let outcome = tokio::time::timeout(Duration::from_secs(5), connect)
+            .await
+            .expect("a refused dial must fail at once, not run out the connect timeout");
+        let error = match outcome {
+            Ok(_) => panic!("a refusing dialer must not yield a channel"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(
+            error.contains(&format!(
+                "{relay_addr}: datagram dialer: no route to {relay_addr}"
+            )),
+            "the error names the relay and keeps the dialer's reason, got: {error}"
+        );
+        assert_eq!(dialer.dialed(), dial_candidates(relay_addr));
+        let mut buf = [0u8; RELAY_DATAGRAM_BUF];
+        assert_eq!(
+            relay_udp.try_recv_from(&mut buf).map_err(|e| e.kind()),
+            Err(io::ErrorKind::WouldBlock),
+            "nothing may reach the relay outside the dialer"
+        );
     }
 }
 

@@ -440,6 +440,26 @@ impl Client {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(provider);
     }
 
+    /// Route the native relay transport's UDP through `dialer`, e.g. a proxy the chat socket
+    /// already uses, instead of a direct socket that would reveal this host's address to the relay.
+    ///
+    /// Every candidate port and every reconnect of a call dials through it, and a dialer error
+    /// fails that dial rather than falling back to a direct socket. An installed
+    /// [`set_relay_transport_provider`](Self::set_relay_transport_provider) still takes precedence,
+    /// since it replaces the native transport altogether. Like that setter, it applies to calls
+    /// set up after it is installed.
+    #[cfg(feature = "voip-relay-native")]
+    pub fn set_relay_datagram_dialer(
+        &self,
+        dialer: Arc<dyn crate::voip::transport::DatagramDialer>,
+    ) {
+        *self
+            .voip_state()
+            .relay_datagram_dialer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(dialer);
+    }
+
     /// The factory that dials `relay`, from the installed provider or this build's default.
     ///
     /// The error is `CallError::Setup` rather than a panic or a `compile_error!`, because "this
@@ -492,9 +512,18 @@ impl Client {
         }
         #[cfg(feature = "voip-relay-native")]
         {
-            Ok(Arc::new(
-                crate::voip::transport::RelayMediaChannelFactory::new(addr, self.runtime.clone()),
-            ))
+            let factory =
+                crate::voip::transport::RelayMediaChannelFactory::new(addr, self.runtime.clone());
+            let dialer = self
+                .voip_state()
+                .relay_datagram_dialer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            Ok(Arc::new(match dialer {
+                Some(dialer) => factory.with_dialer(dialer),
+                None => factory,
+            }))
         }
         #[cfg(not(feature = "voip-relay-native"))]
         {

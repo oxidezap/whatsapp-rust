@@ -110,6 +110,12 @@ pub(crate) struct VoipState {
     /// in `ClientBuilder` for every consumer that never places a call.
     pub(crate) relay_transport_provider:
         std::sync::Mutex<Option<Arc<dyn wacore::voip_control::transport::RelayTransportProvider>>>,
+    /// What the native dialer opens its datagram flow through, when not a direct UDP socket.
+    /// Consulted only when no provider is installed, since a provider replaces the native dialer
+    /// outright.
+    #[cfg(feature = "voip-relay-native")]
+    pub(crate) relay_datagram_dialer:
+        std::sync::Mutex<Option<Arc<dyn crate::voip::transport::DatagramDialer>>>,
 }
 
 impl Default for VoipState {
@@ -121,6 +127,8 @@ impl Default for VoipState {
             pending_call_link_joins: Arc::new(std::sync::Mutex::new(Default::default())),
             pending_call_link_join_lane: Mutex::new(()),
             relay_transport_provider: std::sync::Mutex::new(None),
+            #[cfg(feature = "voip-relay-native")]
+            relay_datagram_dialer: std::sync::Mutex::new(None),
         }
     }
 }
