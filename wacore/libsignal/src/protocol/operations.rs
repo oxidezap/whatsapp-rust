@@ -454,11 +454,16 @@ pub async fn create_sender_key_distribution_message<
     let mut random = RandomAdapter(rng);
     let bytes = engine::Engine::new(&engine::RustCrypto, &mut random)
         .create_sender_distribution(&mut record.inner)?;
-    record.warm_current_signer();
-    if !already_sending {
-        record.mark_wire_gated();
+    // Re-exporting an existing sending chain does not change protocol state.
+    // Keep fresh/gated records on the persistence path, including retries after
+    // a failed durability gate. Cold signing preparation can wait for encryption.
+    if !already_sending || record.is_wire_gated() {
+        record.warm_current_signer();
+        if !already_sending {
+            record.mark_wire_gated();
+        }
+        store.store_sender_key(name, record).await?;
     }
-    store.store_sender_key(name, record).await?;
     SenderKeyDistributionMessage::try_from(bytes::Bytes::from(bytes))
 }
 /// The caller must hold the store's stable sender-key lock across this operation,

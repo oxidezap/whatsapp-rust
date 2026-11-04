@@ -480,6 +480,8 @@ fn signed_key_helper_stores_seconds_and_rejects_pre_epoch() {
 struct Groups {
     records: HashMap<SenderKeyName, SenderKeyRecord>,
     lock: Arc<async_lock::Mutex<()>>,
+    writes: usize,
+    fail_store: bool,
 }
 #[async_trait]
 impl SenderKeyStore for Groups {
@@ -494,12 +496,99 @@ impl SenderKeyStore for Groups {
         name: &SenderKeyName,
         record: SenderKeyRecord,
     ) -> error::Result<()> {
+        self.writes += 1;
+        if self.fail_store {
+            return Err(SignalProtocolError::InvalidState(
+                "test",
+                "sender-key persistence failed".into(),
+            ));
+        }
         self.records.insert(name.clone(), record);
         Ok(())
     }
     async fn sender_key_lock(&self, _: &SenderKeyName) -> Arc<async_lock::Mutex<()>> {
         self.lock.clone()
     }
+}
+#[test]
+fn existing_sender_distribution_is_read_only_even_from_cold_storage() {
+    run(async {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(137);
+        let mut sender = Groups::default();
+        let mut receiver = Groups::default();
+        let name = SenderKeyName::from_parts("test.invalid@g.us", "sender.invalid:1");
+        let lock = sender.sender_key_lock(&name).await;
+        let _guard = lock.lock().await;
+        let distribution = create_sender_key_distribution_message(&name, &mut sender, &mut rng)
+            .await
+            .unwrap();
+        assert_eq!(sender.writes, 1);
+        sender.records.get_mut(&name).unwrap().clear_wire_gated();
+        let before = sender.records[&name].serialize().unwrap();
+        sender.fail_store = true;
+        for cold in [false, true] {
+            if cold {
+                sender
+                    .records
+                    .insert(name.clone(), SenderKeyRecord::deserialize(&before).unwrap());
+            }
+            let repeated = create_sender_key_distribution_message(&name, &mut sender, &mut rng)
+                .await
+                .expect("an unchanged, durable distribution needs no write");
+            assert_eq!(repeated.serialized(), distribution.serialized());
+            assert_eq!(sender.records[&name].serialize().unwrap(), before);
+            assert!(!sender.records[&name].is_wire_gated());
+            assert_eq!(sender.writes, 1);
+        }
+        // Deferring cold signing preparation must retain interoperability.
+        sender.fail_store = false;
+        let receiver_lock = receiver.sender_key_lock(&name).await;
+        let _receiver_guard = receiver_lock.lock().await;
+        process_sender_key_distribution_message(&name, &distribution, &mut receiver)
+            .await
+            .unwrap();
+        let message = group_encrypt(&mut sender, &name, b"after cold distribution", &mut rng)
+            .await
+            .unwrap();
+        assert_eq!(
+            group_decrypt(message.serialized(), &mut receiver, &name)
+                .await
+                .unwrap(),
+            b"after cold distribution"
+        );
+    })
+}
+#[test]
+fn gated_sender_distribution_retries_persistence_before_returning() {
+    run(async {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(139);
+        let mut sender = Groups::default();
+        let name = SenderKeyName::from_parts("test.invalid@g.us", "sender.invalid:1");
+        let lock = sender.sender_key_lock(&name).await;
+        let _guard = lock.lock().await;
+        let distribution = create_sender_key_distribution_message(&name, &mut sender, &mut rng)
+            .await
+            .unwrap();
+        let before = sender.records[&name].serialize().unwrap();
+        assert!(sender.records[&name].is_wire_gated());
+        sender.fail_store = true;
+        assert!(
+            create_sender_key_distribution_message(&name, &mut sender, &mut rng)
+                .await
+                .is_err()
+        );
+        assert_eq!(sender.writes, 2);
+        assert_eq!(sender.records[&name].serialize().unwrap(), before);
+        assert!(sender.records[&name].is_wire_gated());
+        sender.fail_store = false;
+        let retried = create_sender_key_distribution_message(&name, &mut sender, &mut rng)
+            .await
+            .unwrap();
+        assert_eq!(sender.writes, 3);
+        assert_eq!(retried.serialized(), distribution.serialized());
+        assert_eq!(sender.records[&name].serialize().unwrap(), before);
+        assert!(sender.records[&name].is_wire_gated());
+    })
 }
 #[test]
 fn sender_distribution_and_counter_reservations_raise_host_gate() {
