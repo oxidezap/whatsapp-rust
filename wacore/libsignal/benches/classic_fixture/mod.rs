@@ -37,6 +37,7 @@ pub enum Case {
     Conversation,
     SignTen,
     SignAndVerifyTen,
+    VerifyTenAfterSigning,
     GenerateTen,
     RejectPreKey256,
     RootUpdate,
@@ -47,6 +48,7 @@ pub enum Case {
     ArchiveTen,
     ReverseTwenty,
     PromoteTwenty,
+    RetryCurrentTwenty,
     GroupWorst1999,
     GroupNext1999,
     #[cfg(feature = "bench-internals")]
@@ -59,6 +61,12 @@ pub enum Case {
     ColdLookup4000,
     #[cfg(feature = "bench-internals")]
     ColdLookup8000,
+    #[cfg(feature = "bench-internals")]
+    TailLookup2000,
+    #[cfg(feature = "bench-internals")]
+    TailLookup4000,
+    #[cfg(feature = "bench-internals")]
+    TailLookup8000,
     #[cfg(feature = "bench-internals")]
     ColdLoadLookup2000,
     #[cfg(feature = "bench-internals")]
@@ -96,6 +104,7 @@ pub const CASES: &[Case] = &[
     Case::Conversation,
     Case::SignTen,
     Case::SignAndVerifyTen,
+    Case::VerifyTenAfterSigning,
     Case::GenerateTen,
     Case::RejectPreKey256,
     Case::RootUpdate,
@@ -106,6 +115,7 @@ pub const CASES: &[Case] = &[
     Case::ArchiveTen,
     Case::ReverseTwenty,
     Case::PromoteTwenty,
+    Case::RetryCurrentTwenty,
     Case::GroupWorst1999,
     Case::GroupNext1999,
     #[cfg(feature = "bench-internals")]
@@ -118,6 +128,12 @@ pub const CASES: &[Case] = &[
     Case::ColdLookup4000,
     #[cfg(feature = "bench-internals")]
     Case::ColdLookup8000,
+    #[cfg(feature = "bench-internals")]
+    Case::TailLookup2000,
+    #[cfg(feature = "bench-internals")]
+    Case::TailLookup4000,
+    #[cfg(feature = "bench-internals")]
+    Case::TailLookup8000,
     #[cfg(feature = "bench-internals")]
     Case::ColdLoadLookup2000,
     #[cfg(feature = "bench-internals")]
@@ -652,7 +668,9 @@ impl Fixture {
                 let record = this.alice.sessions.0.remove(&this.bob.address).unwrap();
                 this.state = Some(record.session_state().unwrap().clone());
             }
-            Case::SignTen | Case::SignAndVerifyTen => this.plaintext = payload(64),
+            Case::SignTen | Case::SignAndVerifyTen | Case::VerifyTenAfterSigning => {
+                this.plaintext = payload(64);
+            }
             Case::ArchiveTen => {
                 this.generation(1);
                 this.packet = this.alice.encrypt(&this.bob.address, &payload(29));
@@ -677,7 +695,7 @@ impl Fixture {
                     );
                 }
             }
-            Case::PromoteTwenty => {
+            Case::PromoteTwenty | Case::RetryCurrentTwenty => {
                 this.alice.establish(&this.bob);
                 let first = this.alice.encrypt(&this.bob.address, &payload(13));
                 this.bob.receive(&this.alice.address, &first, true, false);
@@ -688,11 +706,33 @@ impl Fixture {
                     let first = this.alice.encrypt(&this.bob.address, &payload(13));
                     this.bob.receive(&this.alice.address, &first, true, false);
                 }
-                this.alice
-                    .sessions
-                    .0
-                    .insert(this.bob.address.clone(), original);
+                if matches!(case, Case::PromoteTwenty) {
+                    this.alice
+                        .sessions
+                        .0
+                        .insert(this.bob.address.clone(), original);
+                }
                 this.packet = this.alice.encrypt(&this.bob.address, &payload(34));
+                let receiving = &this.bob.sessions.0[&this.alice.address];
+                assert_eq!(receiving.previous_session_count(), 19);
+                let current_base = receiving
+                    .clone()
+                    .into_components()
+                    .unwrap()
+                    .current_session
+                    .unwrap()
+                    .alice_base_key
+                    .unwrap();
+                let packet_base = PreKeySignalMessage::try_from(this.packet.as_slice())
+                    .unwrap()
+                    .base_key()
+                    .serialize()
+                    .to_vec();
+                assert_eq!(
+                    current_base == packet_base,
+                    matches!(case, Case::RetryCurrentTwenty),
+                    "current-session retry and archived promotion must select distinct paths"
+                );
             }
             Case::GroupWorst1999 | Case::GroupNext1999 => {
                 let distribution = this.initialize_group();
@@ -771,13 +811,16 @@ impl Fixture {
             Case::ColdLookup2000
             | Case::ColdLookup4000
             | Case::ColdLookup8000
+            | Case::TailLookup2000
+            | Case::TailLookup4000
+            | Case::TailLookup8000
             | Case::ColdLoadLookup2000
             | Case::ColdLoadLookup4000
             | Case::ColdLoadLookup8000
             | Case::EvictTwoHundred => {
                 let count = match case {
-                    Case::ColdLookup4000 | Case::ColdLoadLookup4000 => 4000,
-                    Case::ColdLookup8000 | Case::ColdLoadLookup8000 => 8000,
+                    Case::ColdLookup4000 | Case::TailLookup4000 | Case::ColdLoadLookup4000 => 4000,
+                    Case::ColdLookup8000 | Case::TailLookup8000 | Case::ColdLoadLookup8000 => 8000,
                     Case::EvictTwoHundred => 1999,
                     _ => 2000,
                 };
@@ -785,7 +828,14 @@ impl Fixture {
                     this.stored_backlog(count, matches!(case, Case::EvictTwoHundred));
                 this.stored = stored;
                 this.lookup_key = Some(ratchet);
-                this.lookup_index = count / 2;
+                this.lookup_index = if matches!(
+                    case,
+                    Case::TailLookup2000 | Case::TailLookup4000 | Case::TailLookup8000
+                ) {
+                    count - 1
+                } else {
+                    count / 2
+                };
                 if !matches!(
                     case,
                     Case::ColdLoadLookup2000 | Case::ColdLoadLookup4000 | Case::ColdLoadLookup8000
@@ -1116,6 +1166,20 @@ impl Fixture {
                     black_box(signature);
                 }
             }
+            Case::VerifyTenAfterSigning => {
+                let signature = self
+                    .signature_key
+                    .private_key
+                    .calculate_signature(&self.plaintext, &mut random())
+                    .unwrap();
+                for _ in 0..10 {
+                    assert!(black_box(
+                        self.signature_key
+                            .public_key
+                            .verify_signature(&self.plaintext, &signature)
+                    ));
+                }
+            }
             Case::Conversation => {
                 self.alice.establish(&self.bob);
                 let first = self.alice.encrypt(&self.bob.address, &[71; 10]);
@@ -1133,7 +1197,7 @@ impl Fixture {
                     self.bob.receive(&self.alice.address, packet, false, false);
                 }
             }
-            Case::PromoteTwenty => {
+            Case::PromoteTwenty | Case::RetryCurrentTwenty => {
                 let successes = (0..5)
                     .filter(|_| self.bob.retry_prekey(&self.alice.address, &self.packet))
                     .count();
@@ -1168,7 +1232,12 @@ impl Fixture {
                 );
             }
             #[cfg(feature = "bench-internals")]
-            Case::ColdLookup2000 | Case::ColdLookup4000 | Case::ColdLookup8000 => {
+            Case::ColdLookup2000
+            | Case::ColdLookup4000
+            | Case::ColdLookup8000
+            | Case::TailLookup2000
+            | Case::TailLookup4000
+            | Case::TailLookup8000 => {
                 assert!(access::take(
                     self.session.as_mut().unwrap().session_state_mut().unwrap(),
                     self.lookup_key.as_ref().unwrap(),
@@ -1188,7 +1257,7 @@ impl Fixture {
             #[cfg(feature = "bench-internals")]
             Case::EvictTwoHundred => {
                 let state = self.session.as_mut().unwrap().session_state_mut().unwrap();
-                for counter in 2000..2200 {
+                for counter in 1999..2199 {
                     access::insert(
                         state,
                         self.lookup_key.as_ref().unwrap(),
@@ -1238,6 +1307,9 @@ impl Fixture {
             Case::ColdLookup2000
                 | Case::ColdLookup4000
                 | Case::ColdLookup8000
+                | Case::TailLookup2000
+                | Case::TailLookup4000
+                | Case::TailLookup8000
                 | Case::ColdLoadLookup2000
                 | Case::ColdLoadLookup4000
                 | Case::ColdLoadLookup8000
@@ -1258,7 +1330,7 @@ impl Fixture {
                 .unwrap();
             let keys = &components.current_session.unwrap().receiver_chains[0].message_keys;
             assert!(keys.len() <= 2051);
-            assert!(keys.iter().any(|key| key.index == 2199));
+            assert!(keys.iter().any(|key| key.index == 2198));
         }
     }
 }

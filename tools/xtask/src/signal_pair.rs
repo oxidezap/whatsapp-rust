@@ -268,7 +268,7 @@ mod tests {
     fn counts_the_full_feature_catalog_and_rejects_missing_registration() {
         const SOURCE: &str =
             include_str!("../../../wacore/libsignal/benches/classic_fixture/mod.rs");
-        assert_eq!(case_count(SOURCE).unwrap(), 41);
+        assert_eq!(case_count(SOURCE).unwrap(), 46);
         assert!(case_count("const OTHER: &[Case] = &[];").is_err());
     }
     #[test]
