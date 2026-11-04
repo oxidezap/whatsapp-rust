@@ -33,3 +33,20 @@ The browser lane requires the WASM standard library, matching `wasm-bindgen`
 runner and Chrome/ChromeDriver configured in `wasm.yml`. Browser execution tests
 cover runtime/storage behavior; release builds establish linking only. Exact
 feature combinations live in `tools/xtask/consumers.json`.
+
+## Experimental mobile foundations
+
+`mobile-core` exposes runtime-independent configuration, environment/identity
+binding and local registration workflow policy. It does not implement telephone
+registration, primary-device login or companion hosting. Its isolated consumer
+profiles run with defaults disabled, including a WASM link profile. Those checks
+establish compilation and local state behavior, not authenticated mobile support.
+
+`mobile-transport-native` adds the optional Tokio TCP adapter. It is not required
+by `mobile-core` and is unavailable in the browser profile. Browser bridge and
+ESP32 hosts must provide their own transport, service and persistence adapters.
+An isolated WASM compilation does not qualify browser execution or an ESP32 build.
+
+See `mobile_testing.md` for mock boundaries and `mobile_oracle.md` for APK evidence
+qualification. Missing official artifacts or future bartender/barback capabilities
+must remain explicit validation gaps.

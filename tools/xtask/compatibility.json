@@ -4,6 +4,8 @@
   "profiles": [
     {"package":"whatsapp-rust","name":"minimal","defaults":false,"features":[],"wasm":true},
     {"package":"whatsapp-rust","name":"native-default","defaults":true,"features":[],"wasm":false},
+    {"package":"whatsapp-rust","name":"mobile-core","defaults":false,"features":["mobile-core"],"wasm":true},
+    {"package":"whatsapp-rust","name":"mobile-transport-native","defaults":false,"features":["mobile-transport-native"],"wasm":false},
     {"package":"whatsapp-rust","name":"plugins","defaults":false,"features":["plugins"],"wasm":true},
     {"package":"whatsapp-rust","name":"voip-control","defaults":false,"features":["voip-control"],"wasm":true},
     {"package":"whatsapp-rust","name":"voip-runtime","defaults":false,"features":["voip-runtime"],"wasm":true},
@@ -11,6 +13,7 @@
     {"package":"whatsapp-rust","name":"voip-mlow","defaults":false,"features":["voip-mlow"],"wasm":true},
     {"package":"wacore","name":"minimal","defaults":false,"features":[],"wasm":true},
     {"package":"wacore","name":"default","defaults":true,"features":[],"wasm":true},
+    {"package":"wacore","name":"mobile","defaults":false,"features":["mobile"],"wasm":true},
     {"package":"wacore","name":"voip","defaults":false,"features":["voip"],"wasm":true},
     {"package":"wacore","name":"voip-mlow","defaults":false,"features":["voip-mlow"],"wasm":true},
     {"package":"wacore-appstate","name":"default","defaults":true,"features":[],"wasm":false},
@@ -23,6 +26,7 @@
     {"package":"waproto","name":"serde-snake-case","defaults":false,"features":["serde-snake-case"],"wasm":true},
     {"package":"waproto","name":"serde-enum-repr","defaults":false,"features":["serde-enum-repr"],"wasm":true},
     {"package":"whatsapp-rust-tokio-transport","name":"default","defaults":true,"features":[],"wasm":false},
+    {"package":"whatsapp-rust-tokio-transport","name":"tcp","defaults":false,"features":["tcp"],"wasm":false},
     {"package":"whatsapp-rust-ureq-http-client","name":"default","defaults":true,"features":[],"wasm":false},
     {"package":"whatsapp-rust-sqlite-storage","name":"default","defaults":true,"features":[],"wasm":false},
     {"package":"whatsapp-rust-sqlite-storage","name":"unbundled","defaults":false,"features":[],"wasm":false}
