@@ -28,6 +28,10 @@ pub trait CryptoProvider {
         Ok((*seed, next))
     }
     fn hkdf_sha256(&self, salt: &[u8], input: &[u8], info: &[u8], output: &mut [u8]) -> Result<()>;
+    /// RFC 5869 extraction with the public all-zero SHA-256 salt.
+    fn hkdf_sha256_zero_salt(&self, input: &[u8], info: &[u8], output: &mut [u8]) -> Result<()> {
+        self.hkdf_sha256(&[0; 32], input, info, output)
+    }
     fn encrypt_cbc(&self, key: &[u8; 32], iv: &[u8; 16], plaintext: &[u8]) -> Result<Vec<u8>>;
     fn decrypt_cbc(&self, key: &[u8; 32], iv: &[u8; 16], ciphertext: &[u8]) -> Result<Vec<u8>>;
 }

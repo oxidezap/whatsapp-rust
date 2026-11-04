@@ -226,7 +226,7 @@ impl MessageKey {
             Self::Derived { material, .. } => Ok((material.cipher, material.mac, material.iv)),
             Self::Seed { seed, .. } => {
                 let mut material = [0; 80];
-                crypto.hkdf_sha256(&[0; 32], seed, b"WhisperMessageKeys", &mut material)?;
+                crypto.hkdf_sha256_zero_salt(seed, b"WhisperMessageKeys", &mut material)?;
                 let mut cipher = [0; 32];
                 let mut mac = [0; 32];
                 let mut iv = [0; 16];

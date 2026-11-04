@@ -233,6 +233,9 @@ impl CryptoProvider for PreparedGroupProvider {
     fn hkdf_sha256(&self, salt: &[u8], input: &[u8], info: &[u8], output: &mut [u8]) -> Result<()> {
         RustCrypto.hkdf_sha256(salt, input, info, output)
     }
+    fn hkdf_sha256_zero_salt(&self, input: &[u8], info: &[u8], output: &mut [u8]) -> Result<()> {
+        RustCrypto.hkdf_sha256_zero_salt(input, info, output)
+    }
     fn encrypt_cbc(&self, key: &[u8; 32], iv: &[u8; 16], plaintext: &[u8]) -> Result<Vec<u8>> {
         RustCrypto.encrypt_cbc(key, iv, plaintext)
     }

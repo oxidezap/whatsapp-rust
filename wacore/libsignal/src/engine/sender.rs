@@ -45,7 +45,7 @@ impl SenderKeyState {
 }
 fn expand<C: CryptoProvider>(crypto: &C, seed: &[u8; 32]) -> Result<([u8; 32], [u8; 16])> {
     let mut expanded = [0; 48];
-    crypto.hkdf_sha256(&[0; 32], seed, b"WhisperGroup", &mut expanded)?;
+    crypto.hkdf_sha256_zero_salt(seed, b"WhisperGroup", &mut expanded)?;
     let mut iv = [0; 16];
     let mut cipher = [0; 32];
     iv.copy_from_slice(&expanded[..16]);

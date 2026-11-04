@@ -42,7 +42,7 @@ fn initial_secrets<C: CryptoProvider>(
         shared.zeroize();
     }
     let mut expanded = [0; 64];
-    let result = crypto.hkdf_sha256(&[0; 32], &input, b"WhisperText", &mut expanded);
+    let result = crypto.hkdf_sha256_zero_salt(&input, b"WhisperText", &mut expanded);
     input.zeroize();
     result?;
     let mut root = [0; 32];

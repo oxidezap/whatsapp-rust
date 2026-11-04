@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 use super::error::Result;
 use super::*;
-use crate::engine;
+use crate::engine::{self, CryptoProvider};
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
@@ -75,8 +75,8 @@ impl Drop for MessageKeyGenerator {
 impl MessageKeyGenerator {
     pub fn generate_keys(&self) -> MessageKeys {
         let mut expanded = Zeroizing::new([0; 80]);
-        hkdf::Hkdf::<sha2::Sha256>::new(None, &self.seed)
-            .expand(b"WhisperMessageKeys", expanded.as_mut())
+        engine::RustCrypto
+            .hkdf_sha256_zero_salt(&self.seed, b"WhisperMessageKeys", expanded.as_mut())
             .expect("80 bytes are within the SHA-256 HKDF output limit");
         let mut cipher_key = [0; 32];
         let mut mac_key = [0; 32];
@@ -981,8 +981,8 @@ impl SenderChainKey {
     pub fn sender_message_key(&self) -> SenderMessageKey {
         let seed = Zeroizing::new(engine::RustCrypto.hmac_sha256_array(&self.seed, &[1]));
         let mut expanded = Zeroizing::new([0; 48]);
-        hkdf::Hkdf::<sha2::Sha256>::new(None, seed.as_ref())
-            .expand(b"WhisperGroup", expanded.as_mut())
+        engine::RustCrypto
+            .hkdf_sha256_zero_salt(seed.as_ref(), b"WhisperGroup", expanded.as_mut())
             .expect("48 bytes are within the SHA-256 HKDF output limit");
         let mut iv = [0; 16];
         let mut cipher_key = [0; 32];

@@ -6,12 +6,33 @@ use crate::engine::{CryptoProvider, Error, RandomSource, Result};
 use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
 use curve25519_dalek::{edwards::EdwardsPoint, montgomery::MontgomeryPoint, scalar::Scalar};
 use hmac::{Hmac, HmacReset, KeyInit, Mac};
+use sha2::digest::{block_api::CoreProxy, common::hazmat::SerializableState};
 use sha2::{Digest, Sha256, Sha512};
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 use zeroize::Zeroizing;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RustCrypto;
+
+// SHA-256 states after RFC 2104's public zero-key ipad/opad blocks. These
+// constants avoid global initialization; tests regenerate the serialized states
+// through the hash API to detect any dependency state-format change.
+const ZERO_SALT_IPAD: [u8; 40] = [
+    0xad, 0xde, 0x54, 0xf4, 0x4f, 0x21, 0x25, 0x97, 0xa0, 0xf2, 0xda, 0x90, 0xea, 0x28, 0x12, 0xdf,
+    0x0f, 0x75, 0xe5, 0x64, 0x81, 0x41, 0x92, 0xa3, 0x2b, 0x93, 0x4a, 0x82, 0x32, 0x4e, 0xe0, 0xf8,
+    1, 0, 0, 0, 0, 0, 0, 0,
+];
+const ZERO_SALT_OPAD: [u8; 40] = [
+    0x0f, 0x48, 0x85, 0xd3, 0x77, 0x64, 0xbb, 0x7a, 0x38, 0xc5, 0xc9, 0x37, 0x67, 0x24, 0xd8, 0x5d,
+    0x72, 0x3a, 0x04, 0x8e, 0xb0, 0x34, 0x34, 0x75, 0x18, 0x28, 0xb8, 0xde, 0xa6, 0x45, 0x1d, 0x36,
+    1, 0, 0, 0, 0, 0, 0, 0,
+];
+
+fn public_sha256_prefix(state: &[u8; 40]) -> Sha256 {
+    let core = <Sha256 as CoreProxy>::Core::deserialize(&(*state).into())
+        .expect("fixed public SHA-256 prefix state");
+    Sha256::compose(core, Default::default())
+}
 
 impl RustCrypto {
     pub(crate) fn hmac_sha256_array(&self, key: &[u8], data: &[u8]) -> [u8; 32] {
@@ -135,6 +156,18 @@ impl CryptoProvider for RustCrypto {
             .expand(info, output)
             .map_err(|_| Error::Crypto)
     }
+    fn hkdf_sha256_zero_salt(&self, input: &[u8], info: &[u8], output: &mut [u8]) -> Result<()> {
+        let mut inner = public_sha256_prefix(&ZERO_SALT_IPAD);
+        inner.update(input);
+        let inner_digest = Zeroizing::new(<[u8; 32]>::from(inner.finalize()));
+        let mut outer = public_sha256_prefix(&ZERO_SALT_OPAD);
+        outer.update(inner_digest.as_slice());
+        let prk = Zeroizing::new(<[u8; 32]>::from(outer.finalize()));
+        hkdf::Hkdf::<Sha256>::from_prk(prk.as_ref())
+            .map_err(|_| Error::Crypto)?
+            .expand(info, output)
+            .map_err(|_| Error::Crypto)
+    }
     fn encrypt_cbc(&self, key: &[u8; 32], iv: &[u8; 16], plaintext: &[u8]) -> Result<Vec<u8>> {
         Ok(cbc::Encryptor::<aes::Aes256>::new(key.into(), iv.into())
             .encrypt_padded_vec::<Pkcs7>(plaintext))
@@ -149,6 +182,56 @@ impl CryptoProvider for RustCrypto {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn public_zero_salt_prefixes_match_the_hash_state_format() {
+        for (pad, expected) in [(0x36, ZERO_SALT_IPAD), (0x5c, ZERO_SALT_OPAD)] {
+            let mut hash = Sha256::new();
+            hash.update([pad; 64]);
+            let (core, buffer) = hash.decompose();
+            assert_eq!(buffer.get_pos(), 0);
+            assert_eq!(core.serialize().as_slice(), expected);
+        }
+    }
+
+    #[test]
+    fn zero_salt_hkdf_matches_rfc5869_and_generic_boundaries() {
+        let mut rfc = [0; 42];
+        RustCrypto
+            .hkdf_sha256_zero_salt(&[11; 22], b"", &mut rfc)
+            .unwrap();
+        assert_eq!(
+            rfc,
+            hex(
+                "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8"
+            )
+        );
+        for input_len in [0, 1, 31, 32, 33, 63, 64, 65, 127, 128, 1024] {
+            let input: Vec<_> = (0..input_len).map(|index| index as u8).collect();
+            for info in [b"".as_slice(), b"WhisperMessageKeys", b"WhisperGroup"] {
+                for output_len in [0, 1, 31, 32, 33, 48, 80, 96] {
+                    let mut expected = vec![0xa5; output_len];
+                    let mut actual = expected.clone();
+                    RustCrypto
+                        .hkdf_sha256(&[0; 32], &input, info, &mut expected)
+                        .unwrap();
+                    RustCrypto
+                        .hkdf_sha256_zero_salt(&input, info, &mut actual)
+                        .unwrap();
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+        for output_len in [255 * 32, 255 * 32 + 1] {
+            let mut expected = vec![0xa5; output_len];
+            let mut actual = expected.clone();
+            assert_eq!(
+                RustCrypto.hkdf_sha256(&[0; 32], b"synthetic", b"", &mut expected),
+                RustCrypto.hkdf_sha256_zero_salt(b"synthetic", b"", &mut actual)
+            );
+            assert_eq!(actual, expected);
+        }
+    }
+
     #[test]
     fn paired_chain_hmac_matches_independent_messages() {
         for seed in 0u8..32 {

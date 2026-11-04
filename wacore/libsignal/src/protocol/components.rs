@@ -774,7 +774,7 @@ fn sender_state_components(value: &engine::SenderKeyState) -> SenderKeyStateComp
 /// Expand a compact skipped-key seed through the independent crypto provider.
 pub(crate) fn derived_keys(seed: &[u8; 32]) -> Result<([u8; 32], [u8; 32], [u8; 16])> {
     let mut material = [0; 80];
-    engine::RustCrypto.hkdf_sha256(&[0; 32], seed, b"WhisperMessageKeys", &mut material)?;
+    engine::RustCrypto.hkdf_sha256_zero_salt(seed, b"WhisperMessageKeys", &mut material)?;
     let mut cipher = [0; 32];
     let mut mac = [0; 32];
     let mut iv = [0; 16];

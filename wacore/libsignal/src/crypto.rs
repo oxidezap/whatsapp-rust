@@ -376,6 +376,14 @@ impl<C: crate::engine::CryptoProvider> crate::engine::CryptoProvider for Provide
     ) -> crate::engine::Result<()> {
         self.crypto.hkdf_sha256(salt, input, info, output)
     }
+    fn hkdf_sha256_zero_salt(
+        &self,
+        input: &[u8],
+        info: &[u8],
+        output: &mut [u8],
+    ) -> crate::engine::Result<()> {
+        self.crypto.hkdf_sha256_zero_salt(input, info, output)
+    }
     fn encrypt_cbc(
         &self,
         key: &[u8; 32],
