@@ -1058,8 +1058,10 @@ async fn relay_driver<S: DialDatagram>(
     let mut dropped_inbound = 0u32;
     let mut hung_up = false;
     // The datagram the flow could not take yet. A dialled flow may push back (a proxy, a tunnel),
-    // so waiting for it is a branch of the select below rather than a block in front of it: reads,
-    // timers and a hang-up keep running. Nothing is flushed past it, so wire order holds.
+    // so waiting for it is a branch of the select below rather than a block in front of it: reads
+    // and timers keep running. Nothing is flushed past it, so wire order holds, and nothing more is
+    // taken off the outbound queue until it goes, so a stalled flow backs up into the bounded queue
+    // (where the caller drops media) rather than into the stack.
     let mut unsent: Option<BytesMut> = None;
     loop {
         // Flush, deliver, announce: everything the stack produced since the last wakeup, before
@@ -1091,7 +1093,9 @@ async fn relay_driver<S: DialDatagram>(
             // of `connect_relay_media`.
             let _ = events.try_send(RelayTransportEvent::Connected);
         }
-        if hung_up {
+        // A goodbye held behind a datagram is still owed: keep going until the flow takes it, which
+        // `disconnect`'s deadline bounds.
+        if hung_up && unsent.is_none() {
             // `try_send`, unlike the terminal send in `finish`, because this close was asked for
             // locally: the call already knows, and by the time `disconnect` runs it has left its
             // receive loop, so nothing is draining this channel. Awaiting a slot that only the
@@ -1112,7 +1116,7 @@ async fn relay_driver<S: DialDatagram>(
                 // went away is noticed rather than waited out.
                 Err(e) => Err(StackError::Failed(format!("relay socket recv: {e}"))),
             },
-            queued = outbound.recv() => match queued {
+            queued = outbound.recv(), if unsent.is_none() => match queued {
                 Ok(packet) => stack.write_media(now(), &packet),
                 // `disconnect` closed the queue: say goodbye on the wire, then let the top of the
                 // loop flush it before ending.
@@ -2749,6 +2753,115 @@ mod datagram_dialer {
         tokio::time::timeout(Duration::from_secs(30), body)
             .await
             .expect("the held-send round-trip must complete within the bound");
+    }
+
+    /// While a datagram is held the driver takes nothing more off the outbound queue: media backs
+    /// up there, at its bound, for `send` to drop, instead of piling up inside the stack.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_send_leaves_media_in_the_bounded_queue() {
+        let body = async {
+            let (relay_addr, relay_task) = spawn_relay().await;
+            let gate = Arc::new(SendGate::default());
+            let dialer = Arc::new(GatedDialer {
+                to: relay_addr,
+                gate: gate.clone(),
+            });
+            let (chan, _events) = connect_relay_media_via(
+                "192.0.2.1:3480".parse().unwrap(),
+                Arc::new(crate::runtime_impl::TokioRuntime),
+                Some(dialer),
+            )
+            .await
+            .expect("relay connect through the dialer");
+            let (_, relay) = relay_task.await.unwrap();
+
+            gate.hold();
+            chan.send(Bytes::from_static(&[0x90, 0x78, 1, 1]))
+                .await
+                .expect("client writes into the open channel");
+            loopback_relay::wait_for(
+                || gate.held.load(Ordering::SeqCst) > 0,
+                "the driver to offer its datagram to the held flow",
+            )
+            .await;
+            for _ in 0..2 * RELAY_SEND_CAP {
+                chan.send(Bytes::from_static(&[0x90, 0x78, 3, 3]))
+                    .await
+                    .expect("a full queue drops media rather than failing the send");
+            }
+            // Time for a driver that still drained the queue to empty it.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(
+                chan.outbound.len(),
+                RELAY_SEND_CAP,
+                "nothing is taken off the queue while a datagram is held"
+            );
+
+            gate.release();
+            chan.disconnect().await;
+            relay.driver.abort();
+        };
+
+        tokio::time::timeout(Duration::from_secs(30), body)
+            .await
+            .expect("the held-queue check must complete within the bound");
+    }
+
+    /// A hang-up whose goodbye the flow holds back still reaches the relay once the flow takes it,
+    /// and `disconnect` returns as soon as it has, well inside its deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hang_up_held_by_the_flow_still_says_goodbye() {
+        let body = async {
+            let (relay_addr, relay_task) = spawn_relay().await;
+            let gate = Arc::new(SendGate::default());
+            let (chan, _events) = RelayMediaChannelFactory::new(
+                "192.0.2.1:3480".parse().unwrap(),
+                Arc::new(crate::runtime_impl::TokioRuntime),
+            )
+            .with_dialer(Arc::new(GatedDialer {
+                to: relay_addr,
+                gate: gate.clone(),
+            }))
+            .connect()
+            .await
+            .expect("relay connect through the dialer");
+            let (_, relay) = relay_task.await.unwrap();
+
+            gate.hold();
+            let started = tokio::time::Instant::now();
+            let hang_up = tokio::spawn({
+                let chan = chan.clone();
+                async move { chan.disconnect().await }
+            });
+            loopback_relay::wait_for(
+                || gate.held.load(Ordering::SeqCst) > 0,
+                "the driver to offer its goodbye to the held flow",
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                !hang_up.is_finished(),
+                "the driver waits for the held goodbye"
+            );
+
+            gate.release();
+            let goodbye = tokio::time::timeout(Duration::from_secs(1), next_packet(&relay)).await;
+            assert_eq!(
+                goodbye.expect("the relay hears the goodbye once the flow takes it"),
+                None,
+                "the relay sees the channel close, with no media in between"
+            );
+            hang_up.await.unwrap();
+            assert!(
+                started.elapsed() < RELAY_DISCONNECT_TIMEOUT,
+                "disconnect returns once the goodbye is out, not at its deadline"
+            );
+            relay.driver.abort();
+        };
+
+        tokio::time::timeout(Duration::from_secs(30), body)
+            .await
+            .expect("the held-goodbye hang-up must complete within the bound");
     }
 }
 
