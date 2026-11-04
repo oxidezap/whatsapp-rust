@@ -216,9 +216,33 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         Ok(output)
     }
     pub fn decrypt(&mut self, record: &mut SessionRecord, input: &[u8]) -> Result<Vec<u8>> {
+        self.decrypt_selected(record, input, None)
+    }
+    pub(crate) fn decrypt_existing_pre_key(
+        &mut self,
+        record: &mut SessionRecord,
+        input: &[u8],
+        version: u32,
+        base_key: [u8; 32],
+    ) -> Result<Vec<u8>> {
+        self.decrypt_selected(record, input, Some((version, base_key)))
+    }
+    fn decrypt_selected(
+        &mut self,
+        record: &mut SessionRecord,
+        input: &[u8],
+        selection: Option<(u32, [u8; 32])>,
+    ) -> Result<Vec<u8>> {
         let message = SignalMessageView::decode(input)?;
+        let matches = |state: &SessionState| {
+            selection.is_none_or(|(version, base)| {
+                state.version == version && state.alice_base_key == Some(base)
+            })
+        };
         let mut failure = Error::MissingKey;
-        if let Some(current) = record.current.as_mut() {
+        if let Some(current) = record.current.as_mut()
+            && matches(current)
+        {
             if let Some(index) = current
                 .receivers
                 .iter()
@@ -241,9 +265,15 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
                     Err(error) => failure = error,
                 }
             }
+            if selection.is_some() {
+                return Err(failure);
+            }
         }
         for index in 0..record.previous.len() {
             let mut candidate = record.previous[index].decode(self.crypto)?;
+            if !matches(&candidate) {
+                continue;
+            }
             match self.decrypt_state(&mut candidate, &message, input) {
                 Ok((plaintext, _)) => {
                     record.materialize_reservation(self.crypto)?;
@@ -252,6 +282,11 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
                     return Ok(plaintext);
                 }
                 Err(error) => {
+                    // A prekey identifies one session. Searching stale copies
+                    // after its failure could accept an already consumed packet.
+                    if selection.is_some() {
+                        return Err(error);
+                    }
                     if error == Error::Duplicate || failure == Error::MissingKey {
                         failure = error;
                     }
@@ -327,7 +362,12 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
             }
         }
         if existing {
-            return self.decrypt(record, wrapper.message);
+            return self.decrypt_existing_pre_key(
+                record,
+                wrapper.message,
+                u32::from(wrapper.bytes[0] >> 4),
+                wrapper.base_key,
+            );
         }
         if wrapper.pre_key_id.is_some() != p.local_one_time_pre_key.is_some() {
             return Err(Error::MissingKey);
@@ -344,7 +384,12 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         let mut state = self.initialize_responder(p)?;
         state.version = u32::from(wrapper.bytes[0] >> 4);
         candidate.install(state);
-        let plaintext = self.decrypt(&mut candidate, wrapper.message)?;
+        let plaintext = self.decrypt_existing_pre_key(
+            &mut candidate,
+            wrapper.message,
+            u32::from(wrapper.bytes[0] >> 4),
+            wrapper.base_key,
+        )?;
         *record = candidate;
         Ok(plaintext)
     }

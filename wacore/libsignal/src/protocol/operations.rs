@@ -886,7 +886,14 @@ async fn message_decrypt_prekey_using<
     let mut engine = engine::Engine::new(&crypto, &mut random);
     let plaintext = if existing {
         candidate
-            .operate(|record| engine.decrypt(record, message.message().serialized()))
+            .operate(|record| {
+                engine.decrypt_existing_pre_key(
+                    record,
+                    message.message().serialized(),
+                    u32::from(message.message_version()),
+                    message.parsed.base_key,
+                )
+            })
             .map_err(|error| {
                 message_error(
                     error,

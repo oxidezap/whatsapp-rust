@@ -1601,6 +1601,81 @@ fn delayed_archived_prekey_updates_identity_row_without_fresh_rotation_or_prekey
 }
 
 #[test]
+fn selected_prekey_failure_never_retries_an_older_copy_of_the_same_session() {
+    run(async {
+        for entrypoint in 0..3 {
+            for current in [false, true] {
+                for duplicate in [false, true] {
+                    let mut f = established_signal_fixture(0x1828_d004).await;
+                    let older = f.b_sessions.0[&f.aa]
+                        .clone()
+                        .into_components()
+                        .unwrap()
+                        .current_session
+                        .unwrap();
+                    let packet = f.late_prekey.clone();
+                    let keys = f.keys.clone_for_prekey();
+                    let mut selected = if duplicate {
+                        decrypt_receiver_entrypoint(entrypoint, &packet, &mut f, &keys)
+                            .await
+                            .unwrap();
+                        f.b_sessions.0[&f.aa]
+                            .clone()
+                            .into_components()
+                            .unwrap()
+                            .current_session
+                            .unwrap()
+                    } else {
+                        older.clone()
+                    };
+                    if !duplicate {
+                        selected.receiver_chains[0].chain_key.as_mut().unwrap().key =
+                            Some(vec![0x73; 32]);
+                    }
+                    let mut components = f.b_sessions.0[&f.aa].clone().into_components().unwrap();
+                    if current {
+                        components.current_session = Some(selected);
+                    } else {
+                        components
+                            .current_session
+                            .as_mut()
+                            .unwrap()
+                            .alice_base_key
+                            .as_mut()
+                            .unwrap()[1] ^= 1;
+                        components.previous_sessions.insert(0, selected);
+                    }
+                    components.previous_sessions.push(older);
+                    let encoded = SessionRecord::from_components(components)
+                        .unwrap()
+                        .serialize()
+                        .unwrap();
+                    f.b_sessions
+                        .0
+                        .insert(f.aa.clone(), SessionRecord::deserialize(&encoded).unwrap());
+                    let before = f.b_sessions.0[&f.aa].serialize().unwrap();
+                    let saves = f.b.save_calls;
+                    let error = decrypt_receiver_entrypoint(entrypoint, &packet, &mut f, &keys)
+                        .await
+                        .err()
+                        .expect("selected prekey candidate must reject the packet");
+                    if duplicate {
+                        assert!(matches!(
+                            error,
+                            SignalProtocolError::DuplicatedMessage(_, _)
+                        ));
+                    } else {
+                        assert!(matches!(error, SignalProtocolError::BadMac(_)));
+                    }
+                    assert_eq!(f.b_sessions.0[&f.aa].serialize().unwrap(), before);
+                    assert_eq!(f.b.save_calls, saves);
+                }
+            }
+        }
+    })
+}
+
+#[test]
 fn authenticated_bad_group_ciphertext_is_not_stored_state_corruption() {
     run(async {
         let mut rng = rand::rngs::StdRng::seed_from_u64(1828);
