@@ -255,6 +255,7 @@ fn decode_reservation(f: &Data<'_>, live: Option<&[u8; 16]>) -> Result<(Reservat
             incarnation,
             committed: trusted,
             waived: false,
+            publication_pending: false,
         },
         trusted,
     ))

@@ -516,6 +516,8 @@ pub struct Reservation {
     pub incarnation: Option<[u8; 16]>,
     pub(crate) committed: bool,
     pub(crate) waived: bool,
+    /// The host still owes persistence before publishing group output.
+    pub(crate) publication_pending: bool,
 }
 impl Reservation {
     pub fn prepare(&mut self, next_counter: u32, count: u32, incarnation: [u8; 16]) -> Result<u32> {
@@ -553,9 +555,9 @@ impl Reservation {
         self.waived
     }
     pub fn reset_chain(&mut self) {
-        let waived = self.waived;
-        *self = Self::default();
-        self.waived = waived;
+        self.ceiling = None;
+        self.incarnation = None;
+        self.committed = false;
     }
     /// The numerical horizon can be rebased, but a fresh private key has no
     /// durability proof until its own state snapshot commits.

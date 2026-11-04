@@ -780,7 +780,6 @@ pub struct SenderKeyCryptoContext {
 #[derive(Clone, Default)]
 pub struct SenderKeyRecord {
     pub(crate) inner: engine::SenderKeyRecord,
-    wire_gated: bool,
     group_crypto: Option<Arc<group_crypto::GroupCryptoCache>>,
 }
 impl SenderKeyRecord {
@@ -847,14 +846,12 @@ impl SenderKeyRecord {
     pub fn deserialize(bytes: &[u8]) -> Result<Self> {
         Ok(Self {
             inner: engine::codec::decode_sender_key_record(&engine::RustCrypto, bytes)?,
-            wire_gated: false,
             group_crypto: None,
         })
     }
     pub fn deserialize_for_store(bytes: &[u8], token: &[u8; 16]) -> Result<Self> {
         Ok(Self {
             inner: engine::codec::decode_sender_key_record_live(&engine::RustCrypto, bytes, token)?,
-            wire_gated: false,
             group_crypto: None,
         })
     }
@@ -945,13 +942,13 @@ impl SenderKeyRecord {
         size_of::<Self>() + self.estimated_heap_bytes()
     }
     pub fn mark_wire_gated(&mut self) {
-        self.wire_gated = true;
+        self.inner.reservation.publication_pending = true;
     }
     pub fn clear_wire_gated(&mut self) {
-        self.wire_gated = false;
+        self.inner.reservation.publication_pending = false;
     }
     pub fn is_wire_gated(&self) -> bool {
-        self.wire_gated
+        self.inner.reservation.publication_pending
     }
     pub fn estimated_heap_bytes(&self) -> usize {
         self.inner.states.capacity() * size_of::<engine::SenderKeyState>()
