@@ -69,7 +69,7 @@ jobs:
             args: -p wacore-noise --lib
           # Exercise address ownership in the production Signal runtime.
           - name: wacore-libsignal (address)
-            cache-key: signal-runtime-address
+            cache-key: libsignal-address
             args: -p wacore-libsignal --lib address
           # Scoped allocation ownership must survive cross-thread frees, TLS
           # teardown and unwinding without recursing through the allocator.

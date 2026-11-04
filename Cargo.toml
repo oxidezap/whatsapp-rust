@@ -46,7 +46,6 @@ members = [
 ]
 exclude = ["vendor/wasmtime-internal-cache"]
 default-members = [
-    "wacore/libsignal",
     ".",
     "http_clients/ureq-client",
     "storages/sqlite-storage",
@@ -55,6 +54,7 @@ default-members = [
     "wacore/appstate",
     "wacore/binary",
     "wacore/derive",
+    "wacore/libsignal",
     "wacore/noise",
     "waproto",
 ]
