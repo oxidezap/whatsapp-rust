@@ -699,7 +699,9 @@ mod attribute_storage {
             std::mem::size_of::<StoredNode<AttrsRef<'static>>>(),
             std::mem::size_of::<NodeRef<'static>>(),
         );
-        measure(bencher, count, |n| entries(n).collect::<AttrsRef<'static>>());
+        measure(bencher, count, |n| {
+            entries(n).collect::<AttrsRef<'static>>()
+        });
     }
 
     #[divan::bench(args = [0, 1, 2, 3, 4, 8, 9])]
