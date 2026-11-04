@@ -2,21 +2,43 @@
 //! Persisted protobuf data codecs. Reloads burn reserved counters unless the
 //! caller supplies the live cache incarnation. No storage operation occurs here.
 use crate::engine::{CryptoProvider, Error, Result, state::*, wire::*};
+use arrayvec::ArrayVec;
 use std::collections::VecDeque;
-type Data<'a> = Vec<(u32, Value<'a>)>;
+type Data<'a> = [(u32, Value<'a>)];
 // The wire byte bound alone does not bound a table of two-byte scalar fields.
 // This independent per-message bound caps the table at 4 MiB on 64-bit hosts,
 // while allowing historical skipped-key backlogs well above the default 2000.
 pub(crate) const MAX_STORED_FIELDS: usize = 131_072;
-fn fields(bytes: &[u8]) -> Result<Data<'_>> {
+fn scan_fields<'a>(bytes: &'a [u8], mut visit: impl FnMut((u32, Value<'a>))) -> Result<()> {
     let mut f = Fields::new_storage(bytes)?;
-    let mut out = Vec::new();
+    let mut count = 0;
     while let Some(field) = f.next()? {
-        if out.len() == MAX_STORED_FIELDS {
+        if count == MAX_STORED_FIELDS {
             return Err(Error::Encoding("stored protobuf field budget exceeded"));
         }
-        out.push(field);
+        count += 1;
+        visit(field);
     }
+    Ok(())
+}
+fn fields(bytes: &[u8]) -> Result<Vec<(u32, Value<'_>)>> {
+    let mut out = Vec::new();
+    scan_fields(bytes, |field| out.push(field))?;
+    Ok(out)
+}
+fn message_key_fields(bytes: &[u8]) -> Result<ArrayVec<(u32, Value<'_>), 5>> {
+    let mut out: ArrayVec<(u32, Value<'_>), 5> = ArrayVec::new();
+    scan_fields(bytes, |field| {
+        if !matches!(field.0, 1..=4 | 100) {
+            return;
+        }
+        if let Some(previous) = out.iter_mut().find(|(number, _)| *number == field.0) {
+            *previous = field;
+        } else {
+            // Only five distinct field numbers reach this table.
+            out.push(field);
+        }
+    })?;
     Ok(out)
 }
 fn one<'a>(f: &Data<'a>, n: u32) -> Option<Value<'a>> {
@@ -40,7 +62,7 @@ fn raw<const N: usize>(f: &Data<'_>, n: u32) -> Result<[u8; N]> {
     array(required(f, n)?)
 }
 fn message_key(input: &[u8]) -> Result<MessageKey> {
-    let f = fields(input)?;
+    let f = message_key_fields(input)?;
     let index = number(&f, 1)?;
     if let (Some(cipher), Some(mac), Some(iv)) = (data(&f, 2)?, data(&f, 3)?, data(&f, 4)?)
         && cipher.len() == 32
@@ -578,6 +600,40 @@ mod parser_budget_tests {
 #[cfg(test)]
 mod message_key_tests {
     use super::*;
+    #[test]
+    fn skipped_key_fields_keep_the_last_value_including_wire_type() {
+        let seed = [23; 32];
+        let mut wire = Vec::new();
+        bytes(&mut wire, 1, &[0xff]);
+        uint(&mut wire, 100, 1);
+        uint(&mut wire, 1, 9);
+        bytes(&mut wire, 100, &seed);
+        let key = message_key(&wire).unwrap();
+        assert_eq!(key.index(), 9);
+        assert_eq!(
+            key.expanded(&crate::engine::RustCrypto).unwrap(),
+            MessageKey::Seed { index: 9, seed }
+                .expanded(&crate::engine::RustCrypto)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn skipped_key_budget_counts_unknown_fields() {
+        let mut wire = Vec::new();
+        uint(&mut wire, 1, 9);
+        bytes(&mut wire, 100, &[23; 32]);
+        for _ in 2..MAX_STORED_FIELDS {
+            uint(&mut wire, 101, 0);
+        }
+        assert_eq!(message_key(&wire).unwrap().index(), 9);
+        uint(&mut wire, 102, 0);
+        assert!(matches!(
+            message_key(&wire),
+            Err(Error::Encoding("stored protobuf field budget exceeded"))
+        ));
+    }
+
     #[test]
     fn redundant_seed_requires_all_expanded_fields_to_match() {
         let seed = [17; 32];
