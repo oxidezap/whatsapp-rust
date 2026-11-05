@@ -191,11 +191,11 @@ type DetState = std::hash::BuildHasherDefault<std::hash::DefaultHasher>;
 /// driving the future directly keeps unrelated runtime tasks out of it.
 #[divan::bench(args = [0u8, 3, 5])]
 fn client_retry_count(bencher: divan::Bencher, initial: u8) {
-    use whatsapp_rust::bench_support::ReceiveHarness;
+    use whatsapp_rust::client::bench_retry::RetryCountHarness;
 
     const RETRIES: usize = 128;
-    static RETRY_CLIENT: OnceLock<ReceiveHarness> = OnceLock::new();
-    let client = RETRY_CLIENT.get_or_init(ReceiveHarness::new);
+    static RETRY_CLIENT: OnceLock<RetryCountHarness> = OnceLock::new();
+    let client = RETRY_CLIENT.get_or_init(RetryCountHarness::default);
     let keys: Vec<String> = (0..RETRIES)
         .map(|i| format!("1555000{i:04}@s.whatsapp.net:RETRY{i:04}:15551110000@s.whatsapp.net"))
         .collect();
