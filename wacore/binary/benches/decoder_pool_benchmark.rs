@@ -1,6 +1,7 @@
 //! Full token decoding, storage construction/drop and selected attribute reads.
 //! These fixtures are synthetic; they do not represent a traffic distribution.
 //! Consumer arms expose the complete frame before selectively reading attributes.
+//! Owned arms include the Arc allocation/drop used by the native receive path.
 use divan::black_box;
 #[path = "decoder_pool/fixture.rs"]
 mod fixture;
@@ -77,7 +78,8 @@ fn main() {
 fn owned_tree_attribute_consumer(bencher: divan::Bencher, width: usize) {
     let data = bytes::Bytes::from(fixture::node_bytes(width));
     bencher.bench_local(|| {
-        let frame = OwnedNodeRef::new(black_box(data.clone())).expect("decode");
+        let frame =
+            std::sync::Arc::new(OwnedNodeRef::new(black_box(data.clone())).expect("decode"));
         black_box(&frame);
         black_box(decoder_pool::consume_tree(frame.get()).expect("attributes"));
     });
@@ -87,8 +89,9 @@ fn owned_tree_attribute_consumer(bencher: divan::Bencher, width: usize) {
 fn owned_chunked_attribute_consumer(bencher: divan::Bencher, width: usize) {
     let data = bytes::Bytes::from(fixture::node_bytes(width));
     bencher.bench_local(|| {
-        let frame =
-            decoder_pool::OwnedFrame::new(black_box(data.clone()), 128, false).expect("decode");
+        let frame = std::sync::Arc::new(
+            decoder_pool::OwnedFrame::new(black_box(data.clone()), 128, false).expect("decode"),
+        );
         black_box(&frame);
         black_box(frame.get().consume().expect("attributes"));
     });
@@ -98,8 +101,9 @@ fn owned_chunked_attribute_consumer(bencher: divan::Bencher, width: usize) {
 fn owned_two_pass_attribute_consumer(bencher: divan::Bencher, width: usize) {
     let data = bytes::Bytes::from(fixture::node_bytes(width));
     bencher.bench_local(|| {
-        let frame =
-            decoder_pool::OwnedFrame::new(black_box(data.clone()), 0, true).expect("decode");
+        let frame = std::sync::Arc::new(
+            decoder_pool::OwnedFrame::new(black_box(data.clone()), 0, true).expect("decode"),
+        );
         black_box(&frame);
         black_box(frame.get().consume().expect("attributes"));
     });
