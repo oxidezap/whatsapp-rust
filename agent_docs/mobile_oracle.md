@@ -41,7 +41,8 @@ The capture qualification path is:
    infer completeness from one exported APK.
 4. Compute file hashes/sizes, fill the lock with acquisition conditions and
    signer evidence, then run the local verifier. Keep raw artifacts in approved
-   local/private storage; do not upload the APK or decompiled code by default.
+   local/private storage; do not publish the APK or decompiled code in public
+   repositories or releases by default.
 
 No APK has been acquired or executed to validate this process in this workstream.
 The Web lookup confirmed the official download page and APK link, but the Web

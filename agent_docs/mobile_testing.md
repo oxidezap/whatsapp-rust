@@ -130,3 +130,16 @@ hashes prevent accidental mixing; they do not authenticate untrusted storage or
 detect rollback to an older database. Semantic response inputs must come from a
 qualified parser. Local `confirm_persisted` records the host's durability
 confirmation; it does not perform or independently prove a database write.
+
+Portable endpoint hosts use plain ASCII names with letters, digits, dots,
+hyphens and underscores, or IPv4/IPv6 literals. URI-only percent escapes,
+sub-delimiters and IPvFuture literals are rejected before adapter selection.
+DNS resolution and label policy remain the adapter's responsibility. The native
+adapter normalizes bracketed IPv6 for its dialer; the external consumer tests
+check that portable endpoint spellings are accepted consistently.
+
+The native TCP read driver owns a retirement guard before its first poll.
+Runtime shutdown retires the stream even when the driver never ran. A writer
+that is already in progress owns its half until it completes or is cancelled;
+its guard releases that half on shutdown. Tests cover a write future retained
+by another executor, including immediate rejection of new sends after shutdown.
