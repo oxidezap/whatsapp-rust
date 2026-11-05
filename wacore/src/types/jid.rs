@@ -205,11 +205,9 @@ impl JidExt for Jid {
     }
 
     fn to_protocol_address(&self) -> ProtocolAddress {
-        // Written straight into the address: the intermediate `String` this
-        // used to build was allocated only to be copied in and dropped.
-        let mut addr = make_reusable_protocol_address();
-        self.reset_protocol_address(&mut addr);
-        addr
+        ProtocolAddress::from_writer(SIGNAL_DEVICE_ID, |name| {
+            push_signal_address_to(self, name);
+        })
     }
 
     fn to_protocol_address_string(&self) -> String {
@@ -220,7 +218,7 @@ impl JidExt for Jid {
 
     fn reset_protocol_address(&self, addr: &mut ProtocolAddress) {
         let jid = self;
-        addr.reset_with(|name| write_signal_address_to(jid, name));
+        addr.reset_with(|name| push_signal_address_to(jid, name));
     }
 }
 

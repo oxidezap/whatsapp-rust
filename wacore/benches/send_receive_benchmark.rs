@@ -26,13 +26,12 @@ use wacore_binary::jid::Jid;
 use wacore_binary::marshal::marshal;
 use wacore_binary::node::{Node, NodeContent};
 use wacore_libsignal::protocol::{
-    CiphertextMessage, Direction, GenericSignedPreKey, IdentityChange, IdentityKey,
-    IdentityKeyPair, IdentityKeyStore, KeyPair, PreKeyBundle, PreKeyId, PreKeyRecord,
-    PreKeySignalMessage, PreKeyStore, ProtocolAddress, SenderKeyRecord, SenderKeyStore,
-    SessionRecord, SessionStore, SignalMessage, SignedPreKeyId, SignedPreKeyRecord,
-    SignedPreKeyStore, Timestamp, UsePQRatchet, create_sender_key_distribution_message,
-    group_decrypt, message_decrypt, message_encrypt, process_prekey_bundle,
-    process_sender_key_distribution_message,
+    CiphertextMessage, Direction, IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore,
+    KeyPair, PreKeyBundle, PreKeyId, PreKeyRecord, PreKeySignalMessage, PreKeyStore,
+    ProtocolAddress, SenderKeyRecord, SenderKeyStore, SessionRecord, SessionStore, SignalMessage,
+    SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore, Timestamp, UsePQRatchet,
+    create_sender_key_distribution_message, group_decrypt, message_decrypt, message_encrypt,
+    process_prekey_bundle, process_sender_key_distribution_message,
 };
 use wacore_libsignal::store::sender_key_name::SenderKeyName;
 use waproto::whatsapp as wa;
@@ -311,7 +310,8 @@ impl User {
             .calculate_signature(&spk_pair.public_key.serialize(), &mut rng)
             .unwrap();
         let spk_record =
-            SignedPreKeyRecord::new(spk_id, Timestamp::from_epoch_millis(0), &spk_pair, &spk_sig);
+            SignedPreKeyRecord::new(spk_id, Timestamp::from_epoch_millis(0), &spk_pair, &spk_sig)
+                .expect("valid synthetic signed prekey");
 
         let mut prekeys = MemPreKeyStore(DetHashMap::default());
         let mut signed_prekeys = MemSignedPreKeyStore(DetHashMap::default());

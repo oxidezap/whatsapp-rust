@@ -79,6 +79,8 @@ pub enum MediaDecryptionError {
     Decryption(#[source] AesCbcDecryptionError),
     #[error("HMAC initialization failed")]
     Mac(#[source] CryptoError),
+    #[error("HMAC provider failed")]
+    MacProvider(#[source] crate::libsignal::crypto::CryptoProviderError),
     #[error("{0}")]
     Other(#[from] anyhow::Error),
 }
@@ -1097,6 +1099,63 @@ impl DownloadUtils {
         media_key: &[u8],
         media_type: MediaType,
     ) -> std::result::Result<(), MediaDecryptionError> {
+        Self::verify_and_decrypt_using(
+            encrypted_payload,
+            media_key,
+            media_type,
+            |key, iv, ciphertext| Ok(hmac_sha256_two_part(key, iv, ciphertext)),
+            |buffer, key, iv| aes_256_cbc_decrypt_in_place(buffer, key, iv),
+        )
+    }
+
+    /// Authenticate media and decrypt through the caller's symmetric backend.
+    /// CBC decryption is called only after the media MAC authenticates and the
+    /// ciphertext has a valid block length.
+    pub fn verify_and_decrypt_in_place_with_provider(
+        provider: &dyn crate::libsignal::crypto::SymmetricCryptoProvider,
+        encrypted_payload: &mut Vec<u8>,
+        media_key: &[u8],
+        media_type: MediaType,
+    ) -> std::result::Result<(), MediaDecryptionError> {
+        Self::verify_and_decrypt_using(
+            encrypted_payload,
+            media_key,
+            media_type,
+            |key, iv, ciphertext| provider.hmac_sha256(key, &[iv, ciphertext]),
+            |buffer, key, iv| {
+                let ciphertext_len = buffer.len();
+                provider
+                    .aes_256_cbc_decrypt_in_place(key, iv, buffer)
+                    .map_err(AesCbcDecryptionError::Provider)?;
+                if !ciphertext_len
+                    .checked_sub(buffer.len())
+                    .is_some_and(|padding| (1..=AES_BLOCK_SIZE).contains(&padding))
+                {
+                    return Err(AesCbcDecryptionError::Provider(
+                        crate::libsignal::crypto::CryptoProviderError::BackendFailed,
+                    ));
+                }
+                Ok(())
+            },
+        )
+    }
+
+    fn verify_and_decrypt_using(
+        encrypted_payload: &mut Vec<u8>,
+        media_key: &[u8],
+        media_type: MediaType,
+        mac: impl FnOnce(
+            &[u8; 32],
+            &[u8; 16],
+            &[u8],
+        )
+            -> std::result::Result<[u8; 32], crate::libsignal::crypto::CryptoProviderError>,
+        decrypt: impl FnOnce(
+            &mut Vec<u8>,
+            &[u8; 32],
+            &[u8; 16],
+        ) -> std::result::Result<(), AesCbcDecryptionError>,
+    ) -> std::result::Result<(), MediaDecryptionError> {
         if encrypted_payload.len() <= MEDIA_MAC_SIZE {
             return Err(MediaDecryptionError::PayloadTooShort);
         }
@@ -1107,8 +1166,8 @@ impl DownloadUtils {
             .map_err(|_| MediaDecryptionError::PayloadTooShort)?;
         let (iv, cipher_key, mac_key) = Self::get_media_keys(media_key, media_type)?;
 
-        let computed_mac_full =
-            hmac_sha256_two_part(&mac_key, &iv, &encrypted_payload[..ciphertext_len]);
+        let computed_mac_full = mac(&mac_key, &iv, &encrypted_payload[..ciphertext_len])
+            .map_err(MediaDecryptionError::MacProvider)?;
         if subtle::ConstantTimeEq::ct_eq(&computed_mac_full[..MEDIA_MAC_SIZE], &received_mac)
             .unwrap_u8()
             == 0
@@ -1122,8 +1181,7 @@ impl DownloadUtils {
         }
 
         encrypted_payload.truncate(ciphertext_len);
-        aes_256_cbc_decrypt_in_place(encrypted_payload, &cipher_key, &iv)
-            .map_err(MediaDecryptionError::Decryption)
+        decrypt(encrypted_payload, &cipher_key, &iv).map_err(MediaDecryptionError::Decryption)
     }
 
     /// Authenticate and decrypt in the same allocation, then verify the declared
@@ -1137,9 +1195,43 @@ impl DownloadUtils {
         expected_enc_sha256: Option<&[u8]>,
         expected_sha256: Option<&[u8]>,
     ) -> std::result::Result<(), MediaDecryptionError> {
+        Self::verify_and_decrypt_with_hashes_using(
+            encrypted_payload,
+            expected_enc_sha256,
+            expected_sha256,
+            |payload| Self::verify_and_decrypt_in_place(payload, media_key, media_type),
+        )
+    }
+
+    pub fn verify_and_decrypt_in_place_with_hashes_and_provider(
+        provider: &dyn crate::libsignal::crypto::SymmetricCryptoProvider,
+        encrypted_payload: &mut Vec<u8>,
+        media_key: &[u8],
+        media_type: MediaType,
+        expected_enc_sha256: Option<&[u8]>,
+        expected_sha256: Option<&[u8]>,
+    ) -> std::result::Result<(), MediaDecryptionError> {
+        Self::verify_and_decrypt_with_hashes_using(
+            encrypted_payload,
+            expected_enc_sha256,
+            expected_sha256,
+            |payload| {
+                Self::verify_and_decrypt_in_place_with_provider(
+                    provider, payload, media_key, media_type,
+                )
+            },
+        )
+    }
+
+    fn verify_and_decrypt_with_hashes_using(
+        encrypted_payload: &mut Vec<u8>,
+        expected_enc_sha256: Option<&[u8]>,
+        expected_sha256: Option<&[u8]>,
+        decrypt: impl FnOnce(&mut Vec<u8>) -> std::result::Result<(), MediaDecryptionError>,
+    ) -> std::result::Result<(), MediaDecryptionError> {
         use sha2::Digest;
         let encrypted_digest = expected_enc_sha256.map(|_| Sha256::digest(&*encrypted_payload));
-        Self::verify_and_decrypt_in_place(encrypted_payload, media_key, media_type)?;
+        decrypt(encrypted_payload)?;
         if let Some((actual, expected)) = encrypted_digest.zip(expected_enc_sha256)
             && actual.as_slice() != expected
         {
@@ -2490,6 +2582,41 @@ mod tests {
         assert!(matches!(cbc, AesCbcDecryptionError::BadKeyOrIv));
     }
 
+    #[test]
+    fn media_mac_provider_failure_is_named_without_running_cbc_or_mutating_input() {
+        use crate::libsignal::crypto::{CryptoProviderError, SymmetricCryptoProvider};
+        struct Unavailable;
+        impl SymmetricCryptoProvider for Unavailable {
+            fn hmac_sha256(&self, _: &[u8], _: &[&[u8]]) -> Result<[u8; 32], CryptoProviderError> {
+                Err(CryptoProviderError::BackendFailed)
+            }
+            fn aes_256_cbc_decrypt_in_place(
+                &self,
+                _: &[u8; 32],
+                _: &[u8; 16],
+                _: &mut Vec<u8>,
+            ) -> Result<(), CryptoProviderError> {
+                panic!("CBC must not run after MAC provider failure")
+            }
+        }
+        let mut input = vec![7; 26];
+        let error = DownloadUtils::verify_and_decrypt_in_place_with_provider(
+            &Unavailable,
+            &mut input,
+            &[3; 32],
+            MediaType::Image,
+        )
+        .unwrap_err();
+        assert_eq!(input, vec![7; 26]);
+        assert!(error.to_string().contains("MAC"));
+        assert!(!error.to_string().contains("AES-CBC"));
+        assert!(matches!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<CryptoProviderError>(),
+            Some(CryptoProviderError::BackendFailed)
+        ));
+    }
     #[test]
     fn media_decryption_mac_preserves_crypto_error_source() {
         let inner = CryptoError::UnknownAlgorithm("MAC", "BogusAlg".into());

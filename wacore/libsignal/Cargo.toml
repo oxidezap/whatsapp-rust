@@ -1,52 +1,59 @@
 [package]
 name = "wacore-libsignal"
 version = "0.7.0"
-edition = "2024"
-rust-version.workspace = true
+edition.workspace = true
 authors = ["João Lucas <jlucaso@hotmail.com>"]
 license = "MIT"
+rust-version.workspace = true
 repository = "https://github.com/oxidezap/whatsapp-rust"
-description = "Signal Protocol implementation for the WhatsApp platform"
+description = "Storage-compatible Signal protocol with a sans-I/O state engine"
 
 [features]
-# Typed interop with the decoded libsignal SessionRecord v1 model. Off by
-# default so native consumers carry no migration surface.
 legacy-session-interop = []
+bench-internals = []
 
 [dependencies]
-aes = { workspace = true }
-async-lock = { workspace = true }
-async-trait = { workspace = true }
-buffa = { workspace = true }
-bytes = { workspace = true }
-cbc = { workspace = true }
+arrayvec = { version = "0.7.8", default-features = false }
+aes.workspace = true
+aes-gcm.workspace = true
+cbc = { workspace = true, features = ["block-padding"] }
+ctr.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+hkdf.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
+curve25519-dalek = { version = "5.0.0", features = ["zeroize"] }
+rand.workspace = true
+serde.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+async-lock.workspace = true
+portable-atomic.workspace = true
 chrono = { workspace = true, features = ["now"] }
-ctr = { workspace = true }
-curve25519-dalek = "5.0.0"
-ghash = "0.6.0"
-hex = { workspace = true }
-hkdf = { workspace = true }
-hmac = { workspace = true }
-log = { workspace = true }
-portable-atomic = { workspace = true }
-rand = { workspace = true }
-serde = { workspace = true, features = ["alloc"] }
-sha1 = { workspace = true }
-sha2 = { workspace = true }
-subtle = { workspace = true }
-thiserror = { workspace = true }
-wacore-derive = { workspace = true }
-wacore-binary = { workspace = true }
-waproto = { workspace = true }
-x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
+hex.workspace = true
+itoa.workspace = true
+wacore-binary.workspace = true
+wacore-derive.workspace = true
+waproto.workspace = true
+buffa.workspace = true
+log.workspace = true
 
 [dev-dependencies]
-divan = { workspace = true }
+syn = { version = "3.0", features = ["full", "visit"] }
+ciborium = "0.2"
+divan.workspace = true
 futures = { workspace = true, features = ["executor"] }
-
-[[bench]]
-name = "libsignal_benchmark"
-harness = false
+serde_json.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "rewrite_benchmark"
+harness = false
+
+[[bench]]
+name = "classic_benchmark"
+harness = false

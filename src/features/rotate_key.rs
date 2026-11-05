@@ -215,7 +215,8 @@ impl Client {
                         ))
                     })?;
                 let record =
-                    new_signed_pre_key_record(new_id, &kp, signature, self.runtime.wall_time_utc());
+                    new_signed_pre_key_record(new_id, &kp, signature, self.runtime.wall_time_utc())
+                        .map_err(SignalMaintenanceError::Signal)?;
                 backend
                     .store_signed_prekey(
                         new_id,
@@ -236,7 +237,8 @@ impl Client {
             &snapshot.signed_pre_key,
             snapshot.signed_pre_key_signature,
             self.runtime.wall_time_utc(),
-        );
+        )
+        .map_err(SignalMaintenanceError::Signal)?;
         backend
             .store_signed_prekey(
                 old_id,

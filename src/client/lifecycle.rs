@@ -3997,8 +3997,7 @@ mod tests {
                         .unwrap();
                     let identity = KeyPair::generate(&mut rand::rng());
                     let ephemeral = KeyPair::generate(&mut rand::rng());
-                    let identity_pub: [u8; 32] =
-                        identity.public_key.public_key_bytes().try_into().unwrap();
+                    let identity_pub: [u8; 32] = *identity.public_key.public_key_bytes();
                     let mut noise =
                         wacore_noise::NoiseHandshake::new(NOISE_PATTERN_XX, &WA_CONN_HEADER)?;
                     noise.authenticate(&peer);

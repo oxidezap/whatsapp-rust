@@ -1012,6 +1012,12 @@ impl InstrumentedRuntime {
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait::async_trait]
 impl Runtime for InstrumentedRuntime {
+    fn crypto_provider(
+        &self,
+    ) -> Option<Arc<dyn crate::libsignal::crypto::SymmetricCryptoProvider>> {
+        self.inner.crypto_provider()
+    }
+
     #[cfg(feature = "instance-clock")]
     fn clock(&self) -> Option<&Arc<dyn crate::time::Clock>> {
         self.inner.clock()
@@ -1065,6 +1071,12 @@ impl Runtime for InstrumentedRuntime {
 #[cfg(target_arch = "wasm32")]
 #[async_trait::async_trait(?Send)]
 impl Runtime for InstrumentedRuntime {
+    fn crypto_provider(
+        &self,
+    ) -> Option<Arc<dyn crate::libsignal::crypto::SymmetricCryptoProvider>> {
+        self.inner.crypto_provider()
+    }
+
     #[cfg(feature = "instance-clock")]
     fn clock(&self) -> Option<&Arc<dyn crate::time::Clock>> {
         self.inner.clock()

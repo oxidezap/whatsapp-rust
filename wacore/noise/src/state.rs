@@ -2,7 +2,8 @@ use crate::error::{NoiseError, Result};
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use wacore_libsignal::crypto::{
-    GcmInPlaceBuffer, TransportAead, aes_256_gcm_decrypt, aes_256_gcm_encrypt, transport_aead,
+    GcmInPlaceBuffer, RustCryptoProvider, TransportAead, TransportAeadFactory, aes_256_gcm_decrypt,
+    aes_256_gcm_encrypt,
 };
 
 /// Buffer kinds accepted by [`NoiseCipher::decrypt_in_place_with_counter`].
@@ -24,18 +25,22 @@ const TAG_LEN: usize = 16;
 /// A cipher wrapper that encapsulates AES-256-GCM encryption/decryption
 /// with counter-based IV generation.
 pub struct NoiseCipher {
-    /// Connection-lifetime AEAD from the provider hook: the transport key is
-    /// fixed, so the default RustCrypto path precomputes the AES key schedule
-    /// and the GHASH subkey once instead of on every frame; custom providers
-    /// keep observing transport crypto through the trait default.
+    /// Owned connection-lifetime AEAD. The default provider prepares its AES
+    /// key schedule once; an explicitly supplied provider owns its own context.
     aead: Box<dyn TransportAead>,
 }
 
 impl NoiseCipher {
     /// Creates a new cipher from a 32-byte key.
     pub fn new(key: &[u8; 32]) -> Result<Self> {
+        Self::with_provider(key, &RustCryptoProvider)
+    }
+
+    /// Prepare a cipher with a caller-selected provider, without process-wide
+    /// mutable configuration. The returned AEAD owns its key material.
+    pub fn with_provider(key: &[u8; 32], provider: &dyn TransportAeadFactory) -> Result<Self> {
         Ok(Self {
-            aead: transport_aead(key).map_err(NoiseError::Encrypt)?,
+            aead: provider.transport_aead(key).map_err(NoiseError::Encrypt)?,
         })
     }
 
@@ -48,6 +53,11 @@ impl NoiseCipher {
         self.aead
             .encrypt_in_place(&iv, b"", &mut out)
             .map_err(NoiseError::Encrypt)?;
+        if out.len() != plaintext.len() + TAG_LEN {
+            return Err(NoiseError::Encrypt(
+                wacore_libsignal::crypto::CryptoProviderError::BackendFailed,
+            ));
+        }
         Ok(out)
     }
 

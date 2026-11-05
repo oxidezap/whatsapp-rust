@@ -2691,29 +2691,7 @@ mod tests {
     /// so we can tell which side of a migration won by parsing the surviving
     /// session, not by raw-byte comparison.
     fn tagged_session_blob(remote_regid: u32) -> Vec<u8> {
-        use wacore::libsignal::protocol::{SessionRecord, SessionState};
-        use waproto::whatsapp::SessionStructure;
-
-        let state = SessionState::from_session_structure({
-            let mut proto = SessionStructure::default();
-            proto.session_version = Some(3);
-            proto.local_identity_public = None;
-            proto.remote_identity_public = None;
-            proto.root_key = None;
-            proto.previous_counter = Some(0);
-            proto.sender_chain = buffa::MessageField::none();
-            proto.receiver_chains = vec![];
-            proto.pending_pre_key = buffa::MessageField::none();
-            proto.remote_registration_id = Some(remote_regid);
-            proto.local_registration_id = Some(0);
-            proto.alice_base_key = Some(vec![]);
-            proto.needs_refresh = None;
-            proto.pending_key_exchange = buffa::MessageField::none();
-            proto
-        });
-        SessionRecord::new(state)
-            .serialize()
-            .expect("serialize session record")
+        crate::test_utils::synthetic_serialized_session(remote_regid, None)
     }
 
     /// Both PN and LID slots hold a session for the same peer; the

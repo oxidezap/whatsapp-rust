@@ -58,6 +58,10 @@ jobs:
     env:
       LANE: ${{ matrix.lane }}
       TOOLCHAIN: ${{ matrix.toolchain }}
+      # Candidate profiles and external package consumers compile separate graphs.
+      # Keep their generated protocol artifacts within hosted runner disk limits.
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -107,6 +111,12 @@ jobs:
       - name: Validate candidate or frozen contracts
         if: ${{ !inputs.release-check }}
         run: target/debug/whatsapp-xtask ci compatibility --lane "$LANE" --toolchain "$TOOLCHAIN"
+      - name: Reclaim completed consumer build artifacts
+        # Package consumers use an independent temporary target directory.
+        # The completed checkout consumers are not reused by the remaining checks.
+        run: |
+          rm -rf -- target/consumers
+          df -h .
       - name: Qualify distributed artifacts outside the checkout
         run: target/debug/whatsapp-xtask ci package-consumers --lane "$LANE" --toolchain "$TOOLCHAIN"
       - name: Prove SDK and host breaks fail downstream compilation

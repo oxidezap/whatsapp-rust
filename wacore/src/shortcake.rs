@@ -540,11 +540,7 @@ mod tests {
         // companion: ephemeral identity + commitment + prologue + handoff proof
         let companion_kp = ShortcakeUtils::generate_companion_ephemeral_keypair();
         let companion_nonce = ShortcakeUtils::generate_companion_nonce();
-        let companion_pub: [u8; 32] = companion_kp
-            .public_key
-            .public_key_bytes()
-            .try_into()
-            .unwrap();
+        let companion_pub = *companion_kp.public_key.public_key_bytes();
         let identity = ShortcakeUtils::build_companion_ephemeral_identity(
             &companion_pub,
             device_type,
@@ -558,7 +554,7 @@ mod tests {
 
         // primary: its own ephemeral identity, sent back as <primary_ephemeral_identity>
         let primary_kp = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
-        let primary_pub: [u8; 32] = primary_kp.public_key.public_key_bytes().try_into().unwrap();
+        let primary_pub: [u8; 32] = *primary_kp.public_key.public_key_bytes();
         let primary_nonce = [0x33u8; 32];
         let primary_wire = {
             let mut proto = wa::PrimaryEphemeralIdentity::default();

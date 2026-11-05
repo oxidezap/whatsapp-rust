@@ -23,6 +23,12 @@ impl ClockedRuntime {
 }
 
 impl Runtime for ClockedRuntime {
+    fn crypto_provider(
+        &self,
+    ) -> Option<Arc<dyn crate::libsignal::crypto::SymmetricCryptoProvider>> {
+        self.inner.crypto_provider()
+    }
+
     fn clock(&self) -> Option<&Arc<dyn Clock>> {
         Some(&self.clock)
     }

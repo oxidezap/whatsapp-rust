@@ -85,9 +85,38 @@ async fn decrypt_session_message(
     signal_address: &wacore::libsignal::protocol::ProtocolAddress,
     adapter: &mut crate::store::signal_adapter::SignalProtocolStoreAdapter,
     rng: &mut LazyStdRng,
+    crypto_provider: Option<Arc<dyn wacore::libsignal::crypto::SymmetricCryptoProvider>>,
 ) -> Result<DecryptionResult, SignalProtocolError> {
-    match message {
-        ParsedSessionMessage::Retained(message) => {
+    match (message, crypto_provider.as_deref()) {
+        (ParsedSessionMessage::Retained(message), Some(provider)) => {
+            wacore::libsignal::protocol::message_decrypt_with_provider(
+                provider,
+                message,
+                signal_address,
+                &mut adapter.session_store,
+                &mut adapter.identity_store,
+                &mut adapter.pre_key_store,
+                &adapter.signed_pre_key_store,
+                rng,
+                UsePQRatchet::No,
+            )
+            .await
+        }
+        (ParsedSessionMessage::Consumable(message), Some(provider)) => {
+            wacore::libsignal::protocol::message_decrypt_owned_with_provider(
+                provider,
+                message,
+                signal_address,
+                &mut adapter.session_store,
+                &mut adapter.identity_store,
+                &mut adapter.pre_key_store,
+                &adapter.signed_pre_key_store,
+                rng,
+                UsePQRatchet::No,
+            )
+            .await
+        }
+        (ParsedSessionMessage::Retained(message), None) => {
             message_decrypt(
                 message,
                 signal_address,
@@ -100,7 +129,7 @@ async fn decrypt_session_message(
             )
             .await
         }
-        ParsedSessionMessage::Consumable(message) => {
+        (ParsedSessionMessage::Consumable(message), None) => {
             message_decrypt_owned(
                 message,
                 signal_address,
@@ -650,11 +679,7 @@ impl Client {
                 let Ok(message) = PreKeySignalMessage::try_from(payload.ciphertext.clone()) else {
                     continue;
                 };
-                let Ok(identity) =
-                    <[u8; 32]>::try_from(message.identity_key().public_key().public_key_bytes())
-                else {
-                    return;
-                };
+                let identity = *message.identity_key().public_key().public_key_bytes();
                 drop(message);
                 if self
                     .validate_incoming_companion_identity(
@@ -1273,6 +1298,7 @@ impl Client {
                     &signal_address,
                     &mut adapter,
                     &mut rng,
+                    self.runtime.crypto_provider(),
                 );
                 #[cfg(feature = "tracing")]
                 let decrypt_res = tracing::Instrument::instrument(
@@ -1301,16 +1327,8 @@ impl Client {
                         .live_retention
                         .pause_after_stage()
                         .await;
-                    // Buffer the prekey this pkmsg consumed: message_decrypt promoted
-                    // the session into the (volatile) cache but no longer deletes the
-                    // prekey itself. The post-loop flush deletes it only once that
-                    // session is durable, keeping a crash from orphaning the prekey.
-                    if let Some(prekey_id) = decrypted.consumed_prekey_id {
-                        adapter
-                            .pre_key_store
-                            .buffer_consumed_prekey(prekey_id, &signal_address)
-                            .await;
-                    }
+                    // The checkout commit already coupled consumed-prekey deletion
+                    // intent to this session. Cancellation after staging cannot lose it.
                     if decrypted.identity_change.is_changed() && !local_identity_reacted {
                         local_identity_reacted = true;
                         self.react_to_local_identity_change(
@@ -1420,6 +1438,7 @@ impl Client {
                             &signal_address,
                             &mut adapter,
                             &mut rng,
+                            self.runtime.crypto_provider(),
                         )
                         .await;
 
@@ -1437,12 +1456,6 @@ impl Client {
                                     ObservedId::new(info.id.as_str()),
                                     address.observe()
                                 );
-                                if let Some(prekey_id) = decrypted.consumed_prekey_id {
-                                    adapter
-                                        .pre_key_store
-                                        .buffer_consumed_prekey(prekey_id, &signal_address)
-                                        .await;
-                                }
                                 // Normally NewOrUnchanged here (the untrusted
                                 // identity was deleted+flushed before the retry),
                                 // but mirror the main-decode gate so a concurrent
@@ -1522,7 +1535,10 @@ impl Client {
                                         MigrationDecryptResult::Duplicate => {
                                             outcome.duplicate = true;
                                         }
-                                        MigrationDecryptResult::NotDecrypted(terminal) => {
+                                        MigrationDecryptResult::NotDecrypted(
+                                            terminal,
+                                            retry_reason,
+                                        ) => {
                                             log::debug!(
                                                 "[msg:{}] InvalidPreKeyId after identity change for {}. \
                                                  Sending retry receipt with fresh keys.",
@@ -1541,7 +1557,8 @@ impl Client {
                                             outcome.undecryptable |= self
                                                 .handle_decrypt_failure(
                                                     info,
-                                                    RetryReason::InvalidKeyId,
+                                                    retry_reason
+                                                        .unwrap_or(RetryReason::InvalidKeyId),
                                                     decrypt_fail_mode,
                                                     ack_recipient,
                                                 )
@@ -1583,7 +1600,8 @@ impl Client {
                                     outcome.undecryptable |= self
                                         .handle_decrypt_failure(
                                             info,
-                                            RetryReason::InvalidKey,
+                                            local_crypto_retry_reason(&retry_err)
+                                                .unwrap_or(RetryReason::InvalidKey),
                                             decrypt_fail_mode,
                                             ack_recipient,
                                         )
@@ -1640,7 +1658,7 @@ impl Client {
                             ));
                             std::future::poll_fn(|cx| poll_inbound_phase(future.as_mut(), cx)).await
                         };
-                        let terminal = match migration {
+                        let (terminal, retry_reason) = match migration {
                             MigrationDecryptResult::Decrypted => {
                                 outcome.decrypted = true;
                                 continue;
@@ -1649,7 +1667,7 @@ impl Client {
                                 outcome.duplicate = true;
                                 continue;
                             }
-                            MigrationDecryptResult::NotDecrypted(reason) => reason,
+                            MigrationDecryptResult::NotDecrypted(reason, retry) => (reason, retry),
                         };
 
                         debug!(
@@ -1668,7 +1686,7 @@ impl Client {
                         outcome.undecryptable |= self
                             .handle_decrypt_failure(
                                 info,
-                                RetryReason::NoSession,
+                                retry_reason.unwrap_or(RetryReason::NoSession),
                                 decrypt_fail_mode,
                                 ack_recipient,
                             )
@@ -1705,7 +1723,7 @@ impl Client {
                             ));
                             std::future::poll_fn(|cx| poll_inbound_phase(future.as_mut(), cx)).await
                         };
-                        let terminal = match migration {
+                        let (terminal, retry_reason) = match migration {
                             MigrationDecryptResult::Decrypted => {
                                 outcome.decrypted = true;
                                 continue;
@@ -1714,7 +1732,7 @@ impl Client {
                                 outcome.duplicate = true;
                                 continue;
                             }
-                            MigrationDecryptResult::NotDecrypted(reason) => reason,
+                            MigrationDecryptResult::NotDecrypted(reason, retry) => (reason, retry),
                         };
 
                         // WAWebMsgProcessingDecryptionHandler classifies both as
@@ -1750,7 +1768,12 @@ impl Client {
                             terminal.unwrap_or(failure),
                         );
                         outcome.undecryptable |= self
-                            .handle_decrypt_failure(info, reason, decrypt_fail_mode, ack_recipient)
+                            .handle_decrypt_failure(
+                                info,
+                                retry_reason.unwrap_or(reason),
+                                decrypt_fail_mode,
+                                ack_recipient,
+                            )
                             .await;
                         continue;
                     } else if matches!(e, SignalProtocolError::InvalidPreKeyId) {
@@ -1783,7 +1806,7 @@ impl Client {
                             ));
                             std::future::poll_fn(|cx| poll_inbound_phase(future.as_mut(), cx)).await
                         };
-                        let terminal = match migration {
+                        let (terminal, retry_reason) = match migration {
                             MigrationDecryptResult::Decrypted => {
                                 outcome.decrypted = true;
                                 continue;
@@ -1792,7 +1815,7 @@ impl Client {
                                 outcome.duplicate = true;
                                 continue;
                             }
-                            MigrationDecryptResult::NotDecrypted(reason) => reason,
+                            MigrationDecryptResult::NotDecrypted(reason, retry) => (reason, retry),
                         };
 
                         log::debug!(
@@ -1815,7 +1838,7 @@ impl Client {
                         outcome.undecryptable |= self
                             .handle_decrypt_failure(
                                 info,
-                                RetryReason::InvalidKeyId,
+                                retry_reason.unwrap_or(RetryReason::InvalidKeyId),
                                 decrypt_fail_mode,
                                 ack_recipient,
                             )
@@ -1847,6 +1870,20 @@ impl Client {
                                 decrypt_fail_mode,
                                 ack_recipient,
                             )
+                            .await;
+                        continue;
+                    } else if let Some(reason) = local_crypto_retry_reason(&e) {
+                        // Our backend did not judge the ciphertext. Keep the
+                        // same packet recoverable after a transient outage.
+                        outcome.had_failure = true;
+                        self.report_enc_decrypt_failure(
+                            info,
+                            enc_index,
+                            enc_type,
+                            EncDecryptFailureReason::LocalCryptoFailure,
+                        );
+                        outcome.undecryptable |= self
+                            .handle_decrypt_failure(info, reason, decrypt_fail_mode, ack_recipient)
                             .await;
                         continue;
                     } else {
@@ -1940,12 +1977,22 @@ impl Client {
                 let _chain_guard = chain_lock.lock().await;
                 // A refcount bump: the skmsg stays a slice of the frame buffer
                 // through parsing rather than being copied per message.
-                group_decrypt_shared(
-                    payload.ciphertext.clone(),
-                    &mut adapter.sender_key_store,
-                    &sender_key_name,
-                )
-                .await
+                if let Some(provider) = self.runtime.crypto_provider() {
+                    wacore::libsignal::protocol::group_decrypt_shared_with_provider(
+                        &*provider,
+                        payload.ciphertext.clone(),
+                        &mut adapter.sender_key_store,
+                        &sender_key_name,
+                    )
+                    .await
+                } else {
+                    group_decrypt_shared(
+                        payload.ciphertext.clone(),
+                        &mut adapter.sender_key_store,
+                        &sender_key_name,
+                    )
+                    .await
+                }
             };
 
             match decrypt_result {
@@ -2672,11 +2719,11 @@ impl Client {
         stanza_origin: raw_pending::StanzaOrigin,
     ) -> MigrationDecryptResult {
         if !parsed_message.is_available() || !sender_jid.is_lid() {
-            return MigrationDecryptResult::NotDecrypted(None);
+            return MigrationDecryptResult::NotDecrypted(None, None);
         }
 
         let Some(pn) = self.lid_pn_cache.get_phone_number(&sender_jid.user).await else {
-            return MigrationDecryptResult::NotDecrypted(None);
+            return MigrationDecryptResult::NotDecrypted(None, None);
         };
 
         // Release the address lock so the migration loop can acquire it for
@@ -2700,10 +2747,18 @@ impl Client {
                 ObservedId::new(info.id.as_str()),
                 info.source.sender.observe()
             );
-            return MigrationDecryptResult::NotDecrypted(None);
+            return MigrationDecryptResult::NotDecrypted(None, None);
         }
 
-        match decrypt_session_message(parsed_message, signal_address, adapter, rng).await {
+        match decrypt_session_message(
+            parsed_message,
+            signal_address,
+            adapter,
+            rng,
+            self.runtime.crypto_provider(),
+        )
+        .await
+        {
             // PN→LID migration re-addresses an existing peer; the LID address gets
             // the identity for the first time (NewOrUnchanged), so no local
             // identity-change reaction is warranted here.
@@ -2720,12 +2775,6 @@ impl Client {
                     ObservedId::new(info.id.as_str()),
                     info.source.sender.observe()
                 );
-                if let Some(prekey_id) = decrypted.consumed_prekey_id {
-                    adapter
-                        .pre_key_store
-                        .buffer_consumed_prekey(prekey_id, signal_address)
-                        .await;
-                }
                 // Buffer for post-lock handling, keeping the same ordering as the
                 // batch's main path.
                 defer_plaintext(
@@ -2752,7 +2801,10 @@ impl Client {
                 );
                 // A session was found and moved; whatever failed now is the
                 // terminal cause, not the error that opened the migration.
-                MigrationDecryptResult::NotDecrypted(Some(session_error_reason(&retry_err)))
+                MigrationDecryptResult::NotDecrypted(
+                    Some(session_error_reason(&retry_err)),
+                    local_crypto_retry_reason(&retry_err),
+                )
             }
         }
     }
@@ -2918,7 +2970,7 @@ mod adv_tests {
         let device = wacore::libsignal::protocol::KeyPair::generate(&mut rand::make_rng::<
             rand::rngs::StdRng,
         >());
-        let identity: [u8; 32] = device.public_key.public_key_bytes().try_into().unwrap();
+        let identity: [u8; 32] = *device.public_key.public_key_bytes();
         assert!(
             client
                 .validate_incoming_companion_identity(&sender, None, &identity)
