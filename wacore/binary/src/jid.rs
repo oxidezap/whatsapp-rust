@@ -522,6 +522,16 @@ fn identity_agent(server: Server, agent: u8) -> u8 {
     if server.renders_agent() { agent } else { 0 }
 }
 
+/// Fixed-width identity metadata avoids four separate hasher writes. Disjoint
+/// bit ranges preserve every field that equality observes, including integrator.
+#[inline]
+fn identity_word(server: Server, agent: u8, device: u16, integrator: u16) -> u64 {
+    (server as u8 as u64)
+        | (device as u64) << 8
+        | (integrator as u64) << 24
+        | (identity_agent(server, agent) as u64) << 40
+}
+
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Default)]
 pub struct Jid {
@@ -919,10 +929,12 @@ impl std::hash::Hash for Jid {
     #[inline]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.user.hash(state);
-        self.server.hash(state);
-        self.device.hash(state);
-        self.integrator.hash(state);
-        identity_agent(self.server, self.agent).hash(state);
+        state.write_u64(identity_word(
+            self.server,
+            self.agent,
+            self.device,
+            self.integrator,
+        ));
     }
 }
 
@@ -946,10 +958,12 @@ impl std::hash::Hash for JidRef<'_> {
     #[inline]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.user.as_ref().hash(state);
-        self.server.hash(state);
-        self.device.hash(state);
-        self.integrator.hash(state);
-        identity_agent(self.server, self.agent).hash(state);
+        state.write_u64(identity_word(
+            self.server,
+            self.agent,
+            self.device,
+            self.integrator,
+        ));
     }
 }
 
@@ -1450,6 +1464,69 @@ impl TryFrom<String> for Jid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_identity_preserves_owned_borrowed_hashes_and_field_distinctions() {
+        use std::collections::{HashMap, hash_map::DefaultHasher};
+        use std::hash::{Hash, Hasher};
+
+        fn hash(value: &impl Hash) -> u64 {
+            let mut state = DefaultHasher::new();
+            value.hash(&mut state);
+            state.finish()
+        }
+
+        let servers = [
+            Server::Pn,
+            Server::Lid,
+            Server::Group,
+            Server::Broadcast,
+            Server::Newsletter,
+            Server::Hosted,
+            Server::HostedLid,
+            Server::Messenger,
+            Server::Interop,
+            Server::Bot,
+            Server::Call,
+        ];
+        for user in ["", "5511999990000", "long-user-with-unicode-世界"] {
+            let mut identities = HashMap::new();
+            for server in servers {
+                for agent in [0, 1, 128, u8::MAX] {
+                    for device in [0, 1, 255, 256, 32768, u16::MAX] {
+                        for integrator in [0, 1, 255, 256, 32768, u16::MAX] {
+                            let jid = Jid {
+                                user: user.into(),
+                                server,
+                                agent,
+                                device,
+                                integrator,
+                            };
+                            let borrowed = JidRef {
+                                user: NodeStr::Borrowed(user),
+                                server,
+                                agent,
+                                device,
+                                integrator,
+                            };
+                            assert_eq!(hash(&jid), hash(&borrowed));
+                            let owned_ref = JidRef {
+                                user: NodeStr::Owned(jid.user.clone()),
+                                ..borrowed
+                            };
+                            assert_eq!(hash(&jid), hash(&owned_ref));
+                            let word = identity_word(server, agent, device, integrator);
+                            if let Some(previous) = identities.insert(word, jid.clone()) {
+                                // Collisions are allowed only for agents that equality ignores.
+                                assert_eq!(previous, jid);
+                                assert_eq!(hash(&previous), hash(&jid));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     use std::str::FromStr;
 
     /// The regression the whole change is for, and the one a naive fix does not
