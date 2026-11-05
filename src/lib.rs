@@ -594,8 +594,9 @@ pub mod mobile_registration;
 pub mod mobile_session;
 #[cfg(feature = "mobile-core")]
 pub use mobile_session::{
-    MobileEphemeralKeyProvider, MobileLoginAttempt, MobileLoginOptionsProvider,
-    RegisteredMobileSession, RegistrationLoginPhoneIdMapping, validate_registration_login_profile,
+    MobileAppStatePolicy, MobileEphemeralKeyProvider, MobileLoginAttempt,
+    MobileLoginOptionsProvider, RegisteredMobileSession, RegistrationLoginPhoneIdMapping,
+    validate_registration_login_profile,
 };
 pub mod transport;
 pub mod upload;

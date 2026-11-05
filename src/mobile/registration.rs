@@ -50,11 +50,11 @@ pub struct RegistrationAttestationValue {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum MobileRegistrationError {
-    #[error(transparent)]
+    #[error("{0}")]
     Workflow(#[from] RegistrationError),
-    #[error(transparent)]
+    #[error("{0}")]
     Wire(#[from] RegistrationWireError),
-    #[error(transparent)]
+    #[error("{0}")]
     Store(#[from] StoreError),
     #[error("registration profile, keys or environment differs from the stored binding")]
     BindingMismatch,

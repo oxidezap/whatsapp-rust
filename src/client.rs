@@ -1355,7 +1355,7 @@ impl std::fmt::Display for ConnectStage {
 #[non_exhaustive]
 pub enum ConnectError {
     #[cfg(feature = "mobile-core")]
-    #[error(transparent)]
+    #[error("{0}")]
     PrimaryMobile(#[from] crate::mobile_primary::PrimaryManagementError),
     #[error("persisted session role does not match the configured client")]
     InvalidSessionRole,

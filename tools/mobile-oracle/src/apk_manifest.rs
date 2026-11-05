@@ -146,7 +146,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Manifest> {
         let header = u16le(bytes, p + 2)? as usize;
         let size = u32le(bytes, p + 4)? as usize;
         ensure!(
-            header >= 8 && size >= header && size % 4 == 0 && p + size <= bytes.len(),
+            header >= 8 && size >= header && size.is_multiple_of(4) && p + size <= bytes.len(),
             "invalid XML chunk"
         );
         let b = &bytes[p..p + size];

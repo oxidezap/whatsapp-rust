@@ -21,9 +21,9 @@ const MAX_TRACKED_COMPANIONS: usize = 128;
 pub enum PrimaryManagementError {
     #[error("invalid primary operation: {0}")]
     Invalid(&'static str),
-    #[error(transparent)]
+    #[error("{0}")]
     Crypto(#[from] PrimaryLinkError),
-    #[error(transparent)]
+    #[error("{0}")]
     Store(#[from] crate::store::error::StoreError),
     #[error("primary protocol operation failed")]
     Protocol(#[source] anyhow::Error),

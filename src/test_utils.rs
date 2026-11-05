@@ -893,6 +893,15 @@ async fn primary_client_with_factory(
     backend: Arc<dyn Backend>,
     factory: Arc<dyn crate::transport::TransportFactory>,
 ) -> Arc<Client> {
+    primary_client_with_factory_and_app_state_policy(backend, factory, None).await
+}
+
+#[cfg(all(test, feature = "mobile-core"))]
+async fn primary_client_with_factory_and_app_state_policy(
+    backend: Arc<dyn Backend>,
+    factory: Arc<dyn crate::transport::TransportFactory>,
+    app_state_policy: Option<crate::MobileAppStatePolicy>,
+) -> Arc<Client> {
     use crate::{ClockedRuntime, RegisteredMobileSession};
     use wacore::mobile::{
         MobileAppVersion, MobileDevice, MobileEnvironment, MobileLoginOptions, MobileLoginProfile,
@@ -979,6 +988,10 @@ async fn primary_client_with_factory(
     )
     .unwrap()
     .with_primary_identity_policy(wacore::send::PrimaryDeviceIdentityPolicy::Omit);
+    let session = match app_state_policy {
+        Some(policy) => session.with_app_state_policy(policy),
+        None => session,
+    };
     persistence.flush().await.unwrap();
     Client::builder()
         .with_runtime_arc(runtime)
@@ -1014,11 +1027,23 @@ pub(crate) async fn create_primary_iq_test_client_with_backend(
     Arc<Client>,
     Arc<crate::transport::mock::CapturingMockTransport>,
 ) {
+    create_primary_iq_test_client_with_app_state_policy(backend, None).await
+}
+
+#[cfg(all(test, feature = "mobile-core"))]
+pub(crate) async fn create_primary_iq_test_client_with_app_state_policy(
+    backend: Arc<dyn Backend>,
+    policy: Option<crate::MobileAppStatePolicy>,
+) -> (
+    Arc<Client>,
+    Arc<crate::transport::mock::CapturingMockTransport>,
+) {
     use crate::transport::mock::CapturingMockTransportFactory;
     use wacore::handshake::NoiseCipher;
     let factory = CapturingMockTransportFactory::new();
     let transport = factory.transport();
-    let client = primary_client_with_factory(backend, Arc::new(factory)).await;
+    let client =
+        primary_client_with_factory_and_app_state_policy(backend, Arc::new(factory), policy).await;
     let socket = crate::socket::NoiseSocket::with_observers(
         client.runtime.clone(),
         transport.clone() as Arc<dyn crate::transport::Transport>,

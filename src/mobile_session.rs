@@ -94,10 +94,21 @@ pub fn validate_registration_login_profile(
     Ok(())
 }
 
+/// Source-qualified primary app-state behavior; references disagree on snapshots.
+/// This selects request/state policy, not official APK or server qualification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MobileAppStatePolicy {
+    /// Preserve the shared snapshot/bootstrap exchange used by pinned Cobalt and whalibmob.
+    SnapshotCompatible,
+    /// Pinned Zapo: authoritative local state, namespace 3, no snapshot restoration.
+    AuthoritativeZapo,
+}
+
 /// Immutable connection profile bound to one account, key identity and environment.
 /// No Web defaults, ambient entropy, or endpoint discovery are applied.
 pub struct RegisteredMobileSession {
     media_http_profile: Option<Arc<wacore::download::MobileMediaHttpProfile>>,
+    app_state_policy: Option<MobileAppStatePolicy>,
     environment: MobileEnvironment,
     profile: MobileLoginProfile,
     options: MobileLoginOptions,
@@ -113,6 +124,16 @@ pub struct RegisteredMobileSession {
 }
 
 impl RegisteredMobileSession {
+    /// Select app-state behavior explicitly before primary sync or mutation operations.
+    /// Login alone does not require this profile.
+    pub fn with_app_state_policy(mut self, policy: MobileAppStatePolicy) -> Self {
+        self.app_state_policy = Some(policy);
+        self
+    }
+    pub fn app_state_policy(&self) -> Option<MobileAppStatePolicy> {
+        self.app_state_policy
+    }
+
     /// Select the primary's persisted self-identity signature shape explicitly.
     /// Strict device-signature verification remains the default.
     pub fn with_self_identity_profile(
@@ -238,6 +259,7 @@ impl RegisteredMobileSession {
         let trust = MobileNoiseTrust::new(*environment.trust().noise_root())?;
         Ok(Self {
             media_http_profile: None,
+            app_state_policy: None,
             environment,
             profile,
             options,

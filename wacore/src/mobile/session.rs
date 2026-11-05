@@ -47,9 +47,9 @@ pub enum MobileSessionError {
     InvalidCertificate(&'static str),
     #[error("mobile server certificate has expired")]
     ExpiredCertificate,
-    #[error(transparent)]
+    #[error("{0}")]
     Protobuf(#[from] buffa::DecodeError),
-    #[error(transparent)]
+    #[error("{0}")]
     Noise(#[from] HandshakeError),
 }
 

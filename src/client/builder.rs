@@ -85,7 +85,7 @@ pub enum ClientBuilderError {
     #[error("invalid mobile session configuration: {0}")]
     MobileSessionConfiguration(&'static str),
     #[cfg(feature = "mobile-core")]
-    #[error(transparent)]
+    #[error("{0}")]
     MobileSession(#[from] wacore::mobile::MobileSessionError),
     #[error("missing async runtime")]
     MissingRuntime,

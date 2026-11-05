@@ -34,6 +34,34 @@ static-key checks; a present expiry must remain valid.
 A fresh primary also needs host-generated `PrimaryAppStateKeyInput`
 or an existing validated app-state key in storage before connecting.
 
+App-state operations additionally require an explicit immutable
+`with_app_state_policy(MobileAppStatePolicy::...)` selection; login alone does
+not select it. `SnapshotCompatible` preserves the shared snapshot/bootstrap
+exchange seen in pinned Cobalt and whalibmob. `AuthoritativeZapo` selects Zapo's
+namespace `3`, incremental-only sync and mutation upload from a missing local
+collection. Its outgoing patch sets `deviceIndex` to zero after MAC generation.
+The shared post-send resync and durability behavior remain unchanged; this profile
+does not introduce new server-acknowledgement or local-commit semantics. It ignores server snapshots and rejects destructive snapshot rebuilds
+without clearing the primary's local baseline. Neither choice is inferred from
+Android/iOS or advertised as APK-qualified. A primary never asks device zero to
+recover its own snapshot through a companion-only peer request.
+
+The authoritative profile comes from Zapo
+`bceb268c846763a2cd0b494da830a54aacdc3818`,
+`src/appstate/sync/WaAppStateSyncClient.ts` (`buildCollectionSyncRequest`,
+`buildSyncIqNode`, `processCollectionRound`). The alternate profile reflects
+Cobalt `cb9fbf172507626948fbc3611d0a6fb00bb3a0f1`,
+`sync/exchange/MutationRequestBuilder.java`, and whalibmob
+`8f50db4c586534dc0af4d13b26bdd09ef42660c0`, `lib/Client.js`.
+The unchanged companion guard is also supported by official Web
+`WAWebSyncdRequestBuilderBuild`, inspected through an AST in the verified
+WhatsApp `2.3000.1052559453` bundle `4ab82076eb3225f2b47d11a8321e3b821057b8c2fff2944bb3262436ebb15da4`
+(bytes `952672..961443`) from whatspec `ae3880925bacd23863cc30ec480c9f82bfd869f1`.
+The archive SHA-256 is `2958d99a3d84141fa8479f1f991e06246e68c063ca8f618a8d5d361287387f62`;
+all 676 locked bundles were verified. This Web evidence does not qualify a
+mobile client or server. Tests use synthetic IQs and preserve the existing
+companion behavior.
+
 Media operations require an explicit `MobileMediaHttpProfile`, selected with
 `with_media_http_profile`. Supply its User-Agent, routes and any intended
 Origin. Login itself does not require a media profile. Do not inherit Web
