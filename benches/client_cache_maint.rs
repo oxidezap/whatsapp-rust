@@ -185,6 +185,107 @@ fn cache_insert(bencher: divan::Bencher, n: usize) {
 /// measures one iteration, which is always the first batch.
 type DetState = std::hash::BuildHasherDefault<std::hash::DefaultHasher>;
 
+/// Isolate the atomic retry/PDO update's table work. These are cache
+/// microbenchmarks, not complete retry or PDO consumers. Fixed seeds make
+/// probe/load distributions comparable without changing production hashers.
+/// Each sample owns a fresh fixture so misses remain misses and every hit
+/// starts from the same value. Input setup and destruction are untimed.
+#[divan::bench(args = [0usize, 50, 100], consts = [false, true])]
+fn cache_upsert_mix<const MANAGED: bool>(bencher: divan::Bencher, hit_percent: usize) {
+    bencher
+        .counter(ItemsCount::new(BATCH))
+        .with_inputs(|| {
+            let mut builder = Cache::builder();
+            if MANAGED {
+                builder = builder
+                    .max_capacity((2 * BATCH) as u64)
+                    .time_to_live(Duration::from_secs(3600));
+            }
+            let cache: Cache<String, u8, DetState> =
+                builder.hash_builder(DetState::default()).build();
+            let keys: Vec<String> = (0..2 * BATCH)
+                .map(|i| {
+                    format!(
+                        "1555000{i:04}@s.whatsapp.net:TESTMESSAGE{i:04}:15551110000@s.whatsapp.net"
+                    )
+                })
+                .collect();
+            block_on(async {
+                for key in &keys[..BATCH] {
+                    cache.insert(key.clone(), 1).await;
+                }
+            });
+            (cache, keys)
+        })
+        .bench_refs(|(cache, keys)| {
+            block_on(async {
+                let mut sum = 0usize;
+                for i in 0..BATCH {
+                    // Spread hits through the batch instead of clustering
+                    // them at its front. Both halves contain unique keys.
+                    let key = &keys[if (i + 1) * hit_percent / 100 > i * hit_percent / 100 {
+                        i
+                    } else {
+                        BATCH + i
+                    }];
+                    sum += cache
+                        .upsert_with_by_ref(black_box(key.as_str()), |current| {
+                            let next = current.copied().unwrap_or_default() + 1;
+                            (Some(next), usize::from(next))
+                        })
+                        .await;
+                }
+                black_box(sum)
+            })
+        });
+}
+
+/// Saturated retries and denied PDO admissions return no replacement. A hit
+/// must leave its timestamp/value alone; a miss must not allocate an owned key.
+#[divan::bench(args = [false, true], consts = [false, true])]
+fn cache_upsert_no_change<const MANAGED: bool>(bencher: divan::Bencher, hit: bool) {
+    bencher
+        .counter(ItemsCount::new(BATCH))
+        .with_inputs(|| {
+            let mut builder = Cache::builder();
+            if MANAGED {
+                builder = builder
+                    .max_capacity(BATCH as u64)
+                    .time_to_live(Duration::from_secs(3600));
+            }
+            let cache: Cache<String, u8, DetState> =
+                builder.hash_builder(DetState::default()).build();
+            let keys: Vec<String> = (0..BATCH)
+                .map(|i| {
+                    format!(
+                        "1555000{i:04}@s.whatsapp.net:TESTMESSAGE{i:04}:15551110000@s.whatsapp.net"
+                    )
+                })
+                .collect();
+            if hit {
+                block_on(async {
+                    for key in &keys {
+                        cache.insert(key.clone(), 5).await;
+                    }
+                });
+            }
+            (cache, keys)
+        })
+        .bench_refs(|(cache, keys)| {
+            block_on(async {
+                let mut found = 0usize;
+                for key in keys.iter() {
+                    found += cache
+                        .upsert_with_by_ref(black_box(key.as_str()), |current| {
+                            (None, usize::from(current.is_some()))
+                        })
+                        .await;
+                }
+                black_box(found)
+            })
+        });
+}
+
 #[divan::bench(args = CACHE_SIZES)]
 fn cache_insert_at_capacity(bencher: divan::Bencher, n: usize) {
     static FULL: OnceLock<Vec<Cache<Jid, Arc<()>, DetState>>> = OnceLock::new();
