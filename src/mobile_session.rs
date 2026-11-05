@@ -1,4 +1,5 @@
 //! Registered primary-mobile session configuration, independent of host I/O.
+use std::mem::{size_of, size_of_val};
 use std::sync::Arc;
 use wacore::libsignal::protocol::KeyPair;
 use wacore::mobile::{
@@ -381,6 +382,26 @@ impl RegisteredMobileSession {
     }
 }
 
+impl wacore::stats::HeapSize for RegisteredMobileSession {
+    fn heap_bytes(&self) -> usize {
+        use wacore::stats::HeapSize as _;
+        let arc_header = 2 * size_of::<usize>();
+        self.environment.heap_bytes()
+            + self.profile.heap_bytes()
+            + self.options.heap_bytes()
+            + self
+                .media_http_profile
+                .as_ref()
+                .map_or(0, |profile| arc_header + profile.heap_bytes())
+            + arc_header
+            + size_of_val(self.ephemeral_keys.as_ref())
+            + self
+                .options_provider
+                .as_ref()
+                .map_or(0, |provider| arc_header + size_of_val(provider.as_ref()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,6 +470,34 @@ mod tests {
         )
         .unwrap()
     }
+    #[test]
+    fn retained_heap_counts_login_and_media_buffer_capacity() {
+        use wacore::stats::HeapSize;
+        let device = Device::new();
+        let mut session = config(&device, "heap-fixture");
+        let before = session.heap_bytes();
+        let mut push_name = String::with_capacity(4096);
+        push_name.push_str("synthetic");
+        let push_capacity = push_name.capacity();
+        session.options = MobileLoginOptions::builder().push_name(push_name).build();
+        assert_eq!(session.heap_bytes(), before + push_capacity);
+        assert!(session.profile.app_version().heap_bytes() >= 3 * size_of::<u32>());
+
+        let before_media = session.heap_bytes();
+        let mut route = String::with_capacity(4096);
+        route.push_str("/mms/image");
+        let route_capacity = route.capacity();
+        session = session.with_media_http_profile(
+            wacore::download::MobileMediaHttpProfile::new(
+                "SyntheticFixture/1".into(),
+                None,
+                vec![(wacore::download::MediaType::Image, route)],
+            )
+            .unwrap(),
+        );
+        assert!(session.heap_bytes() >= before_media + route_capacity);
+    }
+
     // Independent wire-field inspection: generated decoder is not the oracle here.
     fn counters(mut input: &[u8]) -> (Option<i32>, Option<u32>, Option<i32>) {
         fn take_varint(input: &mut &[u8]) -> u64 {
@@ -572,7 +621,8 @@ mod tests {
         use wacore::libsignal::protocol::PrivateKey;
         use wacore::mobile::MobileCertificateExpiryPolicy;
         fn key(seed: u8) -> KeyPair {
-            KeyPair::try_from(PrivateKey::deserialize(&[seed; 32]).unwrap()).unwrap()
+            let private = PrivateKey::deserialize(&[seed; 32]).unwrap();
+            KeyPair::new(private.public_key().unwrap(), private)
         }
         fn bytes(out: &mut Vec<u8>, number: u8, value: &[u8]) {
             out.extend_from_slice(&[number << 3 | 2, value.len() as u8]);
@@ -583,6 +633,7 @@ mod tests {
             details.extend_from_slice(expiry);
             bytes(&mut details, 5, static_key);
             let signature = root
+                .private_key
                 .calculate_signature(&details, &mut rand::rngs::StdRng::seed_from_u64(55))
                 .unwrap();
             let mut result = Vec::new();

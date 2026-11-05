@@ -787,6 +787,13 @@ pub struct MemoryReport {
     pub signal_sessions: CollectionStats,
     pub signal_identities: CollectionStats,
     pub signal_sender_keys: CollectionStats,
+    /// Retained native-mobile configuration and known provider object allocations.
+    /// Provider-owned captures are opaque; concrete profile buffers are walked.
+    /// Shared configuration is attributed once to each client that retains it.
+    pub mobile_session: CollectionStats,
+    /// Persisted mobile role/context/checkpoint/state buffers in the device snapshot.
+    /// Only sizes are exposed; registration context may contain credentials.
+    pub mobile_session_binding: CollectionStats,
     /// What the optional subsystems attached to this build retain. Empty when
     /// none is attached. One field rather than a `cfg`'d field per subsystem,
     /// so the report has one shape whatever was compiled; see
@@ -864,7 +871,7 @@ pub struct SubsystemMemory {
 impl MemoryReport {
     /// Common byte-carrying collections used by both totals and `Display`.
     /// Feature-specific collections stay beside their gated report section.
-    fn collections(&self) -> [(&'static str, &CollectionStats); 20] {
+    fn collections(&self) -> [(&'static str, &CollectionStats); 22] {
         [
             ("group_cache:", &self.group_cache),
             ("device_registry_cache:", &self.device_registry_cache),
@@ -886,6 +893,8 @@ impl MemoryReport {
             ("core_event_handlers:", &self.core_event_handlers),
             ("status_privacy:", &self.status_privacy),
             ("inbound_chat_budgets:", &self.inbound_chat_budgets),
+            ("mobile_session:", &self.mobile_session),
+            ("mobile_session_binding:", &self.mobile_session_binding),
         ]
     }
 
@@ -1181,6 +1190,8 @@ impl std::fmt::Display for MemoryReport {
         writeln!(f, "  custom_enc_handlers:    {}", self.custom_enc_handlers)?;
         writeln!(f, "  stanza_interceptors:    {}", self.stanza_interceptors)?;
         line(f, "core_event_handlers:", &self.core_event_handlers)?;
+        line(f, "mobile_session:", &self.mobile_session)?;
+        line(f, "mobile_session_binding:", &self.mobile_session_binding)?;
         writeln!(
             f,
             "  total estimated:        {} B",
@@ -1829,6 +1840,12 @@ impl SessionState {
     }
 }
 
+/// Device state belongs to PersistenceManager. Event dispatch does not need a
+/// second, stale copy of its keys, profile and persisted session metadata.
+pub(crate) struct ClientCore {
+    pub(crate) event_bus: wacore::types::events::CoreEventBus,
+}
+
 /// A single WhatsApp session: the connection, the Signal state, and every
 /// protocol operation built on top of them.
 ///
@@ -1888,7 +1905,7 @@ impl SessionState {
 /// ```
 pub struct Client {
     pub(crate) runtime: Arc<dyn Runtime>,
-    pub(crate) core: wacore::client::CoreClient,
+    pub(crate) core: ClientCore,
 
     pub(crate) persistence_manager: Arc<PersistenceManager>,
     /// Write-behind buffer for inbound messageSecret captures; readers check

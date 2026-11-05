@@ -508,7 +508,8 @@ mod mobile_transport_tests {
     use waproto::whatsapp as wa;
 
     fn key(seed: u8) -> KeyPair {
-        KeyPair::try_from(PrivateKey::deserialize(&[seed; 32]).unwrap()).unwrap()
+        let private = PrivateKey::deserialize(&[seed; 32]).unwrap();
+        KeyPair::new(private.public_key().unwrap(), private)
     }
     struct Ephemeral(std::sync::atomic::AtomicU8);
     impl crate::MobileEphemeralKeyProvider for Ephemeral {
@@ -671,6 +672,7 @@ mod mobile_transport_tests {
             },
         );
         let signature = key(41)
+            .private_key
             .calculate_signature(&details, &mut rand::rngs::StdRng::seed_from_u64(77))
             .unwrap();
         let mut certificate = Vec::new();
@@ -710,11 +712,11 @@ mod mobile_transport_tests {
         noise.authenticate(client.public_key_bytes());
         noise.authenticate(ephemeral.public_key.public_key_bytes());
         noise
-            .mix_key(&ephemeral.calculate_agreement(&client).unwrap())
+            .mix_key(&ephemeral.private_key.calculate_agreement(&client).unwrap())
             .unwrap();
         let encrypted_static = noise.encrypt(server.public_key.public_key_bytes()).unwrap();
         noise
-            .mix_key(&server.calculate_agreement(&client).unwrap())
+            .mix_key(&server.private_key.calculate_agreement(&client).unwrap())
             .unwrap();
         let encrypted_cert = noise.encrypt(&certificate(&server, mismatch)).unwrap();
         let mut response = wa::HandshakeMessage::default();
@@ -765,6 +767,7 @@ mod mobile_transport_tests {
             noise
                 .mix_key(
                     &ephemeral
+                        .private_key
                         .calculate_agreement(
                             &PublicKey::from_djb_public_key_bytes(&client_static).unwrap(),
                         )

@@ -4,7 +4,7 @@ use wacore_binary::JidExt as _;
 use waproto::whatsapp as wa;
 
 use crate::adv::{AccountSignatureMessage, AdvValidation, validate_adv_with_identity_key};
-use crate::libsignal::crypto::hmac_sha256;
+use crate::libsignal::crypto::hmac_sha256_two_part;
 use crate::libsignal::protocol::{KeyPair, PublicKey};
 
 use super::PrimaryLinkError;
@@ -69,7 +69,7 @@ pub fn build_signed_key_index_list<R: Rng + CryptoRng>(
     let mut message = Vec::with_capacity(2 + encoded.len());
     message.extend_from_slice(&[6, 2]);
     message.extend_from_slice(&encoded);
-    let signature = primary.calculate_signature(&message, rng)?;
+    let signature = primary.private_key.calculate_signature(&message, rng)?;
     let mut signed = wa::ADVSignedKeyIndexList::default();
     signed.details = Some(encoded);
     signed.account_signature = Some(signature.to_vec());
@@ -89,7 +89,12 @@ pub fn build_signed_companion_identity<R: Rng + CryptoRng>(
         return Err(PrimaryLinkError::InvalidInput("companion key index"));
     }
     let companion = PublicKey::from_djb_public_key_bytes(companion_identity)?;
-    let agreement = zeroize::Zeroizing::new(primary.calculate_agreement(&companion)?);
+    let agreement = zeroize::Zeroizing::new(
+        primary
+            .private_key
+            .calculate_agreement(&companion)
+            .map_err(|_| PrimaryLinkError::Authentication)?,
+    );
     if bool::from(agreement.as_ref().ct_eq(&[0; 32])) {
         return Err(PrimaryLinkError::Authentication);
     }
@@ -101,14 +106,16 @@ pub fn build_signed_companion_identity<R: Rng + CryptoRng>(
     details.device_type = params.encryption_type();
     let encoded = waproto::codec::adv_device_identity_to_vec(&details);
     let message = AccountSignatureMessage::new(&encoded, &companion, details.device_type);
-    let signature = primary.calculate_signature(message.as_bytes(), rng)?;
+    let signature = primary
+        .private_key
+        .calculate_signature(message.as_bytes(), rng)?;
     let mut signed = wa::ADVSignedDeviceIdentity::default();
     signed.details = Some(encoded);
     signed.account_signature_key = Some(primary.public_key.public_key_bytes().to_vec());
     signed.account_signature = Some(signature.to_vec());
     let encoded = waproto::codec::adv_signed_device_identity_to_vec(&signed);
     let mut wrapped = wa::ADVSignedDeviceIdentityHMAC::default();
-    wrapped.hmac = Some(hmac_sha256(adv_secret, &encoded).to_vec());
+    wrapped.hmac = Some(hmac_sha256_two_part(adv_secret, &encoded, b"").to_vec());
     wrapped.details = Some(encoded);
     wrapped.account_type = params.encryption_type();
     Ok(SignedCompanionIdentity {
@@ -499,6 +506,7 @@ mod tests {
         details.key_index = Some(0);
         let encoded = waproto::codec::adv_device_identity_to_vec(&details);
         let signature = primary
+            .private_key
             .calculate_signature(
                 AccountSignatureMessage::new(&encoded, &primary.public_key, None).as_bytes(),
                 &mut rng,
@@ -569,6 +577,7 @@ mod tests {
             signed.details = Some(waproto::codec::adv_device_identity_to_vec(&details));
             signed.account_signature = Some(
                 primary
+                    .private_key
                     .calculate_signature(
                         AccountSignatureMessage::new(
                             signed.details.as_deref().unwrap(),
@@ -596,6 +605,7 @@ mod tests {
         signed.details = Some(waproto::codec::adv_device_identity_to_vec(&details));
         signed.account_signature = Some(
             primary
+                .private_key
                 .calculate_signature(
                     AccountSignatureMessage::new(
                         signed.details.as_deref().unwrap(),

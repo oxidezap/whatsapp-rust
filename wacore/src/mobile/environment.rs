@@ -266,6 +266,12 @@ impl<T> EnvironmentBound<T> {
     }
 }
 
+impl crate::stats::HeapSize for MobileEnvironment {
+    fn heap_bytes(&self) -> usize {
+        self.id.capacity() + self.registration.0.capacity() + self.connection.host.capacity()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -55,7 +55,12 @@ impl PrimaryHello {
             return Err(PrimaryLinkError::InvalidInput("identity key-pair mismatch"));
         }
         let peer = PublicKey::from_djb_public_key_bytes(companion_identity)?;
-        let shared_identity = Zeroizing::new(primary_identity.calculate_agreement(&peer)?);
+        let shared_identity = Zeroizing::new(
+            primary_identity
+                .private_key
+                .calculate_agreement(&peer)
+                .map_err(|_| PrimaryLinkError::Authentication)?,
+        );
         if bool::from(shared_identity.as_ref().ct_eq(&[0; 32])) {
             return Err(PrimaryLinkError::Authentication);
         }
@@ -102,7 +107,12 @@ pub fn prepare_primary_hello(
         PairCodeUtils::decrypt_primary_ephemeral_pub(wrapped_companion_ephemeral, &code)
             .map_err(|_| PrimaryLinkError::Authentication)?;
     let companion = PublicKey::from_djb_public_key_bytes(&companion)?;
-    let shared_ephemeral = Zeroizing::new(primary_ephemeral.calculate_agreement(&companion)?);
+    let shared_ephemeral = Zeroizing::new(
+        primary_ephemeral
+            .private_key
+            .calculate_agreement(&companion)
+            .map_err(|_| PrimaryLinkError::Authentication)?,
+    );
     if bool::from(shared_ephemeral.as_ref().ct_eq(&[0; 32])) {
         return Err(PrimaryLinkError::Authentication);
     }
@@ -147,7 +157,10 @@ mod tests {
                 .as_slice(),
             primary.public_key.public_key_bytes()
         );
-        let shared = companion.calculate_agreement(&primary.public_key).unwrap();
+        let shared = companion
+            .private_key
+            .calculate_agreement(&primary.public_key)
+            .unwrap();
         let mut key = [0; 32];
         crate::crypto::hkdf_sha256_into(
             &shared,
@@ -170,6 +183,7 @@ mod tests {
             .unwrap();
         let actual = hello.complete(&bundle, peer, &primary_identity).unwrap();
         let identity_shared = companion_identity
+            .private_key
             .calculate_agreement(&primary_identity.public_key)
             .unwrap();
         let mut material = Vec::from(shared);

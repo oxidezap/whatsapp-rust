@@ -22,30 +22,34 @@ impl EphemeralRegistrationKey {
         if plaintext.len() > FORM_LIMIT {
             return Err(RegistrationWireError::SizeLimit);
         }
-        let mut base = [0; 32];
-        base[0] = 9;
-        let public = wacore_libsignal::crypto::x25519_agreement(&self.0, &base)
+        use wacore_libsignal::protocol::{PrivateKey, PublicKey};
+        let private =
+            PrivateKey::deserialize(self.0.as_ref()).map_err(|_| RegistrationWireError::Crypto)?;
+        let public = private
+            .public_key()
             .map_err(|_| RegistrationWireError::Crypto)?;
+        let server = PublicKey::from_djb_public_key_bytes(server_public_key)
+            .map_err(|_| RegistrationWireError::InvalidServerKey)?;
+        // The engine also rejects all-zero DH; keep the envelope's typed error
+        // and its explicit defensive check before publishing ciphertext.
         let shared = Zeroizing::new(
-            wacore_libsignal::crypto::x25519_agreement(&self.0, server_public_key)
-                .map_err(|_| RegistrationWireError::Crypto)?,
+            private
+                .calculate_agreement(&server)
+                .map_err(|_| RegistrationWireError::InvalidServerKey)?,
         );
-        if bool::from(shared.ct_eq(&[0; 32])) || public == [0; 32] {
+        if bool::from(shared.ct_eq(&[0; 32])) || public.public_key_bytes() == &[0; 32] {
             return Err(RegistrationWireError::InvalidServerKey);
         }
         let mut payload = Zeroizing::new(Vec::with_capacity(32 + plaintext.len() + 16));
         payload.extend_from_slice(plaintext);
         // Zero nonce is the traced envelope construction. Fresh per-request DH
         // material is mandatory: this type is consumed to prevent accidental reuse.
-        wacore_libsignal::crypto::aes_256_gcm_encrypt_in_place(
-            &shared,
-            &[0; 12],
-            b"",
-            &mut *payload,
-        )
-        .map_err(|_| RegistrationWireError::Crypto)?;
+        wacore_libsignal::crypto::transport_aead(&shared)
+            .map_err(|_| RegistrationWireError::Crypto)?
+            .encrypt_in_place(&[0; 12], b"", &mut *payload)
+            .map_err(|_| RegistrationWireError::Crypto)?;
         let mut wire = Zeroizing::new(Vec::with_capacity(32 + payload.len()));
-        wire.extend_from_slice(&public);
+        wire.extend_from_slice(public.public_key_bytes());
         wire.extend_from_slice(&payload);
         Ok(RegistrationEnvelope {
             encoded: base64::engine::general_purpose::URL_SAFE.encode(&*wire),

@@ -3757,7 +3757,8 @@ async fn runtime_cache_config_honors_disabled_recent_cache() {
 /// the runtime-retained `RuntimeCacheConfig` (456 B down to 136 B on the
 /// structs). A struct-level delta alone does not prove the per-client saving,
 /// since neighbor-field padding could absorb part of it. The current fixed
-/// client layout is 4288 B before feature-sized fields and the 56 B pending
+/// client layout is 3256 B after removing the unused Device copy, before
+/// feature-sized fields and the 56 B pending
 /// call-offer tracker. The tracker is needed even without the VoIP subsystem:
 /// a terminate must cancel an offer paused on identity learning. It retains
 /// only in-flight offers, and `memory_report()` exposes their count. The
@@ -3779,13 +3780,11 @@ fn client_size_pins_runtime_cache_config_saving() {
     // table (32 inline bytes on this target); its count remains one pointer.
     // Every size-varying attachment is measured in this same build and stacked
     // on top, so only an unaccounted layout move trips the assert.
-    // CoreClient owns Device inline. The original fixed base included a
-    // 1032 B Device with a 152 B ClientProfile. Measure the whole attachment:
-    // three keypairs shrinking by 4 B each reduce Device by 16 B, including
-    // its padding. Adding their individual deltas would overcount by 4 B.
-    // With the current 160 B profile, main's Device is 1040 B and ours is 1024 B.
+    // The original fixed base included a 1032 B Device copy in CoreClient.
+    // PersistenceManager already owns the authoritative device and snapshots;
+    // the SDK now retains only the same event bus. Future core Device layout
+    // changes must not change this SDK budget.
     let mut expected = (4288 - 1032)
-        + size_of::<wacore::store::Device>()
         + size_of::<subsystem::Subsystems>()
         + size_of::<crate::handlers::call::pending_offers::PendingOffers>()
         + size_of::<Arc<std::sync::Mutex<crate::retry::HistoryPayloadRegistry>>>()
@@ -5437,7 +5436,19 @@ async fn received_stanza_handling_reads_no_clock() {
 #[tokio::test]
 async fn memory_report_display_sections_stay_aligned() {
     let client = crate::test_utils::create_test_client_with_name("memory_report_sections").await;
-    let rendered = client.memory_report().await.to_string();
+    let report = client.memory_report().await;
+    assert_eq!(
+        (report.mobile_session.entries, report.mobile_session.bytes),
+        (0, 0)
+    );
+    assert_eq!(
+        (
+            report.mobile_session_binding.entries,
+            report.mobile_session_binding.bytes
+        ),
+        (0, 0)
+    );
+    let rendered = report.to_string();
 
     let ttl_start = rendered
         .find("--- TTL-bounded caches ---")
@@ -5527,6 +5538,49 @@ async fn memory_report_display_sections_stay_aligned() {
             "{name} must render under the transient-retention heading, got:\n{rendered}"
         );
     }
+}
+
+#[cfg(feature = "mobile-core")]
+#[tokio::test]
+async fn memory_report_attributes_mobile_configuration_and_persisted_buffer_capacity() {
+    let client = crate::test_utils::primary_startup_client().await;
+    let before = client.memory_report().await;
+    assert_eq!(before.mobile_session.entries, 1);
+    assert!(
+        before.mobile_session.bytes >= std::mem::size_of::<crate::RegisteredMobileSession>() as u64
+    );
+    assert_eq!(before.mobile_session_binding.entries, 1);
+
+    let snapshot = client.persistence_manager.get_device_snapshot();
+    let mut binding = snapshot.mobile_session.as_ref().unwrap().as_ref().clone();
+    drop(snapshot);
+    let prior_capacity = binding.registration_context.capacity();
+    binding.registration_context.reserve(4096);
+    let added_capacity = binding.registration_context.capacity() - prior_capacity;
+    assert!(added_capacity >= 4096);
+    client
+        .persistence_manager
+        .process_command(wacore::store::DeviceCommand::SetMobileSessionBinding(
+            binding,
+        ))
+        .await;
+
+    let after = client.memory_report().await;
+    assert_eq!(
+        (after.mobile_session.entries, after.mobile_session.bytes),
+        (before.mobile_session.entries, before.mobile_session.bytes)
+    );
+    assert_eq!(after.mobile_session_binding.entries, 1);
+    assert_eq!(
+        after.mobile_session_binding.bytes,
+        before.mobile_session_binding.bytes + added_capacity as u64
+    );
+    assert!(
+        after.total_estimated_bytes() >= before.total_estimated_bytes() + added_capacity as u64
+    );
+    let rendered = after.to_string();
+    assert!(rendered.contains("mobile_session:"));
+    assert!(rendered.contains("mobile_session_binding:"));
 }
 
 /// The offline unknown-device queue has no capacity cap: its bound is the drain

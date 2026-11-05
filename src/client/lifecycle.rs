@@ -538,10 +538,9 @@ impl Client {
         let mut unique_id_bytes = [0u8; 2];
         rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut unique_id_bytes);
 
-        let device_snapshot = persistence_manager.get_device_snapshot();
-        let mut core_device = device_snapshot.core.clone();
-        core_device.status_privacy = None;
-        let core = wacore::client::CoreClient::new(core_device);
+        let core = ClientCore {
+            event_bus: wacore::types::events::CoreEventBus::new(),
+        };
 
         // `MajorSyncTask` queue. 8 slots, not 32: `async_channel` allocates the
         // whole ring up front (~66 B/slot), so the depth is always-resident

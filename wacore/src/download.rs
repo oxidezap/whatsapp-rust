@@ -5,6 +5,7 @@ use crate::libsignal::crypto::{
 use anyhow::{Result, anyhow};
 use base64::Engine as _;
 use base64::prelude::*;
+use core::mem::{size_of, size_of_val};
 use hmac::Hmac;
 use hmac::Mac;
 use sha2::Sha256;
@@ -2653,6 +2654,25 @@ pub struct MobileMediaHttpProfile {
     user_agent: std::sync::Arc<str>,
     origin: Option<std::sync::Arc<str>>,
     upload_routes: std::sync::Arc<[(MediaType, String)]>,
+}
+
+impl crate::stats::HeapSize for MobileMediaHttpProfile {
+    fn heap_bytes(&self) -> usize {
+        let arc_header = 2 * size_of::<usize>();
+        arc_header
+            + self.user_agent.len()
+            + self
+                .origin
+                .as_ref()
+                .map_or(0, |value| arc_header + value.len())
+            + arc_header
+            + size_of_val(self.upload_routes.as_ref())
+            + self
+                .upload_routes
+                .iter()
+                .map(|(_, path)| path.capacity())
+                .sum::<usize>()
+    }
 }
 impl MobileMediaHttpProfile {
     pub fn new(

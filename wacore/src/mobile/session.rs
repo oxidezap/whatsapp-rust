@@ -10,6 +10,7 @@
 //! Field presence is explicit: reference mobile clients differ on optional login
 //! fields. Callers supply installation metadata, build version, entropy and time.
 
+use core::mem::size_of;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use wacore_libsignal::protocol::{KeyPair, PublicKey};
@@ -112,6 +113,12 @@ impl MobileAppVersion {
     }
 }
 
+impl crate::stats::HeapSize for MobileAppVersion {
+    fn heap_bytes(&self) -> usize {
+        self.0.capacity() * size_of::<u32>()
+    }
+}
+
 /// Installation metadata supplied by the host, never generated during login.
 /// Optional fields preserve absence rather than inserting carrier/locale values.
 #[derive(Clone, bon::Builder)]
@@ -138,6 +145,36 @@ pub struct MobileDevice {
 pub struct MobileLoginProfile {
     version: MobileAppVersion,
     user_agent: cp::UserAgent,
+}
+
+impl crate::stats::HeapSize for MobileLoginProfile {
+    fn heap_bytes(&self) -> usize {
+        use crate::stats::HeapSize as _;
+        let strings = [
+            &self.user_agent.mcc,
+            &self.user_agent.mnc,
+            &self.user_agent.os_version,
+            &self.user_agent.manufacturer,
+            &self.user_agent.device,
+            &self.user_agent.os_build_number,
+            &self.user_agent.phone_id,
+            &self.user_agent.locale_language_iso6391,
+            &self.user_agent.locale_country_iso31661_alpha2,
+            &self.user_agent.device_board,
+            &self.user_agent.device_exp_id,
+            &self.user_agent.device_model_type,
+        ]
+        .into_iter()
+        .map(|value| value.as_ref().map_or(0, String::capacity))
+        .sum::<usize>();
+        self.version.heap_bytes()
+            + strings
+            + self
+                .user_agent
+                .app_version
+                .as_option()
+                .map_or(0, |_| size_of::<cp::user_agent::AppVersion>())
+    }
 }
 
 fn text(value: &str, field: &'static str) -> Result<(), MobileSessionError> {
@@ -286,6 +323,12 @@ pub struct MobileLoginOptions {
     traffic_anonymization: Option<cp::TrafficAnonymization>,
     connection_sequence_info: Option<i32>,
     lid_db_migrated: Option<bool>,
+}
+
+impl crate::stats::HeapSize for MobileLoginOptions {
+    fn heap_bytes(&self) -> usize {
+        self.push_name.as_ref().map_or(0, String::capacity)
+    }
 }
 
 impl MobileLoginOptions {
@@ -476,8 +519,11 @@ fn checked_agreement(
     key: &KeyPair,
     peer: &[u8; 32],
 ) -> Result<(), MobileSessionError> {
+    let peer = PublicKey::from_djb_public_key_bytes(peer)
+        .map_err(|_| MobileSessionError::InvalidKeyMaterial)?;
     let shared = Zeroizing::new(
-        wacore_libsignal::crypto::x25519_agreement(key.private_key.serialize(), peer)
+        key.private_key
+            .calculate_agreement(&peer)
             .map_err(|_| MobileSessionError::InvalidKeyMaterial)?,
     );
     if bool::from(shared.ct_eq(&[0; 32])) {
@@ -591,7 +637,8 @@ mod tests {
     use wacore_noise::NoiseState;
 
     fn key(seed: u8) -> KeyPair {
-        KeyPair::try_from(PrivateKey::deserialize(&[seed; 32]).unwrap()).unwrap()
+        let private = PrivateKey::deserialize(&[seed; 32]).unwrap();
+        KeyPair::new(private.public_key().unwrap(), private)
     }
 
     fn device() -> MobileDevice {
@@ -650,7 +697,10 @@ mod tests {
 
     fn sign_details(root: &KeyPair, details: &[u8]) -> Vec<u8> {
         let mut random = rand::rngs::StdRng::seed_from_u64(99);
-        let signature = root.calculate_signature(details, &mut random).unwrap();
+        let signature = root
+            .private_key
+            .calculate_signature(details, &mut random)
+            .unwrap();
         let mut encoded = Vec::new();
         bytes(&mut encoded, 1, details);
         bytes(&mut encoded, 2, &signature);
@@ -926,13 +976,23 @@ mod tests {
         peer.authenticate(client_ephemeral);
         peer.authenticate(server_ephemeral.public_key.public_key_bytes());
         let client = PublicKey::from_djb_public_key_bytes(client_ephemeral).unwrap();
-        peer.mix_key(&server_ephemeral.calculate_agreement(&client).unwrap())
-            .unwrap();
+        peer.mix_key(
+            &server_ephemeral
+                .private_key
+                .calculate_agreement(&client)
+                .unwrap(),
+        )
+        .unwrap();
         let encrypted_static = peer
             .encrypt(server_static.public_key.public_key_bytes())
             .unwrap();
-        peer.mix_key(&server_static.calculate_agreement(&client).unwrap())
-            .unwrap();
+        peer.mix_key(
+            &server_static
+                .private_key
+                .calculate_agreement(&client)
+                .unwrap(),
+        )
+        .unwrap();
         let certificate = signed_certificate(
             root,
             server_static.public_key.public_key_bytes(),
@@ -984,6 +1044,7 @@ mod tests {
         assert_eq!(client_static, key(23).public_key.public_key_bytes());
         peer.mix_key(
             &server_ephemeral
+                .private_key
                 .calculate_agreement(&PublicKey::from_djb_public_key_bytes(&client_static).unwrap())
                 .unwrap(),
         )
@@ -1077,8 +1138,13 @@ mod tests {
             .unwrap();
             peer.authenticate(client_public.public_key_bytes());
             peer.authenticate(ephemeral.public_key.public_key_bytes());
-            peer.mix_key(&ephemeral.calculate_agreement(&client_public).unwrap())
-                .unwrap();
+            peer.mix_key(
+                &ephemeral
+                    .private_key
+                    .calculate_agreement(&client_public)
+                    .unwrap(),
+            )
+            .unwrap();
             let mut server = wa::handshake_message::ServerHello::default();
             server.ephemeral = Some(ephemeral.public_key.public_key_bytes().to_vec());
             server.r#static = Some(peer.encrypt(&low_order).unwrap());
