@@ -9264,7 +9264,7 @@ async fn wait_for_startup_sync_succeeds_when_history_tasks_finish() {
 }
 
 #[tokio::test]
-async fn session_readiness_and_startup_sync_can_precede_initial_prekey_upload() {
+async fn ready_waiters_do_not_require_initial_prekey_upload() {
     let client = offline_resume_test_client().await;
     client.set_connected_for_test(true);
     client.set_logged_in_for_test(true, Ordering::Relaxed);
@@ -9288,6 +9288,36 @@ async fn session_readiness_and_startup_sync_can_precede_initial_prekey_upload() 
             .server_has_prekeys
     );
     assert!(futures::poll!(upload.as_mut()).is_pending());
+    drop(guard);
+}
+
+#[tokio::test]
+async fn reconnect_success_publishes_connected_while_prekey_upload_is_blocked() {
+    let client = offline_resume_test_client().await;
+    client
+        .persistence_manager
+        .modify_device(|device| {
+            device.pn = Some("15550001000@s.whatsapp.net".parse().unwrap());
+            device.push_name = "Synthetic reconnect".into();
+            device.server_has_prekeys = false;
+        })
+        .await;
+    client.set_connected_for_test(true);
+    client.offline_sync_completed.store(true, Ordering::Release);
+    let guard = client.prekey_upload_lock.lock().await;
+    let success = NodeBuilder::new("success").build();
+    client.handle_success(&success.as_node_ref()).await;
+    client
+        .wait_for_session_ready(Duration::from_secs(2))
+        .await
+        .expect("post-login must publish Connected without awaiting the blocked upload");
+    assert!(
+        !client
+            .persistence_manager
+            .get_device_snapshot()
+            .server_has_prekeys
+    );
+    client.signal_shutdown_sync();
     drop(guard);
 }
 

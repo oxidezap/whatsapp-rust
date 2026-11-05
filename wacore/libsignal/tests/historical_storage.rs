@@ -138,6 +138,34 @@ fn existing_v3_and_v4_sessions_resume_with_exact_historical_ciphertext() {
                 .unwrap(),
             bytes(row, "plaintext")
         );
+        // Exercise the ratchet produced by this decrypt, independently of the
+        // fixture's saved receiver. Fresh sending keys need their own lease.
+        let index = receiver
+            .current
+            .as_ref()
+            .unwrap()
+            .sender
+            .as_ref()
+            .unwrap()
+            .index;
+        receiver
+            .reservation
+            .prepare(index, 128, incarnation())
+            .unwrap();
+        receiver.reservation.mark_committed();
+        let reply = engine
+            .encrypt(&mut receiver, &bytes(row, "reply_plaintext"))
+            .unwrap();
+        let mut live_peer = engine::codec::decode_session_record_live(
+            &RustCrypto,
+            &bytes(row, "sender_after"),
+            &incarnation(),
+        )
+        .unwrap();
+        assert_eq!(
+            engine.decrypt(&mut live_peer, &reply).unwrap(),
+            bytes(row, "reply_plaintext")
+        );
         let mut reply_sender = engine::codec::decode_session_record_live(
             &RustCrypto,
             &bytes(row, "receiver_after"),

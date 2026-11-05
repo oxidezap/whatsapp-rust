@@ -1351,6 +1351,8 @@ impl Fixture {
             let keys = &components.current_session.unwrap().receiver_chains[0].message_keys;
             assert!(keys.len() <= 2051);
             assert!(keys.iter().any(|key| key.index == 2198));
+            assert!(keys.iter().any(|key| key.index == 153));
+            assert!(!keys.iter().any(|key| key.index == 152));
         }
     }
 }
