@@ -125,8 +125,11 @@ complete previous snapshots into a versioned fixture directory. Immutable source
 revisions and digests preserve provenance; task reports belong in the PR.
 
 The normalization capture adapter stores all original cases with shared observed
-outcomes. Run `node tools/whatspec-codegen/fixtures/capture-group-normalization.cjs
-PATH/TO/whatspec --check` against the pinned external checkout to reproduce it.
+outcomes. Run `cargo run -p web-oracle -- group PATH/TO/whatspec --check
+tools/whatspec-codegen/fixtures/group_normalization_oracle.json` against the pinned
+external checkout to reproduce it. The Rust adapter observes the unchanged upstream
+harness through Node's local inspector; it injects no JavaScript. See
+[the Web oracle guide](../tools/web-oracle/README.md) for all three Rust drivers.
 The normal generator and tests remain offline-capable. The emitter verifies the
 expanded oracle's canonical digest and emits a table with one shared test runner,
 not one copy of the runner per case. Review any capture or digest change against

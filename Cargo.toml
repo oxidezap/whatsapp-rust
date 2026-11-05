@@ -32,6 +32,7 @@ members = [
     "tools/whatspec-codegen",
     "tools/mobile-oracle",
     "tools/mobile-oracle-android",
+    "tools/web-oracle",
     "tools/oracle-cli",
     "tools/oracle-core",
     "tools/xtask",
