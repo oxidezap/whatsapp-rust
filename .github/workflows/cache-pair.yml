@@ -1,0 +1,67 @@
+name: Cache paired experiment
+on:
+  pull_request:
+    branches: [main]
+    paths: [".github/workflows/cache-pair.yml", "tools/xtask/src/cache_pair.rs"]
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: cache-pair-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+env:
+  CARGO_INCREMENTAL: "0"
+  MALLOC_ARENA_MAX: "1"
+  MALLOC_MMAP_THRESHOLD_: "131072"
+  MALLOC_TRIM_THRESHOLD_: "131072"
+  MALLOC_TOP_PAD_: "131072"
+jobs:
+  compare:
+    name: Cache CPU and memory on one host
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@3.25.3,cargo-codspeed@5.0.2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: cache-pair
+          cache-targets: "false"
+      - name: Key the libc debug package
+        id: libc6
+        run: cargo xt ci workflow libc-version
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/libc6-dbg
+          key: libc6-dbg-${{ runner.arch }}-${{ steps.libc6.outputs.version }}
+      - name: Bound apt and pre-install libc debug symbols
+        env:
+          LIBC6_VERSION: ${{ steps.libc6.outputs.version }}
+        run: cargo xt ci workflow install-libc-debug
+      - name: Build immutable baseline and candidate
+        run: |
+          cargo build --locked -p whatsapp-xtask
+          install -m 755 target/debug/whatsapp-xtask "$RUNNER_TEMP/cache-compare"
+          "$RUNNER_TEMP/cache-compare" ci cache-pair-prepare --base-revision 725cdde29abd03766dde4dca9bcf2fceb7060c7e --head-revision 344ee04ec4ce71bff0069fd2185089b2605da7a4
+          lscpu > .cache-pair-out/results/host.txt
+      - uses: CodSpeedHQ/action@61efe07e57e55bedeab750c434504de272a56e8c # v5.6.1
+        with:
+          mode: simulation,memory
+          runner-version: "5.4.2"
+          disable-memory-capture-stack: "false"
+          disable-memory-track-physical: "false"
+          run: '"$RUNNER_TEMP/cache-compare" ci cache-pair-measure'
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: cache-pair-provenance
+          path: .cache-pair-out/results
