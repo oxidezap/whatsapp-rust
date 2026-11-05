@@ -40,3 +40,36 @@ impl RetryCountHarness {
         sum
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    fn complete_without_runtime<F: Future>(future: F) -> F::Output {
+        let mut future = pin!(future);
+        let mut context = Context::from_waker(Waker::noop());
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(value) => value,
+            Poll::Pending => panic!("retry bookkeeping unexpectedly needs a runtime wakeup"),
+        }
+    }
+
+    #[test]
+    fn retry_fixture_completes_without_polling_background_tasks() {
+        let fixture = RetryCountHarness::default();
+        let keys = [
+            "synthetic-message-a".to_owned(),
+            "synthetic-message-b".to_owned(),
+        ];
+        for (seed, expected) in [(0, 2), (3, 8), (5, 0)] {
+            complete_without_runtime(fixture.prepare_retry_counts(&keys, seed));
+            assert_eq!(
+                complete_without_runtime(fixture.increment_retry_counts(&keys)),
+                expected,
+            );
+        }
+    }
+}
