@@ -112,8 +112,8 @@ fn pooled(bencher: divan::Bencher, count: usize) {
     measure_pooled(bencher, count, 0);
 }
 
-// Upper bound for a chunked arena (e.g. bumpalo) that never copies on growth:
-// the pool is sized once for the whole batch.
+// Optimistic reference: count discovery happens outside the measured region.
+// This is not a chunked arena or a measured bound for a decoder using one.
 #[divan::bench(args = [0, 1, 2, 3, 4, 8, 9])]
 fn pooled_presized(bencher: divan::Bencher, count: usize) {
     let total = (0..NODES)
