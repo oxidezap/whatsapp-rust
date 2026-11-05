@@ -124,10 +124,19 @@ Do not mark the future mobile mock gate validated until its required capabilitie
 exist and the scenarios execute. Do not require that future server work to land
 before testing the pure core and optional native transport offline.
 
-Registration checkpoints bind both the selected environment and the account's
-identity/Noise public-key digest. Restore rejects a different binding. These
-hashes prevent accidental mixing; they do not authenticate untrusted storage or
-detect rollback to an older database. Semantic response inputs must come from a
+Registration checkpoints bind the selected environment, the account's
+identity/Noise public-key digest and a host-supplied `RegistrationRunId`.
+Create a fresh run ID with host entropy or a durably unique allocator for each
+new workflow. Restore the persisted workflow after restart instead of creating
+a new sequence with a reused ID. Keep one active owner of each run; a copied or
+rolled-back checkpoint does not create a distinct run.
+
+Attempt tokens include a digest of that context and their sequence number.
+Completions from another environment, identity or run must be rejected without
+changing state. Restore validates pending token context and rejects an older
+checkpoint schema. These hashes prevent accidental mixing; they do not
+authenticate untrusted storage, enforce host-wide ID uniqueness or detect
+rollback to an older database. Semantic response inputs must come from a
 qualified parser. Local `confirm_persisted` records the host's durability
 confirmation; it does not perform or independently prove a database write.
 

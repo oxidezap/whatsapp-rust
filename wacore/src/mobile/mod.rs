@@ -14,6 +14,6 @@ pub use environment::{
 };
 pub use registration::{
     AttemptToken, RegistrationCheckpoint, RegistrationError, RegistrationIdentity,
-    RegistrationOperation, RegistrationOutcome, RegistrationPolicy, RegistrationStage,
-    RegistrationWorkflow,
+    RegistrationOperation, RegistrationOutcome, RegistrationPolicy, RegistrationRunId,
+    RegistrationStage, RegistrationWorkflow,
 };

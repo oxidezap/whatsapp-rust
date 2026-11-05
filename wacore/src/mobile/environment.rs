@@ -156,6 +156,12 @@ impl MobileTrust {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EnvironmentBinding([u8; 32]);
 
+impl EnvironmentBinding {
+    pub(super) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
 /// Immutable per-session configuration with no built-in production destination.
 #[derive(Debug, Clone)]
 pub struct MobileEnvironment {

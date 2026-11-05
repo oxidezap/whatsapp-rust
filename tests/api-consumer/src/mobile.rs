@@ -5,8 +5,8 @@
 
 use whatsapp_rust::mobile::{
     EnvironmentBound, MobileConfigurationError, MobileEnvironment, MobileTrust,
-    RegistrationEndpoint, RegistrationIdentity, RegistrationPolicy, RegistrationWorkflow,
-    TcpEndpoint,
+    RegistrationEndpoint, RegistrationIdentity, RegistrationPolicy, RegistrationRunId,
+    RegistrationWorkflow, TcpEndpoint,
 };
 
 pub fn mock_environment(port: u16) -> Result<MobileEnvironment, MobileConfigurationError> {
@@ -25,9 +25,10 @@ pub fn bind_state<T>(environment: &MobileEnvironment, state: T) -> EnvironmentBo
 pub fn workflow(
     environment: &MobileEnvironment,
     identity: RegistrationIdentity,
+    run_id: RegistrationRunId,
     policy: RegistrationPolicy,
 ) -> RegistrationWorkflow {
-    RegistrationWorkflow::new(environment.binding(), identity, policy)
+    RegistrationWorkflow::new(environment.binding(), identity, run_id, policy)
 }
 
 #[cfg(feature = "mobile-transport-native")]
@@ -67,7 +68,12 @@ mod tests {
 
         let policy = RegistrationPolicy::new(3, 100).expect("bounded policy");
         let identity = RegistrationIdentity::from_public_keys(&[3; 32], &[4; 32]);
-        let mut original = workflow(&environment, identity, policy);
+        let mut original = workflow(
+            &environment,
+            identity,
+            RegistrationRunId::from_bytes([7; 32]),
+            policy,
+        );
         let token = original
             .begin(RegistrationOperation::RequestCode, 10)
             .expect("reserve attempt");
@@ -98,6 +104,7 @@ mod tests {
         let core_workflow: wacore::mobile::RegistrationWorkflow = RegistrationWorkflow::new(
             core_binding,
             RegistrationIdentity::from_public_keys(&[3; 32], &[4; 32]),
+            RegistrationRunId::from_bytes([7; 32]),
             policy,
         );
         assert_eq!(core_workflow.stage(), RegistrationStage::Ready);
