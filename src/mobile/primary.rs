@@ -1548,20 +1548,20 @@ impl MobilePrimaryApi<'_> {
             prepared.map(|value| Sha256::digest(value.upload.media_key).into());
         let (_, journal, accounts) = self.state()?;
         validate_owned(device, &accounts)?;
-        if journal
-            .abandoned_dispatches
-            .iter()
-            .any(|op| dispatch_for_device(op, device))
-        {
-            return Err(PrimaryManagementError::Invalid(
-                "dispatch was abandoned; resume it explicitly or revoke device",
-            ));
-        }
         let record = journal
             .companions
             .iter()
             .find(|v| &v.device_jid == device)
             .ok_or(PrimaryManagementError::Invalid("unconfirmed device"))?;
+        if journal
+            .abandoned_dispatches
+            .iter()
+            .any(|op| dispatch_for_companion(op, record, &accounts))
+        {
+            return Err(PrimaryManagementError::Invalid(
+                "dispatch was abandoned; resume it explicitly or revoke device",
+            ));
+        }
         if journal.pending.is_some() || journal.maintenance.as_ref().is_some_and(|op| !matches!(op, Maintenance::Bootstrap { device: reserved, peer_identity, key_index, payload_hash, media_key_fingerprint: expected_key, .. } if reserved == device && peer_identity == &record.peer_identity && *key_index == record.key_index && payload_hash == &history_hash && expected_key == &media_key_fingerprint)) {
             return Err(PrimaryManagementError::Invalid("another operation is active"));
         }
@@ -1704,37 +1704,28 @@ impl MobilePrimaryApi<'_> {
             .mobile_primary_operation_guard()
             .await;
         self.client.persistence_manager.flush().await?;
-        let (binding, mut journal, _) = self.state()?;
+        let (binding, mut journal, accounts) = self.state()?;
         if journal.pending.is_some() || journal.maintenance.is_some() {
             return Err(PrimaryManagementError::Invalid("active operation"));
         }
+        let record = journal
+            .companions
+            .iter()
+            .find(|record| &record.device_jid == device)
+            .ok_or(PrimaryManagementError::Invalid(
+                "archived companion identity changed",
+            ))?;
         let position = journal
             .abandoned_dispatches
             .iter()
-            .rposition(|op| dispatch_for_device(op, device))
-            .ok_or(PrimaryManagementError::Invalid("no abandoned dispatch"))?;
-        let (peer_identity, key_index) = match &journal.abandoned_dispatches[position] {
-            Maintenance::Bootstrap {
-                peer_identity,
-                key_index,
-                ..
-            }
-            | Maintenance::History {
-                peer_identity,
-                key_index,
-                ..
-            } => (peer_identity, key_index),
-            _ => return Err(PrimaryManagementError::Invalid("invalid archived dispatch")),
-        };
-        if !journal.companions.iter().any(|record| {
-            &record.device_jid == device
-                && &record.peer_identity == peer_identity
-                && &record.key_index == key_index
-        }) {
-            return Err(PrimaryManagementError::Invalid(
-                "archived companion identity changed",
-            ));
-        }
+            // Recovery must keep the original dispatch target as well as its
+            // IDs and hashes. An authenticated alias cannot rewrite that target.
+            .rposition(|op| {
+                dispatch_for_device(op, device) && dispatch_for_companion(op, record, &accounts)
+            })
+            .ok_or(PrimaryManagementError::Invalid(
+                "no abandoned dispatch for current companion",
+            ))?;
         journal.maintenance = Some(journal.abandoned_dispatches.remove(position));
         self.save(binding, &journal).await
     }
@@ -1847,20 +1838,20 @@ impl MobilePrimaryApi<'_> {
         }
         let (binding, mut journal, accounts) = self.state()?;
         validate_owned(device, &accounts)?;
-        if journal
-            .abandoned_dispatches
-            .iter()
-            .any(|op| dispatch_for_device(op, device))
-        {
-            return Err(PrimaryManagementError::Invalid(
-                "dispatch was abandoned; resume it explicitly or revoke device",
-            ));
-        }
         let record = journal
             .companions
             .iter()
             .find(|v| &v.device_jid == device)
             .ok_or(PrimaryManagementError::Invalid("unconfirmed companion"))?;
+        if journal
+            .abandoned_dispatches
+            .iter()
+            .any(|op| dispatch_for_companion(op, record, &accounts))
+        {
+            return Err(PrimaryManagementError::Invalid(
+                "dispatch was abandoned; resume it explicitly or revoke device",
+            ));
+        }
         let cursor = HistoryCursor {
             sync_type: metadata.sync_type.to_i32(),
             chunk_order: metadata.chunk_order,
@@ -2048,6 +2039,20 @@ fn dispatch_for_key_index(operation: &Maintenance, target: u32) -> bool {
 fn dispatch_for_device(operation: &Maintenance, target: &Jid) -> bool {
     matches!(operation, Maintenance::Bootstrap { device, .. } | Maintenance::History { device, .. } if device == target)
 }
+fn dispatch_for_companion(
+    operation: &Maintenance,
+    companion: &HostedCompanion,
+    accounts: &[Jid],
+) -> bool {
+    // Device slots can be reused. Retain old recovery evidence without making
+    // it a barrier for a separately confirmed key/identity at the same address.
+    matches!(operation,
+        Maintenance::Bootstrap { device, peer_identity, key_index, .. }
+        | Maintenance::History { device, peer_identity, key_index, .. }
+        if same_owned_device_slot(device, &companion.device_jid, accounts)
+            && *key_index == companion.key_index
+            && peer_identity == &companion.peer_identity)
+}
 fn validate_initial_history(history: &wa::HistorySync) -> Result<(), PrimaryManagementError> {
     if history.sync_type != wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP
         || history.chunk_order != Some(0)
@@ -2182,6 +2187,66 @@ mod tests {
         key.key_data.fill(2);
         key.fingerprint.clear();
         assert!(validate_app_state_key(&[0, 0, 0, 0, 0, 1], &key).is_err());
+    }
+    #[test]
+    fn archived_dispatch_binding_requires_key_identity_and_owned_device_slot() {
+        let accounts = [
+            "15550000001@s.whatsapp.net".parse().unwrap(),
+            "10000000001@lid".parse().unwrap(),
+        ];
+        let mut companion = HostedCompanion {
+            device_jid: "15550000001:2@s.whatsapp.net".parse().unwrap(),
+            peer_identity: [7; 32],
+            signed_identity: vec![1],
+            key_index: 1,
+            history_sent: false,
+            app_state_sent: false,
+            history_cursors: vec![],
+        };
+        let alias = "10000000001:2@lid".parse().unwrap();
+        for operation in [
+            Maintenance::Bootstrap {
+                device: alias,
+                peer_identity: [7; 32],
+                key_index: 1,
+                payload_hash: [1; 32],
+                media_key_fingerprint: None,
+                history_message_id: "synthetic-history".into(),
+                app_state_message_id: "synthetic-state".into(),
+                history_message_hash: None,
+                app_state_message_hash: None,
+                app_state_key_id: None,
+            },
+            Maintenance::History {
+                device: "10000000001:2@lid".parse().unwrap(),
+                peer_identity: [7; 32],
+                key_index: 1,
+                cursor: HistoryCursor {
+                    sync_type: wa::message::HistorySyncType::FULL.to_i32(),
+                    chunk_order: 0,
+                    progress: 37,
+                    file_sha256: [1; 32],
+                },
+                message_id: "synthetic-chunk".into(),
+                message_hash: [2; 32],
+            },
+        ] {
+            assert!(dispatch_for_companion(&operation, &companion, &accounts));
+            companion.key_index = 2;
+            assert!(!dispatch_for_companion(&operation, &companion, &accounts));
+            companion.key_index = 1;
+            companion.peer_identity = [8; 32];
+            assert!(!dispatch_for_companion(&operation, &companion, &accounts));
+            companion.peer_identity = [7; 32];
+            companion.device_jid.device = 3;
+            assert!(!dispatch_for_companion(&operation, &companion, &accounts));
+            companion.device_jid.device = 2;
+            assert!(!dispatch_for_companion(
+                &operation,
+                &companion,
+                &accounts[..1]
+            ));
+        }
     }
     #[test]
     fn journal_strict_schema_and_capacities_survive_roundtrip() {
@@ -2617,12 +2682,19 @@ mod tests {
         client: &std::sync::Arc<Client>,
         initialize_app_state: bool,
     ) -> (Jid, [u8; 32]) {
+        seed_confirmed_companion(client, initialize_app_state, 1).await
+    }
+    async fn seed_confirmed_companion(
+        client: &std::sync::Arc<Client>,
+        initialize_app_state: bool,
+        key_index: u32,
+    ) -> (Jid, [u8; 32]) {
         use rand::SeedableRng;
         use wacore::libsignal::protocol::{
             IdentityKeyPair, KeyPair, PreKeyBundle, UsePQRatchet, process_prekey_bundle,
         };
         use wacore::pair::{DeviceState, PairUtils};
-        let mut rng = rand::rngs::StdRng::seed_from_u64(185);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(184 + u64::from(key_index));
         let peer = DeviceState {
             identity_key: KeyPair::generate(&mut rng),
             noise_key: KeyPair::generate(&mut rng),
@@ -2631,7 +2703,10 @@ mod tests {
         let peer_identity: [u8; 32] = *peer.identity_key.public_key.public_key_bytes();
         let device: Jid = "15550000001:2@s.whatsapp.net".parse().unwrap();
         let api = client.mobile_primary().unwrap();
-        api.initialize(7, AdvDefaultEncoding::Omit).await.unwrap();
+        let first_companion = api.state().is_err();
+        if first_companion {
+            api.initialize(7, AdvDefaultEncoding::Omit).await.unwrap();
+        }
         let snapshot = client.persistence_manager.get_device_snapshot();
         let issued = build_signed_companion_identity(
             &snapshot.identity_key,
@@ -2640,8 +2715,8 @@ mod tests {
             &IdentityParameters {
                 raw_id: 7,
                 timestamp_seconds: 100,
-                key_index: 1,
-                valid_indexes: &[0, 1],
+                key_index,
+                valid_indexes: &[0, key_index],
                 default_encoding: AdvDefaultEncoding::Omit,
             },
             &mut rng,
@@ -2657,14 +2732,20 @@ mod tests {
         )
         .unwrap();
         let (binding, mut journal, _) = api.state().unwrap();
-        journal.high_water = 1;
-        journal.live_indexes = vec![0, 1];
+        journal.high_water = journal.high_water.max(key_index);
+        journal.live_indexes = vec![0, key_index];
         journal.key_index_timestamp = 100;
+        assert!(
+            journal
+                .companions
+                .iter()
+                .all(|record| record.device_jid != device)
+        );
         journal.companions.push(HostedCompanion {
             device_jid: device.clone(),
             peer_identity,
             signed_identity: proof,
-            key_index: 1,
+            key_index,
             history_sent: false,
             app_state_sent: false,
             history_cursors: vec![],
@@ -2696,6 +2777,14 @@ mod tests {
         )
         .unwrap();
         let mut adapter = client.signal_adapter();
+        if !first_companion {
+            // Confirmation of a replacement proof permits a fresh synthetic
+            // Signal session for that identity at the reused device address.
+            client
+                .signal_cache
+                .put_identity(&device.to_protocol_address(), &peer_identity)
+                .await;
+        }
         process_prekey_bundle(
             &device.to_protocol_address(),
             &mut adapter.session_store,
@@ -2706,15 +2795,17 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            snapshot
-                .backend
-                .load_identity(device.to_protocol_address().as_str())
-                .await
-                .unwrap()
-                .is_none(),
-            "fixture identity must exist only in write-behind cache"
-        );
+        if first_companion {
+            assert!(
+                snapshot
+                    .backend
+                    .load_identity(device.to_protocol_address().as_str())
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "fixture identity must exist only in write-behind cache"
+            );
+        }
         (device, peer_identity)
     }
     fn initial_history() -> wa::HistorySync {
@@ -3203,6 +3294,92 @@ mod tests {
         wire.close().await;
     }
     #[tokio::test]
+    async fn abandoned_alias_dispatch_is_not_activated_under_a_different_target() {
+        let wire = Wire::new(crate::test_utils::primary_test_backend()).await;
+        let (device, _) = seed_confirmed_cache_only(&wire.client, false).await;
+        let api = wire.client.mobile_primary().unwrap();
+        assert!(api.bootstrap(&device, &initial_history()).await.is_err());
+        api.abandon_dispatch(&device).await.unwrap();
+        wire.client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                "10000000001@lid".parse().unwrap(),
+            )))
+            .await;
+        let (binding, mut journal, _) = api.state().unwrap();
+        let Maintenance::Bootstrap { device: target, .. } = &mut journal.abandoned_dispatches[0]
+        else {
+            panic!("bootstrap archive")
+        };
+        *target = "10000000001:2@lid".parse().unwrap();
+        let archive_bytes = serde_json::to_vec(&journal.abandoned_dispatches).unwrap();
+        api.save(binding, &journal).await.unwrap();
+        let sent_before = wire.transport.sent_count();
+        assert!(api.resume_abandoned_dispatch(&device).await.is_err());
+        assert!(api.bootstrap(&device, &initial_history()).await.is_err());
+        assert_eq!(wire.transport.sent_count(), sent_before);
+        let (_, latest, _) = api.state().unwrap();
+        assert!(latest.maintenance.is_none());
+        assert_eq!(
+            serde_json::to_vec(&latest.abandoned_dispatches).unwrap(),
+            archive_bytes,
+            "rejected alias recovery cannot retarget or consume the original archive"
+        );
+        wire.close().await;
+    }
+    #[tokio::test]
+    async fn abandoned_dispatch_does_not_block_replacement_at_the_same_device_address() {
+        let mut wire = Wire::new(crate::test_utils::primary_test_backend()).await;
+        let (device, old_identity) = seed_confirmed_cache_only(&wire.client, false).await;
+        let api_client = wire.client.clone();
+        let api = api_client.mobile_primary().unwrap();
+        assert!(api.bootstrap(&device, &initial_history()).await.is_err());
+        api.abandon_dispatch(&device).await.unwrap();
+        let old_archive = api.state().unwrap().1.abandoned_dispatches[0].clone();
+        let old_archive_bytes = serde_json::to_vec(&old_archive).unwrap();
+
+        let client = wire.client.clone();
+        let reconcile =
+            tokio::spawn(async move { client.mobile_primary().unwrap().reconcile().await });
+        let request = wire.request(1).await;
+        wire.devices(request.get(), None).await;
+        reconcile.await.unwrap().unwrap();
+        assert!(api.companions().unwrap().is_empty());
+        let (replacement, new_identity) = seed_confirmed_companion(&wire.client, true, 2).await;
+        assert_eq!(replacement, device);
+        assert_ne!(new_identity, old_identity);
+        assert!(api.resume_abandoned_dispatch(&device).await.is_err());
+        let before = wire.transport.sent_count();
+        api.bootstrap(&device, &initial_history()).await.unwrap();
+        assert_eq!(wire.transport.sent_count(), before + 2);
+        let upload = prepared_history("/history/replacement").upload;
+        api.send_uploaded_history_chunk(
+            &device,
+            PrimaryHistoryChunk {
+                sync_type: wa::message::HistorySyncType::FULL,
+                chunk_order: 0,
+                progress: 37,
+            },
+            &upload,
+        )
+        .await
+        .unwrap();
+        assert_eq!(wire.transport.sent_count(), before + 3);
+        let (_, journal, _) = api.state().unwrap();
+        assert!(journal.maintenance.is_none());
+        assert_eq!(journal.high_water, 2);
+        assert!(journal.companions[0].bootstrap_dispatch_complete());
+        assert_eq!(journal.companions[0].key_index, 2);
+        assert_eq!(journal.companions[0].history_cursors.len(), 1);
+        assert_eq!(journal.abandoned_dispatches.len(), 1);
+        assert_eq!(
+            serde_json::to_vec(&journal.abandoned_dispatches[0]).unwrap(),
+            old_archive_bytes,
+            "replacement dispatch must retain the old recovery evidence unchanged"
+        );
+        wire.close().await;
+    }
+    #[tokio::test]
     async fn partially_dispatched_bootstrap_can_be_abandoned_and_device_revoked() {
         use rand::SeedableRng;
         let mut wire = Wire::new(crate::test_utils::primary_test_backend()).await;
@@ -3241,6 +3418,19 @@ mod tests {
         );
         let sent_before = wire.transport.sent_count();
         assert!(api.bootstrap(&device, &initial_history()).await.is_err());
+        assert!(
+            api.send_uploaded_history_chunk(
+                &device,
+                PrimaryHistoryChunk {
+                    sync_type: wa::message::HistorySyncType::FULL,
+                    chunk_order: 0,
+                    progress: 37,
+                },
+                &prepared_history("/history/blocked").upload,
+            )
+            .await
+            .is_err()
+        );
         assert_eq!(
             wire.transport.sent_count(),
             sent_before,
