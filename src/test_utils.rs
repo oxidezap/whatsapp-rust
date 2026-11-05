@@ -954,6 +954,8 @@ pub(crate) async fn answer_iq(
     request_id: &str,
     response: &Node,
 ) -> Arc<OwnedNodeRef> {
+    use crate::client::{ResponseWaiter, StreamedResponse};
+
     let sender = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             if let Some(sender) = client.response_waiters_guard().remove(request_id) {
@@ -968,9 +970,16 @@ pub(crate) async fn answer_iq(
     #[cfg(feature = "voip-control")]
     client.bind_pending_call_link_join_ack(&response.as_node_ref());
     let delivered = node_to_owned_ref(response);
-    // Test helper: the map only ever holds Iq waiters in these fixtures.
-    if let crate::client::ResponseWaiter::Iq(sender) = sender {
-        let _ = sender.send(delivered.clone());
+    match sender {
+        ResponseWaiter::Iq(sender) => {
+            let _ = sender.send(delivered.clone());
+        }
+        // This fixture already holds a tree, so use the same replay delivery
+        // as the receive path does for streaming IQs with a raw observer.
+        ResponseWaiter::Stream(sink) => sink(StreamedResponse::Node(&delivered)),
+        ResponseWaiter::Phash(_) | ResponseWaiter::GroupPhash(_, _) => {
+            panic!("answer_iq received a message acknowledgement waiter for {request_id}");
+        }
     }
     delivered
 }
