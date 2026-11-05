@@ -1,5 +1,6 @@
 //! Full token decoding, storage construction/drop and selected attribute reads.
 //! These fixtures are synthetic; they do not represent a traffic distribution.
+//! Consumer arms expose the complete frame before selectively reading attributes.
 use divan::black_box;
 use wacore_binary::bench_internals as decoder_pool;
 pub use wacore_binary::*;
@@ -41,6 +42,7 @@ fn tree_attribute_consumer(bencher: divan::Bencher, width: usize) {
     let data = decoder_pool::fixture(width);
     bencher.bench_local(|| {
         let tree = decoder_pool::baseline(black_box(&data)).expect("decode");
+        black_box(&tree);
         black_box(decoder_pool::consume_tree(&tree).expect("attributes"));
     });
 }
@@ -50,6 +52,7 @@ fn chunked_attribute_consumer(bencher: divan::Bencher, width: usize) {
     let data = decoder_pool::fixture(width);
     bencher.bench_local(|| {
         let frame = decoder_pool::decode(black_box(&data), 128, false).expect("decode");
+        black_box(&frame);
         black_box(frame.consume().expect("attributes"));
     });
 }
@@ -59,6 +62,7 @@ fn two_pass_attribute_consumer(bencher: divan::Bencher, width: usize) {
     let data = decoder_pool::fixture(width);
     bencher.bench_local(|| {
         let frame = decoder_pool::decode(black_box(&data), 0, true).expect("decode");
+        black_box(&frame);
         black_box(frame.consume().expect("attributes"));
     });
 }
@@ -72,6 +76,7 @@ fn owned_tree_attribute_consumer(bencher: divan::Bencher, width: usize) {
     let data = bytes::Bytes::from(decoder_pool::fixture(width));
     bencher.bench_local(|| {
         let frame = OwnedNodeRef::new(black_box(data.clone())).expect("decode");
+        black_box(&frame);
         black_box(decoder_pool::consume_tree(frame.get()).expect("attributes"));
     });
 }
@@ -82,6 +87,7 @@ fn owned_chunked_attribute_consumer(bencher: divan::Bencher, width: usize) {
     bencher.bench_local(|| {
         let frame =
             decoder_pool::OwnedFrame::new(black_box(data.clone()), 128, false).expect("decode");
+        black_box(&frame);
         black_box(frame.get().consume().expect("attributes"));
     });
 }
@@ -92,6 +98,7 @@ fn owned_two_pass_attribute_consumer(bencher: divan::Bencher, width: usize) {
     bencher.bench_local(|| {
         let frame =
             decoder_pool::OwnedFrame::new(black_box(data.clone()), 0, true).expect("decode");
+        black_box(&frame);
         black_box(frame.get().consume().expect("attributes"));
     });
 }
