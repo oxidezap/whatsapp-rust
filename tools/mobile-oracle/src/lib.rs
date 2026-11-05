@@ -5,6 +5,11 @@
 //! Signature and provenance fields record an operator's evidence and require
 //! independent review before any artifact can be treated as an official oracle.
 
+mod evidence;
+pub use evidence::{
+    ExtractionEvidence, ExtractionTool, SelectorChange, SelectorEvidence, VerifiedSelector,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Take};
@@ -37,6 +42,10 @@ pub struct ApkLock {
     /// This declaration is reviewed, not established by the integrity verifier.
     pub declared_installation_complete: bool,
     pub artifacts: Vec<Artifact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extractions: Vec<ExtractionEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selectors: Vec<SelectorEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -90,6 +99,7 @@ pub struct VerificationReport {
     pub authenticity: AuthenticityStatus,
     pub protocol_execution: ExecutionStatus,
     pub verified_artifacts: Vec<VerifiedArtifact>,
+    pub verified_selectors: Vec<VerifiedSelector>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -179,6 +189,11 @@ impl ApkLock {
             "invalid SDK range"
         );
         nonempty(&self.distribution_channel, "distribution_channel")?;
+        nonempty(&self.acquisition.source_url, "source_url")?;
+        ensure!(
+            !self.acquisition.source_url.chars().any(char::is_whitespace),
+            "acquisition URL must not contain whitespace"
+        );
         let origin =
             url::Url::parse(&self.acquisition.source_url).context("invalid acquisition URL")?;
         ensure!(
@@ -250,6 +265,7 @@ impl ApkLock {
             signature_report,
             "signature verification report must be a locked artifact"
         );
+        evidence::validate(self)?;
         Ok(())
     }
 }
@@ -337,6 +353,8 @@ pub struct DriftReport {
     pub before: SnapshotIdentity,
     pub after: SnapshotIdentity,
     pub artifact_changes: Vec<ArtifactChange>,
+    pub extraction_provenance_changed: bool,
+    pub selector_changes: Vec<SelectorChange>,
     pub protocol_execution: ExecutionStatus,
 }
 
@@ -375,6 +393,10 @@ pub fn compare_locks(before_path: &Path, after_path: &Path) -> Result<DriftRepor
     normalized_after
         .artifacts
         .sort_by(|a, b| a.path.cmp(&b.path));
+    evidence::normalize(&mut normalized_before);
+    evidence::normalize(&mut normalized_after);
+    let extraction_provenance_changed =
+        normalized_before.extractions != normalized_after.extractions;
     let declarations_changed = normalized_before != normalized_after;
     Ok(DriftReport {
         schema_version: 1,
@@ -384,8 +406,40 @@ pub fn compare_locks(before_path: &Path, after_path: &Path) -> Result<DriftRepor
         before: SnapshotIdentity::from(&before),
         after: SnapshotIdentity::from(&after),
         artifact_changes,
+        extraction_provenance_changed,
+        selector_changes: evidence::selector_changes(&before, &after),
         protocol_execution: ExecutionStatus::NotRun,
     })
+}
+
+fn open_artifact(root: &Path, artifact: &Artifact) -> Result<File> {
+    let path = root
+        .join(&artifact.path)
+        .canonicalize()
+        .with_context(|| format!("resolving artifact {}", artifact.path))?;
+    ensure!(
+        path.starts_with(root),
+        "artifact escapes root: {}",
+        artifact.path
+    );
+    ensure!(
+        std::fs::metadata(&path)?.is_file(),
+        "artifact is not a regular file: {}",
+        artifact.path
+    );
+    let file = File::open(path).with_context(|| format!("opening artifact {}", artifact.path))?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file(),
+        "artifact is not a regular file: {}",
+        artifact.path
+    );
+    ensure!(
+        metadata.len() == artifact.size_bytes,
+        "artifact size mismatch: {}",
+        artifact.path
+    );
+    Ok(file)
 }
 
 /// Verify all declared artifacts under one local root with bounded streaming.
@@ -401,33 +455,7 @@ pub fn verify(lock_path: &Path, artifact_root: &Path) -> Result<VerificationRepo
     ensure!(root.is_dir(), "artifact root must be a directory");
     let mut verified_artifacts = Vec::with_capacity(lock.artifacts.len());
     for artifact in &lock.artifacts {
-        let path = root
-            .join(&artifact.path)
-            .canonicalize()
-            .with_context(|| format!("resolving artifact {}", artifact.path))?;
-        ensure!(
-            path.starts_with(&root),
-            "artifact escapes root: {}",
-            artifact.path
-        );
-        ensure!(
-            std::fs::metadata(&path)?.is_file(),
-            "artifact is not a regular file: {}",
-            artifact.path
-        );
-        let file =
-            File::open(path).with_context(|| format!("opening artifact {}", artifact.path))?;
-        let metadata = file.metadata()?;
-        ensure!(
-            metadata.is_file(),
-            "artifact is not a regular file: {}",
-            artifact.path
-        );
-        ensure!(
-            metadata.len() == artifact.size_bytes,
-            "artifact size mismatch: {}",
-            artifact.path
-        );
+        let file = open_artifact(&root, artifact)?;
         let (size_bytes, sha256) = hash_reader(&mut file.take(artifact.size_bytes + 1))?;
         if size_bytes != artifact.size_bytes || sha256 != artifact.sha256 {
             bail!("artifact digest/size mismatch: {}", artifact.path);
@@ -438,6 +466,7 @@ pub fn verify(lock_path: &Path, artifact_root: &Path) -> Result<VerificationRepo
             sha256,
         });
     }
+    let verified_selectors = evidence::verify_selectors(&lock, &root)?;
     verified_artifacts.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(VerificationReport {
         schema_version: 1,
@@ -446,6 +475,7 @@ pub fn verify(lock_path: &Path, artifact_root: &Path) -> Result<VerificationRepo
         authenticity: AuthenticityStatus::RequiresIndependentReview,
         protocol_execution: ExecutionStatus::NotRun,
         verified_artifacts,
+        verified_selectors,
     })
 }
 
@@ -503,6 +533,8 @@ mod tests {
             },
             declared_installation_complete: true,
             artifacts,
+            extractions: Vec::new(),
+            selectors: Vec::new(),
         };
         (dir, lock)
     }
@@ -669,6 +701,151 @@ mod tests {
         lock.acquisition.acquired_at_utc = "2026-11-04T22:00:00Z".into();
         lock.min_sdk = lock.target_sdk + 1;
         assert!(lock.validate().is_err());
+    }
+
+    fn extraction_fixture() -> (TempDir, ApkLock) {
+        let (dir, mut lock) = fixture();
+        let data = b"synthetic-header:method-body:synthetic-tail";
+        fs::write(dir.path().join("classes.dex"), data).unwrap();
+        lock.artifacts.push(Artifact {
+            path: "classes.dex".into(),
+            kind: ArtifactKind::Dex,
+            size_bytes: data.len() as u64,
+            sha256: hex::encode(Sha256::digest(data)),
+        });
+        lock.extractions.push(ExtractionEvidence {
+            output_path: "classes.dex".into(),
+            input_apk_path: "base.apk".into(),
+            input_apk_sha256: lock.artifacts[0].sha256.clone(),
+            archive_member: "classes.dex".into(),
+            tool: ExtractionTool {
+                name: "synthetic-extractor".into(),
+                version: "1".into(),
+                artifact_sha256: "33".repeat(32),
+                arguments: vec!["base.apk".into()],
+            },
+        });
+        lock.selectors.push(SelectorEvidence {
+            id: "synthetic-method".into(),
+            artifact_path: "classes.dex".into(),
+            offset_bytes: 17,
+            size_bytes: 11,
+            sha256: hex::encode(Sha256::digest(&data[17..28])),
+            rationale: "Synthetic byte range only; no real DEX method or protocol behavior".into(),
+        });
+        (dir, lock)
+    }
+
+    #[test]
+    fn verifies_exact_selector_bytes_without_claiming_method_execution() {
+        let (dir, lock) = extraction_fixture();
+        let path = write_lock(&dir, &lock);
+        let report = verify(&path, dir.path()).unwrap();
+        assert_eq!(report.verified_selectors.len(), 1);
+        assert_eq!(
+            report.verified_selectors[0].sha256,
+            lock.selectors[0].sha256
+        );
+        assert_eq!(report.protocol_execution, ExecutionStatus::NotRun);
+    }
+
+    #[test]
+    fn rejects_stale_selector_fingerprint_even_when_whole_file_hash_matches() {
+        let (dir, mut lock) = extraction_fixture();
+        lock.selectors[0].sha256 = "44".repeat(32);
+        let path = write_lock(&dir, &lock);
+        let error = verify(&path, dir.path()).unwrap_err();
+        assert!(error.to_string().contains("selector fingerprint mismatch"));
+    }
+
+    #[test]
+    fn rejects_selector_overflow_out_of_bounds_and_index_only_evidence() {
+        for (offset, size) in [(u64::MAX, 1), (0, 1000), (0, 0)] {
+            let (_, mut lock) = extraction_fixture();
+            lock.selectors[0].offset_bytes = offset;
+            lock.selectors[0].size_bytes = size;
+            assert!(lock.validate().is_err());
+        }
+        let (_, mut lock) = extraction_fixture();
+        lock.selectors[0].sha256.clear();
+        assert!(lock.validate().is_err());
+        let (_, mut lock) = extraction_fixture();
+        lock.selectors[0].rationale.clear();
+        assert!(lock.validate().is_err());
+    }
+
+    #[test]
+    fn requires_lineage_for_derived_files_and_rejects_stale_source_or_tool_hash() {
+        let (_, mut lock) = extraction_fixture();
+        lock.extractions.clear();
+        assert!(lock.validate().is_err());
+        let (_, mut lock) = extraction_fixture();
+        lock.extractions[0].input_apk_sha256 = "55".repeat(32);
+        assert!(lock.validate().is_err());
+        let (_, mut lock) = extraction_fixture();
+        lock.extractions[0].tool.artifact_sha256 = "missing".into();
+        assert!(lock.validate().is_err());
+        let (_, mut lock) = extraction_fixture();
+        lock.extractions[0].archive_member = "../classes.dex".into();
+        assert!(lock.validate().is_err());
+    }
+
+    #[test]
+    fn reports_selector_and_tool_drift_without_artifact_changes() {
+        let (dir, lock) = extraction_fixture();
+        let before = write_lock(&dir, &lock);
+        let mut after = lock.clone();
+        after.selectors[0].rationale = "Changed analysis requires requalification".into();
+        after.extractions[0].tool.version = "2".into();
+        let after_path = dir.path().join("after.lock.json");
+        fs::write(&after_path, serde_json::to_vec(&after).unwrap()).unwrap();
+        let report = compare_locks(&before, &after_path).unwrap();
+        assert!(report.declarations_changed);
+        assert!(report.extraction_provenance_changed);
+        assert_eq!(report.selector_changes.len(), 1);
+        assert!(report.artifact_changes.is_empty());
+        assert_eq!(report.protocol_execution, ExecutionStatus::NotRun);
+    }
+
+    #[test]
+    fn evidence_record_order_is_not_semantic_drift() {
+        let (dir, mut lock) = extraction_fixture();
+        let mut second_artifact = lock.artifacts[2].clone();
+        second_artifact.path = "classes2.dex".into();
+        lock.artifacts.push(second_artifact);
+        let mut second_extraction = lock.extractions[0].clone();
+        second_extraction.output_path = "classes2.dex".into();
+        second_extraction.archive_member = "classes2.dex".into();
+        lock.extractions.push(second_extraction);
+        let mut second_selector = lock.selectors[0].clone();
+        second_selector.id = "other-method".into();
+        second_selector.artifact_path = "classes2.dex".into();
+        lock.selectors.push(second_selector);
+        let before = write_lock(&dir, &lock);
+        lock.extractions.reverse();
+        lock.selectors.reverse();
+        let after = dir.path().join("reordered-evidence.lock.json");
+        fs::write(&after, serde_json::to_vec(&lock).unwrap()).unwrap();
+        let report = compare_locks(&before, &after).unwrap();
+        assert!(!report.declarations_changed);
+        assert!(!report.extraction_provenance_changed);
+        assert!(report.selector_changes.is_empty());
+    }
+
+    #[test]
+    fn rejects_hidden_controls_in_provenance_url_before_url_normalization() {
+        let (_, mut lock) = fixture();
+        for source in [
+            "https://example.invalid/\nartifact",
+            " https://example.invalid/artifact",
+            "https://example.invalid/artifact ",
+        ] {
+            lock.acquisition.source_url = source.into();
+            assert!(
+                lock.validate().is_err(),
+                "accepted nonliteral URL {source:?}"
+            );
+        }
     }
 
     #[cfg(unix)]

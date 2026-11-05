@@ -6,6 +6,54 @@ The mobile protocol core remains independent of the runtime, filesystem,
 network, APK tools, Android and this verifier. Host tooling is not a portability
 qualification for whatsapp-rust-bridge, browser WASM or ESP32.
 
+## Acquire the first snapshot without running the application
+
+The official consumer Android download entry is
+[WhatsApp for Android](https://www.whatsapp.com/download/android). The older
+[Android URL](https://www.whatsapp.com/android) redirects there. Its "Download
+WhatsApp directly" link points to an APK on `scontent.whatsapp.net`; that CDN
+address may include an expiring signed query. Treat the landing page as the
+source reference and the downloaded bytes/hash as the snapshot identity. Do
+not paste a signed CDN query into a lock or assume the current URL pins a
+historical version. This source does not establish Business or iOS coverage.
+
+The smallest user action that unblocks this work is to download the original
+APK through that official button and make the file available in the workspace
+through an approved file-transfer path. No account, installation, execution or
+local SDK setup is needed for that handoff. Do not copy an expiring CDN query into shared logs or the lock;
+record the landing-page URL. The verification steps below can be performed on
+the received file. Do not re-sign or modify it.
+
+The capture qualification path is:
+
+1. On a machine permitted to access the official page/CDN, download through
+   that page into a fresh capture directory. Preserve the original file.
+   Downloading is enough for static work; do not install, launch or register.
+2. With a pinned Android SDK Build Tools installation, run
+   `apksigner verify --verbose --print-certs base.apk`, retain its output and
+   require a successful exit status. Independently review the signer digest
+   and rotation evidence against a trusted reference. Signature validity alone
+   is not an authenticity decision.
+3. Use the pinned SDK's `apkanalyzer apk summary base.apk` and manifest commands
+   to obtain package/version/SDK metadata. Inspect the contained native
+   libraries to select the intended ABI. If acquiring an already installed
+   authorized package instead, preserve its complete base/split set; do not
+   infer completeness from one exported APK.
+4. Compute file hashes/sizes, fill the lock with acquisition conditions and
+   signer evidence, then run the local verifier. Keep raw artifacts in approved
+   local/private storage; do not upload the APK or decompiled code by default.
+
+No APK has been acquired or executed to validate this process in this workstream.
+The Web lookup confirmed the official download page and APK link, but the Web
+fetcher rejected the binary content type. If the selected executor's network
+policy does not allow the official origin/CDN, request the supported policy
+change or bring in an operator-acquired capture. Do not unset proxies, switch
+to an unofficial mirror or otherwise route around the policy. There is no need
+to contact registration endpoints, send SMS or use an account for these steps.
+
+Tool references: [apksigner](https://developer.android.com/tools/apksigner) and
+[apkanalyzer](https://developer.android.com/tools/apkanalyzer).
+
 ## Verify a local snapshot
 
 ```sh
@@ -88,7 +136,7 @@ reviewed capture data and computed hashes before running verification.
 Other artifact kinds are `split_apk`, `dex`, `native_library` and `resources`.
 Paths are relative to the supplied artifact root, use forward slashes and must
 not contain traversal or URI/drive syntax. Acquisition URLs must be HTTPS and
-contain no credentials, query or fragment. Do not put account information,
+contain no whitespace, controls, credentials, query or fragment. Do not put account information,
 access tokens, OTPs, PINs, session files or signing secrets in any capture.
 
 Before accepting an official snapshot, independently verify base/split
@@ -105,6 +153,67 @@ DEX; use Ghidra or equivalent for JNI/ELF. Record the ELF build-id as additional
 analysis metadata, never as a substitute for SHA-256. Avoid redistributing APKs
 or decompiled proprietary code by default. Acquisition and storage permissions
 need their own review for the actual channel and jurisdiction.
+
+## Extraction provenance and byte-range selectors
+
+A base/split-only lock can omit `extractions` and `selectors`. Any declared
+DEX, native-library or resource artifact must carry one extraction record
+referencing its locked source APK, the same source hash, the original archive
+member and the extractor name/version/distribution hash/arguments. These are
+operator declarations, not proof that a tool ran or that its output follows
+from the source ZIP entry. The verifier does not execute extractors or inspect
+ZIP ancestry. Record command arguments without credentials or session data.
+
+Selectors can only reference locked derived artifacts. Each selector requires
+a unique ID, file offset, nonempty byte length, SHA-256 and an explanation of
+the call-path/guard analysis. The verifier checks the actual selected bytes
+with bounded streaming after verifying the complete artifact. Offsets are
+file offsets, never runtime addresses or function indices. A fingerprint
+match establishes byte identity only; it does not establish that the range is
+a function, that a guard is active or that any behavior was executed.
+
+Example optional records, with placeholders requiring real reviewed values:
+
+```json
+{
+  "extractions": [
+    {
+      "output_path": "classes.dex",
+      "input_apk_path": "base.apk",
+      "input_apk_sha256": "<same hash as locked base.apk>",
+      "archive_member": "classes.dex",
+      "tool": {
+        "name": "<extractor>",
+        "version": "<exact version>",
+        "artifact_sha256": "<tool distribution SHA-256>",
+        "arguments": ["<exact non-secret arguments>"]
+      }
+    }
+  ],
+  "selectors": [
+    {
+      "id": "<analysis-local stable ID>",
+      "artifact_path": "classes.dex",
+      "offset_bytes": 1,
+      "size_bytes": 1,
+      "sha256": "<selected byte-range SHA-256>",
+      "rationale": "<callers, guards, locator and why this exact range matters>"
+    }
+  ]
+}
+```
+
+Add `classes.dex` to `artifacts` with kind `dex` and its own complete file
+hash/size. The examples do not identify any real WhatsApp function. Missing
+lineage, a stale source hash, missing/invalid tool metadata, unsafe archive
+members, unknown selector artifacts, overflow/out-of-bounds ranges and stale
+range hashes fail. There are at most 4096 extraction and 4096 selector
+records, with an additional aggregate selector-read budget of 4 GiB.
+
+`diff` reports selector changes and extraction-provenance changes separately
+from whole-artifact changes. A tool or analysis change is visible even when
+output bytes did not change. Reordering records is not semantic drift. The
+command does not requalify selectors, execute code or update expectations.
 
 ## Executable oracle qualification
 
