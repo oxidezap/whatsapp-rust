@@ -6,13 +6,15 @@
 //! independent review before any artifact can be treated as an official oracle.
 
 mod evidence;
+mod zip_lineage;
 pub use evidence::{
-    ExtractionEvidence, ExtractionTool, SelectorChange, SelectorEvidence, VerifiedSelector,
+    ExtractionEvidence, ExtractionMode, ExtractionStatus, ExtractionTool, ExtractionVerification,
+    SelectorChange, SelectorEvidence, VerifiedSelector,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{Read, Take};
+use std::io::Read;
 use std::path::{Component, Path};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -100,6 +102,7 @@ pub struct VerificationReport {
     pub protocol_execution: ExecutionStatus,
     pub verified_artifacts: Vec<VerifiedArtifact>,
     pub verified_selectors: Vec<VerifiedSelector>,
+    pub extraction_verifications: Vec<ExtractionVerification>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -270,7 +273,7 @@ impl ApkLock {
     }
 }
 
-fn hash_reader(reader: &mut Take<File>) -> Result<(u64, String)> {
+fn hash_reader(reader: &mut impl Read) -> Result<(u64, String)> {
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 16 * 1024];
     let mut count = 0_u64;
@@ -467,6 +470,7 @@ pub fn verify(lock_path: &Path, artifact_root: &Path) -> Result<VerificationRepo
         });
     }
     let verified_selectors = evidence::verify_selectors(&lock, &root)?;
+    let extraction_verifications = zip_lineage::verify(&lock, &root)?;
     verified_artifacts.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(VerificationReport {
         schema_version: 1,
@@ -476,6 +480,7 @@ pub fn verify(lock_path: &Path, artifact_root: &Path) -> Result<VerificationRepo
         protocol_execution: ExecutionStatus::NotRun,
         verified_artifacts,
         verified_selectors,
+        extraction_verifications,
     })
 }
 
@@ -718,6 +723,7 @@ mod tests {
             input_apk_path: "base.apk".into(),
             input_apk_sha256: lock.artifacts[0].sha256.clone(),
             archive_member: "classes.dex".into(),
+            mode: ExtractionMode::OperatorDeclared,
             tool: ExtractionTool {
                 name: "synthetic-extractor".into(),
                 version: "1".into(),
@@ -747,6 +753,199 @@ mod tests {
             lock.selectors[0].sha256
         );
         assert_eq!(report.protocol_execution, ExecutionStatus::NotRun);
+        assert_eq!(
+            report.extraction_verifications[0].status,
+            ExtractionStatus::OperatorDeclared
+        );
+    }
+
+    fn raw_member_fixture(method: zip::CompressionMethod) -> (TempDir, ApkLock) {
+        use std::io::{Cursor, Write};
+        let (dir, mut lock) = extraction_fixture();
+        let output = fs::read(dir.path().join("classes.dex")).unwrap();
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive
+            .start_file(
+                "classes.dex",
+                zip::write::SimpleFileOptions::default().compression_method(method),
+            )
+            .unwrap();
+        archive.write_all(&output).unwrap();
+        let bytes = archive.finish().unwrap().into_inner();
+        replace_source_apk(&dir, &mut lock, &bytes);
+        lock.extractions[0].mode = ExtractionMode::ArchiveMember;
+        (dir, lock)
+    }
+
+    fn replace_source_apk(dir: &TempDir, lock: &mut ApkLock, bytes: &[u8]) {
+        fs::write(dir.path().join("base.apk"), bytes).unwrap();
+        lock.artifacts[0].size_bytes = bytes.len() as u64;
+        lock.artifacts[0].sha256 = hex::encode(Sha256::digest(bytes));
+        lock.extractions[0].input_apk_sha256 = lock.artifacts[0].sha256.clone();
+    }
+
+    #[test]
+    fn verifies_stored_and_deflated_member_ancestry_without_execution() {
+        for method in [
+            zip::CompressionMethod::Stored,
+            zip::CompressionMethod::Deflated,
+        ] {
+            let (dir, lock) = raw_member_fixture(method);
+            let report = verify(&write_lock(&dir, &lock), dir.path()).unwrap();
+            assert_eq!(
+                report.extraction_verifications[0].status,
+                ExtractionStatus::ArchiveMemberVerified
+            );
+            assert_eq!(report.protocol_execution, ExecutionStatus::NotRun);
+            assert_eq!(
+                report.authenticity,
+                AuthenticityStatus::RequiresIndependentReview
+            );
+        }
+    }
+
+    #[test]
+    fn extraction_mode_defaults_to_declared_and_mode_drift_is_visible() {
+        let (dir, lock) = extraction_fixture();
+        let mut value = serde_json::to_value(&lock).unwrap();
+        value["extractions"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("mode");
+        let path = dir.path().join("old.json");
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(
+            verify(&path, dir.path()).unwrap().extraction_verifications[0].status,
+            ExtractionStatus::OperatorDeclared
+        );
+        let mut changed = lock;
+        changed.extractions[0].mode = ExtractionMode::ArchiveMember;
+        let diff = compare_locks(&path, &write_lock(&dir, &changed)).unwrap();
+        assert!(diff.extraction_provenance_changed);
+        assert!(diff.artifact_changes.is_empty());
+        assert!(verify(&write_lock(&dir, &changed), dir.path()).is_err());
+    }
+
+    #[test]
+    fn raw_ancestry_rejects_transformed_bytes_and_missing_member() {
+        let (dir, mut lock) = raw_member_fixture(zip::CompressionMethod::Stored);
+        lock.selectors.clear();
+        let replacement = b"different artifact with self-consistent locked digest";
+        fs::write(dir.path().join("classes.dex"), replacement).unwrap();
+        lock.artifacts[2].size_bytes = replacement.len() as u64;
+        lock.artifacts[2].sha256 = hex::encode(Sha256::digest(replacement));
+        assert!(verify(&write_lock(&dir, &lock), dir.path()).is_err());
+        lock.extractions[0].archive_member = "missing.dex".into();
+        assert!(verify(&write_lock(&dir, &lock), dir.path()).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_zip_members_before_parser_inventory_collapses_them() {
+        let (dir, mut lock) = raw_member_fixture(zip::CompressionMethod::Stored);
+        let bytes = fs::read(dir.path().join("base.apk")).unwrap();
+        let end = bytes.len() - 22;
+        let start = u32::from_le_bytes(bytes[end + 16..end + 20].try_into().unwrap()) as usize;
+        let central = bytes[start..end].to_vec();
+        let mut duplicated = bytes[..end].to_vec();
+        duplicated.extend_from_slice(&central);
+        duplicated.extend_from_slice(&bytes[end..]);
+        let end = duplicated.len() - 22;
+        duplicated[end + 8..end + 10].copy_from_slice(&2_u16.to_le_bytes());
+        duplicated[end + 10..end + 12].copy_from_slice(&2_u16.to_le_bytes());
+        duplicated[end + 12..end + 16].copy_from_slice(&(2 * central.len() as u32).to_le_bytes());
+        replace_source_apk(&dir, &mut lock, &duplicated);
+        let error = verify(&write_lock(&dir, &lock), dir.path()).unwrap_err();
+        assert!(error.to_string().contains("duplicate APK ZIP member"));
+    }
+
+    #[test]
+    fn rejects_unsupported_metadata_and_mismatched_local_headers() {
+        for variant in 0..5 {
+            let (dir, mut lock) = raw_member_fixture(zip::CompressionMethod::Stored);
+            let mut bytes = fs::read(dir.path().join("base.apk")).unwrap();
+            let end = bytes.len() - 22;
+            match variant {
+                0 => bytes[end + 4..end + 6].copy_from_slice(&1_u16.to_le_bytes()),
+                1 => bytes[end + 10..end + 12].copy_from_slice(&u16::MAX.to_le_bytes()),
+                2 => {
+                    bytes[end + 12..end + 16].copy_from_slice(&(17_u32 * 1024 * 1024).to_le_bytes())
+                }
+                3 => bytes[8..10].copy_from_slice(&8_u16.to_le_bytes()),
+                _ => bytes.extend_from_slice(b"trailing bytes"),
+            }
+            replace_source_apk(&dir, &mut lock, &bytes);
+            assert!(
+                verify(&write_lock(&dir, &lock), dir.path()).is_err(),
+                "accepted malformed variant {variant}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_member_crc_must_match_even_when_source_hash_is_locked() {
+        let (dir, mut lock) = raw_member_fixture(zip::CompressionMethod::Stored);
+        let mut bytes = fs::read(dir.path().join("base.apk")).unwrap();
+        let end = bytes.len() - 22;
+        let central = u32::from_le_bytes(bytes[end + 16..end + 20].try_into().unwrap()) as usize;
+        bytes[14..18].copy_from_slice(&0_u32.to_le_bytes());
+        bytes[central + 16..central + 20].copy_from_slice(&0_u32.to_le_bytes());
+        replace_source_apk(&dir, &mut lock, &bytes);
+        assert!(verify(&write_lock(&dir, &lock), dir.path()).is_err());
+    }
+
+    #[test]
+    fn rejects_encrypted_unsupported_and_nonregular_members() {
+        for variant in 0..3 {
+            let (dir, mut lock) = raw_member_fixture(zip::CompressionMethod::Stored);
+            let mut bytes = fs::read(dir.path().join("base.apk")).unwrap();
+            let end = bytes.len() - 22;
+            let central =
+                u32::from_le_bytes(bytes[end + 16..end + 20].try_into().unwrap()) as usize;
+            match variant {
+                0 => {
+                    bytes[6..8].copy_from_slice(&1_u16.to_le_bytes());
+                    bytes[central + 8..central + 10].copy_from_slice(&1_u16.to_le_bytes());
+                }
+                1 => {
+                    bytes[8..10].copy_from_slice(&12_u16.to_le_bytes());
+                    bytes[central + 10..central + 12].copy_from_slice(&12_u16.to_le_bytes());
+                }
+                _ => {
+                    bytes[central + 5] = 3;
+                    bytes[central + 38..central + 42]
+                        .copy_from_slice(&(0o120777_u32 << 16).to_le_bytes());
+                }
+            }
+            replace_source_apk(&dir, &mut lock, &bytes);
+            assert!(
+                verify(&write_lock(&dir, &lock), dir.path()).is_err(),
+                "accepted unsupported variant {variant}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_apk_signing_block_gap_without_interpreting_or_authenticating_it() {
+        let (dir, mut lock) = raw_member_fixture(zip::CompressionMethod::Stored);
+        let bytes = fs::read(dir.path().join("base.apk")).unwrap();
+        let end = bytes.len() - 22;
+        let central = u32::from_le_bytes(bytes[end + 16..end + 20].try_into().unwrap()) as usize;
+        let gap = b"synthetic signing block placeholder, not a valid APK signature";
+        let mut modified = bytes[..central].to_vec();
+        modified.extend_from_slice(gap);
+        modified.extend_from_slice(&bytes[central..]);
+        let end = modified.len() - 22;
+        modified[end + 16..end + 20].copy_from_slice(&((central + gap.len()) as u32).to_le_bytes());
+        replace_source_apk(&dir, &mut lock, &modified);
+        let report = verify(&write_lock(&dir, &lock), dir.path()).unwrap();
+        assert_eq!(
+            report.extraction_verifications[0].status,
+            ExtractionStatus::ArchiveMemberVerified
+        );
+        assert_eq!(
+            report.authenticity,
+            AuthenticityStatus::RequiresIndependentReview
+        );
     }
 
     #[test]
@@ -756,6 +955,33 @@ mod tests {
         let path = write_lock(&dir, &lock);
         let error = verify(&path, dir.path()).unwrap_err();
         assert!(error.to_string().contains("selector fingerprint mismatch"));
+    }
+
+    #[test]
+    fn decoded_member_cannot_expand_past_the_locked_output() {
+        use std::io::{Cursor, Write};
+        let (dir, mut lock) = raw_member_fixture(zip::CompressionMethod::Deflated);
+        lock.selectors.clear();
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive
+            .start_file(
+                "classes.dex",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated),
+            )
+            .unwrap();
+        archive.write_all(&vec![0; 1024 * 1024]).unwrap();
+        let mut bytes = archive.finish().unwrap().into_inner();
+        let end = bytes.len() - 22;
+        let central = u32::from_le_bytes(bytes[end + 16..end + 20].try_into().unwrap()) as usize;
+        // Lie consistently in both headers. The decoder must still be bounded.
+        bytes[22..26].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[central + 24..central + 28].copy_from_slice(&1_u32.to_le_bytes());
+        replace_source_apk(&dir, &mut lock, &bytes);
+        fs::write(dir.path().join("classes.dex"), [0]).unwrap();
+        lock.artifacts[2].size_bytes = 1;
+        lock.artifacts[2].sha256 = hex::encode(Sha256::digest([0]));
+        assert!(verify(&write_lock(&dir, &lock), dir.path()).is_err());
     }
 
     #[test]

@@ -117,8 +117,9 @@ Artifacts are streamed with a 16 KiB read buffer. The verifier caps a lock at
 
 A successful verification means that the declared files have the expected bytes.
 It does not establish APK authenticity, lawful acquisition, completeness of an
-installation, the relation between extracted files and their APK, or protocol
-conformance. Reports always state `authenticity: requires_independent_review`
+installation or protocol conformance. Raw archive-member verification can establish
+the byte relation described below; transformed outputs retain declared provenance.
+Reports always state `authenticity: requires_independent_review`
 and `protocol_execution: not_run`. Neither status can be promoted by editing a
 lock. Synthetic tests are explicitly fabricated; no official APK is included.
 
@@ -189,7 +190,8 @@ digests against a trusted reference and record rotations. The locked report
 records this evidence; the Rust verifier does not invoke apksigner or validate
 its output. An APK can have a valid signature from an untrusted signer.
 Review package/version/ABI metadata with `apkanalyzer` and compare it with the
-lock. The verifier currently validates declarations, not APK ZIP contents.
+lock. Acquisition metadata remains declared; opt-in raw ZIP-member checks do not
+parse or authenticate the Android manifest or signing block.
 
 Preserve original bytes, extraction tool versions/options and hashes for every
 output. Use JADX/baksmali as navigation aids, confirming relevant decisions in
@@ -203,10 +205,28 @@ need their own review for the actual channel and jurisdiction.
 A base/split-only lock can omit `extractions` and `selectors`. Any declared
 DEX, native-library or resource artifact must carry one extraction record
 referencing its locked source APK, the same source hash, the original archive
-member and the extractor name/version/distribution hash/arguments. These are
-operator declarations, not proof that a tool ran or that its output follows
-from the source ZIP entry. The verifier does not execute extractors or inspect
-ZIP ancestry. Record command arguments without credentials or session data.
+member and the extractor name/version/distribution hash/arguments. The default
+`operator_declared` mode records provenance without proving that a tool ran or
+that its output follows from the source entry. Use it for transformed outputs.
+Record command arguments without credentials or session data.
+
+Set `mode` to `archive_member` only for an exact decoded copy of a ZIP member.
+The verifier reads that member from the locked APK and compares its streamed
+size and SHA-256 with the locked derived artifact. Successful reports distinguish
+`archive_member_verified` from `operator_declared`. No files are unpacked and no
+extractor or APK code runs. This establishes raw byte ancestry, not tool
+execution, manifest authenticity, signature validity or behavioral equivalence.
+
+The raw-member path supports stored and deflated members in classic,
+single-disk ZIP archives, including the gap used by an APK signing block.
+ZIP64, multi-disk, ambiguous directory records and duplicate member names fail
+explicitly. Selected members must be unencrypted and use a supported compression
+method. The preflight bounds central
+and aggregate local metadata at 16 MiB each, with at most 65534 entries before
+invoking the ZIP parser. Decoded names have a separate 64 MiB budget. Selected
+compressed bytes and decoded output have separate aggregate budgets of 4 GiB.
+This is a deliberately bounded archive profile, not qualification of every APK
+distribution format. Preserve original base/splits and report unsupported inputs.
 
 Selectors can only reference locked derived artifacts. Each selector requires
 a unique ID, file offset, nonempty byte length, SHA-256 and an explanation of
@@ -226,6 +246,7 @@ Example optional records, with placeholders requiring real reviewed values:
       "input_apk_path": "base.apk",
       "input_apk_sha256": "<same hash as locked base.apk>",
       "archive_member": "classes.dex",
+      "mode": "archive_member",
       "tool": {
         "name": "<extractor>",
         "version": "<exact version>",

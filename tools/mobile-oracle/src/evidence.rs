@@ -23,7 +23,33 @@ pub struct ExtractionEvidence {
     pub input_apk_sha256: String,
     /// Path inside the source APK archive, not a host filesystem destination.
     pub archive_member: String,
+    /// Raw archive bytes can be checked; transformed output remains declared provenance.
+    #[serde(default)]
+    pub mode: ExtractionMode,
     pub tool: ExtractionTool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtractionMode {
+    #[default]
+    OperatorDeclared,
+    ArchiveMember,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExtractionVerification {
+    pub output_path: String,
+    pub input_apk_path: String,
+    pub archive_member: String,
+    pub status: ExtractionStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtractionStatus {
+    OperatorDeclared,
+    ArchiveMemberVerified,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
