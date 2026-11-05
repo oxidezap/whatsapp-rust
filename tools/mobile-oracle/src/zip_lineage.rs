@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
@@ -16,6 +16,47 @@ use crate::{
 const CENTRAL_LIMIT: u64 = 16 * 1024 * 1024;
 const EOCD_FIXED: usize = 22;
 const CENTRAL_FIXED: usize = 46;
+
+/// The ZIP parser sees only the validated classic end record, without its comment.
+/// Member and central-directory bytes are unchanged. Truncating the comment and
+/// zeroing its exposed length prevents recovery through unvalidated comment records.
+struct ValidatedZip {
+    file: File,
+    length: u64,
+    position: u64,
+}
+
+impl Read for ValidatedZip {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.position >= self.length || buffer.is_empty() {
+            return Ok(0);
+        }
+        let count = (self.length - self.position).min(buffer.len() as u64) as usize;
+        let read = if self.position < self.length - 2 {
+            let count = count.min((self.length - 2 - self.position) as usize);
+            self.file.seek(SeekFrom::Start(self.position))?;
+            self.file.read(&mut buffer[..count])?
+        } else {
+            buffer[..count].fill(0);
+            count
+        };
+        self.position += read as u64;
+        Ok(read)
+    }
+}
+
+impl Seek for ValidatedZip {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        let position = match from {
+            SeekFrom::Start(position) => Some(position),
+            SeekFrom::Current(delta) => self.position.checked_add_signed(delta),
+            SeekFrom::End(delta) => self.length.checked_add_signed(delta),
+        }
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid APK ZIP seek"))?;
+        self.position = position;
+        Ok(position)
+    }
+}
 
 fn u16_at(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
@@ -45,34 +86,42 @@ fn validate_extra(extra: &[u8]) -> Result<()> {
 
 /// Bound central metadata before the general ZIP parser allocates any records.
 /// This deliberately accepts classic single-disk ZIP only, not ZIP64 or SFX.
-fn preflight(file: &mut File) -> Result<(usize, u64)> {
+fn preflight(file: &mut File) -> Result<(usize, u64, u64)> {
     let length = file.metadata()?.len();
-    // Include the parser's entire EOCD search window and any preceding ZIP64 locator.
-    let tail_length = length.min((EOCD_FIXED + 65536 + 20) as u64) as usize;
+    let tail_length = length.min((EOCD_FIXED + u16::MAX as usize) as u64) as usize;
     ensure!(tail_length >= EOCD_FIXED, "APK ZIP end record is missing");
     file.seek(SeekFrom::End(-(tail_length as i64)))?;
     let mut tail = vec![0; tail_length];
     file.read_exact(&mut tail)?;
-    let offset = (0..=tail.len() - EOCD_FIXED)
-        .rev()
-        .find(|&at| {
-            tail[at..at + 4] == *b"PK\x05\x06"
-                && at + EOCD_FIXED + u16_at(&tail, at + 20) as usize == tail.len()
-        })
-        .context("APK ZIP end record is missing or has trailing bytes")?;
-    ensure!(
-        tail.windows(4)
-            .filter(|part| *part == b"PK\x05\x06")
-            .count()
-            == 1,
-        "unsupported ambiguous APK ZIP end records"
-    );
-    ensure!(
-        !tail
-            .windows(4)
-            .any(|part| part == b"PK\x06\x06" || part == b"PK\x06\x07"),
-        "unsupported ZIP64 APK metadata"
-    );
+    let mut selected = None;
+    for at in 0..=tail.len() - EOCD_FIXED {
+        let end = &tail[at..];
+        let position = length - tail_length as u64 + at as u64;
+        let central_size = u32_at(end, 12) as u64;
+        let central_start = u32_at(end, 16) as u64;
+        let count = u16_at(end, 10);
+        // A magic sequence in member data, signing blocks or comments is not
+        // an end record unless its fixed fields and physical bounds agree.
+        let candidate = end[..4] == *b"PK\x05\x06"
+            && at + EOCD_FIXED + u16_at(end, 20) as usize == tail.len()
+            && u16_at(end, 4) == 0
+            && u16_at(end, 6) == 0
+            && u16_at(end, 8) == count
+            && count != u16::MAX
+            && central_size != u32::MAX as u64
+            && central_start != u32::MAX as u64
+            && central_start.checked_add(central_size) == Some(position)
+            && count as u64 * CENTRAL_FIXED as u64 <= central_size
+            && (count > 0 || central_size == 0);
+        if candidate {
+            ensure!(
+                selected.is_none(),
+                "ambiguous structurally valid APK ZIP end records"
+            );
+            selected = Some(at);
+        }
+    }
+    let offset = selected.context("APK ZIP has no bounded classic single-disk end record")?;
     let end = &tail[offset..];
     ensure!(
         u16_at(end, 4) == 0 && u16_at(end, 6) == 0,
@@ -171,7 +220,11 @@ fn preflight(file: &mut File) -> Result<(usize, u64)> {
         "APK ZIP central directory has unparsed bytes"
     );
     file.seek(SeekFrom::Start(0))?;
-    Ok((count as usize, central_start))
+    Ok((
+        count as usize,
+        central_start,
+        eocd_start + EOCD_FIXED as u64,
+    ))
 }
 
 pub(crate) fn verify(lock: &ApkLock, root: &Path) -> Result<Vec<ExtractionVerification>> {
@@ -197,11 +250,16 @@ pub(crate) fn verify(lock: &ApkLock, root: &Path) -> Result<Vec<ExtractionVerifi
     for (input, extractions) in groups {
         let artifact = artifacts.get(input).context("missing locked source APK")?;
         let mut file = open_artifact(root, artifact)?;
-        let (count, central_start) = preflight(&mut file)?;
+        let (count, central_start, length) = preflight(&mut file)?;
         let config = zip::read::Config {
             archive_offset: zip::read::ArchiveOffset::Known(0),
         };
-        let mut archive = zip::ZipArchive::with_config(config, file).context("reading APK ZIP")?;
+        let view = ValidatedZip {
+            file,
+            length,
+            position: 0,
+        };
+        let mut archive = zip::ZipArchive::with_config(config, view).context("reading APK ZIP")?;
         ensure!(
             archive.len() == count && archive.central_directory_start() == central_start,
             "APK ZIP parser inventory differs from bounded preflight"

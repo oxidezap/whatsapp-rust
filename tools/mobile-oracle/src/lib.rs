@@ -949,6 +949,129 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_zip_magic_in_member_comment_and_signing_gap_is_not_metadata() {
+        use std::io::{Cursor, Write};
+        let magic = b"ordinary PK\x05\x06 and PK\x06\x06 and PK\x06\x07 bytes are data";
+        for region in 0..3 {
+            let (dir, mut lock) = raw_member_fixture(zip::CompressionMethod::Stored);
+            lock.selectors.clear();
+            let mut bytes = fs::read(dir.path().join("base.apk")).unwrap();
+            let end = bytes.len() - 22;
+            match region {
+                0 => {
+                    let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+                    archive
+                        .start_file(
+                            "classes.dex",
+                            zip::write::SimpleFileOptions::default()
+                                .compression_method(zip::CompressionMethod::Stored),
+                        )
+                        .unwrap();
+                    archive.write_all(magic).unwrap();
+                    bytes = archive.finish().unwrap().into_inner();
+                    fs::write(dir.path().join("classes.dex"), magic).unwrap();
+                    lock.artifacts[2].size_bytes = magic.len() as u64;
+                    lock.artifacts[2].sha256 = hex::encode(Sha256::digest(magic));
+                }
+                1 => {
+                    bytes[end + 20..end + 22].copy_from_slice(&(magic.len() as u16).to_le_bytes());
+                    bytes.extend_from_slice(magic);
+                }
+                _ => {
+                    let central =
+                        u32::from_le_bytes(bytes[end + 16..end + 20].try_into().unwrap()) as usize;
+                    bytes.splice(central..central, magic.iter().copied());
+                    let end = bytes.len() - 22;
+                    bytes[end + 16..end + 20]
+                        .copy_from_slice(&((central + magic.len()) as u32).to_le_bytes());
+                }
+            }
+            replace_source_apk(&dir, &mut lock, &bytes);
+            let report = verify(&write_lock(&dir, &lock), dir.path()).unwrap();
+            assert_eq!(
+                report.extraction_verifications[0].status,
+                ExtractionStatus::ArchiveMemberVerified
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_two_structurally_valid_end_records_instead_of_selecting_one() {
+        let (dir, mut lock) = raw_member_fixture(zip::CompressionMethod::Stored);
+        let mut bytes = fs::read(dir.path().join("base.apk")).unwrap();
+        let end = bytes.len() - 22;
+        bytes[end + 20..end + 22].copy_from_slice(&22_u16.to_le_bytes());
+        let mut other = [0; 22];
+        other[..4].copy_from_slice(b"PK\x05\x06");
+        other[16..20].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&other);
+        replace_source_apk(&dir, &mut lock, &bytes);
+        let error = verify(&write_lock(&dir, &lock), dir.path()).unwrap_err();
+        assert!(error.to_string().contains("ambiguous structurally valid"));
+    }
+
+    #[test]
+    fn unvalidated_comment_end_and_zip64_records_never_reach_the_zip_parser() {
+        let (dir, mut lock) = raw_member_fixture(zip::CompressionMethod::Stored);
+        let mut bytes = fs::read(dir.path().join("base.apk")).unwrap();
+        let end = bytes.len() - 22;
+        let mut comment = Vec::new();
+        comment.extend_from_slice(b"PK\x06\x06");
+        comment.extend_from_slice(&u64::MAX.to_le_bytes());
+        comment.extend_from_slice(&[0; 44]);
+        comment.extend_from_slice(b"PK\x06\x07");
+        comment.extend_from_slice(&[0; 16]);
+        let mut other = [0; 22];
+        other[..4].copy_from_slice(b"PK\x05\x06");
+        other[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
+        other[10..12].copy_from_slice(&u16::MAX.to_le_bytes());
+        other[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        other[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        comment.extend_from_slice(&other);
+        bytes[end + 20..end + 22].copy_from_slice(&(comment.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&comment);
+        replace_source_apk(&dir, &mut lock, &bytes);
+        let report = verify(&write_lock(&dir, &lock), dir.path()).unwrap();
+        assert_eq!(
+            report.extraction_verifications[0].status,
+            ExtractionStatus::ArchiveMemberVerified
+        );
+    }
+
+    #[test]
+    fn rejects_a_structural_zip64_footer_before_the_general_parser() {
+        let (dir, mut lock) = raw_member_fixture(zip::CompressionMethod::Stored);
+        let bytes = fs::read(dir.path().join("base.apk")).unwrap();
+        let end = bytes.len() - 22;
+        let central_size = u32::from_le_bytes(bytes[end + 12..end + 16].try_into().unwrap()) as u64;
+        let central_start =
+            u32::from_le_bytes(bytes[end + 16..end + 20].try_into().unwrap()) as u64;
+        let mut modified = bytes[..end].to_vec();
+        let zip64_position = modified.len() as u64;
+        modified.extend_from_slice(b"PK\x06\x06");
+        modified.extend_from_slice(&44_u64.to_le_bytes());
+        modified.extend_from_slice(&45_u16.to_le_bytes());
+        modified.extend_from_slice(&45_u16.to_le_bytes());
+        modified.extend_from_slice(&[0; 8]);
+        modified.extend_from_slice(&1_u64.to_le_bytes());
+        modified.extend_from_slice(&1_u64.to_le_bytes());
+        modified.extend_from_slice(&central_size.to_le_bytes());
+        modified.extend_from_slice(&central_start.to_le_bytes());
+        modified.extend_from_slice(b"PK\x06\x07");
+        modified.extend_from_slice(&0_u32.to_le_bytes());
+        modified.extend_from_slice(&zip64_position.to_le_bytes());
+        modified.extend_from_slice(&1_u32.to_le_bytes());
+        let mut legacy = bytes[end..].to_vec();
+        legacy[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
+        legacy[10..12].copy_from_slice(&u16::MAX.to_le_bytes());
+        legacy[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        legacy[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        modified.extend_from_slice(&legacy);
+        replace_source_apk(&dir, &mut lock, &modified);
+        assert!(verify(&write_lock(&dir, &lock), dir.path()).is_err());
+    }
+
+    #[test]
     fn rejects_stale_selector_fingerprint_even_when_whole_file_hash_matches() {
         let (dir, mut lock) = extraction_fixture();
         lock.selectors[0].sha256 = "44".repeat(32);
