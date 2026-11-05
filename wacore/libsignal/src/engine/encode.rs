@@ -9,6 +9,12 @@ use crate::engine::state::{
 
 trait Encodable {
     fn encode<S: Sink>(&self, sink: &mut S);
+
+    fn encoded_len(&self) -> usize {
+        let mut sink = CountSink::default();
+        self.encode(&mut sink);
+        sink.0
+    }
 }
 
 trait Sink {
@@ -42,9 +48,16 @@ trait Sink {
 struct CountSink(usize);
 
 fn encoded_len<M: Encodable + ?Sized>(message: &M) -> usize {
-    let mut sink = CountSink::default();
-    message.encode(&mut sink);
-    sink.0
+    message.encoded_len()
+}
+
+#[inline]
+fn varint_len(value: u64) -> usize {
+    if value < 128 {
+        1
+    } else {
+        (u64::BITS - value.leading_zeros()).div_ceil(7) as usize
+    }
 }
 
 impl Sink for CountSink {
@@ -54,11 +67,7 @@ impl Sink for CountSink {
 
     #[inline]
     fn varint(&mut self, value: u64) {
-        self.0 += if value < 128 {
-            1
-        } else {
-            (u64::BITS - value.leading_zeros()).div_ceil(7) as usize
-        };
+        self.0 += varint_len(value);
     }
 
     fn message<M: Encodable + ?Sized>(&mut self, field: u32, message: &M) {
@@ -102,6 +111,11 @@ impl Sink for VecSink<'_> {
 }
 
 impl Encodable for DerivedMessageKey {
+    fn encoded_len(&self) -> usize {
+        // Three one-byte tags and lengths, followed by fixed-size key material.
+        2 + 32 + 2 + 32 + 2 + 16
+    }
+
     fn encode<S: Sink>(&self, sink: &mut S) {
         sink.bytes(2, &self.cipher);
         sink.bytes(3, &self.mac);
@@ -110,6 +124,16 @@ impl Encodable for DerivedMessageKey {
 }
 
 impl Encodable for MessageKey {
+    fn encoded_len(&self) -> usize {
+        let material_len = match self {
+            // Local field 100 has a two-byte tag; its seed is always 32 bytes.
+            Self::Seed { .. } => 3 + 32,
+            Self::Derived { material, .. } => material.encoded_len(),
+            Self::Stored { material, .. } => material.material.encoded_len() + 3 + 32,
+        };
+        1 + varint_len(self.index().into()) + material_len
+    }
+
     fn encode<S: Sink>(&self, sink: &mut S) {
         sink.uint(1, self.index().into());
         match self {
@@ -251,6 +275,10 @@ impl Encodable for SenderSigningKey<'_> {
 }
 
 impl Encodable for SenderMessageKey {
+    fn encoded_len(&self) -> usize {
+        1 + varint_len(self.iteration.into()) + 2 + 32
+    }
+
     fn encode<S: Sink>(&self, sink: &mut S) {
         sink.uint(1, self.iteration.into());
         sink.bytes(2, &self.seed);
@@ -345,6 +373,50 @@ mod tests {
     use super::*;
     use crate::engine::{RustCrypto, codec};
     use std::collections::VecDeque;
+
+    #[test]
+    fn key_lengths_match_encoded_bytes_at_every_counter_boundary() {
+        use crate::engine::state::StoredMessageKey;
+        let mut indexes = vec![0, 1, u32::MAX];
+        for shift in (7..32).step_by(7) {
+            let boundary = 1_u32 << shift;
+            indexes.extend([boundary - 1, boundary, boundary + 1]);
+        }
+        for index in indexes {
+            let material = DerivedMessageKey {
+                cipher: [11; 32],
+                mac: [12; 32],
+                iv: [13; 16],
+            };
+            let keys = [
+                MessageKey::Seed {
+                    index,
+                    seed: [14; 32],
+                },
+                MessageKey::Derived {
+                    index,
+                    material: Box::new(material.clone()),
+                },
+                MessageKey::Stored {
+                    index,
+                    material: std::sync::Arc::new(StoredMessageKey::new(material, [15; 32])),
+                },
+            ];
+            for key in keys {
+                let mut out = vec![0xaa];
+                key.encode(&mut VecSink(&mut out));
+                assert_eq!(encoded_len(&key), out.len() - 1);
+                assert_eq!(out[0], 0xaa);
+            }
+            let key = SenderMessageKey {
+                iteration: index,
+                seed: [16; 32],
+            };
+            let mut out = Vec::new();
+            key.encode(&mut VecSink(&mut out));
+            assert_eq!(encoded_len(&key), out.len());
+        }
+    }
 
     #[test]
     fn varint_sinks_match_the_schema_reference_at_all_boundaries() {

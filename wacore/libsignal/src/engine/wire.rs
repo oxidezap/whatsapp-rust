@@ -30,9 +30,20 @@ impl<'a> Fields<'a> {
         }
         Ok(Self { bytes })
     }
+    #[inline]
     fn varint(&mut self) -> Result<u64> {
-        let mut value = 0;
-        for i in 0..10 {
+        let (&first, rest) = self
+            .bytes
+            .split_first()
+            .ok_or(Error::Encoding("truncated varint"))?;
+        self.bytes = rest;
+        if first < 128 {
+            return Ok(u64::from(first));
+        }
+        self.varint_tail(u64::from(first & 127))
+    }
+    fn varint_tail(&mut self, mut value: u64) -> Result<u64> {
+        for i in 1..10 {
             let (&byte, rest) = self
                 .bytes
                 .split_first()
@@ -205,20 +216,39 @@ impl SignalMessage {
         previous_counter: u32,
         ciphertext_len: usize,
     ) -> Vec<u8> {
-        let mut out = Vec::with_capacity(
-            1 + bytes_len(1, 33)
-                + uint_len(2, counter)
-                + uint_len(3, previous_counter)
-                + bytes_len(4, ciphertext_len)
-                + 8,
+        let mut out =
+            Vec::with_capacity(Self::encoded_len(counter, previous_counter, ciphertext_len));
+        Self::write_prefix(
+            &mut out,
+            version,
+            ratchet,
+            counter,
+            previous_counter,
+            ciphertext_len,
         );
-        out.push((version << 4) | 3);
-        bytes(&mut out, 1, &tagged_key(ratchet));
-        uint(&mut out, 2, counter.into());
-        uint(&mut out, 3, previous_counter.into());
-        varint(&mut out, (4 << 3) | 2);
-        varint(&mut out, ciphertext_len as u64);
         out
+    }
+    pub(crate) fn encoded_len(counter: u32, previous_counter: u32, ciphertext_len: usize) -> usize {
+        1 + bytes_len(1, 33)
+            + uint_len(2, counter)
+            + uint_len(3, previous_counter)
+            + bytes_len(4, ciphertext_len)
+            + 8
+    }
+    pub(crate) fn write_prefix(
+        out: &mut Vec<u8>,
+        version: u8,
+        ratchet: &[u8; 32],
+        counter: u32,
+        previous_counter: u32,
+        ciphertext_len: usize,
+    ) {
+        out.push((version << 4) | 3);
+        bytes(out, 1, &tagged_key(ratchet));
+        uint(out, 2, counter.into());
+        uint(out, 3, previous_counter.into());
+        varint(out, (4 << 3) | 2);
+        varint(out, ciphertext_len as u64);
     }
     pub fn encode(&self) -> Vec<u8> {
         self.encode_with_version(3)
@@ -246,11 +276,17 @@ impl PreKeySignalMessage {
         self.encode_with_version(3)
     }
     pub fn encode_with_version(&self, version: u8) -> Vec<u8> {
+        let mut out = self.prefix(version, self.message.len());
+        out.extend_from_slice(&self.message);
+        self.write_suffix(&mut out);
+        out
+    }
+    pub(crate) fn prefix(&self, version: u8, message_len: usize) -> Vec<u8> {
         let mut out = Vec::with_capacity(
             1 + self.pre_key_id.map_or(0, |id| uint_len(1, id))
                 + bytes_len(2, 33)
                 + bytes_len(3, 33)
-                + bytes_len(4, self.message.len())
+                + bytes_len(4, message_len)
                 + uint_len(5, self.registration)
                 + uint_len(6, self.signed_pre_key_id),
         );
@@ -260,10 +296,13 @@ impl PreKeySignalMessage {
         }
         bytes(&mut out, 2, &tagged_key(&self.base_key));
         bytes(&mut out, 3, &tagged_key(&self.identity));
-        bytes(&mut out, 4, &self.message);
-        uint(&mut out, 5, self.registration.into());
-        uint(&mut out, 6, self.signed_pre_key_id.into());
+        varint(&mut out, (4 << 3) | 2);
+        varint(&mut out, message_len as u64);
         out
+    }
+    pub(crate) fn write_suffix(&self, out: &mut Vec<u8>) {
+        uint(out, 5, self.registration.into());
+        uint(out, 6, self.signed_pre_key_id.into());
     }
     pub fn decode(input: &[u8]) -> Result<Self> {
         Ok(PreKeySignalMessageView::decode(input)?.to_owned())
@@ -510,6 +549,58 @@ impl<'a> SenderKeyMessageView<'a> {
 mod borrowed_tests {
     use super::*;
     #[test]
+    fn varint_fast_path_preserves_values_errors_and_consumed_bytes() {
+        fn reference(input: &mut &[u8]) -> Result<u64> {
+            let mut value = 0;
+            for i in 0..10 {
+                let (&byte, rest) = input
+                    .split_first()
+                    .ok_or(Error::Encoding("truncated varint"))?;
+                *input = rest;
+                if i == 9 && byte > 1 {
+                    return Err(Error::Encoding("varint overflow"));
+                }
+                value |= u64::from(byte & 127) << (7 * i);
+                if byte & 128 == 0 {
+                    return Ok(value);
+                }
+            }
+            Err(Error::Encoding("varint overflow"))
+        }
+        let mut cases = vec![vec![], vec![128; 10], vec![255; 11]];
+        for byte in 0..=255 {
+            cases.push(vec![byte]);
+            cases.push(vec![128, byte, 42]);
+            let mut longest = vec![128; 9];
+            longest.extend([byte, 42]);
+            cases.push(longest);
+        }
+        for bit in 0..64 {
+            for value in [
+                (1u64 << bit) - 1,
+                1u64 << bit,
+                (1u64 << bit).saturating_add(1),
+                u64::MAX,
+            ] {
+                let mut encoded = Vec::new();
+                varint(&mut encoded, value);
+                for len in 0..=encoded.len() {
+                    cases.push(encoded[..len].to_vec());
+                }
+                encoded.push(42);
+                cases.push(encoded);
+            }
+        }
+        for input in cases {
+            let mut old = input.as_slice();
+            let expected = reference(&mut old);
+            let mut fields = Fields::new(&input).unwrap();
+            assert_eq!(fields.varint(), expected, "input: {input:?}");
+            assert_eq!(fields.bytes, old, "input: {input:?}");
+        }
+    }
+
+    #[test]
     fn wire_serialization_contract_across_varint_boundaries() {
         use crate::core::{IdentityKey, PublicKey};
         use sha2::{Digest, Sha256};
@@ -673,6 +764,60 @@ mod borrowed_tests {
         let mut encoded = distribution.encode();
         encoded[0] = 0x43;
         assert_eq!(SenderKeyDistribution::decode(&encoded), Err(Error::Version));
+    }
+
+    #[test]
+    fn streamed_prekey_matches_nested_encoding_without_growing_the_buffer() {
+        for version in [3, 4] {
+            for pre_key_id in [None, Some(0), Some(127), Some(128), Some(u32::MAX)] {
+                for len in [0, 16, 127, 128, 16384] {
+                    let signal = SignalMessage {
+                        ratchet: [9; 32],
+                        counter: u32::MAX,
+                        previous_counter: 128,
+                        ciphertext: vec![3; len],
+                        mac: [4; 8],
+                    };
+                    let inner = signal.encode_with_version(version);
+                    let wrapper = PreKeySignalMessage {
+                        registration: u32::MAX,
+                        pre_key_id,
+                        signed_pre_key_id: 128,
+                        base_key: [8; 32],
+                        identity: [7; 32],
+                        message: inner.clone(),
+                    };
+                    // Independent field-by-field reference for the original envelope order.
+                    let mut expected = vec![(version << 4) | 3];
+                    if let Some(id) = pre_key_id {
+                        uint(&mut expected, 1, id.into());
+                    }
+                    bytes(&mut expected, 2, &tagged_key(&wrapper.base_key));
+                    bytes(&mut expected, 3, &tagged_key(&wrapper.identity));
+                    bytes(&mut expected, 4, &inner);
+                    uint(&mut expected, 5, wrapper.registration.into());
+                    uint(&mut expected, 6, wrapper.signed_pre_key_id.into());
+                    assert_eq!(wrapper.encode_with_version(version), expected);
+                    let mut streamed = wrapper.prefix(version, inner.len());
+                    let capacity = streamed.capacity();
+                    let start = streamed.len();
+                    SignalMessage::write_prefix(
+                        &mut streamed,
+                        version,
+                        &signal.ratchet,
+                        signal.counter,
+                        signal.previous_counter,
+                        signal.ciphertext.len(),
+                    );
+                    streamed.extend_from_slice(&signal.ciphertext);
+                    streamed.extend_from_slice(&signal.mac);
+                    assert_eq!(&streamed[start..], inner);
+                    wrapper.write_suffix(&mut streamed);
+                    assert_eq!(streamed, expected);
+                    assert_eq!(streamed.capacity(), capacity);
+                }
+            }
+        }
     }
 
     fn inside(input: &[u8], part: &[u8]) -> bool {
