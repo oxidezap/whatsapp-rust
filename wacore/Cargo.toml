@@ -135,6 +135,10 @@ name = "reporting_token_benchmark"
 harness = false
 
 [[bench]]
+name = "usync_response_benchmark"
+harness = false
+
+[[bench]]
 name = "send_receive_benchmark"
 harness = false
 
