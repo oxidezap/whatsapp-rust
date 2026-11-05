@@ -18,6 +18,102 @@ use whatsapp_rust::mobile::{
     RegistrationWorkflow, TcpEndpoint,
 };
 
+#[cfg(feature = "mobile-ports")]
+#[path = "mobile_runtime_fixture.rs"]
+pub mod runtime_fixture;
+
+/// Execute the public SDK configuration and payload APIs without selecting I/O.
+pub fn exercise_login_payload() -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::Arc;
+    use whatsapp_rust::mobile::{
+        MobileAppVersion, MobileDevice, MobileLoginOptions, MobileLoginProfile,
+        MobileNoisePrologue, MobilePlatform, MobileSessionError,
+    };
+    use whatsapp_rust::{
+        MobileEphemeralKeyProvider, PrimaryDeviceIdentityPolicy, RegisteredMobileSession,
+    };
+
+    struct NoConnectionEntropy;
+    impl MobileEphemeralKeyProvider for NoConnectionEntropy {
+        fn generate(&self) -> Result<wacore::libsignal::protocol::KeyPair, MobileSessionError> {
+            Err(MobileSessionError::InvalidKeyMaterial)
+        }
+    }
+
+    let profile = MobileLoginProfile::new(
+        MobilePlatform::Android,
+        MobileAppVersion::parse("2.26.1.7")?,
+        MobileDevice::builder()
+            .manufacturer("Synthetic".into())
+            .device("Fixture".into())
+            .os_version("15".into())
+            .os_build_number("fixture-build".into())
+            .phone_id("synthetic-installation".into())
+            .locale_language("en".into())
+            .locale_country("ZZ".into())
+            .build(),
+    )?;
+    let options = MobileLoginOptions::builder()
+        .device(0)
+        .passive(false)
+        .pull(false)
+        .build()
+        .with_session_id(Some(42))
+        .with_connect_attempt_count(Some(3))
+        .with_login_counter(Some(7));
+    let payload = profile.build_payload(99910000000, &options)?;
+    assert_eq!(payload.username, Some(99910000000));
+    assert_eq!(payload.device, Some(0));
+    assert_eq!(payload.session_id, Some(42));
+    assert_eq!(payload.connect_attempt_count, Some(3));
+    assert_eq!(payload.lc, Some(7));
+    assert_eq!(payload.passive, Some(false));
+    assert_eq!(payload.pull, Some(false));
+    assert!(payload.web_info.is_unset());
+    let encoded = profile.encode_payload(99910000000, &options)?;
+    let session = RegisteredMobileSession::new(
+        mock_environment(4443)?,
+        profile,
+        options,
+        99910000000,
+        RegistrationIdentity::from_public_keys(&[3; 32], &[4; 32]),
+        MobileNoisePrologue::new(3),
+        Arc::new(NoConnectionEntropy),
+    )?
+    .with_primary_identity_policy(PrimaryDeviceIdentityPolicy::Omit);
+    assert_eq!(session.encode_payload()?, encoded);
+    Ok(())
+}
+
+/// Cross-target crypto golden generated independently with Node and RFC 7748 keys.
+/// The fixed secrets and fictitious telephone fields are for this probe only.
+pub fn exercise_registration_envelope() -> Result<(), Box<dyn std::error::Error>> {
+    use whatsapp_rust::mobile::registration_wire::{
+        EphemeralRegistrationKey, RegistrationWireError,
+    };
+
+    fn bytes(value: &str) -> Result<[u8; 32], std::num::ParseIntError> {
+        let mut result = [0; 32];
+        for (index, byte) in result.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)?;
+        }
+        Ok(result)
+    }
+    let secret = bytes("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")?;
+    let recipient = bytes("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")?;
+    let envelope =
+        EphemeralRegistrationKey::from_bytes(secret).seal(&recipient, b"cc=999&in=10000000")?;
+    assert_eq!(
+        envelope.encoded(),
+        "hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmqzyqIiPBXyIaX7wcy1xwrck5Lj4_ZPR5frJIN2D73fK7Or"
+    );
+    assert!(matches!(
+        EphemeralRegistrationKey::from_bytes([3; 32]).seal(&[0; 32], b"cc=999"),
+        Err(RegistrationWireError::InvalidServerKey)
+    ));
+    Ok(())
+}
+
 pub fn mock_environment(port: u16) -> Result<MobileEnvironment, MobileConfigurationError> {
     MobileEnvironment::new(
         "isolated-mobile-fixture",
@@ -57,6 +153,19 @@ mod tests {
     use whatsapp_rust::mobile::{
         RegistrationError, RegistrationOperation, RegistrationOutcome, RegistrationStage,
     };
+
+    #[test]
+    fn public_mobile_payload_and_crypto_execute_without_native_ports() {
+        exercise_login_payload().expect("synthetic public configuration");
+        exercise_registration_envelope().expect("independent synthetic vector");
+    }
+
+    #[cfg(feature = "mobile-ports")]
+    #[test]
+    fn registration_uses_only_supplied_host_ports() {
+        futures::executor::block_on(runtime_fixture::exercise_durable_registration())
+            .expect("synthetic registration and durable restore");
+    }
 
     #[test]
     fn persisted_attempt_does_not_resend_or_cross_environments() {

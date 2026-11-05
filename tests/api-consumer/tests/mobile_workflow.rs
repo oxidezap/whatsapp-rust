@@ -1,8 +1,9 @@
 #![cfg(target_arch = "wasm32")]
 
-//! Browser execution of the portable policy through the downstream SDK export.
-//! Outcomes and durability acknowledgements are synthetic host inputs; these
-//! tests do not open a transport, execute an APK or access a persistent store.
+//! Browser execution of portable mobile policy, payloads, crypto and supplied SDK ports.
+//! Replies and accounts are synthetic. Tests use only an in-memory persistence
+//! port, with no transport, APK, filesystem database or real SMS. A backend reload
+//! does not qualify process-crash persistence or server acceptance.
 
 use api_consumer::mobile::{bind_state, mock_environment, workflow};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -13,6 +14,23 @@ use whatsapp_rust::mobile::{
 };
 
 wasm_bindgen_test_configure!(run_in_browser);
+
+#[wasm_bindgen_test]
+fn browser_executes_public_mobile_payload_and_configuration() {
+    api_consumer::mobile::exercise_login_payload().expect("synthetic login profile");
+}
+
+#[wasm_bindgen_test]
+fn browser_registration_envelope_matches_independent_crypto_vector() {
+    api_consumer::mobile::exercise_registration_envelope().expect("RFC7748/Node envelope vector");
+}
+
+#[wasm_bindgen_test]
+async fn browser_registration_persists_identity_through_supplied_ports() {
+    api_consumer::mobile::runtime_fixture::exercise_durable_registration()
+        .await
+        .expect("synthetic SDK registration and durable restore");
+}
 
 fn identity() -> RegistrationIdentity {
     RegistrationIdentity::from_public_keys(&[3; 32], &[4; 32])

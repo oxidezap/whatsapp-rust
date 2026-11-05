@@ -2116,6 +2116,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "smallvec",
+ "subtle",
  "thiserror",
  "tokio",
  "wacore",

@@ -97,6 +97,11 @@ that outcome is unknown. A process restart cannot recover a lost HTTP response
 and must not resend it automatically. Expose a registered account only after
 its identity and workflow state are durable.
 
+## Companion hosting
+
+Use [mobile_primary.md](mobile_primary.md) for QR/code approval, proof confirmation,
+index publication, bootstrap/history dispatch and durable recovery contracts.
+
 ## Checks
 
 Run focused tests without real accounts or network services:

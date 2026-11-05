@@ -12,6 +12,8 @@ use whatsapp_rust::mobile::{
 };
 
 fn exercise() -> Result<RegistrationStage, Box<dyn std::error::Error>> {
+    api_consumer::mobile::exercise_login_payload()?;
+    api_consumer::mobile::exercise_registration_envelope()?;
     let environment = mock_environment(4443)?;
     let state = bind_state(&environment, black_box(7_u32));
     assert_eq!(*state.get(&environment)?, 7);
