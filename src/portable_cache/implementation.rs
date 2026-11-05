@@ -1561,11 +1561,14 @@ where
         let mut guard = self.inner.write().await;
         match &mut *guard {
             Storage::Plain(inner) => {
-                let (next, result) = update(inner.get(key));
+                // The closure cannot yield while this write guard is held,
+                // so the entry stays valid through publication.
+                let current = inner.get_mut(key);
+                let (next, result) = update(current.as_deref());
                 let Some(next) = next else {
                     return result;
                 };
-                if let Some(slot) = inner.get_mut(key) {
+                if let Some(slot) = current {
                     *slot = next;
                 } else if self.capacity_limit() != Some(0) {
                     inner.insert_new(key.to_owned(), next);
@@ -1573,19 +1576,21 @@ where
                 result
             }
             Storage::Managed(inner) => {
-                if inner
-                    .get(key)
+                let mut current = inner.get_mut(key);
+                if current
+                    .as_ref()
                     .is_some_and(|entry| self.is_expired(entry, now))
                 {
+                    current = None;
                     inner.remove_key(key);
                 }
 
-                let (next, result) = update(inner.get(key).map(|entry| &entry.value));
+                let (next, result) = update(current.as_ref().map(|entry| &entry.value));
                 let Some(next) = next else {
                     return result;
                 };
 
-                if let Some(entry) = inner.get_mut(key) {
+                if let Some(entry) = current {
                     entry.value = next;
                     entry.inserted_at = now;
                     entry.last_accessed_at = now;
