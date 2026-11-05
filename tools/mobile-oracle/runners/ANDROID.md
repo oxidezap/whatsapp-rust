@@ -148,3 +148,5 @@ unqualified. Neither Android evidence nor JVM agreement qualifies iOS, ESP32 or
 an application's complete mobile API.
 
 The next independently scoped probes cover [original Superpack extraction and Curve25519 JNI](PROTOCOL.md). They add a bounded native crypto comparison while retaining the application/session limits above.
+
+A separate [registration field-format probe](REGISTRATION_FORM.md) exercises the original builder/formatter offline with all byte values and synthetic UTF-8 text; it does not invoke HTTP or registration.

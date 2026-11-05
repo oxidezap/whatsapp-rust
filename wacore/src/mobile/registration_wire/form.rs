@@ -3,6 +3,13 @@ use zeroize::Zeroizing;
 
 use super::{FIELD_LIMIT, FORM_LIMIT, RegistrationWireError};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ByteEncoding {
+    EveryByte,
+    Rfc3986,
+    FormText,
+}
+
 /// References differ on Signal-field padding; select it explicitly per profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Base64Padding {
@@ -89,12 +96,52 @@ impl RegistrationForm {
         name: &str,
         value: &[u8],
     ) -> Result<(), RegistrationWireError> {
+        self.push_encoded_bytes(name, value, ByteEncoding::EveryByte)
+    }
+
+    /// Encode raw bytes using RFC 3986's unreserved set and uppercase escapes.
+    /// Select this explicitly when the reference profile preserves unreserved
+    /// bytes; `push_percent_bytes` continues to escape every byte.
+    pub fn push_rfc3986_bytes(
+        &mut self,
+        name: &str,
+        value: &[u8],
+    ) -> Result<(), RegistrationWireError> {
+        self.push_encoded_bytes(name, value, ByteEncoding::Rfc3986)
+    }
+
+    /// Encode UTF-8 text as an application/x-www-form-urlencoded value.
+    /// Spaces become `+`, `*` remains literal and `~` is escaped. The result is
+    /// already encoded and must not pass through another form encoder.
+    pub fn push_form_text(&mut self, name: &str, value: &str) -> Result<(), RegistrationWireError> {
+        self.push_encoded_bytes(name, value.as_bytes(), ByteEncoding::FormText)
+    }
+
+    fn push_encoded_bytes(
+        &mut self,
+        name: &str,
+        value: &[u8],
+        encoding: ByteEncoding,
+    ) -> Result<(), RegistrationWireError> {
         if value.len() > FORM_LIMIT / 3 {
             return Err(RegistrationWireError::SizeLimit);
         }
         const HEX: &[u8; 16] = b"0123456789ABCDEF";
         let mut encoded = Zeroizing::new(String::with_capacity(value.len() * 3));
         for &byte in value {
+            let literal = match encoding {
+                ByteEncoding::EveryByte => false,
+                ByteEncoding::Rfc3986 => byte.is_ascii_alphanumeric() || b"-._~".contains(&byte),
+                ByteEncoding::FormText => byte.is_ascii_alphanumeric() || b"-._*".contains(&byte),
+            };
+            if literal {
+                encoded.push(char::from(byte));
+                continue;
+            }
+            if encoding == ByteEncoding::FormText && byte == b' ' {
+                encoded.push('+');
+                continue;
+            }
             encoded.push('%');
             encoded.push(HEX[(byte >> 4) as usize] as char);
             encoded.push(HEX[(byte & 15) as usize] as char);
@@ -168,6 +215,17 @@ impl Default for RegistrationForm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicit_text_and_byte_policies_do_not_double_encode() {
+        let mut form = RegistrationForm::new();
+        form.push_percent_bytes("legacy", b"A ~*+").unwrap();
+        form.push_rfc3986_bytes("bytes", b"A ~*+").unwrap();
+        form.push_form_text("text", "A ~*+é").unwrap();
+        assert_eq!(
+            &*form.encode(&[]).unwrap(),
+            "legacy=%41%20%7E%2A%2B&bytes=A%20~%2A%2B&text=A+%7E*%2B%C3%A9"
+        );
+    }
     #[test]
     fn order_padding_percent_and_empty_values_are_preserved() {
         let mut form = RegistrationForm::new();
