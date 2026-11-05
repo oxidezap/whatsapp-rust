@@ -1,5 +1,7 @@
 //! Matched CPU/allocation workloads, with explicit ports for retired adapter methods.
-use crate::prefetch_pair::{cargo_codspeed_version, full_sha, revision};
+use crate::prefetch_pair::{
+    cargo_codspeed_version, ensure_locked_dependencies, full_sha, revision,
+};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -284,8 +286,10 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
             for target_bench in benches {
                 command.args(["--bench", target_bench]);
             }
+            command.args(["--", "--locked"]);
             run(&mut command)?;
         }
+        ensure_locked_dependencies(&checkout)?;
         artifacts.push(Artifact {
             role: role.to_owned(),
             revision: sha.to_owned(),
@@ -342,6 +346,7 @@ pub fn measure(root: &Path, output: &Path) -> Result<()> {
             revision(&artifact.checkout)? == artifact.revision,
             "Signal comparison revision changed"
         );
+        ensure_locked_dependencies(&artifact.checkout)?;
         let package = artifact.checkout.join(PACKAGE);
         for (file, expected) in [
             (WORKLOAD, &manifest.workload_sha256),

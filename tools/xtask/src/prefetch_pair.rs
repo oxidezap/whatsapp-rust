@@ -72,6 +72,18 @@ pub(super) fn full_sha(sha: &str) -> Result<()> {
     );
     Ok(())
 }
+pub(super) fn ensure_locked_dependencies(checkout: &Path) -> Result<()> {
+    let committed = capture(
+        Command::new("git")
+            .current_dir(checkout)
+            .args(["show", "HEAD:Cargo.lock"]),
+    )?;
+    ensure!(
+        std::fs::read(checkout.join("Cargo.lock"))? == committed.stdout,
+        "paired Cargo.lock differs from its committed revision"
+    );
+    Ok(())
+}
 fn version_response(code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> Result<String> {
     let text = format!(
         "{}{}",
@@ -411,7 +423,10 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
                 &item.address_bench,
                 "--bench",
                 &item.sdk_bench,
+                "--",
+                "--locked",
             ]))?;
+        ensure_locked_dependencies(&item.checkout)?;
     }
     write_json(
         &output.join("results/manifest.json"),
@@ -466,6 +481,7 @@ pub fn measure(root: &Path, output: &Path) -> Result<()> {
             revision(&item.checkout)? == item.sha,
             "paired revision changed after building"
         );
+        ensure_locked_dependencies(&item.checkout)?;
         ensure!(
             sha256(&std::fs::read(item.checkout.join(BENCH))?) == manifest.benchmark_sha256,
             "prefetch workload changed after building"
@@ -510,6 +526,40 @@ pub fn measure(root: &Path, output: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn paired_dependencies_reject_both_unstaged_and_staged_lock_changes() {
+        let checkout = tempfile::tempdir().unwrap();
+        run(Command::new("git")
+            .current_dir(checkout.path())
+            .args(["init", "-q"]))
+        .unwrap();
+        let lock = checkout.path().join("Cargo.lock");
+        write(&lock, b"version = 4\n").unwrap();
+        run(Command::new("git")
+            .current_dir(checkout.path())
+            .args(["add", "Cargo.lock"]))
+        .unwrap();
+        run(Command::new("git").current_dir(checkout.path()).args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "pin dependencies",
+        ]))
+        .unwrap();
+        ensure_locked_dependencies(checkout.path()).unwrap();
+        write(&lock, b"version = 4\n# changed dependency resolution\n").unwrap();
+        assert!(ensure_locked_dependencies(checkout.path()).is_err());
+        run(Command::new("git")
+            .current_dir(checkout.path())
+            .args(["add", "Cargo.lock"]))
+        .unwrap();
+        assert!(ensure_locked_dependencies(checkout.path()).is_err());
+        write(&lock, b"version = 4\n").unwrap();
+        ensure_locked_dependencies(checkout.path()).unwrap();
+    }
     const SOURCE: &str = include_str!("../../../benches/appstate_prefetch.rs");
     #[test]
     fn version_probe_accepts_only_the_pinned_response() {
