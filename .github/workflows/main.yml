@@ -119,6 +119,10 @@ jobs:
     name: Build & Test
     # Keep ALSA-dependent builds on a fixed Ubuntu LTS release.
     runs-on: ubuntu-24.04
+    # Retain backtraces while keeping workspace test artifacts within runner disk limits.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "1"
+      CARGO_PROFILE_TEST_DEBUG: "1"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -237,6 +241,11 @@ jobs:
     name: Build & Lint (all features)
     # Keep ALSA-dependent builds on a fixed Ubuntu LTS release.
     runs-on: ubuntu-24.04
+    # The all-targets build filled the hosted runner's disk on a cold cache.
+    # Retain limited debug info for backtraces; keep assertions and optimization defaults.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "1"
+      CARGO_PROFILE_TEST_DEBUG: "1"
     # Runs on every PR (no voip path filter): the voip-gated code is scattered across the client,
     # handler, send and stanza layers, so enumerating its files in a path filter kept leaking. The
     # webrtc/opus tree compiles once and is cached (sccache), so the steady-state cost is the
