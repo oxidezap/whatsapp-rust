@@ -17,9 +17,9 @@ source reference and the downloaded bytes/hash as the snapshot identity. Do
 not paste a signed CDN query into a lock or assume the current URL pins a
 historical version. This source does not establish Business or iOS coverage.
 
-The smallest user action that unblocks this work is to download the original
-APK through that official button and make the file available in the workspace
-through an approved file-transfer path. No account, installation, execution or
+For an operator handoff, download the original APK through that official
+button and make the file available in the workspace through an approved
+file-transfer path. No account, installation, execution or
 local SDK setup is needed for that handoff. Do not copy an expiring CDN query into shared logs or the lock;
 record the landing-page URL. The verification steps below can be performed on
 the received file. Do not re-sign or modify it.
@@ -44,11 +44,9 @@ The capture qualification path is:
    local/private storage; do not publish the APK or decompiled code in public
    repositories or releases by default.
 
-No APK has been acquired or executed to validate this process in this workstream.
-The Web lookup confirmed the official download page and APK link, but the Web
-fetcher rejected the binary content type. If the selected executor's network
-policy does not allow the official origin/CDN, request the supported policy
-change or bring in an operator-acquired capture. Do not unset proxies, switch
+If the selected executor's network policy does not allow the official
+origin/CDN, request the supported policy change or bring in an
+operator-acquired capture. Do not unset proxies, switch
 to an unofficial mirror or otherwise route around the policy. There is no need
 to contact registration endpoints, send SMS or use an account for these steps.
 
