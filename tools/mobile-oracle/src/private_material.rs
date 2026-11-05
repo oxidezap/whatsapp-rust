@@ -65,7 +65,19 @@ pub fn export_private_material(
     report: &crate::MaterialReport,
     material: &wacore::mobile::AndroidTokenMaterial,
 ) -> Result<PrivateExport> {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    export_private_material_with(repository, report, material, |file, bytes| {
+        file.write_all(bytes)?;
+        file.sync_all()
+    })
+}
+#[cfg(unix)]
+fn export_private_material_with(
+    repository: &Path,
+    report: &crate::MaterialReport,
+    material: &wacore::mobile::AndroidTokenMaterial,
+    write_and_sync: impl FnOnce(&mut fs::File, &[u8]) -> std::io::Result<()>,
+) -> Result<PrivateExport> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     hash(&report.lock_sha256)?;
     hash(&report.recipe_sha256)?;
     let root = repository.canonicalize()?;
@@ -109,14 +121,14 @@ pub fn export_private_material(
         certificates_hex: certificates.iter().map(hex::encode).collect(),
     };
     let bytes = Zeroizing::new(serde_json::to_vec(&envelope)?);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
+    // Keep failed writes private and unpublished. The same-directory no-clobber
+    // publication exposes only a complete synced file, and drop removes a failed
+    // temporary export so a retry can use the same provenance-bound final path.
+    let mut file = tempfile::NamedTempFile::new_in(&directory)?;
+    file.as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    write_and_sync(file.as_file_mut(), &bytes)?;
+    file.persist_noclobber(&path).map_err(|error| error.error)?;
     Ok(PrivateExport {
         path,
         sha256: hex::encode(Sha256::digest(&*bytes)),
@@ -180,9 +192,12 @@ pub fn import_private_material(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    #[test]
-    fn synthetic_private_roundtrip_binding_permissions_and_no_clobber() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
+
+    fn synthetic_inputs() -> (
+        tempfile::TempDir,
+        crate::MaterialReport,
+        wacore::mobile::AndroidTokenMaterial,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(".gitignore"), "/.cache/\n").unwrap();
         let material = wacore::mobile::AndroidTokenMaterial::from_derived(
@@ -206,6 +221,52 @@ mod tests {
             certificate_sha256: vec![],
             secret_exported: false,
         };
+        (dir, report, material)
+    }
+
+    #[test]
+    fn failed_partial_export_is_unpublished_and_retry_succeeds() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, report, material) = synthetic_inputs();
+        let private = dir.path().join(".cache/mobile-oracle/private");
+        let final_path = private.join(format!(
+            "{}-{}.json",
+            report.lock_sha256, report.recipe_sha256
+        ));
+        let Err(error) =
+            export_private_material_with(dir.path(), &report, &material, |file, bytes| {
+                assert_eq!(file.metadata()?.permissions().mode() & 0o777, 0o600);
+                file.write_all(&bytes[..37])?;
+                assert!(!final_path.exists());
+                Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+            })
+        else {
+            panic!("partial write must fail export");
+        };
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+        assert!(!final_path.exists());
+        assert_eq!(fs::read_dir(&private).unwrap().count(), 0);
+
+        let receipt = export_private_material(dir.path(), &report, &material).unwrap();
+        assert_eq!(receipt.path, final_path);
+        assert_eq!(fs::read_dir(&private).unwrap().count(), 1);
+        let restored = import_private_material(
+            &receipt.path,
+            &receipt.sha256,
+            &report.lock_sha256,
+            &report.recipe_sha256,
+        )
+        .unwrap();
+        assert_eq!(
+            restored.token_base64("01234").unwrap(),
+            material.token_base64("01234").unwrap()
+        );
+    }
+
+    #[test]
+    fn synthetic_private_roundtrip_binding_permissions_and_no_clobber() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let (dir, report, material) = synthetic_inputs();
         let receipt = export_private_material(dir.path(), &report, &material).unwrap();
         assert_eq!(
             fs::metadata(&receipt.path).unwrap().permissions().mode() & 0o777,
@@ -222,7 +283,16 @@ mod tests {
             restored.token_base64("01234").unwrap(),
             material.token_base64("01234").unwrap()
         );
+        let original = fs::read(&receipt.path).unwrap();
         assert!(export_private_material(dir.path(), &report, &material).is_err());
+        assert_eq!(fs::read(&receipt.path).unwrap(), original);
+        assert_eq!(
+            fs::read_dir(receipt.path.parent().unwrap())
+                .unwrap()
+                .count(),
+            1,
+            "failed publication must remove its temporary file"
+        );
         assert!(
             import_private_material(
                 &receipt.path,
