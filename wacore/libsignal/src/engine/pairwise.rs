@@ -169,7 +169,34 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
         let key = sender.step(self.crypto)?;
         let (cipher, mac, iv) = key.expanded(self.crypto)?;
         let ciphertext_len = super::crypto::cbc_ciphertext_len(plaintext.len())?;
-        let mut output = SignalMessage::prefix(
+        let wrapper = session
+            .pending_pre_key
+            .as_ref()
+            .map(|pending| PreKeySignalMessage {
+                registration: session.local_registration,
+                pre_key_id: pending.pre_key_id,
+                // Validate after encryption to preserve provider/error precedence.
+                signed_pre_key_id: pending.signed_pre_key_id.unwrap_or_default() as u32,
+                base_key: pending.base_key,
+                identity: session.local_identity,
+                message: Vec::new(),
+            });
+        let mut output = wrapper.as_ref().map_or_else(Vec::new, |wrapper| {
+            wrapper.prefix(
+                session.version as u8,
+                SignalMessage::encoded_len(key.index(), session.previous_counter, ciphertext_len),
+            )
+        });
+        let inner_start = output.len();
+        if wrapper.is_none() {
+            output.reserve(SignalMessage::encoded_len(
+                key.index(),
+                session.previous_counter,
+                ciphertext_len,
+            ));
+        }
+        SignalMessage::write_prefix(
+            &mut output,
             session.version as u8,
             &sender.ratchet,
             key.index(),
@@ -187,27 +214,22 @@ impl<C: CryptoProvider, R: RandomSource> Engine<'_, C, R> {
             &[
                 &wire::tagged_key(&session.local_identity),
                 &wire::tagged_key(&session.remote_identity),
-                &output,
+                &output[inner_start..],
             ],
         )?;
         output.extend_from_slice(&authentication[..8]);
         // Match the decoder budget: exclude the version byte and trailing MAC.
-        if output.len() - 9 > wire::MAX_MESSAGE_SIZE {
+        if output.len() - inner_start - 9 > wire::MAX_MESSAGE_SIZE {
             return Err(Error::Encoding("protobuf size limit"));
         }
         if let Some(pending) = &session.pending_pre_key {
             if pending.kyber_pre_key_id.is_some() || pending.kyber_ciphertext.is_some() {
                 return Err(Error::Version);
             }
-            output = PreKeySignalMessage {
-                registration: session.local_registration,
-                pre_key_id: pending.pre_key_id,
-                signed_pre_key_id: pending.signed_pre_key_id.ok_or(Error::MissingKey)? as u32,
-                base_key: pending.base_key,
-                identity: session.local_identity,
-                message: output,
+            pending.signed_pre_key_id.ok_or(Error::MissingKey)?;
+            if let Some(wrapper) = &wrapper {
+                wrapper.write_suffix(&mut output);
             }
-            .encode_with_version(session.version as u8);
             if output.len() - 1 > wire::MAX_MESSAGE_SIZE {
                 return Err(Error::Encoding("protobuf size limit"));
             }
