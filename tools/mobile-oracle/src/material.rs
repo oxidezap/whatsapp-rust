@@ -125,7 +125,7 @@ pub fn extract_material(
     ensure!(
         recipe.signatures.len() <= 32
             && (recipe.signatures.is_empty() != recipe.signing_block.is_none()),
-        "select exactly one of ordered v1 signature blocks or explicit v2/v3 scheme"
+        "select exactly one of ordered v1 signature blocks or explicit v2/v3/v3.1 scheme"
     );
     let mut components = Vec::new();
     let manifest = crate::apk_manifest::parse(&read(

@@ -17,6 +17,17 @@ source reference and the downloaded bytes/hash as the snapshot identity. Do
 not paste a signed CDN query into a lock or assume the current URL pins a
 historical version. This source does not establish Business or iOS coverage.
 
+The official `https://www.whatsapp.com/android/current/WhatsApp.apk` endpoint
+is another acquisition location. It is mutable, so record the final bytes,
+not an assumption that `current` will restore the same release later.
+For independent signer review, fetch
+`https://www.whatsapp.com/.well-known/assetlinks.json` separately and compare
+the `com.whatsapp` certificate SHA-256 fingerprints with apksigner's output.
+Preserve the reference hash and acquisition time privately. Check every
+SDK-specific signer and rotation result; do not assume a single signer applies
+to every Android version. The published association corroborates certificate
+ownership, while apksigner validates the acquired APK signature.
+
 For an operator handoff, download the original APK through that official
 button and make the file available in the workspace through an approved
 file-transfer path. No account, installation, execution or
