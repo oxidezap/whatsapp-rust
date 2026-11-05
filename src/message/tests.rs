@@ -2449,6 +2449,100 @@ async fn test_second_message_with_only_skmsg_decrypts() {
     client.clone().handle_incoming_message(message_node).await;
 }
 
+#[tokio::test]
+async fn migration_provider_failure_keeps_a_local_retry_reason_and_recovers() {
+    use crate::lid_pn_cache::{LearningSource, LidPnEntry};
+    use crate::test_utils::crypto::CountingCrypto;
+    use wacore::runtime::CryptoRuntime;
+
+    for opening in [
+        RetryReason::NoSession,
+        RetryReason::BadMac,
+        RetryReason::InvalidKeyId,
+    ] {
+        let provider = Arc::new(CountingCrypto::default());
+        let runtime = Arc::new(CryptoRuntime::new(
+            Arc::new(crate::TokioRuntime),
+            provider.clone(),
+        ));
+        let (client, _) = capturing_client_configured("migration_provider_retry", |builder| {
+            builder.with_runtime_arc(runtime)
+        })
+        .await;
+        let pn: Jid = "15550001009@s.whatsapp.net".parse().unwrap();
+        let lid: Jid = "100000000000009@lid".parse().unwrap();
+        client
+            .lid_pn_cache
+            .add(&LidPnEntry::new(
+                lid.user.to_string(),
+                pn.user.to_string(),
+                LearningSource::PeerLidMessage,
+            ))
+            .await;
+        let (bundle, bob) = bobs_prekey_bundle(&client).await;
+        let address = bob.to_protocol_address();
+        let mut alice = AlicePeer::new(&pn.to_string()).await;
+        alice.install_bob_session(&address, &bundle).await;
+        let first = alice.encrypt_text(&address, "establish PN session").await;
+        assert!(submit_and_check_session(&client, &pn, &first).await.0);
+        client.flush_signal_cache().await.unwrap();
+
+        if opening != RetryReason::InvalidKeyId {
+            alice
+                .sessions
+                .0
+                .get_mut(&address)
+                .unwrap()
+                .session_state_mut()
+                .unwrap()
+                .clear_unacknowledged_pre_key_message();
+        }
+        if opening == RetryReason::BadMac {
+            let mut shadow = alice.clone();
+            shadow.sessions = MemSessionStore::default();
+            let (bundle, _) = bobs_prekey_bundle(&client).await;
+            shadow.install_bob_session(&address, &bundle).await;
+            let first = shadow.encrypt_text(&address, "establish LID shadow").await;
+            assert!(submit_and_check_session(&client, &lid, &first).await.0);
+        }
+        let packet = alice.encrypt_text(&address, "recover the PN session").await;
+        let info = Arc::new(create_test_message_info(
+            &lid.to_string(),
+            "MIGRATION_PROVIDER",
+            &lid.to_string(),
+        ));
+        provider.fail_decrypt.store(true, Ordering::Relaxed);
+        let decrypts = provider.decrypts.load(Ordering::Relaxed);
+        let outcome = client
+            .clone()
+            .process_session_enc_batch(
+                vec![enc_payload_from_ciphertext(&packet)],
+                &info,
+                &lid,
+                DecryptFailMode::Show,
+            )
+            .await;
+        assert!(!outcome.decrypted);
+        assert_eq!(provider.decrypts.load(Ordering::Relaxed) - decrypts, 1);
+        await_retry_receipt(&client, &info, 1, RetryReason::UnknownError).await;
+        provider.fail_decrypt.store(false, Ordering::Relaxed);
+        let outcome = client
+            .clone()
+            .process_session_enc_batch(
+                vec![enc_payload_from_ciphertext(&packet)],
+                &info,
+                &lid,
+                DecryptFailMode::Show,
+            )
+            .await;
+        assert!(
+            outcome.decrypted,
+            "the same packet must recover without a new session"
+        );
+        client.signal_shutdown_sync();
+    }
+}
+
 /// Test case for UntrustedIdentity error handling and recovery
 ///
 /// Scenario:

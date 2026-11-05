@@ -205,7 +205,9 @@ enum MigrationDecryptResult {
     /// in fact found and whose retry then failed a MAC or a store read.
     /// `None` means nothing was migrated, so the caller's own error still is
     /// the terminal one.
-    NotDecrypted(Option<EncDecryptFailureReason>),
+    /// The optional retry reason overrides the opening error only when the
+    /// migrated decrypt failed locally; other failures retain the caller's mapping.
+    NotDecrypted(Option<EncDecryptFailureReason>, Option<RetryReason>),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
