@@ -100,7 +100,7 @@ reviewed DEX and instruction fingerprints, not values inferred as trusted merely
 because a report contains them:
 
 ```sh
-MOBILE_DEX_PROBE_REPORT=.cache/mobile-oracle/probe.json \
+MOBILE_DEX_PROBE_REPORT="$PWD/.cache/mobile-oracle/probe.json" \
 MOBILE_DEX_EXPECTED_SHA256=REVIEWED_DEX_SHA256 \
 MOBILE_DEX_EXPECTED_SELECTOR_SHA256=REVIEWED_INSTRUCTION_SHA256 \
 cargo test --locked -p mobile-oracle --test dex_probe -- --ignored
@@ -112,3 +112,5 @@ report and both pins; missing evidence fails. Like the observation comparator,
 it consumes operator-supplied evidence and cannot authenticate a runner. A green
 comparison establishes only this synthetic pure-helper agreement. Full DEX/ART,
 JNI and registration qualification remain separate work.
+
+For separate original-DEX ART and original JNI execution, see the [Android probes](ANDROID.md). Their execution modes and limits differ from this translated JVM probe.
