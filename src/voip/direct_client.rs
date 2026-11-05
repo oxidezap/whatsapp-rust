@@ -115,6 +115,10 @@ impl DirectCallHost for Client {
         peer: &Jid,
         plaintext: &[u8],
     ) -> Result<DirectCallKeys, CallError> {
+        let sender_role = self.sending_identity_role();
+        sender_role
+            .validate()
+            .map_err(|_| CallError::MissingDeviceIdentity)?;
         let epoch = self.call_state().epoch();
         let mut devices = drop_hosted_devices(
             self.signal()
@@ -132,6 +136,7 @@ impl DirectCallHost for Client {
             .get_device_snapshot()
             .account
             .is_none()
+            && wacore::send::needs_device_identity_for_role(true, None, sender_role).is_err()
         {
             let lock_jids = self.build_session_lock_keys(&devices).await;
             let guards = self.session_guards_for(&lock_jids).await;

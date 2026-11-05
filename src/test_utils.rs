@@ -998,6 +998,22 @@ async fn primary_client_with_factory_and_app_state_policy(
     factory: Arc<dyn crate::transport::TransportFactory>,
     app_state_policy: Option<crate::MobileAppStatePolicy>,
 ) -> Arc<Client> {
+    primary_client_with_factory_and_identity_policy(
+        backend,
+        factory,
+        app_state_policy,
+        wacore::send::PrimaryDeviceIdentityPolicy::Omit,
+    )
+    .await
+}
+
+#[cfg(all(test, feature = "mobile-core"))]
+async fn primary_client_with_factory_and_identity_policy(
+    backend: Arc<dyn Backend>,
+    factory: Arc<dyn crate::transport::TransportFactory>,
+    app_state_policy: Option<crate::MobileAppStatePolicy>,
+    identity_policy: wacore::send::PrimaryDeviceIdentityPolicy,
+) -> Arc<Client> {
     use crate::{ClockedRuntime, RegisteredMobileSession};
     use wacore::mobile::{
         MobileAppVersion, MobileDevice, MobileEnvironment, MobileLoginOptions, MobileLoginProfile,
@@ -1073,7 +1089,7 @@ async fn primary_client_with_factory_and_app_state_policy(
         Arc::new(NoHandshakeKeys),
     )
     .unwrap()
-    .with_primary_identity_policy(wacore::send::PrimaryDeviceIdentityPolicy::Omit);
+    .with_primary_identity_policy(identity_policy);
     let session = match app_state_policy {
         Some(policy) => session.with_app_state_policy(policy),
         None => session,
@@ -1095,6 +1111,19 @@ async fn primary_client_with_factory_and_app_state_policy(
 pub(crate) fn primary_test_backend() -> Arc<wacore::store::InMemoryBackend> {
     let clock = Arc::new(crate::VirtualClock::new(1000, wacore::time::Instant::ZERO).unwrap());
     Arc::new(wacore::store::InMemoryBackend::new().with_clock(clock))
+}
+
+#[cfg(all(test, feature = "mobile-core"))]
+pub(crate) async fn primary_startup_client_with_identity_policy(
+    policy: wacore::send::PrimaryDeviceIdentityPolicy,
+) -> Arc<Client> {
+    primary_client_with_factory_and_identity_policy(
+        primary_test_backend(),
+        Arc::new(MockTransportFactory::new()),
+        None,
+        policy,
+    )
+    .await
 }
 
 #[cfg(all(test, feature = "mobile-core"))]
