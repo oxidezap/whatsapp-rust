@@ -1744,11 +1744,6 @@ fn parse_admin_profile_node(node: &NodeRef<'_>) -> NewsletterAdminProfile {
     }
 }
 
-/// Build the MEX variables for `update_newsletter_user_setting`. WA Web
-/// (WAWebNewsletterUpdateUserSettingJob) sends `{ input: { newsletter_id, type, value } }`
-/// with value ON/OFF; the mute-expiration is local DB state, never on the wire. The
-/// generated op's input type is opaque (a bare string), so the structured object is
-/// passed directly as variables.
 /// Build the MEX variables for a picture-only `update_newsletter`. WA Web edits
 /// each field through a "changed?" flag whose null value collapses to an empty
 /// string, which is what clears the picture server-side.
@@ -1829,6 +1824,11 @@ fn followers_variables(jid: &Jid, count: u32) -> fetch_newsletter_followers::Var
     value
 }
 
+/// Build the MEX variables for `update_newsletter_user_setting`. WA Web
+/// (WAWebNewsletterUpdateUserSettingJob) sends `{ input: { newsletter_id, type, value } }`
+/// with value ON/OFF; the mute-expiration is local DB state, never on the wire. The
+/// generated op's input type is opaque (a bare string), so the structured object is
+/// passed directly as variables.
 fn mute_user_setting_variables(jid: &Jid, mute_type: &str, muted: bool) -> serde_json::Value {
     serde_json::json!({
         "input": {

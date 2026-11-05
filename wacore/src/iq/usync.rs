@@ -51,7 +51,7 @@
 //! ```
 
 use crate::WireEnum;
-use crate::iq::spec::IqSpec;
+use crate::iq::spec::{IqSpec, IqStreamSpec};
 use crate::request::InfoQuery;
 use crate::stanza::business::VerifiedName;
 use anyhow::anyhow;
@@ -1064,6 +1064,15 @@ impl IqSpec for DeviceListSpec {
     }
 }
 
+impl IqStreamSpec for DeviceListSpec {
+    fn consume_response(
+        &self,
+        stream: &mut wacore_binary::NodeStream<'_>,
+    ) -> Result<Self::Response, anyhow::Error> {
+        project_device_list_response(consume_usync_response(stream)?)
+    }
+}
+
 impl IqSpec for CompleteDeviceListSpec {
     type Response = DeviceListResponse;
 
@@ -1077,6 +1086,25 @@ impl IqSpec for CompleteDeviceListSpec {
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
         let parsed = project_device_list_response_checked(parse_usync_response(response)?, true)?;
+        self.validate_response(parsed)
+    }
+}
+
+impl IqStreamSpec for CompleteDeviceListSpec {
+    fn consume_response(
+        &self,
+        stream: &mut wacore_binary::NodeStream<'_>,
+    ) -> Result<Self::Response, anyhow::Error> {
+        let parsed = project_device_list_response_checked(consume_usync_response(stream)?, true)?;
+        self.validate_response(parsed)
+    }
+}
+
+impl CompleteDeviceListSpec {
+    fn validate_response(
+        &self,
+        parsed: DeviceListResponse,
+    ) -> Result<DeviceListResponse, anyhow::Error> {
         for expected in &self.0.jids {
             let Some(returned) = parsed.device_lists.iter().find(|returned| {
                 device_list_identity_matches(&returned.user, expected, &parsed.lid_mappings)

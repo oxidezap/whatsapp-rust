@@ -83,6 +83,44 @@ fn malformed_selected_cbc_lengths_do_not_advance_pairwise_or_group_state() {
         assert_eq!(encode_sender_key_record(&record), before);
     }
 }
+#[test]
+fn prekey_wrapper_errors_follow_provider_errors_and_never_publish_state() {
+    let mut random = Deterministic(1859);
+    let (session, _, _) = peers(&mut Engine::new(&RustCrypto, &mut random), true);
+    for unsupported in [false, true] {
+        let mut invalid = session.clone();
+        let pending = invalid
+            .current
+            .as_mut()
+            .unwrap()
+            .pending_pre_key
+            .as_mut()
+            .unwrap();
+        let pending = std::sync::Arc::make_mut(pending);
+        pending.signed_pre_key_id = None;
+        if unsupported {
+            pending.kyber_pre_key_id = Some(1);
+        }
+        let before = encode_session_record(&invalid);
+        let provider = FailingMac::new(3);
+        let crypto = crate::crypto::ProviderCrypto::new(&provider);
+        assert_eq!(
+            Engine::new(&crypto, &mut random).encrypt(&mut invalid, b"synthetic"),
+            Err(Error::Crypto)
+        );
+        assert_eq!(encode_session_record(&invalid), before);
+        assert_eq!(
+            Engine::new(&RustCrypto, &mut random).encrypt(&mut invalid, b"synthetic"),
+            Err(if unsupported {
+                Error::Version
+            } else {
+                Error::MissingKey
+            })
+        );
+        assert_eq!(encode_session_record(&invalid), before);
+    }
+}
+
 struct FailingMac {
     calls: std::sync::atomic::AtomicUsize,
     fail_at: usize,
