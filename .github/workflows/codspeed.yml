@@ -5,8 +5,7 @@ on:
     branches: [main]
     paths-ignore: ["**.md", "docs/**"]
   pull_request:
-    # Measure the stacked decoder experiment while its benchmark parent is draft.
-    branches: [main, bench/binary-attribute-storage]
+    branches: [main]
     paths-ignore: ["**.md", "docs/**"]
   # Allows CodSpeed to trigger backtest performance analysis to generate
   # initial baseline data.
