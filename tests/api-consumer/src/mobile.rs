@@ -2,6 +2,15 @@
 //!
 //! This probe performs no I/O and does not require an executor, even through the
 //! SDK re-export. APK, mock-server and target execution are separate validation.
+//!
+//! A pre-send checkpoint acknowledgement cannot publish final registration.
+//!
+//! ```compile_fail,E0308
+//! use whatsapp_rust::mobile::{AttemptToken, RegistrationWorkflow};
+//! fn acknowledge_request_checkpoint(flow: &mut RegistrationWorkflow, token: AttemptToken) {
+//!     flow.confirm_persisted(token).unwrap();
+//! }
+//! ```
 
 use whatsapp_rust::mobile::{
     EnvironmentBound, MobileConfigurationError, MobileEnvironment, MobileTrust,
@@ -108,6 +117,69 @@ mod tests {
             policy,
         );
         assert_eq!(core_workflow.stage(), RegistrationStage::Ready);
+    }
+
+    #[test]
+    fn durable_acknowledgement_is_phase_and_workflow_bound() {
+        let environment = mock_environment(4443).expect("synthetic environment");
+        let identity = RegistrationIdentity::from_public_keys(&[3; 32], &[4; 32]);
+        let policy = RegistrationPolicy::new(2, 100).expect("bounded policy");
+        let mut original = workflow(
+            &environment,
+            identity,
+            RegistrationRunId::from_bytes([7; 32]),
+            policy,
+        );
+        assert_eq!(original.pending_persistence(), None);
+        let attempt = original
+            .begin(RegistrationOperation::RequestCode, 10)
+            .expect("reserve");
+        original
+            .complete(attempt, RegistrationOutcome::Verified, 11)
+            .expect("verify");
+        let commit: whatsapp_rust::mobile::RegistrationCommitToken = original
+            .pending_persistence()
+            .expect("final durability token");
+
+        let encoded =
+            serde_json::to_vec(&original.checkpoint()).expect("serialize verified checkpoint");
+        let mut restored = RegistrationWorkflow::restore(
+            serde_json::from_slice(&encoded).expect("deserialize"),
+            environment.binding(),
+            identity,
+        )
+        .expect("restore verified state");
+        assert_eq!(restored.pending_persistence(), Some(commit));
+        let mut foreign = workflow(
+            &environment,
+            identity,
+            RegistrationRunId::from_bytes([8; 32]),
+            policy,
+        );
+        let other_attempt = foreign
+            .begin(RegistrationOperation::RequestCode, 10)
+            .expect("reserve foreign");
+        foreign
+            .complete(other_attempt, RegistrationOutcome::Verified, 11)
+            .expect("verify foreign");
+        assert_eq!(
+            restored.confirm_persisted(
+                foreign
+                    .pending_persistence()
+                    .expect("foreign durability token")
+            ),
+            Err(RegistrationError::StaleCompletion)
+        );
+        assert_eq!(restored.stage(), RegistrationStage::Verified);
+        restored
+            .confirm_persisted(commit)
+            .expect("host confirms its matching durable write");
+        assert_eq!(restored.stage(), RegistrationStage::Registered);
+        assert_eq!(restored.pending_persistence(), None);
+        assert_eq!(
+            restored.confirm_persisted(commit),
+            Err(RegistrationError::InvalidTransition)
+        );
     }
 
     #[cfg(feature = "mobile-transport-native")]

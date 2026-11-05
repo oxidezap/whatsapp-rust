@@ -13,7 +13,7 @@ pub use environment::{
     RegistrationEndpoint, TcpEndpoint,
 };
 pub use registration::{
-    AttemptToken, RegistrationCheckpoint, RegistrationError, RegistrationIdentity,
-    RegistrationOperation, RegistrationOutcome, RegistrationPolicy, RegistrationRunId,
-    RegistrationStage, RegistrationWorkflow,
+    AttemptToken, RegistrationCheckpoint, RegistrationCommitToken, RegistrationError,
+    RegistrationIdentity, RegistrationOperation, RegistrationOutcome, RegistrationPolicy,
+    RegistrationRunId, RegistrationStage, RegistrationWorkflow,
 };

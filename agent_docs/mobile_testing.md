@@ -140,6 +140,30 @@ rollback to an older database. Semantic response inputs must come from a
 qualified parser. Local `confirm_persisted` records the host's durability
 confirmation; it does not perform or independently prove a database write.
 
+While `Verified`, obtain the pending `RegistrationCommitToken` before committing
+the verified identity and checkpoint atomically. A successful durable write must
+return that same token to `confirm_persisted`. Capture it before the write;
+do not obtain a fresh token when handling the completion. Advancing the verified
+checkpoint's time invalidates the earlier token and requires a current write.
+Serialize the backend writes and final publication, or use backend revision
+checks to prevent an older write from replacing a newer snapshot. Rejecting an
+old acknowledgement cannot undo its backend write. Avoid unnecessary deadline
+ticks after `Verified` while its write is pending. A token prevents stale publication but
+cannot guarantee progress if the host keeps changing the checkpoint.
+Failed or cancelled writes must not publish `Registered`. The persistence token
+is distinct from a network
+attempt token, so a delayed acknowledgement for an earlier pre-send checkpoint
+cannot be passed as final identity confirmation. After restart, restore the
+`Verified` checkpoint and recover its pending persistence token before resuming
+the host's durability decision.
+
+Publishing an in-memory snapshot is not durability. In the existing SDK,
+`PersistenceManager::process_command` applies a command and marks state dirty;
+`flush` separately awaits the backend save and can fail or be cancelled. Future
+mobile storage integration must define its atomic identity/checkpoint write and
+correlate the successful completion. These core tokens do not add mobile fields
+to `Device`, implement a backend transaction or authenticate a storage callback.
+
 Portable endpoint hosts use plain ASCII names with letters, digits, dots,
 hyphens and underscores, or IPv4/IPv6 literals. URI-only percent escapes,
 sub-delimiters and IPvFuture literals are rejected before adapter selection.
@@ -152,3 +176,20 @@ Runtime shutdown retires the stream even when the driver never ran. A writer
 that is already in progress owns its half until it completes or is cancelled;
 its guard releases that half on shutdown. Tests cover a write future retained
 by another executor, including immediate rejection of new sends after shutdown.
+
+## Synthetic policy performance coverage
+
+`wacore/benches/mobile_workflow_benchmark.rs` provides Divan rows for local
+policy transitions, in-flight and verified checkpoint restore, and current
+durability acknowledgement. Its `mobile` feature is explicitly enabled in the
+core shard of the existing CodSpeed workflow; it is not a default runtime feature.
+Run measurements through that CodSpeed integration. Native compile/lint checks
+are not performance measurements.
+
+The fixtures, checkpoint clones and initial workflow construction are outside
+each timed operation. Restore rows include validation and context hashing; the
+acknowledgement row measures local publication, without a backend write. Fixed
+keys, clocks and outcomes are fabricated. These CPU/allocation baselines do not
+measure network, registration acceptance, SMS, APK execution, native transport
+throughput or browser/ESP32 execution. Review the first CodSpeed results before
+setting budgets or claiming improvements.

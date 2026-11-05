@@ -49,6 +49,16 @@ pub struct AttemptToken {
     context: [u8; 32],
 }
 
+/// Correlates final identity-state durability with one verified checkpoint.
+///
+/// This is distinct from the token for persisting/sending a request attempt.
+/// Only a verified workflow can issue it through `pending_persistence`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegistrationCommitToken {
+    attempt: AttemptToken,
+    checkpoint_time_ms: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum RegistrationStage {
@@ -348,10 +358,33 @@ impl RegistrationWorkflow {
         Ok(expired)
     }
 
+    /// Correlate a host-owned durable write with the current verified checkpoint.
+    ///
+    /// Capture this before starting the write, including after checkpoint restore.
+    /// A failed or cancelled write must not be acknowledged. A later checkpoint
+    /// clock update invalidates an older write's token. This scopes completion;
+    /// it does not prove or perform a storage write.
+    pub fn pending_persistence(&self) -> Option<RegistrationCommitToken> {
+        (self.checkpoint.stage == RegistrationStage::Verified).then_some(RegistrationCommitToken {
+            attempt: AttemptToken {
+                sequence: self.checkpoint.attempts,
+                context: self.context,
+            },
+            checkpoint_time_ms: self.checkpoint.last_time_ms,
+        })
+    }
+
     /// Publish Registered only after the host has durably committed identity state.
-    pub fn confirm_persisted(&mut self) -> Result<(), RegistrationError> {
+    /// Pass the token captured before that write, not a token read at completion.
+    pub fn confirm_persisted(
+        &mut self,
+        token: RegistrationCommitToken,
+    ) -> Result<(), RegistrationError> {
         if self.checkpoint.stage != RegistrationStage::Verified {
             return Err(RegistrationError::InvalidTransition);
+        }
+        if self.pending_persistence() != Some(token) {
+            return Err(RegistrationError::StaleCompletion);
         }
         self.checkpoint.stage = RegistrationStage::Registered;
         Ok(())
@@ -435,6 +468,36 @@ mod tests {
         )
     }
 
+    fn foreign_workflows(checkpoint: &RegistrationCheckpoint) -> [RegistrationWorkflow; 3] {
+        let other_environment = MobileEnvironment::new(
+            "other-test",
+            RegistrationEndpoint::new("https://other-register.test/v2").unwrap(),
+            TcpEndpoint::new("other-stream.test", 443).unwrap(),
+            MobileTrust::new([1; 32], [2; 32]).unwrap(),
+        )
+        .unwrap();
+        [
+            RegistrationWorkflow::new(
+                other_environment.binding(),
+                checkpoint.identity,
+                checkpoint.run_id,
+                checkpoint.policy,
+            ),
+            RegistrationWorkflow::new(
+                checkpoint.environment,
+                RegistrationIdentity::from_public_keys(&[5; 32], &[4; 32]),
+                checkpoint.run_id,
+                checkpoint.policy,
+            ),
+            RegistrationWorkflow::new(
+                checkpoint.environment,
+                checkpoint.identity,
+                RegistrationRunId::from_bytes([8; 32]),
+                checkpoint.policy,
+            ),
+        ]
+    }
+
     #[test]
     fn lost_response_and_restart_never_trigger_automatic_resend() {
         let mut flow = workflow(4);
@@ -508,7 +571,8 @@ mod tests {
         flow.complete(token, RegistrationOutcome::Verified, 6)
             .unwrap();
         assert_eq!(flow.stage(), RegistrationStage::Verified);
-        flow.confirm_persisted().unwrap();
+        let commit = flow.pending_persistence().unwrap();
+        flow.confirm_persisted(commit).unwrap();
         assert_eq!(flow.stage(), RegistrationStage::Registered);
     }
 
@@ -602,33 +666,7 @@ mod tests {
     fn completion_tokens_do_not_cross_environments_identity_keys_or_runs() {
         let mut original = workflow(2);
         let checkpoint = original.checkpoint();
-        let other_environment = MobileEnvironment::new(
-            "other-test",
-            RegistrationEndpoint::new("https://other-register.test/v2").unwrap(),
-            TcpEndpoint::new("other-stream.test", 443).unwrap(),
-            MobileTrust::new([1; 32], [2; 32]).unwrap(),
-        )
-        .unwrap();
-        let mut foreign_workflows = [
-            RegistrationWorkflow::new(
-                other_environment.binding(),
-                checkpoint.identity,
-                checkpoint.run_id,
-                checkpoint.policy,
-            ),
-            RegistrationWorkflow::new(
-                checkpoint.environment,
-                RegistrationIdentity::from_public_keys(&[5; 32], &[4; 32]),
-                checkpoint.run_id,
-                checkpoint.policy,
-            ),
-            RegistrationWorkflow::new(
-                checkpoint.environment,
-                checkpoint.identity,
-                RegistrationRunId::from_bytes([8; 32]),
-                checkpoint.policy,
-            ),
-        ];
+        let mut foreign_workflows = foreign_workflows(&checkpoint);
         let own_token = original
             .begin(RegistrationOperation::RequestCode, 10)
             .unwrap();
@@ -682,5 +720,107 @@ mod tests {
             .complete(token, RegistrationOutcome::NeedsCode, 11)
             .unwrap();
         assert_eq!(restored.stage(), RegistrationStage::AwaitingCode);
+    }
+
+    #[test]
+    fn persistence_confirmation_cannot_publish_a_different_verified_run() {
+        let mut original = workflow(2);
+        let checkpoint = original.checkpoint();
+        let own = original
+            .begin(RegistrationOperation::RequestCode, 10)
+            .unwrap();
+        original
+            .complete(own, RegistrationOutcome::Verified, 11)
+            .unwrap();
+        let before = original.checkpoint();
+        for mut foreign in foreign_workflows(&checkpoint) {
+            let other = foreign
+                .begin(RegistrationOperation::RequestCode, 10)
+                .unwrap();
+            foreign
+                .complete(other, RegistrationOutcome::Verified, 11)
+                .unwrap();
+            assert_eq!(
+                original.confirm_persisted(foreign.pending_persistence().unwrap()),
+                Err(RegistrationError::StaleCompletion)
+            );
+            assert_eq!(original.checkpoint(), before);
+        }
+        original
+            .confirm_persisted(original.pending_persistence().unwrap())
+            .unwrap();
+        assert_eq!(original.pending_persistence(), None);
+    }
+
+    #[test]
+    fn durable_confirmation_survives_restore_but_not_failed_or_stale_writes() {
+        let mut flow = workflow(3);
+        assert_eq!(flow.pending_persistence(), None);
+        let previous = flow.begin(RegistrationOperation::CheckAccount, 10).unwrap();
+        assert_eq!(flow.pending_persistence(), None);
+        flow.complete(previous, RegistrationOutcome::Ready, 11)
+            .unwrap();
+        let verified = flow.begin(RegistrationOperation::RequestCode, 12).unwrap();
+        flow.complete(verified, RegistrationOutcome::Verified, 13)
+            .unwrap();
+        let completion = flow.pending_persistence().unwrap();
+        assert_eq!(completion.attempt, verified);
+        let before = flow.checkpoint();
+        // A host write failed or was cancelled: do not acknowledge its token.
+        let write_result: Result<(), ()> = Err(());
+        if write_result.is_ok() {
+            flow.confirm_persisted(completion).unwrap();
+        }
+        assert_eq!(flow.stage(), RegistrationStage::Verified);
+        assert_eq!(flow.checkpoint(), before);
+        assert_eq!(
+            flow.confirm_persisted(RegistrationCommitToken {
+                attempt: previous,
+                checkpoint_time_ms: flow.checkpoint.last_time_ms,
+            }),
+            Err(RegistrationError::StaleCompletion)
+        );
+        assert_eq!(flow.checkpoint(), before);
+
+        let checkpoint = serde_json::from_slice(&serde_json::to_vec(&before).unwrap()).unwrap();
+        let mut restored =
+            RegistrationWorkflow::restore(checkpoint, before.environment, before.identity).unwrap();
+        assert_eq!(restored.pending_persistence(), Some(completion));
+        restored.confirm_persisted(completion).unwrap();
+        assert_eq!(restored.stage(), RegistrationStage::Registered);
+        assert_eq!(restored.pending_persistence(), None);
+        let registered = restored.checkpoint();
+        assert_eq!(
+            restored.confirm_persisted(completion),
+            Err(RegistrationError::InvalidTransition)
+        );
+        assert_eq!(restored.checkpoint(), registered);
+    }
+
+    #[test]
+    fn final_write_confirmation_must_match_the_current_checkpoint_revision() {
+        let mut flow = workflow(2);
+        let attempt = flow.begin(RegistrationOperation::RequestCode, 10).unwrap();
+        flow.complete(attempt, RegistrationOutcome::Verified, 11)
+            .unwrap();
+        let old_write = flow.pending_persistence().unwrap();
+        assert!(!flow.expire(20).unwrap());
+        let before = flow.checkpoint();
+        assert_eq!(
+            flow.confirm_persisted(old_write),
+            Err(RegistrationError::StaleCompletion)
+        );
+        assert_eq!(flow.checkpoint(), before);
+        let current_write = flow.pending_persistence().unwrap();
+        assert_ne!(current_write, old_write);
+        assert!(!flow.expire(20).unwrap());
+        assert_eq!(flow.pending_persistence(), Some(current_write));
+        let checkpoint =
+            serde_json::from_slice(&serde_json::to_vec(&flow.checkpoint()).unwrap()).unwrap();
+        let mut restored =
+            RegistrationWorkflow::restore(checkpoint, before.environment, before.identity).unwrap();
+        assert_eq!(restored.pending_persistence(), Some(current_write));
+        restored.confirm_persisted(current_write).unwrap();
+        assert_eq!(restored.stage(), RegistrationStage::Registered);
     }
 }

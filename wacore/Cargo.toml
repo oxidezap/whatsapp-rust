@@ -197,6 +197,11 @@ harness = false
 # inside the bench instead, so it is the only part that needs the extra feature.
 required-features = ["voip-mlow"]
 
+[[bench]]
+name = "mobile_workflow_benchmark"
+harness = false
+required-features = ["mobile"]
+
 [[example]]
 name = "voip_profile"
 required-features = ["voip-mlow"]

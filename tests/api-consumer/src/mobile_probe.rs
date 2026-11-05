@@ -32,12 +32,19 @@ fn exercise() -> Result<RegistrationStage, Box<dyn std::error::Error>> {
         RegistrationStage::OutcomeUnknown { .. }
     ));
     restored.complete(token, RegistrationOutcome::NeedsCode, black_box(20))?;
+    let token = restored.begin(RegistrationOperation::SubmitCode, black_box(21))?;
+    restored.complete(token, RegistrationOutcome::Verified, black_box(22))?;
+    // Synthetic host acknowledgement exercises the API; this probe accesses no store.
+    let commit = restored
+        .pending_persistence()
+        .ok_or("missing final durability token")?;
+    restored.confirm_persisted(commit)?;
     Ok(restored.stage())
 }
 
 fn main() {
     assert!(matches!(
         black_box(exercise()),
-        Ok(RegistrationStage::AwaitingCode)
+        Ok(RegistrationStage::Registered)
     ));
 }
