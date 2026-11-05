@@ -32,6 +32,18 @@ fn tree_compressed(bencher: divan::Bencher, width: usize) {
     bencher.bench(|| black_box(fixture.receive(black_box(&fixture.compressed))));
 }
 
+#[divan::bench(args = WIDTHS)]
+fn stream_plain(bencher: divan::Bencher, width: usize) {
+    let fixture = fixture(width);
+    bencher.bench(|| black_box(fixture.receive_streaming(black_box(&fixture.plain))));
+}
+
+#[divan::bench(args = WIDTHS)]
+fn stream_compressed(bencher: divan::Bencher, width: usize) {
+    let fixture = fixture(width);
+    bencher.bench(|| black_box(fixture.receive_streaming(black_box(&fixture.compressed))));
+}
+
 fn main() {
     divan::main();
 }

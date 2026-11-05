@@ -1,7 +1,7 @@
 // Shared by the CodSpeed workload and its fixture validation test.
 
 use std::io::Write;
-use wacore::iq::spec::IqSpec;
+use wacore::iq::spec::{IqSpec, IqStreamSpec};
 use wacore::iq::usync::{DeviceListResponse, DeviceListSpec};
 use wacore_binary::Jid;
 use wacore_binary::builder::NodeBuilder;
@@ -97,5 +97,16 @@ impl Fixture {
         let bytes = unpack(frame).expect("unpack response");
         let node = unmarshal_ref(&bytes).expect("decode response");
         self.spec.parse_response(&node).expect("parse response")
+    }
+
+    pub fn receive_streaming(&self, frame: &[u8]) -> DeviceListResponse {
+        let mut stream = wacore_binary::NodeStream::from_packed(frame).expect("packed response");
+        stream.open().expect("decode root").expect("response root");
+        let response = self
+            .spec
+            .consume_response(&mut stream)
+            .expect("consume response");
+        stream.finish().expect("validate trailer");
+        response
     }
 }

@@ -1201,23 +1201,106 @@ fn parse_protocol_states(result: &NodeRef<'_>) -> Result<Vec<UsyncProtocolState>
     let capacity = result.children().map_or(0, <[_]>::len);
     let mut states = Vec::with_capacity(capacity);
     for node in result.children().into_iter().flatten() {
-        let Ok(protocol) = UsyncProtocolKind::try_from(node.tag.as_ref()) else {
-            continue;
-        };
-        let error = parse_subprotocol_error(node)?;
-        let mut attrs = node.attrs();
-        let refresh_seconds = attrs
-            .optional_u64(ATTR_REFRESH)
-            .map(|value| checked_u32(value, ATTR_REFRESH))
-            .transpose()?;
-        attrs.finish()?;
-        states.push(UsyncProtocolState {
-            protocol,
-            refresh_seconds,
-            error,
-        });
+        if let Some(state) = parse_protocol_state(node)? {
+            states.push(state);
+        }
     }
     Ok(states)
+}
+
+fn parse_protocol_state(node: &NodeRef<'_>) -> Result<Option<UsyncProtocolState>, anyhow::Error> {
+    let Ok(protocol) = UsyncProtocolKind::try_from(node.tag.as_ref()) else {
+        return Ok(None);
+    };
+    let error = parse_subprotocol_error(node)?;
+    let mut attrs = node.attrs();
+    let refresh_seconds = attrs
+        .optional_u64(ATTR_REFRESH)
+        .map(|value| checked_u32(value, ATTR_REFRESH))
+        .transpose()?;
+    attrs.finish()?;
+    Ok(Some(UsyncProtocolState {
+        protocol,
+        refresh_seconds,
+        error,
+    }))
+}
+
+/// Keep the same typed parser as the tree path, with at most one user's
+/// decoded subtree alive. The neutral output is projected only after all
+/// protocol states and users have been parsed, as it is for a tree response.
+pub(crate) fn consume_usync_response(
+    stream: &mut wacore_binary::NodeStream<'_>,
+) -> Result<UsyncResponse, anyhow::Error> {
+    loop {
+        let Some(head) = stream.open()? else {
+            stream.finish()?;
+            return Err(anyhow!("USync response is missing <{TAG_USYNC}>"));
+        };
+        if head.tag == TAG_USYNC {
+            break;
+        }
+        stream.close()?;
+    }
+
+    let mut protocol_states = Vec::new();
+    let mut users = None;
+    let mut saw_result = false;
+    let mut result_error = None;
+    let mut list_error = None;
+    while let Some(head) = stream.open()? {
+        match head.tag.as_ref() {
+            TAG_RESULT if !saw_result => {
+                saw_result = true;
+                protocol_states = Vec::with_capacity(head.child_count());
+                while let Some(node) = stream.next_child()? {
+                    if result_error.is_none() {
+                        match parse_protocol_state(&node) {
+                            Ok(Some(state)) => protocol_states.push(state),
+                            Ok(None) => {}
+                            Err(error) => result_error = Some(error),
+                        }
+                    }
+                }
+            }
+            TAG_LIST if users.is_none() => {
+                let mut parsed_users = Vec::with_capacity(head.child_count());
+                while let Some(node) = stream.next_child()? {
+                    if node.tag == TAG_USER && list_error.is_none() {
+                        match parse_user_result(&node) {
+                            Ok(Some(user)) => parsed_users.push(user),
+                            Ok(None) => {}
+                            Err(error) => list_error = Some(error),
+                        }
+                    }
+                }
+                users = Some(parsed_users);
+            }
+            _ => {}
+        }
+        // This also validates skipped siblings and duplicate list/result nodes.
+        stream.close()?;
+    }
+    stream.close()?;
+    // Tree decoding validates the entire frame before any semantic error is
+    // reported. Keep that precedence for unread root siblings and the zlib
+    // trailer too, including responses whose typed parsing failed above.
+    stream.finish()?;
+
+    // The tree parser checks result metadata before the list, regardless of
+    // their wire order. Defer semantic errors so streaming preserves that
+    // priority, including a result error over a missing or malformed list.
+    if let Some(error) = result_error {
+        return Err(error);
+    }
+    let users = users.ok_or_else(|| anyhow!("USync response is missing <{TAG_LIST}>"))?;
+    if let Some(error) = list_error {
+        return Err(error);
+    }
+    Ok(UsyncResponse {
+        protocol_states,
+        users,
+    })
 }
 
 fn parse_user_result(user: &NodeRef<'_>) -> Result<Option<UsyncUserResult>, anyhow::Error> {
