@@ -581,6 +581,8 @@ pub mod store;
 #[cfg(feature = "mobile-core")]
 pub use wacore::mobile;
 #[cfg(feature = "mobile-core")]
+pub use wacore::mobile::primary::PrimarySelfIdentityProfile;
+#[cfg(feature = "mobile-core")]
 pub use wacore::{download::MobileMediaHttpProfile, send::PrimaryDeviceIdentityPolicy};
 #[cfg(feature = "mobile-core")]
 #[path = "mobile/primary.rs"]

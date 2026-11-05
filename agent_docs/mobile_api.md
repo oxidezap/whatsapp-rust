@@ -24,7 +24,14 @@ changes through its commands and mobile registration operations.
 `RegisteredMobileSession` holds an explicit login profile, application version,
 Noise prologue and host key provider. It does not fetch a Web version. Callers
 must select `with_primary_identity_policy`; no policy is inferred from the
-platform. A fresh primary also needs host-generated `PrimaryAppStateKeyInput`
+platform. Self-identity validation requires a device signature by default. An
+explicit account-signature-only profile still verifies the trusted account
+signature and rejects an invalid present device signature. Certificate expiry
+policy also stays strict by default. The explicit legacy `IfPresent` profile
+permits an absent expiry without changing the environment root, signature or
+static-key checks; a present expiry must remain valid.
+
+A fresh primary also needs host-generated `PrimaryAppStateKeyInput`
 or an existing validated app-state key in storage before connecting.
 
 Media operations require an explicit `MobileMediaHttpProfile`, selected with
@@ -58,10 +65,12 @@ let session = RegisteredMobileSession::from_registered_account(
 ```
 
 The host still supplies login-only metadata. The factory validates shared
-platform, version, OS and locale values. Registration HTTP model IDs and
-manufacturer encodings can differ from login marketing names, so map them
-explicitly. Select either FDID-uppercase or an independent host phone ID with
-`RegistrationLoginPhoneIdMapping`; do not silently equate unrelated IDs.
+platform, version, OS and locale values, plus Android manufacturer when present.
+Registration HTTP model IDs can differ from login marketing names, so map model
+names explicitly. iOS registration does not carry a manufacturer. Select either
+FDID-uppercase or an independent host phone ID with
+`RegistrationLoginPhoneIdMapping`; do not silently equate unrelated IDs. Retain
+independent phone IDs and other login-only metadata across restoration.
 
 For existing credentials, use the typed key import and persistence APIs, then
 construct `RegisteredMobileSession::new` with the matching profile and binding.
@@ -75,7 +84,9 @@ attempt. `MobileLoginOptionsProvider` may supply per-attempt session IDs and
 other profile fields using host-owned entropy. It receives the validated device
 snapshot and a counter reserved per Client immediately before XX. Failed
 handshakes count; failed pre-dial attempts do not. The provider returns complete
-options, with explicit field presence. The static default inserts no session
+options, with explicit field presence. Clone configured options and use
+`with_session_id`, `with_connect_attempt_count` and `with_login_counter` to replace
+only chosen attempt fields; passing `None` explicitly omits that field. The static default inserts no session
 ID, login counter or reconnect counter. `encode_payload` inspects static
 options; connections use `encode_attempt_payload`.
 

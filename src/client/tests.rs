@@ -3805,6 +3805,12 @@ fn client_size_pins_runtime_cache_config_saving() {
     if cfg!(feature = "plugins") {
         expected += size_of::<Option<Arc<()>>>();
     }
+    #[cfg(feature = "mobile-core")]
+    {
+        // Mobile configuration remains behind one shared pointer. Its per-client
+        // handshake counter and alignment are opt-in; keep the Web base fixed.
+        expected += size_of::<(Option<Arc<crate::RegisteredMobileSession>>, AtomicU32)>();
+    }
     #[cfg(feature = "bench-harness")]
     {
         // Only the benchmark carries this one-pointer attachment (4368 ->

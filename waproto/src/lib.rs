@@ -593,6 +593,23 @@ pub mod codec {
     }
 
     #[inline(never)]
+    pub fn adv_device_identity_to_vec(message: &whatsapp::ADVDeviceIdentity) -> Vec<u8> {
+        message.encode_to_vec()
+    }
+
+    #[inline(never)]
+    pub fn adv_signed_device_identity_hmac_to_vec(
+        message: &whatsapp::ADVSignedDeviceIdentityHMAC,
+    ) -> Vec<u8> {
+        message.encode_to_vec()
+    }
+
+    #[inline(never)]
+    pub fn client_pairing_props_to_vec(message: &whatsapp::ClientPairingProps) -> Vec<u8> {
+        message.encode_to_vec()
+    }
+
+    #[inline(never)]
     pub fn adv_device_identity_decode(
         bytes: &[u8],
     ) -> Result<whatsapp::ADVDeviceIdentity, buffa::DecodeError> {

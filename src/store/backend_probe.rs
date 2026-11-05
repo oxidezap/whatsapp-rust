@@ -87,6 +87,10 @@ macro_rules! forward_domains {
             }
         }
         impl ProtocolStore for $owner {
+            #[cfg(feature = "instance-clock")]
+            fn clock(&self) -> Option<&Arc<dyn wacore::time::Clock>> {
+                self.backend.clock()
+            }
             forward_methods! {
                 fn get_sender_key_devices<'s, 'a>(this: &'s Self, group_jid: &'a str) -> Result<Vec<(String, bool)>>;
                 fn set_sender_key_status<'s, 'a, 'b, 'c>(this: &'s Self, group_jid: &'a str, entries: &'b [(&'c str, bool)]) -> Result<()>;

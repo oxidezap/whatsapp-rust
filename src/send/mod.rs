@@ -929,6 +929,9 @@ pub(crate) struct SendPipelineOptions<'a> {
     /// instead of handing over a copy.
     pub(crate) request_id: Option<&'a str>,
     pub(crate) peer: bool,
+    /// A proven companion identity, checked again under the encryption session lock.
+    /// Only valid for peer sends; None preserves ordinary send behavior.
+    pub(crate) expected_peer_identity: Option<[u8; 32]>,
     /// A peer recovery must use the socket its request generation names.
     pub(crate) send_scope: Option<(u64, std::sync::Arc<crate::socket::NoiseSocket>)>,
     pub(crate) send_observer: Option<Box<dyn wacore::socket::noise_socket::SendObserver>>,
@@ -2808,6 +2811,7 @@ impl Client {
             sent_at,
             request_id: request_id_override,
             peer,
+            expected_peer_identity,
             send_scope,
             send_observer,
             edit,
@@ -2833,6 +2837,12 @@ impl Client {
             group_repair::GroupIdentitySnapshot::default()
         };
         validate_extra_stanza_nodes(&extra_stanza_nodes)?;
+        if expected_peer_identity.is_some() && (!peer || to.is_group()) {
+            return Err(SendError::InvalidRequest(
+                "expected identity requires an individual peer send".into(),
+            )
+            .into());
+        }
         if request_id_override.is_some_and(str::is_empty) {
             return Err(SendError::InvalidRequest("message ID must not be empty".into()).into());
         }
@@ -2926,7 +2936,8 @@ impl Client {
             requires_connection_generation_check,
             dm_unreached,
         } = if peer && !to.is_group() {
-            box_send_branch(self.send_peer_branch(to, message, request_id)).await?
+            box_send_branch(self.send_peer_branch(to, message, request_id, expected_peer_identity))
+                .await?
         } else if let Some(recipients) = group_direct_recipients {
             if !to.is_group() {
                 return Err(SendError::InvalidRequest(
@@ -3164,6 +3175,7 @@ impl Client {
         to: Jid,
         message: &wa::Message,
         request_id: &str,
+        expected_identity: Option<[u8; 32]>,
     ) -> Result<SendBranchOutput, anyhow::Error> {
         let node = {
             // Peer messages are only valid for individual users, not groups
@@ -3177,6 +3189,31 @@ impl Client {
             let mut store_adapter = self.signal_adapter();
 
             let device_snapshot = self.persistence_manager.get_device_snapshot();
+            if let Some(expected) = expected_identity {
+                use wacore::libsignal::protocol::SessionStore as _;
+                let cached = self
+                    .signal_cache
+                    .get_identity(&signal_addr, device_snapshot.backend.as_ref())
+                    .await?
+                    .ok_or_else(|| anyhow!("proven peer identity is missing"))?;
+                let record = store_adapter
+                    .session_store
+                    .load_session(&signal_addr)
+                    .await?
+                    .ok_or_else(|| anyhow!("proven peer session is missing"))?;
+                let remote = record
+                    .session_state()
+                    .ok_or_else(|| anyhow!("proven peer session has no current state"))?
+                    .remote_identity_key()
+                    .map_err(|_| anyhow!("proven peer session has an invalid remote identity"))?
+                    .ok_or_else(|| anyhow!("proven peer session has no remote identity"))?;
+                // Both comparisons bind public identity keys to the confirmed peer.
+                if cached.as_ref() != expected.as_slice()
+                    || remote.public_key().public_key_bytes() != expected.as_slice()
+                {
+                    return Err(anyhow!("peer identity changed after proof validation"));
+                }
+            }
             wacore::send::prepare_peer_stanza_for_role(
                 &mut store_adapter.session_store,
                 &mut store_adapter.identity_store,
@@ -8800,6 +8837,121 @@ mod tests {
         )
         .await
         .expect("peer session");
+    }
+
+    #[tokio::test]
+    async fn proven_peer_identity_is_rechecked_after_lock_wait_without_advancing_ratchet() {
+        use wacore::libsignal::protocol::{
+            IdentityKey, IdentityKeyStore as _, KeyPair, SessionStore as _,
+        };
+        let client = crate::test_utils::create_test_client_with_name("peer-proof-race").await;
+        let peer: Jid = "100000000000009:2@s.whatsapp.net".parse().unwrap();
+        seed_peer_send_state(&client, &peer).await;
+        let address = peer.to_protocol_address();
+        let snapshot = client.persistence_manager.get_device_snapshot();
+        let expected: [u8; 32] = client
+            .signal_cache
+            .get_identity(&address, snapshot.backend.as_ref())
+            .await
+            .unwrap()
+            .unwrap()
+            .as_ref()
+            .try_into()
+            .unwrap();
+        let mut adapter = client.signal_adapter();
+        let before = adapter
+            .session_store
+            .load_session(&address)
+            .await
+            .unwrap()
+            .unwrap()
+            .serialize()
+            .unwrap();
+        let session_lock = client.session_lock_for(address.as_str()).await;
+        let guard = session_lock.lock().await;
+        let message =
+            pdo_request_message(wa::message::PeerDataOperationRequestType::HistorySyncOnDemand);
+        let mut preparing =
+            Box::pin(client.send_peer_branch(peer.clone(), &message, "proof-race", Some(expected)));
+        assert!(futures::poll!(&mut preparing).is_pending());
+        // A different canonical session owner completes an identity replacement
+        // after the primary's preliminary proof check and before encryption.
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let replacement = KeyPair::generate(&mut rng);
+        adapter
+            .identity_store
+            .save_identity(&address, &IdentityKey::new(replacement.public_key))
+            .await
+            .unwrap();
+        drop(guard);
+        let error = match preparing.await {
+            Ok(_) => panic!("changed identity must reject before encryption"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("peer identity changed"));
+        assert_eq!(
+            before,
+            adapter
+                .session_store
+                .load_session(&address)
+                .await
+                .unwrap()
+                .unwrap()
+                .serialize()
+                .unwrap()
+        );
+
+        // Cache equality alone is insufficient: the active SessionRecord may
+        // still belong to a different remote identity after replacement.
+        let old_key =
+            wacore::libsignal::protocol::PublicKey::from_djb_public_key_bytes(&expected).unwrap();
+        seed_peer_send_state(&client, &peer).await;
+        adapter
+            .identity_store
+            .save_identity(&address, &IdentityKey::new(old_key))
+            .await
+            .unwrap();
+        let before = adapter
+            .session_store
+            .load_session(&address)
+            .await
+            .unwrap()
+            .unwrap()
+            .serialize()
+            .unwrap();
+        let mut sent = Box::pin(client.wait_for_sent_node(
+            crate::client::NodeFilter::tag("message").attr("id", "proof-session-mismatch"),
+        ));
+        assert!(futures::poll!(&mut sent).is_pending());
+        let error = client
+            .send_message_impl(
+                peer,
+                &message,
+                SendPipelineOptions {
+                    peer: true,
+                    expected_peer_identity: Some(expected),
+                    request_id: Some("proof-session-mismatch"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("session identity must be checked by the full peer pipeline");
+        assert!(error.to_string().contains("peer identity changed"));
+        assert!(
+            futures::poll!(&mut sent).is_pending(),
+            "no wire stanza may be captured"
+        );
+        assert_eq!(
+            before,
+            adapter
+                .session_store
+                .load_session(&address)
+                .await
+                .unwrap()
+                .unwrap()
+                .serialize()
+                .unwrap()
+        );
     }
 
     fn pdo_request_message(request_type: wa::message::PeerDataOperationRequestType) -> wa::Message {

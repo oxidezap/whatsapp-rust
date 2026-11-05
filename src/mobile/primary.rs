@@ -1,6 +1,6 @@
 //! Primary companion hosting through the existing IQ, Signal and persistence paths.
 use crate::Client;
-use buffa::Enumeration as _;
+use buffa::{Enumeration as _, Message as _};
 use rand::{CryptoRng, Rng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -96,6 +96,43 @@ struct PendingOperation {
     device_jid: Option<Jid>,
     stage: PrimaryOperationStage,
 }
+/// An abandoned approval remains recoverable; a delayed server result can still land.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AbandonedApproval {
+    pending: PendingOperation,
+}
+impl AbandonedApproval {
+    pub fn key_index(&self) -> u32 {
+        self.pending.key_index
+    }
+    pub fn peer_identity(&self) -> &[u8; 32] {
+        &self.pending.peer_identity
+    }
+    pub fn reference(&self) -> &[u8] {
+        &self.pending.reference
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ApprovalObservation {
+    NotAdvertised,
+    IndexAdvertisedWithoutDevice,
+    DeviceAdvertised,
+}
+/// Observation describes two completed snapshots, never a proof of permanent non-delivery.
+pub struct ApprovalSettlement {
+    key_index: u32,
+    observation: ApprovalObservation,
+}
+impl ApprovalSettlement {
+    pub fn key_index(&self) -> u32 {
+        self.key_index
+    }
+    pub fn observation(&self) -> ApprovalObservation {
+        self.observation
+    }
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostedCompanion {
@@ -114,7 +151,9 @@ impl HostedCompanion {
     pub fn key_index(&self) -> u32 {
         self.key_index
     }
-    pub fn bootstrap_complete(&self) -> bool {
+    /// Both bootstrap messages were dispatched and checkpointed locally.
+    /// This does not claim peer application or full account-history completion.
+    pub fn bootstrap_dispatch_complete(&self) -> bool {
         self.history_sent && self.app_state_sent
     }
 }
@@ -156,11 +195,23 @@ enum Maintenance {
     },
     Bootstrap {
         device: Jid,
+        peer_identity: [u8; 32],
+        key_index: u32,
         payload_hash: [u8; 32],
+        media_key_fingerprint: Option<[u8; 32]>,
+        history_message_id: String,
+        app_state_message_id: String,
+        history_message_hash: Option<[u8; 32]>,
+        app_state_message_hash: Option<[u8; 32]>,
+        app_state_key_id: Option<Vec<u8>>,
     },
     History {
         device: Jid,
+        peer_identity: [u8; 32],
+        key_index: u32,
         cursor: HistoryCursor,
+        message_id: String,
+        message_hash: [u8; 32],
     },
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -175,11 +226,17 @@ struct PrimaryJournal {
     pending: Option<PendingOperation>,
     maintenance: Option<Maintenance>,
     companions: Vec<HostedCompanion>,
+    #[serde(default)]
+    abandoned: Vec<AbandonedApproval>,
+    #[serde(default)]
+    abandoned_dispatches: Vec<Maintenance>,
 }
 impl PrimaryJournal {
     fn validate(&self) -> Result<(), PrimaryManagementError> {
         if self.schema != 1
             || self.companions.len() > MAX_TRACKED_COMPANIONS
+            || self.abandoned.len() > MAX_TRACKED_COMPANIONS
+            || self.abandoned_dispatches.len() > MAX_TRACKED_COMPANIONS
             || self.live_indexes.is_empty()
             || self.live_indexes.len() > 4096
             || !self.live_indexes.contains(&0)
@@ -189,8 +246,40 @@ impl PrimaryJournal {
                 "journal schema or capacity",
             ));
         }
+        match &self.maintenance {
+            Some(Maintenance::Bootstrap {
+                history_message_id,
+                app_state_message_id,
+                app_state_key_id,
+                ..
+            }) if !valid_message_id(history_message_id)
+                || !valid_message_id(app_state_message_id)
+                || history_message_id == app_state_message_id
+                || app_state_key_id.as_ref().is_some_and(|id| id.len() != 6) =>
+            {
+                return Err(PrimaryManagementError::Invalid("bootstrap message journal"));
+            }
+            Some(Maintenance::History { message_id, .. }) if !valid_message_id(message_id) => {
+                return Err(PrimaryManagementError::Invalid("history message journal"));
+            }
+            _ => {}
+        }
         let mut indexes = std::collections::BTreeSet::new();
         let mut devices = std::collections::BTreeSet::new();
+        for abandoned in &self.abandoned {
+            let pending = &abandoned.pending;
+            if pending.key_index == 0
+                || pending.key_index > self.high_water
+                || pending.reference.is_empty()
+                || pending.reference.len() > 4096
+                || pending.issued_identity.is_empty()
+                || pending.issued_identity.len() > 16384
+                || pending.signed_indexes.is_empty()
+                || pending.signed_indexes.len() > 16384
+            {
+                return Err(PrimaryManagementError::Invalid("abandoned approval record"));
+            }
+        }
         for companion in &self.companions {
             if companion.key_index == 0
                 || companion.key_index > self.high_water
@@ -220,6 +309,23 @@ impl PrimaryJournal {
         }
         Ok(())
     }
+    fn apply_observed(&mut self, observed: &PrimaryDeviceSnapshot) {
+        self.live_indexes = observed.live_indexes.clone();
+        self.live_indexes.extend(
+            self.abandoned
+                .iter()
+                .filter(|record| {
+                    observed
+                        .advertised_indexes
+                        .contains(&record.pending.key_index)
+                })
+                .map(|record| record.pending.key_index),
+        );
+        self.live_indexes.sort_unstable();
+        self.live_indexes.dedup();
+        self.high_water = self.high_water.max(observed.high_water);
+        self.key_index_timestamp = self.key_index_timestamp.max(observed.key_index_timestamp);
+    }
     fn encode(&self) -> Result<Vec<u8>, PrimaryManagementError> {
         self.validate()?;
         let encoded = serde_json::to_vec(self)?;
@@ -244,10 +350,47 @@ impl PrimaryCodeExchange {
     }
 }
 struct PrimaryDeviceSnapshot {
+    advertised_indexes: Vec<u32>,
     devices: Vec<(Jid, u32)>,
     live_indexes: Vec<u32>,
     high_water: u32,
     key_index_timestamp: u64,
+}
+
+/// An explicitly prepared external-history descriptor. It contains a media key;
+/// hosts retain it in their protected storage before dispatch and restore the
+/// exact descriptor after cancellation. No descriptor is silently re-uploaded.
+pub struct PreparedBootstrapHistory {
+    upload: crate::upload::UploadResponse,
+    payload_hash: [u8; 32],
+}
+impl PreparedBootstrapHistory {
+    pub fn from_uploaded(
+        history: &wa::HistorySync,
+        upload: crate::upload::UploadResponse,
+    ) -> Result<Self, PrimaryManagementError> {
+        validate_initial_history(history)?;
+        let bytes = bounded_history_bytes(history, 16 * 1024 * 1024)?;
+        let payload_hash = Sha256::digest(&bytes).into();
+        let compressed = compress_history(&bytes)?;
+        if upload.media_key == [0; 32]
+            || upload.direct_path.is_empty()
+            || upload.direct_path.len() > 4096
+            || upload.file_length != compressed.len() as u64
+            || upload.file_sha256 != <[u8; 32]>::from(Sha256::digest(&compressed))
+        {
+            return Err(PrimaryManagementError::Invalid(
+                "external history descriptor does not match payload",
+            ));
+        }
+        Ok(Self {
+            upload,
+            payload_hash,
+        })
+    }
+    pub fn upload_descriptor(&self) -> &crate::upload::UploadResponse {
+        &self.upload
+    }
 }
 
 pub struct MobilePrimaryApi<'a> {
@@ -391,6 +534,8 @@ impl MobilePrimaryApi<'_> {
             pending: None,
             maintenance: None,
             companions: Vec::new(),
+            abandoned: Vec::new(),
+            abandoned_dispatches: Vec::new(),
         };
         self.save(binding, &journal).await
     }
@@ -428,8 +573,7 @@ impl MobilePrimaryApi<'_> {
                 "key-index timestamp regressed",
             ));
         }
-        journal.live_indexes = observed.live_indexes;
-        journal.high_water = observed.high_water;
+        journal.apply_observed(&observed);
         journal.key_index_timestamp = timestamp_seconds;
         let mut indexes: Vec<u32> = journal
             .companions
@@ -583,6 +727,7 @@ impl MobilePrimaryApi<'_> {
             .persistence_manager
             .mobile_primary_operation_guard()
             .await;
+        self.client.persistence_manager.flush().await?;
         let (binding, mut journal, accounts) = self.state()?;
         let pending = journal
             .pending
@@ -689,7 +834,7 @@ impl MobilePrimaryApi<'_> {
             app_state_sent: false,
             history_cursors: Vec::new(),
         });
-        journal.live_indexes = observed.live_indexes;
+        journal.apply_observed(&observed);
         journal.high_water = journal.high_water.max(observed.high_water);
         journal.key_index_timestamp = journal
             .key_index_timestamp
@@ -700,6 +845,9 @@ impl MobilePrimaryApi<'_> {
     /// Query and authenticate a complete current account device list. Signed
     /// indexes for untracked companions are retained during later publications.
     async fn query_current_devices(&self) -> Result<PrimaryDeviceSnapshot, PrimaryManagementError> {
+        // A cancelled/failed prior save may already be visible in the snapshot.
+        // Settle its retained durability future before any recovery wire action.
+        self.client.persistence_manager.flush().await?;
         let sid = self.client.generate_request_id();
         let (_, journal, accounts) = self.state()?;
         let response = self
@@ -719,6 +867,7 @@ impl MobilePrimaryApi<'_> {
             .map_err(|_| PrimaryManagementError::Invalid("primary identity"))?;
         let mut devices = Vec::new();
         let mut live_indexes = vec![0];
+        let mut advertised_indexes = vec![0];
         let mut high_water = journal.high_water;
         let mut key_index_timestamp = journal.key_index_timestamp;
         for list in response.device_lists {
@@ -733,6 +882,7 @@ impl MobilePrimaryApi<'_> {
                 if verified.raw_id != journal.raw_id {
                     return Err(PrimaryManagementError::Invalid("account epoch changed"));
                 }
+                advertised_indexes.extend(verified.valid_indexes.iter().copied());
                 high_water = high_water.max(verified.current_index);
                 key_index_timestamp = key_index_timestamp.max(verified.timestamp);
                 for device in list.devices {
@@ -763,7 +913,12 @@ impl MobilePrimaryApi<'_> {
         if let Some(index) = live_indexes.last() {
             high_water = high_water.max(*index);
         }
+        advertised_indexes.sort_unstable();
+        advertised_indexes.dedup();
+        devices.sort_unstable_by_key(|(jid, index)| (jid.to_string(), *index));
+        devices.dedup();
         Ok(PrimaryDeviceSnapshot {
+            advertised_indexes,
             devices,
             live_indexes,
             high_water,
@@ -789,8 +944,7 @@ impl MobilePrimaryApi<'_> {
                 .iter()
                 .any(|(jid, index)| jid == &v.device_jid && *index == v.key_index)
         });
-        journal.live_indexes = observed.live_indexes;
-        journal.high_water = observed.high_water;
+        journal.apply_observed(&observed);
         journal.key_index_timestamp = observed.key_index_timestamp;
         self.save(binding, &journal).await
     }
@@ -809,13 +963,148 @@ impl MobilePrimaryApi<'_> {
         journal.pending = None;
         self.save(binding, &journal).await
     }
+    /// Release an abandoned approval's active slot while retaining its public
+    /// recovery tombstone and spent index. Matching snapshots do not prove that
+    /// a delayed result can never land; the returned observation stays explicit.
+    pub async fn settle_unsuccessful_approval(
+        &self,
+    ) -> Result<ApprovalSettlement, PrimaryManagementError> {
+        let _operation_guard = self
+            .client
+            .persistence_manager
+            .mobile_primary_operation_guard()
+            .await;
+        self.client.persistence_manager.flush().await?;
+        let (_, journal, _) = self.state()?;
+        let pending = journal
+            .pending
+            .as_ref()
+            .ok_or(PrimaryManagementError::Invalid("no pending approval"))?;
+        let spent_index = pending.key_index;
+        let first = self.query_current_devices().await?;
+        let second = self.query_current_devices().await?;
+        if first.devices != second.devices
+            || first.live_indexes != second.live_indexes
+            || first.advertised_indexes != second.advertised_indexes
+            || first.high_water != second.high_water
+        {
+            return Err(PrimaryManagementError::Invalid(
+                "account topology is changing",
+            ));
+        }
+        let observation = if second
+            .devices
+            .iter()
+            .any(|(_, index)| *index == spent_index)
+        {
+            ApprovalObservation::DeviceAdvertised
+        } else if second.advertised_indexes.contains(&spent_index) {
+            ApprovalObservation::IndexAdvertisedWithoutDevice
+        } else {
+            ApprovalObservation::NotAdvertised
+        };
+        let (binding, mut journal, _) = self.state()?;
+        if journal
+            .pending
+            .as_ref()
+            .is_none_or(|value| value.key_index != spent_index)
+            || journal.abandoned.len() >= MAX_TRACKED_COMPANIONS
+        {
+            return Err(PrimaryManagementError::Invalid(
+                "approval changed or recovery capacity reached",
+            ));
+        }
+        let pending = journal
+            .pending
+            .take()
+            .ok_or(PrimaryManagementError::Invalid("approval changed"))?;
+        journal.abandoned.push(AbandonedApproval { pending });
+        journal.apply_observed(&second);
+        self.save(binding, &journal).await?;
+        Ok(ApprovalSettlement {
+            key_index: spent_index,
+            observation,
+        })
+    }
+    pub fn abandoned_approvals(&self) -> Result<Vec<AbandonedApproval>, PrimaryManagementError> {
+        Ok(self.state()?.1.abandoned)
+    }
+    /// Recover a late approval only with its original reference, signatures,
+    /// peer identity and a fresh authenticated device/index observation.
+    pub async fn recover_abandoned_approval(
+        &self,
+        key_index: u32,
+        reference: &[u8],
+        device: &Jid,
+        proof: &[u8],
+    ) -> Result<(), PrimaryManagementError> {
+        let _operation_guard = self
+            .client
+            .persistence_manager
+            .mobile_primary_operation_guard()
+            .await;
+        let observed = self.query_current_devices().await?;
+        let (binding, mut journal, accounts) = self.state()?;
+        if journal.pending.is_some() || journal.maintenance.is_some() {
+            return Err(PrimaryManagementError::Invalid("active operation"));
+        }
+        let position = journal
+            .abandoned
+            .iter()
+            .position(|v| v.pending.key_index == key_index)
+            .ok_or(PrimaryManagementError::Invalid(
+                "unknown abandoned approval",
+            ))?;
+        let pending = &journal.abandoned[position].pending;
+        if pending
+            .device_jid
+            .as_ref()
+            .is_some_and(|acknowledged| acknowledged != device)
+        {
+            return Err(PrimaryManagementError::Invalid(
+                "acknowledged abandoned companion mismatch",
+            ));
+        }
+        if !observed
+            .devices
+            .iter()
+            .any(|(jid, index)| jid == device && *index == key_index)
+        {
+            return Err(PrimaryManagementError::Invalid(
+                "late companion not advertised",
+            ));
+        }
+        let verified = PendingCompanion::new(
+            &pending.reference,
+            &accounts,
+            &pending.peer_identity,
+            SignedCompanionIdentity {
+                device_identity: pending.issued_identity.clone(),
+                key_index_list: pending.signed_indexes.clone(),
+            },
+        )?
+        .acknowledge(device)?
+        .verify(reference, device, proof)?;
+        journal.companions.push(HostedCompanion {
+            device_jid: verified.device_jid().clone(),
+            peer_identity: *verified.peer_identity(),
+            signed_identity: verified.signed_identity().to_vec(),
+            key_index,
+            history_sent: false,
+            app_state_sent: false,
+            history_cursors: vec![],
+        });
+        journal.abandoned.remove(position);
+        journal.apply_observed(&observed);
+        self.save(binding, &journal).await
+    }
     pub async fn revoke(
         &self,
         server: &Jid,
         device: &Jid,
         reason: &str,
         timestamp_seconds: u64,
-        rng: &mut (impl Rng + CryptoRng),
+        rng: &mut impl CryptoRng,
     ) -> Result<(), PrimaryManagementError> {
         let _operation_guard = self
             .client
@@ -829,25 +1118,47 @@ impl MobilePrimaryApi<'_> {
                 "key-index timestamp regressed",
             ));
         }
-        journal.live_indexes = observed.live_indexes;
-        journal.high_water = observed.high_water;
+        let observed_key_index = observed
+            .devices
+            .iter()
+            .find(|(jid, _)| jid == device)
+            .map(|(_, index)| *index);
+        if observed_key_index.is_some_and(|index| {
+            journal
+                .companions
+                .iter()
+                .any(|record| &record.device_jid == device && record.key_index != index)
+        }) {
+            return Err(PrimaryManagementError::Invalid(
+                "tracked companion address changed key index; reconcile first",
+            ));
+        }
+        journal.apply_observed(&observed);
         journal.key_index_timestamp = timestamp_seconds;
         if journal.pending.is_some()
             || journal.maintenance.is_some()
-            || !journal.companions.iter().any(|v| &v.device_jid == device)
+            || (observed_key_index.is_none()
+                && !journal.companions.iter().any(|v| &v.device_jid == device))
         {
             return Err(PrimaryManagementError::Invalid(
                 "untracked device or active operation",
             ));
         }
         RemovePrimaryCompanionSpec::new(server, &accounts, device, reason)?;
-        let signed = self.sign_indexes(&journal, Some(device), timestamp_seconds, rng)?;
-        let key_index = journal
-            .companions
-            .iter()
-            .find(|v| &v.device_jid == device)
-            .ok_or(PrimaryManagementError::Invalid("untracked companion"))?
-            .key_index;
+        let mut signing_state = journal.clone();
+        if let Some(index) = observed_key_index {
+            signing_state.live_indexes.retain(|value| *value != index);
+        }
+        let signed = self.sign_indexes(&signing_state, Some(device), timestamp_seconds, rng)?;
+        let key_index = observed_key_index
+            .or_else(|| {
+                journal
+                    .companions
+                    .iter()
+                    .find(|v| &v.device_jid == device)
+                    .map(|v| v.key_index)
+            })
+            .ok_or(PrimaryManagementError::Invalid("untracked companion"))?;
         journal.maintenance = Some(Maintenance::Revoke {
             device: device.clone(),
             key_index,
@@ -865,7 +1176,7 @@ impl MobilePrimaryApi<'_> {
         server: &Jid,
         reason: &str,
         timestamp_seconds: u64,
-        rng: &mut (impl Rng + CryptoRng),
+        rng: &mut impl CryptoRng,
     ) -> Result<(), PrimaryManagementError> {
         let _operation_guard = self
             .client
@@ -879,8 +1190,7 @@ impl MobilePrimaryApi<'_> {
                 "key-index timestamp regressed",
             ));
         }
-        journal.live_indexes = observed.live_indexes;
-        journal.high_water = observed.high_water;
+        journal.apply_observed(&observed);
         journal.key_index_timestamp = timestamp_seconds;
         if journal.pending.is_some() || journal.maintenance.is_some() {
             return Err(PrimaryManagementError::Invalid("active operation"));
@@ -916,7 +1226,7 @@ impl MobilePrimaryApi<'_> {
         journal: &PrimaryJournal,
         excluding: Option<&Jid>,
         timestamp_seconds: u64,
-        rng: &mut (impl Rng + CryptoRng),
+        rng: &mut impl CryptoRng,
     ) -> Result<Vec<u8>, PrimaryManagementError> {
         let indexes: Vec<_> = std::iter::once(0)
             .chain(journal.live_indexes.iter().copied().filter(|index| {
@@ -959,7 +1269,7 @@ impl MobilePrimaryApi<'_> {
         &self,
         server: &Jid,
         timestamp_seconds: u64,
-        rng: &mut (impl Rng + CryptoRng),
+        rng: &mut impl CryptoRng,
     ) -> Result<(), PrimaryManagementError> {
         let _operation_guard = self
             .client
@@ -973,8 +1283,7 @@ impl MobilePrimaryApi<'_> {
                 "key-index timestamp regressed",
             ));
         }
-        journal.live_indexes = observed.live_indexes;
-        journal.high_water = observed.high_water;
+        journal.apply_observed(&observed);
         journal.key_index_timestamp = timestamp_seconds;
         if journal.pending.is_some() || journal.maintenance.is_some() {
             return Err(PrimaryManagementError::Invalid("active operation"));
@@ -995,13 +1304,14 @@ impl MobilePrimaryApi<'_> {
             .persistence_manager
             .mobile_primary_operation_guard()
             .await;
+        self.client.persistence_manager.flush().await?;
         self.resume_maintenance_inner(server).await
     }
     /// Re-sign a failed maintenance publication against a new authenticated snapshot.
     pub async fn refresh_maintenance_indexes(
         &self,
         timestamp_seconds: u64,
-        rng: &mut (impl Rng + CryptoRng),
+        rng: &mut impl CryptoRng,
     ) -> Result<(), PrimaryManagementError> {
         let _operation_guard = self
             .client
@@ -1015,8 +1325,7 @@ impl MobilePrimaryApi<'_> {
                 "key-index timestamp regressed",
             ));
         }
-        journal.live_indexes = fresh.live_indexes;
-        journal.high_water = fresh.high_water;
+        journal.apply_observed(&fresh);
         journal.key_index_timestamp = timestamp_seconds;
         let operation = journal
             .maintenance
@@ -1100,6 +1409,8 @@ impl MobilePrimaryApi<'_> {
                         return Err(PrimaryManagementError::Invalid("maintenance changed"));
                     }
                     latest.companions.clear();
+                    latest.abandoned.clear();
+                    latest.abandoned_dispatches.clear();
                     latest.live_indexes = vec![0];
                     self.save(binding, &latest).await?;
                 }
@@ -1142,6 +1453,13 @@ impl MobilePrimaryApi<'_> {
                         .find(|v| v.device_jid == device)
                         .map(|v| v.key_index);
                     latest.companions.retain(|v| v.device_jid != device);
+                    latest
+                        .abandoned
+                        .retain(|record| record.pending.key_index != key_index);
+                    latest
+                        .abandoned_dispatches
+                        .retain(|operation| !dispatch_for_device(operation, &device));
+                    latest.live_indexes.retain(|v| *v != key_index);
                     if let Some(index) = removed_index {
                         latest.live_indexes.retain(|v| *v != index);
                     }
@@ -1164,9 +1482,11 @@ impl MobilePrimaryApi<'_> {
         let mut expected_live = expected.valid_indexes;
         expected_live.sort_unstable();
         expected_live.dedup();
+        let (_, mut observed_state, _) = self.state()?;
+        observed_state.apply_observed(&fresh);
         if fresh.high_water > expected.current_index
             || fresh.key_index_timestamp > timestamp
-            || fresh.live_indexes != expected_live
+            || observed_state.live_indexes != expected_live
         {
             return Err(PrimaryManagementError::Invalid(
                 "account devices changed; refresh maintenance indexes before retry",
@@ -1187,30 +1507,93 @@ impl MobilePrimaryApi<'_> {
         device: &Jid,
         history: &wa::HistorySync,
     ) -> Result<(), PrimaryManagementError> {
-        self.bootstrap_with_media_key(device, history, None).await
+        self.bootstrap_inner(device, history, None).await
     }
-    /// Large bootstrap uploads require an explicit host-owned media key.
-    pub async fn bootstrap_with_media_key(
+    pub async fn prepare_external_bootstrap_history(
+        &self,
+        history: &wa::HistorySync,
+        media_key: [u8; 32],
+    ) -> Result<PreparedBootstrapHistory, PrimaryManagementError> {
+        validate_initial_history(history)?;
+        if media_key == [0; 32] {
+            return Err(PrimaryManagementError::Invalid("history media key"));
+        }
+        let bytes = bounded_history_bytes(history, 16 * 1024 * 1024)?;
+        let payload_hash = Sha256::digest(&bytes).into();
+        let compressed =
+            wacore::runtime::blocking(&*self.client.runtime, move || compress_history(&bytes))
+                .await?;
+        let upload = self
+            .client
+            .upload(
+                compressed,
+                wacore::download::MediaType::History,
+                crate::UploadOptions::new().with_media_key(media_key),
+            )
+            .await
+            .map_err(PrimaryManagementError::protocol)?;
+        Ok(PreparedBootstrapHistory {
+            upload,
+            payload_hash,
+        })
+    }
+    /// Retry with the original retained upload, even if a later CDN refresh would
+    /// return another path. The exact notification hash and message ID stay bound.
+    pub async fn bootstrap_with_uploaded_history(
         &self,
         device: &Jid,
         history: &wa::HistorySync,
-        media_key: Option<[u8; 32]>,
+        prepared: &PreparedBootstrapHistory,
+    ) -> Result<(), PrimaryManagementError> {
+        self.bootstrap_inner(device, history, Some(prepared)).await
+    }
+    async fn bootstrap_inner(
+        &self,
+        device: &Jid,
+        history: &wa::HistorySync,
+        prepared: Option<&PreparedBootstrapHistory>,
     ) -> Result<(), PrimaryManagementError> {
         let _operation_guard = self
             .client
             .persistence_manager
             .mobile_primary_operation_guard()
             .await;
+        self.client.persistence_manager.flush().await?;
+        validate_initial_history(history)?;
+        let history_size = history
+            .try_encoded_len()
+            .map_err(PrimaryManagementError::protocol)? as usize;
+        if history_size > 16 * 1024 * 1024 || (history_size > 64 * 1024 && prepared.is_none()) {
+            return Err(PrimaryManagementError::Invalid(
+                "bootstrap requires a bounded payload and retained external descriptor",
+            ));
+        }
         let history_hash: [u8; 32] =
-            Sha256::digest(waproto::codec::history_sync_to_vec(history)).into();
+            Sha256::digest(bounded_history_bytes(history, 16 * 1024 * 1024)?).into();
+        if prepared.is_some_and(|value| value.payload_hash != history_hash) {
+            return Err(PrimaryManagementError::Invalid(
+                "prepared history payload changed",
+            ));
+        }
+        let media_key_fingerprint =
+            prepared.map(|value| Sha256::digest(value.upload.media_key).into());
         let (_, journal, accounts) = self.state()?;
         validate_owned(device, &accounts)?;
+        if journal
+            .abandoned_dispatches
+            .iter()
+            .any(|op| dispatch_for_device(op, device))
+        {
+            return Err(PrimaryManagementError::Invalid(
+                "dispatch was abandoned; resume it explicitly or revoke device",
+            ));
+        }
         let record = journal
             .companions
             .iter()
             .find(|v| &v.device_jid == device)
             .ok_or(PrimaryManagementError::Invalid("unconfirmed device"))?;
-        if journal.pending.is_some() || journal.maintenance.as_ref().is_some_and(|op| !matches!(op, Maintenance::Bootstrap { device: reserved, payload_hash } if reserved == device && payload_hash == &history_hash)) {
+        if journal.pending.is_some() || journal.maintenance.as_ref().is_some_and(|op| !matches!(op, Maintenance::Bootstrap { device: reserved, peer_identity, key_index, payload_hash, media_key_fingerprint: expected_key, .. } if reserved == device && peer_identity == &record.peer_identity && *key_index == record.key_index && payload_hash == &history_hash && expected_key == &media_key_fingerprint)) {
             return Err(PrimaryManagementError::Invalid("another operation is active"));
         }
         let expected_identity = record.peer_identity;
@@ -1218,30 +1601,26 @@ impl MobilePrimaryApi<'_> {
         if reserved.maintenance.is_none() {
             reserved.maintenance = Some(Maintenance::Bootstrap {
                 device: device.clone(),
+                peer_identity: record.peer_identity,
+                key_index: record.key_index,
                 payload_hash: history_hash,
+                media_key_fingerprint,
+                history_message_id: self.client.generate_message_id().to_string(),
+                app_state_message_id: self.client.generate_message_id().to_string(),
+                history_message_hash: None,
+                app_state_message_hash: None,
+                app_state_key_id: None,
             });
             self.save(binding, &reserved).await?;
         }
-        self.client
-            .ensure_e2e_sessions(std::slice::from_ref(device))
-            .await
-            .map_err(PrimaryManagementError::protocol)?;
+        self.ensure_companion_identity(device, &expected_identity)
+            .await?;
         let snapshot = self.client.persistence_manager.get_device_snapshot();
-        let identity = snapshot
-            .backend
-            .load_identity(device.to_protocol_address().as_str())
-            .await?
-            .ok_or(PrimaryManagementError::Invalid(
-                "missing companion Signal identity",
-            ))?;
-        if !bool::from(identity.as_slice().ct_eq(&expected_identity)) {
-            return Err(PrimaryManagementError::Invalid(
-                "companion Signal identity mismatch",
-            ));
-        }
         if !record.history_sent {
-            let message = self.build_history_message(history, media_key).await?;
-            self.send_peer(device, &message).await?;
+            let message = self.build_history_message(history, prepared)?;
+            let message_id = self.bind_bootstrap_message(device, &message, true).await?;
+            self.send_peer(device, &message, &message_id, expected_identity)
+                .await?;
             self.mark_bootstrap(device, true).await?;
         }
         if !record.app_state_sent {
@@ -1250,15 +1629,44 @@ impl MobilePrimaryApi<'_> {
                 .mobile_session
                 .as_ref()
                 .ok_or(PrimaryManagementError::Invalid("mobile session"))?;
-            let id = self
-                .client
-                .ensure_primary_app_state_key(session.app_state_key())
-                .await?;
+            let (_, current, _) = self.state()?;
+            let selected = match current.maintenance.as_ref() {
+                Some(Maintenance::Bootstrap {
+                    app_state_key_id, ..
+                }) => app_state_key_id.clone(),
+                _ => {
+                    return Err(PrimaryManagementError::Invalid(
+                        "bootstrap operation changed",
+                    ));
+                }
+            };
+            let id = if let Some(id) = selected {
+                id
+            } else {
+                let id = self
+                    .client
+                    .ensure_primary_app_state_key(session.app_state_key())
+                    .await?;
+                let (binding, mut current, _) = self.state()?;
+                if let Some(Maintenance::Bootstrap {
+                    app_state_key_id, ..
+                }) = current.maintenance.as_mut()
+                {
+                    *app_state_key_id = Some(id.clone());
+                } else {
+                    return Err(PrimaryManagementError::Invalid(
+                        "bootstrap operation changed",
+                    ));
+                }
+                self.save(binding, &current).await?;
+                id
+            };
             let stored = snapshot
                 .backend
                 .get_sync_key(&id)
                 .await?
                 .ok_or(PrimaryManagementError::Invalid("app-state key missing"))?;
+            validate_app_state_key(&id, &stored)?;
             let fingerprint =
                 waproto::codec::app_state_sync_key_fingerprint_decode(&stored.fingerprint)
                     .map_err(|_| PrimaryManagementError::Invalid("app-state fingerprint"))?;
@@ -1278,7 +1686,9 @@ impl MobilePrimaryApi<'_> {
             protocol.app_state_sync_key_share = buffa::MessageField::some(share);
             let mut message = wa::Message::default();
             message.protocol_message = buffa::MessageField::some(protocol);
-            self.send_peer(device, &message).await?;
+            let message_id = self.bind_bootstrap_message(device, &message, false).await?;
+            self.send_peer(device, &message, &message_id, expected_identity)
+                .await?;
             self.mark_bootstrap(device, false).await?;
         }
         let (binding, mut latest, _) = self.state()?;
@@ -1286,54 +1696,163 @@ impl MobilePrimaryApi<'_> {
         self.save(binding, &latest).await?;
         Ok(())
     }
-    async fn build_history_message(
-        &self,
-        history: &wa::HistorySync,
-        media_key: Option<[u8; 32]>,
-    ) -> Result<wa::Message, PrimaryManagementError> {
-        if history.sync_type != wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP
-            || history.progress != Some(100)
-            || history.chunk_order != Some(0)
+    /// Stop local dispatch without erasing sent-leg progress or message identities.
+    /// This releases management operations; late peer application remains possible.
+    pub async fn abandon_dispatch(&self, device: &Jid) -> Result<(), PrimaryManagementError> {
+        let _operation_guard = self
+            .client
+            .persistence_manager
+            .mobile_primary_operation_guard()
+            .await;
+        self.client.persistence_manager.flush().await?;
+        let (binding, mut journal, _) = self.state()?;
+        if journal.abandoned_dispatches.len() >= MAX_TRACKED_COMPANIONS
+            || journal
+                .maintenance
+                .as_ref()
+                .is_none_or(|op| !dispatch_for_device(op, device))
         {
             return Err(PrimaryManagementError::Invalid(
-                "initial bootstrap metadata",
+                "no dispatch or recovery capacity reached",
             ));
         }
-        let bytes = waproto::codec::history_sync_to_vec(history);
-        if bytes.len() <= 64 * 1024 {
-            return build_history_bootstrap(history);
-        }
-        if bytes.len() > 16 * 1024 * 1024 {
-            return Err(PrimaryManagementError::Invalid(
-                "history chunk capacity; use streaming upload",
-            ));
-        }
-        let media_key = media_key.ok_or(PrimaryManagementError::Invalid(
-            "external history media key required",
-        ))?;
-        if media_key == [0; 32] {
-            return Err(PrimaryManagementError::Invalid("history media key"));
-        }
-        let compressed =
-            wacore::runtime::blocking(&*self.client.runtime, move || compress_history(&bytes))
-                .await?;
-        let upload = self
+        let operation = journal
+            .maintenance
+            .take()
+            .ok_or(PrimaryManagementError::Invalid("dispatch changed"))?;
+        journal.abandoned_dispatches.push(operation);
+        self.save(binding, &journal).await
+    }
+    /// Restore exactly the archived IDs and payload hashes before retrying the
+    /// original bootstrap/history API. No fresh logical send identity is minted.
+    pub async fn resume_abandoned_dispatch(
+        &self,
+        device: &Jid,
+    ) -> Result<(), PrimaryManagementError> {
+        let _operation_guard = self
             .client
-            .upload(
-                compressed,
-                wacore::download::MediaType::History,
-                crate::UploadOptions::new().with_media_key(media_key),
-            )
-            .await
-            .map_err(PrimaryManagementError::protocol)?;
-        Ok(external_history_message(
-            &PrimaryHistoryChunk {
-                sync_type: wa::message::HistorySyncType::INITIAL_BOOTSTRAP,
-                chunk_order: 0,
-                progress: 100,
-            },
-            &upload,
-        ))
+            .persistence_manager
+            .mobile_primary_operation_guard()
+            .await;
+        self.client.persistence_manager.flush().await?;
+        let (binding, mut journal, _) = self.state()?;
+        if journal.pending.is_some() || journal.maintenance.is_some() {
+            return Err(PrimaryManagementError::Invalid("active operation"));
+        }
+        let position = journal
+            .abandoned_dispatches
+            .iter()
+            .rposition(|op| dispatch_for_device(op, device))
+            .ok_or(PrimaryManagementError::Invalid("no abandoned dispatch"))?;
+        let (peer_identity, key_index) = match &journal.abandoned_dispatches[position] {
+            Maintenance::Bootstrap {
+                peer_identity,
+                key_index,
+                ..
+            }
+            | Maintenance::History {
+                peer_identity,
+                key_index,
+                ..
+            } => (peer_identity, key_index),
+            _ => return Err(PrimaryManagementError::Invalid("invalid archived dispatch")),
+        };
+        if !journal.companions.iter().any(|record| {
+            &record.device_jid == device
+                && &record.peer_identity == peer_identity
+                && &record.key_index == key_index
+        }) {
+            return Err(PrimaryManagementError::Invalid(
+                "archived companion identity changed",
+            ));
+        }
+        journal.maintenance = Some(journal.abandoned_dispatches.remove(position));
+        self.save(binding, &journal).await
+    }
+    /// Replace a local bootstrap only when no peer payload has ever been bound
+    /// for sending. Once a message hash exists, recovery must retain its identity.
+    pub async fn cancel_unsent_bootstrap(
+        &self,
+        device: &Jid,
+    ) -> Result<(), PrimaryManagementError> {
+        let _operation_guard = self
+            .client
+            .persistence_manager
+            .mobile_primary_operation_guard()
+            .await;
+        self.client.persistence_manager.flush().await?;
+        let (binding, mut journal, _) = self.state()?;
+        let safe = matches!(&journal.maintenance, Some(Maintenance::Bootstrap { device: reserved, history_message_hash: None, app_state_message_hash: None, .. }) if reserved == device)
+            && journal.companions.iter().any(|record| {
+                &record.device_jid == device && !record.history_sent && !record.app_state_sent
+            });
+        if !safe {
+            return Err(PrimaryManagementError::Invalid(
+                "bootstrap may have reached companion",
+            ));
+        }
+        journal.maintenance = None;
+        self.save(binding, &journal).await
+    }
+    async fn bind_bootstrap_message(
+        &self,
+        device: &Jid,
+        message: &wa::Message,
+        history: bool,
+    ) -> Result<String, PrimaryManagementError> {
+        let hash: [u8; 32] = Sha256::digest(waproto::codec::message_to_vec(message)).into();
+        let (binding, mut journal, _) = self.state()?;
+        let Some(Maintenance::Bootstrap {
+            device: reserved,
+            history_message_id,
+            app_state_message_id,
+            history_message_hash,
+            app_state_message_hash,
+            ..
+        }) = journal.maintenance.as_mut()
+        else {
+            return Err(PrimaryManagementError::Invalid(
+                "bootstrap operation changed",
+            ));
+        };
+        if reserved != device {
+            return Err(PrimaryManagementError::Invalid(
+                "bootstrap companion changed",
+            ));
+        }
+        let (id, expected) = if history {
+            (history_message_id.clone(), history_message_hash)
+        } else {
+            (app_state_message_id.clone(), app_state_message_hash)
+        };
+        if expected.as_ref().is_some_and(|value| value != &hash) {
+            return Err(PrimaryManagementError::Invalid(
+                "ambiguous bootstrap payload changed",
+            ));
+        }
+        if expected.is_none() {
+            *expected = Some(hash);
+            self.save(binding, &journal).await?;
+        }
+        Ok(id)
+    }
+    fn build_history_message(
+        &self,
+        history: &wa::HistorySync,
+        prepared: Option<&PreparedBootstrapHistory>,
+    ) -> Result<wa::Message, PrimaryManagementError> {
+        validate_initial_history(history)?;
+        if let Some(prepared) = prepared {
+            return Ok(external_history_message(
+                &PrimaryHistoryChunk {
+                    sync_type: wa::message::HistorySyncType::INITIAL_BOOTSTRAP,
+                    chunk_order: 0,
+                    progress: 100,
+                },
+                &prepared.upload,
+            ));
+        }
+        build_history_bootstrap(history)
     }
     /// Export one externally uploaded history chunk and checkpoint its exact hash
     /// and cursor after the encrypted peer send. Hosts can use upload_stream with
@@ -1349,6 +1868,7 @@ impl MobilePrimaryApi<'_> {
             .persistence_manager
             .mobile_primary_operation_guard()
             .await;
+        self.client.persistence_manager.flush().await?;
         if metadata.progress > 100
             || upload.media_key == [0; 32]
             || upload.direct_path.is_empty()
@@ -1358,6 +1878,15 @@ impl MobilePrimaryApi<'_> {
         }
         let (binding, mut journal, accounts) = self.state()?;
         validate_owned(device, &accounts)?;
+        if journal
+            .abandoned_dispatches
+            .iter()
+            .any(|op| dispatch_for_device(op, device))
+        {
+            return Err(PrimaryManagementError::Invalid(
+                "dispatch was abandoned; resume it explicitly or revoke device",
+            ));
+        }
         let record = journal
             .companions
             .iter()
@@ -1390,15 +1919,29 @@ impl MobilePrimaryApi<'_> {
         } else if cursor.chunk_order != 0 {
             return Err(PrimaryManagementError::Invalid("initial history cursor"));
         }
-        if journal.pending.is_some() || journal.maintenance.as_ref().is_some_and(|v| !matches!(v, Maintenance::History { device: reserved, cursor: expected } if reserved == device && expected.sync_type == cursor.sync_type && expected.chunk_order == cursor.chunk_order && expected.progress == cursor.progress && expected.file_sha256 == cursor.file_sha256)) { return Err(PrimaryManagementError::Invalid("another operation is active")); }
+        let message = external_history_message(&metadata, upload);
+        let message_hash: [u8; 32] =
+            Sha256::digest(waproto::codec::message_to_vec(&message)).into();
+        if journal.pending.is_some() || journal.maintenance.as_ref().is_some_and(|v| !matches!(v, Maintenance::History { device: reserved, peer_identity, key_index, cursor: expected, message_hash: expected_message, .. } if reserved == device && peer_identity == &record.peer_identity && *key_index == record.key_index && expected.sync_type == cursor.sync_type && expected.chunk_order == cursor.chunk_order && expected.progress == cursor.progress && expected.file_sha256 == cursor.file_sha256 && expected_message == &message_hash)) { return Err(PrimaryManagementError::Invalid("another operation is active")); }
+        let message_id = if let Some(Maintenance::History { message_id, .. }) = &journal.maintenance
+        {
+            message_id.clone()
+        } else {
+            self.client.generate_message_id().to_string()
+        };
         journal.maintenance = Some(Maintenance::History {
             device: device.clone(),
+            peer_identity: record.peer_identity,
+            key_index: record.key_index,
             cursor: cursor.clone(),
+            message_id: message_id.clone(),
+            message_hash,
         });
         self.save(binding, &journal).await?;
         self.ensure_companion_identity(device, &record.peer_identity)
             .await?;
-        self.send_peer(device, &external_history_message(&metadata, upload))
+        let expected_identity = record.peer_identity;
+        self.send_peer(device, &message, &message_id, expected_identity)
             .await?;
         let (binding, mut journal, _) = self.state()?;
         let record = journal
@@ -1428,14 +1971,18 @@ impl MobilePrimaryApi<'_> {
             .await
             .map_err(PrimaryManagementError::protocol)?;
         let snapshot = self.client.persistence_manager.get_device_snapshot();
-        let identity = snapshot
-            .backend
-            .load_identity(device.to_protocol_address().as_str())
-            .await?
+        let encryption_jid = self.client.resolve_encryption_jid(device).await;
+        let address = encryption_jid.to_protocol_address();
+        let identity = self
+            .client
+            .signal_cache
+            .get_identity(&address, snapshot.backend.as_ref())
+            .await
+            .map_err(PrimaryManagementError::protocol)?
             .ok_or(PrimaryManagementError::Invalid(
                 "missing companion Signal identity",
             ))?;
-        if !bool::from(identity.ct_eq(expected)) {
+        if !bool::from(identity.as_ref().ct_eq(expected)) {
             return Err(PrimaryManagementError::Invalid(
                 "companion Signal identity mismatch",
             ));
@@ -1446,6 +1993,8 @@ impl MobilePrimaryApi<'_> {
         &self,
         device: &Jid,
         message: &wa::Message,
+        message_id: &str,
+        expected_identity: [u8; 32],
     ) -> Result<(), PrimaryManagementError> {
         self.client
             .send_message_impl(
@@ -1453,6 +2002,8 @@ impl MobilePrimaryApi<'_> {
                 message,
                 crate::send::SendPipelineOptions {
                     peer: true,
+                    request_id: Some(message_id),
+                    expected_peer_identity: Some(expected_identity),
                     ..Default::default()
                 },
             )
@@ -1496,6 +2047,37 @@ fn validate_owned(device: &Jid, accounts: &[Jid]) -> Result<(), PrimaryManagemen
     }
     Ok(())
 }
+fn dispatch_for_device(operation: &Maintenance, target: &Jid) -> bool {
+    matches!(operation, Maintenance::Bootstrap { device, .. } | Maintenance::History { device, .. } if device == target)
+}
+fn validate_initial_history(history: &wa::HistorySync) -> Result<(), PrimaryManagementError> {
+    if history.sync_type != wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP
+        || history.chunk_order != Some(0)
+        || history.progress != Some(100)
+    {
+        return Err(PrimaryManagementError::Invalid(
+            "initial bootstrap metadata",
+        ));
+    }
+    Ok(())
+}
+fn valid_message_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+}
+fn bounded_history_bytes(
+    history: &wa::HistorySync,
+    limit: usize,
+) -> Result<Vec<u8>, PrimaryManagementError> {
+    let size = history
+        .try_encoded_len()
+        .map_err(PrimaryManagementError::protocol)? as usize;
+    if size > limit {
+        return Err(PrimaryManagementError::Invalid(
+            "history chunk capacity; use streaming upload",
+        ));
+    }
+    Ok(waproto::codec::history_sync_to_vec(history))
+}
 fn build_history_bootstrap(
     history: &wa::HistorySync,
 ) -> Result<wa::Message, PrimaryManagementError> {
@@ -1504,7 +2086,7 @@ fn build_history_bootstrap(
             "initial history bootstrap type",
         ));
     }
-    let bytes = waproto::codec::history_sync_to_vec(history);
+    let bytes = bounded_history_bytes(history, 64 * 1024)?;
     if bytes.len() > 64 * 1024 {
         return Err(PrimaryManagementError::Invalid(
             "inline bootstrap capacity; external history upload required",
@@ -1615,6 +2197,8 @@ mod tests {
             pending: None,
             maintenance: None,
             companions: vec![],
+            abandoned: vec![],
+            abandoned_dispatches: vec![],
         };
         let encoded = journal.encode().unwrap();
         let restored: PrimaryJournal = serde_json::from_slice(&encoded).unwrap();
@@ -1752,16 +2336,27 @@ mod tests {
                 .unwrap();
         }
         async fn devices(&mut self, request: &wacore_binary::NodeRef<'_>, signed: Option<&[u8]>) {
+            self.devices_snapshot(request, signed, signed.is_some())
+                .await;
+        }
+        async fn devices_snapshot(
+            &mut self,
+            request: &wacore_binary::NodeRef<'_>,
+            signed: Option<&[u8]>,
+            present: bool,
+        ) {
             use wacore_binary::builder::NodeBuilder;
             let mut entries = vec![NodeBuilder::new("device").attr("id", "0").build()];
             let mut children = vec![];
             if let Some(signed) = signed {
-                entries.push(
-                    NodeBuilder::new("device")
-                        .attr("id", "2")
-                        .attr("key-index", "1")
-                        .build(),
-                );
+                if present {
+                    entries.push(
+                        NodeBuilder::new("device")
+                            .attr("id", "2")
+                            .attr("key-index", "1")
+                            .build(),
+                    );
+                }
                 children.push(
                     NodeBuilder::new("key-index-list")
                         .attr("ts", "100")
@@ -1807,7 +2402,7 @@ mod tests {
         use wacore::libsignal::protocol::KeyPair;
         use wacore::pair::{DeviceState, PairUtils};
         use wacore_binary::builder::NodeBuilder;
-        let backend = std::sync::Arc::new(wacore::store::InMemoryBackend::new());
+        let backend = crate::test_utils::primary_test_backend();
         let mut wire = Wire::new(backend.clone()).await;
         wire.client
             .mobile_primary()
@@ -1975,5 +2570,673 @@ mod tests {
                 .high_water,
             1
         );
+    }
+    async fn seed_confirmed_cache_only(
+        client: &std::sync::Arc<Client>,
+        initialize_app_state: bool,
+    ) -> (Jid, [u8; 32]) {
+        use rand::SeedableRng;
+        use wacore::libsignal::protocol::{
+            IdentityKeyPair, KeyPair, PreKeyBundle, UsePQRatchet, process_prekey_bundle,
+        };
+        use wacore::pair::{DeviceState, PairUtils};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(185);
+        let peer = DeviceState {
+            identity_key: KeyPair::generate(&mut rng),
+            noise_key: KeyPair::generate(&mut rng),
+            adv_secret_key: [7; 32],
+        };
+        let peer_identity: [u8; 32] = peer
+            .identity_key
+            .public_key
+            .public_key_bytes()
+            .try_into()
+            .unwrap();
+        let device: Jid = "15550000001:2@s.whatsapp.net".parse().unwrap();
+        let api = client.mobile_primary().unwrap();
+        api.initialize(7, AdvDefaultEncoding::Omit).await.unwrap();
+        let snapshot = client.persistence_manager.get_device_snapshot();
+        let issued = build_signed_companion_identity(
+            &snapshot.identity_key,
+            &peer_identity,
+            &peer.adv_secret_key,
+            &IdentityParameters {
+                raw_id: 7,
+                timestamp_seconds: 100,
+                key_index: 1,
+                valid_indexes: &[0, 1],
+                default_encoding: AdvDefaultEncoding::Omit,
+            },
+            &mut rng,
+        )
+        .unwrap();
+        let (proof, _) = PairUtils::do_pair_crypto(&peer, &issued.device_identity).unwrap();
+        verify_companion_proof(
+            &issued,
+            &proof,
+            &peer_identity,
+            std::slice::from_ref(snapshot.pn.as_ref().unwrap()),
+            &device,
+        )
+        .unwrap();
+        let (binding, mut journal, _) = api.state().unwrap();
+        journal.high_water = 1;
+        journal.live_indexes = vec![0, 1];
+        journal.key_index_timestamp = 100;
+        journal.companions.push(HostedCompanion {
+            device_jid: device.clone(),
+            peer_identity,
+            signed_identity: proof,
+            key_index: 1,
+            history_sent: false,
+            app_state_sent: false,
+            history_cursors: vec![],
+        });
+        api.save(binding, &journal).await.unwrap();
+        if initialize_app_state {
+            client
+                .ensure_primary_app_state_key(Some(
+                    &PrimaryAppStateKeyInput::new([0, 0, 0, 0, 0, 1], [7; 32], 7, 1000).unwrap(),
+                ))
+                .await
+                .unwrap();
+        }
+        let receiver = IdentityKeyPair::from(peer.identity_key);
+        let spk = KeyPair::generate(&mut rng);
+        let opk = KeyPair::generate(&mut rng);
+        let signature = receiver
+            .private_key()
+            .calculate_signature(&spk.public_key.serialize(), &mut rng)
+            .unwrap();
+        let bundle = PreKeyBundle::new(
+            1,
+            1u32.into(),
+            Some((1u32.into(), opk.public_key)),
+            1u32.into(),
+            spk.public_key,
+            signature,
+            *receiver.identity_key(),
+        )
+        .unwrap();
+        let mut adapter = client.signal_adapter();
+        process_prekey_bundle(
+            &device.to_protocol_address(),
+            &mut adapter.session_store,
+            &mut adapter.identity_store,
+            &bundle,
+            &mut rng,
+            UsePQRatchet::No,
+        )
+        .await
+        .unwrap();
+        assert!(
+            snapshot
+                .backend
+                .load_identity(device.to_protocol_address().as_str())
+                .await
+                .unwrap()
+                .is_none(),
+            "fixture identity must exist only in write-behind cache"
+        );
+        (device, peer_identity)
+    }
+    fn initial_history() -> wa::HistorySync {
+        let mut history = wa::HistorySync::default();
+        history.sync_type = wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP;
+        history.chunk_order = Some(0);
+        history.progress = Some(100);
+        history
+    }
+    fn prepared_history(path: &str) -> PreparedBootstrapHistory {
+        let history = initial_history();
+        let bytes = bounded_history_bytes(&history, 16 * 1024 * 1024).unwrap();
+        let compressed = compress_history(&bytes).unwrap();
+        PreparedBootstrapHistory::from_uploaded(
+            &history,
+            crate::upload::UploadResponse {
+                url: "https://synthetic.invalid/history".into(),
+                direct_path: path.into(),
+                media_key: [1; 32],
+                file_sha256: Sha256::digest(&compressed).into(),
+                file_enc_sha256: [2; 32],
+                file_length: compressed.len() as u64,
+                media_key_timestamp: 100,
+                streaming_sidecar: None,
+            },
+        )
+        .unwrap()
+    }
+    struct FailCheckpointAfterWrite {
+        inner: std::sync::Arc<crate::transport::mock::CapturingMockTransport>,
+        fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl crate::transport::Transport for FailCheckpointAfterWrite {
+        async fn send(&self, data: bytes::Bytes) -> anyhow::Result<()> {
+            crate::transport::Transport::send(self.inner.as_ref(), data).await?;
+            // Arm storage failure synchronously after the real Noise frame was
+            // accepted, before the sender can checkpoint its completed dispatch.
+            self.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn disconnect(&self) {
+            crate::transport::Transport::disconnect(self.inner.as_ref()).await;
+        }
+    }
+    #[tokio::test]
+    async fn bootstrap_uses_cache_only_identity_and_reuses_durable_id_after_failed_checkpoint_restart()
+     {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let (mut probe, _) = crate::store::release::tests::ProbeBackend::new();
+        probe.backend = crate::test_utils::primary_test_backend();
+        let fail = Arc::new(AtomicBool::new(false));
+        probe.fail_before_method = Some(("save", fail.clone()));
+        let backend: Arc<dyn crate::store::Backend> = Arc::new(probe);
+        let wire = Wire::new(backend.clone()).await;
+        let (device, peer) = seed_confirmed_cache_only(&wire.client, true).await;
+        let api = wire.client.mobile_primary().unwrap();
+        wire.client
+            .signal_cache
+            .put_identity(&device.to_protocol_address(), &[9; 32])
+            .await;
+        assert!(api.ensure_companion_identity(&device, &peer).await.is_err());
+        assert_eq!(wire.transport.sent_count(), 0);
+        wire.client
+            .signal_cache
+            .put_identity(&device.to_protocol_address(), &peer)
+            .await;
+        api.ensure_companion_identity(&device, &peer).await.unwrap();
+        let mut invalid = initial_history();
+        invalid.progress = Some(37);
+        assert!(api.bootstrap(&device, &invalid).await.is_err());
+        assert!(
+            api.state().unwrap().1.maintenance.is_none(),
+            "invalid input cannot reserve the journal"
+        );
+        let fault_transport = Arc::new(FailCheckpointAfterWrite {
+            inner: wire.transport.clone(),
+            fail: fail.clone(),
+        });
+        let socket = crate::socket::NoiseSocket::with_observers(
+            wire.client.runtime.clone(),
+            fault_transport,
+            wacore::handshake::NoiseCipher::new(&[0; 32]).unwrap(),
+            wacore::handshake::NoiseCipher::new(&[0; 32]).unwrap(),
+            crate::socket::noise_socket::SendObservers::with_stats(wire.client.stats.clone())
+                .with_sent_frames(wire.client.sent_frame_tap.clone()),
+        );
+        *wire.client.noise_socket.lock().unwrap() = Some(Arc::new(socket));
+        let prepared = prepared_history("/history/original");
+        assert!(
+            api.bootstrap_with_uploaded_history(&device, &initial_history(), &prepared)
+                .await
+                .is_err()
+        );
+        assert!(
+            fail.load(Ordering::SeqCst),
+            "checkpoint fault must be armed by the real peer frame"
+        );
+        let first = wire.request(0).await;
+        assert_eq!(first.get().tag, "message");
+        assert!(
+            first.get().get_optional_child("enc").is_some(),
+            "bootstrap must use real Signal encryption"
+        );
+        let first_id = first
+            .get()
+            .attrs()
+            .optional_string("id")
+            .unwrap()
+            .into_owned();
+        let durable = backend.load().await.unwrap().unwrap();
+        let durable_journal: PrimaryJournal = serde_json::from_slice(
+            durable
+                .mobile_session
+                .as_ref()
+                .unwrap()
+                .primary_state
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!durable_journal.companions[0].history_sent);
+        assert!(
+            matches!(durable_journal.maintenance, Some(Maintenance::Bootstrap { history_message_id, history_message_hash: Some(_), .. }) if history_message_id == first_id)
+        );
+        let release = wire.client.store_release();
+        wire.close().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), release.wait())
+            .await
+            .unwrap();
+        fail.store(false, Ordering::SeqCst);
+        let resumed = Wire::new(backend).await;
+        let changed = prepared_history("/history/refreshed-path");
+        assert!(
+            resumed
+                .client
+                .mobile_primary()
+                .unwrap()
+                .bootstrap_with_uploaded_history(&device, &initial_history(), &changed)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            resumed.transport.sent_count(),
+            0,
+            "changed descriptor cannot rebind an ambiguous message"
+        );
+        resumed
+            .client
+            .mobile_primary()
+            .unwrap()
+            .bootstrap_with_uploaded_history(&device, &initial_history(), &prepared)
+            .await
+            .unwrap();
+        let repeated = resumed.request(0).await;
+        assert_eq!(
+            repeated.get().attrs().optional_string("id").as_deref(),
+            Some(first_id.as_str())
+        );
+        assert!(
+            resumed
+                .client
+                .mobile_primary()
+                .unwrap()
+                .companions()
+                .unwrap()[0]
+                .bootstrap_dispatch_complete()
+        );
+        resumed.close().await;
+    }
+    #[tokio::test]
+    async fn undurable_bootstrap_intent_cannot_send_until_retained_flush_succeeds() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let (mut probe, _) = crate::store::release::tests::ProbeBackend::new();
+        probe.backend = crate::test_utils::primary_test_backend();
+        let fail = Arc::new(AtomicBool::new(false));
+        probe.fail_before_method = Some(("save", fail.clone()));
+        let wire = Wire::new(Arc::new(probe)).await;
+        let (device, _) = seed_confirmed_cache_only(&wire.client, true).await;
+        let api = wire.client.mobile_primary().unwrap();
+        fail.store(true, Ordering::SeqCst);
+        assert!(api.bootstrap(&device, &initial_history()).await.is_err());
+        let id = match api.state().unwrap().1.maintenance.unwrap() {
+            Maintenance::Bootstrap {
+                history_message_id, ..
+            } => history_message_id,
+            _ => panic!("bootstrap intent"),
+        };
+        assert!(api.bootstrap(&device, &initial_history()).await.is_err());
+        assert_eq!(
+            wire.transport.sent_count(),
+            0,
+            "resume must settle the failed intent flush before wire"
+        );
+        fail.store(false, Ordering::SeqCst);
+        api.bootstrap(&device, &initial_history()).await.unwrap();
+        let sent = wire.request(0).await;
+        assert_eq!(
+            sent.get().attrs().optional_string("id").as_deref(),
+            Some(id.as_str())
+        );
+        wire.close().await;
+    }
+    #[tokio::test]
+    async fn abandoned_upload_releases_slot_preserves_spent_index_and_recovers_or_revokes_late_device()
+     {
+        use rand::SeedableRng;
+        use wacore::libsignal::protocol::KeyPair;
+        use wacore::pair::{DeviceState, PairUtils};
+        use wacore_binary::builder::NodeBuilder;
+        for advertised_only in [false, true] {
+            let mut wire = Wire::new(crate::test_utils::primary_test_backend()).await;
+            wire.client
+                .mobile_primary()
+                .unwrap()
+                .initialize(7, AdvDefaultEncoding::Omit)
+                .await
+                .unwrap();
+            let mut rng = rand::rngs::StdRng::seed_from_u64(190);
+            let peer = DeviceState {
+                identity_key: KeyPair::generate(&mut rng),
+                noise_key: KeyPair::generate(&mut rng),
+                adv_secret_key: [7; 32],
+            };
+            let qr_text = PairUtils::make_qr_data(
+                &peer,
+                "abandoned-reference",
+                wacore::companion_reg::CompanionWebClientType::Chrome,
+            );
+            let client = wire.client.clone();
+            let qr = CompanionQr::parse(&qr_text).unwrap();
+            let prepare = tokio::spawn(async move {
+                client
+                    .mobile_primary()
+                    .unwrap()
+                    .prepare_qr(&qr, 100, &[], &mut rand::rngs::StdRng::seed_from_u64(191))
+                    .await
+            });
+            let request = wire.request(0).await;
+            wire.devices(request.get(), None).await;
+            assert_eq!(prepare.await.unwrap().unwrap(), 1);
+            let (_, journal, _) = wire.client.mobile_primary().unwrap().state().unwrap();
+            let pending = journal.pending.unwrap();
+            let signed = pending.signed_indexes;
+            let (proof, _) = PairUtils::do_pair_crypto(&peer, &pending.issued_identity).unwrap();
+            let client = wire.client.clone();
+            let upload = tokio::spawn(async move {
+                client
+                    .mobile_primary()
+                    .unwrap()
+                    .upload_prepared(&"s.whatsapp.net".parse().unwrap(), None)
+                    .await
+            });
+            let request = wire.request(1).await;
+            wire.reply(
+                request.get(),
+                vec![NodeBuilder::new("error").attr("code", "500").build()],
+                true,
+            )
+            .await;
+            assert!(upload.await.unwrap().is_err());
+            let client = wire.client.clone();
+            let settle = tokio::spawn(async move {
+                client
+                    .mobile_primary()
+                    .unwrap()
+                    .settle_unsuccessful_approval()
+                    .await
+            });
+            for index in [2, 3] {
+                let request = wire.request(index).await;
+                wire.devices_snapshot(
+                    request.get(),
+                    if advertised_only { Some(&signed) } else { None },
+                    false,
+                )
+                .await;
+            }
+            let settlement = settle.await.unwrap().unwrap();
+            assert_eq!(settlement.key_index(), 1);
+            assert_eq!(
+                settlement.observation(),
+                if advertised_only {
+                    ApprovalObservation::IndexAdvertisedWithoutDevice
+                } else {
+                    ApprovalObservation::NotAdvertised
+                }
+            );
+            let api = wire.client.mobile_primary().unwrap();
+            assert_eq!(api.abandoned_approvals().unwrap().len(), 1);
+            assert!(api.pending_stage().unwrap().is_none());
+            let client = wire.client.clone();
+            let qr = CompanionQr::parse(&qr_text).unwrap();
+            let prepare = tokio::spawn(async move {
+                client
+                    .mobile_primary()
+                    .unwrap()
+                    .prepare_qr(&qr, 100, &[], &mut rand::rngs::StdRng::seed_from_u64(192))
+                    .await
+            });
+            let request = wire.request(4).await;
+            wire.devices_snapshot(
+                request.get(),
+                if advertised_only { Some(&signed) } else { None },
+                false,
+            )
+            .await;
+            assert_eq!(
+                prepare.await.unwrap().unwrap(),
+                2,
+                "an abandoned index must never be reused"
+            );
+            wire.client
+                .mobile_primary()
+                .unwrap()
+                .cancel_prepared()
+                .await
+                .unwrap();
+            let client = wire.client.clone();
+            if !advertised_only {
+                let recover = tokio::spawn(async move {
+                    client
+                        .mobile_primary()
+                        .unwrap()
+                        .recover_abandoned_approval(
+                            1,
+                            b"abandoned-reference",
+                            &"15550000001:2@s.whatsapp.net".parse().unwrap(),
+                            &proof,
+                        )
+                        .await
+                });
+                let request = wire.request(5).await;
+                wire.devices(request.get(), Some(&signed)).await;
+                recover.await.unwrap().unwrap();
+                assert_eq!(
+                    wire.client
+                        .mobile_primary()
+                        .unwrap()
+                        .companions()
+                        .unwrap()
+                        .len(),
+                    1
+                );
+            } else {
+                let revoke = tokio::spawn(async move {
+                    client
+                        .mobile_primary()
+                        .unwrap()
+                        .revoke(
+                            &"s.whatsapp.net".parse().unwrap(),
+                            &"15550000001:2@s.whatsapp.net".parse().unwrap(),
+                            "user_initiated",
+                            101,
+                            &mut rand::rngs::StdRng::seed_from_u64(193),
+                        )
+                        .await
+                });
+                for index in [5, 6] {
+                    let request = wire.request(index).await;
+                    wire.devices(request.get(), Some(&signed)).await;
+                }
+                let request = wire.request(7).await;
+                assert!(
+                    request
+                        .get()
+                        .get_optional_child("remove-companion-device")
+                        .is_some()
+                );
+                wire.reply(request.get(), vec![], false).await;
+                let request = wire.request(8).await;
+                wire.devices(request.get(), None).await;
+                let request = wire.request(9).await;
+                assert!(request.get().get_optional_child("key-index-list").is_some());
+                wire.reply(request.get(), vec![], false).await;
+                revoke.await.unwrap().unwrap();
+            }
+            assert!(
+                wire.client
+                    .mobile_primary()
+                    .unwrap()
+                    .abandoned_approvals()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                wire.client
+                    .mobile_primary()
+                    .unwrap()
+                    .state()
+                    .unwrap()
+                    .1
+                    .high_water,
+                2
+            );
+            wire.close().await;
+        }
+    }
+    #[tokio::test]
+    async fn cancelled_intent_save_is_settled_before_any_bootstrap_frame() {
+        use std::sync::Arc;
+        let (mut probe, _) = crate::store::release::tests::ProbeBackend::new();
+        probe.backend = crate::test_utils::primary_test_backend();
+        let (release_tx, release_rx) = async_channel::unbounded();
+        let (entered_tx, entered_rx) = async_channel::unbounded();
+        for _ in 0..32 {
+            release_tx.try_send(()).unwrap();
+        }
+        probe.gate = Some(release_rx.clone());
+        probe.entered = Some(entered_tx);
+        probe.gate_method = "save";
+        let wire = Wire::new(Arc::new(probe)).await;
+        let (device, _) = seed_confirmed_cache_only(&wire.client, true).await;
+        while release_rx.try_recv().is_ok() {}
+        while entered_rx.try_recv().is_ok() {}
+        let client = wire.client.clone();
+        let target = device.clone();
+        let first = tokio::spawn(async move {
+            client
+                .mobile_primary()
+                .unwrap()
+                .bootstrap(&target, &initial_history())
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let operation = wire
+            .client
+            .mobile_primary()
+            .unwrap()
+            .state()
+            .unwrap()
+            .1
+            .maintenance
+            .unwrap();
+        let id = match &operation {
+            Maintenance::Bootstrap {
+                history_message_id, ..
+            } => history_message_id.clone(),
+            _ => panic!("bootstrap intent"),
+        };
+        let mut legacy = serde_json::to_value(&operation).unwrap();
+        legacy.as_object_mut().unwrap().remove("history_message_id");
+        assert!(
+            serde_json::from_value::<Maintenance>(legacy).is_err(),
+            "old ambiguous journals cannot silently mint replacement IDs"
+        );
+        let client = wire.client.clone();
+        let target = device.clone();
+        let retry = tokio::spawn(async move {
+            client
+                .mobile_primary()
+                .unwrap()
+                .bootstrap(&target, &initial_history())
+                .await
+        });
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!retry.is_finished());
+        assert_eq!(wire.transport.sent_count(), 0);
+        for _ in 0..32 {
+            release_tx.try_send(()).unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), retry)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let request = wire.request(0).await;
+        assert_eq!(
+            request.get().attrs().optional_string("id").as_deref(),
+            Some(id.as_str())
+        );
+        wire.close().await;
+    }
+    #[tokio::test]
+    async fn partially_dispatched_bootstrap_can_be_abandoned_and_device_revoked() {
+        use rand::SeedableRng;
+        let mut wire = Wire::new(crate::test_utils::primary_test_backend()).await;
+        let (device, _) = seed_confirmed_cache_only(&wire.client, false).await;
+        let api = wire.client.mobile_primary().unwrap();
+        assert!(
+            api.bootstrap(&device, &initial_history()).await.is_err(),
+            "missing app-state key interrupts after history dispatch"
+        );
+        let (_, journal, _) = api.state().unwrap();
+        assert!(journal.companions[0].history_sent);
+        assert!(!journal.companions[0].app_state_sent);
+        let original_ids = match journal.maintenance.as_ref().unwrap() {
+            Maintenance::Bootstrap {
+                history_message_id,
+                app_state_message_id,
+                ..
+            } => (history_message_id.clone(), app_state_message_id.clone()),
+            _ => panic!("bootstrap intent"),
+        };
+        let signed = api
+            .sign_indexes(
+                &journal,
+                None,
+                100,
+                &mut rand::rngs::StdRng::seed_from_u64(195),
+            )
+            .unwrap();
+        api.abandon_dispatch(&device).await.unwrap();
+        let (_, archived, _) = api.state().unwrap();
+        assert!(archived.maintenance.is_none());
+        assert!(archived.companions[0].history_sent);
+        assert!(!archived.companions[0].app_state_sent);
+        assert!(
+            matches!(&archived.abandoned_dispatches[0], Maintenance::Bootstrap { history_message_id, app_state_message_id, .. } if (history_message_id, app_state_message_id) == (&original_ids.0, &original_ids.1))
+        );
+        let sent_before = wire.transport.sent_count();
+        assert!(api.bootstrap(&device, &initial_history()).await.is_err());
+        assert_eq!(
+            wire.transport.sent_count(),
+            sent_before,
+            "abandoned dispatch cannot auto-resend with new IDs"
+        );
+        let client = wire.client.clone();
+        let revoke = tokio::spawn(async move {
+            client
+                .mobile_primary()
+                .unwrap()
+                .revoke(
+                    &"s.whatsapp.net".parse().unwrap(),
+                    &device,
+                    "user_initiated",
+                    101,
+                    &mut rand::rngs::StdRng::seed_from_u64(196),
+                )
+                .await
+        });
+        for index in [1, 2] {
+            let request = wire.request(index).await;
+            wire.devices(request.get(), Some(&signed)).await;
+        }
+        let request = wire.request(3).await;
+        wire.reply(request.get(), vec![], false).await;
+        let request = wire.request(4).await;
+        wire.devices(request.get(), None).await;
+        let request = wire.request(5).await;
+        wire.reply(request.get(), vec![], false).await;
+        revoke.await.unwrap().unwrap();
+        let (_, final_state, _) = wire.client.mobile_primary().unwrap().state().unwrap();
+        assert!(final_state.companions.is_empty());
+        assert!(final_state.abandoned_dispatches.is_empty());
+        wire.close().await;
     }
 }

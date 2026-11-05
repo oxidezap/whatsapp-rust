@@ -44,8 +44,8 @@ pub enum RegistrationLoginPhoneIdMapping {
 }
 
 /// Validate metadata whose registration/login meaning is shared by the profile.
-/// HTTP model IDs and manufacturer encodings may differ from login marketing names;
-/// callers map those fields explicitly when constructing their login profile.
+/// HTTP model IDs may differ from login marketing names, so callers map model names explicitly.
+/// Android manufacturer must match; iOS registration does not carry a manufacturer.
 pub fn validate_registration_login_profile(
     profile: &MobileLoginProfile,
     metadata: &wacore::mobile::registration_wire::RegistrationLoginMetadata<'_>,
@@ -70,6 +70,9 @@ pub fn validate_registration_login_profile(
     if user_agent.platform != Some(platform.to_protobuf())
         || profile.app_version() != &expected_version
         || user_agent.os_version.as_deref() != Some(metadata.os_version)
+        || metadata
+            .android_manufacturer
+            .is_some_and(|manufacturer| user_agent.manufacturer.as_deref() != Some(manufacturer))
         || user_agent.locale_language_iso6391.as_deref() != Some(metadata.language)
         || user_agent.locale_country_iso31661_alpha2.as_deref() != Some(metadata.locale_country)
         || user_agent
@@ -106,9 +109,34 @@ pub struct RegisteredMobileSession {
     ephemeral_keys: Arc<dyn MobileEphemeralKeyProvider>,
     app_state_key: Option<crate::mobile_primary::PrimaryAppStateKeyInput>,
     primary_identity_policy: Option<wacore::send::PrimaryDeviceIdentityPolicy>,
+    self_identity_profile: wacore::mobile::primary::PrimarySelfIdentityProfile,
 }
 
 impl RegisteredMobileSession {
+    /// Select the primary's persisted self-identity signature shape explicitly.
+    /// Strict device-signature verification remains the default.
+    pub fn with_self_identity_profile(
+        mut self,
+        profile: wacore::mobile::primary::PrimarySelfIdentityProfile,
+    ) -> Self {
+        self.self_identity_profile = profile;
+        self
+    }
+
+    pub fn self_identity_profile(&self) -> wacore::mobile::primary::PrimarySelfIdentityProfile {
+        self.self_identity_profile
+    }
+
+    /// Explicit legacy certificate-shape policy. The environment root, signature,
+    /// static-key binding, and expiration checks for present timestamps are unchanged.
+    pub fn with_certificate_expiry_policy(
+        mut self,
+        policy: wacore::mobile::MobileCertificateExpiryPolicy,
+    ) -> Self {
+        self.trust = self.trust.with_expiry_policy(policy);
+        self
+    }
+
     /// Build from the durable registration result, retaining canonical account/environment/key binding.
     /// Login-only metadata stays explicit; registration metadata must agree where meanings match.
     pub fn from_registered_account(
@@ -221,6 +249,8 @@ impl RegisteredMobileSession {
             ephemeral_keys,
             app_state_key: None,
             primary_identity_policy: None,
+            self_identity_profile:
+                wacore::mobile::primary::PrimarySelfIdentityProfile::RequireDeviceSignature,
         })
     }
 
@@ -345,11 +375,18 @@ mod tests {
         }
     }
     fn config(device: &Device, env_id: &str) -> RegisteredMobileSession {
+        config_with_noise_root(device, env_id, [2; 32])
+    }
+    fn config_with_noise_root(
+        device: &Device,
+        env_id: &str,
+        root: [u8; 32],
+    ) -> RegisteredMobileSession {
         let environment = MobileEnvironment::new(
             env_id,
             RegistrationEndpoint::for_test_http("http://mock.invalid/registration").unwrap(),
             TcpEndpoint::new("mock.invalid", 5222).unwrap(),
-            MobileTrust::new([1; 32], [2; 32]).unwrap(),
+            MobileTrust::new([1; 32], root).unwrap(),
         )
         .unwrap();
         let profile = MobileLoginProfile::new(
@@ -411,15 +448,24 @@ mod tests {
                 0 => {
                     let value = take_varint(&mut input);
                     match tag >> 3 {
-                        9 => result.0 = Some(value as i32),
                         16 => result.1 = Some(value as u32),
                         24 => result.2 = Some(value as i32),
                         _ => {}
                     }
                 }
+                1 => {
+                    input = &input[8..];
+                }
                 2 => {
                     let count = take_varint(&mut input) as usize;
                     input = &input[count..];
+                }
+                5 => {
+                    let value = i32::from_le_bytes(input[..4].try_into().unwrap());
+                    input = &input[4..];
+                    if tag >> 3 == 9 {
+                        result.0 = Some(value);
+                    }
                 }
                 _ => panic!("unexpected fixture wire type"),
             }
@@ -437,7 +483,7 @@ mod tests {
             app_version: &[2, 26, 1],
             os_version: "1",
             registration_model: "model_code_different_from_login_name",
-            android_manufacturer: Some("encoded_manufacturer"),
+            android_manufacturer: Some("Acme"),
             family_device_id: "synthetic",
             language: "en",
             locale_country: "GB",
@@ -457,6 +503,16 @@ mod tests {
             )
             .is_err()
         );
+        metadata.android_manufacturer = Some("different-manufacturer");
+        assert!(
+            validate_registration_login_profile(
+                config.profile(),
+                &metadata,
+                RegistrationLoginPhoneIdMapping::IndependentHostId
+            )
+            .is_err()
+        );
+        metadata.android_manufacturer = Some("Acme");
         metadata.platform = RegistrationPlatform::Ios;
         assert!(
             validate_registration_login_profile(
@@ -488,6 +544,105 @@ mod tests {
         );
     }
 
+    #[test]
+    fn explicit_certificate_shape_policy_preserves_root_and_present_expiry_checks() {
+        use rand::SeedableRng;
+        use wacore::libsignal::protocol::PrivateKey;
+        use wacore::mobile::MobileCertificateExpiryPolicy;
+        fn key(seed: u8) -> KeyPair {
+            KeyPair::try_from(PrivateKey::deserialize(&[seed; 32]).unwrap()).unwrap()
+        }
+        fn bytes(out: &mut Vec<u8>, number: u8, value: &[u8]) {
+            out.extend_from_slice(&[number << 3 | 2, value.len() as u8]);
+            out.extend_from_slice(value);
+        }
+        fn certificate(root: &KeyPair, static_key: &[u8], expiry: &[u8]) -> Vec<u8> {
+            let mut details = vec![8, 1];
+            details.extend_from_slice(expiry);
+            bytes(&mut details, 5, static_key);
+            let signature = root
+                .calculate_signature(&details, &mut rand::rngs::StdRng::seed_from_u64(55))
+                .unwrap();
+            let mut result = Vec::new();
+            bytes(&mut result, 1, &details);
+            bytes(&mut result, 2, &signature);
+            result
+        }
+        let device = Device::new();
+        let root = key(11);
+        let foreign_root = key(12);
+        let server = key(13);
+        let server_public: [u8; 32] = server.public_key.public_key_bytes().try_into().unwrap();
+        let session = config_with_noise_root(
+            &device,
+            "synthetic-cert",
+            root.public_key.public_key_bytes().try_into().unwrap(),
+        );
+        let missing = certificate(&root, &server_public, &[]);
+        assert!(
+            session
+                .trust()
+                .verify_certificate(&missing, &server_public, 100)
+                .is_err()
+        );
+        let session =
+            session.with_certificate_expiry_policy(MobileCertificateExpiryPolicy::IfPresent);
+        session
+            .trust()
+            .verify_certificate(&missing, &server_public, 100)
+            .unwrap();
+        assert!(
+            session
+                .trust()
+                .verify_certificate(
+                    &certificate(&foreign_root, &server_public, &[]),
+                    &server_public,
+                    100
+                )
+                .is_err()
+        );
+        // Field 3 remains a checked expiration, including zero and the exact boundary.
+        for expiry in [&[24, 0][..], &[24, 99], &[24, 100], &[26, 1, 0]] {
+            assert!(
+                session
+                    .trust()
+                    .verify_certificate(
+                        &certificate(&root, &server_public, expiry),
+                        &server_public,
+                        100
+                    )
+                    .is_err()
+            );
+        }
+        session
+            .trust()
+            .verify_certificate(
+                &certificate(&root, &server_public, &[24, 101]),
+                &server_public,
+                100,
+            )
+            .unwrap();
+        let wrong_static: [u8; 32] = key(14).public_key.public_key_bytes().try_into().unwrap();
+        assert!(
+            session
+                .trust()
+                .verify_certificate(&missing, &wrong_static, 100)
+                .is_err()
+        );
+        assert_eq!(
+            session.self_identity_profile(),
+            wacore::mobile::primary::PrimarySelfIdentityProfile::RequireDeviceSignature
+        );
+        assert_eq!(
+            session
+                .with_self_identity_profile(
+                    wacore::mobile::primary::PrimarySelfIdentityProfile::AccountSignatureOnly
+                )
+                .self_identity_profile(),
+            wacore::mobile::primary::PrimarySelfIdentityProfile::AccountSignatureOnly
+        );
+    }
+
     struct DynamicOptions {
         session_ids: std::sync::atomic::AtomicI32,
     }
@@ -495,17 +650,17 @@ mod tests {
         fn options(
             &self,
             context: MobileLoginAttempt<'_>,
-            _configured: &MobileLoginOptions,
+            configured: &MobileLoginOptions,
         ) -> Result<MobileLoginOptions, MobileSessionError> {
             // Deterministic synthetic entropy stand-in, deliberately confined to tests.
             let session_id = self
                 .session_ids
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(MobileLoginOptions::builder()
-                .session_id(session_id)
-                .connect_attempt_count(context.zero_based_attempt)
-                .login_counter(context.device.login_counter)
-                .build())
+            Ok(configured
+                .clone()
+                .with_session_id(Some(session_id))
+                .with_connect_attempt_count(Some(context.zero_based_attempt))
+                .with_login_counter(Some(context.device.login_counter)))
         }
     }
 

@@ -13,9 +13,10 @@ mod qr;
 
 pub use exchange::{AcknowledgedCompanion, PendingCompanion, VerifiedCompanion};
 pub use identity::{
-    AdvDefaultEncoding, IdentityParameters, SignedCompanionIdentity,
+    AdvDefaultEncoding, IdentityParameters, PrimarySelfIdentityProfile, SignedCompanionIdentity,
     build_signed_companion_identity, build_signed_key_index_list, next_companion_key_index,
-    validate_primary_account_identity, verify_companion_proof,
+    validate_primary_account_identity, validate_primary_account_identity_with_profile,
+    verify_companion_proof,
 };
 pub use iq::{
     PairDeviceAcknowledgement, PairDevicePem, PairDeviceSpec, PrimaryHelloSpec,

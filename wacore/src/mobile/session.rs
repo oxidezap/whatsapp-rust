@@ -288,6 +288,24 @@ pub struct MobileLoginOptions {
     lid_db_migrated: Option<bool>,
 }
 
+impl MobileLoginOptions {
+    /// Replace only this attempt field; `None` explicitly omits it.
+    pub fn with_session_id(mut self, value: Option<i32>) -> Self {
+        self.session_id = value;
+        self
+    }
+    /// Replace only this attempt field; `None` explicitly omits it.
+    pub fn with_connect_attempt_count(mut self, value: Option<u32>) -> Self {
+        self.connect_attempt_count = value;
+        self
+    }
+    /// Replace only this attempt field; `None` explicitly omits it.
+    pub fn with_login_counter(mut self, value: Option<i32>) -> Self {
+        self.login_counter = value;
+        self
+    }
+}
+
 /// Native-mobile protocol shape with an explicitly selected dictionary version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MobileNoisePrologue([u8; 4]);

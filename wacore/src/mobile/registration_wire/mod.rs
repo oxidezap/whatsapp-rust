@@ -29,8 +29,8 @@ pub use request::{
     flash_code_from_caller_id,
 };
 pub use response::{
-    RegistrationChallenge, RegistrationResponse, RegistrationResponseDecision,
-    RegistrationResponseStatus, RegistrationWaitHints,
+    RegistrationChallenge, RegistrationDeliveryHints, RegistrationResponse,
+    RegistrationResponseDecision, RegistrationResponseStatus, RegistrationWaitHints,
 };
 
 /// A relative registration operation, never a production destination.

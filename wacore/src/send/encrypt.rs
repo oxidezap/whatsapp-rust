@@ -140,13 +140,6 @@ struct RawEncryptAttempt {
     first_error: Option<anyhow::Error>,
 }
 
-/// Resolve the `<device-identity>` blob a stanza must carry. A pkmsg recipient
-/// validates our identity from it; without it a pkmsg advances the sender chain
-/// while the peer can't consume the pre-key message (the linked-device deadlock).
-///
-/// - `includes_prekey && account.is_some()` -> `Ok(Some(encoded))`
-/// - `includes_prekey && account.is_none()` -> `Err` (refuse before send)
-/// - `!includes_prekey` -> `Ok(None)`
 /// Explicit primary wire profiles from the pinned reference clients. Neither profile
 /// synthesizes an ADV identity: Zapo omits it for device 0; whalibmob attaches
 /// a stored identity only when one is available. These are reference-derived.
@@ -202,6 +195,13 @@ pub fn needs_device_identity_for_role(
     }
 }
 
+/// Resolve the `<device-identity>` blob a stanza must carry. A pkmsg recipient
+/// validates our identity from it; without it a pkmsg advances the sender chain
+/// while the peer can't consume the pre-key message (the linked-device deadlock).
+///
+/// - `includes_prekey && account.is_some()` -> `Ok(Some(encoded))`
+/// - `includes_prekey && account.is_none()` -> `Err` (refuse before send)
+/// - `!includes_prekey` -> `Ok(None)`
 pub fn needs_device_identity(
     includes_prekey: bool,
     account: Option<&wa::ADVSignedDeviceIdentity>,

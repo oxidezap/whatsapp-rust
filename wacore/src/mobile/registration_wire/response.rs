@@ -85,6 +85,136 @@ impl RegistrationWaitHints {
     }
 }
 
+/// Known verification-route hints. No entered OTP/PIN or challenge bytes are held.
+/// Strings may include telephone prefixes and deliberately have no Debug output.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "DeliveryHintsWire")]
+pub struct RegistrationDeliveryHints {
+    code_length: Option<u8>,
+    flash_filter: Option<String>,
+    flash_prefix: Option<String>,
+    flash_country_code: Option<String>,
+    flash_timeout_seconds: Option<u32>,
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeliveryHintsWire {
+    code_length: Option<u8>,
+    flash_filter: Option<String>,
+    flash_prefix: Option<String>,
+    flash_country_code: Option<String>,
+    flash_timeout_seconds: Option<u32>,
+}
+impl TryFrom<DeliveryHintsWire> for RegistrationDeliveryHints {
+    type Error = RegistrationWireError;
+    fn try_from(value: DeliveryHintsWire) -> Result<Self, Self::Error> {
+        Self::new(
+            value.code_length,
+            value.flash_filter,
+            value.flash_prefix,
+            value.flash_country_code,
+            value.flash_timeout_seconds,
+        )
+    }
+}
+impl Drop for RegistrationDeliveryHints {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.flash_filter.zeroize();
+        self.flash_prefix.zeroize();
+        self.flash_country_code.zeroize();
+    }
+}
+impl RegistrationDeliveryHints {
+    pub fn new(
+        code_length: Option<u8>,
+        flash_filter: Option<String>,
+        flash_prefix: Option<String>,
+        flash_country_code: Option<String>,
+        flash_timeout_seconds: Option<u32>,
+    ) -> Result<Self, RegistrationWireError> {
+        let value = Self {
+            code_length,
+            flash_filter,
+            flash_prefix,
+            flash_country_code,
+            flash_timeout_seconds,
+        };
+        if value.code_length.is_some_and(|v| !(1..=32).contains(&v))
+            || value.flash_timeout_seconds == Some(0)
+            || [
+                &value.flash_filter,
+                &value.flash_prefix,
+                &value.flash_country_code,
+            ]
+            .iter()
+            .zip([128, 64, 64])
+            .any(|(value, limit)| {
+                value.as_ref().is_some_and(|v| {
+                    v.is_empty() || v.len() > limit || v.chars().any(char::is_control)
+                })
+            })
+        {
+            return Err(RegistrationWireError::InvalidResponseField(
+                "delivery hint".into(),
+            ));
+        }
+        Ok(value)
+    }
+    pub fn code_length(&self) -> Option<u8> {
+        self.code_length
+    }
+    pub fn flash_filter(&self) -> Option<&str> {
+        self.flash_filter.as_deref()
+    }
+    pub fn flash_prefix(&self) -> Option<&str> {
+        self.flash_prefix.as_deref()
+    }
+    pub fn flash_country_code(&self) -> Option<&str> {
+        self.flash_country_code.as_deref()
+    }
+    pub fn flash_timeout_seconds(&self) -> Option<u32> {
+        self.flash_timeout_seconds
+    }
+}
+
+fn delivery_hints(
+    object: &mut Map<String, Value>,
+) -> Result<Option<RegistrationDeliveryHints>, RegistrationWireError> {
+    // whalibmob 8f50db4 Registration.js2473-2479: only positive length/timeout
+    // are retained; empty optional strings are absent. Unknown data is not saved.
+    let code_length = object
+        .remove("length")
+        .map(wait_seconds)
+        .transpose()?
+        .flatten()
+        .filter(|v| *v > 0)
+        .map(u8::try_from)
+        .transpose()
+        .map_err(|_| RegistrationWireError::InvalidResponseField("delivery hint".into()))?;
+    let timeout = object
+        .remove("flash_timeout")
+        .map(wait_seconds)
+        .transpose()?
+        .flatten()
+        .filter(|v| *v > 0)
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| RegistrationWireError::InvalidResponseField("delivery hint".into()))?;
+    let filter = string(object, "cli_filter")?.filter(|v| !v.is_empty());
+    let prefix = string(object, "cli_prefix")?.filter(|v| !v.is_empty());
+    let country = string(object, "cli_cc")?.filter(|v| !v.is_empty());
+    if code_length.is_none()
+        && timeout.is_none()
+        && filter.is_none()
+        && prefix.is_none()
+        && country.is_none()
+    {
+        return Ok(None);
+    }
+    RegistrationDeliveryHints::new(code_length, filter, prefix, country, timeout).map(Some)
+}
+
 /// Parsed response. Login, challenge and unknown data may be sensitive; no serde/Debug dump.
 pub struct RegistrationResponse {
     status: Option<RegistrationResponseStatus>,
@@ -93,6 +223,7 @@ pub struct RegistrationResponse {
     challenge: Option<RegistrationChallenge>,
     waits: RegistrationWaitHints,
     retry_after: Option<i64>,
+    delivery_hints: Option<RegistrationDeliveryHints>,
     pending: Option<String>,
     blocked: bool,
     unknown: Map<String, Value>,
@@ -226,6 +357,7 @@ impl RegistrationResponse {
             .map(wait_seconds)
             .transpose()?
             .flatten();
+        let delivery_hints = delivery_hints(&mut object)?;
         let blocked = match object.get("custom_block_screen") {
             None | Some(Value::Null) | Some(Value::Bool(false)) => false,
             Some(Value::Object(_)) | Some(Value::Bool(true)) => true,
@@ -242,6 +374,7 @@ impl RegistrationResponse {
             challenge,
             waits,
             retry_after,
+            delivery_hints,
             pending,
             blocked,
             unknown: object,
@@ -263,6 +396,10 @@ impl RegistrationResponse {
     pub fn waits(&self) -> &RegistrationWaitHints {
         &self.waits
     }
+    pub fn delivery_hints(&self) -> Option<&RegistrationDeliveryHints> {
+        self.delivery_hints.as_ref()
+    }
+
     /// Signed server value; negative sentinels are retained, never clamped to zero.
     pub fn retry_after(&self) -> Option<i64> {
         self.retry_after
@@ -503,5 +640,27 @@ mod tests {
         ] {
             assert!(RegistrationResponse::parse(malformed).is_err());
         }
+    }
+    #[test]
+    fn typed_delivery_hints_preserve_flash_metadata_and_reject_malformed_values() {
+        let response = RegistrationResponse::parse(br#"{"status":"sent","length":6,"cli_filter":"(.*)373(.*)","cli_prefix":"373","cli_cc":"39","flash_timeout":30}"#).unwrap();
+        let hints = response.delivery_hints().unwrap();
+        assert_eq!(hints.code_length(), Some(6));
+        assert_eq!(hints.flash_filter(), Some("(.*)373(.*)"));
+        assert_eq!(hints.flash_prefix(), Some("373"));
+        assert_eq!(hints.flash_country_code(), Some("39"));
+        assert_eq!(hints.flash_timeout_seconds(), Some(30));
+        assert!(RegistrationResponse::parse(br#"{"length":true}"#).is_err());
+        assert!(RegistrationResponse::parse(br#"{"length":33}"#).is_err());
+        assert!(RegistrationResponse::parse(br#"{"cli_filter":false}"#).is_err());
+        assert!(RegistrationResponse::parse(br#"{"flash_timeout":4294967296}"#).is_err());
+        let oversized = serde_json::json!({"cli_filter": "x".repeat(129)});
+        assert!(RegistrationResponse::parse(&serde_json::to_vec(&oversized).unwrap()).is_err());
+        assert!(
+            RegistrationResponse::parse(br#"{"length":0,"flash_timeout":-1}"#)
+                .unwrap()
+                .delivery_hints()
+                .is_none()
+        );
     }
 }

@@ -1192,15 +1192,16 @@ mod mobile_media_http_tests {
                 .await
                 .unwrap();
             assert_eq!(bytes, plaintext);
-            let requests = raw.requests.lock().unwrap();
-            assert_eq!(requests.len(), 1);
-            assert!(
-                requests[0]
-                    .url
-                    .starts_with("https://cdn.invalid/mms/sticker/exact?")
-            );
-            assert_mobile_headers(&requests[0], None);
-            drop(requests);
+            {
+                let requests = raw.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1);
+                assert!(
+                    requests[0]
+                        .url
+                        .starts_with("https://cdn.invalid/mms/sticker/exact?")
+                );
+                assert_mobile_headers(&requests[0], None);
+            }
             let mut unsafe_static = waproto::whatsapp::message::ImageMessage::default();
             unsafe_static.static_url = Some("https://untrusted.invalid/image".into());
             unsafe_static.file_sha256 = Some(vec![0; 32]);

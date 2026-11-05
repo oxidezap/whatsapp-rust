@@ -1,8 +1,11 @@
 //! Portable, durable registration driver. No HTTP operation is retried implicitly.
 //!
-//! The host retains its artifact-qualified profile and registration material. Its
-//! fingerprint is persisted alongside the keys; changing either requires another
-//! empty storage namespace. Cancellation retains the exchange inside this driver.
+//! The host supplies an artifact-qualified profile and registration material. Its
+//! bounded snapshot and fingerprint are persisted alongside the keys, so restore
+//! never regenerates installation IDs. Profile/key drift is rejected. Cancellation
+//! retains the exchange inside this driver.
+//! Challenge state is checkpointed; images/audio remain caller-owned. Hosts must
+//! retain their UI payload securely when solving a challenge across a restart.
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,10 +17,10 @@ use wacore::mobile::{
     RegistrationRunId, RegistrationStage, RegistrationWorkflow,
     registration_wire::{
         AttestationPolicy, BodyAttestation, CodeRequestPlan, EphemeralRegistrationKey,
-        RegistrationEndpointPath, RegistrationForm, RegistrationMaterial,
-        RegistrationMaterialPersistence, RegistrationRequest, RegistrationRequestBuilder,
-        RegistrationResponse, RegistrationResponseDecision, RegistrationWireError,
-        VerificationMethod,
+        RegistrationDeliveryHints, RegistrationEndpointPath, RegistrationForm,
+        RegistrationMaterial, RegistrationMaterialPersistence, RegistrationRequest,
+        RegistrationRequestBuilder, RegistrationResponse, RegistrationResponseDecision,
+        RegistrationWireError, VerificationMethod,
     },
 };
 use wacore::net::{HttpClient, HttpRequest, HttpResponse};
@@ -81,6 +84,10 @@ pub struct MobileRegistrationResult {
     pub stage: RegistrationStage,
 }
 
+const REGISTRATION_CONTEXT_LIMIT: usize = 64 * 1024;
+// Maximum bounded delivery hints plus five growing timestamps fit this reserve.
+const DYNAMIC_CONTEXT_HEADROOM: usize = 1024;
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DriverContext {
@@ -88,6 +95,8 @@ struct DriverContext {
     profile_fingerprint: [u8; 32],
     material: String,
     code_not_before: [u64; 5],
+    #[serde(default)]
+    delivery: Option<RegistrationDeliveryContext>,
 }
 impl Drop for DriverContext {
     fn drop(&mut self) {
@@ -107,11 +116,49 @@ impl DriverContext {
     fn encode(&self) -> Result<Vec<u8>, MobileRegistrationError> {
         let mut bytes =
             serde_json::to_vec(self).map_err(|_| MobileRegistrationError::InvalidCheckpoint)?;
-        if bytes.len() > 64 * 1024 {
+        if bytes.len() > REGISTRATION_CONTEXT_LIMIT {
             bytes.zeroize();
             return Err(RegistrationWireError::SizeLimit.into());
         }
         Ok(bytes)
+    }
+}
+
+/// The successful delivery request's selected route and bounded server hints.
+/// This acknowledges a request; it does not prove handset delivery. External
+/// callers can explicitly declare equivalent metadata on the same host timebase.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistrationDeliveryContext {
+    method: VerificationMethod,
+    observed_at_ms: u64,
+    hints: RegistrationDeliveryHints,
+}
+impl RegistrationDeliveryContext {
+    pub fn new(
+        method: VerificationMethod,
+        observed_at_ms: u64,
+        hints: RegistrationDeliveryHints,
+    ) -> Self {
+        Self {
+            method,
+            observed_at_ms,
+            hints,
+        }
+    }
+    pub fn method(&self) -> VerificationMethod {
+        self.method
+    }
+    pub fn observed_at_ms(&self) -> u64 {
+        self.observed_at_ms
+    }
+    pub fn hints(&self) -> &RegistrationDeliveryHints {
+        &self.hints
+    }
+    pub fn flash_expires_at_ms(&self) -> Option<u64> {
+        self.hints
+            .flash_timeout_seconds()
+            .and_then(|seconds| self.observed_at_ms.checked_add(u64::from(seconds) * 1000))
     }
 }
 
@@ -229,12 +276,18 @@ impl MobileRegistrationClient {
                 .encode(encoded_material.as_slice()),
             profile_fingerprint: builder.context_fingerprint()?,
             code_not_before: [0; 5],
+            delivery: None,
         };
+        let mut initial_context = context.encode()?;
+        if initial_context.len() > REGISTRATION_CONTEXT_LIMIT - DYNAMIC_CONTEXT_HEADROOM {
+            initial_context.zeroize();
+            return Err(RegistrationWireError::SizeLimit.into());
+        }
         let binding = MobileSessionBinding::new(
             *environment.binding().as_bytes(),
             *identity.as_bytes(),
             platform,
-            context.encode()?,
+            initial_context,
             Some(encode(&workflow)?),
         )?;
         let device = keys.into_device(binding.clone())?;
@@ -281,6 +334,14 @@ impl MobileRegistrationClient {
         validate_binding(&binding, &environment, identity, builder)?;
         let context = DriverContext::decode(&binding)?;
         let mut workflow = decode(&binding, &environment, identity)?;
+        if snapshot.pn.is_none()
+            && matches!(
+                workflow.stage(),
+                RegistrationStage::Verified | RegistrationStage::Registered
+            )
+        {
+            return Err(MobileRegistrationError::BindingMismatch);
+        }
         if snapshot.pn.is_some() {
             let token = workflow
                 .pending_persistence()
@@ -376,6 +437,10 @@ impl MobileRegistrationClient {
     /// A canceled or failed store/HTTP operation must be settled before another operation.
     pub fn recovery_required(&self) -> bool {
         self.recovering
+            || matches!(
+                self.workflow.stage(),
+                RegistrationStage::InFlight { .. } | RegistrationStage::OutcomeUnknown { .. }
+            )
     }
     /// Inspect a retained ambiguous response without retrying or publishing state.
     pub fn pending_response(&self) -> Option<&RegistrationResponse> {
@@ -389,12 +454,61 @@ impl MobileRegistrationClient {
 
     /// Explicitly accept an OTP requested elsewhere; performs no HTTP operation.
     pub async fn await_external_code(&mut self) -> Result<(), MobileRegistrationError> {
+        self.await_external_code_with_delivery(None).await
+    }
+
+    /// Explicit external metadata is optional and never causes an OTP lookup.
+    pub async fn await_external_code_with_delivery(
+        &mut self,
+        delivery: Option<RegistrationDeliveryContext>,
+    ) -> Result<(), MobileRegistrationError> {
         self.available()?;
+        let now = self.now()?;
+        if delivery
+            .as_ref()
+            .is_some_and(|value| value.observed_at_ms > now)
+        {
+            return Err(MobileRegistrationError::Clock);
+        }
         let mut candidate = self.candidate()?;
-        candidate.await_external_code(self.now()?)?;
+        candidate.await_external_code(now)?;
+        let mut context = self.context.clone();
+        context.delivery = delivery;
         self.recovering = true;
-        self.persist_candidate(candidate, None, self.context.clone())
-            .await
+        self.persist_candidate(candidate, None, context).await
+    }
+
+    pub fn verification_delivery(&self) -> Option<&RegistrationDeliveryContext> {
+        self.context.delivery.as_ref()
+    }
+
+    /// Pure caller-ID extraction using explicit overrides or the persisted flash
+    /// request's hints. Missing length/route never falls back to a guessed profile.
+    /// No call log is read and no code is submitted by this helper.
+    pub fn extract_flash_code(
+        &self,
+        caller_id: &str,
+        length: Option<usize>,
+        filter: Option<&str>,
+    ) -> Result<Zeroizing<String>, MobileRegistrationError> {
+        let delivery = self
+            .context
+            .delivery
+            .as_ref()
+            .filter(|value| value.method == VerificationMethod::Flash)
+            .ok_or(RegistrationWireError::MissingMaterial(
+                "flash delivery context",
+            ))?;
+        let length = length
+            .or(delivery.hints.code_length().map(usize::from))
+            .ok_or(RegistrationWireError::MissingMaterial("flash code length"))?;
+        Ok(
+            wacore::mobile::registration_wire::flash_code_from_caller_id(
+                caller_id,
+                length,
+                filter.or(delivery.hints.flash_filter()),
+            )?,
+        )
     }
 
     pub async fn check_account(
@@ -528,7 +642,7 @@ impl MobileRegistrationClient {
     }
 
     fn available(&self) -> Result<(), MobileRegistrationError> {
-        if self.recovering || self.pending.is_some() {
+        if self.recovery_required() || self.pending.is_some() {
             return Err(MobileRegistrationError::DeliveryUnknown);
         }
         Ok(())
@@ -691,7 +805,16 @@ impl MobileRegistrationClient {
             {
                 return Err(MobileRegistrationError::BindingMismatch);
             }
-            self.workflow = decode(&actual, &self.environment, self.identity)?;
+            let candidate = decode(&actual, &self.environment, self.identity)?;
+            if snapshot.pn.is_none()
+                && matches!(
+                    candidate.stage(),
+                    RegistrationStage::Verified | RegistrationStage::Registered
+                )
+            {
+                return Err(MobileRegistrationError::BindingMismatch);
+            }
+            self.workflow = candidate;
             self.context = DriverContext::decode(&actual)?;
             self.binding = actual;
             self.publication = None;
@@ -793,6 +916,12 @@ impl MobileRegistrationClient {
             .as_ref()
             .ok_or(MobileRegistrationError::DeliveryUnknown)?;
         let decision = response.decision(pending.endpoint);
+        let preferred_method = pending.method.or_else(|| {
+            self.context
+                .delivery
+                .as_ref()
+                .map(RegistrationDeliveryContext::method)
+        });
         let outcome = match decision {
             RegistrationResponseDecision::AccountKeysDiffer
             | RegistrationResponseDecision::AccountRecognized => RegistrationOutcome::Ready,
@@ -802,7 +931,7 @@ impl MobileRegistrationClient {
             RegistrationResponseDecision::Registered => RegistrationOutcome::Verified,
             RegistrationResponseDecision::RateLimited => RegistrationOutcome::RetryAfter {
                 delay_ms: response
-                    .wait_hint_seconds(pending.method)
+                    .wait_hint_seconds(preferred_method)
                     .and_then(|n| n.checked_mul(1000))
                     .ok_or(MobileRegistrationError::UnknownResponse)?,
             },
@@ -810,7 +939,7 @@ impl MobileRegistrationClient {
             | RegistrationResponseDecision::RequiredInput
             | RegistrationResponseDecision::Rejected => RegistrationOutcome::RetryAfter {
                 delay_ms: response
-                    .wait_hint_seconds(pending.method)
+                    .wait_hint_seconds(preferred_method)
                     .unwrap_or(0)
                     .checked_mul(1000)
                     .ok_or(MobileRegistrationError::UnknownResponse)?,
@@ -843,6 +972,16 @@ impl MobileRegistrationClient {
         candidate.complete(pending.token, outcome, self.now()?)?;
         let mut next_context = self.context.clone();
         let now = self.now()?;
+        if decision == RegistrationResponseDecision::CodeSent {
+            let method = pending
+                .method
+                .ok_or(MobileRegistrationError::UnknownResponse)?;
+            next_context.delivery = Some(RegistrationDeliveryContext::new(
+                method,
+                now,
+                response.delivery_hints().cloned().unwrap_or_default(),
+            ));
+        }
         for method in [
             VerificationMethod::Sms,
             VerificationMethod::Voice,
@@ -953,800 +1092,5 @@ fn decode(
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
-mod tests {
-    use super::*;
-    use async_trait::async_trait;
-    use futures::channel::oneshot;
-    use rand::SeedableRng;
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use wacore::libsignal::protocol::KeyPair;
-    use wacore::mobile::registration_wire::{
-        Base64Padding, RegistrationAppVersion, RegistrationCommonFields, RegistrationEncoding,
-        RegistrationHeaderProfile, RegistrationIdentityFields, RegistrationPlatform,
-    };
-    use wacore::mobile::{MobileTrust, RegistrationEndpoint, TcpEndpoint};
-    use wacore::runtime::AbortHandle;
-    use wacore::store::{InMemoryBackend, traits::DeviceStore};
-    use wacore::time::{Instant, VirtualClock};
-
-    struct TestRuntime;
-    #[async_trait]
-    impl Runtime for TestRuntime {
-        fn spawn(&self, _: BoxFuture<'static, ()>) -> AbortHandle {
-            panic!("driver must not spawn")
-        }
-        fn sleep(&self, _: Duration) -> BoxFuture<'static, ()> {
-            Box::pin(futures::future::pending())
-        }
-        fn spawn_blocking(&self, _: Box<dyn FnOnce() + Send + 'static>) -> BoxFuture<'static, ()> {
-            panic!("driver must not perform blocking I/O")
-        }
-        fn yield_now(&self) -> Option<BoxFuture<'static, ()>> {
-            None
-        }
-    }
-    struct TestProof;
-    impl RegistrationAttestation for TestProof {
-        fn attest<'a>(
-            &'a self,
-            encrypted_body: &'a [u8],
-        ) -> BoxFuture<'a, Result<RegistrationAttestationValue, MobileRegistrationError>> {
-            Box::pin(async move {
-                assert!(!encrypted_body.is_empty());
-                Ok(RegistrationAttestationValue {
-                    body_attestation: Some(Zeroizing::new("synthetic-proof".into())),
-                    authorization: None,
-                })
-            })
-        }
-    }
-    enum Reply {
-        Ready(&'static [u8]),
-        Deferred(oneshot::Receiver<&'static [u8]>),
-        Failure,
-    }
-    struct MockHttp {
-        backend: Arc<InMemoryBackend>,
-        replies: Mutex<VecDeque<Reply>>,
-        calls: AtomicUsize,
-    }
-    #[async_trait]
-    impl HttpClient for MockHttp {
-        async fn execute(&self, request: HttpRequest) -> anyhow::Result<HttpResponse> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            let durable = self
-                .backend
-                .load()
-                .await?
-                .expect("keys durable before network");
-            let checkpoint: RegistrationCheckpoint = serde_json::from_slice(
-                durable
-                    .mobile_session
-                    .as_ref()
-                    .unwrap()
-                    .registration_checkpoint
-                    .as_ref()
-                    .unwrap(),
-            )
-            .unwrap();
-            let restored = RegistrationWorkflow::restore(
-                checkpoint,
-                environment().binding(),
-                RegistrationIdentity::from_public_keys(
-                    durable
-                        .identity_key
-                        .public_key
-                        .public_key_bytes()
-                        .try_into()
-                        .unwrap(),
-                    durable
-                        .noise_key
-                        .public_key
-                        .public_key_bytes()
-                        .try_into()
-                        .unwrap(),
-                ),
-            )?;
-            assert!(matches!(
-                restored.stage(),
-                RegistrationStage::OutcomeUnknown { .. }
-            ));
-            assert!(request.url.starts_with("http://mock.invalid/mobile/"));
-            assert!(request.body.as_ref().unwrap().starts_with(b"ENC="));
-            assert_eq!(
-                request.headers.get("request_token").map(String::as_str),
-                Some(UUID)
-            );
-            let reply = self.replies.lock().unwrap().pop_front().unwrap();
-            let bytes = match reply {
-                Reply::Ready(bytes) => bytes,
-                Reply::Deferred(receiver) => receiver.await?,
-                Reply::Failure => anyhow::bail!("synthetic transport failure"),
-            };
-            Ok(HttpResponse::new(200, bytes.to_vec()))
-        }
-    }
-    const UUID: &str = "00000000-0000-4000-8000-000000000001";
-    const POLICY: AttestationPolicy = AttestationPolicy {
-        require_body_attestation: true,
-        require_authorization: false,
-    };
-    fn environment() -> MobileEnvironment {
-        MobileEnvironment::new(
-            "synthetic",
-            RegistrationEndpoint::for_test_http("http://mock.invalid/mobile").unwrap(),
-            TcpEndpoint::new("mock.invalid", 5222).unwrap(),
-            MobileTrust::new([9; 32], [7; 32]).unwrap(),
-        )
-        .unwrap()
-    }
-    struct Fixture {
-        keys: MobileDeviceKeys,
-        noise: [u8; 32],
-        identity: [u8; 32],
-        prekey: [u8; 32],
-        header: RegistrationHeaderProfile,
-        encoding: RegistrationEncoding,
-        fields: RegistrationForm,
-    }
-    impl Fixture {
-        fn new() -> Self {
-            let mut rng = rand::rngs::StdRng::seed_from_u64(773);
-            let identity = KeyPair::generate(&mut rng);
-            let noise = KeyPair::generate(&mut rng);
-            let prekey = KeyPair::generate(&mut rng);
-            let signature = identity
-                .calculate_signature(&prekey.public_key.serialize(), &mut rng)
-                .unwrap();
-            Self {
-                noise: noise.public_key.public_key_bytes().try_into().unwrap(),
-                identity: identity.public_key.public_key_bytes().try_into().unwrap(),
-                prekey: prekey.public_key.public_key_bytes().try_into().unwrap(),
-                keys: MobileDeviceKeys {
-                    registration_id: 123,
-                    noise_key: noise,
-                    identity_key: identity,
-                    signed_pre_key: prekey,
-                    signed_pre_key_id: 1,
-                    signed_pre_key_signature: signature,
-                    adv_secret_key: [6; 32],
-                },
-                header: RegistrationHeaderProfile::new(
-                    RegistrationPlatform::Android,
-                    &RegistrationAppVersion::new(&[2, 26, 1, 1]).unwrap(),
-                    "15",
-                    "Synthetic",
-                    "Test",
-                    vec![],
-                )
-                .unwrap(),
-                encoding: RegistrationEncoding {
-                    signal_padding: Base64Padding::Padded,
-                    token_on_register: true,
-                    mirror_code_and_register_query: false,
-                    code_order: vec![],
-                    register_order: vec![],
-                },
-                fields: RegistrationForm::new(),
-            }
-        }
-        fn builder(&self) -> RegistrationRequestBuilder<'_> {
-            RegistrationRequestBuilder::new(
-                &self.header,
-                &self.encoding,
-                RegistrationCommonFields {
-                    country_code: "999",
-                    national_number: "01000000",
-                    release_channel: 0,
-                    language: "en",
-                    locale_country: "ZZ",
-                    family_device_id: UUID,
-                    access_session_id: "synthetic-session",
-                    registration_token: Some("synthetic-token"),
-                    business_certificate: None,
-                    platform_fields: &self.fields,
-                    identity: RegistrationIdentityFields {
-                        noise_public_key: &self.noise,
-                        registration_id: self.keys.registration_id,
-                        identity_public_key: &self.identity,
-                        signed_prekey_id: 1,
-                        signed_prekey_public: &self.prekey,
-                        signed_prekey_signature: &self.keys.signed_pre_key_signature,
-                        experience_id: &[5; 16],
-                        identity_id: b"synthetic-id",
-                    },
-                },
-            )
-            .unwrap()
-        }
-        async fn client(&self, replies: Vec<Reply>) -> (MobileRegistrationClient, Arc<MockHttp>) {
-            let backend = Arc::new(InMemoryBackend::new());
-            let http = Arc::new(MockHttp {
-                backend: backend.clone(),
-                replies: Mutex::new(replies.into()),
-                calls: AtomicUsize::new(0),
-            });
-            let client = MobileRegistrationClient::initialize(
-                backend,
-                self.keys.clone(),
-                &self.builder(),
-                environment(),
-                StoredMobilePlatform::Android,
-                RegistrationRunId::from_bytes([12; 32]),
-                RegistrationPolicy::new(10, 1000).unwrap(),
-                http.clone(),
-                Arc::new(VirtualClock::new(1000, Instant::ZERO).unwrap()),
-                Arc::new(TestRuntime),
-            )
-            .await
-            .unwrap();
-            (client, http)
-        }
-    }
-    #[tokio::test]
-    async fn wire_workflow_persists_keys_before_dispatch_and_identity_before_success() {
-        {
-            let fixture = Fixture::new();
-            let (mut client, http) = fixture
-                .client(vec![
-                    Reply::Ready(br#"{"status":"fail","reason":"incorrect"}"#),
-                    Reply::Ready(br#"{"status":"sent","sms_wait":5}"#),
-                    Reply::Ready(br#"{"status":"ok","login":"99901000000"}"#),
-                ])
-                .await;
-            let builder = fixture.builder();
-            let lookup = client
-                .check_account(
-                    &builder,
-                    Some(UUID),
-                    EphemeralRegistrationKey::from_bytes([21; 32]),
-                    POLICY,
-                    &TestProof,
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                lookup.decision,
-                RegistrationResponseDecision::AccountKeysDiffer
-            );
-            assert_eq!(lookup.stage, RegistrationStage::Ready);
-            assert_eq!(http.calls.load(Ordering::SeqCst), 1);
-            client
-                .request_code(
-                    &builder,
-                    VerificationMethod::Sms,
-                    Some(UUID),
-                    &fixture.fields,
-                    EphemeralRegistrationKey::from_bytes([22; 32]),
-                    POLICY,
-                    &TestProof,
-                )
-                .await
-                .unwrap();
-            assert_eq!(client.stage(), RegistrationStage::AwaitingCode);
-            assert!(matches!(
-                client
-                    .request_code(
-                        &builder,
-                        VerificationMethod::Sms,
-                        Some(UUID),
-                        &fixture.fields,
-                        EphemeralRegistrationKey::from_bytes([28; 32]),
-                        POLICY,
-                        &TestProof
-                    )
-                    .await,
-                Err(MobileRegistrationError::Workflow(
-                    RegistrationError::Cooldown
-                ))
-            ));
-            assert_eq!(http.calls.load(Ordering::SeqCst), 2);
-            let complete = client
-                .submit_code(
-                    &builder,
-                    "123456",
-                    Some(UUID),
-                    &fixture.fields,
-                    EphemeralRegistrationKey::from_bytes([23; 32]),
-                    POLICY,
-                    &TestProof,
-                )
-                .await
-                .unwrap();
-            assert_eq!(complete.stage, RegistrationStage::Registered);
-            let account = client.registered_account().unwrap();
-            assert_eq!(account.canonical_phone_number(), "99901000000");
-            assert_eq!(account.material().login_metadata().family_device_id, UUID);
-            assert_eq!(account.environment().binding(), environment().binding());
-            let durable = http.backend.load().await.unwrap().unwrap();
-            assert_eq!(durable.pn.unwrap().user, "99901000000");
-            let restored = MobileRegistrationClient::restore(
-                client.store.clone(),
-                &builder,
-                environment(),
-                http.clone(),
-                client.clock.clone(),
-                Arc::new(TestRuntime),
-            )
-            .unwrap();
-            assert_eq!(restored.stage(), RegistrationStage::Registered);
-            let (restored, material) = MobileRegistrationClient::restore_persisted(
-                client.store.clone(),
-                environment(),
-                http.clone(),
-                client.clock.clone(),
-                Arc::new(TestRuntime),
-            )
-            .unwrap();
-            assert_eq!(restored.stage(), RegistrationStage::Registered);
-            assert_eq!(
-                material.builder().unwrap().context_fingerprint().unwrap(),
-                builder.context_fingerprint().unwrap()
-            );
-            assert_eq!(http.calls.load(Ordering::SeqCst), 3);
-        }
-    }
-    #[tokio::test]
-    async fn canceled_exchange_resumes_without_another_dispatch() {
-        {
-            let fixture = Fixture::new();
-            let (sender, receiver) = oneshot::channel();
-            let (mut client, http) = fixture.client(vec![Reply::Deferred(receiver)]).await;
-            let builder = fixture.builder();
-            let mut attempt = Box::pin(client.request_code(
-                &builder,
-                VerificationMethod::Sms,
-                Some(UUID),
-                &fixture.fields,
-                EphemeralRegistrationKey::from_bytes([24; 32]),
-                POLICY,
-                &TestProof,
-            ));
-            assert!(futures::poll!(&mut attempt).is_pending());
-            drop(attempt);
-            assert!(matches!(
-                client.stage(),
-                RegistrationStage::OutcomeUnknown { .. }
-            ));
-            assert_eq!(http.calls.load(Ordering::SeqCst), 1);
-            assert!(matches!(
-                client
-                    .check_account(
-                        &builder,
-                        Some(UUID),
-                        EphemeralRegistrationKey::from_bytes([25; 32]),
-                        POLICY,
-                        &TestProof
-                    )
-                    .await,
-                Err(MobileRegistrationError::DeliveryUnknown)
-            ));
-            sender.send(br#"{"status":"sent"}"#).unwrap();
-            assert_eq!(
-                client.resume_pending().await.unwrap().unwrap().stage,
-                RegistrationStage::AwaitingCode
-            );
-            assert_eq!(http.calls.load(Ordering::SeqCst), 1);
-        }
-    }
-    #[tokio::test]
-    async fn transport_failure_never_requests_an_otp_or_reports_fresh_account() {
-        {
-            let fixture = Fixture::new();
-            let (mut client, http) = fixture.client(vec![Reply::Failure]).await;
-            assert!(matches!(
-                client
-                    .check_account(
-                        &fixture.builder(),
-                        Some(UUID),
-                        EphemeralRegistrationKey::from_bytes([26; 32]),
-                        POLICY,
-                        &TestProof
-                    )
-                    .await,
-                Err(MobileRegistrationError::DeliveryUnknown)
-            ));
-            assert_eq!(http.calls.load(Ordering::SeqCst), 1);
-            assert!(matches!(
-                client.stage(),
-                RegistrationStage::OutcomeUnknown { .. }
-            ));
-            assert!(matches!(
-                client.resume_pending().await,
-                Err(MobileRegistrationError::DeliveryUnknown)
-            ));
-        }
-    }
-    #[tokio::test]
-    async fn challenge_and_pin_are_explicit_paths_and_profile_drift_is_rejected() {
-        {
-            let mut fixture = Fixture::new();
-            let (mut client, http) = fixture
-                .client(vec![
-                    Reply::Ready(br#"{"status":"fail","image_blob":"AQI="}"#),
-                    Reply::Ready(br#"{"status":"fail","reason":"2fa_required"}"#),
-                    Reply::Ready(br#"{"status":"ok","login":"99901000000"}"#),
-                ])
-                .await;
-            {
-                let builder = fixture.builder();
-                let result = client
-                    .request_code(
-                        &builder,
-                        VerificationMethod::Voice,
-                        Some(UUID),
-                        &fixture.fields,
-                        EphemeralRegistrationKey::from_bytes([31; 32]),
-                        POLICY,
-                        &TestProof,
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(result.stage, RegistrationStage::AwaitingChallenge);
-                assert_eq!(
-                    result.response.challenge().unwrap().image.as_deref(),
-                    Some([1, 2].as_slice())
-                );
-                let result = client
-                    .submit_challenge(
-                        &builder,
-                        "synthetic-answer",
-                        Some(UUID),
-                        &fixture.fields,
-                        EphemeralRegistrationKey::from_bytes([32; 32]),
-                        POLICY,
-                        &TestProof,
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(result.stage, RegistrationStage::AwaitingPin);
-                let result = client
-                    .submit_pin(
-                        &builder,
-                        "123456",
-                        Some(UUID),
-                        &fixture.fields,
-                        EphemeralRegistrationKey::from_bytes([33; 32]),
-                        POLICY,
-                        &TestProof,
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(result.stage, RegistrationStage::Registered);
-            }
-            fixture.keys.registration_id += 1;
-            assert!(matches!(
-                MobileRegistrationClient::restore(
-                    client.store.clone(),
-                    &fixture.builder(),
-                    environment(),
-                    http.clone(),
-                    client.clock.clone(),
-                    Arc::new(TestRuntime)
-                ),
-                Err(MobileRegistrationError::BindingMismatch)
-            ));
-            assert_eq!(http.calls.load(Ordering::SeqCst), 3);
-        }
-    }
-
-    #[tokio::test]
-    async fn external_code_and_unsent_attestation_failure_have_no_http_side_effect() {
-        struct FailedProof;
-        impl RegistrationAttestation for FailedProof {
-            fn attest<'a>(
-                &'a self,
-                _: &'a [u8],
-            ) -> BoxFuture<'a, Result<RegistrationAttestationValue, MobileRegistrationError>>
-            {
-                Box::pin(async { Err(MobileRegistrationError::Attestation) })
-            }
-        }
-        {
-            let fixture = Fixture::new();
-            let (mut client, http) = fixture.client(vec![]).await;
-            assert!(matches!(
-                client
-                    .check_account(
-                        &fixture.builder(),
-                        Some(UUID),
-                        EphemeralRegistrationKey::from_bytes([34; 32]),
-                        POLICY,
-                        &FailedProof
-                    )
-                    .await,
-                Err(MobileRegistrationError::Attestation)
-            ));
-            assert_eq!(client.stage(), RegistrationStage::Ready);
-            client.await_external_code().await.unwrap();
-            assert_eq!(client.stage(), RegistrationStage::AwaitingCode);
-            assert_eq!(http.calls.load(Ordering::SeqCst), 0);
-            let restored = MobileRegistrationClient::restore(
-                client.store.clone(),
-                &fixture.builder(),
-                environment(),
-                http,
-                client.clock.clone(),
-                Arc::new(TestRuntime),
-            )
-            .unwrap();
-            assert_eq!(restored.stage(), RegistrationStage::AwaitingCode);
-        }
-    }
-    #[tokio::test]
-    async fn invalid_otp_can_be_corrected_but_zero_login_cannot_be_committed() {
-        {
-            let fixture = Fixture::new();
-            let (mut client, http) = fixture
-                .client(vec![
-                    Reply::Ready(br#"{"status":"fail","reason":"bad_code"}"#),
-                    Reply::Ready(br#"{"status":"ok","login":"0"}"#),
-                ])
-                .await;
-            client.await_external_code().await.unwrap();
-            let builder = fixture.builder();
-            let rejected = client
-                .submit_code(
-                    &builder,
-                    "111111",
-                    Some(UUID),
-                    &fixture.fields,
-                    EphemeralRegistrationKey::from_bytes([35; 32]),
-                    POLICY,
-                    &TestProof,
-                )
-                .await
-                .unwrap();
-            assert_eq!(rejected.decision, RegistrationResponseDecision::Rejected);
-            assert_eq!(rejected.stage, RegistrationStage::AwaitingCode);
-            assert!(matches!(
-                client
-                    .submit_code(
-                        &builder,
-                        "123456",
-                        Some(UUID),
-                        &fixture.fields,
-                        EphemeralRegistrationKey::from_bytes([36; 32]),
-                        POLICY,
-                        &TestProof
-                    )
-                    .await,
-                Err(MobileRegistrationError::MissingIdentity)
-            ));
-            assert!(matches!(
-                client.stage(),
-                RegistrationStage::OutcomeUnknown { .. }
-            ));
-            assert!(http.backend.load().await.unwrap().unwrap().pn.is_none());
-        }
-    }
-    async fn gate_device_saves(
-        client: &mut MobileRegistrationClient,
-        backend: Arc<InMemoryBackend>,
-    ) -> async_channel::Sender<()> {
-        let (mut probe, _) = crate::store::release::tests::ProbeBackend::new();
-        let (unpark, gate) = async_channel::bounded(2);
-        probe.backend = backend;
-        probe.gate = Some(gate);
-        probe.gate_method = "save";
-        client.store = Arc::new(PersistenceManager::new(Arc::new(probe)).await.unwrap());
-        unpark
-    }
-
-    #[tokio::test]
-    async fn canceled_pre_send_checkpoint_never_dispatches_and_retains_attempt_budget() {
-        {
-            let fixture = Fixture::new();
-            let (mut client, http) = fixture.client(vec![]).await;
-            let unpark = gate_device_saves(&mut client, http.backend.clone()).await;
-            let builder = fixture.builder();
-            let mut request = Box::pin(client.check_account(
-                &builder,
-                Some(UUID),
-                EphemeralRegistrationKey::from_bytes([37; 32]),
-                POLICY,
-                &TestProof,
-            ));
-            assert!(futures::poll!(&mut request).is_pending());
-            drop(request);
-            assert_eq!(http.calls.load(Ordering::SeqCst), 0);
-            assert!(client.recovery_required());
-            assert!(matches!(
-                client.stage(),
-                RegistrationStage::OutcomeUnknown { .. }
-            ));
-            unpark.send(()).await.unwrap();
-            unpark.send(()).await.unwrap();
-            assert!(client.resume_pending().await.unwrap().is_none());
-            assert_eq!(client.stage(), RegistrationStage::Ready);
-            let checkpoint = serde_json::to_value(client.workflow.checkpoint()).unwrap();
-            assert_eq!(checkpoint["attempts"], 1);
-            assert_eq!(http.calls.load(Ordering::SeqCst), 0);
-        }
-    }
-
-    #[tokio::test]
-    async fn canceled_final_commit_cannot_publish_registered_until_retained_save_finishes() {
-        {
-            let fixture = Fixture::new();
-            let (mut client, http) = fixture
-                .client(vec![Reply::Ready(
-                    br#"{"status":"ok","login":"99901000000"}"#,
-                )])
-                .await;
-            client.await_external_code().await.unwrap();
-            let unpark = gate_device_saves(&mut client, http.backend.clone()).await;
-            unpark.send(()).await.unwrap(); // Only the pre-send checkpoint may complete.
-            let builder = fixture.builder();
-            let mut request = Box::pin(client.submit_code(
-                &builder,
-                "123456",
-                Some(UUID),
-                &fixture.fields,
-                EphemeralRegistrationKey::from_bytes([38; 32]),
-                POLICY,
-                &TestProof,
-            ));
-            assert!(futures::poll!(&mut request).is_pending());
-            drop(request);
-            assert!(matches!(
-                client.stage(),
-                RegistrationStage::OutcomeUnknown { .. }
-            ));
-            assert!(http.backend.load().await.unwrap().unwrap().pn.is_none());
-            assert_eq!(http.calls.load(Ordering::SeqCst), 1);
-            unpark.send(()).await.unwrap();
-            let result = client.resume_pending().await.unwrap().unwrap();
-            assert_eq!(result.stage, RegistrationStage::Registered);
-            assert!(http.backend.load().await.unwrap().unwrap().pn.is_some());
-            assert_eq!(http.calls.load(Ordering::SeqCst), 1);
-        }
-    }
-    #[tokio::test]
-    async fn verified_without_login_retains_validated_durable_submitted_number() {
-        let fixture = Fixture::new();
-        let (mut client, http) = fixture
-            .client(vec![Reply::Ready(br#"{"status":"verified"}"#)])
-            .await;
-        client.await_external_code().await.unwrap();
-        let result = client
-            .submit_code(
-                &fixture.builder(),
-                "123456",
-                Some(UUID),
-                &fixture.fields,
-                EphemeralRegistrationKey::from_bytes([39; 32]),
-                POLICY,
-                &TestProof,
-            )
-            .await
-            .unwrap();
-        assert_eq!(result.stage, RegistrationStage::Registered);
-        assert_eq!(
-            http.backend.load().await.unwrap().unwrap().pn.unwrap().user,
-            "99901000000"
-        );
-    }
-    #[tokio::test]
-    async fn timeout_retains_exchange_and_recovery_rejects_unrelated_publication() {
-        struct ElapsedTimer;
-        #[async_trait]
-        impl Runtime for ElapsedTimer {
-            fn spawn(&self, _: BoxFuture<'static, ()>) -> AbortHandle {
-                panic!("unexpected spawn")
-            }
-            fn sleep(&self, _: Duration) -> BoxFuture<'static, ()> {
-                Box::pin(async {})
-            }
-            fn spawn_blocking(
-                &self,
-                _: Box<dyn FnOnce() + Send + 'static>,
-            ) -> BoxFuture<'static, ()> {
-                panic!("unexpected I/O")
-            }
-            fn yield_now(&self) -> Option<BoxFuture<'static, ()>> {
-                None
-            }
-        }
-        let fixture = Fixture::new();
-        let (sender, receiver) = oneshot::channel();
-        let (mut client, http) = fixture.client(vec![Reply::Deferred(receiver)]).await;
-        client.runtime = Arc::new(ElapsedTimer);
-        let builder = fixture.builder();
-        assert!(matches!(
-            client
-                .request_code(
-                    &builder,
-                    VerificationMethod::Sms,
-                    Some(UUID),
-                    &fixture.fields,
-                    EphemeralRegistrationKey::from_bytes([40; 32]),
-                    POLICY,
-                    &TestProof
-                )
-                .await,
-            Err(MobileRegistrationError::DeliveryUnknown)
-        ));
-        sender.send(br#"{"status":"sent"}"#).unwrap();
-        assert_eq!(
-            client.resume_pending().await.unwrap().unwrap().stage,
-            RegistrationStage::AwaitingCode
-        );
-        assert_eq!(http.calls.load(Ordering::SeqCst), 1);
-
-        let (sender, receiver) = oneshot::channel();
-        let (mut client, http) = fixture.client(vec![Reply::Deferred(receiver)]).await;
-        let mut request = Box::pin(client.request_code(
-            &builder,
-            VerificationMethod::Sms,
-            Some(UUID),
-            &fixture.fields,
-            EphemeralRegistrationKey::from_bytes([41; 32]),
-            POLICY,
-            &TestProof,
-        ));
-        assert!(futures::poll!(&mut request).is_pending());
-        drop(request);
-        let unrelated = RegistrationWorkflow::new(
-            environment().binding(),
-            builder.registration_identity(),
-            RegistrationRunId::from_bytes([99; 32]),
-            RegistrationPolicy::new(10, 1000).unwrap(),
-        );
-        let mut next = client.binding.clone();
-        next.registration_checkpoint = Some(encode(&unrelated).unwrap());
-        client
-            .store
-            .update_mobile_registration(client.binding.clone(), next, None)
-            .await
-            .unwrap();
-        sender.send(br#"{"status":"sent"}"#).unwrap();
-        assert!(matches!(
-            client.resume_pending().await,
-            Err(MobileRegistrationError::BindingMismatch)
-        ));
-        assert_eq!(http.calls.load(Ordering::SeqCst), 1);
-    }
-    #[tokio::test]
-    async fn retry_after_only_response_persists_cooldown_without_automatic_retry() {
-        let fixture = Fixture::new();
-        let (mut client, http) = fixture
-            .client(vec![Reply::Ready(
-                br#"{"status":"fail","reason":"too_recent","retry_after":2}"#,
-            )])
-            .await;
-        let result = client
-            .request_code(
-                &fixture.builder(),
-                VerificationMethod::Voice,
-                Some(UUID),
-                &fixture.fields,
-                EphemeralRegistrationKey::from_bytes([42; 32]),
-                POLICY,
-                &TestProof,
-            )
-            .await
-            .unwrap();
-        assert_eq!(result.decision, RegistrationResponseDecision::RateLimited);
-        assert_eq!(result.stage, RegistrationStage::Ready);
-        assert!(matches!(
-            client
-                .request_code(
-                    &fixture.builder(),
-                    VerificationMethod::Voice,
-                    Some(UUID),
-                    &fixture.fields,
-                    EphemeralRegistrationKey::from_bytes([43; 32]),
-                    POLICY,
-                    &TestProof
-                )
-                .await,
-            Err(MobileRegistrationError::Workflow(
-                RegistrationError::Cooldown
-            ))
-        ));
-        assert_eq!(http.calls.load(Ordering::SeqCst), 1);
-    }
-}
+#[path = "registration_tests.rs"]
+mod tests;

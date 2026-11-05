@@ -502,14 +502,7 @@ impl<'a> RegistrationRequestBuilder<'a> {
         )
     }
 
-    fn build(
-        &self,
-        endpoint: RegistrationEndpointPath,
-        request_token: Option<&str>,
-        method: Option<VerificationMethod>,
-        code: Option<&str>,
-        extras: &RegistrationForm,
-    ) -> Result<RegistrationRequest, RegistrationWireError> {
+    fn common_form(&self, include_token: bool) -> Result<RegistrationForm, RegistrationWireError> {
         let c = &self.common;
         let mut form = RegistrationForm::new();
         form.push_wire("cc", c.country_code)?;
@@ -545,9 +538,7 @@ impl<'a> RegistrationRequestBuilder<'a> {
         form.push_base64("expid", c.identity.experience_id, padding)?;
         form.push_percent_bytes("id", c.identity.identity_id)?;
         form.push_wire("access_session_id", c.access_session_id)?;
-        let uses_token = endpoint != RegistrationEndpointPath::Exist
-            && (endpoint != RegistrationEndpointPath::Register || self.encoding.token_on_register);
-        if uses_token {
+        if include_token {
             form.push_wire(
                 "token",
                 c.registration_token
@@ -556,6 +547,29 @@ impl<'a> RegistrationRequestBuilder<'a> {
             )?;
         }
         form.append(c.platform_fields)?;
+        Ok(form)
+    }
+
+    fn validate_stable_material(&self) -> Result<(), RegistrationWireError> {
+        let _ = self.common_form(false)?;
+        if let Some(token) = self.common.registration_token {
+            let mut optional = RegistrationForm::new();
+            optional.push_wire("token", token)?;
+        }
+        Ok(())
+    }
+
+    fn build(
+        &self,
+        endpoint: RegistrationEndpointPath,
+        request_token: Option<&str>,
+        method: Option<VerificationMethod>,
+        code: Option<&str>,
+        extras: &RegistrationForm,
+    ) -> Result<RegistrationRequest, RegistrationWireError> {
+        let uses_token = endpoint != RegistrationEndpointPath::Exist
+            && (endpoint != RegistrationEndpointPath::Register || self.encoding.token_on_register);
+        let mut form = self.common_form(uses_token)?;
         if let Some(method) = method {
             form.push_wire("method", method.as_str())?;
         }
@@ -784,7 +798,7 @@ impl RegistrationMaterial {
                 return Err(RegistrationWireError::SizeLimit);
             }
         }
-        let _ = builder.check_account(None)?;
+        builder.validate_stable_material()?;
         let i = &c.identity;
         let encoded = c.platform_fields.encode(&[])?;
         if encoded.len() > Self::LIMIT {
@@ -902,7 +916,7 @@ impl RegistrationMaterial {
             signature,
         };
         // Re-run normal construction validation rather than trust serialized fields.
-        let _ = material.builder()?.check_account(None)?;
+        material.builder()?.validate_stable_material()?;
         Ok(material)
     }
     pub fn login_metadata(&self) -> RegistrationLoginMetadata<'_> {
@@ -1002,20 +1016,17 @@ pub fn flash_code_from_caller_id(
             .ok_or(RegistrationWireError::InvalidField(
                 "unsupported flash filter",
             ))?;
-        let offset = digits
-            .rfind(prefix)
-            .ok_or(RegistrationWireError::InvalidField(
-                "flash filter does not match",
-            ))?;
-        let tail = &digits[offset + prefix.len()..];
-        if !tail.is_empty() {
-            tail
-        } else if offset > 0 {
-            &digits[..offset]
+        if let Some(offset) = digits.rfind(prefix) {
+            let tail = &digits[offset + prefix.len()..];
+            if !tail.is_empty() {
+                tail
+            } else if offset > 0 {
+                &digits[..offset]
+            } else {
+                digits.as_str()
+            }
         } else {
-            return Err(RegistrationWireError::InvalidField(
-                "flash filter has no captured digits",
-            ));
+            digits.as_str()
         }
     } else {
         &digits
@@ -1292,6 +1303,17 @@ mod tests {
         let material = RegistrationMaterial::capture(&builder).unwrap();
         let bytes = material.encode().unwrap();
         let restored = RegistrationMaterial::decode(&bytes).unwrap();
+        assert!(matches!(
+            restored.builder().unwrap().check_account(None),
+            Err(RegistrationWireError::MissingMaterial("request_token"))
+        ));
+        assert!(
+            restored
+                .builder()
+                .unwrap()
+                .check_account(Some(UUID))
+                .is_ok()
+        );
         assert_eq!(
             builder.context_fingerprint().unwrap(),
             restored.builder().unwrap().context_fingerprint().unwrap()
@@ -1337,7 +1359,10 @@ mod tests {
             "123456"
         );
         assert!(flash_code_from_caller_id("123456", 6, Some("(a+)+$")).is_err());
-        assert!(flash_code_from_caller_id("123456", 6, Some("(.*)999(.*)")).is_err());
+        assert_eq!(
+            &*flash_code_from_caller_id("123456", 6, Some("(.*)999(.*)")).unwrap(),
+            "123456"
+        );
         assert!(flash_code_from_caller_id("123456", 0, None).is_err());
         assert!(flash_code_from_caller_id(&"1".repeat(513), 6, None).is_err());
     }

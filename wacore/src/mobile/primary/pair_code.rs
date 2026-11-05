@@ -82,11 +82,13 @@ pub fn prepare_primary_hello(
     if pairing_code.len() > 16 {
         return Err(PrimaryLinkError::InvalidInput("pairing code"));
     }
-    let code: String = pairing_code
-        .chars()
-        .filter(|c| *c != '-')
-        .map(|c| c.to_ascii_uppercase())
-        .collect();
+    let code = Zeroizing::new(
+        pairing_code
+            .chars()
+            .filter(|c| *c != '-')
+            .map(|c| c.to_ascii_uppercase())
+            .collect::<String>(),
+    );
     const ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTVWXYZ";
     if code.len() != 8 || !code.bytes().all(|b| ALPHABET.contains(&b)) {
         return Err(PrimaryLinkError::InvalidInput("pairing code"));

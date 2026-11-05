@@ -243,7 +243,7 @@ impl FreshDeviceRow {
             .map(serde_json::to_vec)
             .transpose()
             .map_err(|e| StoreError::Serialization(Box::new(e)))?;
-        row.login_counter = supplied.login_counter as i32;
+        row.login_counter = supplied.login_counter;
         row.lid_migrated = supplied.lid_migrated;
         row.read_receipts_disabled = supplied.read_receipts_disabled;
         row.server_client_expiration = supplied

@@ -1465,8 +1465,13 @@ impl Client {
                             .public_key_bytes()
                             .try_into()
                             .map_err(|_| "invalid primary identity key")?;
-                        wacore::mobile::primary::validate_primary_account_identity(
-                            bytes, identity, own,
+                        let profile = self
+                            .mobile_session
+                            .as_ref()
+                            .ok_or("missing primary session profile")?
+                            .self_identity_profile();
+                        wacore::mobile::primary::validate_primary_account_identity_with_profile(
+                            bytes, identity, own, profile,
                         )
                         .map(Box::new)
                         .map_err(|_| "invalid primary success device identity")
@@ -2793,7 +2798,6 @@ mod tests {
     #[cfg(feature = "mobile-core")]
     #[tokio::test]
     async fn primary_with_a_durable_key_becomes_ready_without_companion_bootstrap() {
-        use buffa::Message as _;
         let client = primary_startup_client().await;
         let key_id = [0, 0, 0, 0, 0, 1];
         let mut fingerprint = waproto::whatsapp::message::AppStateSyncKeyFingerprint::default();
@@ -2807,7 +2811,9 @@ mod tests {
                 &key_id,
                 crate::store::traits::AppStateSyncKey {
                     key_data: vec![7; 32],
-                    fingerprint: fingerprint.encode_to_vec(),
+                    fingerprint: waproto::codec::app_state_sync_key_fingerprint_to_vec(
+                        &fingerprint,
+                    ),
                     timestamp: 1000,
                 },
             )

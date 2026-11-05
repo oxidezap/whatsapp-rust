@@ -893,7 +893,7 @@ async fn primary_client_with_factory(
     backend: Arc<dyn Backend>,
     factory: Arc<dyn crate::transport::TransportFactory>,
 ) -> Arc<Client> {
-    use crate::{ClockedRuntime, RegisteredMobileSession, VirtualClock};
+    use crate::{ClockedRuntime, RegisteredMobileSession};
     use wacore::mobile::{
         MobileAppVersion, MobileDevice, MobileEnvironment, MobileLoginOptions, MobileLoginProfile,
         MobileNoisePrologue, MobilePlatform, MobileSessionError, MobileTrust, RegistrationEndpoint,
@@ -907,7 +907,12 @@ async fn primary_client_with_factory(
             panic!("startup fixture must never run a real handshake")
         }
     }
-    let clock = Arc::new(VirtualClock::new(1000, wacore::time::Instant::ZERO).unwrap());
+    let clock = backend
+        .clock()
+        .cloned()
+        .expect("primary fixtures require an explicit backend clock");
+    let runtime: Arc<dyn wacore::runtime::Runtime> =
+        Arc::new(ClockedRuntime::new(Arc::new(TokioRuntime), clock));
     let persistence = Arc::new(PersistenceManager::new(backend).await.unwrap());
     let environment = MobileEnvironment::new(
         "synthetic-startup",
@@ -976,7 +981,7 @@ async fn primary_client_with_factory(
     .with_primary_identity_policy(wacore::send::PrimaryDeviceIdentityPolicy::Omit);
     persistence.flush().await.unwrap();
     Client::builder()
-        .with_runtime(ClockedRuntime::new(Arc::new(TokioRuntime), clock))
+        .with_runtime_arc(runtime)
         .with_persistence_manager(persistence)
         .with_transport_factory_arc(factory)
         .with_http_client(MockHttpClient)
@@ -988,9 +993,16 @@ async fn primary_client_with_factory(
 }
 
 #[cfg(all(test, feature = "mobile-core"))]
+pub(crate) fn primary_test_backend() -> Arc<wacore::store::InMemoryBackend> {
+    let clock = Arc::new(crate::VirtualClock::new(1000, wacore::time::Instant::ZERO).unwrap());
+    Arc::new(wacore::store::InMemoryBackend::new().with_clock(clock))
+}
+
+#[cfg(all(test, feature = "mobile-core"))]
 pub(crate) async fn primary_startup_client() -> Arc<Client> {
+    let clock = Arc::new(crate::VirtualClock::new(1000, wacore::time::Instant::ZERO).unwrap());
     primary_client_with_factory(
-        Arc::new(wacore::store::InMemoryBackend::new()),
+        Arc::new(wacore::store::InMemoryBackend::new().with_clock(clock)),
         Arc::new(MockTransportFactory::new()),
     )
     .await

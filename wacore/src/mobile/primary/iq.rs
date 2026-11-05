@@ -1,4 +1,3 @@
-use buffa::Message as _;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, Node, NodeContent, NodeRef};
 use waproto::whatsapp as wa;
@@ -133,7 +132,7 @@ impl IqSpec for PairDeviceSpec {
         if let Some(props) = &self.client_props {
             children.push(
                 NodeBuilder::new("client-props")
-                    .bytes(props.encode_to_vec())
+                    .bytes(waproto::codec::client_pairing_props_to_vec(props))
                     .build(),
             );
         }
