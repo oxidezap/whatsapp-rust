@@ -66,85 +66,70 @@ pub enum OpenContent<'a> {
     Scalar(NodeContentRef<'a>),
 }
 
+// Retain only the unread suffix so each primitive checks its own width once.
+// Absolute positions are needed only by the streaming interface.
 pub(crate) struct Decoder<'a> {
     data: &'a [u8],
-    position: usize,
+    initial_len: usize,
 }
 
 impl<'a> Decoder<'a> {
     pub(crate) fn new(data: &'a [u8]) -> Self {
-        Self { data, position: 0 }
+        Self {
+            data,
+            initial_len: data.len(),
+        }
     }
 
     pub(crate) fn is_finished(&self) -> bool {
-        self.position >= self.data.len()
+        self.data.is_empty()
     }
 
     pub(crate) fn bytes_left(&self) -> usize {
-        self.data.len() - self.position
-    }
-
-    #[inline(always)]
-    fn check_eos(&self, len: usize) -> Result<()> {
-        if self.bytes_left() >= len {
-            Ok(())
-        } else {
-            Err(BinaryError::UnexpectedEof)
-        }
+        self.data.len()
     }
 
     #[inline(always)]
     fn read_u8(&mut self) -> Result<u8> {
-        self.check_eos(1)?;
-        let position = self.position;
-        self.position += 1;
-        Ok(self.data[position])
+        let Some((&byte, remaining)) = self.data.split_first() else {
+            return Err(BinaryError::UnexpectedEof);
+        };
+        self.data = remaining;
+        Ok(byte)
+    }
+
+    #[inline(always)]
+    fn read_array<const N: usize>(&mut self) -> Result<&'a [u8; N]> {
+        let Some((bytes, remaining)) = self.data.split_first_chunk() else {
+            return Err(BinaryError::UnexpectedEof);
+        };
+        self.data = remaining;
+        Ok(bytes)
     }
 
     #[inline(always)]
     fn read_u16_be(&mut self) -> Result<u16> {
-        self.check_eos(2)?;
-        let position = self.position;
-        self.position += 2;
-        Ok(u16::from_be_bytes([
-            self.data[position],
-            self.data[position + 1],
-        ]))
+        Ok(u16::from_be_bytes(*self.read_array()?))
     }
 
     #[inline(always)]
     fn read_u20_be(&mut self) -> Result<u32> {
-        self.check_eos(3)?;
-        let position = self.position;
-        self.position += 3;
-        let bytes = [
-            self.data[position],
-            self.data[position + 1],
-            self.data[position + 2],
-        ];
-        Ok(((bytes[0] as u32 & 0x0F) << 16) | ((bytes[1] as u32) << 8) | (bytes[2] as u32))
+        let [a, b, c] = *self.read_array()?;
+        Ok(((a as u32 & 0x0F) << 16) | ((b as u32) << 8) | c as u32)
     }
 
     #[inline(always)]
     fn read_u32_be(&mut self) -> Result<u32> {
-        self.check_eos(4)?;
-        let position = self.position;
-        self.position += 4;
-        Ok(u32::from_be_bytes([
-            self.data[position],
-            self.data[position + 1],
-            self.data[position + 2],
-            self.data[position + 3],
-        ]))
+        Ok(u32::from_be_bytes(*self.read_array()?))
     }
 
     #[inline(always)]
     fn read_bytes(&mut self, len: usize) -> Result<&'a [u8]> {
-        self.check_eos(len)?;
-        let start = self.position;
-        let end = start + len;
-        self.position = end;
-        Ok(&self.data[start..end])
+        let Some((bytes, remaining)) = self.data.split_at_checked(len) else {
+            return Err(BinaryError::UnexpectedEof);
+        };
+        self.data = remaining;
+        Ok(bytes)
     }
 
     #[inline(always)]
@@ -512,7 +497,7 @@ impl<'a> Decoder<'a> {
     /// buffer has to drop once it is done with what was decoded.
     #[inline]
     pub(crate) fn position(&self) -> usize {
-        self.position
+        self.initial_len - self.data.len()
     }
 
     /// Decode a node's head only: tag, attributes and what its content is,
@@ -727,6 +712,37 @@ mod tests {
     use crate::node::{Attrs, Node};
 
     type TestResult = Result<()>;
+
+    #[test]
+    fn primitive_reads_preserve_positions_after_truncation() {
+        let input = [1, 2, 3, 4, 5];
+        for len in 0..=input.len() {
+            for consumed in 0..=len {
+                for width in 1..=4 {
+                    let mut decoder = Decoder::new(&input[..len]);
+                    decoder.read_bytes(consumed).unwrap();
+                    let result = match width {
+                        1 => decoder.read_u8().map(u32::from),
+                        2 => decoder.read_u16_be().map(u32::from),
+                        3 => decoder.read_u20_be(),
+                        _ => decoder.read_u32_be(),
+                    };
+                    let end = consumed + if result.is_ok() { width } else { 0 };
+                    assert_eq!(result.is_ok(), len - consumed >= width);
+                    assert_eq!(decoder.position(), end);
+                    assert_eq!(decoder.bytes_left(), len - end);
+                    assert!(matches!(
+                        decoder.read_bytes(usize::MAX),
+                        Err(BinaryError::UnexpectedEof)
+                    ));
+                    assert_eq!(decoder.position(), end);
+                    assert_eq!(decoder.read_bytes(len - end).unwrap(), &input[end..len]);
+                    assert!(decoder.is_finished());
+                    assert_eq!(decoder.position(), len);
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_decode_node() -> TestResult {
@@ -1006,6 +1022,57 @@ mod tests {
         decoder.read_bytes(3).unwrap();
         assert_eq!(decoder.bytes_left(), 0);
         assert!(decoder.is_finished());
+    }
+
+    #[test]
+    fn packed_output_matches_scalar_and_validates_trimmed_nibbles() {
+        for tag in [token::HEX_8, token::NIBBLE_8] {
+            for byte in 0..=255u8 {
+                for half in [false, true] {
+                    let bytes = [1 | if half { 128 } else { 0 }, byte];
+                    let actual = Decoder::new(&bytes).read_packed(tag);
+                    let glyph = |n| {
+                        if tag == token::HEX_8 {
+                            Ok(b"0123456789ABCDEF"[n as usize])
+                        } else {
+                            Decoder::unpack_nibble(n)
+                        }
+                    };
+                    let expected = glyph(byte >> 4).and_then(|high| {
+                        glyph(byte & 15).map(|low| {
+                            let pair = [high, low];
+                            String::from_utf8(pair[..if half { 1 } else { 2 }].to_vec()).unwrap()
+                        })
+                    });
+                    assert_eq!(
+                        actual
+                            .as_ref()
+                            .map(|s| s.as_str())
+                            .map_err(ToString::to_string),
+                        expected.as_deref().map_err(ToString::to_string),
+                        "tag {tag}, byte {byte}, half {half}",
+                    );
+                }
+            }
+        }
+        // Cover the inline limits on 32/64-bit targets and the wire maximum.
+        for len in [0, 1, 6, 7, 12, 13, 63, 127] {
+            for half in [false, true] {
+                let mut bytes = vec![len | if half { 128 } else { 0 }];
+                bytes.resize(1 + len as usize, 0x12);
+                for tag in [token::HEX_8, token::NIBBLE_8] {
+                    let expected_len = (len as usize * 2).saturating_sub(usize::from(half));
+                    let expected: String = "12".repeat(len as usize)[..expected_len].into();
+                    assert_eq!(Decoder::new(&bytes).read_packed(tag).unwrap(), expected);
+                    if len > 0 {
+                        assert!(matches!(
+                            Decoder::new(&bytes[..bytes.len() - 1]).read_packed(tag),
+                            Err(BinaryError::UnexpectedEof)
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     /// Test hex packed string decoding
