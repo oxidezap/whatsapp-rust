@@ -368,3 +368,123 @@ mod tests {
         assert!(error.to_string().contains("local metadata exceeds budget"));
     }
 }
+
+/// Read one explicit member through the same bounded classic-ZIP ancestry checks.
+pub(crate) fn stream_material_member(
+    mut file: File,
+    name: &str,
+    limit: u64,
+    mut consume: impl FnMut(&[u8]),
+) -> Result<()> {
+    let (count, central_start, length) = preflight(&mut file)?;
+    let config = zip::read::Config {
+        archive_offset: zip::read::ArchiveOffset::Known(0),
+    };
+    let mut archive = zip::ZipArchive::with_config(
+        config,
+        ValidatedZip {
+            file,
+            length,
+            position: 0,
+        },
+    )?;
+    ensure!(
+        archive.len() == count && archive.central_directory_start() == central_start,
+        "ZIP inventory mismatch"
+    );
+    archive.validate_header_consistency()?;
+    let mut names = BTreeSet::new();
+    let mut name_bytes = 0;
+    for entry in archive.file_names() {
+        let entry = entry?;
+        name_bytes += entry.len();
+        ensure!(
+            name_bytes <= 64 * 1024 * 1024 && names.insert(entry.into_owned()),
+            "ambiguous or excessive ZIP inventory"
+        );
+    }
+    let mut member = archive.by_name(name)?;
+    ensure!(
+        !member.encrypted() && member.is_file() && !member.is_symlink(),
+        "unsupported APK member"
+    );
+    ensure!(
+        member.name_raw() == name.as_bytes() && member.name()?.as_ref() == name,
+        "ambiguous APK member name"
+    );
+    ensure!(
+        matches!(
+            member.compression(),
+            CompressionMethod::Stored | CompressionMethod::Deflated
+        ),
+        "unsupported APK compression"
+    );
+    ensure!(
+        member.size() <= limit && member.compressed_size() <= limit,
+        "APK member exceeds budget"
+    );
+    let expected = member.size();
+    let mut total = 0u64;
+    let mut buffer = [0; 16 * 1024];
+    loop {
+        let count = member.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        total += count as u64;
+        ensure!(total <= limit, "APK decompression budget exceeded");
+        consume(&buffer[..count]);
+    }
+    ensure!(total == expected, "APK member output size mismatch");
+    Ok(())
+}
+pub(crate) fn read_material_member(file: File, name: &str, limit: u64) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    stream_material_member(file, name, limit, |chunk| bytes.extend_from_slice(chunk))?;
+    Ok(bytes)
+}
+
+pub(crate) fn read_signing_block(mut file: File) -> Result<Vec<u8>> {
+    let (_, central_start, _) = preflight(&mut file)?;
+    ensure!(central_start >= 24, "missing APK signing block");
+    file.seek(SeekFrom::Start(central_start - 24))?;
+    let mut footer = [0; 24];
+    file.read_exact(&mut footer)?;
+    ensure!(
+        &footer[8..] == b"APK Sig Block 42",
+        "missing APK signing block magic"
+    );
+    let size = u64::from_le_bytes(footer[..8].try_into()?);
+    ensure!(
+        (24..=16 * 1024 * 1024 - 8).contains(&size) && size + 8 <= central_start,
+        "invalid signing block size"
+    );
+    file.seek(SeekFrom::Start(central_start - size - 8))?;
+    let mut bytes = vec![0; (size + 8) as usize];
+    file.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod signing_tests {
+    use super::*;
+    use std::io::{Cursor, Write};
+    #[test]
+    fn signing_block_is_selected_from_bounded_central_directory() {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file("synthetic", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"synthetic").unwrap();
+        let mut bytes = writer.finish().unwrap().into_inner();
+        let end = bytes.len() - 22;
+        let central = u32_at(&bytes, end + 16) as usize;
+        let block = crate::apk_signing::tests::fixture(crate::SigningScheme::V2);
+        bytes.splice(central..central, block.iter().copied());
+        let end = bytes.len() - 22;
+        bytes[end + 16..end + 20].copy_from_slice(&((central + block.len()) as u32).to_le_bytes());
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&bytes).unwrap();
+        assert_eq!(read_signing_block(file).unwrap(), block);
+    }
+}

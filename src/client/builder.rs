@@ -82,6 +82,11 @@ impl ClientBuild {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ClientBuilderError {
+    #[error("invalid mobile session configuration: {0}")]
+    MobileSessionConfiguration(&'static str),
+    #[cfg(feature = "mobile-core")]
+    #[error(transparent)]
+    MobileSession(#[from] wacore::mobile::MobileSessionError),
     #[error("missing async runtime")]
     MissingRuntime,
     #[error("an instance clock requires the instance-clock SDK feature")]
@@ -225,6 +230,13 @@ impl Default for ClientBuilder {
 }
 
 impl ClientBuilder {
+    /// Select a registered primary-mobile profile. Supply an explicit mobile transport factory.
+    #[cfg(feature = "mobile-core")]
+    pub fn with_mobile_session(mut self, session: Arc<crate::RegisteredMobileSession>) -> Self {
+        self.extensions_mut().mobile_session = Some(session);
+        self
+    }
+
     /// Create an empty builder. All four platform dependencies are required.
     pub fn new() -> Self {
         Self {
@@ -706,6 +718,44 @@ impl ClientBuilder {
                 .as_ref()
                 .cloned()
                 .ok_or(ClientBuilderError::MissingPersistenceManager)?;
+            let persisted_mobile = persistence_manager
+                .get_device_snapshot()
+                .mobile_session
+                .is_some();
+            #[cfg(feature = "mobile-core")]
+            let mobile = self
+                .extensions
+                .as_deref()
+                .and_then(|extensions| extensions.mobile_session.as_ref());
+            #[cfg(feature = "mobile-core")]
+            let configured_mobile = mobile.is_some();
+            #[cfg(not(feature = "mobile-core"))]
+            let configured_mobile = false;
+            if persisted_mobile != configured_mobile {
+                return Err(ClientBuilderError::MobileSessionConfiguration(
+                    "persisted role mismatch",
+                ));
+            }
+            #[cfg(feature = "mobile-core")]
+            if let Some(session) = mobile {
+                session.validate_device(&persistence_manager.get_device_snapshot())?;
+                let clock = runtime.instance_clock().ok_or(
+                    ClientBuilderError::MobileSessionConfiguration("missing instance clock"),
+                )?;
+                let reading = clock
+                    .reading()
+                    .map_err(ClientBuilderError::InvalidInstanceClock)?;
+                if reading.wall_time_millis() < 0 {
+                    return Err(ClientBuilderError::MobileSessionConfiguration(
+                        "negative instance clock",
+                    ));
+                }
+                if self.options.override_version.is_some() {
+                    return Err(ClientBuilderError::MobileSessionConfiguration(
+                        "mobile version belongs in its profile",
+                    ));
+                }
+            }
             validate_clock_alignment(&runtime, &persistence_manager)?;
             if let Some(clock) = runtime.instance_clock() {
                 clock
@@ -1097,6 +1147,8 @@ impl Drop for ClientConstructionGuard {
 
 #[derive(Default)]
 pub(super) struct ClientExtensions {
+    #[cfg(feature = "mobile-core")]
+    pub(super) mobile_session: Option<Arc<crate::RegisteredMobileSession>>,
     pub(super) inbound_durability_hook: Option<Arc<dyn InboundDurabilityHook>>,
     pub(super) history_sync_capture_hook: Option<Arc<dyn HistorySyncCaptureHook>>,
     pub(super) history_sync_durability_hook: Option<Arc<dyn HistorySyncDurabilityHook>>,
@@ -1333,6 +1385,33 @@ mod tests {
             .with_persistence_manager(persistence_manager)
             .with_transport_factory(MockTransportFactory::new())
             .with_http_client(MockHttpClient)
+    }
+
+    #[tokio::test]
+    async fn mobile_persisted_role_cannot_load_through_web_builder() {
+        let builder = complete_builder().await;
+        let binding = wacore::store::MobileSessionBinding::new(
+            [1; 32],
+            [2; 32],
+            wacore::store::StoredMobilePlatform::Android,
+            vec![],
+            None,
+        )
+        .unwrap();
+        builder
+            .persistence_manager
+            .as_ref()
+            .unwrap()
+            .process_command(wacore::store::DeviceCommand::SetMobileSessionBinding(
+                binding,
+            ))
+            .await;
+        assert!(matches!(
+            builder.build().await,
+            Err(ClientBuilderError::MobileSessionConfiguration(
+                "persisted role mismatch"
+            ))
+        ));
     }
 
     struct RetryPolicy;

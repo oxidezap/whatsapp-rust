@@ -887,3 +887,137 @@ pub(crate) async fn answer_iq(
     }
     delivered
 }
+
+#[cfg(all(test, feature = "mobile-core"))]
+async fn primary_client_with_factory(
+    backend: Arc<dyn Backend>,
+    factory: Arc<dyn crate::transport::TransportFactory>,
+) -> Arc<Client> {
+    use crate::{ClockedRuntime, RegisteredMobileSession, VirtualClock};
+    use wacore::mobile::{
+        MobileAppVersion, MobileDevice, MobileEnvironment, MobileLoginOptions, MobileLoginProfile,
+        MobileNoisePrologue, MobilePlatform, MobileSessionError, MobileTrust, RegistrationEndpoint,
+        RegistrationIdentity, TcpEndpoint,
+    };
+    use wacore::store::{DeviceCommand, MobileSessionBinding, StoredMobilePlatform};
+
+    struct NoHandshakeKeys;
+    impl crate::MobileEphemeralKeyProvider for NoHandshakeKeys {
+        fn generate(&self) -> Result<wacore::libsignal::protocol::KeyPair, MobileSessionError> {
+            panic!("startup fixture must never run a real handshake")
+        }
+    }
+    let clock = Arc::new(VirtualClock::new(1000, wacore::time::Instant::ZERO).unwrap());
+    let persistence = Arc::new(PersistenceManager::new(backend).await.unwrap());
+    let environment = MobileEnvironment::new(
+        "synthetic-startup",
+        RegistrationEndpoint::for_test_http("http://mock.invalid/registration").unwrap(),
+        TcpEndpoint::new("mock.invalid", 5222).unwrap(),
+        MobileTrust::new([1; 32], [2; 32]).unwrap(),
+    )
+    .unwrap();
+    let device = persistence.get_device_snapshot();
+    let binding = MobileSessionBinding::new(
+        *environment.binding().as_bytes(),
+        device.mobile_identity_hash(),
+        StoredMobilePlatform::Android,
+        vec![],
+        None,
+    )
+    .unwrap();
+    let identity = RegistrationIdentity::from_public_keys(
+        device
+            .identity_key
+            .public_key
+            .public_key_bytes()
+            .try_into()
+            .unwrap(),
+        device
+            .noise_key
+            .public_key
+            .public_key_bytes()
+            .try_into()
+            .unwrap(),
+    );
+    if device.mobile_session.is_none() {
+        persistence
+            .process_command(DeviceCommand::SetMobileSessionBinding(binding))
+            .await;
+    }
+    persistence
+        .process_command(DeviceCommand::SetId(Some(
+            "15550000001@s.whatsapp.net".parse().unwrap(),
+        )))
+        .await;
+    let profile = MobileLoginProfile::new(
+        MobilePlatform::Android,
+        MobileAppVersion::parse("2.26.1").unwrap(),
+        MobileDevice::builder()
+            .manufacturer("Acme".into())
+            .device("Model".into())
+            .os_version("1".into())
+            .os_build_number("B1".into())
+            .phone_id("synthetic".into())
+            .locale_language("en".into())
+            .locale_country("GB".into())
+            .build(),
+    )
+    .unwrap();
+    let session = RegisteredMobileSession::new(
+        environment,
+        profile,
+        MobileLoginOptions::default(),
+        15550000001,
+        identity,
+        MobileNoisePrologue::new(3),
+        Arc::new(NoHandshakeKeys),
+    )
+    .unwrap()
+    .with_primary_identity_policy(wacore::send::PrimaryDeviceIdentityPolicy::Omit);
+    persistence.flush().await.unwrap();
+    Client::builder()
+        .with_runtime(ClockedRuntime::new(Arc::new(TokioRuntime), clock))
+        .with_persistence_manager(persistence)
+        .with_transport_factory_arc(factory)
+        .with_http_client(MockHttpClient)
+        .with_mobile_session(Arc::new(session))
+        .build()
+        .await
+        .unwrap()
+        .into_client()
+}
+
+#[cfg(all(test, feature = "mobile-core"))]
+pub(crate) async fn primary_startup_client() -> Arc<Client> {
+    primary_client_with_factory(
+        Arc::new(wacore::store::InMemoryBackend::new()),
+        Arc::new(MockTransportFactory::new()),
+    )
+    .await
+}
+#[cfg(all(test, feature = "mobile-core"))]
+pub(crate) async fn create_primary_iq_test_client_with_backend(
+    backend: Arc<dyn Backend>,
+) -> (
+    Arc<Client>,
+    Arc<crate::transport::mock::CapturingMockTransport>,
+) {
+    use crate::transport::mock::CapturingMockTransportFactory;
+    use wacore::handshake::NoiseCipher;
+    let factory = CapturingMockTransportFactory::new();
+    let transport = factory.transport();
+    let client = primary_client_with_factory(backend, Arc::new(factory)).await;
+    let socket = crate::socket::NoiseSocket::with_observers(
+        client.runtime.clone(),
+        transport.clone() as Arc<dyn crate::transport::Transport>,
+        NoiseCipher::new(&[0; 32]).unwrap(),
+        NoiseCipher::new(&[0; 32]).unwrap(),
+        crate::socket::noise_socket::SendObservers::with_stats(client.stats.clone())
+            .with_sent_frames(client.sent_frame_tap.clone()),
+    );
+    *client.noise_socket.lock().unwrap() = Some(Arc::new(socket));
+    client.set_connected_for_test(true);
+    client.set_driver_running_for_test(true, std::sync::atomic::Ordering::Release);
+    client.enter_live_mode_for_tests();
+    (client, transport)
+}

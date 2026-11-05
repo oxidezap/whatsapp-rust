@@ -4,6 +4,11 @@ pub mod commands;
 pub mod device;
 pub mod error;
 pub mod in_memory;
+pub mod mobile_session;
+pub use mobile_session::{
+    MobileDeviceKeys, MobileSessionBinding, StoredMobilePlatform, StoredMobileRole,
+    validate_mobile_primary_pn,
+};
 pub mod persistence;
 pub mod signal_cache;
 pub mod traits;

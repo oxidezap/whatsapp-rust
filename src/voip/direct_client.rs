@@ -208,6 +208,10 @@ pub(crate) async fn encrypt_known_call_keys(
     ring_devices: &[Jid],
     plaintext: &[u8],
 ) -> Result<DirectCallKeys, CallError> {
+    let sender_role = client.sending_identity_role();
+    sender_role
+        .validate()
+        .map_err(|_| CallError::MissingDeviceIdentity)?;
     let epoch = client.voip_state().direct.epoch();
     let raw = {
         let lock_jids = client.build_session_lock_keys(devices).await;
@@ -253,9 +257,12 @@ pub(crate) async fn encrypt_known_call_keys(
         .get_device_snapshot()
         .account
         .clone();
-    let device_identity =
-        wacore::send::needs_device_identity(raw.includes_prekey_message, account.as_deref())
-            .map_err(|_| CallError::MissingDeviceIdentity)?;
+    let device_identity = wacore::send::needs_device_identity_for_role(
+        raw.includes_prekey_message,
+        account.as_deref(),
+        sender_role,
+    )
+    .map_err(|_| CallError::MissingDeviceIdentity)?;
     Ok(DirectCallKeys {
         device_keys,
         ring_devices: ring_devices.to_vec(),

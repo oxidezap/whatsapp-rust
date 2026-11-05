@@ -1149,7 +1149,7 @@ impl Client {
             RetransmissionRoute::Status => unreachable!("status handled above"),
         };
         let stanza = wacore::session_engine::publication::PreparedSignal::new(
-            wacore::send::prepare_pairwise_retry_stanza(
+            wacore::send::prepare_pairwise_retry_stanza_for_role(
                 &mut store_adapter.session_store,
                 &mut store_adapter.identity_store,
                 wacore::send::PairwiseRetryRequest {
@@ -1162,6 +1162,7 @@ impl Client {
                     edit,
                     pre_encoded: pre_encoded.as_deref().map(Vec::as_slice),
                 },
+                self.sending_identity_role(),
             )
             .await?,
         )

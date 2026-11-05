@@ -7,6 +7,9 @@ publish = false
 license.workspace = true
 
 [dependencies]
+libc = "0.2"
+zeroize = { workspace = true }
+wacore = { path = "../../wacore", default-features = false, features = ["mobile"] }
 hex = "0.4.3"
 anyhow = { workspace = true }
 chrono = { workspace = true, features = ["std"] }

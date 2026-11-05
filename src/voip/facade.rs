@@ -1672,6 +1672,10 @@ async fn fanout_group_epoch_for_generation(
     update: &GroupCallUpdate,
     generation: Option<u64>,
 ) -> Result<GroupEpochFanout, CallError> {
+    let sender_role = client.sending_identity_role();
+    sender_role
+        .validate()
+        .map_err(|_| CallError::MissingDeviceIdentity)?;
     ensure_group_rekey_generation(client, &update.call_id, generation)?;
     // The authoritative roster transaction is already committed before this fan-out starts. Any
     // preparation failure would make an identical redelivery stale, so own teardown from the first
@@ -1764,9 +1768,10 @@ async fn fanout_group_epoch_for_generation(
         .stats
         .record_unkeyable_devices(UnkeyableDevice::Encrypt, encrypted.unkeyed_at_encrypt);
     ensure_group_rekey_generation(client, &update.call_id, generation)?;
-    let device_identity = wacore::send::needs_device_identity(
+    let device_identity = wacore::send::needs_device_identity_for_role(
         encrypted.includes_prekey_message,
         device.account.as_deref(),
+        sender_role,
     )
     .map_err(|_| CallError::MissingDeviceIdentity)?;
     let encrypted =

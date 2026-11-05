@@ -1,12 +1,14 @@
 //! Experimental, runtime-independent foundations for mobile clients.
 //!
-//! This module defines configuration and workflow policy, not an implemented
-//! registration wire protocol. Hosts supply time, transport, HTTP, randomness,
-//! persistence and platform services. No mobile request is sent by these types.
-//! Official APK qualification is still required before adding wire builders.
+//! Hosts supply time, transport, HTTP, randomness, persistence and platform
+//! services. Reference-derived wire components remain experimental until
+//! independently qualified against the pinned official client artifacts.
 
 mod environment;
+pub mod primary;
 mod registration;
+pub mod registration_wire;
+mod session;
 
 pub use environment::{
     EnvironmentBinding, EnvironmentBound, MobileConfigurationError, MobileEnvironment, MobileTrust,
@@ -17,3 +19,11 @@ pub use registration::{
     RegistrationIdentity, RegistrationOperation, RegistrationOutcome, RegistrationPolicy,
     RegistrationRunId, RegistrationStage, RegistrationWorkflow,
 };
+pub use session::{
+    MobileAppVersion, MobileCertificateExpiryPolicy, MobileDevice, MobileLoginOptions,
+    MobileLoginProfile, MobileNoisePrologue, MobileNoiseTrust, MobilePlatform, MobileSessionError,
+    MobileXxHandshake, MobileXxHandshakeOutcome, VerifiedMobileCertificate,
+};
+
+mod token;
+pub use token::{AndroidTokenError, AndroidTokenMaterial, ios_registration_token};

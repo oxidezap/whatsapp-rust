@@ -7,10 +7,18 @@ fn main() -> Result<std::process::ExitCode> {
     let mut args = std::env::args_os().skip(1);
     let command = args
         .next()
-        .context("usage: mobile-oracle verify <lock> <root> | diff <before-lock> <after-lock> | compare <lock> <root> <corpus> <apk-observations> <rust-observations>")?;
+        .context("usage: mobile-oracle material <lock> <root> <recipe> [--export-private <repository>] | verify <lock> <root> | diff <before-lock> <after-lock> | compare <lock> <root> <corpus> <apk-observations> <rust-observations>")?;
     let first = PathBuf::from(args.next().context("missing first path")?);
     let second = PathBuf::from(args.next().context("missing second path")?);
-    let (output, passed) = if command == "compare" {
+    let (output, passed) = if command == "material" {
+        let recipe = PathBuf::from(args.next().context("missing recipe path")?);
+        if args.next().is_some() {
+            bail!("unexpected argument");
+        }
+        let (report, _private_material) =
+            mobile_oracle::extract_material(&first, &second, &recipe)?;
+        (serde_json::to_string_pretty(&report)?, true)
+    } else if command == "compare" {
         let corpus = PathBuf::from(args.next().context("missing corpus path")?);
         let apk = PathBuf::from(args.next().context("missing APK observations path")?);
         let rust = PathBuf::from(args.next().context("missing Rust observations path")?);
@@ -29,7 +37,7 @@ fn main() -> Result<std::process::ExitCode> {
         } else if command == "diff" {
             serde_json::to_string_pretty(&mobile_oracle::compare_locks(&first, &second)?)?
         } else {
-            bail!("unknown command; expected verify, diff or compare");
+            bail!("unknown command; expected verify, diff, compare or material");
         };
         (report, true)
     };

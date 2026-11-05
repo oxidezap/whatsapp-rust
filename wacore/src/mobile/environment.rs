@@ -157,7 +157,7 @@ impl MobileTrust {
 pub struct EnvironmentBinding([u8; 32]);
 
 impl EnvironmentBinding {
-    pub(super) fn as_bytes(&self) -> &[u8; 32] {
+    pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 }

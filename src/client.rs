@@ -1354,6 +1354,11 @@ impl std::fmt::Display for ConnectStage {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ConnectError {
+    #[cfg(feature = "mobile-core")]
+    #[error(transparent)]
+    PrimaryMobile(#[from] crate::mobile_primary::PrimaryManagementError),
+    #[error("persisted session role does not match the configured client")]
+    InvalidSessionRole,
     /// A connection is already up, or another attempt is already in flight.
     #[error("client is already connected")]
     AlreadyConnected,
@@ -1429,8 +1434,11 @@ impl ConnectError {
     pub fn is_timeout(&self) -> bool {
         match self {
             ConnectError::Timeout { .. } => true,
+            #[cfg(feature = "mobile-core")]
+            ConnectError::PrimaryMobile(_) => false,
             ConnectError::Handshake(handshake) => handshake.is_timeout(),
-            ConnectError::AlreadyConnected
+            ConnectError::InvalidSessionRole
+            | ConnectError::AlreadyConnected
             | ConnectError::NotActivated
             | ConnectError::Shutdown
             | ConnectError::Paused
@@ -1925,6 +1933,11 @@ pub struct Client {
     /// including reconnects, reads this same value, so the policy cannot
     /// change under an in-flight handshake.
     pub(crate) noise_cert_policy: wacore::handshake::NoiseCertPolicy,
+    #[cfg(feature = "mobile-core")]
+    pub(crate) mobile_session: Option<Arc<crate::RegisteredMobileSession>>,
+    /// Reserved XX attempts per client; failed pre-dial attempts do not advance it.
+    #[cfg(feature = "mobile-core")]
+    pub(crate) mobile_handshake_attempts: AtomicU32,
     pub(crate) additional_static_media_hosts: Box<[wacore::download::MediaHost]>,
     /// Terminal shutdown (process-wide). Fired by shutdown, logout or synchronous drop cleanup.
     /// Long-lived subscribers that must outlive reconnect cycles (saver,

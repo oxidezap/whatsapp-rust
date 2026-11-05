@@ -446,7 +446,10 @@ impl SidecarAccumulator {
 /// Audio and video are the only media types that benefit from a streaming
 /// sidecar (progressive playback/seek); images/documents are fetched whole.
 fn media_type_uses_sidecar(media_type: MediaType) -> bool {
-    matches!(media_type, MediaType::Audio | MediaType::Video)
+    matches!(
+        media_type,
+        MediaType::Audio | MediaType::Ptt | MediaType::Video | MediaType::Gif
+    )
 }
 
 /// A re-readable source of already-encrypted upload bytes.

@@ -1611,6 +1611,45 @@ impl MsgSecretStore for InMemoryBackend {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl DeviceStore for InMemoryBackend {
+    async fn initialize_mobile_device(&self, device: &Device) -> Result<()> {
+        device.validate_mobile_session()?;
+        device
+            .mobile_session
+            .as_ref()
+            .ok_or_else(|| {
+                crate::store::error::StoreError::Validation("missing mobile binding".into())
+            })?
+            .validate()?;
+        let mut state = self.state.lock().await;
+        if state.device.is_some()
+            || state.latest_sync_key_id.is_some()
+            || !state.identities.is_empty()
+            || !state.sessions.is_empty()
+            || !state.prekeys.is_empty()
+            || !state.signed_prekeys.is_empty()
+            || !state.sender_keys.is_empty()
+            || !state.sync_keys.is_empty()
+            || !state.versions.is_empty()
+            || !state.mutation_macs.is_empty()
+            || !state.sender_key_devices.is_empty()
+            || !state.lid_mappings.is_empty()
+            || !state.pn_to_lid.is_empty()
+            || !state.base_keys.is_empty()
+            || !state.device_lists.is_empty()
+            || !state.group_metadata.is_empty()
+            || !state.tc_tokens.is_empty()
+            || !state.sent_messages.is_empty()
+            || !state.pending_inbound.is_empty()
+            || !state.msg_secrets.is_empty()
+        {
+            return Err(crate::store::error::StoreError::InvalidConfig(
+                "mobile initialization requires an empty namespace".into(),
+            ));
+        }
+        state.device = Some(device.clone());
+        Ok(())
+    }
+
     async fn save(&self, device: &Device) -> Result<()> {
         self.state.lock().await.device = Some(device.clone());
         Ok(())
@@ -1933,6 +1972,45 @@ fn hb_table_bytes<K, V, S>(map: &HbHashMap<K, V, S>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mobile_initializer_rejects_stale_signal_and_invalid_binding() {
+        use crate::store::commands::{DeviceCommand, apply_command_to_device};
+        use crate::store::{MobileSessionBinding, StoredMobilePlatform};
+        let mut device = Device::new();
+        let binding = MobileSessionBinding::new(
+            [1; 32],
+            device.mobile_identity_hash(),
+            StoredMobilePlatform::Android,
+            vec![1],
+            Some(vec![2]),
+        )
+        .unwrap();
+        apply_command_to_device(&mut device, DeviceCommand::SetMobileSessionBinding(binding));
+        let stale = InMemoryBackend::new();
+        stale.put_identity("15551234567", [3; 32]).await.unwrap();
+        assert!(stale.initialize_mobile_device(&device).await.is_err());
+        assert!(stale.load().await.unwrap().is_none());
+        assert_eq!(
+            stale.load_identity("15551234567").await.unwrap(),
+            Some([3; 32])
+        );
+        let fresh = InMemoryBackend::new();
+        fresh.initialize_mobile_device(&device).await.unwrap();
+        assert!(fresh.initialize_mobile_device(&device).await.is_err());
+        let invalid = InMemoryBackend::new();
+        let binding = MobileSessionBinding::new(
+            [1; 32],
+            [0; 32],
+            StoredMobilePlatform::Android,
+            vec![1],
+            None,
+        )
+        .unwrap();
+        apply_command_to_device(&mut device, DeviceCommand::SetMobileSessionBinding(binding));
+        assert!(invalid.initialize_mobile_device(&device).await.is_err());
+        assert!(invalid.load().await.unwrap().is_none());
+    }
 
     fn is_backend<T: Backend>() {}
 

@@ -63,6 +63,17 @@ impl SqliteDatabase {
             .map(|(_, store)| store)
     }
 
+    /// Allocate a fresh mobile namespace and persist supplied credentials atomically.
+    /// Accepts pending or registered mobile state, validates its binding and keys,
+    /// and never generates a temporary Web identity. The returned store is ready
+    /// for `PersistenceManager::new` or reopening by its allocated device id.
+    pub async fn import_mobile_device(
+        &self,
+        device: &wacore::store::Device,
+    ) -> Result<SqliteStore> {
+        self.template.import_mobile_device_impl(device).await
+    }
+
     /// Provision exactly `device_id`, for the single-account/restore path.
     /// An existing row is an insert error, not a reset or an idempotent ensure.
     pub async fn provision_device(&self, device_id: i32) -> Result<SqliteStore> {

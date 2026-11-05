@@ -147,16 +147,66 @@ struct RawEncryptAttempt {
 /// - `includes_prekey && account.is_some()` -> `Ok(Some(encoded))`
 /// - `includes_prekey && account.is_none()` -> `Err` (refuse before send)
 /// - `!includes_prekey` -> `Ok(None)`
+/// Explicit primary wire profiles from the pinned reference clients. Neither profile
+/// synthesizes an ADV identity: Zapo omits it for device 0; whalibmob attaches
+/// a stored identity only when one is available. These are reference-derived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PrimaryDeviceIdentityPolicy {
+    #[default]
+    Omit,
+    AttachWhenAvailable,
+}
+
+/// Sending role is supplied by the host after validating persisted role/key binding.
+/// An unknown role is never interpreted as a primary permission to omit ADV.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SenderIdentityRole {
+    #[default]
+    Companion,
+    MobilePrimary(PrimaryDeviceIdentityPolicy),
+    Unknown,
+}
+impl SenderIdentityRole {
+    pub fn validate(self) -> Result<()> {
+        if self == Self::Unknown {
+            bail!("unknown sending identity role");
+        }
+        Ok(())
+    }
+    pub(crate) fn requires_account(self) -> bool {
+        self == Self::Companion
+    }
+}
+
+pub fn needs_device_identity_for_role(
+    includes_prekey: bool,
+    account: Option<&wa::ADVSignedDeviceIdentity>,
+    role: SenderIdentityRole,
+) -> Result<Option<Vec<u8>>> {
+    role.validate()?;
+    if !includes_prekey {
+        return Ok(None);
+    }
+    match role {
+        SenderIdentityRole::MobilePrimary(PrimaryDeviceIdentityPolicy::Omit) => Ok(None),
+        SenderIdentityRole::MobilePrimary(PrimaryDeviceIdentityPolicy::AttachWhenAvailable) => {
+            Ok(account.map(waproto::codec::adv_signed_device_identity_to_vec))
+        }
+        SenderIdentityRole::Companion => {
+            let acc = account.ok_or_else(|| {
+                anyhow!("pkmsg requires <device-identity> but no ADV account is present")
+            })?;
+            Ok(Some(waproto::codec::adv_signed_device_identity_to_vec(acc)))
+        }
+        SenderIdentityRole::Unknown => unreachable!("validated above"),
+    }
+}
+
 pub fn needs_device_identity(
     includes_prekey: bool,
     account: Option<&wa::ADVSignedDeviceIdentity>,
 ) -> Result<Option<Vec<u8>>> {
-    if !includes_prekey {
-        return Ok(None);
-    }
-    let acc = account
-        .ok_or_else(|| anyhow!("pkmsg requires <device-identity> but no ADV account is present"))?;
-    Ok(Some(waproto::codec::adv_signed_device_identity_to_vec(acc)))
+    needs_device_identity_for_role(includes_prekey, account, SenderIdentityRole::Companion)
 }
 
 /// Maximum number of concurrent per-device crypto tasks during group send
@@ -1554,6 +1604,62 @@ mod encryption_override_tests {
         assert_ne!(
             device_list_fingerprint(&list),
             device_list_fingerprint(&[lid("100000000000001", 5)])
+        );
+    }
+}
+
+#[cfg(test)]
+mod sender_identity_role_tests {
+    use super::*;
+    #[test]
+    fn explicit_primary_profiles_and_unknown_role_do_not_weaken_companions() {
+        let account = wa::ADVSignedDeviceIdentity::default();
+        for prekey in [false, true] {
+            assert!(
+                needs_device_identity_for_role(prekey, None, SenderIdentityRole::Unknown).is_err()
+            );
+            assert!(
+                needs_device_identity_for_role(prekey, Some(&account), SenderIdentityRole::Unknown)
+                    .is_err()
+            );
+        }
+        assert!(needs_device_identity(true, None).is_err());
+        for policy in [
+            PrimaryDeviceIdentityPolicy::Omit,
+            PrimaryDeviceIdentityPolicy::AttachWhenAvailable,
+        ] {
+            assert!(
+                needs_device_identity_for_role(
+                    true,
+                    None,
+                    SenderIdentityRole::MobilePrimary(policy)
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+        assert!(
+            needs_device_identity_for_role(
+                true,
+                Some(&account),
+                SenderIdentityRole::MobilePrimary(PrimaryDeviceIdentityPolicy::Omit)
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            needs_device_identity_for_role(
+                true,
+                Some(&account),
+                SenderIdentityRole::MobilePrimary(PrimaryDeviceIdentityPolicy::AttachWhenAvailable)
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            needs_device_identity(true, Some(&account))
+                .unwrap()
+                .is_some()
         );
     }
 }

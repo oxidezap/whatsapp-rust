@@ -16,6 +16,18 @@ impl Boundary {
     fn check_path(&mut self, path: impl IntoIterator<Item = String>) {
         let parts: Vec<_> = path.into_iter().collect();
         let joined = parts.join("::");
+        // Signing consumes host-owned entropy; naming a pure trait selects no generator.
+        if parts.len() == 2
+            && matches!(parts[0].as_str(), "rand" | "rand_core")
+            && matches!(parts[1].as_str(), "Rng" | "CryptoRng")
+        {
+            return;
+        }
+        let explicit_time_value = parts.len() == 1
+            && matches!(
+                parts[0].as_str(),
+                "now_secs" | "now_millis" | "now_utc" | "elapsed"
+            );
         let forbidden = parts.iter().any(|part| {
             matches!(
                 part.as_str(),
@@ -37,13 +49,13 @@ impl Boundary {
                     | "rand_core"
                     | "getrandom"
                     | "chrono"
-                    | "now_secs"
-                    | "now_millis"
-                    | "now_utc"
-                    | "elapsed"
                     | "spawn"
                     | "sleep"
-            )
+            ) || !explicit_time_value
+                && matches!(
+                    part.as_str(),
+                    "now_secs" | "now_millis" | "now_utc" | "elapsed"
+                )
         });
         let global_clock = joined.starts_with("crate::time")
             || joined.starts_with("wacore::time")
@@ -132,11 +144,28 @@ impl<'ast> Visit<'ast> for Boundary {
     }
 
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-        if call.method == "now" {
+        if matches!(
+            call.method.to_string().as_str(),
+            "now" | "now_secs" | "now_millis" | "now_utc" | "elapsed"
+        ) {
             self.violations.push("ambient now() method".into());
         }
         self.check_path([call.method.to_string()]);
         syn::visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let Expr::Path(function) = call.func.as_ref()
+            && function.path.segments.last().is_some_and(|segment| {
+                matches!(
+                    segment.ident.to_string().as_str(),
+                    "now_secs" | "now_millis" | "now_utc" | "elapsed"
+                )
+            })
+        {
+            self.violations.push("ambient clock function".into());
+        }
+        syn::visit::visit_expr_call(self, call);
     }
 
     fn visit_expr_await(&mut self, _: &'ast syn::ExprAwait) {
@@ -249,6 +278,12 @@ fn guard_rejects_aliased_services_and_nested_clock_reads() {
         "fn f(clock: Clock) { clock.now(); }",
         "fn f() { std::env::var(\"URL\"); }",
         "async fn f() {}",
+        "fn f() { rand::rng(); }",
+        "use rand::{CryptoRng, rng as source}; fn f() { source(); }",
+        "use rand::rngs::OsRng as Entropy; fn f() {}",
+        "use rand::*; fn f() {}",
+        "fn f() { now_secs(); }",
+        "fn f(clock: Clock) { clock.elapsed(); }",
         "#[cfg(test)] mod tests {} fn f() { std::net::TcpStream::connect(\"host\"); }",
     ] {
         assert!(!violations(source).is_empty(), "{source}");
@@ -257,6 +292,7 @@ fn guard_rejects_aliased_services_and_nested_clock_reads() {
 
 #[test]
 fn guard_accepts_explicit_time_and_test_only_adapters() {
+    assert!(violations("use rand::{CryptoRng, Rng}; fn f<R: Rng + CryptoRng>(rng: &mut R, now_secs: u64) -> u64 { let _: u8 = rng.random(); now_secs }").is_empty());
     assert!(
         violations("fn expired(now: u64, deadline: u64) -> bool { now >= deadline }").is_empty()
     );

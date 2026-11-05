@@ -10,6 +10,12 @@ use waproto::whatsapp as wa;
 #[derive(Clone)]
 pub enum DeviceCommand {
     SetId(Option<Jid>),
+    SetMobileSessionBinding(crate::store::MobileSessionBinding),
+    CompleteMobileRegistration {
+        binding: crate::store::MobileSessionBinding,
+        pn: Jid,
+        lid: Option<Jid>,
+    },
     SetLid(Option<Jid>),
     SetPushName(String),
     SetAccount(Option<wa::ADVSignedDeviceIdentity>),
@@ -69,6 +75,10 @@ pub enum DeviceCommand {
 impl std::fmt::Debug for DeviceCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::CompleteMobileRegistration { .. } => {
+                f.write_str("CompleteMobileRegistration([REDACTED])")
+            }
+            Self::SetMobileSessionBinding(_) => f.write_str("SetMobileSessionBinding([REDACTED])"),
             Self::SetId(v) => f.debug_tuple("SetId").field(v).finish(),
             Self::SetLid(v) => f.debug_tuple("SetLid").field(v).finish(),
             Self::SetPushName(v) => f.debug_tuple("SetPushName").field(v).finish(),
@@ -131,6 +141,14 @@ fn apply_command_with_clock(
     now: impl FnOnce() -> i64,
 ) {
     match command {
+        DeviceCommand::CompleteMobileRegistration { binding, pn, lid } => {
+            device.mobile_session = Some(std::sync::Arc::new(binding));
+            device.pn = Some(pn);
+            device.lid = lid;
+        }
+        DeviceCommand::SetMobileSessionBinding(binding) => {
+            device.mobile_session = Some(std::sync::Arc::new(binding));
+        }
         DeviceCommand::SetId(id) => {
             device.pn = id;
         }

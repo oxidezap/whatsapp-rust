@@ -3177,7 +3177,7 @@ impl Client {
             let mut store_adapter = self.signal_adapter();
 
             let device_snapshot = self.persistence_manager.get_device_snapshot();
-            wacore::send::prepare_peer_stanza(
+            wacore::send::prepare_peer_stanza_for_role(
                 &mut store_adapter.session_store,
                 &mut store_adapter.identity_store,
                 to,
@@ -3185,6 +3185,7 @@ impl Client {
                 message,
                 request_id,
                 device_snapshot.account.as_deref(),
+                self.sending_identity_role(),
             )
             .await?
         };

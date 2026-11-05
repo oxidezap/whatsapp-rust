@@ -1443,6 +1443,36 @@ impl Client {
             }
         };
 
+        // Primary sessions own their profile; they do not receive the Web
+        // companion's setting_pushName bootstrap. Only seed an absent local
+        // name so a reconnect cannot overwrite a newer local rename.
+        let primary_display_name = self
+            .is_mobile_primary()
+            .then(|| node.get_attr("display_name").map(|name| name.to_string()))
+            .flatten();
+        #[cfg(feature = "mobile-core")]
+        let primary_account = self
+            .is_mobile_primary()
+            .then(|| {
+                node.get_optional_child("device-identity")
+                    .and_then(wacore_binary::NodeRef::content_bytes)
+                    .map(|bytes| {
+                        let device = self.persistence_manager.get_device_snapshot();
+                        let own = device.pn.as_ref().ok_or("missing primary account")?;
+                        let identity: &[u8; 32] = device
+                            .identity_key
+                            .public_key
+                            .public_key_bytes()
+                            .try_into()
+                            .map_err(|_| "invalid primary identity key")?;
+                        wacore::mobile::primary::validate_primary_account_identity(
+                            bytes, identity, own,
+                        )
+                        .map(Box::new)
+                        .map_err(|_| "invalid primary success device identity")
+                    })
+            })
+            .flatten();
         let client_clone = self.clone();
         let task_generation = current_generation;
         #[cfg(feature = "bench-harness")]
@@ -1450,11 +1480,48 @@ impl Client {
         self.runtime.spawn_detached(Box::pin(async move {
             #[cfg(feature = "bench-harness")]
             let mut _startup_task = startup_task;
+            if client_clone.connection_generation.load(Ordering::SeqCst) != task_generation {
+                return;
+            }
+            #[cfg(feature = "mobile-core")]
+            match primary_account {
+                Some(Ok(account)) => {
+                    client_clone
+                        .persistence_manager
+                        .process_command(DeviceCommand::SetAccount(Some(*account)))
+                        .await;
+                }
+                Some(Err(error)) => {
+                    warn!("Primary startup rejected server device identity: {error}");
+                    return;
+                }
+                None => {}
+            }
+            if let Some(name) = primary_display_name
+                && client_clone.persistence_manager.get_device_snapshot().push_name.is_empty()
+            {
+                client_clone
+                    .persistence_manager
+                    .process_command(DeviceCommand::SetPushName(name))
+                    .await;
+            }
             // Update LID if changed (moved here to avoid blocking the read loop
             // on Device snapshot + write lock).
             if let Some(lid) = lid_from_server {
                 let device_snapshot =
                     client_clone.persistence_manager.get_device_snapshot();
+                if client_clone.is_mobile_primary()
+                    && let Some(pn) = device_snapshot.pn.as_ref()
+                    && let Err(error) = client_clone
+                        .add_lid_pn_mapping(
+                            lid.user.as_str(),
+                            pn.user.as_str(),
+                            wacore::types::lid_pn::LearningSource::Other,
+                        )
+                        .await
+                {
+                    warn!("Failed to persist primary own-account LID mapping: {error}");
+                }
                 if device_snapshot.lid.as_ref() != Some(&lid) {
                     debug!("Updating LID from server to '{}'", lid.observe());
                     client_clone
@@ -1500,7 +1567,8 @@ impl Client {
             // Check if we need initial app state sync (empty pushname indicates fresh pairing
             // where pushname will come from app state sync's setting_pushName mutation)
             let device_snapshot = client_clone.persistence_manager.get_device_snapshot();
-            let needs_pushname_from_sync = device_snapshot.push_name.is_empty();
+            let mobile_primary = client_clone.is_mobile_primary();
+            let needs_pushname_from_sync = !mobile_primary && device_snapshot.push_name.is_empty();
             if needs_pushname_from_sync {
                 debug!("Push name is empty - will be set from app state sync (setting_pushName)");
             }
@@ -1512,6 +1580,17 @@ impl Client {
                 debug!(
                     "Skipping post-login init: connection closed (likely pairing phase reconnect)"
                 );
+                return;
+            }
+
+            check_generation!();
+            #[cfg(feature = "mobile-core")]
+            if let Some(session) = &client_clone.mobile_session
+                && let Err(error) = client_clone
+                    .ensure_primary_app_state_key(session.app_state_key())
+                    .await
+            {
+                warn!("Primary startup cannot initialize authoritative app-state: {error}");
                 return;
             }
 
@@ -1557,7 +1636,8 @@ impl Client {
                     // the first message). It used to sit between `<success>` and the
                     // `set_passive(false)` that gates offline delivery, where its two
                     // serial DB reads delayed the backlog for a log line.
-                    if let Err(e) = key_client.log_primary_phone_session_state().await
+                    if !key_client.is_mobile_primary()
+                        && let Err(e) = key_client.log_primary_phone_session_state().await
                         && !key_client.is_shutting_down()
                     {
                         warn!(target: "Client/PDO", "Failed to check the primary-phone session on login: {e:?}");
@@ -1595,6 +1675,19 @@ impl Client {
                 && !client_clone.is_shutting_down()
             {
                 warn!("Failed to send post-connect active IQ: {e:?}");
+            }
+
+            // Primary references announce availability immediately after active,
+            // before draining offline messages. A companion instead waits for
+            // its app-state profile bootstrap below. Preserve the host's manual
+            // presence policy through the shared presence API.
+            if mobile_primary {
+                check_generation!();
+                match Box::pin(client_clone.send_automatic_available()).await {
+                    Ok(true) => debug!("Primary initial presence sent successfully."),
+                    Ok(false) => {}
+                    Err(e) => warn!("Failed to send primary initial presence: {e:?}"),
+                }
             }
 
             // === Wait for offline sync to complete ===
@@ -1726,7 +1819,10 @@ impl Client {
             check_generation!();
 
             let flag_set = client_clone.needs_initial_full_sync.is_armed();
-            let needs_initial_sync = flag_set || needs_pushname_from_sync;
+            // A primary is authoritative for app-state. Asking a companion
+            // snapshot/bootstrap path for its own state can wait forever for a
+            // key-share from a primary phone that is this very session.
+            let needs_initial_sync = !mobile_primary && (flag_set || needs_pushname_from_sync);
 
             if needs_initial_sync {
                 // Boxed, and the arm behind its own `async fn`, because a Rust
@@ -1748,7 +1844,7 @@ impl Client {
                 // === Reconnection path ===
                 // Pushname is already known, send presence and Connected immediately.
                 let device_snapshot = client_clone.persistence_manager.get_device_snapshot();
-                if !device_snapshot.push_name.is_empty() {
+                if !mobile_primary && !device_snapshot.push_name.is_empty() {
                     match client_clone.send_automatic_available().await {
                         Ok(true) => debug!("Initial presence sent successfully."),
                         Ok(false) => {}
@@ -2631,6 +2727,134 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "mobile-core")]
+    use crate::test_utils::primary_startup_client;
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn primary_success_seeds_profile_but_cannot_be_ready_without_its_authoritative_key() {
+        let client = primary_startup_client().await;
+        let events = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(events.clone()).detach();
+        client.set_connected_for_test(true);
+        let success = NodeBuilder::new("success")
+            .attr("display_name", "Synthetic primary")
+            .attr("lid", "10000000001@lid")
+            .build();
+        client.handle_success(&success.as_node_ref()).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        let device = client.persistence_manager.get_device_snapshot();
+        assert_eq!(device.push_name, "Synthetic primary");
+        assert_eq!(device.lid.as_ref().unwrap().user.as_str(), "10000000001");
+        assert_eq!(
+            client
+                .persistence_manager
+                .backend()
+                .get_lid_mapping("10000000001")
+                .await
+                .unwrap()
+                .unwrap()
+                .phone_number,
+            "15550000001"
+        );
+        assert!(client.is_logged_in(), "server authentication is retained");
+        assert!(
+            events
+                .events()
+                .iter()
+                .all(|event| !matches!(&**event, Event::Connected(_)))
+        );
+        client.notify_connection_shutdown();
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn primary_success_does_not_persist_an_unverified_server_identity() {
+        let client = primary_startup_client().await;
+        client.set_connected_for_test(true);
+        let success = NodeBuilder::new("success")
+            .attr("display_name", "Unverified profile")
+            .children([NodeBuilder::new("device-identity")
+                .bytes(vec![0xff])
+                .build()])
+            .build();
+        client.handle_success(&success.as_node_ref()).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        let device = client.persistence_manager.get_device_snapshot();
+        assert!(device.account.is_none());
+        assert!(device.push_name.is_empty());
+        client.notify_connection_shutdown();
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn primary_with_a_durable_key_becomes_ready_without_companion_bootstrap() {
+        use buffa::Message as _;
+        let client = primary_startup_client().await;
+        let key_id = [0, 0, 0, 0, 0, 1];
+        let mut fingerprint = waproto::whatsapp::message::AppStateSyncKeyFingerprint::default();
+        fingerprint.raw_id = Some(7);
+        fingerprint.current_index = Some(0);
+        fingerprint.device_indexes = vec![0];
+        client
+            .persistence_manager
+            .backend()
+            .set_sync_key(
+                &key_id,
+                crate::store::traits::AppStateSyncKey {
+                    key_data: vec![7; 32],
+                    fingerprint: fingerprint.encode_to_vec(),
+                    timestamp: 1000,
+                },
+            )
+            .await
+            .unwrap();
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetPushName("New local profile".into()))
+            .await;
+        let events = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(events.clone()).detach();
+        client.set_connected_for_test(true);
+        client
+            .needs_initial_full_sync
+            .settle(client.connection_generation.load(Ordering::SeqCst), true);
+        // The transport intentionally has no peer: a companion bootstrap would
+        // block on its app-state request/key-share. A primary already owns its
+        // durable key and must publish readiness after its offline drain.
+        client.offline_sync_completed.store(true, Ordering::Relaxed);
+        let success = NodeBuilder::new("success")
+            .attr("display_name", "Older server profile")
+            .build();
+        client.handle_success(&success.as_node_ref()).await;
+        for _ in 0..200 {
+            if events
+                .events()
+                .iter()
+                .any(|event| matches!(&**event, Event::Connected(_)))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            events
+                .events()
+                .iter()
+                .any(|event| matches!(&**event, Event::Connected(_)))
+        );
+        assert_eq!(
+            client.persistence_manager.get_device_snapshot().push_name,
+            "New local profile",
+            "a stale success observation must not overwrite local intent"
+        );
+        client.notify_connection_shutdown();
+    }
+
     #[tokio::test]
     async fn an_ack_capacity_retry_releases_its_source_and_keeps_its_original_scope() {
         use crate::test_utils::{create_iq_test_client, node_to_owned_ref};

@@ -61,6 +61,8 @@ pub enum DeregistrationOutcome {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum DeregistrationSkipReason {
+    /// A registered phone is the primary account, not a companion to unlink.
+    MobilePrimary,
     /// The socket was disconnected when logout checked it.
     Offline,
     /// No phone-number identity was available for the companion request.
@@ -161,6 +163,18 @@ impl Drop for Client {
 }
 
 impl Client {
+    /// Whether this client was explicitly configured as a registered mobile primary.
+    pub fn is_mobile_primary(&self) -> bool {
+        #[cfg(feature = "mobile-core")]
+        {
+            self.mobile_session.is_some()
+        }
+        #[cfg(not(feature = "mobile-core"))]
+        {
+            false
+        }
+    }
+
     fn clear_protocol_terminal_reason(&self) {
         *self
             .protocol_terminal_reason
@@ -503,6 +517,8 @@ impl Client {
         extensions: ClientExtensions,
     ) -> ClientAssembly {
         let ClientExtensions {
+            #[cfg(feature = "mobile-core")]
+            mobile_session,
             #[cfg(feature = "client-lifecycle")]
             lifecycle,
             #[cfg(feature = "plugins")]
@@ -561,6 +577,10 @@ impl Client {
             send_active_receipts: AtomicU32::new(0),
             ik_handshake_failures: AtomicU32::new(0),
             noise_cert_policy,
+            #[cfg(feature = "mobile-core")]
+            mobile_session,
+            #[cfg(feature = "mobile-core")]
+            mobile_handshake_attempts: AtomicU32::new(0),
             additional_static_media_hosts,
             shutdown_notifier: wacore::runtime::ShutdownNotifier::new(),
             connection_shutdown: std::sync::Mutex::new(wacore::runtime::ShutdownNotifier::new()),
@@ -1425,11 +1445,50 @@ impl Client {
         )
     )]
     async fn connect_graph(self: &Arc<Self>) -> Result<Connection<'_>, ConnectError> {
+        // Persisted role is checked on every reconnect, before version or transport I/O.
+        if self
+            .persistence_manager
+            .get_device_snapshot()
+            .mobile_session
+            .is_some()
+            != self.is_mobile_primary()
+        {
+            return Err(ConnectError::InvalidSessionRole);
+        }
+        #[cfg(feature = "mobile-core")]
+        if let Some(session) = &self.mobile_session {
+            session
+                .validate_device(&self.persistence_manager.get_device_snapshot())
+                .map_err(handshake::HandshakeError::Mobile)?;
+            let clock = self
+                .runtime
+                .instance_clock()
+                .ok_or(handshake::HandshakeError::Mobile(
+                    wacore::mobile::MobileSessionError::MissingClock,
+                ))?;
+            let reading = clock.reading().map_err(|_| {
+                handshake::HandshakeError::Mobile(
+                    wacore::mobile::MobileSessionError::MalformedClock,
+                )
+            })?;
+            if reading.wall_time_millis() < 0 {
+                return Err(handshake::HandshakeError::Mobile(
+                    wacore::mobile::MobileSessionError::MalformedClock,
+                )
+                .into());
+            }
+        }
+
         #[cfg(feature = "tracing")]
         self.record_identity_on_current_span("wa.conn.connect", module_path!());
 
         let attempt = self.begin_connection_attempt()?;
         let _guard = scopeguard::guard(attempt, |ticket| self.finish_connection_attempt(ticket));
+        #[cfg(feature = "mobile-core")]
+        if let Some(session) = &self.mobile_session {
+            self.ensure_primary_app_state_key(session.app_state_key())
+                .await?;
+        }
 
         self.clear_protocol_terminal_reason();
         let _t = wacore::telemetry::timer(wacore::telemetry::CONNECT_DURATION);
@@ -1485,23 +1544,29 @@ impl Client {
         // WA Web: both MQTT and DGW transports use a 20s connect timeout.
         // Without this, a dead network blocks on the OS TCP SYN timeout (~60-75s).
         // Version fetch is also wrapped so a hung HTTP request doesn't block connect().
-        let version_future = rt_timeout(
-            &*self.runtime,
-            TRANSPORT_CONNECT_TIMEOUT,
+        let version_future = rt_timeout(&*self.runtime, TRANSPORT_CONNECT_TIMEOUT, async {
+            if self.is_mobile_primary() {
+                return Ok(None);
+            }
             crate::version::resolve_and_update_version_on(
                 &self.persistence_manager,
                 &self.http_client,
                 self.override_version,
                 &self.runtime,
-            ),
-        );
+            )
+            .await
+        });
         let transport_future = rt_timeout(
             &*self.runtime,
             TRANSPORT_CONNECT_TIMEOUT,
             self.transport_factory.create_transport(),
         );
 
-        debug!("Connecting WebSocket and fetching latest client version in parallel...");
+        if self.is_mobile_primary() {
+            debug!("Connecting registered mobile transport with explicit application version");
+        } else {
+            debug!("Connecting WebSocket and fetching latest client version in parallel...");
+        }
         let (version_result, transport_result) = futures::join!(version_future, transport_future);
 
         let version_fallback = match version_result {
@@ -1509,6 +1574,12 @@ impl Client {
             // A source that hangs until the timeout is unreachable, just more
             // slowly, so it settles for the same fallback a refused one does
             // rather than failing the connect a blocked host would survive.
+            Err(_) if self.is_mobile_primary() => {
+                return Err(ConnectError::Timeout {
+                    stage: ConnectStage::VersionFetch,
+                    timeout: TRANSPORT_CONNECT_TIMEOUT,
+                });
+            }
             Err(_) => crate::version::fallback_for_unreachable_source(
                 &self.persistence_manager.get_device_snapshot(),
             )
@@ -1528,7 +1599,7 @@ impl Client {
                 timeout: TRANSPORT_CONNECT_TIMEOUT,
             })?
             .map_err(ConnectError::Transport)?;
-        debug!("Version fetch and transport connection established.");
+        debug!("Client version selected and transport connection established.");
 
         // The check in `connect` cannot stand for the whole attempt: a version
         // fetch, a transport and a handshake are awaited after it, and a
@@ -1540,18 +1611,47 @@ impl Client {
             return Err(refusal);
         }
 
-        let noise_socket = match handshake::do_handshake_with_cert_policy(
-            self.runtime.clone(),
-            &self.persistence_manager,
-            &self.ik_handshake_failures,
-            transport.clone(),
-            &mut transport_events,
-            crate::socket::noise_socket::SendObservers::with_stats(self.stats.clone())
-                .with_sent_frames(self.sent_frame_tap.clone()),
-            self.noise_cert_policy,
-        )
-        .await
-        {
+        let handshake_result = async {
+            #[cfg(feature = "mobile-core")]
+            if let Some(session) = &self.mobile_session {
+                let attempt = self
+                    .mobile_handshake_attempts
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        current.checked_add(1)
+                    })
+                    .map_err(|_| {
+                        handshake::HandshakeError::Mobile(
+                            wacore::mobile::MobileSessionError::InvalidProfile(
+                                "mobile_handshake_attempts_exhausted",
+                            ),
+                        )
+                    })?;
+                return handshake::do_mobile_handshake(
+                    self.runtime.clone(),
+                    &self.persistence_manager,
+                    transport.clone(),
+                    &mut transport_events,
+                    crate::socket::noise_socket::SendObservers::with_stats(self.stats.clone())
+                        .with_sent_frames(self.sent_frame_tap.clone()),
+                    session,
+                    attempt,
+                )
+                .await;
+            }
+            handshake::do_handshake_with_cert_policy(
+                self.runtime.clone(),
+                &self.persistence_manager,
+                &self.ik_handshake_failures,
+                transport.clone(),
+                &mut transport_events,
+                crate::socket::noise_socket::SendObservers::with_stats(self.stats.clone())
+                    .with_sent_frames(self.sent_frame_tap.clone()),
+                self.noise_cert_policy,
+            )
+            .await
+        }
+        .await;
+        let noise_socket = match handshake_result {
             Ok(socket) => socket,
             Err(e) => {
                 self.close_transport_bounded(&transport).await;
@@ -1628,6 +1728,8 @@ impl Client {
     }
 
     /// Best-effort companion deregistration followed by terminal local shutdown.
+    /// Registered mobile primaries perform local shutdown and retain credentials;
+    /// there is no companion membership for device zero to remove.
     ///
     /// The report distinguishes skipped requests, confirmed IQ responses and
     /// failures, and retains this invocation's shutdown observations. Even a
@@ -1663,7 +1765,15 @@ impl Client {
         // or reachability policy. An attempt can still fail before a frame is
         // written; only a successful IQ response confirms deregistration.
         let deregistration =
-            if !self.is_socket_connected() {
+            if self.is_mobile_primary()
+                || self
+                    .persistence_manager
+                    .get_device_snapshot()
+                    .mobile_session
+                    .is_some()
+            {
+                DeregistrationOutcome::NotAttempted(DeregistrationSkipReason::MobilePrimary)
+            } else if !self.is_socket_connected() {
                 DeregistrationOutcome::NotAttempted(DeregistrationSkipReason::Offline)
             } else {
                 match self.require_pn() {
@@ -3454,6 +3564,49 @@ mod tests {
         ));
         assert!(transport.sent().is_empty(), "offline logout must not send");
         assert_logout_shutdown(&client, &report);
+    }
+
+    #[tokio::test]
+    async fn primary_logout_closes_locally_without_unlinking_device_zero() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let pn = Jid::new("15550000001", wacore_binary::Server::Pn);
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetId(Some(pn)))
+            .await;
+        let snapshot = client.persistence_manager.get_device_snapshot();
+        let binding = wacore::store::MobileSessionBinding::new(
+            [1; 32],
+            snapshot.mobile_identity_hash(),
+            wacore::store::StoredMobilePlatform::Android,
+            vec![],
+            None,
+        )
+        .expect("synthetic primary binding");
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetMobileSessionBinding(binding))
+            .await;
+        let report = tokio::time::timeout(Duration::from_secs(5), client.logout())
+            .await
+            .expect("local primary logout must terminate");
+        assert!(matches!(
+            report.deregistration,
+            DeregistrationOutcome::NotAttempted(DeregistrationSkipReason::MobilePrimary)
+        ));
+        assert!(
+            transport.sent().is_empty(),
+            "primary logout must not unlink a companion"
+        );
+        assert_logout_shutdown(&client, &report);
+        assert!(
+            client
+                .persistence_manager
+                .get_device_snapshot()
+                .mobile_session
+                .is_some(),
+            "local shutdown must retain registered phone credentials"
+        );
     }
 
     #[tokio::test]

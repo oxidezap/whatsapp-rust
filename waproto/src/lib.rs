@@ -692,6 +692,21 @@ pub mod codec {
         whatsapp::cert_chain::noise_certificate::Details::decode_from_slice(bytes)
     }
 
+    /// Native mobile uses a flat certificate, not the Web leaf/intermediate chain.
+    #[inline(never)]
+    pub fn mobile_noise_certificate_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::NoiseCertificate, buffa::DecodeError> {
+        whatsapp::NoiseCertificate::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
+    pub fn mobile_noise_certificate_details_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::noise_certificate::Details, buffa::DecodeError> {
+        whatsapp::noise_certificate::Details::decode_from_slice(bytes)
+    }
+
     /// Business verified-name certificates (usync / business profile parsing).
     #[inline(never)]
     pub fn verified_name_certificate_decode(

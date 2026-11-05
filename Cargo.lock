@@ -2678,11 +2678,14 @@ dependencies = [
  "anyhow",
  "chrono",
  "hex",
+ "libc",
  "serde",
  "serde_json",
  "sha2 0.11.1",
  "tempfile",
  "url",
+ "wacore",
+ "zeroize",
  "zip",
 ]
 
@@ -5419,6 +5422,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "smallvec",
+ "subtle",
  "syn 3.0.9",
  "thiserror 2.0.21",
  "tokio",

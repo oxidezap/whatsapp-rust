@@ -1217,3 +1217,14 @@ mod tests {
         );
     }
 }
+
+mod apk_der;
+mod apk_manifest;
+
+mod material;
+pub use material::{MaterialRecipe, MaterialReport, extract_material};
+mod apk_signing;
+pub use apk_signing::SigningScheme;
+
+mod private_material;
+pub use private_material::{PrivateExport, export_private_material, import_private_material};

@@ -42,6 +42,8 @@ fn pending_device_save(
 /// }
 /// ```
 pub struct PersistenceManager {
+    #[cfg(feature = "mobile-core")]
+    mobile_primary_operation: Mutex<()>,
     device: Arc<RwLock<Device>>,
     /// Read-mostly snapshot, rebuilt under the device write guard in
     /// `modify_device` so it can never lag a committed mutation. Turns every
@@ -126,16 +128,23 @@ impl PersistenceManager {
 
         let device = if let Some(serializable_device) = device_data_opt {
             debug!("PersistenceManager: Loaded existing device data. Initializing Device.");
-            let mut dev = Device::new(backend.clone());
-            dev.load_from_serializable(serializable_device);
-            dev
+            Device {
+                core: serializable_device,
+                backend: backend.clone(),
+            }
         } else {
             debug!("PersistenceManager: No data yet; initializing default Device in memory.");
             Device::new(backend.clone())
         };
 
+        Ok(Self::with_device(backend, device))
+    }
+
+    fn with_device(backend: Arc<dyn Backend>, device: Device) -> Self {
         let snapshot = Arc::new(device.clone());
-        Ok(Self {
+        Self {
+            #[cfg(feature = "mobile-core")]
+            mobile_primary_operation: Mutex::new(()),
             device: Arc::new(RwLock::new(device)),
             device_snapshot: std::sync::RwLock::new(snapshot),
             backend: BackendLease::new(backend),
@@ -147,7 +156,176 @@ impl PersistenceManager {
             fail_sender_key_device_clears: AtomicBool::new(false),
             #[cfg(test)]
             fail_sender_key_device_status_writes: AtomicBool::new(false),
+        }
+    }
+
+    /// Durably initialize a dedicated mobile namespace without generating replacement keys.
+    /// Cancellation may leave the initialized namespace durable; resume it with `new`
+    /// rather than attempting to initialize the namespace again.
+    pub async fn initialize_mobile(
+        backend: Arc<dyn Backend>,
+        device: wacore::store::Device,
+    ) -> Result<Self, StoreError> {
+        device.validate_mobile_session()?;
+        backend.initialize_mobile_device(&device).await?;
+        let device = Device {
+            core: device,
+            backend: backend.clone(),
+        };
+        Ok(Self::with_device(backend, device))
+    }
+
+    /// Atomically import already registered primary credentials into a fresh namespace.
+    /// No temporary identity or intermediate pending row is persisted.
+    pub async fn initialize_registered_mobile(
+        backend: Arc<dyn Backend>,
+        keys: wacore::store::MobileDeviceKeys,
+        binding: wacore::store::MobileSessionBinding,
+        pn: wacore_binary::Jid,
+        lid: Option<wacore_binary::Jid>,
+    ) -> Result<Self, StoreError> {
+        wacore::store::validate_mobile_primary_pn(&pn)?;
+        let mut device = keys.into_device(binding.clone())?;
+        wacore::store::commands::apply_command_to_device(
+            &mut device,
+            DeviceCommand::CompleteMobileRegistration { binding, pn, lid },
+        );
+        Self::initialize_mobile(backend, device).await
+    }
+
+    /// Compare-and-update registration state under this manager's device lock, then persist it.
+    /// Like ordinary device persistence, this requires one manager/writer per namespace;
+    /// it is not a cross-process compare-and-swap.
+    /// A failed flush leaves the new checkpoint owned by this manager for retry.
+    pub async fn update_mobile_registration(
+        &self,
+        expected: wacore::store::MobileSessionBinding,
+        next: wacore::store::MobileSessionBinding,
+        identity: Option<(wacore_binary::Jid, Option<wacore_binary::Jid>)>,
+    ) -> Result<(), StoreError> {
+        expected.validate()?;
+        next.validate()?;
+        if expected.environment_hash != next.environment_hash
+            || expected.identity_hash != next.identity_hash
+            || expected.platform != next.platform
+            || expected.role != next.role
+        {
+            return Err(StoreError::Validation(
+                "mobile registration binding changed".into(),
+            ));
+        }
+        self.modify_device_async(move |device| {
+            Box::pin(async move {
+                device.core.validate_mobile_session()?;
+                if device.mobile_session.as_deref() != Some(&expected) || device.pn.is_some() {
+                    return Err(StoreError::InvalidConfig(
+                        "stale mobile registration checkpoint or registered identity".into(),
+                    ));
+                }
+                let command = if let Some((pn, lid)) = identity {
+                    wacore::store::validate_mobile_primary_pn(&pn)?;
+                    if lid.as_ref().is_some_and(|v| {
+                        v.server != wacore_binary::Server::Lid
+                            || v.agent != 0
+                            || v.integrator != 0
+                            || v.device != 0
+                            || v.user.is_empty()
+                            || !v.user.bytes().all(|c| c.is_ascii_digit())
+                    }) {
+                        return Err(StoreError::Validation("invalid mobile LID identity".into()));
+                    }
+                    DeviceCommand::CompleteMobileRegistration {
+                        binding: next,
+                        pn,
+                        lid,
+                    }
+                } else {
+                    DeviceCommand::SetMobileSessionBinding(next)
+                };
+                wacore::store::commands::apply_command_to_device(&mut device.core, command);
+                Ok(())
+            })
         })
+        .await?;
+        self.flush().await
+    }
+
+    /// Durably replace the bounded primary-operation journal using this manager's CAS lock.
+    /// One manager/writer must own the namespace, as for registration checkpoints.
+    pub async fn update_mobile_primary_state(
+        &self,
+        expected: wacore::store::MobileSessionBinding,
+        primary_state: Vec<u8>,
+    ) -> Result<(), StoreError> {
+        let mut next = expected.clone();
+        next.primary_state = Some(primary_state);
+        next.validate()?;
+        self.modify_device_async(move |device| {
+            Box::pin(async move {
+                device.core.validate_mobile_session()?;
+                if device.mobile_session.as_deref() != Some(&expected) || device.pn.is_none() {
+                    return Err(StoreError::InvalidConfig(
+                        "stale mobile primary journal or unregistered identity".into(),
+                    ));
+                }
+                wacore::store::commands::apply_command_to_device(
+                    &mut device.core,
+                    DeviceCommand::SetMobileSessionBinding(next),
+                );
+                Ok(())
+            })
+        })
+        .await?;
+        self.flush().await
+    }
+
+    /// Serialize primary app-state initialization under this namespace's manager lock.
+    /// The device itself is read only; app-state storage owns key durability.
+    pub async fn initialize_mobile_app_state_key(
+        &self,
+        key_id: Vec<u8>,
+        key: wacore::store::traits::AppStateSyncKey,
+    ) -> Result<Vec<u8>, StoreError> {
+        let device = self.device.write().await;
+        device.core.validate_mobile_session()?;
+        if device.pn.is_none() {
+            return Err(StoreError::InvalidConfig(
+                "primary app-state initialization requires registered identity".into(),
+            ));
+        }
+        let valid_key = |key: &wacore::store::traits::AppStateSyncKey| {
+            key.key_data.len() == 32
+                && waproto::codec::app_state_sync_key_fingerprint_decode(&key.fingerprint).is_ok()
+        };
+        if let Some(existing_id) = device.backend.get_latest_sync_key_id().await? {
+            let existing = device
+                .backend
+                .get_sync_key(&existing_id)
+                .await?
+                .ok_or_else(|| {
+                    StoreError::Validation("missing latest primary app-state key".into())
+                })?;
+            if existing_id.is_empty() || !valid_key(&existing) {
+                return Err(StoreError::Validation(
+                    "invalid persisted primary app-state key".into(),
+                ));
+            }
+            return Ok(existing_id);
+        }
+        if key_id.is_empty() || !valid_key(&key) {
+            return Err(StoreError::Validation(
+                "invalid initial primary app-state key".into(),
+            ));
+        }
+        device.backend.set_sync_key(&key_id, key).await?;
+        Ok(key_id)
+    }
+
+    /// Serialize primary wire operations across handles sharing this manager.
+    /// Durable journal state separately protects cancellation and restart.
+    #[cfg(feature = "mobile-core")]
+    pub async fn mobile_primary_operation_guard(&self) -> async_lock::MutexGuard<'_, ()> {
+        self.mobile_primary_operation.lock().await
     }
 
     /// Cheap point-in-time view of the device state: an Arc refcount bump,
@@ -495,6 +673,192 @@ mod tests {
     use crate::runtime_impl::TokioRuntime;
     use wacore::store::traits::DeviceStore;
     use wacore::time::Instant;
+
+    #[tokio::test]
+    async fn registered_mobile_import_is_one_durable_fresh_identity() {
+        use wacore::store::{MobileDeviceKeys, MobileSessionBinding, StoredMobilePlatform};
+        let source = wacore::store::Device::new();
+        let keys = MobileDeviceKeys {
+            registration_id: source.registration_id,
+            noise_key: source.noise_key.clone(),
+            identity_key: source.identity_key.clone(),
+            signed_pre_key: source.signed_pre_key.clone(),
+            signed_pre_key_id: source.signed_pre_key_id,
+            signed_pre_key_signature: source.signed_pre_key_signature,
+            adv_secret_key: source.adv_secret_key,
+        };
+        let binding = MobileSessionBinding::new(
+            [1; 32],
+            source.mobile_identity_hash(),
+            StoredMobilePlatform::Android,
+            vec![3],
+            None,
+        )
+        .unwrap();
+        let backend = Arc::new(wacore::store::InMemoryBackend::new());
+        let pn: wacore_binary::Jid = "15551234567@s.whatsapp.net".parse().unwrap();
+        let lid: wacore_binary::Jid = "100000000000001@lid".parse().unwrap();
+        let pm = PersistenceManager::initialize_registered_mobile(
+            backend.clone(),
+            keys.clone(),
+            binding.clone(),
+            pn.clone(),
+            Some(lid.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pm.get_device_snapshot().pn, Some(pn.clone()));
+        let stored = backend.load().await.unwrap().unwrap();
+        assert_eq!(stored.pn, Some(pn.clone()));
+        assert_eq!(stored.lid, Some(lid));
+        assert_eq!(stored.mobile_session.as_deref(), Some(&binding));
+        assert!(
+            PersistenceManager::initialize_registered_mobile(
+                backend.clone(),
+                keys.clone(),
+                binding.clone(),
+                pn.clone(),
+                None
+            )
+            .await
+            .is_err()
+        );
+        let invalid = Arc::new(wacore::store::InMemoryBackend::new());
+        let zero = "0@s.whatsapp.net".parse().unwrap();
+        assert!(
+            PersistenceManager::initialize_registered_mobile(
+                invalid.clone(),
+                keys,
+                binding,
+                zero,
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert!(!invalid.exists().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn mobile_initialization_checkpoint_cas_and_final_identity_are_durable() {
+        use wacore::store::{MobileSessionBinding, StoredMobilePlatform};
+        let backend = Arc::new(wacore::store::InMemoryBackend::new());
+        let mut device = wacore::store::Device::new();
+        let binding = MobileSessionBinding::new(
+            [1; 32],
+            device.mobile_identity_hash(),
+            StoredMobilePlatform::Android,
+            vec![9],
+            Some(vec![1]),
+        )
+        .unwrap();
+        wacore::store::commands::apply_command_to_device(
+            &mut device,
+            DeviceCommand::SetMobileSessionBinding(binding.clone()),
+        );
+        let pm = PersistenceManager::initialize_mobile(backend.clone(), device.clone())
+            .await
+            .unwrap();
+        assert!(
+            PersistenceManager::initialize_mobile(backend.clone(), device)
+                .await
+                .is_err()
+        );
+        assert!(
+            pm.update_mobile_primary_state(binding.clone(), vec![1])
+                .await
+                .is_err()
+        );
+        let mut next = binding.clone();
+        next.registration_checkpoint = Some(vec![2]);
+        pm.update_mobile_registration(binding.clone(), next.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.load().await.unwrap().unwrap().mobile_session,
+            Some(Arc::new(next.clone()))
+        );
+        assert!(
+            pm.update_mobile_registration(binding.clone(), next.clone(), None)
+                .await
+                .is_err()
+        );
+        let invalid = "120363000000000000@g.us".parse().unwrap();
+        assert!(
+            pm.update_mobile_registration(next.clone(), next.clone(), Some((invalid, None)))
+                .await
+                .is_err()
+        );
+        let pn = "15551234567@s.whatsapp.net".parse().unwrap();
+        let mut finished = next.clone();
+        finished.registration_checkpoint = None;
+        pm.update_mobile_registration(next.clone(), finished.clone(), Some((pn, None)))
+            .await
+            .unwrap();
+        let stored = backend.load().await.unwrap().unwrap();
+        assert!(stored.pn.is_some());
+        assert_eq!(stored.mobile_session, Some(Arc::new(finished.clone())));
+        pm.update_mobile_primary_state(finished.clone(), vec![7])
+            .await
+            .unwrap();
+        assert!(
+            pm.update_mobile_primary_state(finished.clone(), vec![8])
+                .await
+                .is_err()
+        );
+        let updated = backend
+            .load()
+            .await
+            .unwrap()
+            .unwrap()
+            .mobile_session
+            .unwrap();
+        assert_eq!(updated.primary_state, Some(vec![7]));
+        assert_eq!(updated.registration_context, finished.registration_context);
+        #[cfg(feature = "mobile-core")]
+        {
+            let guard = pm.mobile_primary_operation_guard().await;
+            let mut concurrent = Box::pin(pm.mobile_primary_operation_guard());
+            assert!(futures::poll!(concurrent.as_mut()).is_pending());
+            // Device persistence does not depend on the operation guard.
+            pm.flush().await.unwrap();
+            drop(guard);
+            drop(concurrent.await);
+        }
+        use wacore::store::traits::{AppStateSyncKey, AppSyncStore};
+        let mut fingerprint = waproto::whatsapp::message::AppStateSyncKeyFingerprint::default();
+        fingerprint.raw_id = Some(1);
+        fingerprint.current_index = Some(0);
+        fingerprint.device_indexes = vec![0];
+        let fingerprint = waproto::codec::app_state_sync_key_fingerprint_to_vec(&fingerprint);
+        let first = AppStateSyncKey {
+            key_data: vec![1; 32],
+            fingerprint: fingerprint.clone(),
+            timestamp: 1,
+        };
+        let second = AppStateSyncKey {
+            key_data: vec![2; 32],
+            fingerprint,
+            timestamp: 2,
+        };
+        let (left, right) = futures::join!(
+            pm.initialize_mobile_app_state_key(vec![1; 6], first),
+            pm.initialize_mobile_app_state_key(vec![2; 6], second)
+        );
+        assert_eq!(left.unwrap(), right.unwrap());
+        let present = usize::from(backend.get_sync_key(&[1; 6]).await.unwrap().is_some())
+            + usize::from(backend.get_sync_key(&[2; 6]).await.unwrap().is_some());
+        assert_eq!(
+            present, 1,
+            "concurrent initializers must preserve one usable key"
+        );
+
+        assert!(
+            pm.update_mobile_registration(next.clone(), next, None)
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn panicking_modifiers_publish_and_persist_partial_changes() {

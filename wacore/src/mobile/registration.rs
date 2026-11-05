@@ -8,6 +8,11 @@ use thiserror::Error;
 pub struct RegistrationIdentity([u8; 32]);
 
 impl RegistrationIdentity {
+    /// Public-key identity digest for binding host persistence, not private key material.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
     pub fn from_public_keys(identity_key: &[u8; 32], noise_key: &[u8; 32]) -> Self {
         let mut hash = Sha256::new();
         hash.update(b"whatsapp-rust/mobile-registration-identity/v1");
@@ -223,8 +228,11 @@ impl RegistrationWorkflow {
             || checkpoint.policy.request_timeout_ms == 0
             || checkpoint.attempts > checkpoint.policy.max_attempts
             || checkpoint.attempts == 0
-                && (!matches!(checkpoint.stage, RegistrationStage::Ready)
-                    || checkpoint.retry_not_before_ms != 0)
+                && (!matches!(
+                    checkpoint.stage,
+                    RegistrationStage::Ready | RegistrationStage::AwaitingCode
+                ) || checkpoint.retry_not_before_ms != 0)
+            || checkpoint.attempts == 0 && checkpoint.retry_stage != checkpoint.stage
             || matches!(checkpoint.stage, RegistrationStage::InFlight { deadline_ms, .. } if deadline_ms <= checkpoint.last_time_ms)
             || !matches!(
                 checkpoint.retry_stage,
@@ -267,6 +275,43 @@ impl RegistrationWorkflow {
 
     pub fn stage(&self) -> RegistrationStage {
         self.checkpoint.stage
+    }
+
+    /// Accept the caller's explicit declaration that a code was requested elsewhere.
+    /// This sends no request and does not consume an HTTP attempt or prove delivery.
+    pub fn await_external_code(&mut self, now_ms: u64) -> Result<(), RegistrationError> {
+        self.check_time(now_ms)?;
+        if self.checkpoint.stage != RegistrationStage::Ready {
+            return Err(RegistrationError::InvalidTransition);
+        }
+        if now_ms < self.checkpoint.retry_not_before_ms {
+            return Err(RegistrationError::Cooldown);
+        }
+        self.checkpoint.stage = RegistrationStage::AwaitingCode;
+        self.checkpoint.retry_stage = RegistrationStage::AwaitingCode;
+        self.checkpoint.retry_not_before_ms = 0;
+        self.checkpoint.last_time_ms = now_ms;
+        Ok(())
+    }
+
+    /// Abandon a reserved attempt only when the host guarantees HTTP dispatch never began.
+    /// The attempt budget remains consumed. Uncertain deliveries cannot use this escape.
+    pub fn abandon_unsent(
+        &mut self,
+        expected: AttemptToken,
+        now_ms: u64,
+    ) -> Result<(), RegistrationError> {
+        self.check_time(now_ms)?;
+        let RegistrationStage::InFlight { token, .. } = self.checkpoint.stage else {
+            return Err(RegistrationError::InvalidTransition);
+        };
+        if token != expected {
+            return Err(RegistrationError::StaleCompletion);
+        }
+        self.checkpoint.stage = self.checkpoint.retry_stage;
+        self.checkpoint.retry_not_before_ms = 0;
+        self.checkpoint.last_time_ms = now_ms;
+        Ok(())
     }
 
     /// Reserve an attempt before the host persists this checkpoint and sends it.
@@ -466,6 +511,71 @@ mod tests {
             RegistrationRunId::from_bytes([7; 32]),
             RegistrationPolicy::new(max, 100).unwrap(),
         )
+    }
+
+    #[test]
+    fn externally_requested_code_resumes_without_spending_http_attempt() {
+        let mut flow = workflow(1);
+        flow.await_external_code(10).unwrap();
+        assert_eq!(flow.checkpoint().attempts, 0);
+        let checkpoint = flow.checkpoint();
+        let mut restored = RegistrationWorkflow::restore(
+            checkpoint.clone(),
+            checkpoint.environment,
+            checkpoint.identity,
+        )
+        .unwrap();
+        assert_eq!(restored.stage(), RegistrationStage::AwaitingCode);
+        let token = restored
+            .begin(RegistrationOperation::SubmitCode, 11)
+            .unwrap();
+        restored
+            .complete(token, RegistrationOutcome::Verified, 12)
+            .unwrap();
+        assert_eq!(restored.stage(), RegistrationStage::Verified);
+    }
+
+    #[test]
+    fn known_unsent_reservations_can_retry_without_refunding_budget() {
+        let mut flow = workflow(2);
+        let first = flow.begin(RegistrationOperation::RequestCode, 10).unwrap();
+        flow.abandon_unsent(first, 11).unwrap();
+        assert_eq!(flow.stage(), RegistrationStage::Ready);
+        assert_eq!(flow.checkpoint().attempts, 1);
+        let second = flow.begin(RegistrationOperation::RequestCode, 12).unwrap();
+        let before = flow.checkpoint();
+        assert_eq!(
+            flow.abandon_unsent(first, 13),
+            Err(RegistrationError::StaleCompletion)
+        );
+        assert_eq!(flow.checkpoint(), before);
+        flow.delivery_uncertain(second).unwrap();
+        let uncertain = flow.checkpoint();
+        assert_eq!(
+            flow.abandon_unsent(second, 14),
+            Err(RegistrationError::InvalidTransition)
+        );
+        assert_eq!(flow.checkpoint(), uncertain);
+    }
+
+    #[test]
+    fn external_code_declaration_cannot_erase_cooldown_or_inflight_state() {
+        let mut flow = workflow(3);
+        let token = flow.begin(RegistrationOperation::CheckAccount, 10).unwrap();
+        let before = flow.checkpoint();
+        assert_eq!(
+            flow.await_external_code(11),
+            Err(RegistrationError::InvalidTransition)
+        );
+        assert_eq!(flow.checkpoint(), before);
+        flow.complete(token, RegistrationOutcome::RetryAfter { delay_ms: 10 }, 12)
+            .unwrap();
+        assert_eq!(
+            flow.await_external_code(21),
+            Err(RegistrationError::Cooldown)
+        );
+        flow.await_external_code(22).unwrap();
+        assert_eq!(flow.stage(), RegistrationStage::AwaitingCode);
     }
 
     fn foreign_workflows(checkpoint: &RegistrationCheckpoint) -> [RegistrationWorkflow; 3] {

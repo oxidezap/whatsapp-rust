@@ -487,9 +487,11 @@ impl Client {
             marker = marker.attr("mediatype", media);
         }
         children.push(marker.build());
-        if let Some(identity) =
-            wacore::send::needs_device_identity(prekey, snapshot.account.as_deref())?
-        {
+        if let Some(identity) = wacore::send::needs_device_identity_for_role(
+            prekey,
+            snapshot.account.as_deref(),
+            self.sending_identity_role(),
+        )? {
             children.push(
                 wacore_binary::builder::NodeBuilder::new("device-identity")
                     .bytes(identity)

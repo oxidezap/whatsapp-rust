@@ -21,6 +21,9 @@ pub const IK_FAILURE_THRESHOLD: u32 = 1;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum HandshakeError {
+    #[cfg(feature = "mobile")]
+    #[error("Mobile handshake error: {0}")]
+    Mobile(#[from] crate::mobile::MobileSessionError),
     #[error("Transport error: {0}")]
     Transport(#[from] anyhow::Error),
     #[error("Core handshake error: {0}")]
@@ -45,6 +48,8 @@ impl HandshakeError {
     pub fn is_timeout(&self) -> bool {
         match self {
             HandshakeError::Timeout => true,
+            #[cfg(feature = "mobile")]
+            HandshakeError::Mobile(_) => false,
             HandshakeError::Transport(_)
             | HandshakeError::Core(_)
             | HandshakeError::StreamClosed

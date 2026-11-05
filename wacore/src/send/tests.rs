@@ -444,6 +444,7 @@ struct ChainLockProbe {
 
 /// Mock implementation of SendContextResolver for testing
 struct MockSendContextResolver {
+    sender_role: SenderIdentityRole,
     /// Pre-key bundles to return: JID -> Option<PreKeyBundle>
     prekey_bundles: HashMap<Jid, Option<PreKeyBundle>>,
     /// Devices to return from resolve_devices
@@ -465,6 +466,7 @@ struct MockSendContextResolver {
 impl MockSendContextResolver {
     fn new() -> Self {
         Self {
+            sender_role: SenderIdentityRole::Companion,
             prekey_bundles: HashMap::new(),
             devices: Vec::new(),
             phone_to_lid: HashMap::new(),
@@ -525,6 +527,9 @@ impl MockSendContextResolver {
 
 #[async_trait::async_trait]
 impl SendContextResolver for MockSendContextResolver {
+    fn sender_identity_role(&self) -> SenderIdentityRole {
+        self.sender_role
+    }
     async fn lock_device_sessions(&self, _: &[Jid]) -> crate::client::context::SessionLockGuard {
         // This fixture runs pairwise session operations sequentially.
         crate::client::context::SessionLockGuard::none()
@@ -2577,6 +2582,89 @@ mod group_retry {
     }
 
     #[tokio::test]
+    async fn peer_primary_pkmsg_profiles_and_unknown_role() {
+        for (role, account_present, identity_expected) in [
+            (
+                SenderIdentityRole::MobilePrimary(PrimaryDeviceIdentityPolicy::Omit),
+                false,
+                false,
+            ),
+            (
+                SenderIdentityRole::MobilePrimary(PrimaryDeviceIdentityPolicy::Omit),
+                true,
+                false,
+            ),
+            (
+                SenderIdentityRole::MobilePrimary(PrimaryDeviceIdentityPolicy::AttachWhenAvailable),
+                true,
+                true,
+            ),
+            (SenderIdentityRole::Companion, true, true),
+        ] {
+            let (mut sessions, mut identities, jid) = setup_session().await;
+            let address = jid.to_protocol_address();
+            let account = pkmsg_account_proto();
+            let node = prepare_peer_stanza_for_role(
+                &mut sessions,
+                &mut identities,
+                jid,
+                &address,
+                &wa::Message::default(),
+                "primary-peer",
+                account_present.then_some(&account),
+                role,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                node.get_optional_child("enc")
+                    .unwrap()
+                    .attrs()
+                    .optional_string("type")
+                    .as_deref(),
+                Some("pkmsg")
+            );
+            assert_eq!(
+                node.get_optional_child("device-identity").is_some(),
+                identity_expected
+            );
+        }
+        let (mut sessions, mut identities, jid) = setup_session().await;
+        let address = jid.to_protocol_address();
+        let before = sessions
+            .load_session(&address)
+            .await
+            .unwrap()
+            .unwrap()
+            .serialize()
+            .unwrap();
+        assert!(
+            prepare_peer_stanza_for_role(
+                &mut sessions,
+                &mut identities,
+                jid,
+                &address,
+                &wa::Message::default(),
+                "unknown-peer",
+                None,
+                SenderIdentityRole::Unknown
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            before,
+            sessions
+                .load_session(&address)
+                .await
+                .unwrap()
+                .unwrap()
+                .serialize()
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn peer_pkmsg_includes_meta_and_device_identity() {
         let account = pkmsg_account_proto();
         let n = build_peer_stanza(Some(&account)).await;
@@ -4078,6 +4166,88 @@ mod mark_full_distribution_list {
             .unwrap();
         }
         (ss, is)
+    }
+
+    #[tokio::test]
+    async fn primary_group_pkmsg_omits_identity_for_explicit_profile() {
+        for role in [
+            SenderIdentityRole::MobilePrimary(PrimaryDeviceIdentityPolicy::Omit),
+            SenderIdentityRole::Companion,
+            SenderIdentityRole::Unknown,
+        ] {
+            let status = Jid::status_broadcast();
+            let own_pn: Jid = "12025550120@s.whatsapp.net".parse().unwrap();
+            let own_lid: Jid = "100000000000000@lid".parse().unwrap();
+            let requester: Jid = "100000000000001:11@lid".parse().unwrap();
+            let (mut sessions, mut identities) = established_stores(&requester).await;
+            let mut sender_keys = MemSenderKeyStore::default();
+            let mut prekeys = UnusedPreKeyStore;
+            let signed_prekeys = UnusedSignedPreKeyStore;
+            let mut stores = SignalStores {
+                sender_key_store: &mut sender_keys,
+                session_store: &mut sessions,
+                identity_store: &mut identities,
+                prekey_store: &mut prekeys,
+                signed_prekey_store: &signed_prekeys,
+            };
+            let group = GroupRoutingInfo::new(Vec::new(), AddressingMode::Lid);
+            let message = {
+                let mut proto = wa::Message::default();
+                proto.conversation = Some("status retry".into());
+                proto
+            };
+            let account = wa::ADVSignedDeviceIdentity::default();
+            let extension = NodeBuilder::new("custom-extension")
+                .attr("version", "1")
+                .build();
+
+            let mut resolver = MockSendContextResolver::new();
+            resolver.sender_role = role;
+            let outcome = prepare_group_stanza(
+                &TokioTestRuntime,
+                &mut stores,
+                &resolver,
+                GroupStanzaRequest {
+                    group: &group,
+                    own_jid: &own_pn,
+                    own_lid: &own_lid,
+                    account: Some(&account),
+                    to: &status,
+                    message: &message,
+                    message_id: "STATUS-RETRY-1",
+                    force_distribution: false,
+                    distribution_targets: Some(vec![requester.clone()]),
+                    distribution_policy: SenderKeyDistributionPolicy::Required,
+                    phash_devices: None,
+                    edit: None,
+                    extra_nodes: std::slice::from_ref(&extension),
+                    pre_encoded: None,
+                },
+            )
+            .await;
+            if role == SenderIdentityRole::Unknown {
+                assert!(outcome.is_err());
+                continue;
+            }
+            let prepared = outcome.unwrap();
+
+            assert_eq!(
+                prepared
+                    .node
+                    .get_optional_child("device-identity")
+                    .is_some(),
+                role == SenderIdentityRole::Companion
+            );
+            let participants = prepared.node.get_optional_child("participants").unwrap();
+            assert!(participants.children().unwrap().iter().any(|p| {
+                p.get_optional_child("enc")
+                    .unwrap()
+                    .attrs()
+                    .optional_string("type")
+                    .as_deref()
+                    == Some("pkmsg")
+            }));
+        }
     }
 
     #[tokio::test]
@@ -6200,6 +6370,94 @@ mod local_identity_change_on_send {
         /// End to end through `prepare_dm_stanza`: recipient devices and own
         /// companion devices are two separate fan-outs but one participant
         /// list, recipients first.
+        #[tokio::test]
+        async fn primary_dm_pkmsg_omits_even_supplied_identity() {
+            for role in [
+                SenderIdentityRole::MobilePrimary(PrimaryDeviceIdentityPolicy::Omit),
+                SenderIdentityRole::Companion,
+                SenderIdentityRole::Unknown,
+            ] {
+                let own_jid: Jid = "5511900000010:0@s.whatsapp.net".parse().unwrap();
+                let recipient_a: Jid = "5511900000011:0@s.whatsapp.net".parse().unwrap();
+                let recipient_b: Jid = "5511900000011:1@s.whatsapp.net".parse().unwrap();
+                let own_companion: Jid = "5511900000010:2@s.whatsapp.net".parse().unwrap();
+                let all = vec![
+                    recipient_a.clone(),
+                    recipient_b.clone(),
+                    own_companion.clone(),
+                    own_jid.clone(),
+                ];
+
+                let (mut session_store, mut identity_store) = stores_with_sessions(&[
+                    recipient_a.clone(),
+                    recipient_b.clone(),
+                    own_companion.clone(),
+                ])
+                .await;
+                let mut prekey_store = UnusedPreKeyStore;
+                let signed_prekey_store = UnusedSignedPreKeyStore;
+                let mut sender_key_store = MemSenderKeyStore::default();
+                let mut stores = raw_fanout_stores(
+                    &mut sender_key_store,
+                    &mut session_store,
+                    &mut identity_store,
+                    &mut prekey_store,
+                    &signed_prekey_store,
+                );
+                let mut resolver = MockSendContextResolver::new();
+                resolver.sender_role = role;
+                let account = wa::ADVSignedDeviceIdentity::default();
+                let devices = ResolvedDmDevices::new(all, &own_jid, None);
+                let to = recipient_a.to_non_ad();
+                let message = {
+                    let mut proto = wa::Message::default();
+                    proto.conversation = Some("hi".into());
+                    proto
+                };
+
+                let outcome = prepare_dm_stanza(
+                    &TokioTestRuntime,
+                    &mut stores,
+                    &resolver,
+                    DmStanzaRequest {
+                        own_jid: &own_jid,
+                        own_lid: None,
+                        account: Some(&account),
+                        to: &to,
+                        message: &message,
+                        message_id: "DM_SINK_1",
+                        edit: None,
+                        extra_nodes: &[],
+                        devices: &devices,
+                        pre_encoded: None,
+                    },
+                )
+                .await;
+                if role == SenderIdentityRole::Unknown {
+                    assert!(outcome.is_err());
+                    continue;
+                }
+                let prepared = outcome.expect("dm stanza");
+
+                assert_eq!(
+                    prepared
+                        .node
+                        .get_optional_child("device-identity")
+                        .is_some(),
+                    role == SenderIdentityRole::Companion
+                );
+                let participants = prepared.node.get_optional_child("participants").unwrap();
+                assert!(participants.children().unwrap().iter().any(|p| {
+                    p.get_optional_child("enc")
+                        .unwrap()
+                        .attrs()
+                        .optional_string("type")
+                        .as_deref()
+                        == Some("pkmsg")
+                }));
+            }
+        }
+
         #[tokio::test]
         async fn a_dm_stanza_carries_both_halves_in_one_participants_node() {
             let own_jid: Jid = "5511900000010:0@s.whatsapp.net".parse().unwrap();
