@@ -88,12 +88,6 @@ proptest! {
         let decoded = unmarshal_packed_ref(&bytes)
             .expect("decoding our own encoder output must succeed")
             .to_owned();
-        #[cfg(feature = "bench-internals")]
-        for two_pass in [false, true] {
-            let pooled = wacore_binary::bench_internals::decode(&bytes[1..], 32, two_pass)
-                .expect("pooled decoder must accept the production encoder output");
-            prop_assert_eq!(pooled.to_owned(), decoded.clone());
-        }
         prop_assert_eq!(decoded, node);
     }
 }

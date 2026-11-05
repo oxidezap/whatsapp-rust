@@ -854,7 +854,7 @@ impl<'a> NodeRef<'a> {
 use yoke::Yoke;
 
 #[derive(Clone)]
-pub(crate) struct BytesCart(pub(crate) Bytes);
+struct BytesCart(Bytes);
 
 impl std::ops::Deref for BytesCart {
     type Target = [u8];

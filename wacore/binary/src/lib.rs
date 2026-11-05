@@ -13,11 +13,6 @@ pub mod token;
 pub mod util;
 pub mod zlib_pool;
 
-#[cfg(feature = "bench-internals")]
-#[doc(hidden)]
-#[path = "../benches/decoder_pool/mod.rs"]
-pub mod bench_internals;
-
 pub use attrs::{AttrParser, AttrParserRef};
 pub use compact_str::CompactString;
 pub use decoder::OpenContent;
