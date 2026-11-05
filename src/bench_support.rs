@@ -829,6 +829,34 @@ pub struct ReceiveHarness {
 }
 
 impl ReceiveHarness {
+    /// Reset retry bookkeeping outside measurement. No receive worker is
+    /// polled by these futures; the caller can drive the portable cache work
+    /// directly without billing Tokio's background tasks to the operation.
+    pub async fn prepare_retry_counts(&self, keys: &[String], count: u8) {
+        for key in keys {
+            self.client.message_retry_counts.invalidate(key).await;
+            if count != 0 {
+                self.client.preseed_retry_count(key, count).await;
+            }
+        }
+    }
+
+    /// Exercise the actual retry-count consumer, including its saturation
+    /// decision, without sending a retry receipt or doing a decrypt.
+    pub async fn increment_retry_counts(&self, keys: &[String]) -> usize {
+        let mut sum = 0usize;
+        for key in keys {
+            if let Some(count) = self
+                .client
+                .increment_retry_count(key, wacore::protocol::retry::RetryReason::BadMac)
+                .await
+            {
+                sum += usize::from(count);
+            }
+        }
+        sum
+    }
+
     /// Build the receiving client and its peer, drive both to the steady state
     /// (acknowledged pairwise session, peer's sender key installed), and
     /// subscribe one message consumer.

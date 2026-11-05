@@ -185,6 +185,26 @@ fn cache_insert(bencher: divan::Bencher, n: usize) {
 /// measures one iteration, which is always the first batch.
 type DetState = std::hash::BuildHasherDefault<std::hash::DefaultHasher>;
 
+/// The production retry-count consumer on its real managed cache. A zero
+/// seed means a miss, three means an incrementing hit, and five is saturated.
+/// Resetting keys and seeding counts happen before the measured region;
+/// driving the future directly keeps unrelated runtime tasks out of it.
+#[divan::bench(args = [0u8, 3, 5])]
+fn client_retry_count(bencher: divan::Bencher, initial: u8) {
+    use whatsapp_rust::bench_support::ReceiveHarness;
+
+    const RETRIES: usize = 128;
+    static RETRY_CLIENT: OnceLock<ReceiveHarness> = OnceLock::new();
+    let client = RETRY_CLIENT.get_or_init(ReceiveHarness::new);
+    let keys: Vec<String> = (0..RETRIES)
+        .map(|i| format!("1555000{i:04}@s.whatsapp.net:RETRY{i:04}:15551110000@s.whatsapp.net"))
+        .collect();
+    bencher
+        .counter(ItemsCount::new(RETRIES))
+        .with_inputs(|| block_on(client.prepare_retry_counts(&keys, initial)))
+        .bench_refs(|_| black_box(block_on(client.increment_retry_counts(&keys))));
+}
+
 /// Isolate the atomic retry/PDO update's table work. These are cache
 /// microbenchmarks, not complete retry or PDO consumers. Fixed seeds make
 /// probe/load distributions comparable without changing production hashers.

@@ -2304,34 +2304,98 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_with_by_ref_serializes_read_modify_write() {
-        let cache = Arc::new(build_cache::<String, u32>());
-        let mut tasks = Vec::new();
-        for _ in 0..32 {
-            let cache = Arc::clone(&cache);
-            tasks.push(tokio::spawn(async move {
-                cache
-                    .upsert_with_by_ref("counter", |current| {
-                        let next = current.copied().unwrap_or_default() + 1;
-                        (Some(next), next)
-                    })
-                    .await
-            }));
+        let caches: [PortableCache<String, u32>; 2] =
+            [PortableCache::builder().build(), build_cache()];
+        for cache in caches {
+            let cache = Arc::new(cache);
+            let mut tasks = Vec::new();
+            for _ in 0..32 {
+                let cache = Arc::clone(&cache);
+                tasks.push(tokio::spawn(async move {
+                    cache
+                        .upsert_with_by_ref("counter", |current| {
+                            let next = current.copied().unwrap_or_default() + 1;
+                            (Some(next), next)
+                        })
+                        .await
+                }));
+            }
+
+            let mut results = Vec::with_capacity(tasks.len());
+            for task in tasks {
+                results.push(task.await.unwrap());
+            }
+            results.sort_unstable();
+
+            assert_eq!(results, (1..=32).collect::<Vec<_>>());
+            assert_eq!(cache.get("counter").await, Some(32));
+
+            let unchanged = cache
+                .upsert_with_by_ref("counter", |current| (None, current.copied()))
+                .await;
+            assert_eq!(unchanged, Some(32));
+            assert_eq!(cache.get("counter").await, Some(32));
         }
+    }
 
-        let mut results = Vec::with_capacity(tasks.len());
-        for task in tasks {
-            results.push(task.await.unwrap());
-        }
-        results.sort_unstable();
-
-        assert_eq!(results, (1..=32).collect::<Vec<_>>());
-        assert_eq!(cache.get("counter").await, Some(32));
-
-        let unchanged = cache
-            .upsert_with_by_ref("counter", |current| (None, current.copied()))
+    #[tokio::test]
+    async fn upsert_without_replacement_preserves_live_metadata() {
+        let cache = PortableCache::builder()
+            .max_capacity(2)
+            .time_to_live(Duration::from_secs(3600))
+            .time_to_idle(Duration::from_secs(3600))
+            .build();
+        cache.insert("key".to_owned(), 7).await;
+        let stamps = cache.debug_stamps("key").await;
+        let seq = cache.debug_seq("key").await;
+        let result = cache
+            .upsert_with_by_ref("key", |current| {
+                assert_eq!(current, Some(&7));
+                (None, 123)
+            })
             .await;
-        assert_eq!(unchanged, Some(32));
-        assert_eq!(cache.get("counter").await, Some(32));
+        assert_eq!(result, 123);
+        assert_eq!(cache.debug_stamps("key").await, stamps);
+        assert_eq!(cache.debug_seq("key").await, seq);
+        let guard = cache.inner.read().await;
+        let Storage::Managed(inner) = &*guard else {
+            panic!("time-bounded cache must be managed");
+        };
+        let entry = inner.get("key").unwrap();
+        assert_eq!(entry.value, 7);
+        assert!(!entry.referenced.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn upsert_without_replacement_removes_expired_entries() {
+        for idle in [false, true] {
+            let builder = PortableCache::builder().max_capacity(2);
+            let cache = if idle {
+                builder.time_to_idle(Duration::ZERO).build()
+            } else {
+                builder.time_to_live(Duration::ZERO).build()
+            };
+            cache.insert("expired".to_owned(), 7).await;
+            assert_eq!(cache.entry_count(), 1);
+            let result = cache
+                .upsert_with_by_ref("expired", |current| {
+                    assert_eq!(current, None);
+                    (None, 123)
+                })
+                .await;
+            assert_eq!(result, 123);
+            assert_eq!(cache.entry_count(), 0);
+            assert_eq!(cache.debug_order_len().await, 0);
+        }
+        let disabled: PortableCache<String, u32> = PortableCache::builder().max_capacity(0).build();
+        let result = disabled
+            .upsert_with_by_ref("absent", |current| {
+                assert_eq!(current, None);
+                (Some(7), 123)
+            })
+            .await;
+        assert_eq!(result, 123);
+        assert_eq!(disabled.entry_count(), 0);
     }
 
     #[tokio::test]
@@ -3716,6 +3780,32 @@ mod tests {
     impl Hash for CollidingKey {
         fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
             state.write_u64(0);
+        }
+    }
+
+    #[tokio::test]
+    async fn upsert_uses_equality_for_colliding_keys() {
+        for cache in [
+            PortableCache::builder().build(),
+            PortableCache::builder().max_capacity(16).build(),
+        ] {
+            let (a, b) = (CollidingKey("a"), CollidingKey("b"));
+            cache.insert(a.clone(), 7u32).await;
+            cache
+                .upsert_with_by_ref(&b, |current| {
+                    assert_eq!(current, None);
+                    (Some(9), ())
+                })
+                .await;
+            cache
+                .upsert_with_by_ref(&a, |current| {
+                    assert_eq!(current, Some(&7));
+                    (Some(11), ())
+                })
+                .await;
+            assert_eq!(cache.get(&a).await, Some(11));
+            assert_eq!(cache.get(&b).await, Some(9));
+            assert_eq!(cache.entry_count(), 2);
         }
     }
 
