@@ -105,6 +105,37 @@ mod tests {
 
     #[cfg(feature = "mobile-transport-native")]
     #[test]
+    fn portable_hosts_are_accepted_consistently_by_the_native_adapter() {
+        use whatsapp_rust::transport::TokioTcpTransportFactory;
+        for (host, valid) in [
+            ("barback", true),
+            ("bartender_mobile", true),
+            ("fixture.test.", true),
+            ("127.0.0.1", true),
+            ("[::1]", true),
+            ("[2001:db8::1]", true),
+            ("[v1.fixture]", false),
+            ("fixture%2etest", false),
+            ("fixture!name", false),
+            ("fixture+name", false),
+            ("fixture@name", false),
+            ("host/path", false),
+        ] {
+            assert_eq!(
+                TcpEndpoint::new(host, 443).is_ok(),
+                valid,
+                "portable host: {host}"
+            );
+            assert_eq!(
+                TokioTcpTransportFactory::new(host, 443).is_ok(),
+                valid,
+                "native host: {host}"
+            );
+        }
+    }
+
+    #[cfg(feature = "mobile-transport-native")]
+    #[test]
     fn native_adapter_is_optional_and_does_not_dial_on_construction() {
         let environment = mock_environment(4443).expect("synthetic environment");
         let _factory = native_transport(&environment).expect("construct optional adapter");

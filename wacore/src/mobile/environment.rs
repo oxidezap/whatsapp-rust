@@ -1,4 +1,4 @@
-use fluent_uri::Uri;
+use fluent_uri::{Uri, component::Host};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -41,7 +41,7 @@ impl RegistrationEndpoint {
         let scheme = parsed.scheme().as_str();
         if !(scheme.eq_ignore_ascii_case("https")
             || allow_http && scheme.eq_ignore_ascii_case("http"))
-            || authority.host().is_empty()
+            || !portable_host(authority.host_parsed())
             || authority.userinfo().is_some()
             || authority.port().is_some_and(|port| port.is_empty())
             || authority.port_to_u16().map_err(|_| invalid)? == Some(0)
@@ -82,7 +82,7 @@ impl TcpEndpoint {
         let authority_text = format!("tcp://{host}");
         let uri = Uri::parse(authority_text.as_str()).map_err(|_| invalid)?;
         let authority = uri.authority().ok_or(invalid)?;
-        if authority.host().is_empty() || authority.port().is_some() {
+        if !portable_host(authority.host_parsed()) || authority.port().is_some() {
             return Err(invalid);
         }
         Ok(Self { host, port })
@@ -95,6 +95,24 @@ impl TcpEndpoint {
 
     pub fn port(&self) -> u16 {
         self.port
+    }
+}
+
+// RFC URI reg-names also permit percent escapes and sub-delimiters, and
+// IPvFuture has no portable socket address interpretation. Exclude URI-only
+// syntax before passing the host to HTTP, DNS or external host adapters.
+// Resolution and DNS label policy remain the adapter's responsibility.
+fn portable_host(host: Host<'_>) -> bool {
+    match host {
+        Host::RegName(name) => {
+            !name.is_empty()
+                && name
+                    .as_str()
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        }
+        Host::IpvFuture { .. } => false,
+        Host::Ipv4 { .. } | Host::Ipv6 { .. } => true,
     }
 }
 
@@ -284,6 +302,30 @@ mod tests {
         }
         assert!(RegistrationEndpoint::new("https://registration.test/v2").is_ok());
         assert!(RegistrationEndpoint::for_test_http("http://barback:8080/v2").is_ok());
+    }
+
+    #[test]
+    fn rejects_uri_only_host_syntax_before_adapter_selection() {
+        for host in ["[v1.fixture]", "fixture%2etest", "fixture!name"] {
+            assert!(TcpEndpoint::new(host, 443).is_err(), "TCP host: {host}");
+            assert!(
+                RegistrationEndpoint::new(format!("https://{host}/v2")).is_err(),
+                "HTTP host: {host}"
+            );
+        }
+        for host in [
+            "barback",
+            "bartender_mobile",
+            "fixture.test.",
+            "127.0.0.1",
+            "[::1]",
+        ] {
+            assert!(TcpEndpoint::new(host, 443).is_ok(), "TCP host: {host}");
+            assert!(
+                RegistrationEndpoint::new(format!("https://{host}/v2")).is_ok(),
+                "HTTP host: {host}"
+            );
+        }
     }
 
     #[test]

@@ -3,13 +3,13 @@
 //! Framing and Noise remain in the existing protocol layer. This adapter neither
 //! adds TLS nor performs an HTTP upgrade, even when the selected port is 443.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, MutexGuard, watch};
 use wacore::net::{DisconnectReason, Transport, TransportEvent, TransportFactory};
 
 use crate::StreamDialer;
@@ -46,7 +46,10 @@ impl TokioTcpTransportFactory {
             || host.chars().any(|c| {
                 c.is_whitespace() || c.is_control() || matches!(c, '/' | '\\' | '@' | '?' | '#')
             })
-            || (host.contains(':') && host.parse::<std::net::Ipv6Addr>().is_err())
+            || (!host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+                && host.parse::<std::net::Ipv6Addr>().is_err())
             || port == 0
         {
             bail!("TCP destination requires a host without URL syntax and a nonzero port");
@@ -87,21 +90,42 @@ struct ByteStreamTransport<W> {
 
 impl<W> Drop for ByteStreamTransport<W> {
     fn drop(&mut self) {
-        let _ = self.shutdown.send(true);
+        self.shutdown.send_replace(true);
     }
 }
 
 // A cancelled write may have sent a prefix. Retire the entire connection so a
 // subsequent caller cannot append bytes to that incomplete encrypted frame.
-struct WriteRetirement<'a> {
+struct WriteRetirement<'a, W> {
+    writer: MutexGuard<'a, Option<W>>,
     shutdown: &'a watch::Sender<bool>,
     armed: bool,
 }
 
-impl Drop for WriteRetirement<'_> {
+impl<W> Drop for WriteRetirement<'_, W> {
     fn drop(&mut self) {
-        if self.armed {
-            let _ = self.shutdown.send(true);
+        if self.armed || *self.shutdown.borrow() {
+            self.shutdown.send_replace(true);
+            self.writer.take();
+        }
+    }
+}
+
+// Construct outside the spawned future so even cancellation before its first
+// poll retires the stream. A contended writer closes through WriteRetirement
+// when its shutdown-aware operation is cancelled or completes.
+struct DriverRetirement<W> {
+    transport: Weak<ByteStreamTransport<W>>,
+    shutdown: watch::Sender<bool>,
+}
+
+impl<W> Drop for DriverRetirement<W> {
+    fn drop(&mut self) {
+        self.shutdown.send_replace(true);
+        if let Some(transport) = self.transport.upgrade()
+            && let Ok(mut writer) = transport.writer.try_lock()
+        {
+            writer.take();
         }
     }
 }
@@ -110,19 +134,26 @@ impl Drop for WriteRetirement<'_> {
 impl<W: AsyncWrite + Unpin + Send> Transport for ByteStreamTransport<W> {
     async fn send(&self, data: Bytes) -> anyhow::Result<()> {
         let mut shutdown = self.shutdown.subscribe();
-        let mut guard = tokio::select! {
+        if *shutdown.borrow() {
+            bail!("TCP transport is closed");
+        }
+        let guard = tokio::select! {
             biased;
             _ = shutdown.changed() => bail!("TCP transport is closed"),
             guard = self.writer.lock() => guard,
         };
-        if *shutdown.borrow() {
-            bail!("TCP transport is closed");
-        }
-        let writer = guard.as_mut().context("TCP transport is closed")?;
         let mut retirement = WriteRetirement {
+            writer: guard,
             shutdown: &self.shutdown,
             armed: true,
         };
+        if *shutdown.borrow() {
+            bail!("TCP transport is closed");
+        }
+        let writer = retirement
+            .writer
+            .as_mut()
+            .context("TCP transport is closed")?;
         tokio::select! {
             biased;
             _ = shutdown.changed() => bail!("TCP transport closed during write"),
@@ -138,7 +169,7 @@ impl<W: AsyncWrite + Unpin + Send> Transport for ByteStreamTransport<W> {
     }
 
     async fn disconnect(&self) {
-        let _ = self.shutdown.send(true);
+        self.shutdown.send_replace(true);
         // Closing the write half, rather than waiting for a peer-driven shutdown,
         // also releases pending writers when the peer stops reading.
         self.writer.lock().await.take();
@@ -161,7 +192,8 @@ fn handoff_read(buffer: &mut BytesMut) -> Bytes {
 ///
 /// Reads are bounded and delivered through a bounded event queue. Disconnect,
 /// dropped transport ownership and a dropped receiver release the read task,
-/// including while that queue is full. The existing Noise layer validates trust.
+/// including while that queue is full. Stopping the Tokio runtime retires the
+/// transport even if its read task never ran. The existing Noise layer validates trust.
 pub fn from_byte_stream<S>(
     stream: S,
 ) -> (Arc<dyn Transport>, async_channel::Receiver<TransportEvent>)
@@ -175,8 +207,10 @@ where
         writer: Mutex::new(Some(writer)),
         shutdown,
     });
-    let signal = transport.shutdown.clone();
-    let weak_transport = Arc::downgrade(&transport);
+    let driver_retirement = DriverRetirement {
+        shutdown: transport.shutdown.clone(),
+        transport: Arc::downgrade(&transport),
+    };
     let _ = tx.try_send(TransportEvent::Connected);
     tokio::spawn(async move {
         let mut buffer = BytesMut::with_capacity(READ_CAPACITY);
@@ -208,12 +242,7 @@ where
             }
         };
         drop(reader);
-        let _ = signal.send(true);
-        // Retirement must release both halves even when the caller retains the
-        // transport. Signalling first interrupts a writer waiting on the peer.
-        if let Some(transport) = weak_transport.upgrade() {
-            transport.writer.lock().await.take();
-        }
+        drop(driver_retirement);
         // A full, unconsumed queue must not keep the task or socket alive.
         // The eventual channel closure also reports termination to the owner.
         let _ = tx.try_send(TransportEvent::Disconnected(reason));
@@ -497,6 +526,93 @@ mod tests {
                 .kind(),
             std::io::ErrorKind::UnexpectedEof
         );
+    }
+
+    #[test]
+    fn runtime_shutdown_releases_stream_even_before_driver_is_polled() {
+        for started in [false, true] {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (stream, mut peer) = tokio::io::duplex(8);
+            let (transport, events) = {
+                let _entered = runtime.enter();
+                from_byte_stream(stream)
+            };
+            if started {
+                runtime.block_on(async {
+                    assert!(matches!(
+                        events.recv().await.unwrap(),
+                        TransportEvent::Connected
+                    ));
+                    peer.write_all(b"a").await.unwrap();
+                    assert!(matches!(
+                        timeout(DEADLINE, events.recv()).await.unwrap().unwrap(),
+                        TransportEvent::DataReceived(_)
+                    ));
+                });
+            }
+            drop(runtime);
+            let checker = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            checker.block_on(async {
+                assert_eq!(
+                    timeout(DEADLINE, peer.read_u8())
+                        .await
+                        .unwrap()
+                        .unwrap_err()
+                        .kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                );
+                assert!(transport.send(Bytes::from_static(b"closed")).await.is_err());
+            });
+        }
+    }
+
+    #[test]
+    fn runtime_shutdown_cancels_a_write_retained_by_another_executor() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (stream, mut peer) = tokio::io::duplex(1);
+        let (transport, _events) = {
+            let _entered = runtime.enter();
+            from_byte_stream(stream)
+        };
+        let mut pending = Box::pin(transport.send(Bytes::from_static(b"ab")));
+        runtime.block_on(async {
+            tokio::select! {
+                biased;
+                result = &mut pending => panic!("write unexpectedly completed: {result:?}"),
+                result = peer.read_u8() => assert_eq!(result.unwrap(), b'a'),
+            }
+        });
+        drop(runtime);
+        let checker = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        checker.block_on(async {
+            assert!(
+                timeout(DEADLINE, transport.send(Bytes::from_static(b"closed")))
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            assert!(timeout(DEADLINE, pending).await.unwrap().is_err());
+            assert_eq!(
+                timeout(DEADLINE, peer.read_u8())
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::UnexpectedEof
+            );
+        });
     }
 
     #[test]
