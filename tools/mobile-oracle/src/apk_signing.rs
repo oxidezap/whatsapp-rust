@@ -1,11 +1,13 @@
-//! Structural v2/v3 certificate extraction per source.android.com APK signing
-//! scheme v2/v3 formats. Signatures, digests and rotation proofs are not verified.
+//! Structural v2/v3/v3.1 certificate extraction per source.android.com APK signing
+//! formats. Signatures, digests and rotation proofs are not verified.
 use anyhow::{Context, Result, ensure};
 #[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SigningScheme {
     V2,
     V3,
+    #[serde(rename = "v3_1")]
+    V31,
 }
 struct Fields<'a> {
     bytes: &'a [u8],
@@ -49,6 +51,10 @@ pub(crate) fn certificates(
     platform_sdk: u32,
 ) -> Result<Vec<Vec<u8>>> {
     ensure!(
+        scheme != SigningScheme::V31 || platform_sdk >= 33,
+        "v3.1 requires platform SDK 33 or later"
+    );
+    ensure!(
         block.len() >= 32 && block.len() <= 16 * 1024 * 1024,
         "signing block budget exceeded"
     );
@@ -62,11 +68,12 @@ pub(crate) fn certificates(
     let target = match scheme {
         SigningScheme::V2 => 0x7109871a,
         SigningScheme::V3 => 0xf05368c0,
+        SigningScheme::V31 => 0x1b93ad61,
     };
     let mut pos = 8;
     let end = block.len() - 24;
     let mut selected = None;
-    let mut ids = std::collections::BTreeSet::new();
+    let mut ids = std::collections::BTreeMap::new();
     while pos < end {
         ensure!(end - pos >= 8, "truncated signing pair length");
         let size = u64::from_le_bytes(
@@ -82,9 +89,14 @@ pub(crate) fn certificates(
         );
         let next = pos + size as usize;
         let id = u32::from_le_bytes(block[pos..pos + 4].try_into()?);
-        ensure!(ids.insert(id), "duplicate signing block ID");
+        let value = &block[pos + 4..next];
+        // Official APKs can repeat the exact same pair. Only byte-identical
+        // repeats are unambiguous; conflicting values must still fail closed.
+        if let Some(previous) = ids.insert(id, value) {
+            ensure!(previous == value, "conflicting duplicate signing block ID");
+        }
         if id == target {
-            selected = Some(&block[pos + 4..next]);
+            selected = Some(value);
         }
         pos = next;
     }
@@ -102,7 +114,7 @@ pub(crate) fn certificates(
         let mut signed = Fields::new(signer.field()?);
         signed.field()?;
         let cert_bytes = signed.field()?;
-        let applicable = if scheme == SigningScheme::V3 {
+        let applicable = if scheme != SigningScheme::V2 {
             let low = signed.word()?;
             let high = signed.word()?;
             ensure!(low <= high, "invalid signer SDK range");
@@ -155,23 +167,23 @@ pub(crate) mod tests {
         let certs = field(&[0x30, 1, 7]);
         let mut signed = field(&[]);
         signed.extend(field(&certs));
-        if scheme == SigningScheme::V3 {
+        if scheme != SigningScheme::V2 {
             signed.extend(28u32.to_le_bytes());
             signed.extend(35u32.to_le_bytes());
         }
         signed.extend(field(&[]));
         let mut signer = field(&signed);
-        if scheme == SigningScheme::V3 {
+        if scheme != SigningScheme::V2 {
             signer.extend(28u32.to_le_bytes());
             signer.extend(35u32.to_le_bytes());
         }
         signer.extend(field(&[]));
         signer.extend(field(&[]));
         let value = field(&field(&signer));
-        let id: u32 = if scheme == SigningScheme::V2 {
-            0x7109871a
-        } else {
-            0xf05368c0
+        let id: u32 = match scheme {
+            SigningScheme::V2 => 0x7109871a,
+            SigningScheme::V3 => 0xf05368c0,
+            SigningScheme::V31 => 0x1b93ad61,
         };
         let mut pair = ((value.len() + 4) as u64).to_le_bytes().to_vec();
         pair.extend(id.to_le_bytes());
@@ -184,8 +196,68 @@ pub(crate) mod tests {
         block
     }
     #[test]
+    fn explicit_v31_selects_rotated_block_without_v3_fallback() {
+        let original = fixture(SigningScheme::V3);
+        let mut rotated = fixture(SigningScheme::V31);
+        let cert = rotated
+            .windows(7)
+            .position(|b| b == [3, 0, 0, 0, 0x30, 1, 7])
+            .unwrap();
+        rotated[cert + 6] = 8;
+        let mut pairs = original[8..original.len() - 24].to_vec();
+        pairs.extend_from_slice(&rotated[8..rotated.len() - 24]);
+        let size = (pairs.len() + 24) as u64;
+        let mut block = size.to_le_bytes().to_vec();
+        block.extend(pairs);
+        block.extend(size.to_le_bytes());
+        block.extend(b"APK Sig Block 42");
+        assert_eq!(
+            certificates(&block, SigningScheme::V3, 33).unwrap(),
+            vec![vec![0x30, 1, 7]]
+        );
+        assert_eq!(
+            certificates(&block, SigningScheme::V31, 33).unwrap(),
+            vec![vec![0x30, 1, 8]]
+        );
+        assert!(certificates(&original, SigningScheme::V31, 33).is_err());
+        assert_eq!(
+            serde_json::to_string(&SigningScheme::V31).unwrap(),
+            "\"v3_1\""
+        );
+        assert_eq!(
+            serde_json::from_str::<SigningScheme>("\"v3_1\"").unwrap(),
+            SigningScheme::V31
+        );
+    }
+    #[test]
+    fn repeated_signing_pairs_require_identical_bytes() {
+        let original = fixture(SigningScheme::V31);
+        let pair = &original[8..original.len() - 24];
+        let size = (pair.len() * 2 + 24) as u64;
+        let mut repeated = size.to_le_bytes().to_vec();
+        repeated.extend(pair);
+        repeated.extend(pair);
+        repeated.extend(size.to_le_bytes());
+        repeated.extend(b"APK Sig Block 42");
+        assert_eq!(
+            certificates(&repeated, SigningScheme::V31, 33).unwrap(),
+            vec![vec![0x30, 1, 7]]
+        );
+        let cert = repeated
+            .windows(7)
+            .rposition(|b| b == [3, 0, 0, 0, 0x30, 1, 7])
+            .unwrap();
+        repeated[cert + 6] = 8;
+        assert!(
+            certificates(&repeated, SigningScheme::V31, 33)
+                .unwrap_err()
+                .to_string()
+                .contains("conflicting duplicate")
+        );
+    }
+    #[test]
     fn synthetic_schemes_and_truncation() {
-        for scheme in [SigningScheme::V2, SigningScheme::V3] {
+        for scheme in [SigningScheme::V2, SigningScheme::V3, SigningScheme::V31] {
             let b = fixture(scheme);
             assert_eq!(
                 certificates(&b, scheme, 33).unwrap(),
@@ -194,8 +266,13 @@ pub(crate) mod tests {
             for end in 0..b.len() {
                 assert!(certificates(&b[..end], scheme, 33).is_err());
             }
-            if scheme == SigningScheme::V3 {
+            if scheme != SigningScheme::V2 {
                 assert!(certificates(&b, scheme, 27).is_err());
+            }
+            if scheme == SigningScheme::V31 {
+                assert!(certificates(&b, scheme, 32).is_err());
+                assert!(certificates(&b, scheme, 36).is_err());
+                assert!(certificates(&b, SigningScheme::V3, 33).is_err());
             }
         }
     }
