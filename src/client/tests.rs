@@ -5546,9 +5546,7 @@ async fn memory_report_attributes_mobile_configuration_and_persisted_buffer_capa
     let client = crate::test_utils::primary_startup_client().await;
     let before = client.memory_report().await;
     assert_eq!(before.mobile_session.entries, 1);
-    assert!(
-        before.mobile_session.bytes >= std::mem::size_of::<crate::RegisteredMobileSession>() as u64
-    );
+    assert!(before.mobile_session.bytes >= size_of::<crate::RegisteredMobileSession>() as u64);
     assert_eq!(before.mobile_session_binding.entries, 1);
 
     let snapshot = client.persistence_manager.get_device_snapshot();
@@ -5560,9 +5558,7 @@ async fn memory_report_attributes_mobile_configuration_and_persisted_buffer_capa
     assert!(added_capacity >= 4096);
     client
         .persistence_manager
-        .process_command(wacore::store::DeviceCommand::SetMobileSessionBinding(
-            binding,
-        ))
+        .process_command(DeviceCommand::SetMobileSessionBinding(binding))
         .await;
 
     let after = client.memory_report().await;

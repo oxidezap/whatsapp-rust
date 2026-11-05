@@ -149,7 +149,6 @@ pub struct MobileLoginProfile {
 
 impl crate::stats::HeapSize for MobileLoginProfile {
     fn heap_bytes(&self) -> usize {
-        use crate::stats::HeapSize as _;
         let strings = [
             &self.user_agent.mcc,
             &self.user_agent.mnc,
@@ -708,7 +707,7 @@ mod tests {
     }
 
     fn trust(root: &KeyPair) -> MobileNoiseTrust {
-        MobileNoiseTrust::new(root.public_key.public_key_bytes().try_into().unwrap()).unwrap()
+        MobileNoiseTrust::new(*root.public_key.public_key_bytes()).unwrap()
     }
 
     #[test]
@@ -878,7 +877,7 @@ mod tests {
     fn strict_flat_certificate_requires_signature_static_binding_and_freshness() {
         let root = key(11);
         let server = key(12);
-        let server_public: [u8; 32] = server.public_key.public_key_bytes().try_into().unwrap();
+        let server_public: [u8; 32] = *server.public_key.public_key_bytes();
         let encoded = signed_certificate(&root, &server_public, Some(101));
         let verified = trust(&root)
             .verify_certificate(&encoded, &server_public, 100)

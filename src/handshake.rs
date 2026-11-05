@@ -559,27 +559,13 @@ mod mobile_transport_tests {
             "synthetic-sdk",
             RegistrationEndpoint::for_test_http("http://mock.invalid/registration").unwrap(),
             TcpEndpoint::new("mock.invalid", 5222).unwrap(),
-            MobileTrust::new(
-                [1; 32],
-                root.public_key.public_key_bytes().try_into().unwrap(),
-            )
-            .unwrap(),
+            MobileTrust::new([1; 32], *root.public_key.public_key_bytes()).unwrap(),
         )
         .unwrap();
         let device = pm.get_device_snapshot();
         let identity = RegistrationIdentity::from_public_keys(
-            device
-                .identity_key
-                .public_key
-                .public_key_bytes()
-                .try_into()
-                .unwrap(),
-            device
-                .noise_key
-                .public_key
-                .public_key_bytes()
-                .try_into()
-                .unwrap(),
+            device.identity_key.public_key.public_key_bytes(),
+            device.noise_key.public_key.public_key_bytes(),
         );
         let binding = MobileSessionBinding::new(
             *environment.binding().as_bytes(),
@@ -697,7 +683,7 @@ mod mobile_transport_tests {
         let hello = waproto::codec::handshake_message_decode(unframe(&first[4..])).unwrap();
         assert_eq!(
             hello.client_hello.ephemeral.as_deref(),
-            Some(key(44).public_key.public_key_bytes())
+            Some(key(44).public_key.public_key_bytes().as_slice())
         );
         let client =
             PublicKey::from_djb_public_key_bytes(hello.client_hello.ephemeral.as_ref().unwrap())

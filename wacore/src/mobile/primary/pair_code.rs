@@ -44,7 +44,7 @@ impl PrimaryHello {
             .try_into()
             .map_err(|_| PrimaryLinkError::Authentication)?;
         let mut plaintext = Zeroizing::new(Vec::with_capacity(96));
-        aes_256_gcm_decrypt(&key, nonce, b"", &wrapped_bundle[44..], &mut plaintext)?;
+        aes_256_gcm_decrypt(&key[..], nonce, b"", &wrapped_bundle[44..], &mut plaintext)?;
         if plaintext.len() != 96
             || !bool::from(plaintext[..32].ct_eq(companion_identity))
             || !bool::from(plaintext[32..64].ct_eq(primary_identity.public_key.public_key_bytes()))
@@ -176,11 +176,7 @@ mod tests {
         let mut bundle = vec![7; 32];
         bundle.extend_from_slice(&[9; 12]);
         aes_256_gcm_encrypt(&key, &[9; 12], b"", &plain, &mut bundle).unwrap();
-        let peer: &[u8; 32] = companion_identity
-            .public_key
-            .public_key_bytes()
-            .try_into()
-            .unwrap();
+        let peer: &[u8; 32] = companion_identity.public_key.public_key_bytes();
         let actual = hello.complete(&bundle, peer, &primary_identity).unwrap();
         let identity_shared = companion_identity
             .private_key

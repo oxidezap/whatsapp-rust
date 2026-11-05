@@ -117,12 +117,8 @@ impl HttpClient for SuppliedHttp {
                 .expect("durable reservation"),
         )?;
         let identity = whatsapp_rust::mobile::RegistrationIdentity::from_public_keys(
-            durable
-                .identity_key
-                .public_key
-                .public_key_bytes()
-                .try_into()?,
-            durable.noise_key.public_key.public_key_bytes().try_into()?,
+            durable.identity_key.public_key.public_key_bytes(),
+            durable.noise_key.public_key.public_key_bytes(),
         );
         let restored = whatsapp_rust::mobile::RegistrationWorkflow::restore(
             checkpoint,
@@ -170,10 +166,12 @@ pub async fn exercise_durable_registration() -> Result<(), Box<dyn std::error::E
     let identity = KeyPair::generate(&mut rng);
     let noise = KeyPair::generate(&mut rng);
     let prekey = KeyPair::generate(&mut rng);
-    let signature = identity.calculate_signature(&prekey.public_key.serialize(), &mut rng)?;
-    let noise_public: [u8; 32] = noise.public_key.public_key_bytes().try_into()?;
-    let identity_public: [u8; 32] = identity.public_key.public_key_bytes().try_into()?;
-    let prekey_public: [u8; 32] = prekey.public_key.public_key_bytes().try_into()?;
+    let signature = identity
+        .private_key
+        .calculate_signature(&prekey.public_key.serialize(), &mut rng)?;
+    let noise_public = *noise.public_key.public_key_bytes();
+    let identity_public = *identity.public_key.public_key_bytes();
+    let prekey_public = *prekey.public_key.public_key_bytes();
     let keys = MobileDeviceKeys {
         registration_id: 123,
         noise_key: noise,

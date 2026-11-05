@@ -309,6 +309,17 @@ impl PrimaryJournal {
         }
         Ok(())
     }
+    // A proof remains bound to its original PN/LID address and key index. A
+    // fresh authenticated alias of that same device slot may retain it, but a
+    // removed slot or a replacement key must never revive its old index.
+    fn retain_observed_companions(&mut self, observed: &PrimaryDeviceSnapshot, accounts: &[Jid]) {
+        self.companions.retain(|record| {
+            observed.devices.iter().any(|(jid, index)| {
+                same_owned_device_slot(jid, &record.device_jid, accounts)
+                    && *index == record.key_index
+            })
+        });
+    }
     fn apply_observed(&mut self, observed: &PrimaryDeviceSnapshot) {
         self.live_indexes = observed.live_indexes.clone();
         self.live_indexes.extend(
@@ -559,11 +570,8 @@ impl MobilePrimaryApi<'_> {
             .mobile_primary_operation_guard()
             .await;
         let observed = self.query_current_devices().await?;
-        let (binding, mut journal, _) = self.state()?;
-        if journal.pending.is_some()
-            || journal.maintenance.is_some()
-            || journal.companions.len() >= MAX_TRACKED_COMPANIONS
-        {
+        let (binding, mut journal, accounts) = self.state()?;
+        if journal.pending.is_some() || journal.maintenance.is_some() {
             return Err(PrimaryManagementError::Invalid(
                 "pending operation or capacity",
             ));
@@ -573,13 +581,18 @@ impl MobilePrimaryApi<'_> {
                 "key-index timestamp regressed",
             ));
         }
+        journal.retain_observed_companions(&observed, &accounts);
+        if journal.companions.len() >= MAX_TRACKED_COMPANIONS {
+            return Err(PrimaryManagementError::Invalid(
+                "pending operation or capacity",
+            ));
+        }
         journal.apply_observed(&observed);
         journal.key_index_timestamp = timestamp_seconds;
         let mut indexes: Vec<u32> = journal
-            .companions
+            .live_indexes
             .iter()
-            .map(|v| v.key_index)
-            .chain(journal.live_indexes.iter().copied())
+            .copied()
             .chain(live_indexes.iter().copied())
             .chain([0])
             .collect();
@@ -641,12 +654,7 @@ impl MobilePrimaryApi<'_> {
             return Err(PrimaryManagementError::Invalid("code invitation"));
         }
         let snapshot = self.client.persistence_manager.get_device_snapshot();
-        let identity = snapshot
-            .identity_key
-            .public_key
-            .public_key_bytes()
-            .try_into()
-            .map_err(|_| PrimaryManagementError::Invalid("primary identity"))?;
+        let identity = snapshot.identity_key.public_key.public_key_bytes();
         let identity_hash = snapshot
             .mobile_session
             .as_ref()
@@ -859,12 +867,7 @@ impl MobilePrimaryApi<'_> {
             .await
             .map_err(PrimaryManagementError::protocol)?;
         let snapshot = self.client.persistence_manager.get_device_snapshot();
-        let primary: &[u8; 32] = snapshot
-            .identity_key
-            .public_key
-            .public_key_bytes()
-            .try_into()
-            .map_err(|_| PrimaryManagementError::Invalid("primary identity"))?;
+        let primary: &[u8; 32] = snapshot.identity_key.public_key.public_key_bytes();
         let mut devices = Vec::new();
         let mut live_indexes = vec![0];
         let mut advertised_indexes = vec![0];
@@ -938,11 +941,7 @@ impl MobilePrimaryApi<'_> {
                 "active operation must be recovered first",
             ));
         }
-        journal.companions.retain(|v| {
-            observed.devices.iter().any(|(jid, index)| {
-                same_owned_device_slot(jid, &v.device_jid, &accounts) && *index == v.key_index
-            })
-        });
+        journal.retain_observed_companions(&observed, &accounts);
         journal.apply_observed(&observed);
         journal.key_index_timestamp = observed.key_index_timestamp;
         self.save(binding, &journal).await
@@ -1224,7 +1223,6 @@ impl MobilePrimaryApi<'_> {
     ) -> Result<Vec<u8>, PrimaryManagementError> {
         let indexes: Vec<_> = std::iter::once(0)
             .chain(journal.live_indexes.iter().copied())
-            .chain(journal.companions.iter().map(|record| record.key_index))
             .filter(|index| Some(*index) != excluding)
             .collect();
         let mut indexes = indexes;
@@ -1259,12 +1257,13 @@ impl MobilePrimaryApi<'_> {
             .mobile_primary_operation_guard()
             .await;
         let observed = self.query_current_devices().await?;
-        let (binding, mut journal, _) = self.state()?;
+        let (binding, mut journal, accounts) = self.state()?;
         if timestamp_seconds < observed.key_index_timestamp {
             return Err(PrimaryManagementError::Invalid(
                 "key-index timestamp regressed",
             ));
         }
+        journal.retain_observed_companions(&observed, &accounts);
         journal.apply_observed(&observed);
         journal.key_index_timestamp = timestamp_seconds;
         if journal.pending.is_some() || journal.maintenance.is_some() {
@@ -1307,6 +1306,7 @@ impl MobilePrimaryApi<'_> {
                 "key-index timestamp regressed",
             ));
         }
+        journal.retain_observed_companions(&fresh, &accounts);
         journal.apply_observed(&fresh);
         journal.key_index_timestamp = timestamp_seconds;
         let operation = journal
@@ -1444,12 +1444,7 @@ impl MobilePrimaryApi<'_> {
         };
         let fresh = self.query_current_devices().await?;
         let snapshot = self.client.persistence_manager.get_device_snapshot();
-        let primary = snapshot
-            .identity_key
-            .public_key
-            .public_key_bytes()
-            .try_into()
-            .map_err(|_| PrimaryManagementError::Invalid("primary identity"))?;
+        let primary = snapshot.identity_key.public_key.public_key_bytes();
         let expected = wacore::adv::verify_key_index_list(&signed, primary).ok_or(
             PrimaryManagementError::Invalid("maintenance index signature"),
         )?;
@@ -2633,12 +2628,7 @@ mod tests {
             noise_key: KeyPair::generate(&mut rng),
             adv_secret_key: [7; 32],
         };
-        let peer_identity: [u8; 32] = peer
-            .identity_key
-            .public_key
-            .public_key_bytes()
-            .try_into()
-            .unwrap();
+        let peer_identity: [u8; 32] = *peer.identity_key.public_key.public_key_bytes();
         let device: Jid = "15550000001:2@s.whatsapp.net".parse().unwrap();
         let api = client.mobile_primary().unwrap();
         api.initialize(7, AdvDefaultEncoding::Omit).await.unwrap();
@@ -3287,6 +3277,232 @@ mod tests {
         wire.close().await;
     }
     #[tokio::test]
+    async fn preparing_after_external_removal_prunes_tracked_index_and_preserves_high_water() {
+        use rand::SeedableRng;
+        use wacore::libsignal::protocol::KeyPair;
+        use wacore::pair::{DeviceState, PairUtils};
+        let mut wire = Wire::new(crate::test_utils::primary_test_backend()).await;
+        seed_confirmed_cache_only(&wire.client, false).await;
+        let api = wire.client.mobile_primary().unwrap();
+        let (binding, mut journal, accounts) = api.state().unwrap();
+        journal.high_water = 9;
+        let mut capacity_fixture = journal.clone();
+        capacity_fixture
+            .companions
+            .resize(MAX_TRACKED_COMPANIONS, journal.companions[0].clone());
+        // Exercise retention at the capacity bound independently of proof encoding:
+        // the real persisted fixture below retains its verified identity proof.
+        capacity_fixture.retain_observed_companions(
+            &PrimaryDeviceSnapshot {
+                devices: vec![],
+                live_indexes: vec![0],
+                advertised_indexes: vec![0],
+                high_water: 9,
+                key_index_timestamp: 100,
+            },
+            &accounts,
+        );
+        assert!(capacity_fixture.companions.len() < MAX_TRACKED_COMPANIONS);
+        assert_eq!(capacity_fixture.high_water, 9);
+        api.save(binding, &journal).await.unwrap();
+        let snapshot = wire.client.persistence_manager.get_device_snapshot();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(214);
+        let signed = build_signed_key_index_list(
+            &snapshot.identity_key,
+            &IdentityParameters {
+                raw_id: 7,
+                timestamp_seconds: 100,
+                key_index: 9,
+                valid_indexes: &[0],
+                default_encoding: AdvDefaultEncoding::Omit,
+            },
+            &mut rng,
+        )
+        .unwrap();
+        let companion = DeviceState {
+            identity_key: KeyPair::generate(&mut rng),
+            noise_key: KeyPair::generate(&mut rng),
+            adv_secret_key: [6; 32],
+        };
+        let qr = CompanionQr::parse(&PairUtils::make_qr_data(
+            &companion,
+            "replacement-reference",
+            wacore::companion_reg::CompanionWebClientType::Chrome,
+        ))
+        .unwrap();
+        let client = wire.client.clone();
+        let prepare = tokio::spawn(async move {
+            client
+                .mobile_primary()
+                .unwrap()
+                .prepare_qr(&qr, 101, &[7], &mut rand::rngs::StdRng::seed_from_u64(215))
+                .await
+        });
+        let request = wire.request(0).await;
+        wire.devices_snapshot(request.get(), Some(&signed), false)
+            .await;
+        assert_eq!(prepare.await.unwrap().unwrap(), 10);
+        let (_, prepared, _) = wire.client.mobile_primary().unwrap().state().unwrap();
+        assert!(prepared.companions.is_empty());
+        assert_eq!(prepared.high_water, 10);
+        let pending = prepared.pending.unwrap();
+        let envelope =
+            waproto::codec::adv_signed_key_index_list_decode(&pending.signed_indexes).unwrap();
+        let indexes =
+            waproto::codec::adv_key_index_list_decode(envelope.details.as_deref().unwrap())
+                .unwrap();
+        assert_eq!(indexes.current_index, Some(10));
+        assert_eq!(
+            indexes.valid_indexes,
+            vec![0, 7, 10],
+            "caller-supplied indexes remain explicit"
+        );
+        assert_eq!(
+            wire.transport.sent_count(),
+            1,
+            "preparation sends only the fresh device query"
+        );
+        wire.close().await;
+    }
+    #[tokio::test]
+    async fn publishing_filters_removed_companions_before_signing_and_durable_refresh() {
+        use rand::SeedableRng;
+        fn assert_published_indexes(
+            node: &wacore_binary::NodeRef<'_>,
+            high_water: u32,
+            indexes: &[u32],
+        ) {
+            let signed = node.get_optional_child("key-index-list").unwrap();
+            let envelope =
+                waproto::codec::adv_signed_key_index_list_decode(signed.content_bytes().unwrap())
+                    .unwrap();
+            let details =
+                waproto::codec::adv_key_index_list_decode(envelope.details.as_deref().unwrap())
+                    .unwrap();
+            assert_eq!(details.current_index, Some(high_water));
+            assert_eq!(details.valid_indexes, indexes);
+        }
+        for removed_before_publish in [true, false] {
+            let mut wire = Wire::new(crate::test_utils::primary_test_backend()).await;
+            let (tracked, _) = seed_confirmed_cache_only(&wire.client, false).await;
+            wire.client
+                .persistence_manager
+                .process_command(wacore::store::DeviceCommand::SetLid(Some(
+                    "10000000001@lid".parse().unwrap(),
+                )))
+                .await;
+            wire.client.persistence_manager.flush().await.unwrap();
+            let api = wire.client.mobile_primary().unwrap();
+            let (binding, mut journal, _) = api.state().unwrap();
+            journal.high_water = 9;
+            api.save(binding, &journal).await.unwrap();
+            let snapshot = wire.client.persistence_manager.get_device_snapshot();
+            let mut rng = rand::rngs::StdRng::seed_from_u64(211);
+            let mut signed_snapshot = |indexes: &[u32]| {
+                build_signed_key_index_list(
+                    &snapshot.identity_key,
+                    &IdentityParameters {
+                        raw_id: 7,
+                        timestamp_seconds: 100,
+                        key_index: 9,
+                        valid_indexes: indexes,
+                        default_encoding: AdvDefaultEncoding::Omit,
+                    },
+                    &mut rng,
+                )
+                .unwrap()
+            };
+            let present = signed_snapshot(&[0, 1]);
+            let absent = signed_snapshot(&[0]);
+            let client = wire.client.clone();
+            let publish = tokio::spawn(async move {
+                client
+                    .mobile_primary()
+                    .unwrap()
+                    .publish_indexes(
+                        &"s.whatsapp.net".parse().unwrap(),
+                        101,
+                        &mut rand::rngs::StdRng::seed_from_u64(212),
+                    )
+                    .await
+            });
+            let request = wire.request(0).await;
+            if removed_before_publish {
+                wire.alias_devices(request.get(), &absent, &[], &[], 100)
+                    .await;
+            } else {
+                // A LID-only alias retains the original PN-bound proof until removal.
+                wire.alias_devices(request.get(), &present, &[], &[(2, 1)], 100)
+                    .await;
+            }
+            let request = wire.request(1).await;
+            wire.alias_devices(request.get(), &absent, &[], &[], 100)
+                .await;
+            let publication_frame = if removed_before_publish {
+                2
+            } else {
+                assert!(
+                    publish.await.unwrap().is_err(),
+                    "drift must pause publication"
+                );
+                let (_, interrupted, _) = wire.client.mobile_primary().unwrap().state().unwrap();
+                assert_eq!(interrupted.companions[0].device_jid(), &tracked);
+                assert!(matches!(
+                    interrupted.maintenance,
+                    Some(Maintenance::Publish { .. })
+                ));
+                let client = wire.client.clone();
+                let refresh = tokio::spawn(async move {
+                    client
+                        .mobile_primary()
+                        .unwrap()
+                        .refresh_maintenance_indexes(
+                            102,
+                            &mut rand::rngs::StdRng::seed_from_u64(213),
+                        )
+                        .await
+                });
+                let request = wire.request(2).await;
+                wire.alias_devices(request.get(), &absent, &[], &[], 100)
+                    .await;
+                refresh.await.unwrap().unwrap();
+                let (_, refreshed, _) = wire.client.mobile_primary().unwrap().state().unwrap();
+                assert!(refreshed.companions.is_empty());
+                assert_eq!(refreshed.high_water, 9, "removed indexes remain spent");
+                let client = wire.client.clone();
+                let resume = tokio::spawn(async move {
+                    client
+                        .mobile_primary()
+                        .unwrap()
+                        .resume_maintenance(&"s.whatsapp.net".parse().unwrap())
+                        .await
+                });
+                let request = wire.request(3).await;
+                wire.alias_devices(request.get(), &absent, &[], &[], 100)
+                    .await;
+                let request = wire.request(4).await;
+                assert_published_indexes(request.get(), 9, &[0]);
+                wire.reply(request.get(), vec![], false).await;
+                resume.await.unwrap().unwrap();
+                let (_, complete, _) = wire.client.mobile_primary().unwrap().state().unwrap();
+                assert!(complete.companions.is_empty());
+                assert!(complete.maintenance.is_none());
+                assert_eq!(complete.high_water, 9);
+                wire.close().await;
+                continue;
+            };
+            let request = wire.request(publication_frame).await;
+            assert_published_indexes(request.get(), 9, &[0]);
+            wire.reply(request.get(), vec![], false).await;
+            publish.await.unwrap().unwrap();
+            let (_, complete, _) = wire.client.mobile_primary().unwrap().state().unwrap();
+            assert!(complete.companions.is_empty());
+            assert!(complete.maintenance.is_none());
+            assert_eq!(complete.high_water, 9);
+            wire.close().await;
+        }
+    }
+    #[tokio::test]
     async fn lid_alias_revocation_excludes_tracked_pn_index_through_ambiguous_resume_and_refresh() {
         use rand::SeedableRng;
         use wacore::libsignal::protocol::KeyPair;
@@ -3310,12 +3526,7 @@ mod tests {
             noise_key: KeyPair::generate(&mut rng),
             adv_secret_key: [4; 32],
         };
-        let second_identity: [u8; 32] = second
-            .identity_key
-            .public_key
-            .public_key_bytes()
-            .try_into()
-            .unwrap();
+        let second_identity: [u8; 32] = *second.identity_key.public_key.public_key_bytes();
         let issued = build_signed_companion_identity(
             &snapshot.identity_key,
             &second_identity,

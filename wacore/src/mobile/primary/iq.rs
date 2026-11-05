@@ -404,7 +404,7 @@ mod tests {
         };
         let identity = build_signed_companion_identity(
             &primary,
-            peer.public_key.public_key_bytes().try_into().unwrap(),
+            peer.public_key.public_key_bytes(),
             &[7; 32],
             &params,
             &mut rng,

@@ -335,18 +335,8 @@ impl RegisteredMobileSession {
         {
             return Err(MobileSessionError::InvalidUsername);
         }
-        let identity_key: [u8; 32] = device
-            .identity_key
-            .public_key
-            .public_key_bytes()
-            .try_into()
-            .map_err(|_| MobileSessionError::InvalidKeyMaterial)?;
-        let noise_key: [u8; 32] = device
-            .noise_key
-            .public_key
-            .public_key_bytes()
-            .try_into()
-            .map_err(|_| MobileSessionError::InvalidKeyMaterial)?;
+        let identity_key: [u8; 32] = *device.identity_key.public_key.public_key_bytes();
+        let noise_key: [u8; 32] = *device.noise_key.public_key.public_key_bytes();
         if RegistrationIdentity::from_public_keys(&identity_key, &noise_key) != self.identity {
             return Err(MobileSessionError::InvalidKeyMaterial);
         }
@@ -384,7 +374,6 @@ impl RegisteredMobileSession {
 
 impl wacore::stats::HeapSize for RegisteredMobileSession {
     fn heap_bytes(&self) -> usize {
-        use wacore::stats::HeapSize as _;
         let arc_header = 2 * size_of::<usize>();
         self.environment.heap_bytes()
             + self.profile.heap_bytes()
@@ -452,18 +441,8 @@ mod tests {
             MobileLoginOptions::default(),
             15550000001,
             RegistrationIdentity::from_public_keys(
-                device
-                    .identity_key
-                    .public_key
-                    .public_key_bytes()
-                    .try_into()
-                    .unwrap(),
-                device
-                    .noise_key
-                    .public_key
-                    .public_key_bytes()
-                    .try_into()
-                    .unwrap(),
+                device.identity_key.public_key.public_key_bytes(),
+                device.noise_key.public_key.public_key_bytes(),
             ),
             MobileNoisePrologue::new(3),
             Arc::new(Keys),
@@ -493,7 +472,8 @@ mod tests {
                 None,
                 vec![(wacore::download::MediaType::Image, route)],
             )
-            .unwrap(),
+            .unwrap()
+            .into(),
         );
         assert!(session.heap_bytes() >= before_media + route_capacity);
     }
@@ -645,11 +625,11 @@ mod tests {
         let root = key(11);
         let foreign_root = key(12);
         let server = key(13);
-        let server_public: [u8; 32] = server.public_key.public_key_bytes().try_into().unwrap();
+        let server_public: [u8; 32] = *server.public_key.public_key_bytes();
         let session = config_with_noise_root(
             &device,
             "synthetic-cert",
-            root.public_key.public_key_bytes().try_into().unwrap(),
+            *root.public_key.public_key_bytes(),
         );
         let missing = certificate(&root, &server_public, &[]);
         assert!(
@@ -695,7 +675,7 @@ mod tests {
                 100,
             )
             .unwrap();
-        let wrong_static: [u8; 32] = key(14).public_key.public_key_bytes().try_into().unwrap();
+        let wrong_static: [u8; 32] = *key(14).public_key.public_key_bytes();
         assert!(
             session
                 .trust()

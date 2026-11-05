@@ -303,12 +303,7 @@ mod tests {
             noise_key: KeyPair::generate(&mut rng),
             adv_secret_key: [4; 32],
         };
-        let peer: &[u8; 32] = companion
-            .identity_key
-            .public_key
-            .public_key_bytes()
-            .try_into()
-            .unwrap();
+        let peer: &[u8; 32] = companion.identity_key.public_key.public_key_bytes();
         let account = wacore_binary::Jid::from_str("123@s.whatsapp.net").unwrap();
         let device = wacore_binary::Jid::from_str("123:2@s.whatsapp.net").unwrap();
         for encoding in [AdvDefaultEncoding::Omit, AdvDefaultEncoding::Explicit] {
@@ -341,7 +336,7 @@ mod tests {
             assert!(
                 crate::adv::verify_key_index_list(
                     &issued.key_index_list,
-                    primary.public_key.public_key_bytes().try_into().unwrap()
+                    primary.public_key.public_key_bytes()
                 )
                 .is_some()
             );
@@ -439,11 +434,8 @@ mod tests {
         };
         let signed = build_signed_key_index_list(&primary, &params, &mut rng).unwrap();
         assert!(
-            crate::adv::verify_key_index_list(
-                &signed,
-                primary.public_key.public_key_bytes().try_into().unwrap()
-            )
-            .is_some()
+            crate::adv::verify_key_index_list(&signed, primary.public_key.public_key_bytes())
+                .is_some()
         );
         let wrapped = waproto::codec::adv_signed_key_index_list_decode(&signed).unwrap();
         let details =
@@ -461,12 +453,7 @@ mod tests {
             noise_key: KeyPair::generate(&mut rng),
             adv_secret_key: [3; 32],
         };
-        let own: &[u8; 32] = state
-            .identity_key
-            .public_key
-            .public_key_bytes()
-            .try_into()
-            .unwrap();
+        let own: &[u8; 32] = state.identity_key.public_key.public_key_bytes();
         let issued = build_signed_companion_identity(
             &state.identity_key,
             own,
@@ -486,19 +473,15 @@ mod tests {
         validate_primary_account_identity(&proof, own, &jid).unwrap();
         let other = KeyPair::generate(&mut rng);
         assert!(
-            validate_primary_account_identity(
-                &proof,
-                other.public_key.public_key_bytes().try_into().unwrap(),
-                &jid
-            )
-            .is_err()
+            validate_primary_account_identity(&proof, other.public_key.public_key_bytes(), &jid)
+                .is_err()
         );
     }
     #[test]
     fn account_only_primary_profile_verifies_exact_bytes_and_rejects_forged_variants() {
         let mut rng = rand::rngs::StdRng::seed_from_u64(181);
         let primary = KeyPair::generate(&mut rng);
-        let own: &[u8; 32] = primary.public_key.public_key_bytes().try_into().unwrap();
+        let own: &[u8; 32] = primary.public_key.public_key_bytes();
         let jid = wacore_binary::Jid::from_str("15550000001@s.whatsapp.net").unwrap();
         let mut details = wa::ADVDeviceIdentity::default();
         details.raw_id = Some(7);
@@ -566,7 +549,7 @@ mod tests {
         assert!(
             validate_primary_account_identity_with_profile(
                 &waproto::codec::adv_signed_device_identity_to_vec(&signed),
-                other.public_key.public_key_bytes().try_into().unwrap(),
+                other.public_key.public_key_bytes(),
                 &jid,
                 profile
             )

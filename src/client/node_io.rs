@@ -1459,12 +1459,7 @@ impl Client {
                     .map(|bytes| {
                         let device = self.persistence_manager.get_device_snapshot();
                         let own = device.pn.as_ref().ok_or("missing primary account")?;
-                        let identity: &[u8; 32] = device
-                            .identity_key
-                            .public_key
-                            .public_key_bytes()
-                            .try_into()
-                            .map_err(|_| "invalid primary identity key")?;
+                        let identity: &[u8; 32] = device.identity_key.public_key.public_key_bytes();
                         let profile = self
                             .mobile_session
                             .as_ref()

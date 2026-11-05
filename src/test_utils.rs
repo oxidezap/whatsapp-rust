@@ -1027,18 +1027,8 @@ async fn primary_client_with_factory_and_app_state_policy(
     )
     .unwrap();
     let identity = RegistrationIdentity::from_public_keys(
-        device
-            .identity_key
-            .public_key
-            .public_key_bytes()
-            .try_into()
-            .unwrap(),
-        device
-            .noise_key
-            .public_key
-            .public_key_bytes()
-            .try_into()
-            .unwrap(),
+        device.identity_key.public_key.public_key_bytes(),
+        device.noise_key.public_key.public_key_bytes(),
     );
     if device.mobile_session.is_none() {
         persistence

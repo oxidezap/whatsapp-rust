@@ -79,18 +79,8 @@ impl HttpClient for MockHttp {
             checkpoint,
             environment().binding(),
             RegistrationIdentity::from_public_keys(
-                durable
-                    .identity_key
-                    .public_key
-                    .public_key_bytes()
-                    .try_into()
-                    .unwrap(),
-                durable
-                    .noise_key
-                    .public_key
-                    .public_key_bytes()
-                    .try_into()
-                    .unwrap(),
+                durable.identity_key.public_key.public_key_bytes(),
+                durable.noise_key.public_key.public_key_bytes(),
             ),
         )?;
         assert!(matches!(
@@ -142,12 +132,13 @@ impl Fixture {
         let noise = KeyPair::generate(&mut rng);
         let prekey = KeyPair::generate(&mut rng);
         let signature = identity
+            .private_key
             .calculate_signature(&prekey.public_key.serialize(), &mut rng)
             .unwrap();
         Self {
-            noise: noise.public_key.public_key_bytes().try_into().unwrap(),
-            identity: identity.public_key.public_key_bytes().try_into().unwrap(),
-            prekey: prekey.public_key.public_key_bytes().try_into().unwrap(),
+            noise: *noise.public_key.public_key_bytes(),
+            identity: *identity.public_key.public_key_bytes(),
+            prekey: *prekey.public_key.public_key_bytes(),
             keys: MobileDeviceKeys {
                 registration_id: 123,
                 noise_key: noise,
