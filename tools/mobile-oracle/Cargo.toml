@@ -16,6 +16,7 @@ chrono = { workspace = true, features = ["std"] }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 sha2 = { workspace = true }
+sha1 = { workspace = true }
 url = { version = "2.5.8", default-features = false }
 zip = { version = "=9.1.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 

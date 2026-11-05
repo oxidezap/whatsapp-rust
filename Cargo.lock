@@ -2687,11 +2687,25 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha1 0.11.0",
  "sha2 0.11.1",
  "tempfile",
  "url",
  "wacore",
  "zeroize",
+ "zip",
+]
+
+[[package]]
+name = "mobile-oracle-android"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "hex",
+ "jni",
+ "serde_json",
+ "sha2 0.11.1",
  "zip",
 ]
 

@@ -22,6 +22,7 @@ fn explicit_form_policies_match_original_android_fields() {
     assert!(bytes.len() <= 64 * 1024);
     let report: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["driver"], "rust_jni");
     assert_eq!(report["execution"], "android_original_registration_form");
     assert_eq!(report["http"], "not_called");
     assert_eq!(report["registration"], "not_run");

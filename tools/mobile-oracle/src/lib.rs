@@ -1228,3 +1228,5 @@ pub use apk_signing::SigningScheme;
 
 mod private_material;
 pub use private_material::{PrivateExport, export_private_material, import_private_material};
+
+pub mod bootstrap;

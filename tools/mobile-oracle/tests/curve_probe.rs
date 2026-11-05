@@ -34,6 +34,7 @@ fn original_curve_jni_matches_synthetic_rust_crypto() {
     assert!(bytes.len() <= 64 * 1024);
     let report: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["driver"], "rust_jni");
     assert_eq!(report["execution"], "android_original_curve_jni");
     assert_eq!(report["application_lifecycle"], "not_run");
     assert_eq!(report["registration"], "not_run");

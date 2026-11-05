@@ -31,6 +31,7 @@ members = [
     "tests/e2e",
     "tools/whatspec-codegen",
     "tools/mobile-oracle",
+    "tools/mobile-oracle-android",
     "tools/oracle-cli",
     "tools/oracle-core",
     "tools/xtask",

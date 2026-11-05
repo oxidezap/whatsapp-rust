@@ -22,6 +22,7 @@ fn original_dex_android_crypto_matches_synthetic_rust_inputs() {
     assert!(bytes.len() <= 64 * 1024);
     let report: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["driver"], "rust_jni");
     assert_eq!(report["execution"], "android_art_original_dex");
     assert_eq!(report["application_lifecycle"], "not_run");
     assert_eq!(report["registration"], "not_run");

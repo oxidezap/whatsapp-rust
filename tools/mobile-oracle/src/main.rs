@@ -7,9 +7,22 @@ fn main() -> Result<std::process::ExitCode> {
     let mut args = std::env::args_os().skip(1);
     let command = args
         .next()
-        .context("usage: mobile-oracle material <lock> <root> <recipe> [--export-private <repository>] | verify <lock> <root> | diff <before-lock> <after-lock> | compare <lock> <root> <corpus> <apk-observations> <rust-observations>")?;
+        .context("usage: mobile-oracle bootstrap <output-dex> <guest-library-path> | material <lock> <root> <recipe> [--export-private <repository>] | verify <lock> <root> | diff <before-lock> <after-lock> | compare <lock> <root> <corpus> <apk-observations> <rust-observations>")?;
     let first = PathBuf::from(args.next().context("missing first path")?);
     let second = PathBuf::from(args.next().context("missing second path")?);
+    if command == "bootstrap" {
+        if args.next().is_some() {
+            bail!("unexpected bootstrap argument");
+        }
+        let library = second.to_str().context("library path must be UTF-8")?;
+        let dex = mobile_oracle::bootstrap::android_bootstrap(library)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&first)?;
+        file.write_all(&dex)?;
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
     let (output, passed) = if command == "material" {
         let recipe = PathBuf::from(args.next().context("missing recipe path")?);
         let repository = match args.next() {
