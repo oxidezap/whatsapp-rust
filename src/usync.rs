@@ -137,7 +137,7 @@ impl Client {
         for _ in 0..DEVICE_REFRESH_MAX_ATTEMPTS {
             let generation = self.device_topology.current();
             let response = self
-                .execute(DeviceListSpec::new(
+                .execute_streaming(DeviceListSpec::new(
                     jids.clone(),
                     self.generate_request_id(),
                 ))
@@ -196,7 +196,9 @@ impl Client {
         }
         if freshness == crate::cache::Freshness::CachePreferred {
             let sid = self.generate_request_id();
-            let response = self.execute(DeviceListSpec::new(jids, sid)).await?;
+            let response = self
+                .execute_streaming(DeviceListSpec::new(jids, sid))
+                .await?;
             return self
                 .process_device_list_response(&response, freshness)
                 .await;
@@ -206,7 +208,7 @@ impl Client {
             let topology_generation = self.device_topology.current();
             let sid = self.generate_request_id();
             let response = self
-                .execute(DeviceListSpec::new(jids, sid).require_complete_response())
+                .execute_streaming(DeviceListSpec::new(jids, sid).require_complete_response())
                 .await?;
 
             if let Some(devices) = self
@@ -637,7 +639,7 @@ impl Client {
 
         let sid = self.generate_request_id();
         let spec = DeviceListSpec::with_hashes(jids, sid, hashes);
-        let response = self.execute(spec).await?;
+        let response = self.execute_streaming(spec).await?;
         // `process_device_list_response` only touches users the server actually
         // returned, so unchanged (omitted) own devices keep their cache.
         let devices = self

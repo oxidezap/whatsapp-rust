@@ -928,6 +928,46 @@ mod tests {
     use wacore_binary::builder::NodeBuilder;
 
     #[tokio::test]
+    async fn streaming_rejects_contextual_or_error_handling_specs_before_sending() {
+        struct GuardedSpec {
+            contextual: bool,
+            errors: bool,
+        }
+        impl wacore::iq::spec::IqSpec for GuardedSpec {
+            type Response = ();
+            fn build_iq(&self) -> super::InfoQuery<'static> {
+                unreachable!("a contextual contract must not build a streaming request")
+            }
+            fn parse_response(&self, _: &wacore_binary::NodeRef<'_>) -> anyhow::Result<()> {
+                unreachable!("a contextual contract must not reach the legacy parser")
+            }
+            fn uses_contextual_response(&self) -> bool {
+                self.contextual
+            }
+            fn handles_iq_errors(&self) -> bool {
+                self.errors
+            }
+        }
+        impl wacore::iq::spec::IqStreamSpec for GuardedSpec {
+            fn consume_response(
+                &self,
+                _: &mut wacore_binary::NodeStream<'_>,
+            ) -> anyhow::Result<()> {
+                unreachable!("a contextual contract must not reach the stream parser")
+            }
+        }
+        let client = crate::test_utils::create_test_client().await;
+        for (contextual, errors) in [(true, false), (false, true), (true, true)] {
+            let result = client
+                .execute_streaming(GuardedSpec { contextual, errors })
+                .await;
+            assert!(matches!(result, Err(IqError::EncodeError(_))));
+            assert!(client.response_waiters_guard().is_empty());
+            assert_eq!(client.stream_waiter_count.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn generated_message_id_retains_the_wire_format() {
         let client = crate::test_utils::create_test_client().await;
         let first: crate::MessageId = client.generate_message_id();

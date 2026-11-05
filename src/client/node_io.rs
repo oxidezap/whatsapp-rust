@@ -3152,15 +3152,17 @@ mod tests {
             }
 
             /// Start the request, and hand back its id once it is on the wire.
-            async fn start(
+            async fn start<S>(
                 &self,
-                spec: PropsSpec,
+                spec: S,
             ) -> (
-                tokio::task::JoinHandle<
-                    Result<wacore::iq::props::PropsResponse, crate::request::IqError>,
-                >,
+                tokio::task::JoinHandle<Result<S::Response, crate::request::IqError>>,
                 String,
-            ) {
+            )
+            where
+                S: wacore::iq::spec::IqStreamSpec + Send + 'static,
+                S::Response: Send + 'static,
+            {
                 let client = Arc::clone(&self.client);
                 let pending = tokio::spawn(async move { client.execute_streaming(spec).await });
                 let transport = Arc::clone(&self.transport);
@@ -3270,6 +3272,102 @@ mod tests {
                 })
                 .collect();
             assert_eq!(observed, vec!["iq".to_string()]);
+        }
+
+        fn device_result(id: &str) -> Vec<u8> {
+            marshal(
+                &NodeBuilder::new("iq")
+                    .attr("type", "result")
+                    .attr("id", id)
+                    .children([NodeBuilder::new("usync")
+                        .children([NodeBuilder::new("list")
+                            .children([NodeBuilder::new("user")
+                                .attr("jid", Jid::pn("15550000101"))
+                                .children([NodeBuilder::new("devices")
+                                    .children([NodeBuilder::new("device-list")
+                                        .children([NodeBuilder::new("device")
+                                            .attr("id", 0u16)
+                                            .build()])
+                                        .build()])
+                                    .build()])
+                                .build()])
+                            .build()])
+                        .build()])
+                    .build(),
+            )
+            .expect("marshal device response")
+        }
+
+        #[tokio::test]
+        async fn device_list_streaming_preserves_raw_observer_replay() {
+            use wacore::iq::usync::DeviceListSpec;
+            for observed in [false, true] {
+                for packed in [false, true] {
+                    let h = Harness::new().await;
+                    let raw = Arc::new(crate::test_utils::TestEventCollector::default());
+                    let _lease = if observed {
+                        h.client
+                            .core
+                            .event_bus
+                            .subscribe_handler(raw.clone())
+                            .detach();
+                        Some(h.client.acquire_raw_node_forwarding())
+                    } else {
+                        None
+                    };
+                    let spec = DeviceListSpec::new(vec![Jid::pn("15550000101")], "fixture")
+                        .require_complete_response();
+                    let (pending, id) = h.start(spec).await;
+                    let plain = device_result(&id);
+                    let reader = h
+                        .deliver(if packed { compressed(&plain) } else { plain })
+                        .await;
+                    let response = pending.await.expect("task").expect("device response");
+                    h.close(reader).await;
+                    assert_eq!(response.device_lists.len(), 1);
+                    assert_eq!(response.device_lists[0].devices[0].device, 0);
+                    assert_eq!(
+                        raw.events()
+                            .iter()
+                            .filter(|event| matches!(&***event, Event::RawNode(_)))
+                            .count(),
+                        usize::from(observed)
+                    );
+                    assert_eq!(h.client.stream_waiter_count.load(Ordering::Acquire), 0);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn device_list_streaming_rejects_a_corrupt_compression_trailer() {
+            use wacore::iq::usync::DeviceListSpec;
+            let h = Harness::new().await;
+            let (pending, id) = h.start(DeviceListSpec::new(vec![], "fixture")).await;
+            // Put the trailer beyond the initial inflate window, so the read
+            // loop can identify the waiter before it encounters the corruption.
+            let plain = marshal(
+                &NodeBuilder::new("iq")
+                    .attr("type", "result")
+                    .attr("id", id)
+                    .children([
+                        NodeBuilder::new("usync")
+                            .children([NodeBuilder::new("list").build()])
+                            .build(),
+                        NodeBuilder::new("ignored").bytes(vec![7; 8192]).build(),
+                    ])
+                    .build(),
+            )
+            .expect("marshal padded response");
+            let mut packed = compressed(&plain);
+            *packed.last_mut().expect("trailer") ^= 1;
+            let reader = h.deliver(packed).await;
+            let error = pending.await.expect("task").expect_err("corrupt trailer");
+            h.close(reader).await;
+            assert!(
+                matches!(error, crate::request::IqError::ParseError(_)),
+                "{error:?}"
+            );
+            assert_eq!(h.client.stream_waiter_count.load(Ordering::Acquire), 0);
         }
 
         /// An error stanza is never streamed: it is decoded whole and reported
