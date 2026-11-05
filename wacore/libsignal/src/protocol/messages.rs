@@ -275,6 +275,11 @@ impl TryFrom<Bytes> for PreKeySignalMessage {
         let base = public(&view.base_key)?;
         let range = range_of(&bytes, view.message);
         let inner = SignalMessage::try_from(bytes.slice(range))?;
+        if (bytes[0] >> 4) != inner.message_version() {
+            return Err(SignalProtocolError::UnrecognizedCiphertextVersion(
+                bytes[0] >> 4,
+            ));
+        }
         Ok(Self {
             bytes,
             parsed,
@@ -791,6 +796,39 @@ mod borrowed_tests {
                     inner,
                 );
                 assert_eq!(result.is_ok(), outer == inner_version);
+            }
+        }
+    }
+    #[test]
+    fn prekey_parsers_reject_mixed_inner_and_outer_versions() {
+        for outer in [3, 4] {
+            for inner_version in [3, 4] {
+                let mut inner = signal_bytes();
+                inner[0] = (inner_version << 4) | 3;
+                let mut encoded = engine::wire::PreKeySignalMessage {
+                    registration: 5,
+                    pre_key_id: Some(6),
+                    signed_pre_key_id: 7,
+                    base_key: [8; 32],
+                    identity: [9; 32],
+                    message: inner,
+                }
+                .encode();
+                encoded[0] = (outer << 4) | 3;
+                for result in [
+                    PreKeySignalMessage::try_from(encoded.as_slice()),
+                    PreKeySignalMessage::try_from(Bytes::from(encoded.clone())),
+                ] {
+                    if outer == inner_version {
+                        let parsed = result.unwrap();
+                        assert_eq!(parsed.message_version(), outer);
+                        assert_eq!(parsed.message().message_version(), inner_version);
+                    } else {
+                        assert!(
+                            matches!(result, Err(SignalProtocolError::UnrecognizedCiphertextVersion(version)) if version == outer)
+                        );
+                    }
+                }
             }
         }
     }
