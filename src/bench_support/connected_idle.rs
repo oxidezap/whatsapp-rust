@@ -596,9 +596,22 @@ impl Session {
         self.settle().await
     }
 
-    /// Measure only after `receive_activity` or `finish_control` has joined
-    /// startup. A new initialization invalidates the sample instead of becoming
-    /// hidden scheduler work in the maintenance cost.
+    /// Finish setup-only Signal work before measuring cache maintenance.
+    ///
+    /// The synchronous flush in `receive_activity` does not disarm the worker
+    /// scheduled by live receives. On a current-thread runtime that worker can
+    /// otherwise wake inside the next measured `block_on`. Observe its state
+    /// with a bounded wait, rather than assuming a fixed sleep was long enough.
+    /// Keep this separate from `receive_activity`: benchmarks of receiving must
+    /// retain the production flush costs.
+    pub async fn prepare_maintenance(&self) -> Result<()> {
+        self.wait_until(|| !self.client.signal_flush_worker_armed())
+            .await
+            .context("signal flush worker did not finish before maintenance")
+    }
+
+    /// Measure after startup and `prepare_maintenance` have finished. Pending
+    /// setup work invalidates the sample instead of being timed as maintenance.
     pub async fn maintenance(&self) -> Result<()> {
         let started = self.client.bench_startup.started();
         let initialization_iqs = self.initialization_iqs();
@@ -606,8 +619,16 @@ impl Session {
             self.client.bench_startup.pending() == 0,
             "startup is still in flight before maintenance"
         );
+        ensure!(
+            !self.client.signal_flush_worker_armed(),
+            "signal flush worker is still armed before maintenance"
+        );
         self.client.run_cache_maintenance().await;
         self.settle().await?;
+        ensure!(
+            !self.client.signal_flush_worker_armed(),
+            "signal flush worker entered measured maintenance"
+        );
         ensure!(
             self.client.bench_startup.pending() == 0
                 && self.client.bench_startup.started() == started
@@ -1019,6 +1040,33 @@ impl Transport for Wire {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_rejects_flush_worker_left_by_activity() -> Result<()> {
+        let backend = BackendFixture::memory();
+        let session = Session::connect(backend.backend()).await?;
+        let activity = session.prepare_activity().await?;
+        session.receive_activity(activity).await?;
+        ensure!(
+            session.client.signal_flush_worker_armed(),
+            "activity must reproduce the pending setup worker"
+        );
+        let error = session
+            .maintenance()
+            .await
+            .expect_err("setup is not quiescent");
+        ensure!(
+            error
+                .to_string()
+                .contains("signal flush worker is still armed")
+        );
+        session.prepare_maintenance().await?;
+        ensure!(!session.client.signal_flush_worker_armed());
+        session.maintenance().await?;
+        session.maintenance().await?;
+        session.shutdown().await?;
+        backend.cleanup()
+    }
 
     #[tokio::test]
     async fn prepared_activity_joins_passive_startup_but_preserves_offline_drain() -> Result<()> {

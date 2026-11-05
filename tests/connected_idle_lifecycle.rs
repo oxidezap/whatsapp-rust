@@ -148,6 +148,8 @@ async fn activity_setup_excludes_initialization_from_maintenance() -> Result<()>
             initialization_iqs > 0,
             "activity did not exercise initialization"
         );
+        session.prepare_maintenance().await?;
+        session.maintenance().await?;
         session.maintenance().await?;
         ensure!(session.initialization_iqs() == initialization_iqs);
         session.shutdown().await?;

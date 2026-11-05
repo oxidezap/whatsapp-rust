@@ -73,10 +73,15 @@ Boolean arguments mean `false = InMemoryBackend`, `true = file-backed SQLite`.
   Registration happens before spawn under `bench-harness`, with RAII completion
   on return or cancellation. Empty IQ waiters alone cannot establish this barrier:
   initialization may be unpolled or awaiting SQLite before its next query.
+  Setup also calls `prepare_maintenance` to wait, with a timeout, until the
+  coalesced Signal flush worker stands down. Activity's synchronous flush does
+  not disarm that worker; without this barrier its timer can fire in the timed
+  maintenance closure. The activity benchmark retains its receive/flush costs.
   Only the explicit production cache sweep and settling are timed. Maintenance
-  rejects pending/new initialization and checks the synthetic wire's initialization
-  IQ count; it never waits for startup inside this timed region. Periodic keepalive
-  and other session-long workers are deliberately not part of the startup barrier.
+  rejects an armed Signal flush worker and pending/new initialization, and checks
+  the synthetic wire's initialization IQ count; it never waits for startup inside
+  this timed region. Periodic keepalive and other session-long workers are
+  deliberately not part of the startup barrier.
 * Both use fresh fixtures; graceful shutdown/database cleanup is outside timing.
   Shutdown/database cleanup errors fail the fixture. `AllocProfiler` supplies
   native Divan allocation columns and CodSpeed uses its
