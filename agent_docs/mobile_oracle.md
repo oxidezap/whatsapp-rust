@@ -53,6 +53,51 @@ to contact registration endpoints, send SMS or use an account for these steps.
 Tool references: [apksigner](https://developer.android.com/tools/apksigner) and
 [apkanalyzer](https://developer.android.com/tools/apkanalyzer).
 
+## Reproduce acquisition by content identity
+
+Use `cargo xt mobile-apk --help` for host-only acquisition tasks. An acquisition
+lock pins the exact file SHA-256 and byte length, with a declared version label
+and the stable official source page. Commit the reviewed lock, not the APK or
+the temporary CDN URL. Pinning a local file is an explicit operation; fetching
+or importing against an existing lock must never update its expected hash.
+
+The version label is operator metadata. It does not prove the APK's manifest
+version, package, signer or authenticity. The acquisition lock is separate from
+the qualified evidence lock below, which also records independently reviewed
+signature and analysis evidence.
+
+Restore from the content-addressed local cache or an approved durable private
+copy, or supply a current HTTPS download location through the command's named
+environment variable. Every path must check the same locked hash and size.
+A rotated URL is acceptable only if it delivers those exact bytes. A new APK
+requires a new reviewed lock; do not fall back to the latest release.
+
+This follows whatspec's separation of content identity from fetch location.
+The official CDN does not promise historical availability. A hash pins bytes
+but cannot make an expired URL work or recover bytes deleted from storage.
+Preserve a permitted private copy for long-term restoration. Do not create
+public APK release assets automatically, infer redistribution permission from
+whatspec's Web bundle store, or publish signed download queries.
+
+```sh
+# Create a new acquisition lock after reviewing the source and version label.
+cargo xt mobile-apk pin --input /capture/WhatsApp.apk --version VERSION --lock /capture/download.lock.json
+# Import the exact locked bytes, including when network access is unavailable.
+cargo xt mobile-apk import --lock /capture/download.lock.json --input /capture/WhatsApp.apk
+cargo xt mobile-apk verify --lock /capture/download.lock.json
+# Set WHATSAPP_APK_URL privately to a current, permitted direct HTTPS location.
+cargo xt mobile-apk fetch --lock /capture/download.lock.json
+```
+
+The default cache is `target/mobile-apk/<sha256>/WhatsApp.apk`; `--cache` selects
+another operator-controlled cache root. Preserve durable copies outside disposable
+build directories. `--url-env` selects a different environment variable name.
+Do not paste the signed URL into tracked scripts, shell history or CI output.
+Redirects are rejected; supply the direct final location. Normal proxy and TLS
+validation remain enabled. Configure a trusted PEM bundle through `SSL_CERT_FILE`
+when the permitted proxy requires it; do not disable certificate verification.
+Neither download nor import runs or installs the APK.
+
 ## Verify a local snapshot
 
 ```sh

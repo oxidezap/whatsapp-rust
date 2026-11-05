@@ -5546,13 +5546,17 @@ dependencies = [
  "anyhow",
  "clap",
  "flate2",
+ "hex",
  "regex",
  "semver",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "tar",
  "tempfile",
  "toml 1.1.8+spec-1.1.0",
+ "ureq",
+ "url",
  "xtask-support",
 ]
 
