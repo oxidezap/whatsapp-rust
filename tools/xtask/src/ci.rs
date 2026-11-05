@@ -8,20 +8,6 @@ use xtask_support::{capture, write};
 
 #[derive(Subcommand)]
 pub enum Task {
-    /// Build identical cache workloads against two immutable library revisions.
-    CachePairPrepare {
-        #[arg(long)]
-        base_revision: String,
-        #[arg(long)]
-        head_revision: String,
-        #[arg(long, default_value = ".cache-pair-out")]
-        out_dir: PathBuf,
-    },
-    /// Run alternating cache samples under the enclosing CodSpeed instrument.
-    CachePairMeasure {
-        #[arg(long, default_value = ".cache-pair-out")]
-        out_dir: PathBuf,
-    },
     /// Build the same synthetic classic Signal workloads against immutable revisions.
     SignalPairPrepare {
         #[arg(long)]
@@ -267,16 +253,6 @@ fn timed_report(
 
 pub fn run(root: &Path, task: Task) -> Result<u8> {
     match task {
-        Task::CachePairPrepare {
-            base_revision,
-            head_revision,
-            out_dir,
-        } => {
-            super::cache_pair::prepare(root, &base_revision, &head_revision, &out_dir)?;
-        }
-        Task::CachePairMeasure { out_dir } => {
-            super::cache_pair::measure(root, &out_dir)?;
-        }
         Task::SignalPairPrepare {
             base_revision,
             head_revision,
