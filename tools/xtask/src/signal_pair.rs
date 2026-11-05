@@ -286,7 +286,7 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
             for target_bench in benches {
                 command.args(["--bench", target_bench]);
             }
-            command.args(["--", "--locked"]);
+            command.arg("--locked");
             run(&mut command)?;
         }
         ensure_locked_dependencies(&checkout)?;

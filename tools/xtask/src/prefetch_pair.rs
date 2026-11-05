@@ -423,7 +423,6 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
                 &item.address_bench,
                 "--bench",
                 &item.sdk_bench,
-                "--",
                 "--locked",
             ]))?;
         ensure_locked_dependencies(&item.checkout)?;
