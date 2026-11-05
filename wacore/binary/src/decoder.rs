@@ -4,6 +4,7 @@ use crate::node::{AttrsRef, NodeContentRef, NodeRef, NodeStr, ValueRef};
 use crate::token;
 use compact_str::CompactString;
 use std::borrow::Cow;
+use std::mem::MaybeUninit;
 
 /// Each byte's two output characters, so unpacking is one load and one 2-byte
 /// store per input byte instead of two shifts, two lookups and two bounds
@@ -352,9 +353,8 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    /// Decode packed nibble/hex into a stack buffer, then create CompactString.
-    /// Max unpacked length is 254 bytes (127 packed × 2), so the stack buffer
-    /// is always sufficient. Short values (≤24 bytes) are stored inline.
+    /// Decode directly into the final inline or heap string, avoiding a
+    /// zeroed maximum-size scratch buffer and a second copy of the output.
     fn read_packed(&mut self, tag: u8) -> Result<CompactString> {
         let packed_len_byte = self.read_u8()?;
         let is_half_byte = (packed_len_byte & 0x80) != 0;
@@ -365,25 +365,26 @@ impl<'a> Decoder<'a> {
         }
 
         let packed_data = self.read_bytes(len)?;
-        let mut buf = [0u8; 254];
+        let written = len * 2;
+        let mut output = CompactString::with_capacity(written);
+        // SAFETY: Only spare capacity is written; the string stays empty until
+        // decoding succeeds. An invalid nibble can therefore return early and
+        // drop the allocation without exposing partially initialized bytes.
+        let spare = unsafe { output.spare_capacity_mut() };
         let mut pos = 0;
-
         match tag {
-            token::HEX_8 => Self::decode_packed_hex(packed_data, &mut buf, &mut pos),
-            token::NIBBLE_8 => Self::decode_packed_nibble(packed_data, &mut buf, &mut pos)?,
+            token::HEX_8 => Self::decode_packed_hex(packed_data, spare, &mut pos),
+            token::NIBBLE_8 => Self::decode_packed_nibble(packed_data, spare, &mut pos)?,
             _ => return Err(BinaryError::InvalidToken(tag)),
         }
-
-        if is_half_byte && pos > 0 {
+        if is_half_byte {
             pos -= 1;
         }
-
-        // Unlike `read_string`, which validates bytes that came off the wire,
-        // this validates bytes the tables above just wrote, so it can never
-        // fail. Keeping a check at all is cheap insurance against a future
-        // table edit; smoothutf8 is the same validator the wire path uses.
-        let s = smoothutf8::from_utf8(&buf[..pos]).expect("packed decode produced non-ASCII");
-        Ok(CompactString::from(s))
+        // SAFETY: Both decoders initialize exactly `written` bytes, all ASCII
+        // (including NUL for nibble 15). The final nibble is validated even
+        // when the half-byte flag omits it. `pos <= written <= capacity()`.
+        unsafe { output.set_len(pos) };
+        Ok(output)
     }
 
     // Deliberately scalar. A vectorised version of this loop lived here until
@@ -395,13 +396,15 @@ impl<'a> Decoder<'a> {
     // Packed payloads are ids and phone numbers, so the loop also needed a
     // 31-character string before it engaged at all.
     #[inline]
-    fn decode_packed_hex(packed_data: &[u8], out: &mut [u8], pos: &mut usize) {
+    fn decode_packed_hex(packed_data: &[u8], out: &mut [MaybeUninit<u8>], pos: &mut usize) {
         let written = packed_data.len() * 2;
         for (slot, &byte) in out[*pos..*pos + written]
             .chunks_exact_mut(2)
             .zip(packed_data)
         {
-            slot.copy_from_slice(&HEX_PAIRS[byte as usize]);
+            let pair = HEX_PAIRS[byte as usize];
+            slot[0].write(pair[0]);
+            slot[1].write(pair[1]);
         }
         *pos += written;
     }
@@ -411,7 +414,11 @@ impl<'a> Decoder<'a> {
     // out-of-range nibbles before it could shuffle, then fall back to this
     // loop anyway whenever a lane failed.
     #[inline]
-    fn decode_packed_nibble(packed_data: &[u8], out: &mut [u8], pos: &mut usize) -> Result<()> {
+    fn decode_packed_nibble(
+        packed_data: &[u8],
+        out: &mut [MaybeUninit<u8>],
+        pos: &mut usize,
+    ) -> Result<()> {
         let written = packed_data.len() * 2;
         for (slot, &byte) in out[*pos..*pos + written]
             .chunks_exact_mut(2)
@@ -423,7 +430,8 @@ impl<'a> Decoder<'a> {
                 Self::unpack_nibble((byte & 0xF0) >> 4)?;
                 Self::unpack_nibble(byte & 0x0F)?;
             }
-            slot.copy_from_slice(&pair);
+            slot[0].write(pair[0]);
+            slot[1].write(pair[1]);
         }
         *pos += written;
 
@@ -1017,6 +1025,58 @@ mod tests {
         decoder.read_bytes(3).unwrap();
         assert_eq!(decoder.bytes_left(), 0);
         assert!(decoder.is_finished());
+    }
+
+    /// Test hex packed string decoding
+    #[test]
+    fn packed_direct_output_matches_scalar_and_validates_trimmed_nibbles() {
+        for tag in [token::HEX_8, token::NIBBLE_8] {
+            for byte in 0..=255u8 {
+                for half in [false, true] {
+                    let bytes = [1 | if half { 128 } else { 0 }, byte];
+                    let actual = Decoder::new(&bytes).read_packed(tag);
+                    let glyph = |n| {
+                        if tag == token::HEX_8 {
+                            Ok(b"0123456789ABCDEF"[n as usize])
+                        } else {
+                            Decoder::unpack_nibble(n)
+                        }
+                    };
+                    let expected = glyph(byte >> 4).and_then(|high| {
+                        glyph(byte & 15).map(|low| {
+                            let pair = [high, low];
+                            String::from_utf8(pair[..if half { 1 } else { 2 }].to_vec()).unwrap()
+                        })
+                    });
+                    assert_eq!(
+                        actual
+                            .as_ref()
+                            .map(|s| s.as_str())
+                            .map_err(ToString::to_string),
+                        expected.as_deref().map_err(ToString::to_string),
+                        "tag {tag}, byte {byte}, half {half}",
+                    );
+                }
+            }
+        }
+        // Cover the inline limits on 32/64-bit targets and the wire maximum.
+        for len in [0, 1, 6, 7, 12, 13, 63, 127] {
+            for half in [false, true] {
+                let mut bytes = vec![len | if half { 128 } else { 0 }];
+                bytes.resize(1 + len as usize, 0x12);
+                for tag in [token::HEX_8, token::NIBBLE_8] {
+                    let expected_len = (len as usize * 2).saturating_sub(usize::from(half));
+                    let expected: String = "12".repeat(len as usize)[..expected_len].into();
+                    assert_eq!(Decoder::new(&bytes).read_packed(tag).unwrap(), expected);
+                    if len > 0 {
+                        assert!(matches!(
+                            Decoder::new(&bytes[..bytes.len() - 1]).read_packed(tag),
+                            Err(BinaryError::UnexpectedEof)
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     /// Test hex packed string decoding
