@@ -49,9 +49,9 @@ pub(crate) const MAX_NODE_DEPTH: usize = 128;
 
 /// A node's head as [`Decoder::read_node_open`] decodes it, its children left
 /// in the input.
-pub(crate) struct NodeOpen<'a> {
+pub(crate) struct NodeOpen<'a, A = AttrsRef<'a>> {
     pub(crate) tag: NodeStr<'a>,
-    pub(crate) attrs: AttrsRef<'a>,
+    pub(crate) attrs: A,
     pub(crate) content: OpenContent<'a>,
 }
 
@@ -447,16 +447,20 @@ impl<'a> Decoder<'a> {
         }
         let mut v = Vec::with_capacity(size);
         for _ in 0..size {
-            let Some(key) = self.read_value_as_string()? else {
-                return Err(BinaryError::NonStringKey);
-            };
-            let value = match self.read_value()? {
-                Some(v) => v,
-                None => ValueRef::String(NodeStr::Borrowed("")),
-            };
-            v.push((key, value));
+            v.push(self.read_attribute()?);
         }
         Ok(AttrsRef::from_vec(v))
+    }
+
+    pub(crate) fn read_attribute(&mut self) -> Result<(NodeStr<'a>, ValueRef<'a>)> {
+        let Some(key) = self.read_value_as_string()? else {
+            return Err(BinaryError::NonStringKey);
+        };
+        let value = match self.read_value()? {
+            Some(value) => value,
+            None => ValueRef::String(NodeStr::Borrowed("")),
+        };
+        Ok((key, value))
     }
 
     #[inline(always)]
@@ -520,6 +524,13 @@ impl<'a> Decoder<'a> {
     /// The counterpart of [`Self::read_node_ref_at`] for a node too large to
     /// hold as a tree; it reads exactly the bytes that precede the first child.
     pub(crate) fn read_node_open(&mut self) -> Result<NodeOpen<'a>> {
+        self.read_node_open_with(Self::read_attributes)
+    }
+
+    pub(crate) fn read_node_open_with<A>(
+        &mut self,
+        read_attributes: impl FnOnce(&mut Self, usize) -> Result<A>,
+    ) -> Result<NodeOpen<'a, A>> {
         let tag = self.read_u8()?;
         let list_size = self.read_list_size(tag)?;
         if list_size == 0 {
@@ -533,7 +544,7 @@ impl<'a> Decoder<'a> {
         let attr_count = (list_size - 1) / 2;
         let has_content = list_size.is_multiple_of(2);
 
-        let attrs = self.read_attributes(attr_count)?;
+        let attrs = read_attributes(self, attr_count)?;
         let content = if has_content {
             let content_tag = self.read_u8()?;
             match content_tag {

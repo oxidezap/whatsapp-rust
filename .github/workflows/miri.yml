@@ -116,3 +116,6 @@ jobs:
       # not the class of bug this gate is looking for.
       - name: Run tests under Miri
         run: cargo miri test ${{ matrix.args }}
+      - name: Check experimental frame ownership
+        if: matrix.name == 'wacore-binary'
+        run: cargo miri test -p wacore-binary --features bench-internals --test decoder_pool pooled_owned_

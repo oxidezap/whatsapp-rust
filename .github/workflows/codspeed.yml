@@ -5,7 +5,8 @@ on:
     branches: [main]
     paths-ignore: ["**.md", "docs/**"]
   pull_request:
-    branches: [main]
+    # Measure the stacked decoder experiment while its benchmark parent is draft.
+    branches: [main, bench/binary-attribute-storage]
     paths-ignore: ["**.md", "docs/**"]
   # Allows CodSpeed to trigger backtest performance analysis to generate
   # initial baseline data.
@@ -125,7 +126,7 @@ jobs:
           - name: proto-signal
             packages: -p wacore-binary -p wacore-libsignal -p wacore-appstate -p whatsapp-rust-sqlite-storage
             # Persisted-state import benchmarks are feature-gated.
-            features: --features wacore-libsignal/legacy-session-interop
+            features: --features wacore-libsignal/legacy-session-interop,wacore-binary/bench-internals
           # The client crate's own benchmarks. Its fixture needs crate-private
           # internals a bench target cannot otherwise reach, so it builds with
           # the non-default `bench-harness` feature. Its own shard rather than a

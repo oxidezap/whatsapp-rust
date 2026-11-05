@@ -12,6 +12,8 @@ description = "Binary data and constants for WhatsApp protocol"
 crate-type = ["rlib"]
 
 [features]
+# Unstable, non-default support for the isolated decoder storage experiment.
+bench-internals = []
 serde = ["dep:serde", "compact_str/serde", "smallvec/serde"]
 # Render raw phone numbers in `Jid::observe()` instead of the redacted `pn#<hash>`.
 # Local debugging only; never enable in production.
@@ -61,3 +63,12 @@ harness = false
 [[bench]]
 name = "attribute_storage_benchmark"
 harness = false
+
+[[bench]]
+name = "decoder_pool_benchmark"
+harness = false
+required-features = ["bench-internals"]
+
+[[test]]
+name = "decoder_pool"
+required-features = ["bench-internals"]
