@@ -784,12 +784,7 @@ mod tests {
                     assert_eq!(
                         crate::adv::validate_adv_with_identity_key(
                             &result,
-                            state
-                                .identity_key
-                                .public_key
-                                .public_key_bytes()
-                                .try_into()
-                                .unwrap(),
+                            state.identity_key.public_key.public_key_bytes(),
                             None,
                             &Jid::pn_device(TEST_PN, 1),
                         ),
@@ -854,12 +849,7 @@ mod tests {
         assert_eq!(
             crate::adv::validate_adv_with_identity_key(
                 &result,
-                state
-                    .identity_key
-                    .public_key
-                    .public_key_bytes()
-                    .try_into()
-                    .unwrap(),
+                state.identity_key.public_key.public_key_bytes(),
                 None,
                 &Jid::pn_device(TEST_PN, 1),
             ),

@@ -3779,11 +3779,13 @@ fn client_size_pins_runtime_cache_config_saving() {
     // table (32 inline bytes on this target); its count remains one pointer.
     // Every size-varying attachment is measured in this same build and stacked
     // on top, so only an unaccounted layout move trips the assert.
-    // CoreClient owns Device and its ClientProfile inline. The fixed base
-    // includes the old 152 B profile; selecting a web subplatform makes that
-    // profile 160 B on x86_64. Measure the attachment, as with the others.
-    let mut expected = (4288 - 152)
-        + size_of::<wacore::client_profile::ClientProfile>()
+    // CoreClient owns Device inline. The original fixed base included a
+    // 1032 B Device with a 152 B ClientProfile. Measure the whole attachment:
+    // three keypairs shrinking by 4 B each reduce Device by 16 B, including
+    // its padding. Adding their individual deltas would overcount by 4 B.
+    // With the current 160 B profile, main's Device is 1040 B and ours is 1024 B.
+    let mut expected = (4288 - 1032)
+        + size_of::<wacore::store::Device>()
         + size_of::<subsystem::Subsystems>()
         + size_of::<crate::handlers::call::pending_offers::PendingOffers>()
         + size_of::<Arc<std::sync::Mutex<crate::retry::HistoryPayloadRegistry>>>()
@@ -7493,13 +7495,7 @@ mod ensure_sessions_concurrency {
                 .load_identity(primary.to_protocol_address().as_str())
                 .await
                 .unwrap(),
-            Some(
-                keys.identity
-                    .public_key()
-                    .public_key_bytes()
-                    .try_into()
-                    .unwrap()
-            )
+            Some(*keys.identity.public_key().public_key_bytes())
         );
         let next = primary.with_device(3);
         let running = client.clone();
@@ -9271,6 +9267,64 @@ async fn wait_for_startup_sync_succeeds_when_history_tasks_finish() {
         .wait_for_startup_sync(Duration::from_secs(5))
         .await
         .expect("an idle activity tracker is a completed startup sync");
+}
+
+#[tokio::test]
+async fn ready_waiters_do_not_require_initial_prekey_upload() {
+    let client = offline_resume_test_client().await;
+    client.set_connected_for_test(true);
+    client.set_logged_in_for_test(true, Ordering::Relaxed);
+    client.set_ready_for_test(true, Ordering::Relaxed);
+    client.offline_sync_completed.store(true, Ordering::Release);
+    client
+        .persistence_manager
+        .modify_device(|device| device.server_has_prekeys = false)
+        .await;
+
+    let guard = client.prekey_upload_lock.lock().await;
+    let mut upload = std::pin::pin!(client.upload_pre_keys_at_login());
+    assert!(futures::poll!(upload.as_mut()).is_pending());
+
+    client.wait_for_session_ready(Duration::ZERO).await.unwrap();
+    client.wait_for_startup_sync(Duration::ZERO).await.unwrap();
+    assert!(
+        !client
+            .persistence_manager
+            .get_device_snapshot()
+            .server_has_prekeys
+    );
+    assert!(futures::poll!(upload.as_mut()).is_pending());
+    drop(guard);
+}
+
+#[tokio::test]
+async fn reconnect_success_publishes_connected_while_prekey_upload_is_blocked() {
+    let client = offline_resume_test_client().await;
+    client
+        .persistence_manager
+        .modify_device(|device| {
+            device.pn = Some("15550001000@s.whatsapp.net".parse().unwrap());
+            device.push_name = "Synthetic reconnect".into();
+            device.server_has_prekeys = false;
+        })
+        .await;
+    client.set_connected_for_test(true);
+    client.offline_sync_completed.store(true, Ordering::Release);
+    let guard = client.prekey_upload_lock.lock().await;
+    let success = NodeBuilder::new("success").build();
+    client.handle_success(&success.as_node_ref()).await;
+    client
+        .wait_for_session_ready(Duration::from_secs(2))
+        .await
+        .expect("post-login must publish Connected without awaiting the blocked upload");
+    assert!(
+        !client
+            .persistence_manager
+            .get_device_snapshot()
+            .server_has_prekeys
+    );
+    client.signal_shutdown_sync();
+    drop(guard);
 }
 
 /// A chat lane whose receiver the test owns: it decides when — or whether —

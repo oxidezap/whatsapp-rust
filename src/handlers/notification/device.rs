@@ -472,12 +472,12 @@ pub(crate) async fn handle_local_identity_change(
                     .user(sender)
                     .maybe_lid_user(None)
                     .implicit(true)
-                    .maybe_previous_identity_key(keys.and_then(|(previous, _)| {
-                        previous.public_key().public_key_bytes().try_into().ok()
-                    }))
-                    .maybe_current_identity_key(keys.and_then(|(_, current)| {
-                        current.public_key().public_key_bytes().try_into().ok()
-                    }))
+                    .maybe_previous_identity_key(
+                        keys.map(|(previous, _)| *previous.public_key().public_key_bytes()),
+                    )
+                    .maybe_current_identity_key(
+                        keys.map(|(_, current)| *current.public_key().public_key_bytes()),
+                    )
                     .build(),
             )
         });

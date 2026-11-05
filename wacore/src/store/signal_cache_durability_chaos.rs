@@ -649,6 +649,16 @@ impl ChaosHarness {
             .await
             .reservation_pending
             .contains(self.dm_address.as_str());
+        let incarnation = self.cache.lock_sessions().await.incarnation;
+        let expected_snapshot = if dm_was_gated {
+            record.as_ref().map(|record| {
+                let mut bytes = Vec::new();
+                record.serialize_into_for_store(&mut bytes, &incarnation);
+                bytes
+            })
+        } else {
+            None
+        };
         self.cache.flush(&self.backend).await?;
         match record {
             Some(record) => self.commit_dm(record, checkout, true).await?,
@@ -656,10 +666,13 @@ impl ChaosHarness {
                 .cache
                 .cancel_session_checkout(&self.dm_address, checkout),
         }
-        if dm_was_gated {
+        if dm_was_gated && !self.cache.needs_pre_wire_flush().await {
+            // A gated checkout retains an immutable snapshot. Releasing its gate
+            // is safe only when precisely that snapshot reached the backend.
+            let persisted = self.backend.get_session(self.dm_address.as_str()).await?;
             ensure!(
-                self.cache.needs_pre_wire_flush().await,
-                "flush released a checked-out session gate"
+                expected_snapshot.is_some() && persisted.as_deref() == expected_snapshot.as_deref(),
+                "flush released a checked-out session gate without persisting its snapshot"
             );
         }
         Ok(())

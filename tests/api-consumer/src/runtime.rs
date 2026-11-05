@@ -9,6 +9,9 @@ fn native_thread_bounds() {
     send_sync::<dyn Runtime>();
     send_sync::<AbortHandle>();
     send_sync::<wacore::stats::InstrumentedRuntime>();
+    send_sync::<dyn wacore::libsignal::crypto::SymmetricCryptoProvider>();
+    send_sync::<dyn wacore::libsignal::crypto::TransportAeadFactory>();
+    send_sync::<dyn wacore::libsignal::crypto::TransportAead>();
     #[cfg(feature = "voip-control")]
     send_sync::<wacore::voip_control::VideoTeardownHook>();
 }
@@ -19,7 +22,22 @@ fn native_thread_bounds() {
 mod local {
     use super::*;
     use std::{cell::Cell, future::Future, pin::Pin, rc::Rc, sync::Arc, time::Duration};
+    use wacore::libsignal::crypto::{
+        CryptoProviderError, RustCryptoProvider, SymmetricCryptoProvider,
+    };
     use wacore::stats::{InstrumentedRuntime, TaskInstrument};
+
+    struct LocalCrypto(Rc<Cell<usize>>);
+    impl SymmetricCryptoProvider for LocalCrypto {
+        fn hmac_sha256(
+            &self,
+            key: &[u8],
+            parts: &[&[u8]],
+        ) -> Result<[u8; 32], CryptoProviderError> {
+            self.0.set(self.0.get() + 1);
+            RustCryptoProvider.hmac_sha256(key, parts)
+        }
+    }
 
     struct LocalInstrument(Rc<Cell<usize>>);
 
@@ -77,6 +95,28 @@ mod local {
         );
         drop(metered.spawn(Box::pin(async {})));
         assert_eq!(calls.get(), 3);
+        let crypto_calls = Rc::new(Cell::new(0));
+        let provider: Arc<dyn SymmetricCryptoProvider> =
+            Arc::new(LocalCrypto(crypto_calls.clone()));
+        let provided = wacore::runtime::CryptoRuntime::new(
+            Arc::new(LocalRuntime(calls.clone())),
+            provider.clone(),
+        );
+        let metered = InstrumentedRuntime::new(
+            Arc::new(provided),
+            Arc::new(LocalInstrument(Rc::new(Cell::new(0)))),
+        );
+        let selected = metered
+            .crypto_provider()
+            .expect("decorators must forward crypto");
+        assert!(Arc::ptr_eq(&provider, &selected));
+        assert_eq!(
+            selected.hmac_sha256(b"key", &[b"synthetic"]).unwrap(),
+            RustCryptoProvider
+                .hmac_sha256(b"key", &[b"synthetic"])
+                .unwrap()
+        );
+        assert_eq!(crypto_calls.get(), 1);
         #[cfg(feature = "voip-control")]
         {
             let captured = calls.clone();

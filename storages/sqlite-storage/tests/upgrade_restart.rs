@@ -66,8 +66,8 @@ impl Drop for Fixture {
 fn keypair_bytes(pair: &KeyPair) -> Vec<u8> {
     // The v0.7.0 device writer stored private || unprefixed public bytes.
     [
-        pair.private_key.serialize(),
-        pair.public_key.public_key_bytes(),
+        pair.private_key.serialize().as_slice(),
+        pair.public_key.public_key_bytes().as_slice(),
     ]
     .concat()
 }

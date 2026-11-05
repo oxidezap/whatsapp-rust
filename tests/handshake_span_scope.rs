@@ -145,11 +145,7 @@ struct InProcessServer {
 impl InProcessServer {
     fn new() -> Self {
         let identity_kp = KeyPair::generate(&mut rand::rng());
-        let server_static_pub: [u8; 32] = identity_kp
-            .public_key
-            .public_key_bytes()
-            .try_into()
-            .expect("X25519 pub key is 32 bytes");
+        let server_static_pub: [u8; 32] = *identity_kp.public_key.public_key_bytes();
         let cert_chain_bytes = build_cert_chain_bytes(&server_static_pub);
         Self {
             identity_kp,
@@ -158,11 +154,7 @@ impl InProcessServer {
     }
 
     fn server_static_pub(&self) -> [u8; 32] {
-        self.identity_kp
-            .public_key
-            .public_key_bytes()
-            .try_into()
-            .expect("X25519 pub key is 32 bytes")
+        *self.identity_kp.public_key.public_key_bytes()
     }
 }
 
@@ -211,7 +203,7 @@ async fn xx_serve_full(
     let mut noise = NoiseHandshake::new(NOISE_PATTERN_XX, &WA_CONN_HEADER).unwrap();
     noise.authenticate(&client_eph_pub);
     let server_eph = KeyPair::generate(&mut rand::rng());
-    let server_eph_pub: [u8; 32] = server_eph.public_key.public_key_bytes().try_into().unwrap();
+    let server_eph_pub: [u8; 32] = *server_eph.public_key.public_key_bytes();
     noise.authenticate(&server_eph_pub);
     noise
         .mix_shared_secret(server_eph.private_key.serialize(), &client_eph_pub)

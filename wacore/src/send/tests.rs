@@ -4051,7 +4051,8 @@ mod mark_full_distribution_list {
 
         let err = encrypt_group_message(&mut sks, &name, b"hi", &mut rng)
             .await
-            .expect_err("a missing sender key must error");
+            .err()
+            .expect("a missing sender key must error");
         assert!(
             matches!(
                 err.downcast_ref::<SignalProtocolError>(),

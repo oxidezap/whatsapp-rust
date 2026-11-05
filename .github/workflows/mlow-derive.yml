@@ -68,6 +68,16 @@ jobs:
           # Reuse the tooling job's dependencies and the previous job's cache key.
           shared-key: rederive
           workspaces: . -> target
+      - name: Cache pinned WASM captures
+        uses: actions/cache@v6
+        with:
+          path: .cache/wa-wasm
+          key: voip-captures-${{ hashFiles('tools/oracle-core/wasm.lock.json') }}
+      - name: Restore pinned WASM captures
+        # Authenticate release lookup without passing the token to the oracles.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: cargo xt oracle fetch
       - name: Run complete VoIP conformance gate with slow signaling
         run: cargo xt oracle conformance --slow
       - uses: actions/upload-artifact@v7

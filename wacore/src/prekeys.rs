@@ -228,9 +228,8 @@ impl PreKeyUtils {
             if identity
                 .public_key()
                 .verify_signature(&prekey.serialize(), signature)
-                && let Ok(key) = <[u8; 32]>::try_from(identity.public_key().public_key_bytes())
             {
-                primary_identities.insert(jid, key);
+                primary_identities.insert(jid, *identity.public_key().public_key_bytes());
             }
         }
         let mut outcome = PreKeyFetchOutcome {
@@ -822,8 +821,7 @@ mod tests {
                         let response = NodeBuilder::new("iq")
                             .children([NodeBuilder::new("list").children([user]).build()])
                             .build();
-                        let fallbacks =
-                            HashMap::from([(jid.clone(), account_key.try_into().unwrap())]);
+                        let fallbacks = HashMap::from([(jid.clone(), *account_key)]);
                         let outcome = PreKeyUtils::parse_prekeys_response(
                             &response.as_node_ref(),
                             &fallbacks,

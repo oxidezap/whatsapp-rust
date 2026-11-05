@@ -103,11 +103,7 @@ impl ShortcakeSession {
         let mut new_adv_secret = [0u8; 32];
         rand::make_rng::<rand::rngs::StdRng>().fill(&mut new_adv_secret);
 
-        let companion_pub: [u8; 32] = keypair
-            .public_key
-            .public_key_bytes()
-            .try_into()
-            .map_err(|_| PasskeyError::Flow("ephemeral public key is not 32 bytes".into()))?;
+        let companion_pub = *keypair.public_key.public_key_bytes();
         let identity = ShortcakeUtils::build_companion_ephemeral_identity(
             &companion_pub,
             device_type,
@@ -389,18 +385,8 @@ impl ShortcakeIo for Client {
 
     fn device_material(&self) -> Result<DeviceMaterial, PasskeyError> {
         let snapshot = self.persistence_manager.get_device_snapshot();
-        let noise_public: [u8; 32] = snapshot
-            .noise_key
-            .public_key
-            .public_key_bytes()
-            .try_into()
-            .map_err(|_| PasskeyError::Flow("noise public key is not 32 bytes".into()))?;
-        let identity_public: [u8; 32] = snapshot
-            .identity_key
-            .public_key
-            .public_key_bytes()
-            .try_into()
-            .map_err(|_| PasskeyError::Flow("identity public key is not 32 bytes".into()))?;
+        let noise_public = *snapshot.noise_key.public_key.public_key_bytes();
+        let identity_public = *snapshot.identity_key.public_key.public_key_bytes();
         Ok(DeviceMaterial {
             noise_public,
             identity_public,
@@ -802,7 +788,7 @@ mod tests {
 
         // primary's ephemeral identity
         let primary_kp = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
-        let primary_pub: [u8; 32] = primary_kp.public_key.public_key_bytes().try_into().unwrap();
+        let primary_pub: [u8; 32] = *primary_kp.public_key.public_key_bytes();
         let primary_nonce = [0x77u8; 32];
         let primary_bytes = {
             let mut proto = wa::PrimaryEphemeralIdentity::default();

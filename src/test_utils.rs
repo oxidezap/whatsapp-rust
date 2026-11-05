@@ -3,6 +3,93 @@ use std::sync::Arc;
 use crate::Client;
 use wacore_binary::{Jid, Node, OwnedNodeRef};
 
+pub(crate) mod crypto {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use wacore::libsignal::crypto::{
+        CryptoProviderError, RustCryptoProvider, SymmetricCryptoProvider,
+    };
+
+    #[derive(Default)]
+    pub(crate) struct CountingCrypto {
+        pub encrypts: AtomicUsize,
+        pub decrypts: AtomicUsize,
+        pub macs: AtomicUsize,
+        pub fail_encrypt: AtomicBool,
+        pub fail_decrypt: AtomicBool,
+        pub fail_mac: AtomicBool,
+    }
+    impl SymmetricCryptoProvider for CountingCrypto {
+        fn aes_256_cbc_encrypt(
+            &self,
+            key: &[u8; 32],
+            iv: &[u8; 16],
+            plaintext: &[u8],
+            out: &mut Vec<u8>,
+        ) -> Result<(), CryptoProviderError> {
+            self.encrypts.fetch_add(1, Ordering::Relaxed);
+            if self.fail_encrypt.load(Ordering::Relaxed) {
+                return Err(CryptoProviderError::BackendFailed);
+            }
+            RustCryptoProvider.aes_256_cbc_encrypt(key, iv, plaintext, out)
+        }
+        fn aes_256_cbc_decrypt(
+            &self,
+            key: &[u8; 32],
+            iv: &[u8; 16],
+            ciphertext: &[u8],
+            out: &mut Vec<u8>,
+        ) -> Result<(), CryptoProviderError> {
+            self.decrypts.fetch_add(1, Ordering::Relaxed);
+            if self.fail_decrypt.load(Ordering::Relaxed) {
+                return Err(CryptoProviderError::BackendFailed);
+            }
+            RustCryptoProvider.aes_256_cbc_decrypt(key, iv, ciphertext, out)
+        }
+        fn aes_256_cbc_decrypt_in_place(
+            &self,
+            key: &[u8; 32],
+            iv: &[u8; 16],
+            buffer: &mut Vec<u8>,
+        ) -> Result<(), CryptoProviderError> {
+            self.decrypts.fetch_add(1, Ordering::Relaxed);
+            if self.fail_decrypt.load(Ordering::Relaxed) {
+                return Err(CryptoProviderError::BackendFailed);
+            }
+            RustCryptoProvider.aes_256_cbc_decrypt_in_place(key, iv, buffer)
+        }
+        fn hmac_sha256(
+            &self,
+            key: &[u8],
+            parts: &[&[u8]],
+        ) -> Result<[u8; 32], CryptoProviderError> {
+            self.macs.fetch_add(1, Ordering::Relaxed);
+            if self.fail_mac.load(Ordering::Relaxed) {
+                return Err(CryptoProviderError::BackendFailed);
+            }
+            RustCryptoProvider.hmac_sha256(key, parts)
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn default_backend_authenticates_borrowed_chunks_without_payload_copies() {
+        struct AesBackend;
+        impl SymmetricCryptoProvider for AesBackend {}
+        let first = vec![3; 8192];
+        let second = vec![4; 65536];
+        let expected = wacore::libsignal::crypto::hmac_sha256_two_part(b"key", &first, &second);
+        let provider: &dyn SymmetricCryptoProvider = &AesBackend;
+        let (heap, actual) = crate::test_alloc::heap_sample(|| {
+            provider.hmac_sha256(b"key", &[&first, &[], &second])
+        });
+        assert_eq!(actual.unwrap(), expected);
+        assert_eq!(
+            heap.allocations, 0,
+            "multipart authentication must not concatenate the payload"
+        );
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn adv_test_account() -> &'static wacore::libsignal::protocol::KeyPair {
     static KEY: std::sync::OnceLock<wacore::libsignal::protocol::KeyPair> =
@@ -1057,4 +1144,30 @@ pub(crate) async fn create_primary_iq_test_client_with_app_state_policy(
     client.set_driver_running_for_test(true, std::sync::atomic::Ordering::Release);
     client.enter_live_mode_for_tests();
     (client, transport)
+}
+
+/// A structurally valid session for tests of registration and address metadata.
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn synthetic_serialized_session(
+    remote_registration: u32,
+    base: Option<&[u8]>,
+) -> Vec<u8> {
+    use buffa::Message as _;
+    let mut session = waproto::whatsapp::SessionStructure::default();
+    session.session_version = Some(3);
+    let mut local = vec![5];
+    local.extend_from_slice(&[0x11; 32]);
+    let mut remote = vec![5];
+    remote.extend_from_slice(&[0x22; 32]);
+    session.local_identity_public = Some(local);
+    session.remote_identity_public = Some(remote);
+    session.root_key = Some(vec![0x33; 32]);
+    session.previous_counter = Some(0);
+    session.local_registration_id = Some(0);
+    session.remote_registration_id = Some(remote_registration);
+    session.alice_base_key = base.map(<[u8]>::to_vec);
+    let mut record = waproto::whatsapp::RecordStructure::default();
+    record.current_session = buffa::MessageField::some(session);
+    record.encode_to_vec()
 }

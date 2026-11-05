@@ -191,12 +191,32 @@ async fn test_lease_covered_send_survives_persist_failure() -> anyhow::Result<()
     let jid_a = client_a.jid().await;
     let jid_b = client_b.jid().await;
 
-    // Establish both ways: the lease raise happens (and is persisted) here.
     send_and_expect_text(&client_a.client, &mut client_b, &jid_b, "establish", 30).await?;
-    send_and_expect_text(&client_b.client, &mut client_a, &jid_a, "reply", 30).await?;
 
-    // Storage starts refusing session writes; the next send is lease-covered,
-    // so it must still deliver.
+    // The reply creates a fresh local sending ratchet. Refuse writes before
+    // receiving it so the coalescer cannot persist that new private key first.
+    client_a.backend.set_fail_session_writes(true);
+    send_and_expect_text(&client_b.client, &mut client_a, &jid_a, "reply", 30).await?;
+    let writes_before = client_a.backend.session_batch_write_count();
+    let mut sent_waiter = client_a.next_sent_message_waiter();
+    let blocked = client_a
+        .client
+        .send_message(jid_b.clone(), e2e_tests::text_msg("undurable ratchet"))
+        .await;
+    assert!(
+        blocked.is_err(),
+        "a fresh ratchet needs durable private-key state"
+    );
+    assert!(client_a.backend.session_batch_write_count() > writes_before);
+    assert!(
+        matches!(sent_waiter.try_recv(), Ok(None)),
+        "an undurable fresh ratchet must not reach send_node"
+    );
+
+    // Persist the new private key and its lease, then refuse writes again.
+    // The next same-chain send is covered by that exact durable snapshot.
+    client_a.backend.set_fail_session_writes(false);
+    client_a.client.flush_pending_signal_state().await?;
     client_a.backend.set_fail_session_writes(true);
     send_and_expect_text(
         &client_a.client,

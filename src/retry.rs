@@ -1511,7 +1511,7 @@ impl Client {
             // retry == 2: save base key, do NOT delete (WA Web L66-67).
             match device_snapshot
                 .backend
-                .save_base_key(addr_str, message_id, current_base_key)
+                .save_base_key(addr_str, message_id, &current_base_key)
                 .await
             {
                 Ok(()) => info!(
@@ -1531,7 +1531,7 @@ impl Client {
         if base_key_action(retry_count) == BaseKeyAction::Check {
             match device_snapshot
                 .backend
-                .has_same_base_key(addr_str, message_id, current_base_key)
+                .has_same_base_key(addr_str, message_id, &current_base_key)
                 .await
             {
                 Ok(true) => {
@@ -3032,29 +3032,7 @@ mod tests {
     // Produces a parseable SessionRecord so peek_session succeeds and
     // alice_base_key/remote_registration_id return meaningful values.
     fn valid_serialized_session(remote_regid: u32, base_key: Vec<u8>) -> Vec<u8> {
-        use wacore::libsignal::protocol::{SessionRecord, SessionState};
-        use waproto::whatsapp::SessionStructure;
-
-        let state = SessionState::from_session_structure({
-            let mut proto = SessionStructure::default();
-            proto.session_version = Some(3);
-            proto.local_identity_public = None;
-            proto.remote_identity_public = None;
-            proto.root_key = None;
-            proto.previous_counter = Some(0);
-            proto.sender_chain = buffa::MessageField::default();
-            proto.receiver_chains = vec![];
-            proto.pending_pre_key = buffa::MessageField::default();
-            proto.remote_registration_id = Some(remote_regid);
-            proto.local_registration_id = Some(0);
-            proto.alice_base_key = Some(base_key);
-            proto.needs_refresh = None;
-            proto.pending_key_exchange = buffa::MessageField::default();
-            proto
-        });
-        SessionRecord::new(state)
-            .serialize()
-            .expect("serialize session record")
+        crate::test_utils::synthetic_serialized_session(remote_regid, Some(&base_key))
     }
 
     /// WA Web compliance: at retry #1 with no `<keys>`, `updateLocalSignalSession`

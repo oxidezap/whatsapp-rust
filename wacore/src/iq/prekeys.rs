@@ -465,7 +465,7 @@ impl IqSpec for PreKeyUploadSpec {
             &self.signed_pre_key_signature,
             self.pre_keys
                 .iter()
-                .map(|(id, pk)| (*id, pk.public_key_bytes())),
+                .map(|(id, pk)| (*id, pk.public_key_bytes().as_slice())),
         );
 
         InfoQuery::set(
