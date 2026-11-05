@@ -146,3 +146,5 @@ SDKs/ABIs, production token-material selection, signing-history behavior, JNI
 protocol crypto, attestation, account registration and server acceptance remain
 unqualified. Neither Android evidence nor JVM agreement qualifies iOS, ESP32 or
 an application's complete mobile API.
+
+The next independently scoped probes cover [original Superpack extraction and Curve25519 JNI](PROTOCOL.md). They add a bounded native crypto comparison while retaining the application/session limits above.
