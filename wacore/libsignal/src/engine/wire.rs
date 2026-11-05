@@ -30,9 +30,20 @@ impl<'a> Fields<'a> {
         }
         Ok(Self { bytes })
     }
+    #[inline]
     fn varint(&mut self) -> Result<u64> {
-        let mut value = 0;
-        for i in 0..10 {
+        let (&first, rest) = self
+            .bytes
+            .split_first()
+            .ok_or(Error::Encoding("truncated varint"))?;
+        self.bytes = rest;
+        if first < 128 {
+            return Ok(u64::from(first));
+        }
+        self.varint_tail(u64::from(first & 127))
+    }
+    fn varint_tail(&mut self, mut value: u64) -> Result<u64> {
+        for i in 1..10 {
             let (&byte, rest) = self
                 .bytes
                 .split_first()
@@ -537,6 +548,58 @@ impl<'a> SenderKeyMessageView<'a> {
 #[cfg(test)]
 mod borrowed_tests {
     use super::*;
+    #[test]
+    fn varint_fast_path_preserves_values_errors_and_consumed_bytes() {
+        fn reference(input: &mut &[u8]) -> Result<u64> {
+            let mut value = 0;
+            for i in 0..10 {
+                let (&byte, rest) = input
+                    .split_first()
+                    .ok_or(Error::Encoding("truncated varint"))?;
+                *input = rest;
+                if i == 9 && byte > 1 {
+                    return Err(Error::Encoding("varint overflow"));
+                }
+                value |= u64::from(byte & 127) << (7 * i);
+                if byte & 128 == 0 {
+                    return Ok(value);
+                }
+            }
+            Err(Error::Encoding("varint overflow"))
+        }
+        let mut cases = vec![vec![], vec![128; 10], vec![255; 11]];
+        for byte in 0..=255 {
+            cases.push(vec![byte]);
+            cases.push(vec![128, byte, 42]);
+            let mut longest = vec![128; 9];
+            longest.extend([byte, 42]);
+            cases.push(longest);
+        }
+        for bit in 0..64 {
+            for value in [
+                (1u64 << bit) - 1,
+                1u64 << bit,
+                (1u64 << bit).saturating_add(1),
+                u64::MAX,
+            ] {
+                let mut encoded = Vec::new();
+                varint(&mut encoded, value);
+                for len in 0..=encoded.len() {
+                    cases.push(encoded[..len].to_vec());
+                }
+                encoded.push(42);
+                cases.push(encoded);
+            }
+        }
+        for input in cases {
+            let mut old = input.as_slice();
+            let expected = reference(&mut old);
+            let mut fields = Fields::new(&input).unwrap();
+            assert_eq!(fields.varint(), expected, "input: {input:?}");
+            assert_eq!(fields.bytes, old, "input: {input:?}");
+        }
+    }
+
     #[test]
     fn wire_serialization_contract_across_varint_boundaries() {
         use crate::core::{IdentityKey, PublicKey};
