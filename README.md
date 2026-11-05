@@ -73,3 +73,7 @@ Browse GitHub's indexed public dependents for the [crates.io package](https://gi
 ## Disclaimer
 
 This is an unofficial client, not affiliated with WhatsApp or Meta. Using it may violate Meta's Terms of Service and could result in account suspension.
+
+## Acknowledgements
+
+Inspired by [whatsmeow](https://github.com/tulir/whatsmeow) and [Baileys](https://github.com/WhiskeySockets/Baileys).
