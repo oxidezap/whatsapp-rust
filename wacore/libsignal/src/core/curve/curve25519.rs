@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
 use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use curve25519_dalek::scalar;
@@ -91,7 +90,7 @@ impl PrivateKey {
     fn compute_edwards_cache(secret: &StaticSecret) -> (Scalar, CompressedEdwardsY, u8) {
         let key_data = secret.to_bytes();
         let scalar = Scalar::from_bytes_mod_order(key_data);
-        let ed_public_key_point = &scalar * ED25519_BASEPOINT_TABLE;
+        let ed_public_key_point = EdwardsPoint::mul_base(&scalar);
         let ed_public_key = ed_public_key_point.compress();
         let sign_bit = ed_public_key.as_bytes()[31] & 0b1000_0000_u8;
         (scalar, ed_public_key, sign_bit)
@@ -262,7 +261,7 @@ impl PrivateKey {
         hash1.update(&random_bytes[..]);
 
         let r = Scalar::from_bytes_mod_order_wide(&hash1.finalize().into());
-        let cap_r = (&r * ED25519_BASEPOINT_TABLE).compress();
+        let cap_r = EdwardsPoint::mul_base(&r).compress();
 
         // hash = SHA512(R || edPubKey || message)
         let mut hash = Sha512::new();

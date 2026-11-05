@@ -9,6 +9,10 @@ repository = "https://github.com/oxidezap/whatsapp-rust"
 description = "Signal Protocol implementation for the WhatsApp platform"
 
 [features]
+# Keep the fast backend by default. Constrained consumers can trade basepoint
+# multiplication throughput for flash without changing algorithms or key formats.
+default = ["precomputed-tables"]
+precomputed-tables = ["curve25519-dalek/precomputed-tables", "x25519-dalek/precomputed-tables"]
 # Typed interop with the decoded libsignal SessionRecord v1 model. Off by
 # default so native consumers carry no migration surface.
 legacy-session-interop = []
@@ -22,7 +26,7 @@ bytes = { workspace = true }
 cbc = { workspace = true }
 chrono = { workspace = true, features = ["now"] }
 ctr = { workspace = true }
-curve25519-dalek = "5.0.0"
+curve25519-dalek = { version = "5.0.0", default-features = false, features = ["alloc", "zeroize"] }
 ghash = "0.6.0"
 hex = { workspace = true }
 hkdf = { workspace = true }
@@ -37,7 +41,7 @@ subtle = { workspace = true }
 thiserror = { workspace = true }
 wacore-derive = { workspace = true }
 waproto = { workspace = true }
-x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
+x25519-dalek = { version = "3.0.0", default-features = false, features = ["static_secrets", "zeroize"] }
 
 [dev-dependencies]
 divan = { workspace = true }

@@ -12,6 +12,8 @@ description = "Noise Protocol implementation for WhatsApp with AES-256-GCM"
 crate-type = ["rlib"]
 
 [features]
+default = ["precomputed-tables"]
+precomputed-tables = ["wacore-libsignal/precomputed-tables"]
 # Exposes `wacore_noise::test_util` (cert-chain bytes builder, etc.) so
 # downstream crates can share fixtures with the unit tests in this crate.
 test-util = []

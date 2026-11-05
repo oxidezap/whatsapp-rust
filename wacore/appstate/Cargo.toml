@@ -11,6 +11,10 @@ description = "Appstate for WhatsApp protocol"
 [lib]
 crate-type = ["rlib"]
 
+[features]
+default = ["precomputed-tables"]
+precomputed-tables = ["wacore-libsignal/precomputed-tables"]
+
 [dependencies]
 anyhow = { workspace = true }
 buffa = { workspace = true }

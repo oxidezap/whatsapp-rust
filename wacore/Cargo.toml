@@ -17,6 +17,8 @@ autobenches = false
 ignored = ["getrandom"]
 
 [features]
+default = ["precomputed-tables"]
+precomputed-tables = ["wacore-libsignal/precomputed-tables", "wacore-noise/precomputed-tables", "wacore-appstate/precomputed-tables"]
 debug-snapshots = []
 # Typed interop with the decoded libsignal SessionRecord v1 model.
 legacy-session-interop = ["wacore-libsignal/legacy-session-interop"]

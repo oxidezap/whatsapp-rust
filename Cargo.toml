@@ -161,8 +161,8 @@ wacore = { path = "./wacore", default-features = false, version = "0.7.0" }
 wacore-appstate = { path = "./wacore/appstate", default-features = false, version = "0.7.0" }
 wacore-binary = { path = "./wacore/binary", default-features = false, version = "0.7.0" }
 wacore-derive = { path = "./wacore/derive", version = "0.7.0" }
-wacore-libsignal = { path = "./wacore/libsignal", version = "0.7.0" }
-wacore-noise = { path = "./wacore/noise", version = "0.7.0" }
+wacore-libsignal = { path = "./wacore/libsignal", default-features = false, version = "0.7.0" }
+wacore-noise = { path = "./wacore/noise", default-features = false, version = "0.7.0" }
 waproto = { path = "./waproto", version = "0.7.0" }
 yoke = { version = "0.8", features = ["derive"] }
 zerocopy = { version = "0.8.55", default-features = false, features = ["derive"] }
@@ -204,6 +204,7 @@ bench-harness = ["tokio-runtime", "tokio/rt-multi-thread", "dep:wacore-noise", "
 test-support = ["voip-runtime", "tokio-runtime", "dep:wacore-noise", "wacore-noise/test-util"]
 danger-skip-tls-verify = ["whatsapp-rust-tokio-transport?/danger-skip-tls-verify"]
 default = [
+    "precomputed-tables",
     "sqlite-storage",
     "sqlite-storage-bundled",
     "tokio-transport",
@@ -212,6 +213,7 @@ default = [
     "tokio-native",
     "signal",
 ]
+precomputed-tables = ["wacore/precomputed-tables", "wacore-noise?/precomputed-tables"]
 ureq-client = ["dep:whatsapp-rust-ureq-http-client"]
 tokio-transport = ["dep:whatsapp-rust-tokio-transport"]
 tokio-runtime = ["dep:tokio"]
@@ -314,7 +316,7 @@ tokio = { workspace = true, features = ["macros", "rt", "sync", "time"], optiona
 tracing = { workspace = true, optional = true }
 wacore = { workspace = true }
 wacore-binary = { workspace = true }
-wacore-noise = { path = "./wacore/noise", version = "0.7.0", optional = true }
+wacore-noise = { path = "./wacore/noise", version = "0.7.0", default-features = false, optional = true }
 waproto = { workspace = true }
 zeroize = { workspace = true }
 whatsapp-rust-sqlite-storage = { path = "./storages/sqlite-storage", version = "0.7.0", optional = true, default-features = false }
@@ -361,7 +363,7 @@ tokio = { workspace = true, features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { workspace = true, features = ["v4"] }
 wacore = { workspace = true, features = ["test-util"] }
-wacore-noise = { path = "./wacore/noise", features = ["test-util"] }
+wacore-noise = { path = "./wacore/noise", default-features = false, features = ["test-util"] }
 
 [lints]
 workspace = true

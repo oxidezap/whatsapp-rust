@@ -188,6 +188,29 @@ jobs:
       - name: Run doctests
         run: cargo test --workspace --exclude e2e-tests --doc --verbose
 
+  compact-curve:
+    name: Signal and Noise without precomputed tables
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTC_WRAPPER: ""
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@${{ env.PROTOC_VERSION }},cargo-nextest
+      - uses: Swatinem/rust-cache@v2
+      - name: Record the compact consumer's dependency features
+        run: cargo tree -p whatsapp-rust --no-default-features -e normal -f '{p} {f}'
+      - name: Verify Signal and Noise with the compact backend
+        run: cargo nextest run --profile ci --lib -p wacore-libsignal -p wacore-noise --no-default-features
+
   waproto-serde:
     name: waproto serde representations
     runs-on: ubuntu-latest
