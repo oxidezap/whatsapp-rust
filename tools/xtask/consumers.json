@@ -147,6 +147,13 @@
       {
         "lanes": ["native", "msrv"],
         "mode": "test",
+        "features": ["mobile-ports"],
+        "no_default_features": true,
+        "lib": true
+      },
+      {
+        "lanes": ["native", "msrv"],
+        "mode": "test",
         "features": ["mobile-transport-native"],
         "no_default_features": true,
         "lib": true

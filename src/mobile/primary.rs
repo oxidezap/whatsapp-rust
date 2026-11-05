@@ -932,17 +932,16 @@ impl MobilePrimaryApi<'_> {
             .mobile_primary_operation_guard()
             .await;
         let observed = self.query_current_devices().await?;
-        let (binding, mut journal, _) = self.state()?;
+        let (binding, mut journal, accounts) = self.state()?;
         if journal.pending.is_some() || journal.maintenance.is_some() {
             return Err(PrimaryManagementError::Invalid(
                 "active operation must be recovered first",
             ));
         }
         journal.companions.retain(|v| {
-            observed
-                .devices
-                .iter()
-                .any(|(jid, index)| jid == &v.device_jid && *index == v.key_index)
+            observed.devices.iter().any(|(jid, index)| {
+                same_owned_device_slot(jid, &v.device_jid, &accounts) && *index == v.key_index
+            })
         });
         journal.apply_observed(&observed);
         journal.key_index_timestamp = observed.key_index_timestamp;
@@ -1118,16 +1117,12 @@ impl MobilePrimaryApi<'_> {
                 "key-index timestamp regressed",
             ));
         }
-        let observed_key_index = observed
-            .devices
-            .iter()
-            .find(|(jid, _)| jid == device)
-            .map(|(_, index)| *index);
+        let observed_key_index = observed_owned_device_index(&observed, device, &accounts)?;
         if observed_key_index.is_some_and(|index| {
-            journal
-                .companions
-                .iter()
-                .any(|record| &record.device_jid == device && record.key_index != index)
+            journal.companions.iter().any(|record| {
+                same_owned_device_slot(&record.device_jid, device, &accounts)
+                    && record.key_index != index
+            })
         }) {
             return Err(PrimaryManagementError::Invalid(
                 "tracked companion address changed key index; reconcile first",
@@ -1138,27 +1133,26 @@ impl MobilePrimaryApi<'_> {
         if journal.pending.is_some()
             || journal.maintenance.is_some()
             || (observed_key_index.is_none()
-                && !journal.companions.iter().any(|v| &v.device_jid == device))
+                && !journal
+                    .companions
+                    .iter()
+                    .any(|v| same_owned_device_slot(&v.device_jid, device, &accounts)))
         {
             return Err(PrimaryManagementError::Invalid(
                 "untracked device or active operation",
             ));
         }
         RemovePrimaryCompanionSpec::new(server, &accounts, device, reason)?;
-        let mut signing_state = journal.clone();
-        if let Some(index) = observed_key_index {
-            signing_state.live_indexes.retain(|value| *value != index);
-        }
-        let signed = self.sign_indexes(&signing_state, Some(device), timestamp_seconds, rng)?;
         let key_index = observed_key_index
             .or_else(|| {
                 journal
                     .companions
                     .iter()
-                    .find(|v| &v.device_jid == device)
-                    .map(|v| v.key_index)
+                    .find(|record| same_owned_device_slot(&record.device_jid, device, &accounts))
+                    .map(|record| record.key_index)
             })
             .ok_or(PrimaryManagementError::Invalid("untracked companion"))?;
+        let signed = self.sign_indexes(&journal, Some(key_index), timestamp_seconds, rng)?;
         journal.maintenance = Some(Maintenance::Revoke {
             device: device.clone(),
             key_index,
@@ -1224,26 +1218,14 @@ impl MobilePrimaryApi<'_> {
     fn sign_indexes(
         &self,
         journal: &PrimaryJournal,
-        excluding: Option<&Jid>,
+        excluding: Option<u32>,
         timestamp_seconds: u64,
         rng: &mut impl CryptoRng,
     ) -> Result<Vec<u8>, PrimaryManagementError> {
         let indexes: Vec<_> = std::iter::once(0)
-            .chain(journal.live_indexes.iter().copied().filter(|index| {
-                excluding.is_none_or(|jid| {
-                    !journal
-                        .companions
-                        .iter()
-                        .any(|v| &v.device_jid == jid && v.key_index == *index)
-                })
-            }))
-            .chain(
-                journal
-                    .companions
-                    .iter()
-                    .filter(|v| Some(&v.device_jid) != excluding)
-                    .map(|v| v.key_index),
-            )
+            .chain(journal.live_indexes.iter().copied())
+            .chain(journal.companions.iter().map(|record| record.key_index))
+            .filter(|index| Some(*index) != excluding)
             .collect();
         let mut indexes = indexes;
         indexes.sort_unstable();
@@ -1319,7 +1301,7 @@ impl MobilePrimaryApi<'_> {
             .mobile_primary_operation_guard()
             .await;
         let fresh = self.query_current_devices().await?;
-        let (binding, mut journal, _) = self.state()?;
+        let (binding, mut journal, accounts) = self.state()?;
         if timestamp_seconds < fresh.key_index_timestamp {
             return Err(PrimaryManagementError::Invalid(
                 "key-index timestamp regressed",
@@ -1335,14 +1317,12 @@ impl MobilePrimaryApi<'_> {
             Maintenance::Revoke {
                 device, key_index, ..
             } => {
-                if fresh
-                    .devices
-                    .iter()
-                    .any(|(jid, index)| jid == device && index != key_index)
+                if observed_owned_device_index(&fresh, device, &accounts)?
+                    .is_some_and(|index| index != *key_index)
                 {
                     return Err(PrimaryManagementError::Invalid("companion address reused"));
                 }
-                Some(device)
+                Some(*key_index)
             }
             Maintenance::Publish { .. } | Maintenance::RevokeAll { removed: true, .. } => None,
             _ => {
@@ -1426,10 +1406,10 @@ impl MobilePrimaryApi<'_> {
             } => {
                 if !removed {
                     let fresh = self.query_current_devices().await?;
-                    if let Some((_, current_index)) =
-                        fresh.devices.iter().find(|(jid, _)| jid == &device)
+                    if let Some(current_index) =
+                        observed_owned_device_index(&fresh, &device, &accounts)?
                     {
-                        if *current_index != key_index {
+                        if current_index != key_index {
                             return Err(PrimaryManagementError::Invalid(
                                 "companion address reused with another key index",
                             ));
@@ -1447,22 +1427,16 @@ impl MobilePrimaryApi<'_> {
                     } else {
                         return Err(PrimaryManagementError::Invalid("maintenance changed"));
                     }
-                    let removed_index = latest
+                    latest
                         .companions
-                        .iter()
-                        .find(|v| v.device_jid == device)
-                        .map(|v| v.key_index);
-                    latest.companions.retain(|v| v.device_jid != device);
+                        .retain(|record| record.key_index != key_index);
                     latest
                         .abandoned
                         .retain(|record| record.pending.key_index != key_index);
                     latest
                         .abandoned_dispatches
-                        .retain(|operation| !dispatch_for_device(operation, &device));
-                    latest.live_indexes.retain(|v| *v != key_index);
-                    if let Some(index) = removed_index {
-                        latest.live_indexes.retain(|v| *v != index);
-                    }
+                        .retain(|operation| !dispatch_for_key_index(operation, key_index));
+                    latest.live_indexes.retain(|index| *index != key_index);
                     self.save(binding, &latest).await?;
                 }
                 (signed, timestamp)
@@ -2047,6 +2021,35 @@ fn validate_owned(device: &Jid, accounts: &[Jid]) -> Result<(), PrimaryManagemen
     }
     Ok(())
 }
+fn same_owned_device_slot(left: &Jid, right: &Jid, accounts: &[Jid]) -> bool {
+    left.device == right.device
+        && validate_owned(left, accounts).is_ok()
+        && validate_owned(right, accounts).is_ok()
+}
+fn observed_owned_device_index(
+    observed: &PrimaryDeviceSnapshot,
+    device: &Jid,
+    accounts: &[Jid],
+) -> Result<Option<u32>, PrimaryManagementError> {
+    validate_owned(device, accounts)?;
+    let mut selected = None;
+    for (_, index) in observed
+        .devices
+        .iter()
+        .filter(|(jid, _)| same_owned_device_slot(jid, device, accounts))
+    {
+        if selected.is_some_and(|previous| previous != *index) {
+            return Err(PrimaryManagementError::Invalid(
+                "owned device aliases disagree on key index",
+            ));
+        }
+        selected = Some(*index);
+    }
+    Ok(selected)
+}
+fn dispatch_for_key_index(operation: &Maintenance, target: u32) -> bool {
+    matches!(operation, Maintenance::Bootstrap { key_index, .. } | Maintenance::History { key_index, .. } if *key_index == target)
+}
 fn dispatch_for_device(operation: &Maintenance, target: &Jid) -> bool {
     matches!(operation, Maintenance::Bootstrap { device, .. } | Maintenance::History { device, .. } if device == target)
 }
@@ -2376,6 +2379,50 @@ mod tests {
                                 .children([devices])
                                 .build()])
                             .build()])
+                        .build(),
+                ],
+                false,
+            )
+            .await;
+        }
+        async fn alias_devices(
+            &mut self,
+            request: &wacore_binary::NodeRef<'_>,
+            signed: &[u8],
+            pn: &[(u16, u32)],
+            lid: &[(u16, u32)],
+            timestamp: u64,
+        ) {
+            use wacore_binary::builder::NodeBuilder;
+            let mut users = Vec::new();
+            for (user, devices) in [("15550000001@s.whatsapp.net", pn), ("10000000001@lid", lid)] {
+                let entries = std::iter::once(NodeBuilder::new("device").attr("id", "0").build())
+                    .chain(devices.iter().map(|(device, index)| {
+                        NodeBuilder::new("device")
+                            .attr("id", device.to_string())
+                            .attr("key-index", index.to_string())
+                            .build()
+                    }));
+                users.push(
+                    NodeBuilder::new("user")
+                        .attr("jid", user)
+                        .children([NodeBuilder::new("devices")
+                            .children([
+                                NodeBuilder::new("device-list").children(entries).build(),
+                                NodeBuilder::new("key-index-list")
+                                    .attr("ts", timestamp.to_string())
+                                    .bytes(signed.to_vec())
+                                    .build(),
+                            ])
+                            .build()])
+                        .build(),
+                );
+            }
+            self.reply(
+                request,
+                vec![
+                    NodeBuilder::new("usync")
+                        .children([NodeBuilder::new("list").children(users).build()])
                         .build(),
                 ],
                 false,
@@ -3237,6 +3284,263 @@ mod tests {
         let (_, final_state, _) = wire.client.mobile_primary().unwrap().state().unwrap();
         assert!(final_state.companions.is_empty());
         assert!(final_state.abandoned_dispatches.is_empty());
+        wire.close().await;
+    }
+    #[tokio::test]
+    async fn lid_alias_revocation_excludes_tracked_pn_index_through_ambiguous_resume_and_refresh() {
+        use rand::SeedableRng;
+        use wacore::libsignal::protocol::KeyPair;
+        use wacore::pair::{DeviceState, PairUtils};
+        use wacore_binary::builder::NodeBuilder;
+        let mut wire = Wire::new(crate::test_utils::primary_test_backend()).await;
+        let (tracked, first_identity) = seed_confirmed_cache_only(&wire.client, true).await;
+        wire.client
+            .persistence_manager
+            .process_command(wacore::store::DeviceCommand::SetLid(Some(
+                "10000000001@lid".parse().unwrap(),
+            )))
+            .await;
+        wire.client.persistence_manager.flush().await.unwrap();
+        let alias: Jid = "10000000001:2@lid".parse().unwrap();
+        let other: Jid = "15550000001:3@s.whatsapp.net".parse().unwrap();
+        let snapshot = wire.client.persistence_manager.get_device_snapshot();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(201);
+        let second = DeviceState {
+            identity_key: KeyPair::generate(&mut rng),
+            noise_key: KeyPair::generate(&mut rng),
+            adv_secret_key: [4; 32],
+        };
+        let second_identity: [u8; 32] = second
+            .identity_key
+            .public_key
+            .public_key_bytes()
+            .try_into()
+            .unwrap();
+        let issued = build_signed_companion_identity(
+            &snapshot.identity_key,
+            &second_identity,
+            &second.adv_secret_key,
+            &IdentityParameters {
+                raw_id: 7,
+                timestamp_seconds: 100,
+                key_index: 2,
+                valid_indexes: &[0, 1, 2],
+                default_encoding: AdvDefaultEncoding::Omit,
+            },
+            &mut rng,
+        )
+        .unwrap();
+        let (proof, _) = PairUtils::do_pair_crypto(&second, &issued.device_identity).unwrap();
+        let api = wire.client.mobile_primary().unwrap();
+        let (binding, mut journal, accounts) = api.state().unwrap();
+        verify_companion_proof(&issued, &proof, &second_identity, &accounts, &other).unwrap();
+        journal.high_water = 9;
+        journal.live_indexes = vec![0, 1, 2];
+        journal.companions.push(HostedCompanion {
+            device_jid: other.clone(),
+            peer_identity: second_identity,
+            signed_identity: proof,
+            key_index: 2,
+            history_sent: true,
+            app_state_sent: false,
+            history_cursors: vec![],
+        });
+        for (device, peer_identity, key_index) in [
+            (tracked.clone(), first_identity, 1),
+            (other.clone(), second_identity, 2),
+        ] {
+            journal.abandoned_dispatches.push(Maintenance::Bootstrap {
+                device,
+                peer_identity,
+                key_index,
+                payload_hash: [1; 32],
+                media_key_fingerprint: None,
+                history_message_id: format!("synthetic-history-{key_index}"),
+                app_state_message_id: format!("synthetic-state-{key_index}"),
+                history_message_hash: Some([2; 32]),
+                app_state_message_hash: None,
+                app_state_key_id: None,
+            });
+        }
+        api.save(binding, &journal).await.unwrap();
+        let signed = build_signed_key_index_list(
+            &snapshot.identity_key,
+            &IdentityParameters {
+                raw_id: 7,
+                timestamp_seconds: 100,
+                key_index: 9,
+                valid_indexes: &[0, 1, 2],
+                default_encoding: AdvDefaultEncoding::Omit,
+            },
+            &mut rng,
+        )
+        .unwrap();
+        let changed = build_signed_key_index_list(
+            &snapshot.identity_key,
+            &IdentityParameters {
+                raw_id: 7,
+                timestamp_seconds: 101,
+                key_index: 10,
+                valid_indexes: &[0, 2, 10],
+                default_encoding: AdvDefaultEncoding::Omit,
+            },
+            &mut rng,
+        )
+        .unwrap();
+        let decode_indexes = |signed: &[u8]| {
+            let envelope = waproto::codec::adv_signed_key_index_list_decode(signed).unwrap();
+            waproto::codec::adv_key_index_list_decode(envelope.details.as_deref().unwrap()).unwrap()
+        };
+        // A fresh LID-only observation of companions must retain their stored PN proof addresses.
+        let client = wire.client.clone();
+        let reconcile =
+            tokio::spawn(async move { client.mobile_primary().unwrap().reconcile().await });
+        let request = wire.request(0).await;
+        wire.alias_devices(request.get(), &signed, &[], &[(2, 1), (3, 2)], 100)
+            .await;
+        reconcile.await.unwrap().unwrap();
+        assert_eq!(
+            wire.client
+                .mobile_primary()
+                .unwrap()
+                .companions()
+                .unwrap()
+                .len(),
+            2
+        );
+        let client = wire.client.clone();
+        let target = alias.clone();
+        let revoke = tokio::spawn(async move {
+            client
+                .mobile_primary()
+                .unwrap()
+                .revoke(
+                    &"s.whatsapp.net".parse().unwrap(),
+                    &target,
+                    "user_initiated",
+                    101,
+                    &mut rand::rngs::StdRng::seed_from_u64(202),
+                )
+                .await
+        });
+        for frame in [1, 2] {
+            let request = wire.request(frame).await;
+            wire.alias_devices(request.get(), &signed, &[], &[(2, 1), (3, 2)], 100)
+                .await;
+        }
+        let request = wire.request(3).await;
+        assert_eq!(
+            request
+                .get()
+                .get_optional_child("remove-companion-device")
+                .unwrap()
+                .attrs()
+                .optional_jid("jid"),
+            Some(alias)
+        );
+        wire.reply(
+            request.get(),
+            vec![NodeBuilder::new("error").attr("code", "500").build()],
+            true,
+        )
+        .await;
+        assert!(revoke.await.unwrap().is_err());
+        let (_, interrupted, _) = wire.client.mobile_primary().unwrap().state().unwrap();
+        let Some(Maintenance::Revoke {
+            signed: prepared,
+            removed: false,
+            ..
+        }) = interrupted.maintenance
+        else {
+            panic!("ambiguous removal retained")
+        };
+        let prepared = decode_indexes(&prepared);
+        assert_eq!(prepared.current_index, Some(9));
+        assert_eq!(prepared.valid_indexes, vec![0, 2]);
+        let client = wire.client.clone();
+        let resume = tokio::spawn(async move {
+            client
+                .mobile_primary()
+                .unwrap()
+                .resume_maintenance(&"s.whatsapp.net".parse().unwrap())
+                .await
+        });
+        let request = wire.request(4).await;
+        wire.alias_devices(request.get(), &signed, &[], &[(3, 2)], 100)
+            .await;
+        // Another companion arrives after removal: publication must pause for an explicit re-sign.
+        let request = wire.request(5).await;
+        wire.alias_devices(request.get(), &changed, &[], &[(3, 2), (4, 10)], 101)
+            .await;
+        assert!(resume.await.unwrap().is_err());
+        let (_, removed, _) = wire.client.mobile_primary().unwrap().state().unwrap();
+        assert_eq!(removed.high_water, 9);
+        assert_eq!(removed.companions.len(), 1);
+        assert_eq!(removed.companions[0].device_jid(), &other);
+        assert_eq!(removed.abandoned_dispatches.len(), 1);
+        assert!(dispatch_for_key_index(&removed.abandoned_dispatches[0], 2));
+        assert!(matches!(
+            removed.maintenance,
+            Some(Maintenance::Revoke {
+                removed: true,
+                key_index: 1,
+                ..
+            })
+        ));
+        let client = wire.client.clone();
+        let refresh = tokio::spawn(async move {
+            client
+                .mobile_primary()
+                .unwrap()
+                .refresh_maintenance_indexes(102, &mut rand::rngs::StdRng::seed_from_u64(203))
+                .await
+        });
+        let request = wire.request(6).await;
+        wire.alias_devices(request.get(), &changed, &[], &[(3, 2), (4, 10)], 101)
+            .await;
+        refresh.await.unwrap().unwrap();
+        let client = wire.client.clone();
+        let resume = tokio::spawn(async move {
+            client
+                .mobile_primary()
+                .unwrap()
+                .resume_maintenance(&"s.whatsapp.net".parse().unwrap())
+                .await
+        });
+        let request = wire.request(7).await;
+        wire.alias_devices(request.get(), &changed, &[], &[(3, 2), (4, 10)], 101)
+            .await;
+        let request = wire.request(8).await;
+        let published = request
+            .get()
+            .get_optional_child("key-index-list")
+            .unwrap()
+            .content_bytes()
+            .unwrap()
+            .to_vec();
+        let details = decode_indexes(&published);
+        assert_eq!(details.current_index, Some(10));
+        assert_eq!(details.valid_indexes, vec![0, 2, 10]);
+        wire.reply(request.get(), vec![], false).await;
+        resume.await.unwrap().unwrap();
+        let client = wire.client.clone();
+        let reconcile =
+            tokio::spawn(async move { client.mobile_primary().unwrap().reconcile().await });
+        let request = wire.request(9).await;
+        wire.alias_devices(request.get(), &published, &[], &[(3, 2), (4, 10)], 102)
+            .await;
+        reconcile.await.unwrap().unwrap();
+        let (_, complete, _) = wire.client.mobile_primary().unwrap().state().unwrap();
+        assert_eq!(complete.high_water, 10);
+        assert_eq!(complete.live_indexes, vec![0, 2, 10]);
+        assert_eq!(complete.companions.len(), 1);
+        assert_eq!(complete.companions[0].device_jid(), &other);
+        assert!(complete.maintenance.is_none());
+        assert_eq!(
+            wire.transport.sent_count(),
+            10,
+            "resume must not repeat the acknowledged or already-absent remove"
+        );
         wire.close().await;
     }
 }

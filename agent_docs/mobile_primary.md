@@ -51,7 +51,10 @@ index stays spent. It can remain the signed list's `current_index` after it leav
 `valid_indexes`; these fields have different purposes. Fresh device snapshots
 preserve other devices' valid indexes, and publication rejects timestamp
 regression or detected topology drift. There is no server-side compare-and-swap
-guarantee.
+guarantee. A companion's PN and LID addresses can name the same owned device
+slot. Reconcile these aliases using the authenticated account mappings and key
+index; revocation excludes that index from every signed-list source and removes
+its local records without rewriting another device's proof address.
 
 Use `pending_stage()` to inspect an interrupted approval. `cancel_prepared` only
 cancels an unsent prepared operation. After an upload was attempted,

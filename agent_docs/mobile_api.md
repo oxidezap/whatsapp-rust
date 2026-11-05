@@ -117,3 +117,9 @@ cargo test -p whatsapp-rust --lib mobile_persisted_role_cannot_load_through_web_
 Use [mobile_testing.md](mobile_testing.md) for host, WASM and mock server
 contracts, and [mobile_oracle.md](mobile_oracle.md) for pinned APK tooling.
 Keep those host tools out of runtime dependencies.
+
+The SDK `mobile-core` feature enables SQLite mobile provisioning when that backend
+is selected. Direct SQLite consumers enable its `mobile` feature to initialize or
+import mobile namespaces. Loading and saving existing mobile role bindings stays
+available without this feature, so feature-off builds cannot treat mobile state
+as an unbound Web account.

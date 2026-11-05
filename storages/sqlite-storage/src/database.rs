@@ -67,6 +67,7 @@ impl SqliteDatabase {
     /// Accepts pending or registered mobile state, validates its binding and keys,
     /// and never generates a temporary Web identity. The returned store is ready
     /// for `PersistenceManager::new` or reopening by its allocated device id.
+    #[cfg(feature = "mobile")]
     pub async fn import_mobile_device(
         &self,
         device: &wacore::store::Device,

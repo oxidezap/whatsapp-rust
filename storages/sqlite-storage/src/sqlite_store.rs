@@ -217,6 +217,7 @@ impl FreshDeviceRow {
         })
     }
 
+    #[cfg(feature = "mobile")]
     fn from_mobile_device(id: Option<i32>, supplied: &CoreDevice) -> Result<Self> {
         supplied.validate_mobile_session()?;
         let mut row = Self::from_device(id, supplied.clone())?;
@@ -2066,6 +2067,7 @@ impl SqliteStore {
         .await
     }
 
+    #[cfg(feature = "mobile")]
     pub(crate) async fn import_mobile_device_impl(
         &self,
         supplied: &CoreDevice,
@@ -2089,6 +2091,7 @@ impl SqliteStore {
         Ok(self.share_for_device(device_id))
     }
 
+    #[cfg(feature = "mobile")]
     fn ensure_mobile_namespace_empty(
         conn: &mut SqliteConnection,
         device_id: i32,
@@ -5088,6 +5091,7 @@ impl MsgSecretStore for SqliteStore {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl DeviceStore for SqliteStore {
+    #[cfg(feature = "mobile")]
     async fn initialize_mobile_device(&self, supplied: &CoreDevice) -> Result<()> {
         supplied.validate_mobile_session()?;
         supplied
@@ -8001,6 +8005,57 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "mobile"))]
+    #[tokio::test]
+    async fn mobile_binding_remains_readable_without_provisioning_support() {
+        use wacore::store::commands::{DeviceCommand, apply_command_to_device};
+        use wacore::store::{MobileSessionBinding, StoredMobilePlatform};
+        let db = format!(
+            "file:mobile_binding_feature_off_{}?mode=memory&cache=shared",
+            std::process::id()
+        );
+        let database = crate::SqliteDatabase::open(&db, Default::default())
+            .await
+            .unwrap();
+        let store = database.store(117);
+        let mut device = CoreDevice::new();
+        let binding = MobileSessionBinding::new(
+            [1; 32],
+            device.mobile_identity_hash(),
+            StoredMobilePlatform::Android,
+            vec![8, 9],
+            Some(vec![3]),
+        )
+        .unwrap();
+        apply_command_to_device(
+            &mut device,
+            DeviceCommand::SetMobileSessionBinding(binding.clone()),
+        );
+        assert!(
+            DeviceStore::initialize_mobile_device(&store, &device)
+                .await
+                .is_err()
+        );
+        assert!(DeviceStore::load(&store).await.unwrap().is_none());
+        // Existing mobile namespaces must retain their role across a feature-off build.
+        DeviceStore::save(&store, &device).await.unwrap();
+        let restored = DeviceStore::load(&store).await.unwrap().unwrap();
+        assert_eq!(restored.mobile_session.as_deref(), Some(&binding));
+        store
+            .with_retry("corrupt_feature_off_mobile_binding", || {
+                Box::new(|conn| {
+                    diesel::update(device::table.filter(device::id.eq(117)))
+                        .set(device::mobile_session_binding.eq(Some(b"invalid-binding".as_slice())))
+                        .execute(conn)
+                        .map(|_| ())
+                })
+            })
+            .await
+            .unwrap();
+        assert!(DeviceStore::load(&store).await.is_err());
+    }
+
+    #[cfg(feature = "mobile")]
     #[tokio::test]
     async fn mobile_binding_roundtrip_fresh_namespace_and_corruption_fail_closed() {
         use wacore::store::commands::{DeviceCommand, apply_command_to_device};
