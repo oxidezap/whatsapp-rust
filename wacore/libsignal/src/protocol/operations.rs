@@ -29,6 +29,7 @@ async fn commit_received_session<S: SessionStore + ?Sized, I: IdentityKeyStore +
     candidate: SessionRecord,
     address: &ProtocolAddress,
     identities: &mut I,
+    consumed_prekey: Option<PreKeyId>,
 ) -> Result<IdentityChange> {
     // Authentication selects the session, including an archive-only record.
     // Its identity governs trust and the identity row update.
@@ -45,7 +46,7 @@ async fn commit_received_session<S: SessionStore + ?Sized, I: IdentityKeyStore +
     let change = save_identity(identities, address, &remote).await?;
     // The original session remains recoverable until the identity step succeeds.
     *checkout.record_mut() = candidate;
-    checkout.commit().await?;
+    checkout.commit_received(consumed_prekey).await?;
     Ok(change)
 }
 pub async fn process_prekey_bundle<
@@ -796,7 +797,7 @@ async fn message_decrypt_signal_using<
         .map_err(|error| {
             message_error(error, CiphertextMessageType::Whisper, 0, message.counter())
         })?;
-    commit_received_session(checkout, candidate, address, identities).await?;
+    commit_received_session(checkout, candidate, address, identities, None).await?;
     Ok(DecryptionResult {
         plaintext,
         consumed_prekey_id: None,
@@ -972,10 +973,13 @@ async fn message_decrypt_prekey_using<
                 )
             })?
     };
-    let stored_change = commit_received_session(checkout, candidate, address, identities).await?;
+    let consumed_prekey_id = if existing { None } else { message.pre_key_id() };
+    let stored_change =
+        commit_received_session(checkout, candidate, address, identities, consumed_prekey_id)
+            .await?;
     Ok(DecryptionResult {
         plaintext,
-        consumed_prekey_id: if existing { None } else { message.pre_key_id() },
+        consumed_prekey_id,
         identity_change: if existing {
             IdentityChange::NewOrUnchanged
         } else {

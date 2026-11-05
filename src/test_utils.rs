@@ -15,6 +15,7 @@ pub(crate) mod crypto {
         pub decrypts: AtomicUsize,
         pub macs: AtomicUsize,
         pub fail_encrypt: AtomicBool,
+        pub fail_decrypt: AtomicBool,
         pub fail_mac: AtomicBool,
     }
     impl SymmetricCryptoProvider for CountingCrypto {
@@ -39,6 +40,9 @@ pub(crate) mod crypto {
             out: &mut Vec<u8>,
         ) -> Result<(), CryptoProviderError> {
             self.decrypts.fetch_add(1, Ordering::Relaxed);
+            if self.fail_decrypt.load(Ordering::Relaxed) {
+                return Err(CryptoProviderError::BackendFailed);
+            }
             RustCryptoProvider.aes_256_cbc_decrypt(key, iv, ciphertext, out)
         }
         fn aes_256_cbc_decrypt_in_place(
@@ -48,6 +52,9 @@ pub(crate) mod crypto {
             buffer: &mut Vec<u8>,
         ) -> Result<(), CryptoProviderError> {
             self.decrypts.fetch_add(1, Ordering::Relaxed);
+            if self.fail_decrypt.load(Ordering::Relaxed) {
+                return Err(CryptoProviderError::BackendFailed);
+            }
             RustCryptoProvider.aes_256_cbc_decrypt_in_place(key, iv, buffer)
         }
         fn hmac_sha256(

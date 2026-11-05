@@ -62,6 +62,20 @@ pub trait SessionStore: ThreadSafe {
     ) -> SessionCheckoutStoreResult {
         SessionCheckoutStoreResult::Unhandled(record)
     }
+    /// Couple consumed-prekey bookkeeping to the received session's ownership
+    /// transfer. Hosts with deferred deletion override this to preserve the id
+    /// even if completion is cancelled. The default preserves the existing
+    /// store hook; those hosts still receive the id in `DecryptionResult`.
+    fn try_store_received_session_from_checkout(
+        &mut self,
+        address: &ProtocolAddress,
+        record: SessionRecord,
+        checkout: Option<SessionCheckoutKey>,
+        had_session: bool,
+        _consumed_prekey: Option<PreKeyId>,
+    ) -> SessionCheckoutStoreResult {
+        self.try_store_session_from_checkout(address, record, checkout, had_session)
+    }
     fn cancel_session_checkout(
         &mut self,
         _address: &ProtocolAddress,
@@ -199,15 +213,19 @@ impl<'a, S: SessionStore + ?Sized> SessionCheckout<'a, S> {
             .as_mut()
             .expect("checkout record is present until consumed")
     }
-    pub async fn commit(mut self) -> Result<()> {
+    pub async fn commit(self) -> Result<()> {
+        self.commit_received(None).await
+    }
+    pub async fn commit_received(mut self, consumed_prekey: Option<PreKeyId>) -> Result<()> {
         let record = self.record.take().ok_or_else(|| {
             SignalProtocolError::InvalidState("checkout", "record already consumed".into())
         })?;
-        match self.store.try_store_session_from_checkout(
+        match self.store.try_store_received_session_from_checkout(
             &self.address,
             record,
             self.checkout,
             self.had_session,
+            consumed_prekey,
         ) {
             SessionCheckoutStoreResult::Stored => {
                 self.checkout = None;

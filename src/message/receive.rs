@@ -1327,16 +1327,8 @@ impl Client {
                         .live_retention
                         .pause_after_stage()
                         .await;
-                    // Buffer the prekey this pkmsg consumed: message_decrypt promoted
-                    // the session into the (volatile) cache but no longer deletes the
-                    // prekey itself. The post-loop flush deletes it only once that
-                    // session is durable, keeping a crash from orphaning the prekey.
-                    if let Some(prekey_id) = decrypted.consumed_prekey_id {
-                        adapter
-                            .pre_key_store
-                            .buffer_consumed_prekey(prekey_id, &signal_address)
-                            .await;
-                    }
+                    // The checkout commit already coupled consumed-prekey deletion
+                    // intent to this session. Cancellation after staging cannot lose it.
                     if decrypted.identity_change.is_changed() && !local_identity_reacted {
                         local_identity_reacted = true;
                         self.react_to_local_identity_change(
@@ -1464,12 +1456,6 @@ impl Client {
                                     ObservedId::new(info.id.as_str()),
                                     address.observe()
                                 );
-                                if let Some(prekey_id) = decrypted.consumed_prekey_id {
-                                    adapter
-                                        .pre_key_store
-                                        .buffer_consumed_prekey(prekey_id, &signal_address)
-                                        .await;
-                                }
                                 // Normally NewOrUnchanged here (the untrusted
                                 // identity was deleted+flushed before the retry),
                                 // but mirror the main-decode gate so a concurrent
@@ -1874,6 +1860,20 @@ impl Client {
                                 decrypt_fail_mode,
                                 ack_recipient,
                             )
+                            .await;
+                        continue;
+                    } else if let Some(reason) = local_crypto_retry_reason(&e) {
+                        // Our backend did not judge the ciphertext. Keep the
+                        // same packet recoverable after a transient outage.
+                        outcome.had_failure = true;
+                        self.report_enc_decrypt_failure(
+                            info,
+                            enc_index,
+                            enc_type,
+                            EncDecryptFailureReason::LocalCryptoFailure,
+                        );
+                        outcome.undecryptable |= self
+                            .handle_decrypt_failure(info, reason, decrypt_fail_mode, ack_recipient)
                             .await;
                         continue;
                     } else {
@@ -2765,12 +2765,6 @@ impl Client {
                     ObservedId::new(info.id.as_str()),
                     info.source.sender.observe()
                 );
-                if let Some(prekey_id) = decrypted.consumed_prekey_id {
-                    adapter
-                        .pre_key_store
-                        .buffer_consumed_prekey(prekey_id, signal_address)
-                        .await;
-                }
                 // Buffer for post-lock handling, keeping the same ordering as the
                 // batch's main path.
                 defer_plaintext(

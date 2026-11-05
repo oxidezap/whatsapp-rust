@@ -273,15 +273,8 @@ impl<'a> Signal<'a> {
             .await?
         };
 
-        // A pkmsg consumed prekey is reported, not deleted by the decrypt;
-        // buffer it so the caller's flush removes it atomically with the
-        // promoted session.
-        if let Some(prekey_id) = decrypted.consumed_prekey_id {
-            adapter
-                .pre_key_store
-                .buffer_consumed_prekey(prekey_id, &address)
-                .await;
-        }
+        // The session checkout also owns consumed-prekey bookkeeping; its
+        // durable deletion remains ordered behind the caller's session flush.
         Ok(decrypted)
     }
 
@@ -1060,6 +1053,52 @@ mod tests {
         }
         provider.fail_encrypt.store(false, Ordering::Relaxed);
         provider.fail_mac.store(false, Ordering::Relaxed);
+        client.signal_shutdown_sync();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn device_fanout_forwards_the_runtime_provider_inline_and_in_spawned_chunks() {
+        use crate::test_utils::{create_test_client_with_runtime, crypto::CountingCrypto};
+        use wacore::runtime::CryptoRuntime;
+        use wacore::send::{SessionPlan, encrypt_for_devices_with_sessions};
+        let provider = Arc::new(CountingCrypto::default());
+        let client = create_test_client_with_runtime(
+            "fanout-provider",
+            Arc::new(CryptoRuntime::new(
+                Arc::new(crate::TokioRuntime),
+                provider.clone(),
+            )),
+        )
+        .await;
+        for count in [5, 6] {
+            let devices: Vec<_> = (1..=count)
+                .map(|id| Jid::pn_device("15550003004", id))
+                .collect();
+            for peer in &devices {
+                seed_peer_session(&client, peer).await;
+            }
+            let before = provider.encrypts.load(Ordering::Relaxed);
+            let macs = provider.macs.load(Ordering::Relaxed);
+            let mut adapter = client.signal_adapter();
+            let result = encrypt_for_devices_with_sessions(
+                &*client.runtime,
+                &mut adapter.as_signal_stores(),
+                &devices,
+                b"fanout provider contract",
+                false,
+                None,
+                SessionPlan::assume_ready(devices.len()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.encrypted_devices.len(), devices.len());
+            assert_eq!(
+                provider.encrypts.load(Ordering::Relaxed) - before,
+                devices.len()
+            );
+            assert!(provider.macs.load(Ordering::Relaxed) > macs);
+        }
         client.signal_shutdown_sync();
     }
 

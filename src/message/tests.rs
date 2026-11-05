@@ -14372,7 +14372,24 @@ async fn bench_session_decrypt_throughput() {
 /// classification in `group_decrypt_retry_reason`.
 #[test]
 fn test_group_decrypt_retry_reason_classification() {
+    use wacore::libsignal::crypto::CryptoProviderError;
     use wacore::libsignal::protocol::CiphertextMessageType;
+
+    assert_eq!(
+        group_decrypt_retry_reason(&SignalProtocolError::Crypto(
+            CryptoProviderError::BackendFailed
+        )),
+        Some(RetryReason::UnknownError)
+    );
+    for error in [
+        CryptoProviderError::BadInput,
+        CryptoProviderError::AuthFailed,
+    ] {
+        assert_eq!(
+            group_decrypt_retry_reason(&SignalProtocolError::Crypto(error)),
+            None
+        );
+    }
 
     // Recoverable sender-key errors -> retry receipt.
     assert_eq!(
@@ -14408,6 +14425,151 @@ fn test_group_decrypt_retry_reason_classification() {
         group_decrypt_retry_reason(&SignalProtocolError::InvalidProtobufEncoding),
         None
     );
+}
+
+#[tokio::test]
+async fn local_provider_failures_retry_both_receive_paths_and_allow_the_same_ciphertext() {
+    use crate::test_utils::crypto::CountingCrypto;
+    use wacore::libsignal::protocol::{SenderKeyStore as _, SessionStore as _};
+    use wacore::runtime::CryptoRuntime;
+    for group in [false, true] {
+        for cbc in [false, true] {
+            let provider = Arc::new(CountingCrypto::default());
+            let runtime = Arc::new(CryptoRuntime::new(
+                Arc::new(crate::TokioRuntime),
+                provider.clone(),
+            ));
+            let (client, transport) =
+                capturing_client_configured("provider_receive_retry", |builder| {
+                    builder.with_runtime_arc(runtime)
+                })
+                .await;
+            let (handler, events) = wacore::types::events::ChannelEventHandler::new();
+            client.core.event_bus.subscribe_handler(handler).detach();
+            let mut alice = AlicePeer::new("100000000000072@lid").await;
+            let chat: Jid = if group {
+                "120363000000000072@g.us".parse().unwrap()
+            } else {
+                alice.jid.clone()
+            };
+            let session;
+            let ciphertext;
+            if group {
+                let skdm = alice.create_group_skdm(&chat).await;
+                client
+                    .handle_sender_key_distribution_message(
+                        &chat,
+                        &alice.jid,
+                        "PROVIDER_SKDM",
+                        &skdm.axolotl_sender_key_distribution_message.unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                ciphertext =
+                    encrypt_group_text(&mut alice, &chat, "recovered provider plaintext").await;
+                session = None;
+            } else {
+                let (bundle, bob) = bobs_prekey_bundle(&client).await;
+                let address = bob.to_protocol_address();
+                alice.install_bob_session(&address, &bundle).await;
+                session = Some(
+                    alice
+                        .encrypt_text(&address, "recovered provider plaintext")
+                        .await,
+                );
+                ciphertext = Vec::new();
+            }
+            let info = Arc::new(create_test_message_info(
+                &chat.to_string(),
+                "PROVIDER_RETRY",
+                &alice.jid.to_string(),
+            ));
+            let name = make_sender_key_name(&chat, &alice.jid.to_protocol_address());
+            let before = if group {
+                client
+                    .signal_adapter()
+                    .sender_key_store
+                    .load_sender_key(&name)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .serialize()
+                    .unwrap()
+            } else {
+                Vec::new()
+            };
+            for failing in [true, false] {
+                provider.fail_mac.store(failing && !cbc, Ordering::Relaxed);
+                provider
+                    .fail_decrypt
+                    .store(failing && cbc, Ordering::Relaxed);
+                let session_payloads = session
+                    .as_ref()
+                    .map(enc_payload_from_ciphertext)
+                    .into_iter()
+                    .collect();
+                let group_payloads = if group {
+                    vec![skmsg_payload_from_bytes(ciphertext.clone())]
+                } else {
+                    vec![]
+                };
+                process_group_classified_with_sessions(
+                    &client,
+                    info.clone(),
+                    &alice.jid,
+                    session_payloads,
+                    group_payloads,
+                )
+                .await;
+                if failing {
+                    if group {
+                        assert_eq!(
+                            client
+                                .signal_adapter()
+                                .sender_key_store
+                                .load_sender_key(&name)
+                                .await
+                                .unwrap()
+                                .unwrap()
+                                .serialize()
+                                .unwrap(),
+                            before
+                        );
+                    } else {
+                        assert!(
+                            client
+                                .signal_adapter()
+                                .session_store
+                                .load_session(&alice.jid.to_protocol_address())
+                                .await
+                                .unwrap()
+                                .is_none_or(|record| record.session_state().is_none())
+                        );
+                    }
+                    await_retry_receipt(&client, &info, 1, RetryReason::UnknownError).await;
+                    crate::test_utils::wait_for_outbound_tasks(&client).await;
+                    let frames = transport.sent();
+                    for (index, frame) in frames.iter().enumerate() {
+                        let Some(bytes) = decode_frame(index, frame) else {
+                            continue;
+                        };
+                        let node = wacore_binary::marshal::unmarshal_packed_ref(&bytes).unwrap();
+                        assert!(
+                            !(node.tag.as_ref() == "ack"
+                                && node
+                                    .get_attr("id")
+                                    .is_some_and(|v| v.as_str() == info.id.as_str())
+                                && node.get_attr("error").is_some()),
+                            "a local provider outage must not send a terminal NACK"
+                        );
+                    }
+                } else {
+                    assert_eq!(message_events_for_id(&events, &info.id).0, 1);
+                }
+            }
+            client.signal_shutdown_sync();
+        }
+    }
 }
 
 /// F4: a PreKeySignalMessage naming a signed prekey we've rotated past
@@ -16302,6 +16464,12 @@ fn a_local_key_agreement_failure_is_not_the_peers() {
             CryptoProviderError::BackendFailed
         )),
         EncDecryptFailureReason::LocalCryptoFailure,
+    );
+    assert_eq!(
+        local_crypto_retry_reason(&SignalProtocolError::KeyAgreementFailed(
+            CryptoProviderError::BackendFailed
+        )),
+        Some(RetryReason::UnknownError)
     );
 }
 
@@ -21922,6 +22090,10 @@ async fn raw_pending_fresh_drain_protocol_failure_retains_ratchet_advanced_plain
                 .has_raw_for_message(&info)
         );
         client.flush_signal_cache().await.unwrap();
+        assert!(
+            backend.load_prekey(9001).await.unwrap().is_none(),
+            "a cancelled receive must retain consumption with the committed session"
+        );
         client.enter_drain_mode_for_tests();
         client
             .inbound_commit_batch
