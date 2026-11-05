@@ -71,6 +71,11 @@ pub mod sender_key_name {
         pub fn from_buf(key: String, group_len: usize) -> Self {
             Self { key, group_len }
         }
+        /// Validate an externally supplied offset before using the slicing accessors.
+        pub fn try_from_buf(key: String, group_len: usize) -> Option<Self> {
+            (key.is_char_boundary(group_len) && key.as_bytes().get(group_len) == Some(&b':'))
+                .then_some(Self { key, group_len })
+        }
         pub fn cache_key(&self) -> &str {
             &self.key
         }
@@ -90,6 +95,27 @@ pub mod sender_key_name {
     impl core::fmt::Display for SenderKeyName {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             self.key.fmt(f)
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::SenderKeyName;
+
+        #[test]
+        fn checked_offsets_require_a_character_boundary_and_separator() {
+            for offset in [0, 1, 3, 4, usize::MAX] {
+                assert!(SenderKeyName::try_from_buf("é:x".into(), offset).is_none());
+            }
+            assert!(SenderKeyName::try_from_buf("group-sender".into(), 5).is_none());
+            assert!(SenderKeyName::try_from_buf(String::new(), 0).is_none());
+            for (key, offset, group, sender) in
+                [("é:x", 2, "é", "x"), (":", 0, "", ""), ("g:", 1, "g", "")]
+            {
+                let name = SenderKeyName::try_from_buf(key.into(), offset).unwrap();
+                assert_eq!(name.group_id(), group);
+                assert_eq!(name.sender_id(), sender);
+                assert_eq!(name.cache_key(), key);
+            }
         }
     }
 }
@@ -130,11 +156,7 @@ pub mod record_helpers {
             record.public_key = Some(key.public_key.public_key_bytes().to_vec());
             record.private_key = Some(key.private_key.serialize().to_vec());
             record.signature = Some(signature.to_vec());
-            record.timestamp = Some(u64::try_from(timestamp.timestamp()).map_err(|_| {
-                protocol::SignalProtocolError::InvalidArgument(
-                    "signed prekey timestamp precedes epoch".into(),
-                )
-            })?);
+            record.timestamp = Some(timestamp.timestamp().max(0) as u64);
             Ok(record)
         }
     }

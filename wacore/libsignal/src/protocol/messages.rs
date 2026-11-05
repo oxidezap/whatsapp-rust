@@ -211,6 +211,9 @@ impl PreKeySignalMessage {
         if !matches!(version, 3 | 4) {
             return Err(SignalProtocolError::UnrecognizedCiphertextVersion(version));
         }
+        if version != inner.message_version() {
+            return Err(SignalProtocolError::UnrecognizedCiphertextVersion(version));
+        }
         let parsed = engine::wire::PreKeySignalMessage {
             registration,
             pre_key_id: pre_key_id.map(Into::into),
@@ -770,6 +773,26 @@ mod borrowed_tests {
             (message.ciphertext().as_ptr() as usize + message.ciphertext().len())
                 <= pointer as usize + message.serialized().len()
         );
+    }
+    #[test]
+    fn prekey_constructor_rejects_mixed_inner_and_outer_versions() {
+        for outer in [3, 4] {
+            for inner_version in [3, 4] {
+                let mut encoded = signal_bytes();
+                encoded[0] = (inner_version << 4) | 3;
+                let inner = SignalMessage::try_from(encoded.as_slice()).unwrap();
+                let result = PreKeySignalMessage::new(
+                    outer,
+                    1,
+                    Some(2.into()),
+                    3.into(),
+                    PublicKey::from_djb_public_key_bytes(&[4; 32]).unwrap(),
+                    IdentityKey::new(PublicKey::from_djb_public_key_bytes(&[5; 32]).unwrap()),
+                    inner,
+                );
+                assert_eq!(result.is_ok(), outer == inner_version);
+            }
+        }
     }
     #[test]
     fn prekey_inner_retains_unknown_fields_and_shares_outer_storage() {

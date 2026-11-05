@@ -454,12 +454,15 @@ impl<C: crate::engine::CryptoProvider> crate::engine::CryptoProvider for Provide
         ciphertext: &[u8],
     ) -> crate::engine::Result<Vec<u8>> {
         if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
-            return Err(crate::engine::Error::Authentication);
+            return Err(crate::engine::Error::InvalidCiphertext);
         }
         let mut out = zeroize::Zeroizing::new(Vec::new());
         self.provider
             .aes_256_cbc_decrypt(key, iv, ciphertext, &mut out)
-            .map_err(engine_provider_error)?;
+            .map_err(|error| match error {
+                CryptoProviderError::AuthFailed => crate::engine::Error::InvalidCiphertext,
+                error => engine_provider_error(error),
+            })?;
         if !ciphertext
             .len()
             .checked_sub(out.len())
@@ -663,6 +666,36 @@ impl CryptographicMac {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn selected_cbc_padding_errors_match_native_invalid_ciphertext() {
+        use crate::engine::{CryptoProvider, Error as EngineError};
+        struct FailingCbc(CryptoProviderError);
+        impl SymmetricCryptoProvider for FailingCbc {
+            fn aes_256_cbc_decrypt(
+                &self,
+                _: &[u8; 32],
+                _: &[u8; 16],
+                _: &[u8],
+                _: &mut Vec<u8>,
+            ) -> Result<(), CryptoProviderError> {
+                Err(self.0)
+            }
+        }
+        let padding = FailingCbc(CryptoProviderError::AuthFailed);
+        let selected = ProviderCrypto::new(&padding);
+        for input in [&[][..], &[0; 15][..], &[0; 16][..]] {
+            assert_eq!(
+                selected.decrypt_cbc(&[1; 32], &[2; 16], input),
+                Err(EngineError::InvalidCiphertext)
+            );
+        }
+        let outage = FailingCbc(CryptoProviderError::BackendFailed);
+        assert_eq!(
+            ProviderCrypto::new(&outage).decrypt_cbc(&[1; 32], &[2; 16], &[0; 16]),
+            Err(EngineError::Crypto)
+        );
+    }
 
     #[test]
     fn paired_chain_derivation_keeps_selected_callbacks_and_failure_rollback() {

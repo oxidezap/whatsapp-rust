@@ -606,7 +606,7 @@ fn cancelling_pending_commit_does_not_cancel_queued_restoration() {
     assert!(store.record.lock().unwrap().is_some());
 }
 #[test]
-fn signed_key_helper_stores_seconds_and_rejects_pre_epoch() {
+fn signed_key_helper_stores_seconds_and_clamps_pre_epoch() {
     let mut rng = rand::rngs::StdRng::seed_from_u64(2);
     let key = KeyPair::generate(&mut rng);
     let timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 123_000_000).unwrap();
@@ -615,9 +615,11 @@ fn signed_key_helper_stores_seconds_and_rejects_pre_epoch() {
             .unwrap();
     assert_eq!(record.timestamp, Some(1_700_000_000));
     let negative = chrono::DateTime::from_timestamp(-1, 0).unwrap();
-    assert!(
+    assert_eq!(
         crate::store::record_helpers::new_signed_pre_key_record(4, &key, [5; 64], negative)
-            .is_err()
+            .unwrap()
+            .timestamp,
+        Some(0)
     );
 }
 
