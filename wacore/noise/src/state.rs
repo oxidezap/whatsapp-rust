@@ -53,6 +53,11 @@ impl NoiseCipher {
         self.aead
             .encrypt_in_place(&iv, b"", &mut out)
             .map_err(NoiseError::Encrypt)?;
+        if out.len() != plaintext.len() + TAG_LEN {
+            return Err(NoiseError::Encrypt(
+                wacore_libsignal::crypto::CryptoProviderError::BackendFailed,
+            ));
+        }
         Ok(out)
     }
 

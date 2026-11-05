@@ -68,41 +68,71 @@ impl whatsapp_rust::transport::Transport for RecordingTransport {
 
 #[tokio::test]
 async fn a_provider_that_breaks_the_tag_size_contract_cannot_write_a_frame() {
-    let key = [0x11u8; 32];
-    let default_cipher = wacore::handshake::NoiseCipher::new(&key).unwrap();
-    assert_eq!(
-        default_cipher
-            .encrypt_with_counter(0, &[7; 64])
-            .unwrap()
-            .len(),
-        80
-    );
-    let transport = Arc::new(RecordingTransport {
-        writes: Mutex::new(Vec::new()),
-    });
-    let socket = whatsapp_rust::socket::NoiseSocket::new(
-        Arc::new(whatsapp_rust::runtime_impl::TokioRuntime),
-        transport.clone(),
-        wacore::handshake::NoiseCipher::with_provider(&key, &ShortTagProvider)
-            .expect("test provider prepares cipher"),
-        wacore::handshake::NoiseCipher::with_provider(&key, &ShortTagProvider)
-            .expect("test provider prepares cipher"),
-    );
+    for plaintext_len in [64, 16 * 1024, 16 * 1024 + 1] {
+        let key = [0x11u8; 32];
+        let default_cipher = wacore::handshake::NoiseCipher::new(&key).unwrap();
+        assert_eq!(
+            default_cipher
+                .encrypt_with_counter(0, &[7; 64])
+                .unwrap()
+                .len(),
+            80
+        );
+        let transport = Arc::new(RecordingTransport {
+            writes: Mutex::new(Vec::new()),
+        });
+        let socket = whatsapp_rust::socket::NoiseSocket::new(
+            Arc::new(whatsapp_rust::runtime_impl::TokioRuntime),
+            transport.clone(),
+            wacore::handshake::NoiseCipher::with_provider(&key, &ShortTagProvider)
+                .expect("test provider prepares cipher"),
+            wacore::handshake::NoiseCipher::with_provider(&key, &ShortTagProvider)
+                .expect("test provider prepares cipher"),
+        );
 
-    let err = socket
-        .encrypt_and_send(bytes::Bytes::from(vec![7u8; 64]))
+        let err = socket
+            .encrypt_and_send(bytes::Bytes::from(vec![7u8; plaintext_len]))
+            .await
+            .expect_err("a frame whose sealed size disagrees with its prefix must be refused");
+
+        assert!(
+            matches!(
+                err.kind,
+                whatsapp_rust::socket::error::EncryptSendErrorKind::Crypto
+            ),
+            "the mismatch is a crypto-layer fault, got {err:?}"
+        );
+        assert!(
+            transport.writes.lock().expect("writes mutex").is_empty(),
+            "a frame with a prefix that disagrees with its body would desync the peer's parser, so it must never be written"
+        );
+    }
+}
+
+#[tokio::test]
+async fn offloaded_frame_rejects_bad_sealed_length_without_advancing_or_appending() {
+    let runtime: Arc<dyn wacore::runtime::Runtime> =
+        Arc::new(whatsapp_rust::runtime_impl::TokioRuntime);
+    for plaintext_len in [64, 16 * 1024 + 1] {
+        let key = Arc::new(
+            wacore::handshake::NoiseCipher::with_provider(&[0x11; 32], &ShortTagProvider).unwrap(),
+        );
+        let mut counter = 7;
+        let mut output = bytes::BytesMut::from(&b"prefix"[..]);
+        let error = whatsapp_rust::socket::NoiseSocket::encrypt_frame_into(
+            &runtime,
+            &key,
+            &mut counter,
+            bytes::Bytes::from(vec![7; plaintext_len]),
+            &mut output,
+        )
         .await
-        .expect_err("a frame whose sealed size disagrees with its prefix must be refused");
-
-    assert!(
-        matches!(
-            err.kind,
+        .expect_err("malformed provider output must be refused before framing");
+        assert!(matches!(
+            error.kind,
             whatsapp_rust::socket::error::EncryptSendErrorKind::Crypto
-        ),
-        "the mismatch is a crypto-layer fault, got {err:?}"
-    );
-    assert!(
-        transport.writes.lock().expect("writes mutex").is_empty(),
-        "a frame with a prefix that disagrees with its body would desync the peer's parser, so it must never be written"
-    );
+        ));
+        assert_eq!(counter, 7);
+        assert_eq!(&output[..], b"prefix");
+    }
 }
