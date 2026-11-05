@@ -4,7 +4,6 @@ use crate::node::{AttrsRef, NodeContentRef, NodeRef, NodeStr, ValueRef};
 use crate::token;
 use compact_str::CompactString;
 use std::borrow::Cow;
-use std::mem::MaybeUninit;
 
 /// Each byte's two output characters, so unpacking is one load and one 2-byte
 /// store per input byte instead of two shifts, two lookups and two bounds
@@ -67,85 +66,70 @@ pub enum OpenContent<'a> {
     Scalar(NodeContentRef<'a>),
 }
 
+// Retain only the unread suffix so each primitive checks its own width once.
+// Absolute positions are needed only by the streaming interface.
 pub(crate) struct Decoder<'a> {
     data: &'a [u8],
-    position: usize,
+    initial_len: usize,
 }
 
 impl<'a> Decoder<'a> {
     pub(crate) fn new(data: &'a [u8]) -> Self {
-        Self { data, position: 0 }
+        Self {
+            data,
+            initial_len: data.len(),
+        }
     }
 
     pub(crate) fn is_finished(&self) -> bool {
-        self.position >= self.data.len()
+        self.data.is_empty()
     }
 
     pub(crate) fn bytes_left(&self) -> usize {
-        self.data.len() - self.position
-    }
-
-    #[inline(always)]
-    fn check_eos(&self, len: usize) -> Result<()> {
-        if self.bytes_left() >= len {
-            Ok(())
-        } else {
-            Err(BinaryError::UnexpectedEof)
-        }
+        self.data.len()
     }
 
     #[inline(always)]
     fn read_u8(&mut self) -> Result<u8> {
-        self.check_eos(1)?;
-        let position = self.position;
-        self.position += 1;
-        Ok(self.data[position])
+        let (&byte, remaining) = self.data.split_first().ok_or(BinaryError::UnexpectedEof)?;
+        self.data = remaining;
+        Ok(byte)
+    }
+
+    #[inline(always)]
+    fn read_array<const N: usize>(&mut self) -> Result<&'a [u8; N]> {
+        let (bytes, remaining) = self
+            .data
+            .split_first_chunk()
+            .ok_or(BinaryError::UnexpectedEof)?;
+        self.data = remaining;
+        Ok(bytes)
     }
 
     #[inline(always)]
     fn read_u16_be(&mut self) -> Result<u16> {
-        self.check_eos(2)?;
-        let position = self.position;
-        self.position += 2;
-        Ok(u16::from_be_bytes([
-            self.data[position],
-            self.data[position + 1],
-        ]))
+        Ok(u16::from_be_bytes(*self.read_array()?))
     }
 
     #[inline(always)]
     fn read_u20_be(&mut self) -> Result<u32> {
-        self.check_eos(3)?;
-        let position = self.position;
-        self.position += 3;
-        let bytes = [
-            self.data[position],
-            self.data[position + 1],
-            self.data[position + 2],
-        ];
-        Ok(((bytes[0] as u32 & 0x0F) << 16) | ((bytes[1] as u32) << 8) | (bytes[2] as u32))
+        let [a, b, c] = *self.read_array()?;
+        Ok(((a as u32 & 0x0F) << 16) | ((b as u32) << 8) | c as u32)
     }
 
     #[inline(always)]
     fn read_u32_be(&mut self) -> Result<u32> {
-        self.check_eos(4)?;
-        let position = self.position;
-        self.position += 4;
-        Ok(u32::from_be_bytes([
-            self.data[position],
-            self.data[position + 1],
-            self.data[position + 2],
-            self.data[position + 3],
-        ]))
+        Ok(u32::from_be_bytes(*self.read_array()?))
     }
 
     #[inline(always)]
     fn read_bytes(&mut self, len: usize) -> Result<&'a [u8]> {
-        self.check_eos(len)?;
-        let start = self.position;
-        let end = start + len;
-        self.position = end;
-        Ok(&self.data[start..end])
+        let (bytes, remaining) = self
+            .data
+            .split_at_checked(len)
+            .ok_or(BinaryError::UnexpectedEof)?;
+        self.data = remaining;
+        Ok(bytes)
     }
 
     #[inline(always)]
@@ -353,8 +337,9 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    /// Decode directly into the final inline or heap string, avoiding a
-    /// zeroed maximum-size scratch buffer and a second copy of the output.
+    /// Decode packed nibble/hex into a stack buffer, then create CompactString.
+    /// Max unpacked length is 254 bytes (127 packed × 2), so the stack buffer
+    /// is always sufficient. Short values (≤24 bytes) are stored inline.
     fn read_packed(&mut self, tag: u8) -> Result<CompactString> {
         let packed_len_byte = self.read_u8()?;
         let is_half_byte = (packed_len_byte & 0x80) != 0;
@@ -365,26 +350,25 @@ impl<'a> Decoder<'a> {
         }
 
         let packed_data = self.read_bytes(len)?;
-        let written = len * 2;
-        let mut output = CompactString::with_capacity(written);
-        // SAFETY: Only spare capacity is written; the string stays empty until
-        // decoding succeeds. An invalid nibble can therefore return early and
-        // drop the allocation without exposing partially initialized bytes.
-        let spare = unsafe { output.spare_capacity_mut() };
+        let mut buf = [0u8; 254];
         let mut pos = 0;
+
         match tag {
-            token::HEX_8 => Self::decode_packed_hex(packed_data, spare, &mut pos),
-            token::NIBBLE_8 => Self::decode_packed_nibble(packed_data, spare, &mut pos)?,
+            token::HEX_8 => Self::decode_packed_hex(packed_data, &mut buf, &mut pos),
+            token::NIBBLE_8 => Self::decode_packed_nibble(packed_data, &mut buf, &mut pos)?,
             _ => return Err(BinaryError::InvalidToken(tag)),
         }
-        if is_half_byte {
+
+        if is_half_byte && pos > 0 {
             pos -= 1;
         }
-        // SAFETY: Both decoders initialize exactly `written` bytes, all ASCII
-        // (including NUL for nibble 15). The final nibble is validated even
-        // when the half-byte flag omits it. `pos <= written <= capacity()`.
-        unsafe { output.set_len(pos) };
-        Ok(output)
+
+        // Unlike `read_string`, which validates bytes that came off the wire,
+        // this validates bytes the tables above just wrote, so it can never
+        // fail. Keeping a check at all is cheap insurance against a future
+        // table edit; smoothutf8 is the same validator the wire path uses.
+        let s = smoothutf8::from_utf8(&buf[..pos]).expect("packed decode produced non-ASCII");
+        Ok(CompactString::from(s))
     }
 
     // Deliberately scalar. A vectorised version of this loop lived here until
@@ -396,15 +380,13 @@ impl<'a> Decoder<'a> {
     // Packed payloads are ids and phone numbers, so the loop also needed a
     // 31-character string before it engaged at all.
     #[inline]
-    fn decode_packed_hex(packed_data: &[u8], out: &mut [MaybeUninit<u8>], pos: &mut usize) {
+    fn decode_packed_hex(packed_data: &[u8], out: &mut [u8], pos: &mut usize) {
         let written = packed_data.len() * 2;
         for (slot, &byte) in out[*pos..*pos + written]
             .chunks_exact_mut(2)
             .zip(packed_data)
         {
-            let pair = HEX_PAIRS[byte as usize];
-            slot[0].write(pair[0]);
-            slot[1].write(pair[1]);
+            slot.copy_from_slice(&HEX_PAIRS[byte as usize]);
         }
         *pos += written;
     }
@@ -414,11 +396,7 @@ impl<'a> Decoder<'a> {
     // out-of-range nibbles before it could shuffle, then fall back to this
     // loop anyway whenever a lane failed.
     #[inline]
-    fn decode_packed_nibble(
-        packed_data: &[u8],
-        out: &mut [MaybeUninit<u8>],
-        pos: &mut usize,
-    ) -> Result<()> {
+    fn decode_packed_nibble(packed_data: &[u8], out: &mut [u8], pos: &mut usize) -> Result<()> {
         let written = packed_data.len() * 2;
         for (slot, &byte) in out[*pos..*pos + written]
             .chunks_exact_mut(2)
@@ -430,8 +408,7 @@ impl<'a> Decoder<'a> {
                 Self::unpack_nibble((byte & 0xF0) >> 4)?;
                 Self::unpack_nibble(byte & 0x0F)?;
             }
-            slot[0].write(pair[0]);
-            slot[1].write(pair[1]);
+            slot.copy_from_slice(&pair);
         }
         *pos += written;
 
@@ -520,7 +497,7 @@ impl<'a> Decoder<'a> {
     /// buffer has to drop once it is done with what was decoded.
     #[inline]
     pub(crate) fn position(&self) -> usize {
-        self.position
+        self.initial_len - self.data.len()
     }
 
     /// Decode a node's head only: tag, attributes and what its content is,
@@ -735,6 +712,37 @@ mod tests {
     use crate::node::{Attrs, Node};
 
     type TestResult = Result<()>;
+
+    #[test]
+    fn primitive_reads_preserve_positions_after_truncation() {
+        let input = [1, 2, 3, 4, 5];
+        for len in 0..=input.len() {
+            for consumed in 0..=len {
+                for width in 1..=4 {
+                    let mut decoder = Decoder::new(&input[..len]);
+                    decoder.read_bytes(consumed).unwrap();
+                    let result = match width {
+                        1 => decoder.read_u8().map(u32::from),
+                        2 => decoder.read_u16_be().map(u32::from),
+                        3 => decoder.read_u20_be(),
+                        _ => decoder.read_u32_be(),
+                    };
+                    let end = consumed + if result.is_ok() { width } else { 0 };
+                    assert_eq!(result.is_ok(), len - consumed >= width);
+                    assert_eq!(decoder.position(), end);
+                    assert_eq!(decoder.bytes_left(), len - end);
+                    assert!(matches!(
+                        decoder.read_bytes(usize::MAX),
+                        Err(BinaryError::UnexpectedEof)
+                    ));
+                    assert_eq!(decoder.position(), end);
+                    assert_eq!(decoder.read_bytes(len - end).unwrap(), &input[end..len]);
+                    assert!(decoder.is_finished());
+                    assert_eq!(decoder.position(), len);
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_decode_node() -> TestResult {
@@ -1017,7 +1025,7 @@ mod tests {
     }
 
     #[test]
-    fn packed_direct_output_matches_scalar_and_validates_trimmed_nibbles() {
+    fn packed_output_matches_scalar_and_validates_trimmed_nibbles() {
         for tag in [token::HEX_8, token::NIBBLE_8] {
             for byte in 0..=255u8 {
                 for half in [false, true] {
