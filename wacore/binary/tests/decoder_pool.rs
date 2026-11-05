@@ -1,4 +1,6 @@
 //! Compatibility checks for the benchmark-only pooled representation.
+#[path = "../benches/decoder_pool/fixture.rs"]
+mod fixture;
 use wacore_binary::bench_internals as decoder_pool;
 pub use wacore_binary::*;
 
@@ -6,7 +8,7 @@ pub use wacore_binary::*;
 fn pooled_frames_preserve_values_and_consumers() {
     let mut fixtures: Vec<_> = [0, 1, 32, 128]
         .into_iter()
-        .map(decoder_pool::fixture)
+        .map(fixture::node_bytes)
         .collect();
     for node in [
         builder::NodeBuilder::new("message").build(),
@@ -35,7 +37,7 @@ fn pooled_frames_preserve_values_and_consumers() {
 
 #[test]
 fn pooled_frames_preserve_rejections() {
-    let fixture = decoder_pool::fixture(2);
+    let fixture = fixture::node_bytes(2);
     let mut inputs: Vec<Vec<u8>> = (0..fixture.len()).map(|n| fixture[..n].to_vec()).collect();
     let mut trailing = fixture.clone();
     trailing.push(0);
@@ -83,7 +85,7 @@ fn pooled_owned_frame_retains_bytes_and_can_cross_threads() {
     fn send_sync<T: Send + Sync>() {}
     send_sync::<decoder_pool::OwnedFrame>();
     for two_pass in [false, true] {
-        let data = decoder_pool::fixture(32);
+        let data = fixture::node_bytes(32);
         let expected = marshal::unmarshal_ref(&data).unwrap().to_owned();
         let buffer = bytes::Bytes::from(data);
         let frame = std::sync::Arc::new(
@@ -101,7 +103,7 @@ fn pooled_owned_frame_retains_bytes_and_can_cross_threads() {
 
 #[test]
 fn pooled_owned_errors_release_partial_and_complete_frames() {
-    let data = decoder_pool::fixture(2);
+    let data = fixture::node_bytes(2);
     for two_pass in [false, true] {
         let truncated = bytes::Bytes::copy_from_slice(&data[..data.len() - 1]);
         assert!(matches!(

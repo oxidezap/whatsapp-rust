@@ -1,7 +1,6 @@
 //! Benchmark-only storage alternatives using the production wire parser.
-use crate as wacore_binary;
-use wacore_binary::node::{NodeStr, ValueRef};
-use wacore_binary::{Node, NodeContent, Result};
+use crate::node::{NodeStr, ValueRef};
+use crate::{Node, NodeContent, Result};
 
 type Entry<'a> = (NodeStr<'a>, ValueRef<'a>);
 
@@ -254,7 +253,7 @@ fn consume_attrs(attrs: &[Entry<'_>]) -> Result<usize> {
         + id.map_or(0, |s| s.len()))
 }
 
-pub fn consume_tree(node: &wacore_binary::NodeRef<'_>) -> Result<usize> {
+pub fn consume_tree(node: &crate::NodeRef<'_>) -> Result<usize> {
     let mut sum = consume_attrs(node.attrs.as_slice())? + node.tag.len();
     if let Some(children) = node.children() {
         for child in children {
@@ -262,39 +261,4 @@ pub fn consume_tree(node: &wacore_binary::NodeRef<'_>) -> Result<usize> {
         }
     }
     Ok(sum)
-}
-
-pub fn fixture(width: usize) -> Vec<u8> {
-    use wacore_binary::{builder::NodeBuilder, jid::Jid, marshal::marshal_shallow};
-    let children: Vec<_> = (0..width)
-        .map(|i| {
-            NodeBuilder::new("message")
-                .attr(
-                    "from",
-                    Jid::pn_device(format!("55110000{:05}", i / 4), (i % 4) as u16),
-                )
-                .attr("participant", Jid::pn("5511000000000"))
-                .attr(
-                    "id",
-                    if i % 3 == 0 {
-                        "A12345678901234567890123456789012345678901234567890123456789012345"
-                    } else {
-                        "3EB0123456789"
-                    },
-                )
-                .children(vec![
-                    NodeBuilder::new("enc")
-                        .attr("v", "2")
-                        .attr("type", "msg")
-                        .bytes(vec![0xAB; 128])
-                        .build(),
-                ])
-                .build()
-        })
-        .collect();
-    let root = NodeBuilder::new("notification")
-        .attr("type", "devices")
-        .children(children)
-        .build();
-    marshal_shallow(&root).expect("synthetic fixture")[1..].to_vec()
 }
