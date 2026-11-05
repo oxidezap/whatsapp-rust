@@ -3808,9 +3808,10 @@ fn client_size_pins_runtime_cache_config_saving() {
     }
     #[cfg(feature = "mobile-core")]
     {
-        // Mobile configuration remains behind one shared pointer. Its per-client
-        // handshake counter and alignment are opt-in; keep the Web base fixed.
-        expected += size_of::<(Option<Arc<crate::RegisteredMobileSession>>, AtomicU32)>();
+        // These are separate fields, not an independently aligned tuple. In
+        // the x86_64 test layout the four-byte handshake counter fits existing
+        // scalar/tail padding; only the shared pointer extends Client.
+        expected += size_of::<Option<Arc<crate::RegisteredMobileSession>>>();
     }
     #[cfg(feature = "bench-harness")]
     {
