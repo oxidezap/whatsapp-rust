@@ -167,6 +167,14 @@
         "release": true
       },
       {
+        "lanes": ["wasm"],
+        "mode": "test",
+        "features": ["mobile-execution"],
+        "no_default_features": true,
+        "test": "mobile_workflow",
+        "wasm_test": true
+      },
+      {
         "lanes": ["native", "msrv"],
         "mode": "test",
         "features": ["native-default", "contracts"],

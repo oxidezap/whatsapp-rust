@@ -106,6 +106,32 @@ The registered WASM command builds the `mobile_probe` binary, producing a final
 execution. The optional native transport profile is intentionally not a WASM
 profile.
 
+The separate `mobile-execution` consumer feature runs the named
+`mobile_workflow` integration test through `wasm-bindgen-test` in a browser.
+Its WASM registry command has `wasm_test: true`; a native build of the
+WASM-only test cannot qualify execution by reporting zero tests. This feature
+selects the mobile core, JS support and the test harness without selecting
+VoIP, SQLite or a native runtime adapter.
+
+The three synchronous browser cases exercise uncertain-outcome restore,
+verified-checkpoint acknowledgement freshness and environment isolation through
+the SDK export. All outcomes, clocks, run IDs and persistence acknowledgements
+are synthetic host inputs. They do not exercise a transport, an APK, an actual
+database transaction or the JavaScript API of whatsapp-rust-bridge.
+
+The existing WASM CI lane supplies its pinned runner and browser/driver pair.
+For a focused local run, install the runner matching the consumer lock and
+configure a compatible browser/driver before using:
+
+```console
+CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo test --manifest-path tests/api-consumer/Cargo.toml --locked --no-default-features --features mobile-execution --target wasm32-unknown-unknown --test mobile_workflow
+```
+
+Use `CHROMEDRIVER` for a local driver path and, if needed,
+`WASM_BINDGEN_TEST_WEBDRIVER_JSON` for that runner's browser capabilities.
+Do not reuse a signed-in browser profile. Record actual runner/browser versions
+and results in the PR; compilation alone does not establish this qualification.
+
 ESP32 remains experimental until an explicit supported target, allocator/runtime,
 transport and persistence adapter can build and execute representative scenarios.
 Do not claim ESP32 support from a Linux or WASM build. Check target memory budgets

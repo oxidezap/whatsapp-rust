@@ -21,6 +21,7 @@ native-default = ["native", "whatsapp-rust/default"]
 event-fixtures = ["native", "whatsapp-rust/bench-harness"]
 plugins = ["sdk", "whatsapp-rust/plugins"]
 mobile-core = ["sdk", "whatsapp-rust/mobile-core"]
+mobile-execution = ["mobile-core", "js", "dep:wasm-bindgen-test"]
 mobile-transport-native = ["mobile-core", "whatsapp-rust/mobile-transport-native"]
 voip-control = ["sdk", "whatsapp-rust/voip-control"]
 voip-runtime = ["voip-control", "whatsapp-rust/voip-runtime"]
@@ -178,3 +179,8 @@ required-features = ["runtime-execution"]
 name = "mobile_probe"
 path = "src/mobile_probe.rs"
 required-features = ["mobile-core"]
+
+[[test]]
+name = "mobile_workflow"
+path = "tests/mobile_workflow.rs"
+required-features = ["mobile-execution"]
