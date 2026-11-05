@@ -618,12 +618,6 @@ pub struct SignalStoreCache {
     /// Fast-path guard for the normally-empty pending distribution map. Warm
     /// group encrypts avoid a second sender-key mutex acquisition.
     has_pending_sender_key_distributions: AtomicBool,
-    /// Consumed one-time prekeys buffered for durable deletion, keyed by the
-    /// address of the session whose pkmsg promotion consumed each one. The flush
-    /// deletes a prekey only after that session is persisted, so a crash can never
-    /// lose both and leave a redelivered pkmsg undecryptable. Per-address (not a
-    /// global flag) so only the prekeys of still-volatile sessions are deferred.
-    removed_prekeys: Mutex<HashMap<u32, Arc<str>>>,
     /// Per-(group, sender) locks serializing each sender-key chain advance.
     /// Coordination only (like the client session locks): never time-evicted.
     sender_key_locks: Mutex<HashMap<Arc<str>, Arc<Mutex<()>>>>,
@@ -688,6 +682,9 @@ struct SessionStoreState {
     cache: UserIndexedCache<SessionEntry>,
     dirty: HashSet<Arc<str>>,
     deleted: HashSet<Arc<str>>,
+    /// Consumed keys share the session lock so a received session and its
+    /// deferred deletion intent become visible as one transition.
+    removed_prekeys: HashMap<u32, Arc<str>>,
     /// Sessions whose raised counter reservation has not reached the backend
     /// yet. While any address is here, an outbound ciphertext may be relying
     /// on a lease that only exists in memory, so the send path must flush
@@ -706,6 +703,7 @@ impl SessionStoreState {
             cache: UserIndexedCache::new(),
             dirty: HashSet::new(),
             deleted: HashSet::new(),
+            removed_prekeys: HashMap::new(),
             reservation_pending: PendingWireGate::new(),
         }
     }
@@ -830,6 +828,8 @@ impl SessionStoreState {
 
     fn discard(&mut self, incarnation: StoreIncarnation, generation: u64) {
         self.clear();
+        // A discarded volatile session must keep its durable prekey usable.
+        self.removed_prekeys.clear();
         self.incarnation = incarnation;
         self.checkout_generation = generation;
     }
@@ -872,6 +872,7 @@ struct PendingSessionRestore {
     checkout: SessionCheckoutKey,
     had_session: bool,
     completion: Option<Arc<AtomicBool>>,
+    consumed_prekey: Option<u32>,
 }
 
 // === Sender key object cache (same pattern as sessions) ===
@@ -1056,7 +1057,6 @@ impl SignalStoreCache {
             identity_continuity: IdentityContinuity::default(),
             sender_keys: Mutex::new(sender_keys),
             has_pending_sender_key_distributions: AtomicBool::new(false),
-            removed_prekeys: Mutex::new(HashMap::new()),
             sender_key_locks: Mutex::new(HashMap::new()),
             max_entries,
         }
@@ -1079,6 +1079,7 @@ impl SignalStoreCache {
             checkout,
             had_session,
             completion,
+            consumed_prekey,
         } in pending.drain(..)
         {
             let key = if checkout.generation() == state.checkout_generation
@@ -1099,7 +1100,12 @@ impl SignalStoreCache {
             };
             let restored = key.is_some();
             match (key, record) {
-                (Some(key), Some(record)) => state.put_with_key(key, record),
+                (Some(key), Some(record)) => {
+                    if let Some(id) = consumed_prekey {
+                        state.removed_prekeys.insert(id, address.clone());
+                    }
+                    state.put_with_key(key, record);
+                }
                 (Some(key), None) => {
                     state.cache.insert(key, SessionEntry::Absent);
                 }
@@ -1135,6 +1141,18 @@ impl SignalStoreCache {
         checkout: SessionCheckoutKey,
         had_session: bool,
     ) -> SessionCheckoutStoreResult {
+        self.restore_session_with_consumed_prekey(address, record, checkout, had_session, None)
+    }
+
+    #[doc(hidden)]
+    pub fn restore_session_with_consumed_prekey(
+        &self,
+        address: &ProtocolAddress,
+        record: SessionRecord,
+        checkout: SessionCheckoutKey,
+        had_session: bool,
+        consumed_prekey: Option<u32>,
+    ) -> SessionCheckoutStoreResult {
         if checkout.generation() != self.session_recovery_generation.load(Ordering::Acquire) {
             return SessionCheckoutStoreResult::Rejected;
         }
@@ -1159,6 +1177,13 @@ impl SignalStoreCache {
                 return SessionCheckoutStoreResult::Rejected;
             }
             let key = key.clone();
+            if let Some(id) = consumed_prekey {
+                // A fresh Arc distinguishes reconsumption from an older flush
+                // snapshot even when the logical address is unchanged.
+                state
+                    .removed_prekeys
+                    .insert(id, Arc::from(address.as_str()));
+            }
             state.put_with_key(key, record);
             state.evict_if_needed(self.max_entries);
             return SessionCheckoutStoreResult::Stored;
@@ -1175,6 +1200,7 @@ impl SignalStoreCache {
             checkout,
             had_session,
             completion: Some(completion.clone()),
+            consumed_prekey,
         });
         self.has_pending_session_restores
             .store(true, Ordering::Release);
@@ -1196,6 +1222,7 @@ impl SignalStoreCache {
                     checkout,
                     had_session: false,
                     completion: None,
+                    consumed_prekey: None,
                 });
                 self.has_pending_session_restores
                     .store(true, Ordering::Release);
@@ -2135,9 +2162,9 @@ impl SignalStoreCache {
     /// buffered prekey only once its own session is durable; a session still
     /// checked out defers just that prekey, not the others.
     pub async fn remove_prekey(&self, prekey_id: u32, session_address: &str) {
-        self.removed_prekeys
-            .lock()
+        self.lock_sessions()
             .await
+            .removed_prekeys
             .insert(prekey_id, Arc::from(session_address));
     }
 
@@ -2174,8 +2201,8 @@ impl SignalStoreCache {
             // Capture consumption together with its session snapshot: a prekey
             // buffered during the I/O must wait for the next snapshot, even if
             // this flush persisted an older session at the same address.
-            let removed = self.removed_prekeys.lock().await;
-            let prekeys = removed
+            let prekeys = state
+                .removed_prekeys
                 .iter()
                 .map(|(&id, address)| (id, address.clone(), PrekeyProbe::Needed))
                 .collect::<Vec<_>>();
@@ -2228,13 +2255,12 @@ impl SignalStoreCache {
         }
         let incarnation = {
             let state = self.lock_sessions().await;
-            let removed = self.removed_prekeys.lock().await;
             for (id, address, probe) in &mut prekeys {
-                *probe = state.prekey_probe(&removed, *id, address);
+                *probe = state.prekey_probe(&state.removed_prekeys, *id, address);
             }
             state.incarnation
         };
-        // Read-only probes can release both locks. The outer flush gate keeps
+        // Read-only probes can release the session lock. The outer flush gate keeps
         // backend writes ordered; the destructive phase rechecks live cache
         // state and consumption identity before trusting a probe result.
         for (_, address, probe) in &mut prekeys {
@@ -2257,11 +2283,10 @@ impl SignalStoreCache {
         // window, including the gap between session return and consumption
         // buffering, rather than merely retaining a newer buffer entry after
         // its private key has already been destroyed.
-        let state = self.lock_sessions().await;
-        let mut removed = self.removed_prekeys.lock().await;
+        let mut state = self.lock_sessions().await;
         let mut deletable = Vec::new();
         for (id, address, probe) in prekeys {
-            let durable = match state.prekey_probe(&removed, id, &address) {
+            let durable = match state.prekey_probe(&state.removed_prekeys, id, &address) {
                 PrekeyProbe::Durable => true,
                 PrekeyProbe::Deferred => false,
                 PrekeyProbe::Needed => probe == PrekeyProbe::Durable,
@@ -2273,7 +2298,7 @@ impl SignalStoreCache {
         if !deletable.is_empty() {
             backend.remove_prekeys_batch(&deletable).await?;
             for id in deletable {
-                removed.remove(&id);
+                state.removed_prekeys.remove(&id);
             }
         }
         Ok(())
@@ -2559,10 +2584,6 @@ impl SignalStoreCache {
         self.sender_keys.lock().await.discard(incarnation);
         self.has_pending_sender_key_distributions
             .store(false, Ordering::Release);
-        // Drop buffered prekey removals together with the volatile sessions they
-        // belong to: the promoted session is gone, so the still-durable prekey
-        // must stay so a redelivered pkmsg can rebuild the session.
-        self.removed_prekeys.lock().await.clear();
     }
 
     /// Only a discard can make a post-flush write's stale snapshot reloadable.
@@ -2576,7 +2597,7 @@ impl SignalStoreCache {
         {
             sessions.clear_clean_entries();
             if sessions.cache.is_empty() {
-                self.removed_prekeys.lock().await.clear();
+                sessions.removed_prekeys.clear();
             }
         }
         drop(sessions);
@@ -4152,6 +4173,81 @@ mod consumed_prekey_atomicity_tests {
 
     const PREKEY_ID: u32 = 4242;
 
+    #[tokio::test]
+    async fn received_checkout_keeps_consumption_when_queued_completion_is_abandoned() {
+        for queued in [false, true] {
+            let backend = InMemoryBackend::new();
+            let cache = SignalStoreCache::new();
+            let address = seed(&backend).await;
+            let (_, checkout) = cache.checkout_session(&address, &backend).await.unwrap();
+            let guard = if queued {
+                Some(cache.sessions.lock().await)
+            } else {
+                None
+            };
+            let restored = cache.restore_session_with_consumed_prekey(
+                &address,
+                SessionRecord::new_fresh(),
+                checkout,
+                false,
+                Some(PREKEY_ID),
+            );
+            assert!(matches!(
+                restored,
+                SessionCheckoutStoreResult::Stored | SessionCheckoutStoreResult::Pending(_)
+            ));
+            // No caller completes the queued handoff or separately buffers an id.
+            drop(guard);
+            assert!(backend.load_prekey(PREKEY_ID).await.unwrap().is_some());
+            cache.flush(&backend).await.unwrap();
+            assert!(
+                backend
+                    .get_session(address.as_str())
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(backend.load_prekey(PREKEY_ID).await.unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn discarded_received_checkout_keeps_its_durable_prekey() {
+        for queued in [false, true] {
+            let backend = InMemoryBackend::new();
+            let cache = SignalStoreCache::new();
+            let address = seed(&backend).await;
+            let (_, checkout) = cache.checkout_session(&address, &backend).await.unwrap();
+            let guard = if queued {
+                Some(cache.sessions.lock().await)
+            } else {
+                None
+            };
+            let result = cache.restore_session_with_consumed_prekey(
+                &address,
+                SessionRecord::new_fresh(),
+                checkout,
+                false,
+                Some(PREKEY_ID),
+            );
+            assert!(matches!(
+                result,
+                SessionCheckoutStoreResult::Stored | SessionCheckoutStoreResult::Pending(_)
+            ));
+            drop(guard);
+            cache.clear().await;
+            cache.flush(&backend).await.unwrap();
+            assert!(backend.load_prekey(PREKEY_ID).await.unwrap().is_some());
+            assert!(
+                backend
+                    .get_session(address.as_str())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
     /// Seed a durable prekey in the backend and return the address the inbound
     /// pkmsg promotes a session for.
     async fn seed(backend: &InMemoryBackend) -> ProtocolAddress {
@@ -4301,11 +4397,19 @@ mod consumed_prekey_atomicity_tests {
             "B's prekey must be deferred while B's session is checked out"
         );
         assert!(
-            cache.removed_prekeys.lock().await.contains_key(&PREKEY_B),
+            cache
+                .lock_sessions()
+                .await
+                .removed_prekeys
+                .contains_key(&PREKEY_B),
             "B's prekey stays buffered for a later flush"
         );
         assert!(
-            !cache.removed_prekeys.lock().await.contains_key(&PREKEY_A),
+            !cache
+                .lock_sessions()
+                .await
+                .removed_prekeys
+                .contains_key(&PREKEY_A),
             "A's prekey must be drained from the buffer, not left to leak"
         );
 
@@ -4414,7 +4518,11 @@ mod consumed_prekey_atomicity_tests {
             "a prekey with no durable session must survive the flush"
         );
         assert!(
-            cache.removed_prekeys.lock().await.contains_key(&PREKEY_ID),
+            cache
+                .lock_sessions()
+                .await
+                .removed_prekeys
+                .contains_key(&PREKEY_ID),
             "it stays buffered; a later clear() drops it, keeping the prekey durable"
         );
     }
@@ -4580,7 +4688,11 @@ mod consumed_prekey_atomicity_tests {
 
         // The buffered removal must remain so a later successful flush retries it.
         assert!(
-            cache.removed_prekeys.lock().await.contains_key(&PREKEY_ID),
+            cache
+                .lock_sessions()
+                .await
+                .removed_prekeys
+                .contains_key(&PREKEY_ID),
             "buffered prekey removal must persist across a failed flush"
         );
     }
@@ -4800,7 +4912,11 @@ mod consumed_prekey_atomicity_tests {
             "B's prekey must survive a concurrent flush that did not persist B's session"
         );
         assert!(
-            cache.removed_prekeys.lock().await.contains_key(&PREKEY_B),
+            cache
+                .lock_sessions()
+                .await
+                .removed_prekeys
+                .contains_key(&PREKEY_B),
             "B's prekey removal stays buffered for B's own flush"
         );
 
@@ -5104,7 +5220,7 @@ mod lease_reload_tests {
             ));
             assert!(!state.cache.contains_key(idle.as_str()));
         }
-        assert!(cache.removed_prekeys.lock().await.contains_key(&7));
+        assert!(cache.lock_sessions().await.removed_prekeys.contains_key(&7));
         assert!(matches!(
             cache.restore_session_from_checkout(
                 &active,
@@ -6082,7 +6198,13 @@ mod pre_wire_gate_tests {
             assert!(sender_keys.dirty.contains(name.cache_key()));
             assert!(sender_keys.wire_gate_pending.contains(name.cache_key()));
         }
-        assert!(cache.removed_prekeys.lock().await.contains_key(&PREKEY_ID));
+        assert!(
+            cache
+                .lock_sessions()
+                .await
+                .removed_prekeys
+                .contains_key(&PREKEY_ID)
+        );
 
         cache.flush(&backend).await.unwrap();
 

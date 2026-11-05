@@ -616,7 +616,17 @@ fn validate_download_status(status_code: u16) -> std::result::Result<(), Downloa
     Err(error)
 }
 
+#[cfg(test)]
 fn decrypt_or_validate_buffered_body(
+    body: &mut Vec<u8>,
+    decryption: &MediaDecryption,
+    hashes: &ExpectedMediaHashes,
+) -> std::result::Result<(), DownloadRequestError> {
+    decrypt_or_validate_buffered_body_with_provider(None, body, decryption, hashes)
+}
+
+fn decrypt_or_validate_buffered_body_with_provider(
+    provider: Option<&dyn wacore::libsignal::crypto::SymmetricCryptoProvider>,
     body: &mut Vec<u8>,
     decryption: &MediaDecryption,
     hashes: &ExpectedMediaHashes,
@@ -625,13 +635,24 @@ fn decrypt_or_validate_buffered_body(
         MediaDecryption::Encrypted {
             media_key,
             media_type,
-        } => DownloadUtils::verify_and_decrypt_in_place_with_hashes(
-            body,
-            media_key,
-            *media_type,
-            hashes.encrypted(),
-            hashes.plaintext(),
-        )
+        } => if let Some(provider) = provider {
+            DownloadUtils::verify_and_decrypt_in_place_with_hashes_and_provider(
+                provider,
+                body,
+                media_key,
+                *media_type,
+                hashes.encrypted(),
+                hashes.plaintext(),
+            )
+        } else {
+            DownloadUtils::verify_and_decrypt_in_place_with_hashes(
+                body,
+                media_key,
+                *media_type,
+                hashes.encrypted(),
+                hashes.plaintext(),
+            )
+        }
         .map_err(DownloadRequestError::other),
         MediaDecryption::Plaintext { file_sha256 } => {
             DownloadUtils::validate_plaintext_sha256(body, file_sha256)
@@ -1590,6 +1611,7 @@ where
 
     // Keep authentication/decryption and writer I/O in one blocking task so
     // non-streaming writer downloads pay for a single executor round-trip.
+    let crypto_provider = runtime.crypto_provider();
     Ok(wacore::runtime::blocking(&**runtime, move || {
         let mut writer = writer;
         let result = (|| {
@@ -1600,7 +1622,12 @@ where
             budget
                 .check_cancelled()
                 .map_err(DownloadRequestError::ResourcePolicy)?;
-            decrypt_or_validate_buffered_body(&mut body, &decryption, &hashes)?;
+            decrypt_or_validate_buffered_body_with_provider(
+                crypto_provider.as_deref(),
+                &mut body,
+                &decryption,
+                &hashes,
+            )?;
             clear_writer(&mut writer).map_err(DownloadRequestError::writer_io)?;
             // Cancellation-only budgets allow buffered adapters. The retained
             // MemoryWriter allocation still enforces its shared app-state quota;
@@ -1662,13 +1689,19 @@ async fn buffered_download_to_vec(
 ) -> std::result::Result<Vec<u8>, DownloadRequestError> {
     let mut body = buffered_download_body(http_client, request).await?;
     let decryption = request.decryption.clone();
+    let crypto_provider = runtime.crypto_provider();
     wacore::runtime::blocking(&**runtime, move || {
         if let Some(budget) = &hashes.budget {
             budget
                 .check_cancelled()
                 .map_err(DownloadRequestError::ResourcePolicy)?;
         }
-        decrypt_or_validate_buffered_body(&mut body, &decryption, &hashes)?;
+        decrypt_or_validate_buffered_body_with_provider(
+            crypto_provider.as_deref(),
+            &mut body,
+            &decryption,
+            &hashes,
+        )?;
         if let Some(budget) = &hashes.budget {
             budget
                 .check_cancelled()
@@ -2963,6 +2996,60 @@ mod tests {
         )
         .unwrap();
         (params, enc.data_to_upload)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn buffered_media_uses_its_runtime_provider_and_authenticates_before_decrypt() {
+        use crate::test_utils::crypto::CountingCrypto;
+        use std::sync::atomic::Ordering;
+        use wacore::runtime::CryptoRuntime;
+        let provider = Arc::new(CountingCrypto::default());
+        let other = Arc::new(CountingCrypto::default());
+        let runtime: Arc<dyn Runtime> = Arc::new(CryptoRuntime::new(
+            Arc::new(crate::TokioRuntime),
+            provider.clone(),
+        ));
+        let _other_runtime = CryptoRuntime::new(Arc::new(crate::TokioRuntime), other.clone());
+        let original = vec![9; 32 * 1024 + 13];
+        let (params, mut encrypted) = encrypted_params(&original);
+        let downloader = |body| {
+            MediaDownloader::new(
+                RoutedHttpClient::new(Vec::new(), (200, body)),
+                runtime.clone(),
+                MediaRoute::new(vec![MediaHost::new("synthetic.example")]),
+            )
+        };
+        let plain = downloader(encrypted.clone())
+            .download(&params, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(plain, original);
+        assert_eq!(provider.decrypts.load(Ordering::Relaxed), 1);
+        assert_eq!(provider.macs.load(Ordering::Relaxed), 1);
+        assert_eq!(other.decrypts.load(Ordering::Relaxed), 0);
+        provider.fail_mac.store(true, Ordering::Relaxed);
+        assert!(
+            downloader(encrypted.clone())
+                .download(&params, Default::default())
+                .await
+                .is_err()
+        );
+        assert_eq!(provider.decrypts.load(Ordering::Relaxed), 1);
+        provider.fail_mac.store(false, Ordering::Relaxed);
+        *encrypted.last_mut().unwrap() ^= 1;
+        assert!(
+            downloader(encrypted)
+                .download(&params, Default::default())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            provider.decrypts.load(Ordering::Relaxed),
+            1,
+            "invalid MAC must not invoke CBC"
+        );
+        assert_eq!(provider.macs.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test]

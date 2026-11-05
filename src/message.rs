@@ -205,7 +205,9 @@ enum MigrationDecryptResult {
     /// in fact found and whose retry then failed a MAC or a store read.
     /// `None` means nothing was migrated, so the caller's own error still is
     /// the terminal one.
-    NotDecrypted(Option<EncDecryptFailureReason>),
+    /// The optional retry reason overrides the opening error only when the
+    /// migrated decrypt failed locally; other failures retain the caller's mapping.
+    NotDecrypted(Option<EncDecryptFailureReason>, Option<RetryReason>),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -706,7 +708,13 @@ fn signal_error_reason(e: &SignalProtocolError) -> EncDecryptFailureReason {
         EncDecryptFailureReason::MalformedCiphertext
     } else if matches!(e, SignalProtocolError::BackendError(_, _)) {
         EncDecryptFailureReason::StorageFailure
-    } else if matches!(e, SignalProtocolError::KeyAgreementFailed(_)) {
+    } else if matches!(
+        e,
+        SignalProtocolError::KeyAgreementFailed(_)
+            | SignalProtocolError::Crypto(
+                wacore::libsignal::crypto::CryptoProviderError::BackendFailed
+            )
+    ) {
         // "the active crypto provider failed the key agreement" — our provider,
         // not the sender's bytes, which were never judged.
         EncDecryptFailureReason::LocalCryptoFailure
@@ -753,16 +761,26 @@ fn session_error_reason(e: &SignalProtocolError) -> EncDecryptFailureReason {
     }
 }
 
-/// WA Web treats every `SignalDecryptionError` as `SignalRetryable`, so a
-/// sender-key desync must request a resend rather than NACK (which stops the
-/// server retransmitting). `None` = keep the NACK (genuinely non-Signal error).
+/// Local backend failures leave the ciphertext unjudged and safe to retry.
+fn local_crypto_retry_reason(e: &SignalProtocolError) -> Option<RetryReason> {
+    use wacore::libsignal::crypto::CryptoProviderError;
+    matches!(
+        e,
+        SignalProtocolError::Crypto(CryptoProviderError::BackendFailed)
+            | SignalProtocolError::KeyAgreementFailed(CryptoProviderError::BackendFailed)
+    )
+    .then_some(RetryReason::UnknownError)
+}
+
+/// WA Web classifies non-duplicate Signal decryption failures as retryable.
+/// Keep local provider outages out of the terminal NACK branch as well.
 fn group_decrypt_retry_reason(e: &SignalProtocolError) -> Option<RetryReason> {
     match e {
         SignalProtocolError::SignatureValidationFailed => Some(RetryReason::InvalidSignature),
         SignalProtocolError::InvalidSenderKeySession => Some(RetryReason::InvalidSession),
         SignalProtocolError::UnrecognizedMessageVersion(_) => Some(RetryReason::InvalidMessage),
         SignalProtocolError::InvalidMessage(_, _) => Some(RetryReason::InvalidMessage),
-        _ => None,
+        _ => local_crypto_retry_reason(e),
     }
 }
 

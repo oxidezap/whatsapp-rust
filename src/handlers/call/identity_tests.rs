@@ -520,10 +520,9 @@ async fn identity_is_available_inside_the_call_event_callback() {
 #[tokio::test]
 async fn session_migration_finishes_before_offer_event_dispatch() {
     use futures::FutureExt;
-    use wacore::libsignal::protocol::{SessionRecord, SessionState};
+    use wacore::libsignal::protocol::SessionRecord;
     use wacore::types::events::EventHandler;
     use wacore::types::jid::JidExt;
-    use waproto::whatsapp::SessionStructure;
 
     struct CheckMigrationAtDispatch {
         client: std::sync::Weak<Client>,
@@ -557,27 +556,10 @@ async fn session_migration_finishes_before_offer_event_dispatch() {
     let client = create_test_client().await;
     let pn_addr = Jid::pn_device(PN.to_string(), 0).to_protocol_address();
     let lid_addr = Jid::lid_device(LID.to_string(), 0).to_protocol_address();
-    let state = SessionState::from_session_structure({
-        let mut proto = SessionStructure::default();
-        proto.session_version = Some(3);
-        proto.local_identity_public = None;
-        proto.remote_identity_public = None;
-        proto.root_key = None;
-        proto.previous_counter = Some(0);
-        proto.sender_chain = buffa::MessageField::none();
-        proto.receiver_chains = vec![];
-        proto.pending_pre_key = buffa::MessageField::none();
-        proto.remote_registration_id = Some(123);
-        proto.local_registration_id = Some(0);
-        proto.alice_base_key = Some(vec![]);
-        proto.needs_refresh = None;
-        proto.pending_key_exchange = buffa::MessageField::none();
-        proto
-    });
-    client
-        .signal_cache
-        .put_session(&pn_addr, SessionRecord::new(state))
-        .await;
+    let state =
+        SessionRecord::deserialize(&crate::test_utils::synthetic_serialized_session(123, None))
+            .unwrap();
+    client.signal_cache.put_session(&pn_addr, state).await;
     let backend = client.persistence_manager.backend();
     client.signal_cache.flush(backend.as_ref()).await.unwrap();
 

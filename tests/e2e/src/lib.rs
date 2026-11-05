@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use anyhow::Context as _;
 use wacore::net::{HttpClient, HttpRequest};
 use wacore::store::InMemoryBackend;
 use wacore::store::traits::{AppSyncStore, TcTokenEntry};
@@ -18,6 +19,27 @@ use whatsapp_rust::bot::Bot;
 use whatsapp_rust::waproto::whatsapp as wa;
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
+
+async fn wait_for_initial_prekeys(
+    client: &whatsapp_rust::Client,
+    timeout: tokio::time::Duration,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(timeout, async {
+        let mut tick = tokio::time::interval(tokio::time::Duration::from_millis(20));
+        loop {
+            if client
+                .persistence_manager()
+                .get_device_snapshot()
+                .server_has_prekeys
+            {
+                return;
+            }
+            tick.tick().await;
+        }
+    })
+    .await
+    .context("initial prekey upload was not acknowledged")
+}
 
 /// Returns the mock server WebSocket URL from env, or the default.
 pub fn mock_server_url() -> String {
@@ -102,6 +124,7 @@ pub fn scenario_push_name(prefix: &str, flags: &[&str]) -> String {
 pub struct TestClient {
     pub client: Arc<whatsapp_rust::client::Client>,
     pub event_rx: async_channel::Receiver<Arc<Event>>,
+    event_handler: Arc<ChannelEventHandler>,
     pub run_handle: whatsapp_rust::bot::BotHandle,
     /// The concrete backend, retained for its test hooks
     /// (`session_batch_write_count`, `set_fail_session_writes`).
@@ -148,6 +171,7 @@ async fn collect_connect_diagnostics(
     let primary_lid = snapshot.lid.as_ref().map(|jid| jid.to_non_ad());
     let has_pn = snapshot.pn.is_some();
     let has_lid = snapshot.lid.is_some();
+    let prekeys_uploaded = snapshot.server_has_prekeys;
     drop(snapshot);
 
     let (primary_pn_session, primary_lid_session) = futures::join!(
@@ -158,12 +182,13 @@ async fn collect_connect_diagnostics(
     let report = client.memory_report().await;
 
     format!(
-        "socket_connected={}, logged_in={}, has_pn={}, has_lid={}, sync_keys={}, \
+        "socket_connected={}, logged_in={}, has_pn={}, has_lid={}, prekeys_uploaded={}, sync_keys={}, \
          primary_pn_session={}, primary_lid_session={}, app_state_requests={}, app_state_syncs={}",
         client.is_socket_connected(),
         client.is_logged_in(),
         has_pn,
         has_lid,
+        prekeys_uploaded,
         sync_keys,
         primary_pn_session,
         primary_lid_session,
@@ -173,8 +198,7 @@ async fn collect_connect_diagnostics(
 }
 
 impl TestClient {
-    /// Create a client, connect to the mock server, and wait for PairSuccess + Connected.
-    /// Returns the connected TestClient with its JID available via `client.pn()`.
+    /// Connect, wait for readiness and initial prekey publication, then drain startup sync.
     pub async fn connect(prefix: &str) -> anyhow::Result<Self> {
         Self::connect_inner(prefix, Some(unique_push_name(prefix))).await
     }
@@ -233,7 +257,7 @@ impl TestClient {
         if push_name_pre_seeded {
             client.set_force_active_delivery_receipts(true);
         }
-        client.subscribe_handler(event_handler).detach();
+        client.subscribe_handler(event_handler.clone()).detach();
 
         // The mock server no longer auto-pairs (legacy timer is off by
         // default). Spawn an out-of-process "phone" that POSTs the first
@@ -252,40 +276,36 @@ impl TestClient {
         // a notifier, so it does not race event arrival order or fall back to an
         // orthogonal signal — the earlier flake, where a fixed 30s wait for
         // `Connected` timed out under CI load. PairSuccess/Connected still land
-        // in the unbounded `event_rx`; the predicate-filtered `wait_for_event`
+        // in the bounded `event_rx`; the predicate-filtered `wait_for_event`
         // discards them.
-        if let Err(e) = client
-            .wait_for_session_ready(tokio::time::Duration::from_secs(60))
-            .await
-        {
-            let diagnostics = connect_diagnostics(&client, &backend).await;
-            let _ = client.shutdown().await;
-            drop(run_handle);
-            return Err(anyhow::anyhow!(
-                "{prefix}: client never became ready after pairing ({diagnostics}): {e}"
-            ));
+        let startup = async {
+            client
+                .wait_for_session_ready(tokio::time::Duration::from_secs(60))
+                .await
+                .context("client did not become ready after pairing")?;
+            // Ready/offline-sync completion does not wait for key publication.
+            // A new companion cannot receive its first peer message until the
+            // server acknowledges this upload. Check state, not elapsed time.
+            wait_for_initial_prekeys(&client, tokio::time::Duration::from_secs(30)).await?;
+            client
+                .wait_for_startup_sync(tokio::time::Duration::from_secs(30))
+                .await
+                .context("startup sync did not settle")
         }
-
-        // Drain the initial startup sync (offline messages + history) so tests
-        // start from a quiescent state. This is a hard requirement, not
-        // best-effort: a timeout here means a real startup hang or a mid-sync
-        // client that would make assertions race changing state, so it fails
-        // the connect.
-        if let Err(e) = client
-            .wait_for_startup_sync(tokio::time::Duration::from_secs(30))
-            .await
-        {
+        .await;
+        if let Err(e) = startup {
             let diagnostics = connect_diagnostics(&client, &backend).await;
             let _ = client.shutdown().await;
             drop(run_handle);
             return Err(anyhow::anyhow!(
-                "{prefix}: startup sync did not settle ({diagnostics}): {e}"
+                "{prefix}: startup did not settle ({diagnostics}): {e:#}"
             ));
         }
 
         Ok(Self {
             client,
             event_rx,
+            event_handler,
             run_handle,
             backend,
         })
@@ -386,17 +406,42 @@ impl TestClient {
         F: FnMut(&Event) -> bool,
     {
         let timeout = tokio::time::Duration::from_secs(timeout_secs);
-        tokio::time::timeout(timeout, async {
+        // Record only event kinds, never message bodies, identities or tokens.
+        // Preserve the same receiver, predicate and deadline while distinguishing
+        // missing delivery from a full/closed event mailbox on a timeout.
+        let mut observed = Vec::new();
+        let result = tokio::time::timeout(timeout, async {
             loop {
                 match self.event_rx.recv().await {
-                    Ok(event) if predicate(&event) => return Ok(event),
-                    Ok(_) => continue,
+                    Ok(event) => {
+                        let kind = event.kind();
+                        if let Some((_, count)) =
+                            observed.iter_mut().find(|(seen, _)| *seen == kind)
+                        {
+                            *count += 1_u64;
+                        } else {
+                            observed.push((kind, 1_u64));
+                        }
+                        if predicate(&event) {
+                            return Ok(event);
+                        }
+                    }
                     Err(e) => return Err(anyhow::anyhow!("Event channel closed: {e}")),
                 }
             }
         })
-        .await
-        .map_err(|_| anyhow::anyhow!("Timed out waiting for event"))?
+        .await;
+        match result {
+            Ok(result) => result,
+            Err(_) => {
+                let stats = self.event_handler.stats();
+                let diagnostics = connect_diagnostics(&self.client, &self.backend).await;
+                Err(anyhow::anyhow!(
+                    "Timed out waiting for event: observed={observed:?}, queued={}, channel={stats:?}, {diagnostics}",
+                    self.event_rx.len()
+                ))
+            }
+        }
     }
 
     /// Wait for a text message with specific content.
@@ -708,4 +753,61 @@ pub async fn send_and_expect_text(
     let result = sender.send_message(to.clone(), text_msg(text)).await?;
     receiver.wait_for_text(text, timeout_secs).await?;
     Ok(result.message_id.into_string())
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    async fn unconnected_client() -> Arc<whatsapp_rust::Client> {
+        Bot::builder()
+            .with_backend_arc(Arc::new(InMemoryBackend::new()))
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(UreqHttpClient::new())
+            .with_runtime(whatsapp_rust::TokioRuntime)
+            .build()
+            .await
+            .unwrap()
+            .client()
+    }
+
+    #[tokio::test]
+    async fn initial_prekey_barrier_waits_for_acknowledged_upload() {
+        let client = unconnected_client().await;
+        assert!(
+            !client
+                .persistence_manager()
+                .get_device_snapshot()
+                .server_has_prekeys
+        );
+        let mut waiting = Box::pin(wait_for_initial_prekeys(
+            &client,
+            tokio::time::Duration::from_secs(5),
+        ));
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        client
+            .persistence_manager()
+            .modify_device(|device| device.server_has_prekeys = true)
+            .await;
+        waiting.await.unwrap();
+        wait_for_initial_prekeys(&client, tokio::time::Duration::ZERO)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn initial_prekey_barrier_fails_without_publishing_the_flag() {
+        let client = unconnected_client().await;
+        assert!(
+            wait_for_initial_prekeys(&client, tokio::time::Duration::ZERO)
+                .await
+                .is_err()
+        );
+        assert!(
+            !client
+                .persistence_manager()
+                .get_device_snapshot()
+                .server_has_prekeys
+        );
+    }
 }

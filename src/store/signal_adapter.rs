@@ -207,6 +207,26 @@ impl SessionStore for SessionAdapter {
         }
     }
 
+    fn try_store_received_session_from_checkout(
+        &mut self,
+        address: &ProtocolAddress,
+        record: SessionRecord,
+        checkout: Option<SessionCheckoutKey>,
+        had_session: bool,
+        consumed_prekey: Option<PreKeyId>,
+    ) -> SessionCheckoutStoreResult {
+        let Some(checkout) = checkout else {
+            return SessionCheckoutStoreResult::Unhandled(record);
+        };
+        self.0.cache.restore_session_with_consumed_prekey(
+            address,
+            record,
+            checkout,
+            had_session,
+            consumed_prekey.map(Into::into),
+        )
+    }
+
     async fn complete_session_checkout(&mut self) {
         self.0.cache.complete_session_checkout().await;
     }
@@ -414,9 +434,9 @@ impl PreKeyStore for PreKeyAdapter {
     }
     async fn remove_pre_key(&mut self, prekey_id: PreKeyId) -> Result<(), SignalProtocolError> {
         // Plain immediate-removal primitive. The inbound pkmsg path does NOT route
-        // through here: message_decrypt reports the consumed prekey and the receive
-        // path buffers it via buffer_consumed_prekey so the durable delete is
-        // atomic with the session flush (matching WAWebSignalProtocolStoreUnifiedApi).
+        // through here: the received-session checkout buffers the consumed id
+        // together with its session. Flush persists that session before deleting
+        // the private key, so a crash cannot lose both.
         let device = self.0.device();
         device
             .backend
@@ -428,10 +448,9 @@ impl PreKeyStore for PreKeyAdapter {
 
 impl PreKeyAdapter {
     /// Buffer a consumed one-time prekey for deletion on the next cache flush,
-    /// keyed by the session address whose pkmsg promotion consumed it. Called by
-    /// the inbound receive path after `message_decrypt` reports the consumed
-    /// prekey: the promoted session is still volatile in the cache, so the prekey
-    /// must only be deleted once that session is durably flushed.
+    /// keyed by its session address. Normal inbound decryption records this
+    /// intent in the session checkout instead, avoiding a cancellation window.
+    /// Explicit callers must preserve the same persistence-before-deletion order.
     pub async fn buffer_consumed_prekey(&self, prekey_id: PreKeyId, address: &ProtocolAddress) {
         self.0
             .cache
@@ -948,26 +967,21 @@ mod tests {
     }
 
     fn outbound_session() -> (SessionRecord, IdentityKeyPair) {
-        use wacore::libsignal::protocol::{
-            AliceSignalProtocolParameters, KeyPair, UsePQRatchet, initialize_alice_session_record,
-        };
+        use wacore::libsignal::protocol::{ChainKey, KeyPair, RootKey, SessionState};
 
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let local_identity = IdentityKeyPair::generate(&mut rng);
         let remote_identity = IdentityKeyPair::generate(&mut rng);
         let remote_signed_prekey = KeyPair::generate(&mut rng);
-        let parameters = AliceSignalProtocolParameters::new(
-            local_identity.clone(),
-            KeyPair::generate(&mut rng),
-            *remote_identity.identity_key(),
-            remote_signed_prekey.public_key,
-            remote_signed_prekey.public_key,
-            UsePQRatchet::No,
+        let mut state = SessionState::new(
+            3,
+            local_identity.identity_key(),
+            remote_identity.identity_key(),
+            &RootKey::new([0x41; 32]),
+            &remote_signed_prekey.public_key,
         );
-        (
-            initialize_alice_session_record(&parameters, &mut rng).expect("valid session"),
-            local_identity,
-        )
+        state.set_sender_chain(&KeyPair::generate(&mut rng), &ChainKey::new([0x42; 32], 0));
+        (SessionRecord::new(state), local_identity)
     }
 
     async fn cancel_encrypt_after_checkout(seed_durable: bool) {

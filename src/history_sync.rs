@@ -35,6 +35,12 @@ type HistoryBlockingJob = Box<dyn FnOnce() + Send + 'static>;
 type HistoryBlockingJob = Box<dyn FnOnce() + 'static>;
 
 impl wacore::runtime::Runtime for HistoryDownloadRuntime {
+    fn crypto_provider(
+        &self,
+    ) -> Option<Arc<dyn wacore::libsignal::crypto::SymmetricCryptoProvider>> {
+        self.inner.crypto_provider()
+    }
+
     #[cfg(feature = "instance-clock")]
     fn clock(&self) -> Option<&Arc<dyn wacore::time::Clock>> {
         self.inner.clock()
