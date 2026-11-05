@@ -213,9 +213,13 @@ impl<'a, S: SessionStore + ?Sized> SessionCheckout<'a, S> {
             .as_mut()
             .expect("checkout record is present until consumed")
     }
+    /// Return the updated session without consuming a prekey.
     pub async fn commit(self) -> Result<()> {
         self.commit_received(None).await
     }
+    /// Commit through [`SessionStore::try_store_received_session_from_checkout`].
+    /// Hosts with deferred prekey deletion implement that hook to retain its
+    /// intent across cancellation; the default keeps the ordinary store behavior.
     pub async fn commit_received(mut self, consumed_prekey: Option<PreKeyId>) -> Result<()> {
         let record = self.record.take().ok_or_else(|| {
             SignalProtocolError::InvalidState("checkout", "record already consumed".into())
