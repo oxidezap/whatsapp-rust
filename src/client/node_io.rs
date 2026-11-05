@@ -1510,15 +1510,16 @@ impl Client {
             if let Some(lid) = lid_from_server {
                 let device_snapshot =
                     client_clone.persistence_manager.get_device_snapshot();
+                // The tracing-expanded migration future must not inflate
+                // the task retained throughout the offline drain.
                 if client_clone.is_mobile_primary()
                     && let Some(pn) = device_snapshot.pn.as_ref()
-                    && let Err(error) = client_clone
-                        .add_lid_pn_mapping(
-                            lid.user.as_str(),
-                            pn.user.as_str(),
-                            wacore::types::lid_pn::LearningSource::Other,
-                        )
-                        .await
+                    && let Err(error) = Box::pin(client_clone.add_lid_pn_mapping(
+                        lid.user.as_str(),
+                        pn.user.as_str(),
+                        wacore::types::lid_pn::LearningSource::Other,
+                    ))
+                    .await
                 {
                     warn!("Failed to persist primary own-account LID mapping: {error}");
                 }
@@ -3183,8 +3184,9 @@ mod tests {
     /// `wait_for_offline_delivery_end` for the whole offline drain, so its
     /// future is resident for minutes on a client with a backlog. Inlining the
     /// fresh-pairing arm made it 8,224 B. The active IQ also needs a box when
-    /// tracing expands its future. Neither belongs in the drain's resident
-    /// storage. This bounds the spawned task, not the temporary boxed work.
+    /// tracing expands its future, as does primary LID/PN migration. None belongs
+    /// in the drain's resident storage. This bounds the spawned task, not the
+    /// temporary boxed work.
     /// Budget: rebaseline per [layout asserts](../../agent_docs/testing.md).
     #[tokio::test]
     async fn the_post_login_task_does_not_carry_the_fresh_pairing_arm() {
