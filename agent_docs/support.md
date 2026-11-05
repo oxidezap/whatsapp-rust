@@ -34,14 +34,19 @@ runner and Chrome/ChromeDriver configured in `wasm.yml`. Browser execution tests
 cover runtime/storage behavior; release builds establish linking only. Exact
 feature combinations live in `tools/xtask/consumers.json`.
 
-## Experimental mobile foundations
+## Mobile feature qualification
 
-`mobile-core` exposes runtime-independent configuration, environment/identity
-binding and local registration workflow policy. It does not implement telephone
-registration, primary-device login or companion hosting. Its isolated consumer
-profiles run with defaults disabled, including a WASM binary link profile using
-`mobile_probe`, which produces a final `.wasm` rather than only an rlib. Those checks
-establish compilation and local state behavior, not authenticated mobile support.
+`mobile-core` implements registration request/response workflows, primary-device
+login and companion hosting through explicit host-supplied services and profiles.
+Protocol decisions remain runtime-independent, with environment/identity binding
+and durable recovery. These implementations do not establish production server
+acceptance, real SMS delivery or complete official-app parity.
+
+Its isolated consumer profiles run with defaults disabled, including a WASM
+binary link profile using `mobile_probe`, which produces a final `.wasm` rather
+than only an rlib. Separate browser execution tests exercise supplied-port mobile
+workflows with synthetic inputs. Neither compilation nor those tests establish
+authenticated mobile compatibility.
 
 `mobile-transport-native` adds the optional Tokio TCP adapter. It is not required
 by `mobile-core` and is unavailable in the browser profile. Browser bridge and
