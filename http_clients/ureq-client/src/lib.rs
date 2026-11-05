@@ -184,6 +184,27 @@ fn build_agent() -> ureq::Agent {
         builder = builder.tls_config(TlsConfig::builder().disable_verification(true).build());
     }
 
+    #[cfg(not(feature = "danger-skip-tls-verify"))]
+    {
+        use ureq::tls::{Certificate, RootCerts, TlsConfig};
+
+        let native_certs = rustls_native_certs::load_native_certs();
+
+        if !native_certs.certs.is_empty() {
+            let native_roots: Vec<Certificate<'static>> = native_certs
+                .certs
+                .iter()
+                .map(|cert| Certificate::from_der(cert.as_ref()).to_owned())
+                .collect();
+
+            builder = builder.tls_config(
+                TlsConfig::builder()
+                    .root_certs(RootCerts::new_with_certs(&native_roots))
+                    .build(),
+            );
+        }
+    }
+
     builder.build().into()
 }
 

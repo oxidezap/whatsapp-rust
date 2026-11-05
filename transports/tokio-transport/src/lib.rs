@@ -174,6 +174,9 @@ pub fn default_tls_connector() -> Connector {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
+        let native_certs = rustls_native_certs::load_native_certs();
+        root_store.add_parsable_certificates(native_certs.certs);
+
         let config = size_for_one_host(
             rustls::ClientConfig::builder()
                 .with_root_certificates(root_store)

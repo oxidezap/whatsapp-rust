@@ -16,6 +16,7 @@ danger-skip-tls-verify = []
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+rustls-native-certs = "0.8.4"
 tokio = { workspace = true, features = ["rt"] }
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 wacore = { workspace = true }

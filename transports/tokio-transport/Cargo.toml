@@ -22,6 +22,7 @@ futures-util = { version = "0.3.33", default-features = false, features = ["sink
 http = "1.5.0"
 log = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls-native-certs = "0.8.4"
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
 tokio-websockets = { version = "0.13.3", features = [
