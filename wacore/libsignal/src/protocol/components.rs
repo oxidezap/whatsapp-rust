@@ -645,7 +645,7 @@ fn chain_from_components(
 ) -> Result<engine::Chain> {
     let fixed_fields = usize::from(value.sender_ratchet_key.is_some())
         + usize::from(value.sender_ratchet_key_private.is_some())
-        + usize::from(value.chain_key.is_some())
+        + 1 // ChainPosition is emitted even for a closed chain without a key.
         + usize::from(!sender && limit.is_some());
     if value.message_keys.len() > engine::codec::MAX_STORED_FIELDS - fixed_fields {
         return Err(engine::Error::Encoding("stored protobuf field budget exceeded").into());
@@ -823,11 +823,11 @@ fn state_from_components(
     // Handoff preserves future versions and receiver histories beyond the engine's
     // operational limit. Retain the persisted reader's finite budget for the
     // metadata plus each receiver without materializing intermediate protobufs.
-    let base_size = engine::codec::component_session_size(&state, omitted_bytes)?;
+    let mut size = engine::codec::component_session_size(&state, omitted_bytes)?;
     for receiver in value.receiver_chains {
         let omitted_bytes = omitted_chain_bytes(&receiver);
         let chain = chain_from_components(receiver, false, limit)?;
-        engine::codec::check_component_receiver_size(base_size, &chain, omitted_bytes)?;
+        size = engine::codec::check_component_receiver_size(size, &chain, omitted_bytes)?;
         state.receivers.push(chain);
     }
     Ok(state)
@@ -915,8 +915,7 @@ impl SessionRecord {
             .previous
             .iter()
             .map(|archived| {
-                let mut state = archived.decode()?;
-                handoff(&mut state, ceiling);
+                let state = archived.decode()?;
                 project_state(&state)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1272,6 +1271,58 @@ mod tests {
     }
 
     #[test]
+    fn extended_receiver_history_survives_current_and_archived_storage_roundtrips() {
+        for version in [3, 4] {
+            let mut input = record();
+            for state in input
+                .current_session
+                .iter_mut()
+                .chain(&mut input.previous_sessions)
+            {
+                state.session_version = Some(version);
+                state
+                    .receiver_chains
+                    .resize(7, state.receiver_chains[0].clone());
+            }
+            let imported = SessionRecord::from_components(input.clone()).unwrap();
+            assert_eq!(imported.clone().into_components().unwrap(), input);
+            let reloaded = SessionRecord::deserialize(&imported.serialize().unwrap()).unwrap();
+            assert_eq!(reloaded.into_components().unwrap(), input);
+        }
+    }
+
+    #[test]
+    fn closed_component_chain_counts_its_always_encoded_position_field() {
+        let mut input = record();
+        let chain = &mut input.current_session.as_mut().unwrap().receiver_chains[0];
+        chain.chain_key = None;
+        chain.message_keys.resize(
+            engine::codec::MAX_STORED_FIELDS - 1,
+            chain.message_keys[0].clone(),
+        );
+        assert!(SessionRecord::from_components(input).is_err());
+    }
+
+    #[test]
+    fn typed_import_counts_all_receivers_against_the_session_storage_budget() {
+        let mut input = record().current_session.unwrap();
+        input.pending_pre_key = Some(PendingPreKeyComponents {
+            base_key: Some(key(21)),
+            kyber_ciphertext: Some(vec![0; engine::wire::MAX_STORAGE_SIZE - 1024]),
+            ..Default::default()
+        });
+        input
+            .receiver_chains
+            .resize(32, input.receiver_chains[0].clone());
+        assert!(matches!(
+            state_from_components(input, None),
+            Err(SignalProtocolError::Engine(engine::Error::Encoding(
+                "stored protobuf size limit"
+            )))
+        ));
+    }
+
+    #[test]
     fn typed_pairwise_import_keeps_the_stored_field_budget() {
         for sender in [false, true] {
             for limit in [None, Some(4096)] {
@@ -1388,16 +1439,12 @@ mod tests {
         assert!(SessionRecord::from_components(components).is_err());
     }
     #[test]
-    fn handoff_burns_current_and_archived_counters() {
+    fn handoff_burns_only_current_counters_and_preserves_archived_senders() {
         let mut native = SessionRecord::from_components(record()).unwrap();
         native.reserve_sender_chain_counters(0);
         let expected = native.reserved_sender_chain_index();
         let projected = native.into_components().unwrap();
-        for session in projected
-            .current_session
-            .iter()
-            .chain(projected.previous_sessions.iter())
-        {
+        for session in projected.current_session.iter() {
             assert_eq!(
                 session
                     .sender_chain
@@ -1410,11 +1457,12 @@ mod tests {
                 Some(expected)
             );
         }
+        assert_eq!(projected.previous_sessions, record().previous_sessions);
         let mut native = SessionRecord::from_components(record()).unwrap();
         native.reserve_sender_chain_counters(2001);
         let projected = native.into_components().unwrap();
         assert!(projected.current_session.unwrap().sender_chain.is_none());
-        assert!(projected.previous_sessions[0].sender_chain.is_none());
+        assert_eq!(projected.previous_sessions, record().previous_sessions);
     }
     #[test]
     fn conflicting_seed_and_expanded_keys_fail_projection() {

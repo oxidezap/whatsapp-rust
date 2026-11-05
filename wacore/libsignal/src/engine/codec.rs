@@ -170,11 +170,10 @@ pub(crate) fn check_component_receiver_size(
     base_size: usize,
     chain: &Chain,
     omitted_bytes: usize,
-) -> Result<()> {
+) -> Result<usize> {
     let size = crate::engine::encode::receiver_field_size(chain, omitted_bytes)
         .ok_or(Error::Encoding("component size accounting"))?;
-    check_component_size(base_size.saturating_add(size))?;
-    Ok(())
+    check_component_size(base_size.saturating_add(size))
 }
 
 pub fn encode_session_state(state: &SessionState) -> Vec<u8> {
@@ -188,9 +187,9 @@ pub fn decode_session_state(input: &[u8]) -> Result<SessionState> {
     let mut receivers = Vec::new();
     for (n, v) in &f {
         if *n == 7 {
-            if receivers.len() == MAX_RECEIVER_CHAINS {
-                return Err(Error::Encoding("too many receiver chains"));
-            }
+            // Persisted history can exceed the active engine's receiver limit.
+            // The storage byte/field budgets bound decoding; transitions prune
+            // historical chains when adding a new ratchet.
             receivers.push(decode_chain(as_bytes(*v)?, StoredChainRole::Receiver)?);
         }
     }
@@ -579,7 +578,7 @@ mod parser_budget_tests {
     }
 
     #[test]
-    fn sixth_receiver_rejects_before_its_nested_payload_is_decoded() {
+    fn extended_receiver_history_still_validates_each_nested_payload() {
         let mut input = session(0);
         for _ in 0..MAX_RECEIVER_CHAINS {
             bytes(&mut input, 7, &receiver());
@@ -588,11 +587,13 @@ mod parser_budget_tests {
             decode_session_state(&input).unwrap().receivers.len(),
             MAX_RECEIVER_CHAINS
         );
+        bytes(&mut input, 7, &receiver());
+        assert_eq!(
+            decode_session_state(&input).unwrap().receivers.len(),
+            MAX_RECEIVER_CHAINS + 1
+        );
         bytes(&mut input, 7, &[0]);
-        assert!(matches!(
-            decode_session_state(&input),
-            Err(Error::Encoding("too many receiver chains"))
-        ));
+        assert!(decode_session_state(&input).is_err());
     }
 
     #[test]
