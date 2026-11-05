@@ -6,11 +6,13 @@
 //! independent review before any artifact can be treated as an official oracle.
 
 mod evidence;
+mod observations;
 mod zip_lineage;
 pub use evidence::{
     ExtractionEvidence, ExtractionMode, ExtractionStatus, ExtractionTool, ExtractionVerification,
     SelectorChange, SelectorEvidence, VerifiedSelector,
 };
+pub use observations::{CaseComparison, ComparisonReport, ComparisonStatus, compare_observations};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;

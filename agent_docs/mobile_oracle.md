@@ -282,6 +282,11 @@ command does not requalify selectors, execute code or update expectations.
 
 ## Executable oracle qualification
 
+The [offline observation comparison contract](mobile_observations.md) defines
+strict corpus and runner-output inputs for `mobile-oracle compare`. It can check
+supplied byte agreement before a runner is available, while keeping execution
+and authenticity explicitly unqualified.
+
 The next qualification step is one pure function with synthetic inputs, not
 an emulation claim for the entire Android application. Identify its artifact
 hash, DEX class/method or native offset, callers, guards and dependencies.
