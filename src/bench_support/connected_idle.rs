@@ -596,6 +596,18 @@ impl Session {
         self.settle().await
     }
 
+    /// Retire warm-up Signal flush work before entering a maintenance sample.
+    ///
+    /// Keep this outside the timed region: the coalesced worker sleeps before
+    /// flushing and can otherwise first be polled by the measured `block_on`.
+    pub async fn prepare_maintenance_sample(&self) -> Result<()> {
+        self.settle().await?;
+        self.wait_until(|| !self.client.signal_flush_worker_armed())
+            .await
+            .context("warm-up Signal flush worker did not retire")?;
+        Ok(())
+    }
+
     /// Measure only after `receive_activity` or `finish_control` has joined
     /// startup. A new initialization invalidates the sample instead of becoming
     /// hidden scheduler work in the maintenance cost.
@@ -1040,6 +1052,10 @@ mod tests {
             session.receive_activity(activity).await?;
             ensure!(session.client.bench_startup.pending() == 0);
             ensure!(session.delivery_receipts() == MESSAGES);
+            session.prepare_maintenance_sample().await?;
+            ensure!(!session.client.signal_flush_worker_armed());
+            session.maintenance().await?;
+            ensure!(!session.client.signal_flush_worker_armed());
             session.shutdown().await?;
             backend.cleanup()?;
         }

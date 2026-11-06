@@ -88,6 +88,10 @@ fn cache_maintenance_after_activity(bencher: divan::Bencher, sqlite: bool) {
                 let session = Session::connect(backend.backend()).await.expect("connect");
                 let activity = session.prepare_activity().await.expect("prepare activity");
                 session.receive_activity(activity).await.expect("activity");
+                session
+                    .prepare_maintenance_sample()
+                    .await
+                    .expect("warm-up Signal flush worker retired");
                 Fixture {
                     rt: &rt,
                     session: Some(session),
