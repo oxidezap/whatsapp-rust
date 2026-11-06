@@ -30,6 +30,7 @@
 //! }
 //! ```
 
+mod bounded_mobile_binding;
 mod bounded_pending_query;
 mod database;
 mod pool;

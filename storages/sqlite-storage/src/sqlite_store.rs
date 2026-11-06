@@ -108,7 +108,11 @@ struct DeviceRow {
     read_receipts_disabled: bool,
     server_client_expiration: Option<String>,
     status_privacy: Option<Vec<u8>>,
-    mobile_session_binding: Option<Vec<u8>>,
+    #[diesel(
+        select_expression = crate::bounded_mobile_binding::GuardedMobileBindingExpression,
+        select_expression_type = crate::bounded_mobile_binding::GuardedMobileBindingExpression
+    )]
+    mobile_session_binding: crate::bounded_mobile_binding::GuardedMobileBinding,
 }
 
 /// One account in a database that holds several, as [`crate::SqliteDatabase::list_devices`]
@@ -2220,29 +2224,17 @@ impl SqliteStore {
 
         let row = self
             .read_query(move |conn| {
-                // The SQL predicate runs before Diesel materializes the BLOB.
-                // Keep it on the row read itself so a concurrent writer cannot
-                // replace a checked length with an oversized value.
-                let result = device::table
+                device::table
                     .filter(device::id.eq(device_id))
-                    .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(concat!(
-                        "(mobile_session_binding IS NULL OR ",
-                        "(typeof(mobile_session_binding) = 'blob' ",
-                        "AND length(mobile_session_binding) <= 1048576))",
-                    )))
+                    .select(DeviceRow::as_select())
                     .first::<DeviceRow>(conn)
                     .optional()
-                    .map_err(|e| StoreError::Database(Box::new(e)))?;
-                if result.is_none() && device_row_exists(conn, device_id)? {
-                    return Err(StoreError::Validation(
-                        "oversized mobile session binding".into(),
-                    ));
-                }
-                Ok(result)
+                    .map_err(|e| StoreError::Database(Box::new(e)))
             })
             .await?;
 
         if let Some(row) = row {
+            let mobile_session_binding = row.mobile_session_binding.into_bytes()?;
             let pn = if !row.pn.is_empty() {
                 row.pn.parse().ok()
             } else {
@@ -2276,15 +2268,9 @@ impl SqliteStore {
                 })
                 .transpose()?;
 
-            let mobile_session = row
-                .mobile_session_binding
+            let mobile_session = mobile_session_binding
                 .as_deref()
                 .map(|bytes| {
-                    if bytes.len() > 1048576 {
-                        return Err(StoreError::Validation(
-                            "oversized mobile session binding".into(),
-                        ));
-                    }
                     serde_json::from_slice(bytes).map_err(|_| {
                         StoreError::Validation("invalid persisted mobile session binding".into())
                     })
