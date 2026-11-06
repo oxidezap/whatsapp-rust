@@ -6123,6 +6123,21 @@ async fn status_broadcast_stanzas_are_dispatched_inline() {
         !client.processes_inline(&newsletter_status.as_node_ref()),
         "a newsletter <status> has no per-chat queue to order"
     );
+
+    for from in [
+        "15550000002@s.whatsapp.net",
+        "100000000000002@lid",
+        "120363000000000001@g.us",
+    ] {
+        let status = NodeBuilder::new("status")
+            .attr("from", from)
+            .attr("id", "INLINE-4")
+            .build();
+        assert!(
+            client.processes_inline(&status.as_node_ref()),
+            "status ACK admission must preserve arrival order"
+        );
+    }
 }
 
 /// The server counts status updates and calls separately, so a preview that
