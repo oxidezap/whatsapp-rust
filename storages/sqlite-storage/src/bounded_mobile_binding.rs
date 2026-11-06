@@ -48,7 +48,7 @@ impl QueryFragment<Sqlite> for GuardedMobileBindingExpression {
 
 enum BindingValue {
     Absent,
-    Bytes(Vec<u8>),
+    Bytes(Box<[u8]>),
     Rejected,
 }
 
@@ -64,7 +64,7 @@ impl FromSql<Nullable<Binary>, Sqlite> for GuardedMobileBinding {
         }
         let bytes = value.read_blob();
         Ok(Self(if bytes.len() <= MAX_BINDING_BYTES {
-            BindingValue::Bytes(bytes.to_vec())
+            BindingValue::Bytes(Box::from(bytes))
         } else {
             BindingValue::Rejected
         }))
@@ -82,7 +82,7 @@ impl GuardedMobileBinding {
     pub(crate) fn as_bytes(&self) -> Result<Option<&[u8]>> {
         match &self.0 {
             BindingValue::Absent => Ok(None),
-            BindingValue::Bytes(bytes) => Ok(Some(bytes.as_slice())),
+            BindingValue::Bytes(bytes) => Ok(Some(bytes.as_ref())),
             BindingValue::Rejected => Err(StoreError::Validation(
                 "oversized mobile session binding".into(),
             )),
