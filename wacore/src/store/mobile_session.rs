@@ -95,6 +95,7 @@ where
 
 /// Keep both allocations protected until every retired byte is wiped. Return
 /// that already-zeroed allocation for release without repeating the wipe.
+#[inline(never)]
 fn grow_secret_bytes(bytes: &mut zeroize::Zeroizing<Vec<u8>>) -> Vec<u8> {
     use zeroize::Zeroize;
 
