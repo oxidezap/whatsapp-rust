@@ -167,10 +167,7 @@ mod tests {
                 .select(GuardedMobileBindingExpression)
                 .first(&mut conn)
                 .unwrap();
-            assert!(matches!(
-                column.as_bytes(),
-                Err(StoreError::Validation(_))
-            ));
+            assert!(matches!(column.as_bytes(), Err(StoreError::Validation(_))));
         }
         let missing: Option<GuardedMobileBinding> = device::table
             .filter(device::id.eq(99))
