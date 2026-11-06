@@ -2224,9 +2224,9 @@ impl SqliteStore {
                 let result = device::table
                     .filter(device::id.eq(device_id))
                     .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(concat!(
-                        "mobile_session_binding IS NULL OR ",
+                        "(mobile_session_binding IS NULL OR ",
                         "(typeof(mobile_session_binding) = 'blob' ",
-                        "AND length(mobile_session_binding) <= 1048576)",
+                        "AND length(mobile_session_binding) <= 1048576))",
                     )))
                     .first::<DeviceRow>(conn)
                     .optional()
@@ -8021,6 +8021,58 @@ mod tests {
             loaded.first_unupload_pre_key_id, 101,
             "first_unupload_pre_key_id must survive a save/load roundtrip"
         );
+    }
+
+    #[tokio::test]
+    async fn mobile_binding_reads_are_scoped_to_the_requested_account() {
+        use wacore::store::commands::{DeviceCommand, apply_command_to_device};
+        use wacore::store::{MobileSessionBinding, StoredMobilePlatform};
+
+        let db = format!(
+            "file:mobile_scoped_binding_reads_{}?mode=memory&cache=shared",
+            std::process::id()
+        );
+        let database = crate::SqliteDatabase::open(&db, Default::default())
+            .await
+            .unwrap();
+        let mut sources = Vec::new();
+        for (id, pn) in [(131, "15550000001"), (132, "15550000002")] {
+            let mut source = CoreDevice::new();
+            let binding = MobileSessionBinding::new(
+                [id as u8; 32],
+                source.mobile_identity_hash(),
+                StoredMobilePlatform::Android,
+                vec![id as u8],
+                None,
+            )
+            .unwrap();
+            apply_command_to_device(
+                &mut source,
+                DeviceCommand::CompleteMobileRegistration {
+                    binding,
+                    pn: format!("{pn}@s.whatsapp.net").parse().unwrap(),
+                    lid: None,
+                },
+            );
+            DeviceStore::save(&database.store(id), &source)
+                .await
+                .unwrap();
+            sources.push((id, source));
+        }
+
+        // Both valid BLOBs must remain present while each account is read.
+        // An ungrouped OR can otherwise admit the other account's row.
+        for (id, source) in sources {
+            let restored = DeviceStore::load(&database.store(id))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(restored.pn, source.pn);
+            assert_eq!(restored.mobile_session, source.mobile_session);
+            assert_eq!(restored.noise_key.public_key, source.noise_key.public_key);
+        }
+        let missing = database.store(133);
+        assert!(DeviceStore::load(&missing).await.unwrap().is_none());
     }
 
     #[tokio::test]
