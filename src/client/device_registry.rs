@@ -655,6 +655,14 @@ impl Client {
         self.resolve_lookup_keys(&jid.user).await
     }
 
+    /// Check presence under the same current PN/LID keys used by registry reads.
+    pub(crate) async fn device_list_contains_user(&self, devices: &[Jid], user: &Jid) -> bool {
+        let lookup = self.resolve_lookup_keys_for_jid(user).await;
+        lookup
+            .all_keys()
+            .any(|key| devices.iter().any(|device| device.user.as_str() == key))
+    }
+
     /// Owned-key variant of `resolve_lookup_keys`. Test-only: production callers
     /// use the borrowed `resolve_lookup_keys(..).all_keys()` to avoid the churn.
     #[cfg(test)]

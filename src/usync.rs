@@ -227,7 +227,7 @@ impl Client {
                 let mut devices = self
                     .fetch_user_devices_once(failure.response_users, freshness)
                     .await?;
-                if !devices.iter().any(|device| device.to_non_ad() == user) {
+                if !self.device_list_contains_user(&devices, &user).await {
                     // Partial replies may omit an unchanged user. Read its
                     // current record, since notifications may have superseded
                     // the targeted refresh while this batch was in flight.
@@ -1126,9 +1126,35 @@ mod tests {
         use wacore_binary::builder::NodeBuilder;
         // The final reply either omits the user, follows a concurrent registry
         // update, or supplies a newer verified result that must take precedence.
-        for expected_companion in [2, 4, 3] {
+        for (expected_companion, lid_to_pn) in [
+            (2, None),
+            (4, None),
+            (3, None),
+            (3, Some(false)),
+            (3, Some(true)),
+        ] {
             let (client, transport) = create_iq_test_client().await;
-            let users = [Jid::pn("12025550135"), Jid::pn("12025550136")];
+            let phone = Jid::pn("12025550135");
+            let lid = Jid::lid("100000000000135");
+            let (user, alias) = if lid_to_pn == Some(true) {
+                (lid.clone(), phone.clone())
+            } else {
+                (phone.clone(), lid.clone())
+            };
+            let users = [user, Jid::pn("12025550136")];
+            if lid_to_pn.is_some() {
+                client
+                    .add_lid_pn_mapping(
+                        &lid.user,
+                        &phone.user,
+                        crate::lid_pn_cache::LearningSource::Usync,
+                    )
+                    .await
+                    .unwrap();
+                // Mapping publication migrates Signal state; seed both wire
+                // namespaces afterwards so the fixture never needs a key IQ.
+                crate::test_utils::seed_adv_primary(&client, &alias).await;
+            }
             for user in &users {
                 crate::test_utils::seed_adv_primary(&client, user).await;
             }
@@ -1148,7 +1174,11 @@ mod tests {
                 let mut replies = Vec::new();
                 if frame == 0 || frame == 1 || expected_companion == 3 {
                     replies.push(adv_wire_response_with_device(
-                        &users[0],
+                        if frame == 2 && lid_to_pn.is_some() {
+                            &alias
+                        } else {
+                            &users[0]
+                        },
                         if frame == 0 {
                             vec![0xff]
                         } else {
@@ -1195,9 +1225,14 @@ mod tests {
                 answer_iq(&client, &id, &response).await;
             }
             let mut actual = operation.await.unwrap().unwrap();
+            let expected_user = if lid_to_pn.is_some() {
+                &alias
+            } else {
+                &users[0]
+            };
             let mut expected = vec![
-                users[0].clone(),
-                users[0].with_device(expected_companion),
+                expected_user.clone(),
+                expected_user.with_device(expected_companion),
                 users[1].clone(),
                 users[1].with_device(2),
             ];
