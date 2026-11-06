@@ -1089,11 +1089,11 @@ impl Client {
             return;
         };
         if tx
-            .try_send(crate::inbound_queue::QueuedAck {
+            .try_send(Box::new(crate::inbound_queue::QueuedAck {
                 bytes: crate::inbound_queue::retain_ack(bytes, lease),
                 flush: guard,
                 shutdown: shutdown.clone(),
-            })
+            }))
             .is_err()
         {
             warn!("Transport ACK queue exhausted; recycling connection");
@@ -1128,8 +1128,8 @@ impl Client {
     /// client alive.
     fn start_transport_ack_worker(
         self: &Arc<Self>,
-    ) -> async_channel::Sender<crate::inbound_queue::QueuedAck> {
-        let (tx, rx) = async_channel::bounded::<crate::inbound_queue::QueuedAck>(
+    ) -> async_channel::Sender<Box<crate::inbound_queue::QueuedAck>> {
+        let (tx, rx) = async_channel::bounded::<Box<crate::inbound_queue::QueuedAck>>(
             crate::inbound_queue::ACK_QUEUE_ITEMS,
         );
         let rx = crate::inbound_queue::DrainingReceiver(rx);
@@ -1153,11 +1153,11 @@ impl Client {
                 // so its batching only fired when some *other* producer
                 // happened to interleave. `try_recv` only: this never waits
                 // for work that has not arrived.
-                batch.push(first);
+                batch.push(*first);
                 while batch.len() < Self::MAX_ACK_BURST
                     && let Ok(next) = rx.try_recv()
                 {
-                    batch.push(next);
+                    batch.push(*next);
                 }
 
                 // The queue is still drained, exactly as the
@@ -2747,9 +2747,16 @@ mod tests {
     #[tokio::test]
     async fn production_ack_worker_has_a_bounded_channel() {
         let client = crate::test_utils::create_test_client().await;
-        let tx = client.start_transport_ack_worker();
-        assert_eq!(tx.capacity(), Some(256));
-        tx.close();
+        let largest = crate::test_alloc::min_max_block(usize::MAX, || {
+            let tx = client.start_transport_ack_worker();
+            assert_eq!(tx.capacity(), Some(256));
+            tx.close();
+        });
+        // Inline ACK slots reserve 14 KiB on a 64-bit host even when empty.
+        assert!(
+            largest <= 12 * 1024,
+            "idle ACK worker requested {largest} bytes"
+        );
     }
 
     #[tokio::test]
