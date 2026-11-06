@@ -759,7 +759,7 @@ mod tests {
             None,
         )
         .unwrap();
-        apply_command_to_device(
+        wacore::store::commands::apply_command_to_device(
             &mut device,
             DeviceCommand::SetMobileSessionBinding(binding.clone()),
         );
