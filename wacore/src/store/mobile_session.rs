@@ -93,10 +93,9 @@ where
     deserializer.deserialize_seq(SecretBytes)
 }
 
-/// Return the retired allocation while it is still owned, after wiping every
-/// live byte. The decoder drops it before appending; Vec growth must never
-/// reallocate a credential allocation before that wipe.
-fn grow_secret_bytes(bytes: &mut zeroize::Zeroizing<Vec<u8>>) -> zeroize::Zeroizing<Vec<u8>> {
+/// Keep both allocations protected until every retired byte is wiped. Return
+/// that already-zeroed allocation for release without repeating the wipe.
+fn grow_secret_bytes(bytes: &mut zeroize::Zeroizing<Vec<u8>>) -> Vec<u8> {
     use zeroize::Zeroize;
 
     let capacity = bytes
@@ -108,7 +107,7 @@ fn grow_secret_bytes(bytes: &mut zeroize::Zeroizing<Vec<u8>>) -> zeroize::Zeroiz
     replacement.extend_from_slice(bytes.as_slice());
     std::mem::swap(bytes, &mut replacement);
     replacement.as_mut_slice().zeroize();
-    replacement
+    std::mem::take(&mut *replacement)
 }
 
 fn deserialize_optional_secret_bytes<'de, D>(
