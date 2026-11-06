@@ -231,7 +231,13 @@ impl Client {
                     // Partial replies may omit an unchanged user. Read its
                     // current record, since notifications may have superseded
                     // the targeted refresh while this batch was in flight.
-                    let (current, _) = self.get_devices_from_registry_batch(vec![user]).await;
+                    let (current, missing) = self
+                        .get_devices_from_registry_batch(vec![user.clone()])
+                        .await;
+                    anyhow::ensure!(
+                        missing.is_empty(),
+                        "device registry no longer contains {user} after ADV recovery"
+                    );
                     devices.extend(current);
                 }
                 Ok(devices)
@@ -1127,6 +1133,9 @@ mod tests {
         // The final reply either omits the user, follows a concurrent registry
         // update, or supplies a newer verified result that must take precedence.
         for (expected_companion, lid_to_pn) in [
+            (0, None),
+            (0, Some(false)),
+            (0, Some(true)),
             (2, None),
             (4, None),
             (3, None),
@@ -1232,6 +1241,14 @@ mod tests {
                         .await
                         .unwrap();
                 }
+                if final_batch && expected_companion == 0 {
+                    assert!(client.load_device_record_for_jid(&users[0]).await.is_some());
+                    client.invalidate_device_cache(&users[0].user).await;
+                    assert!(client.load_device_record_for_jid(&users[0]).await.is_none());
+                    if lid_to_pn.is_some() {
+                        assert!(client.load_device_record_for_jid(&alias).await.is_none());
+                    }
+                }
                 let response = NodeBuilder::new("iq")
                     .attr("type", "result")
                     .children([NodeBuilder::new("usync")
@@ -1256,7 +1273,18 @@ mod tests {
                 frame += 1;
                 assert!(frame <= DEVICE_REFRESH_MAX_ATTEMPTS + 1);
             }
-            let mut actual = operation.await.unwrap().unwrap();
+            let result = operation.await.unwrap();
+            if expected_companion == 0 {
+                let error = result.unwrap_err();
+                assert!(format!("{error:#}").contains(&users[0].to_string()));
+                assert!(client.load_device_record_for_jid(&users[0]).await.is_none());
+                assert!(client.load_device_record_for_jid(&users[1]).await.is_some());
+                assert!(targeted_attempts >= 2);
+                assert_eq!(transport.sent().len(), targeted_attempts + 2);
+                client.signal_shutdown_sync();
+                continue;
+            }
+            let mut actual = result.unwrap();
             let expected_user = if lid_to_pn.is_some() {
                 &alias
             } else {
