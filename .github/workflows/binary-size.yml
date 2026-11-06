@@ -132,33 +132,12 @@ jobs:
         id: budget
         continue-on-error: true
         run: '"$RUNNER_TEMP/size-xtask" ci workflow size-gate'
-      - name: Install cargo-bloat and cargo-llvm-lines for a failed budget
-        if: steps.budget.outcome == 'failure'
-        env:
-          RUSTC_WRAPPER: ""
-        run: >
-          cargo binstall --no-confirm
-          cargo-bloat@${{ env.CARGO_BLOAT_VERSION }}
-          cargo-llvm-lines@${{ env.CARGO_LLVM_LINES_VERSION }}
-      - name: Diagnose the measured binary
-        if: steps.budget.outcome == 'failure'
-        run: |
-          "$RUNNER_TEMP/size-xtask" ci measure-binary-size --skip-build --out-dir size-diagnostics --event-head "$HEAD_SHA"
-          git diff --exit-code
       - name: Upload size artifacts
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
           name: size-metrics
           path: size-out/
-          if-no-files-found: error
-          retention-days: 90
-      - name: Upload size diagnostics
-        if: ${{ !cancelled() && steps.budget.outcome == 'failure' }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: size-diagnostics
-          path: size-diagnostics/
           if-no-files-found: error
           retention-days: 90
       # Fork PRs run with a read-only token, so they only get the job summary.
@@ -168,6 +147,27 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: '"$RUNNER_TEMP/size-xtask" ci workflow size-comment'
+      - name: Install cargo-bloat and cargo-llvm-lines for a failed budget
+        if: ${{ !cancelled() && steps.budget.outcome == 'failure' }}
+        env:
+          RUSTC_WRAPPER: ""
+        run: >
+          cargo binstall --no-confirm
+          cargo-bloat@${{ env.CARGO_BLOAT_VERSION }}
+          cargo-llvm-lines@${{ env.CARGO_LLVM_LINES_VERSION }}
+      - name: Diagnose the measured binary
+        if: ${{ !cancelled() && steps.budget.outcome == 'failure' }}
+        run: |
+          "$RUNNER_TEMP/size-xtask" ci measure-binary-size --skip-build --out-dir size-diagnostics --event-head "$HEAD_SHA"
+          git diff --exit-code
+      - name: Upload size diagnostics
+        if: ${{ !cancelled() && steps.budget.outcome == 'failure' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: size-diagnostics
+          path: size-diagnostics/
+          if-no-files-found: error
+          retention-days: 90
       - name: Enforce size budget
         if: ${{ always() && !cancelled() }}
         run: '"$RUNNER_TEMP/size-xtask" ci workflow size-gate'
