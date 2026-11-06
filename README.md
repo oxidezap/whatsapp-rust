@@ -82,6 +82,12 @@ This fork by [@KazeDevID](https://github.com/KazeDevID/whatsapp-rust) introduces
 | **Polls** | `sock.sendMessage(jid, { poll: { name, values } })` | `cli.SendMessage(ctx, jid, cli.BuildPollCreation(...))` | `ctx.send_poll(name, &options, 1).await?` |
 | **Typing** | `sock.sendPresenceUpdate("composing", jid)` | `cli.SendChatPresence(jid, PresenceComposing)` | `ctx.send_typing().await?` |
 | **Read Receipt**| `sock.readMessages([msg.key])` | `cli.MarkRead([]types.MessageID{id}, ...)` | `ctx.mark_as_read().await?` |
+| **Mention All**  | Manual map over participants | Manual map over participants | `ctx.mention_all(Some("Announcement")).await?` |
+| **Admin Check**  | Manual participant loop | Manual participant loop | `router.admin_command(...)` or `ctx.is_sender_admin().await?` |
+| **Group Invite** | `sock.groupInviteCode(jid)` | `cli.GetGroupInviteLink(jid, false)` | `ctx.group_invite_code().await?` |
+| **Kick Member**  | `sock.groupParticipantsUpdate(jid, [p], "remove")` | `cli.UpdateGroupParticipants(jid, [p], "remove")` | `ctx.group_kick(&[p]).await?` |
+| **Location Pin** | `sock.sendMessage(jid, { location: {...} })` | `cli.SendMessage(jid, &waProto.LocationMessage{...})` | `ctx.reply_location(lat, lng, name, addr).await?` |
+| **Contact Card** | `sock.sendMessage(jid, { contacts: {...} })` | `cli.SendMessage(jid, &waProto.ContactMessage{...})` | `ctx.reply_contact(name, vcard).await?` |
 | **Performance** | V8 JavaScript Event Loop (~150MB RAM) | Goroutines (~45MB RAM) | Zero-copy `buffa` + Tokio (~8MB RAM) |
 
 ### Fluent Bot Example

@@ -2,7 +2,7 @@
 //!
 //! Inspired by Baileys and WhatsMeow bot ecosystems, `BotRouter` provides a fluent
 //! pattern for registering prefix-based commands, argument parsing, automatic
-//! self-message suppression, and message context helpers.
+//! self-message suppression, admin guards, and group management helpers.
 //!
 //! # Example
 //! ```rust,ignore
@@ -17,9 +17,9 @@
 //!     Ok(())
 //! });
 //!
-//! router.command("poll", |cmd| async move {
-//!     let options = vec!["Rust 🦀".into(), "Go 🐹".into(), "Node.js 🟩".into()];
-//!     cmd.send_poll("Favorite WhatsApp Bot Language?", &options, 1).await?;
+//! // Only group admins can run this:
+//! router.admin_command("tagall", |cmd| async move {
+//!     cmd.mention_all(Some("Attention all members:")).await?;
 //!     Ok(())
 //! });
 //!
@@ -35,6 +35,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use crate::bot::MessageContext;
+use wacore_binary::Jid;
 
 pub type RouterResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -44,6 +45,25 @@ pub type CommandHandler = Arc<
         + Send
         + Sync,
 >;
+
+/// Configuration rules and restrictions for a bot command.
+#[derive(Clone, Debug, Default)]
+pub struct CommandConfig {
+    /// Only group administrators can invoke this command.
+    pub admin_only: bool,
+    /// Command can only be invoked inside group chats.
+    pub group_only: bool,
+    /// Command can only be invoked in private direct messages (DMs).
+    pub dm_only: bool,
+    /// Human-readable documentation for this command.
+    pub description: String,
+}
+
+#[derive(Clone)]
+struct RegisteredCommand {
+    handler: CommandHandler,
+    config: CommandConfig,
+}
 
 /// Context passed to a command handler when an incoming message matches a prefix and command name.
 #[derive(Clone)]
@@ -95,6 +115,83 @@ impl CommandContext {
         self.ctx.send_poll(name, options, selectable_count).await
     }
 
+    /// Reply with user mentions attached in the context info.
+    pub async fn reply_with_mentions(
+        &self,
+        text: impl Into<String>,
+        mentions: &[Jid],
+    ) -> Result<crate::send::SendResult, crate::send::SendError> {
+        self.ctx.reply_with_mentions(text, mentions).await
+    }
+
+    /// Mentions all participants in the group chat (the classic hidetag / tagall).
+    pub async fn mention_all(
+        &self,
+        header: Option<&str>,
+    ) -> Result<crate::send::SendResult, Box<dyn std::error::Error + Send + Sync>> {
+        self.ctx.mention_all(header).await
+    }
+
+    /// Fetch group metadata for the current chat.
+    pub async fn group_metadata(&self) -> Result<crate::features::GroupMetadata, crate::features::GroupError> {
+        self.ctx.group_metadata().await
+    }
+
+    /// Checks if the message sender is an admin in this group.
+    pub async fn is_sender_admin(&self) -> Result<bool, crate::features::GroupError> {
+        self.ctx.is_sender_admin().await
+    }
+
+    /// Checks if the bot itself is an admin in this group.
+    pub async fn is_bot_admin(&self) -> Result<bool, crate::features::GroupError> {
+        self.ctx.is_bot_admin().await
+    }
+
+    /// Kick/remove participants from the current group.
+    pub async fn group_kick(&self, participants: &[Jid]) -> Result<Vec<crate::features::ParticipantChangeResponse>, crate::features::GroupError> {
+        self.ctx.group_kick(participants).await
+    }
+
+    /// Add participants to the current group.
+    pub async fn group_add(&self, participants: &[Jid]) -> Result<Vec<crate::features::ParticipantChangeResponse>, crate::features::GroupError> {
+        self.ctx.group_add(participants).await
+    }
+
+    /// Promote participants to group admins.
+    pub async fn group_promote(&self, participants: &[Jid]) -> Result<Vec<crate::features::ParticipantChangeResponse>, crate::features::GroupError> {
+        self.ctx.group_promote(participants).await
+    }
+
+    /// Demote group admins back to regular members.
+    pub async fn group_demote(&self, participants: &[Jid]) -> Result<Vec<crate::features::ParticipantChangeResponse>, crate::features::GroupError> {
+        self.ctx.group_demote(participants).await
+    }
+
+    /// Retrieve the group invite link code.
+    pub async fn group_invite_code(&self) -> Result<String, crate::features::GroupError> {
+        self.ctx.group_invite_code().await
+    }
+
+    /// Send a location pin message.
+    pub async fn reply_location(
+        &self,
+        latitude: f64,
+        longitude: f64,
+        name: Option<String>,
+        address: Option<String>,
+    ) -> Result<crate::send::SendResult, crate::send::SendError> {
+        self.ctx.reply_location(latitude, longitude, name, address).await
+    }
+
+    /// Send a contact card (vCard) message.
+    pub async fn reply_contact(
+        &self,
+        display_name: impl Into<String>,
+        vcard: impl Into<String>,
+    ) -> Result<crate::send::SendResult, crate::send::SendError> {
+        self.ctx.reply_contact(display_name, vcard).await
+    }
+
     /// Send typing presence (`composing`) to this chat.
     pub async fn send_typing(&self) -> Result<(), crate::features::ChatStateError> {
         self.ctx.send_typing().await
@@ -131,12 +228,17 @@ impl CommandContext {
     }
 
     /// Sender JID (in groups, this is the participant JID).
-    pub fn sender(&self) -> &wacore_binary::Jid {
+    pub fn sender(&self) -> &Jid {
         self.ctx.sender()
     }
 
+    /// Sender phone number string (without server suffix).
+    pub fn sender_phone(&self) -> &str {
+        self.ctx.sender().user()
+    }
+
     /// Chat JID (DM peer, group, or newsletter).
-    pub fn chat(&self) -> &wacore_binary::Jid {
+    pub fn chat(&self) -> &Jid {
         self.ctx.chat()
     }
 }
@@ -146,7 +248,7 @@ impl CommandContext {
 pub struct BotRouter {
     prefixes: Vec<String>,
     ignore_self: bool,
-    commands: HashMap<String, CommandHandler>,
+    commands: HashMap<String, RegisteredCommand>,
     aliases: HashMap<String, String>,
     default_handler: Option<CommandHandler>,
 }
@@ -181,15 +283,77 @@ impl BotRouter {
         self
     }
 
-    /// Register a command handler. Command names are case-insensitive.
+    /// Register a command handler with default configuration.
     pub fn command<F, Fut>(&mut self, name: impl Into<String>, handler: F) -> &mut Self
+    where
+        F: Fn(CommandContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = RouterResult> + Send + 'static,
+    {
+        self.command_with_config(name, CommandConfig::default(), handler)
+    }
+
+    /// Register an admin-only command (only group administrators can invoke).
+    pub fn admin_command<F, Fut>(&mut self, name: impl Into<String>, handler: F) -> &mut Self
+    where
+        F: Fn(CommandContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = RouterResult> + Send + 'static,
+    {
+        let config = CommandConfig {
+            admin_only: true,
+            group_only: true,
+            dm_only: false,
+            description: "Admin only command".to_string(),
+        };
+        self.command_with_config(name, config, handler)
+    }
+
+    /// Register a group-only command (cannot be invoked in private chat).
+    pub fn group_command<F, Fut>(&mut self, name: impl Into<String>, handler: F) -> &mut Self
+    where
+        F: Fn(CommandContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = RouterResult> + Send + 'static,
+    {
+        let config = CommandConfig {
+            admin_only: false,
+            group_only: true,
+            dm_only: false,
+            description: "Group only command".to_string(),
+        };
+        self.command_with_config(name, config, handler)
+    }
+
+    /// Register a DM-only command (cannot be invoked in groups).
+    pub fn dm_command<F, Fut>(&mut self, name: impl Into<String>, handler: F) -> &mut Self
+    where
+        F: Fn(CommandContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = RouterResult> + Send + 'static,
+    {
+        let config = CommandConfig {
+            admin_only: false,
+            group_only: false,
+            dm_only: true,
+            description: "Direct message only command".to_string(),
+        };
+        self.command_with_config(name, config, handler)
+    }
+
+    /// Register a command handler with custom restrictions.
+    pub fn command_with_config<F, Fut>(
+        &mut self,
+        name: impl Into<String>,
+        config: CommandConfig,
+        handler: F,
+    ) -> &mut Self
     where
         F: Fn(CommandContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = RouterResult> + Send + 'static,
     {
         let cmd_name = name.into().to_lowercase();
         let boxed_handler: CommandHandler = Arc::new(move |ctx| Box::pin(handler(ctx)));
-        self.commands.insert(cmd_name, boxed_handler);
+        self.commands.insert(cmd_name, RegisteredCommand {
+            handler: boxed_handler,
+            config,
+        });
         self
     }
 
@@ -206,7 +370,10 @@ impl BotRouter {
     {
         let primary = name.into().to_lowercase();
         let boxed_handler: CommandHandler = Arc::new(move |ctx| Box::pin(handler(ctx)));
-        self.commands.insert(primary.clone(), boxed_handler);
+        self.commands.insert(primary.clone(), RegisteredCommand {
+            handler: boxed_handler,
+            config: CommandConfig::default(),
+        });
         for alias in aliases {
             self.aliases.insert(alias.to_lowercase(), primary.clone());
         }
@@ -224,10 +391,6 @@ impl BotRouter {
     }
 
     /// Dispatch an incoming message through the router.
-    ///
-    /// Returns `Ok(true)` if a command matched and completed successfully,
-    /// `Ok(false)` if the message was not a recognized command or was skipped,
-    /// or `Err(...)` if the command execution failed.
     pub async fn dispatch(&self, ctx: MessageContext) -> RouterResult {
         if self.ignore_self && ctx.is_from_me() {
             return Ok(());
@@ -257,15 +420,42 @@ impl BotRouter {
         let resolved_name = self.aliases.get(&cmd_key).cloned().unwrap_or(cmd_key);
 
         let command_ctx = CommandContext {
-            ctx,
+            ctx: ctx.clone(),
             command: resolved_name.clone(),
             args,
             raw_args,
             prefix: prefix.clone(),
         };
 
-        if let Some(handler) = self.commands.get(&resolved_name) {
-            handler(command_ctx).await?;
+        if let Some(reg) = self.commands.get(&resolved_name) {
+            // Guard: Group-only check
+            if reg.config.group_only && !command_ctx.is_group() {
+                command_ctx.reply("⚠️ Perintah ini hanya dapat digunakan di dalam Grup!").await?;
+                return Ok(());
+            }
+
+            // Guard: DM-only check
+            if reg.config.dm_only && command_ctx.is_group() {
+                command_ctx.reply("⚠️ Perintah ini hanya dapat digunakan di Private Chat (DM)!").await?;
+                return Ok(());
+            }
+
+            // Guard: Admin-only check
+            if reg.config.admin_only {
+                let is_admin = match command_ctx.is_sender_admin().await {
+                    Ok(val) => val,
+                    Err(e) => {
+                        log::warn!(target: "Bot/Router", "Failed to check admin status: {e:?}");
+                        false
+                    }
+                };
+                if !is_admin {
+                    command_ctx.reply("⛔ Perintah ini hanya dapat dijalankan oleh Admin Grup!").await?;
+                    return Ok(());
+                }
+            }
+
+            (reg.handler)(command_ctx).await?;
             Ok(())
         } else if let Some(ref fallback) = self.default_handler {
             fallback(command_ctx).await?;

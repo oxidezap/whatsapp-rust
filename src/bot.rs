@@ -360,6 +360,138 @@ impl MessageContext {
     ) -> Result<crate::send::SendResult, crate::features::PollError> {
         self.client.polls().create(&self.info.source.chat, name, options, selectable_count).await
     }
+
+    /// Reply with user mentions attached in the context info.
+    pub async fn reply_with_mentions(
+        &self,
+        text: impl Into<String>,
+        mentions: &[wacore_binary::Jid],
+    ) -> Result<crate::send::SendResult, crate::send::SendError> {
+        let mut context = self.build_quote_context();
+        context.mentioned_jid = mentions.iter().map(|j| j.to_string()).collect();
+        let mut message = wa::Message::default();
+        let mut ext = wa::message::ExtendedTextMessage::default();
+        ext.text = Some(text.into());
+        ext.context_info = buffa::MessageField::some(context);
+        message.extended_text_message = buffa::MessageField::some(ext);
+        self.send_message(message).await
+    }
+
+    /// Mentions all participants in the group chat (the classic hidetag / tagall).
+    pub async fn mention_all(
+        &self,
+        header: Option<&str>,
+    ) -> Result<crate::send::SendResult, Box<dyn std::error::Error + Send + Sync>> {
+        if !self.is_group() {
+            return Err("mention_all can only be used in a group chat".into());
+        }
+        let meta = self.client.groups().fetch_metadata(&self.info.source.chat).await?;
+        let mentions: Vec<wacore_binary::Jid> = meta.participants.iter().map(|p| p.jid.clone()).collect();
+        let mut content = String::new();
+        if let Some(h) = header {
+            content.push_str(h);
+            content.push_str("\n\n");
+        } else {
+            content.push_str("📢 Announcement to all members:\n\n");
+        }
+        for (i, p) in meta.participants.iter().enumerate() {
+            content.push_str(&format!("{}. @{}\n", i + 1, p.jid.user()));
+        }
+        let result = self.reply_with_mentions(content, &mentions).await?;
+        Ok(result)
+    }
+
+    /// Fetch group metadata for the current chat.
+    pub async fn group_metadata(&self) -> Result<crate::features::GroupMetadata, crate::features::GroupError> {
+        self.client.groups().fetch_metadata(&self.info.source.chat).await
+    }
+
+    /// Checks if the message sender is an admin in this group.
+    pub async fn is_sender_admin(&self) -> Result<bool, crate::features::GroupError> {
+        if !self.is_group() {
+            return Ok(false);
+        }
+        let meta = self.group_metadata().await?;
+        let sender = self.sender();
+        Ok(meta.participants.iter().any(|p| {
+            (&p.jid == sender || p.phone_number.as_ref() == Some(sender) || p.lid.as_ref() == Some(sender))
+                && p.is_admin()
+        }))
+    }
+
+    /// Checks if the bot itself is an admin in this group.
+    pub async fn is_bot_admin(&self) -> Result<bool, crate::features::GroupError> {
+        if !self.is_group() {
+            return Ok(false);
+        }
+        let Some(pn) = self.client.pn() else {
+            return Ok(false);
+        };
+        let meta = self.group_metadata().await?;
+        Ok(meta.participants.iter().any(|p| {
+            (p.jid.user() == pn.user() || p.phone_number.as_ref().map(|j| j.user()) == Some(pn.user()))
+                && p.is_admin()
+        }))
+    }
+
+    /// Kick/remove participants from the current group.
+    pub async fn group_kick(&self, participants: &[wacore_binary::Jid]) -> Result<Vec<crate::features::ParticipantChangeResponse>, crate::features::GroupError> {
+        self.client.groups().remove_participants(&self.info.source.chat, participants).await
+    }
+
+    /// Add participants to the current group.
+    pub async fn group_add(&self, participants: &[wacore_binary::Jid]) -> Result<Vec<crate::features::ParticipantChangeResponse>, crate::features::GroupError> {
+        self.client.groups().add_participants(&self.info.source.chat, participants).await
+    }
+
+    /// Promote participants to group admins.
+    pub async fn group_promote(&self, participants: &[wacore_binary::Jid]) -> Result<Vec<crate::features::ParticipantChangeResponse>, crate::features::GroupError> {
+        self.client.groups().promote_participants(&self.info.source.chat, participants).await
+    }
+
+    /// Demote group admins back to regular members.
+    pub async fn group_demote(&self, participants: &[wacore_binary::Jid]) -> Result<Vec<crate::features::ParticipantChangeResponse>, crate::features::GroupError> {
+        self.client.groups().demote_participants(&self.info.source.chat, participants).await
+    }
+
+    /// Retrieve the group invite link code.
+    pub async fn group_invite_code(&self) -> Result<String, crate::features::GroupError> {
+        self.client.groups().get_invite_link(&self.info.source.chat).await
+    }
+
+    /// Send a location pin message.
+    pub async fn reply_location(
+        &self,
+        latitude: f64,
+        longitude: f64,
+        name: Option<String>,
+        address: Option<String>,
+    ) -> Result<crate::send::SendResult, crate::send::SendError> {
+        let mut message = wa::Message::default();
+        let mut loc = wa::message::LocationMessage::default();
+        loc.degrees_latitude = Some(latitude);
+        loc.degrees_longitude = Some(longitude);
+        loc.name = name;
+        loc.address = address;
+        loc.context_info = buffa::MessageField::some(self.build_quote_context());
+        message.location_message = buffa::MessageField::some(loc);
+        self.send_message(message).await
+    }
+
+    /// Send a contact card (vCard) message.
+    pub async fn reply_contact(
+        &self,
+        display_name: impl Into<String>,
+        vcard: impl Into<String>,
+    ) -> Result<crate::send::SendResult, crate::send::SendError> {
+        let mut message = wa::Message::default();
+        let mut contact = wa::message::ContactMessage::default();
+        contact.display_name = Some(display_name.into());
+        contact.vcard = Some(vcard.into());
+        contact.context_info = buffa::MessageField::some(self.build_quote_context());
+        message.contact_message = buffa::MessageField::some(contact);
+        self.send_message(message).await
+    }
 }
 
 pub mod router;

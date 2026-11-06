@@ -5,9 +5,13 @@
 //! - Multi-device authentication (QR code or 8-digit Pairing Code)
 //! - Baileys & WhatsMeow parity fluent API
 //! - High-level [`BotRouter`] with prefix handling, argument parsing, and aliases
+//! - Admin-only guards (`router.admin_command`) and group-only guards
+//! - Group management (`group_metadata`, `group_kick`, `group_invite_code`)
+//! - Tagall / Hidetag group announcements (`mention_all`)
 //! - Automated blue tick read receipts (`mark_as_read`)
 //! - Instant emoji reactions (`react`)
 //! - Interactive WhatsApp polls (`send_poll`)
+//! - Location and Contact cards (`reply_location`, `reply_contact`)
 //! - Chat presence indicators (`send_typing`)
 //! - Persistent session storage in SQLite
 //!
@@ -118,6 +122,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     });
 
+    // Command: !tagall / !hidetag (Admin only in groups)
+    router.admin_command("tagall", |cmd| async move {
+        let _ = cmd.mark_as_read().await;
+        cmd.react("📢").await?;
+        let header = if cmd.raw_args.is_empty() {
+            "📢 *Pengumuman Untuk Semua Anggota:*"
+        } else {
+            &cmd.raw_args
+        };
+        cmd.mention_all(Some(header)).await?;
+        Ok(())
+    });
+
+    // Command: !link (Get group invite link)
+    router.admin_command("link", |cmd| async move {
+        let _ = cmd.mark_as_read().await;
+        cmd.react("🔗").await?;
+        match cmd.group_invite_code().await {
+            Ok(code) => {
+                cmd.reply(format!("🔗 *Tautan Undangan Grup:*\nhttps://chat.whatsapp.com/{code}")).await?;
+            }
+            Err(e) => {
+                cmd.reply(format!("Gagal mengambil tautan grup: {e}")).await?;
+            }
+        }
+        Ok(())
+    });
+
+    // Command: !admins (List group admins)
+    router.group_command("admins", |cmd| async move {
+        let _ = cmd.mark_as_read().await;
+        cmd.react("🛡️").await?;
+        let meta = cmd.group_metadata().await?;
+        let admins: Vec<_> = meta.participants.iter().filter(|p| p.is_admin()).collect();
+        let mut msg = format!("🛡️ *Daftar Admin Grup ({})*:\n\n", admins.len());
+        for (i, adm) in admins.iter().enumerate() {
+            msg.push_str(&format!("{}. @{}\n", i + 1, adm.jid.user()));
+        }
+        let admin_jids: Vec<_> = admins.iter().map(|p| p.jid.clone()).collect();
+        cmd.reply_with_mentions(msg, &admin_jids).await?;
+        Ok(())
+    });
+
+    // Command: !location (Send demo pin)
+    router.command("location", |cmd| async move {
+        let _ = cmd.mark_as_read().await;
+        cmd.react("📍").await?;
+        cmd.reply_location(
+            -6.1753924,
+            106.8271528,
+            Some("Monas (Monumen Nasional)".into()),
+            Some("Jakarta Pusat, DKI Jakarta, Indonesia".into()),
+        ).await?;
+        Ok(())
+    });
+
+    // Command: !contact (Send bot developer vCard)
+    router.command("contact", |cmd| async move {
+        let _ = cmd.mark_as_read().await;
+        cmd.react("👤").await?;
+        let vcard = "BEGIN:VCARD\nVERSION:3.0\nFN:KazeDevID\nORG:whatsapp-rust Developer\nTEL;type=CELL;type=VOICE;waid=628123456789:+62 812-3456-789\nEND:VCARD";
+        cmd.reply_contact("KazeDevID (Bot Creator)", vcard).await?;
+        Ok(())
+    });
+
     // Command: !info
     router.command_with_aliases("info", &["about", "bot"], move |cmd| {
         let uptime_secs = start_time.elapsed().as_secs();
@@ -149,12 +218,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         cmd.react("📜").await?;
         let help_text = format!(
             "🤖 *Available Bot Commands* (Prefix: `{}`)\n\n\
+            *General Commands:*\n\
             • `{0}ping` — Check bot health and latency\n\
             • `{0}echo <text>` — Echo back message\n\
             • `{0}poll [title]` — Create an interactive WhatsApp poll\n\
             • `{0}typing` — Demonstrate composing presence state\n\
+            • `{0}location` — Send sample location pin message\n\
+            • `{0}contact` — Send contact card (vCard)\n\
             • `{0}info` — Display session and JID diagnostic info\n\
             • `{0}help` — Show this commands menu\n\n\
+            *Group & Admin Commands:*\n\
+            • `{0}tagall [pesan]` — Tag all members (Admin only)\n\
+            • `{0}link` — Fetch group invite link (Admin only)\n\
+            • `{0}admins` — List all administrators in this group\n\n\
             _Powered by whatsapp-rust & KazeDevID_",
             cmd.prefix
         );
