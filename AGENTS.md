@@ -20,7 +20,13 @@ tasks run in release through `tools/oracle-task`. Both stay outside default-memb
 host/specs live under `tools/oracle-*`; they use commit-pinned `unwasm-core`
 for static analysis and whatspec `wa-store` for capture transport. These tool
 members are excluded from `default-members`.
-Do not add Python/Bash task implementations or runtime dependencies on these tools.
+Implement repository-owned executable code, including oracle drivers and task
+implementations, in Rust. Do not add Java, C, JavaScript, Python or Bash task
+implementations, or embed those implementations in Rust strings. External,
+separately pinned reference artifacts may still execute in their original runtime;
+keep their proprietary bytes out of Git. Documentation, Cargo/CI configuration,
+SQL migrations and protocol schemas retain their native declarative formats.
+Do not add runtime dependencies on these tools.
 
 ## Build & verify
 

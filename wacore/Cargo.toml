@@ -17,6 +17,8 @@ autobenches = false
 ignored = ["getrandom"]
 
 [features]
+# Runtime- and I/O-independent experimental mobile configuration/workflow.
+mobile = []
 instance-clock = []
 session-simulator = []
 debug-snapshots = []
@@ -198,6 +200,11 @@ harness = false
 # SRTP, SFrame and framing rows along with the stage rows. The `codec_stages` module is `#[cfg]`-gated
 # inside the bench instead, so it is the only part that needs the extra feature.
 required-features = ["voip-mlow"]
+
+[[bench]]
+name = "mobile_workflow_benchmark"
+harness = false
+required-features = ["mobile"]
 
 [[example]]
 name = "voip_profile"

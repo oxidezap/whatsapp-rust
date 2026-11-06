@@ -226,7 +226,7 @@ pub fn stanza_type_from_message(msg: &wa::Message) -> &'static str {
 /// status privacy or business nodes. Normal builders accept it in `extra_nodes`;
 /// the pairwise retry builder inserts it itself. No empty node is emitted.
 /// Captured-client vectors and their derivation live in
-/// `wacore/tests/fixtures/retry_metadata.json` and `retry_metadata.mjs`.
+/// `wacore/tests/fixtures/retry_metadata.json` and the Rust `web-oracle retry` driver.
 /// Unlike `MessageExt::is_view_once`, this requires a media leaf: the mere
 /// presence of a future-proof wrapper does not create a media record.
 pub fn message_meta_from_message(msg: &wa::Message) -> Option<Node> {

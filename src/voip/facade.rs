@@ -1423,8 +1423,8 @@ pub(super) fn drop_hosted_devices(mut devices: Vec<Jid>) -> Vec<Jid> {
 }
 
 /// Keep only the devices whose encrypt stays a plain `msg` (not pkmsg), given `would_pkmsg` flags
-/// parallel to `devices`. Used when we hold no ADV account and so can't attach the `<device-identity>`
-/// a pkmsg `<enc>` requires. Errors `MissingDeviceIdentity` when every device would be pkmsg (nothing
+/// parallel to `devices`. Used for a companion with no ADV account, whose pkmsg
+/// `<enc>` requires an attached `<device-identity>`. Explicit primary policies may omit it. Errors `MissingDeviceIdentity` when every device would be pkmsg (nothing
 /// left to offer), rather than letting an unvalidatable pkmsg out or failing the whole call silently.
 pub(super) fn keep_non_pkmsg_devices(
     devices: Vec<Jid>,
@@ -1677,6 +1677,10 @@ async fn fanout_group_epoch_for_generation(
     // preparation failure would make an identical redelivery stale, so own teardown from the first
     // fallible step instead of leaving the generation alive without its requested epoch.
     let teardown = GroupRekeyTeardown::new(client, update, generation, true);
+    let sender_role = client.sending_identity_role();
+    sender_role
+        .validate()
+        .map_err(|_| CallError::MissingDeviceIdentity)?;
     let own_lid = client.lid().ok_or(CallError::Media("no own LID"))?;
     let own_pn = client.pn();
     let mut seen = std::collections::HashSet::new();
@@ -1730,7 +1734,9 @@ async fn fanout_group_epoch_for_generation(
     let encrypted = {
         let lock_jids = client.build_session_lock_keys(&recipients).await;
         let session_guards = client.session_guards_for(&lock_jids).await;
-        if device.account.is_none() {
+        if device.account.is_none()
+            && wacore::send::needs_device_identity_for_role(true, None, sender_role).is_err()
+        {
             for recipient in &recipients {
                 if client
                     .would_emit_pkmsg(recipient)
@@ -1764,9 +1770,10 @@ async fn fanout_group_epoch_for_generation(
         .stats
         .record_unkeyable_devices(UnkeyableDevice::Encrypt, encrypted.unkeyed_at_encrypt);
     ensure_group_rekey_generation(client, &update.call_id, generation)?;
-    let device_identity = wacore::send::needs_device_identity(
+    let device_identity = wacore::send::needs_device_identity_for_role(
         encrypted.includes_prekey_message,
         device.account.as_deref(),
+        sender_role,
     )
     .map_err(|_| CallError::MissingDeviceIdentity)?;
     let encrypted =
@@ -1784,6 +1791,7 @@ async fn fanout_group_epoch_for_generation(
         &recipients,
         &encrypted,
         device_identity.as_deref(),
+        sender_role,
     )
     .await?;
     Ok(GroupEpochFanout {
@@ -1803,6 +1811,7 @@ async fn publish_group_epoch_ciphertexts(
     recipients: &[Jid],
     encrypted: &wacore::send::EncryptForDevicesRaw,
     device_identity: Option<&[u8]>,
+    sender_role: wacore::send::SenderIdentityRole,
 ) -> Result<(), CallError> {
     let complete = encrypted.devices.len() == recipients.len()
         && recipients.iter().all(|recipient| {
@@ -1821,7 +1830,7 @@ async fn publish_group_epoch_ciphertexts(
             continue;
         };
         nodes.push(
-            wacore::stanza::group_call::build_group_enc_rekey(
+            wacore::stanza::group_call::build_group_enc_rekey_for_role(
                 &wacore::stanza::group_call::GroupEncRekeyParams {
                     call_id: &update.call_id,
                     id: &client.generate_request_id(),
@@ -1835,6 +1844,7 @@ async fn publish_group_epoch_ciphertexts(
                     },
                     device_identity,
                 },
+                sender_role,
             )
             .map_err(|error| CallError::Response(error.to_string()))?,
         );
@@ -9889,6 +9899,173 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "mobile-core")]
+    async fn mobile_call_client(policy: wacore::send::PrimaryDeviceIdentityPolicy) -> Arc<Client> {
+        let client = crate::test_utils::primary_startup_client_with_identity_policy(policy).await;
+        client
+            .persistence_manager()
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+                Jid::new("111111111111111", Server::Lid),
+            )))
+            .await;
+        client.persistence_manager().flush().await.unwrap();
+        let transport = crate::transport::mock::CapturingMockTransportFactory::new().transport();
+        install_noise_transport(&client, transport).await;
+        client.set_connected_for_test(true);
+        client.enter_live_mode_for_tests();
+        assert!(
+            client
+                .persistence_manager()
+                .get_device_snapshot()
+                .account
+                .is_none()
+        );
+        assert_eq!(
+            client.sending_identity_role(),
+            wacore::send::SenderIdentityRole::MobilePrimary(policy)
+        );
+        client
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn direct_key_preparation_accepts_primary_profiles_without_adv_and_refuses_companion() {
+        use wacore::send::PrimaryDeviceIdentityPolicy::{AttachWhenAvailable, Omit};
+        for policy in [Omit, AttachWhenAvailable] {
+            let client = mobile_call_client(policy).await;
+            let recipient = peer_lid();
+            seed_peer_session(&client, &recipient).await;
+            client
+                .update_device_list(wacore::store::traits::DeviceListRecord {
+                    user: recipient.user.as_str().into(),
+                    devices: [wacore::store::traits::DeviceInfo::new(0, None)].into(),
+                    timestamp: wacore::time::now_secs(),
+                    phash: None,
+                    raw_id: None,
+                })
+                .await
+                .unwrap();
+            let keys =
+                DirectCallHost::prepare_keys(client.as_ref(), &recipient.to_non_ad(), &[9; 32])
+                    .await
+                    .expect("validated primary permits a fresh pre-key call");
+            assert_eq!(keys.ring_devices, vec![recipient.clone()]);
+            assert_eq!(keys.device_keys.len(), 1);
+            assert_eq!(keys.device_keys[0].device_jid, recipient);
+            assert_eq!(keys.device_keys[0].enc_type, "pkmsg");
+            assert!(!keys.device_keys[0].ciphertext.is_empty());
+            assert!(keys.device_identity.is_none());
+        }
+        let client = make_no_account_client().await;
+        let recipient = peer_lid();
+        seed_peer_session(&client, &recipient).await;
+        client
+            .update_device_list(wacore::store::traits::DeviceListRecord {
+                user: recipient.user.as_str().into(),
+                devices: [wacore::store::traits::DeviceInfo::new(0, None)].into(),
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            DirectCallHost::prepare_keys(client.as_ref(), &recipient.to_non_ad(), &[9; 32]).await,
+            Err(CallError::MissingDeviceIdentity)
+        ));
+        assert!(
+            client.would_emit_pkmsg(&recipient).await.unwrap(),
+            "companion preflight must preserve the fresh session"
+        );
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn primary_group_epoch_without_adv_publishes_pkmsg_and_preserves_generation() {
+        use wacore::send::PrimaryDeviceIdentityPolicy::{AttachWhenAvailable, Omit};
+        for policy in [Omit, AttachWhenAvailable] {
+            let client = mobile_call_client(policy).await;
+            let recipient = peer_lid();
+            seed_peer_session(&client, &recipient).await;
+            let update = rekey_update(&client, std::slice::from_ref(&recipient));
+            let generation = register_group_update(&client, &update);
+            let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+            fanout_group_epoch_for_generation(&client, &update, Some(generation))
+                .await
+                .expect("primary rekey must permit missing ADV")
+                .commit(|epoch| {
+                    assert_eq!(epoch.len(), 32);
+                    Ok(())
+                })
+                .unwrap();
+            let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+                .await
+                .unwrap()
+                .unwrap();
+            let node = node.as_node_ref();
+            let rekey = node.get_optional_child("enc_rekey").unwrap();
+            let enc = rekey.get_optional_child("enc").unwrap();
+            assert_eq!(
+                enc.attrs().optional_string("type").as_deref(),
+                Some("pkmsg")
+            );
+            assert!(!enc.content_bytes().unwrap().is_empty());
+            assert!(rekey.get_optional_child("device-identity").is_none());
+            assert_eq!(
+                client.call_registry().generation_of(&update.call_id),
+                Some(generation)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_group_sender_role_terminates_the_committed_generation() {
+        let (client, _) = make_sending_client().await;
+        for command in [
+            crate::store::commands::DeviceCommand::SetId(Some(Jid::pn("15550000001"))),
+            crate::store::commands::DeviceCommand::SetLid(Some(Jid::new(
+                "111111111111111",
+                Server::Lid,
+            ))),
+        ] {
+            client
+                .persistence_manager()
+                .try_process_command(command)
+                .await
+                .expect("primary device-zero addresses");
+        }
+        let snapshot = client.persistence_manager().get_device_snapshot();
+        let binding = wacore::store::MobileSessionBinding::new(
+            [1; 32],
+            snapshot.mobile_identity_hash(),
+            wacore::store::StoredMobilePlatform::Android,
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        client
+            .persistence_manager()
+            .try_process_command(
+                crate::store::commands::DeviceCommand::SetMobileSessionBinding(binding),
+            )
+            .await
+            .expect("valid persisted primary marker without a configured session");
+        assert_eq!(
+            client.sending_identity_role(),
+            wacore::send::SenderIdentityRole::Unknown
+        );
+        let update = rekey_update(&client, &[]);
+        register_group_update(&client, &update);
+        assert!(matches!(
+            fanout_group_epoch(&client, &update).await,
+            Err(CallError::MissingDeviceIdentity)
+        ));
+        assert!(
+            client.call_registry().snapshot(&update.call_id).is_none(),
+            "a failed role preflight must retire the already-committed rekey generation"
+        );
+    }
+
     #[tokio::test]
     async fn missing_group_identity_is_rejected_before_advancing_fresh_sessions() {
         let (client, _sent) = make_sending_client().await;
@@ -9953,6 +10130,7 @@ mod tests {
                 &recipients,
                 &encrypted,
                 None,
+                wacore::send::SenderIdentityRole::Companion,
             )
             .await,
             Err(CallError::Media(

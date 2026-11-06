@@ -140,6 +140,50 @@
       {
         "lanes": ["native", "msrv"],
         "mode": "test",
+        "features": ["mobile-core"],
+        "no_default_features": true,
+        "lib": true
+      },
+      {
+        "lanes": ["native", "msrv"],
+        "mode": "test",
+        "features": ["mobile-ports"],
+        "no_default_features": true,
+        "lib": true
+      },
+      {
+        "lanes": ["native", "msrv"],
+        "mode": "test",
+        "features": ["mobile-transport-native"],
+        "no_default_features": true,
+        "lib": true
+      },
+      {
+        "lanes": ["native", "msrv"],
+        "mode": "test",
+        "features": ["native-default", "mobile-core"],
+        "no_default_features": true,
+        "lib": true
+      },
+      {
+        "lanes": ["wasm"],
+        "mode": "build",
+        "features": ["mobile-core", "js"],
+        "no_default_features": true,
+        "bin": "mobile_probe",
+        "release": true
+      },
+      {
+        "lanes": ["wasm"],
+        "mode": "test",
+        "features": ["mobile-execution"],
+        "no_default_features": true,
+        "test": "mobile_workflow",
+        "wasm_test": true
+      },
+      {
+        "lanes": ["native", "msrv"],
+        "mode": "test",
         "features": ["native-default", "contracts"],
         "lib": true
       },

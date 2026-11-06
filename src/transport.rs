@@ -10,6 +10,9 @@ pub use whatsapp_rust_tokio_transport::{
     default_tls_connector, from_websocket,
 };
 
+#[cfg(feature = "mobile-transport-native")]
+pub use whatsapp_rust_tokio_transport::{TokioTcpTransportFactory, from_byte_stream};
+
 #[cfg(test)]
 pub mod mock {
     use super::*;

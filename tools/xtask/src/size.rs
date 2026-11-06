@@ -212,12 +212,41 @@ fn measure_with(
     Ok(())
 }
 
+const MAX_FUNCTION_ROWS: usize = 80;
+const MAX_FUNCTION_NAME_CHARS: usize = 512;
+
+fn bounded_functions(data: &Value) -> Result<Vec<Value>> {
+    data["functions"]
+        .as_array()
+        .context("cargo bloat returned no function data")?
+        .iter()
+        .take(MAX_FUNCTION_ROWS)
+        .map(|function| {
+            let name = function["name"]
+                .as_str()
+                .context("function name")?
+                .chars()
+                .take(MAX_FUNCTION_NAME_CHARS)
+                .collect::<String>();
+            let size = function["size"].as_u64().context("function size")?;
+            let crate_name = function["crate"]
+                .as_str()
+                .map(|name| name.chars().take(128).collect::<String>());
+            Ok(json!({
+                "crate": crate_name,
+                "name": name,
+                "size": size,
+            }))
+        })
+        .collect()
+}
+
 fn diagnostics(
     root: &Path,
     metrics: &mut Vec<Metric>,
     tools: &mut impl MeasurementTools,
 ) -> Result<Value> {
-    let bloat: Value = serde_json::from_str(&tools.text(
+    let mut bloat: Value = serde_json::from_str(&tools.text(
         root,
         "cargo",
         &[
@@ -257,6 +286,49 @@ fn diagnostics(
             .map(|(_, v)| v)
             .sum(),
     ));
+    // cargo-bloat 0.12.1 emits functions with name, size and optional crate
+    // when --crates is absent. Keep the measured release/example selection.
+    let functions: Value = serde_json::from_str(&tools.text(
+        root,
+        "cargo",
+        &[
+            "bloat",
+            "--release",
+            "--example",
+            "demo",
+            "--message-format",
+            "json",
+            "-n",
+            "80",
+        ],
+    )?)?;
+    let functions = bounded_functions(&functions)?;
+    for function in &functions {
+        println!("size function: {function}");
+    }
+    bloat["functions"] = Value::Array(functions);
+    let mobile_functions: Value = serde_json::from_str(&tools.text(
+        root,
+        "cargo",
+        &[
+            "bloat",
+            "--release",
+            "--example",
+            "demo",
+            "--message-format",
+            "json",
+            "--filter",
+            "(MobileSessionBinding|BindingWire|PersistenceManager|DeviceCommand|mobile_session|validate_mobile|SqliteStore)",
+            "-n",
+            "80",
+        ],
+    )?)?;
+    let mobile_functions = bounded_functions(&mobile_functions)?;
+    for function in &mobile_functions {
+        println!("size mobile function: {function}");
+    }
+    bloat["mobile-functions"] = Value::Array(mobile_functions);
+
     for (package, label) in [("wacore", "wacore"), ("whatsapp-rust", "whatsapp-rust lib")] {
         let (lines, copies) = llvm_total(&tools.text(
             root,
@@ -309,6 +381,13 @@ fn delta(n: i64, base: i64, unit: &str) -> String {
         s.push_str(&format!(" ({:+.2}%)", n as f64 / base as f64 * 100.0));
     }
     s
+}
+fn with_exact_bytes(display: String, n: i64, unit: &str) -> String {
+    if unit == "bytes" {
+        format!("{display} [{n} B]")
+    } else {
+        display
+    }
 }
 fn metrics(directory: &Path) -> Result<Vec<Metric>> {
     Ok(serde_json::from_value(read_json(
@@ -461,12 +540,16 @@ fn render(
                 format!(
                     "| {} | {} | {} | {}{icon} |",
                     m.name,
-                    value(b.value, &m.unit),
-                    value(m.value, &m.unit),
-                    delta(d, b.value, &m.unit)
+                    with_exact_bytes(value(b.value, &m.unit), b.value, &m.unit),
+                    with_exact_bytes(value(m.value, &m.unit), m.value, &m.unit),
+                    with_exact_bytes(delta(d, b.value, &m.unit), d, &m.unit)
                 )
             } else {
-                format!("| {} | (new) | {} | |", m.name, value(m.value, &m.unit))
+                format!(
+                    "| {} | (new) | {} | |",
+                    m.name,
+                    with_exact_bytes(value(m.value, &m.unit), m.value, &m.unit)
+                )
             };
             if m.name.starts_with(".text ") {
                 crate_rows.push(row);
@@ -583,6 +666,25 @@ mod tests {
         assert_eq!(workflow.matches("git diff --exit-code").count(), 3);
     }
     #[test]
+    fn function_diagnostics_follow_the_external_schema_with_bounded_logs() {
+        let data = json!({
+            "functions": (0..MAX_FUNCTION_ROWS + 1)
+                .map(|_| json!({"name": "x".repeat(600), "size": 123}))
+                .collect::<Vec<_>>()
+        });
+        let functions = bounded_functions(&data).unwrap();
+        assert_eq!(functions.len(), MAX_FUNCTION_ROWS);
+        assert_eq!(
+            functions[0]["name"].as_str().unwrap().chars().count(),
+            MAX_FUNCTION_NAME_CHARS
+        );
+        assert!(functions[0]["crate"].is_null());
+        assert_eq!(functions[0]["size"], 123);
+        assert!(bounded_functions(&json!({"functions": [{"name": "missing size"}]})).is_err());
+        assert!(bounded_functions(&json!({"crates": []})).is_err());
+    }
+
+    #[test]
     fn gate_only_is_an_explicit_parser_opt_in() {
         use clap::Parser;
         for (flags, expected_gate, expected_skip) in [
@@ -613,24 +715,51 @@ mod tests {
         let workflow = include_str!("../../../.github/workflows/binary-size.yml");
         let (pr, push) = workflow.split_once("  binary-size-push:").unwrap();
         let steps = pr.split("\n      - ").collect::<Vec<_>>();
-        let step = |name: &str| {
-            *steps
+        let position = |name: &str| {
+            steps
                 .iter()
-                .find(|s| s.starts_with(&format!("name: {name}\n")))
+                .position(|s| s.starts_with(&format!("name: {name}\n")))
                 .unwrap()
         };
+        let step = |name: &str| steps[position(name)];
         let initial = step("Measure binary size");
         assert!(initial.contains("--gate-only --out-dir size-out"));
         assert!(!initial.contains("--skip-build"));
         let probe = step("Check whether size diagnostics are needed");
+        assert!(probe.contains("id: budget"));
         assert!(probe.contains("continue-on-error: true"));
         assert!(probe.contains("ci workflow size-gate"));
+        let diagnostic_guard = "if: ${{ !cancelled() && steps.budget.outcome == 'failure' }}";
+        let install = step("Install cargo-bloat and cargo-llvm-lines for a failed budget");
+        assert!(install.contains(diagnostic_guard));
         let diagnostic = step("Diagnose the measured binary");
-        assert!(diagnostic.contains("if: steps.budget.outcome == 'failure'"));
+        // A status function bypasses success(): a failed publication must not
+        // suppress diagnostics, and the authoritative final gate still runs.
+        assert!(diagnostic.contains(diagnostic_guard));
+        assert!(step("Upload size diagnostics").contains(diagnostic_guard));
         assert!(diagnostic.contains("--skip-build --out-dir size-diagnostics"));
         assert!(!diagnostic.contains("--gate-only"));
         assert!(!diagnostic.contains("--out-dir size-out"));
-        assert!(step("Generate report and evaluate gate").contains("id: report"));
+        let report = step("Generate report and evaluate gate");
+        assert!(report.contains("id: report"));
+        assert!(report.contains("ci binary-size-report --head size-out --out-dir size-out"));
+        let metrics = step("Upload size artifacts");
+        assert!(metrics.contains("if: ${{ !cancelled() }}"));
+        assert!(metrics.contains("path: size-out/"));
+        // Publish the canonical result before optional symbol analysis. Its
+        // failure cannot prevent the final enforcement of the same gate file.
+        let order = [
+            "Generate report and evaluate gate",
+            "Check whether size diagnostics are needed",
+            "Upload size artifacts",
+            "Post sticky PR comment",
+            "Install cargo-bloat and cargo-llvm-lines for a failed budget",
+            "Diagnose the measured binary",
+            "Upload size diagnostics",
+            "Enforce size budget",
+        ]
+        .map(position);
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]));
         let comment = step("Post sticky PR comment");
         // A fresh FAIL report must replace an older PASS even if diagnostics or
         // uploads fail. The status function avoids the implicit success() guard.
@@ -683,12 +812,18 @@ mod tests {
                     "cargo" => {
                         let call = if args[0] == "llvm-lines" {
                             format!("llvm-lines:{}", args[2])
+                        } else if args[0] == "bloat" && args.contains(&"--filter") {
+                            "bloat-mobile-functions".to_owned()
+                        } else if args[0] == "bloat" && !args.contains(&"--crates") {
+                            "bloat-functions".to_owned()
                         } else {
                             args[0].to_owned()
                         };
                         self.calls.push(call.clone());
                         ensure!(self.fail != Some(call.as_str()), "{call} failed");
-                        if args[0] == "bloat" {
+                        if call == "bloat-functions" || call == "bloat-mobile-functions" {
+                            Ok(r#"{"functions":[{"crate":"wacore","name":"fixture::function","size":123}]}"#.into())
+                        } else if args[0] == "bloat" {
                             Ok(r#"{"crates":[{"name":"wacore","size":1234}]}"#.into())
                         } else {
                             Ok(" 123 4 (TOTAL)\n".into())
@@ -780,11 +915,16 @@ mod tests {
                 [
                     "build",
                     "bloat",
+                    "bloat-functions",
+                    "bloat-mobile-functions",
                     "llvm-lines:wacore",
                     "llvm-lines:whatsapp-rust"
                 ]
             );
             assert!(out.join("size-attribution.json").exists());
+            let attribution = read_json(&out.join("size-attribution.json")).unwrap();
+            assert_eq!(attribution["functions"][0]["size"], 123);
+            assert_eq!(attribution["mobile-functions"][0]["size"], 123);
             assert_eq!(
                 read_json(&out.join("size-meta.json")).unwrap()["diagnostics"],
                 "complete"
@@ -836,6 +976,8 @@ mod tests {
             for fail in [
                 "build",
                 "bloat",
+                "bloat-functions",
+                "bloat-mobile-functions",
                 "llvm-lines:wacore",
                 "llvm-lines:whatsapp-rust",
             ] {
@@ -1018,6 +1160,30 @@ mod tests {
         head[1].value += 1;
         assert_eq!(render(&head, Some(&base), false).unwrap().2, "FAIL");
     }
+    #[test]
+    fn report_exposes_exact_bytes_without_changing_the_budget() {
+        let base = vec![
+            metric("bin size (stripped)", "bytes", 12100016),
+            metric("bin .text", "bytes", 9797091),
+        ];
+        let head = vec![
+            metric("bin size (stripped)", "bytes", 12142928),
+            metric("bin .text", "bytes", 9830627),
+        ];
+        let (lines, _, status) = render(&head, Some(&base), false).unwrap();
+        let report = lines.join("\n");
+        assert!(report.contains("9.34 MiB [9797091 B]"));
+        assert!(report.contains("9.38 MiB [9830627 B]"));
+        assert!(report.contains("+32.75 KiB (+0.34%) [33536 B]"));
+        assert_eq!(status, "FAIL");
+        assert_eq!(with_exact_bytes("12".into(), 12, "count"), "12");
+        assert_eq!(with_exact_bytes("0".into(), 0, "bytes"), "0 [0 B]");
+        assert_eq!(
+            with_exact_bytes("-1.00 KiB".into(), -1024, "bytes"),
+            "-1.00 KiB [-1024 B]"
+        );
+    }
+
     #[test]
     fn parses_tool_outputs_and_refuses_missing_measurements() {
         assert_eq!(

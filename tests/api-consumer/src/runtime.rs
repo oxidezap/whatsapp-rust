@@ -17,6 +17,8 @@ fn native_thread_bounds() {
 }
 
 #[cfg(target_arch = "wasm32")]
+// The shared Arc API must accept local, non-Send providers on this target.
+#[allow(clippy::arc_with_non_send_sync)]
 mod local {
     use super::*;
     use std::{cell::Cell, future::Future, pin::Pin, rc::Rc, sync::Arc, time::Duration};

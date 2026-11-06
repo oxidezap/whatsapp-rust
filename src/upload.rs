@@ -187,6 +187,7 @@ async fn upload_media_with_retry<GMC, GMCFut, IMC, IMCFut, EXR, EXRFut, SB, SBFu
     mut invalidate_media_conn: IMC,
     mut execute_request: EXR,
     mut send_body: SB,
+    media_profile: Option<wacore::download::MobileMediaHttpProfile>,
 ) -> Result<UploadResponse>
 where
     GMC: FnMut(bool) -> GMCFut + MaybeSend,
@@ -208,6 +209,7 @@ where
         &mut || Box::pin(invalidate_media_conn()),
         &mut |request| Box::pin(execute_request(request)),
         &mut |request, offset, remaining| Box::pin(send_body(request, offset, remaining)),
+        media_profile,
     )
     .await
 }
@@ -223,9 +225,13 @@ async fn upload_media_with_retry_dyn<'a>(
     invalidate_media_conn: &mut InvalidateMediaConnDyn<'a>,
     execute_request: &mut ExecuteRequestDyn<'a>,
     send_body: &mut SendBodyDyn<'a>,
+    media_profile: Option<wacore::download::MobileMediaHttpProfile>,
 ) -> Result<UploadResponse> {
     let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(crypto.file_enc_sha256);
-    let upload_path = media_type.upload_path();
+    let upload_path = media_profile
+        .as_ref()
+        .map(|p| p.upload_path(media_type))
+        .unwrap_or_else(|| media_type.upload_path());
     let mut force_refresh = false;
     let mut last_error: Option<anyhow::Error> = None;
 
@@ -250,6 +256,10 @@ async fn upload_media_with_retry_dyn<'a>(
                     &media_conn.auth,
                     &token,
                 );
+                let check_req = match &media_profile {
+                    Some(p) => p.apply(check_req),
+                    None => check_req,
+                };
                 if let Ok(check_resp) = execute_request(check_req).await {
                     match parse_upload_progress(&check_resp, ciphertext_len) {
                         UploadExistsResult::Complete { url, direct_path } => {
@@ -287,6 +297,10 @@ async fn upload_media_with_retry_dyn<'a>(
                 file_offset,
             );
 
+            let request = match &media_profile {
+                Some(p) => p.apply(request),
+                None => request,
+            };
             let response = match send_body(request, offset, ciphertext_len - offset).await {
                 Ok(response) => response,
                 Err(err) => {
@@ -431,6 +445,7 @@ impl Client {
         options: UploadOptions,
     ) -> Result<UploadResponse> {
         async {
+            let media_profile = self.mobile_media_http_profile()?;
             let file_length = data.len() as u64;
             let media_key = options.media_key;
             let sidecar = options.streaming_sidecar;
@@ -468,6 +483,7 @@ impl Client {
                     let body = ciphertext.slice(offset as usize..);
                     async move { self.http_client.execute(request.with_body(body)).await }
                 },
+                media_profile,
             )
             .await
         }
@@ -498,6 +514,7 @@ impl Client {
         S: wacore::upload::UploadSource + 'static,
     {
         async {
+            let media_profile = self.mobile_media_http_profile()?;
             let file_length = info.file_length;
             let ciphertext_len = source.len();
             let crypto = UploadCrypto {
@@ -530,6 +547,7 @@ impl Client {
                         .await
                     }
                 },
+                media_profile,
             )
             .await
         }
@@ -666,6 +684,7 @@ mod tests {
                     }
                 }
             },
+            None,
         )
         .await
         .expect("upload should succeed after refreshing media auth");
@@ -721,6 +740,7 @@ mod tests {
                     }
                 }
             },
+            None,
         )
         .await
         .expect("upload should succeed on the second host");
@@ -764,6 +784,7 @@ mod tests {
             move |_request: HttpRequest, _offset, _remaining| async move {
                 Ok(HttpResponse::new(507, b"insufficient storage".to_vec()))
             },
+            None,
         )
         .await
         .expect_err("every host refusing must fail the upload");
@@ -823,6 +844,7 @@ mod tests {
                     }
                 }
             },
+            None,
         )
         .await
         .expect("resumable upload should succeed");
@@ -857,5 +879,339 @@ mod tests {
         // Independent, repeatable readers (host failover / auth refresh).
         assert_eq!(read_at(50), read_at(50));
         assert_eq!(read_at(200), Vec::<u8>::new());
+    }
+}
+
+/// Media-only decorator: URL trust, redirects, streaming admission, byte budgets,
+/// exact upload length and resource reporting retain the underlying contracts.
+struct MobileMediaHttpClient {
+    inner: std::sync::Arc<dyn wacore::net::HttpClient>,
+    profile: wacore::download::MobileMediaHttpProfile,
+}
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl wacore::net::HttpClient for MobileMediaHttpClient {
+    async fn execute(&self, request: HttpRequest) -> Result<HttpResponse> {
+        self.inner.execute(self.profile.apply(request)).await
+    }
+    fn supports_streaming(&self) -> bool {
+        self.inner.supports_streaming()
+    }
+    fn streaming_admission(
+        &self,
+    ) -> Option<wacore::runtime::BoxFuture<'_, Result<wacore::net::StreamingRequestPermit>>> {
+        self.inner.streaming_admission()
+    }
+    fn execute_streaming(
+        &self,
+        request: HttpRequest,
+    ) -> Result<wacore::net::StreamingHttpResponse> {
+        self.inner.execute_streaming(self.profile.apply(request))
+    }
+    fn supports_upload_streaming(&self) -> bool {
+        self.inner.supports_upload_streaming()
+    }
+    fn execute_upload(
+        &self,
+        request: HttpRequest,
+        body: wacore::net::UploadBody,
+        content_length: u64,
+    ) -> Result<HttpResponse> {
+        self.inner
+            .execute_upload(self.profile.apply(request), body, content_length)
+    }
+    fn resource_report(&self) -> Option<wacore::stats::HttpResourceReport> {
+        self.inner.resource_report()
+    }
+}
+pub(crate) fn profile_media_http_client(
+    inner: std::sync::Arc<dyn wacore::net::HttpClient>,
+    profile: Option<wacore::download::MobileMediaHttpProfile>,
+) -> std::sync::Arc<dyn wacore::net::HttpClient> {
+    match profile {
+        Some(profile) => std::sync::Arc::new(MobileMediaHttpClient { inner, profile }),
+        None => inner,
+    }
+}
+impl Client {
+    pub(crate) fn mobile_media_http_profile(
+        &self,
+    ) -> Result<Option<wacore::download::MobileMediaHttpProfile>> {
+        #[cfg(feature = "mobile-core")]
+        if let Some(session) = &self.mobile_session {
+            session.validate_device(&self.persistence_manager.get_device_snapshot())?;
+            return session
+                .media_http_profile()
+                .cloned()
+                .map(Some)
+                .ok_or_else(|| anyhow!("mobile media requires an explicit HTTP/routing profile"));
+        }
+        if self
+            .persistence_manager
+            .get_device_snapshot()
+            .mobile_session
+            .is_some()
+        {
+            return Err(anyhow!("mobile media requires a configured mobile session"));
+        }
+        Ok(None)
+    }
+    pub(crate) fn media_http_client(&self) -> Result<std::sync::Arc<dyn wacore::net::HttpClient>> {
+        Ok(profile_media_http_client(
+            self.http_client.clone(),
+            self.mobile_media_http_profile()?,
+        ))
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod mobile_media_http_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use wacore::download::MobileMediaHttpProfile;
+    use wacore::net::{HttpClient, StreamingHttpResponse, UploadBody};
+
+    struct CaptureHttp {
+        requests: Mutex<Vec<HttpRequest>>,
+        download: Vec<u8>,
+        streaming: bool,
+    }
+    impl CaptureHttp {
+        fn capture(&self, request: HttpRequest) -> HttpResponse {
+            let resume = request.url.contains("resume=1");
+            self.requests.lock().unwrap().push(request);
+            if resume {
+                HttpResponse::new(200, br#"{"resume":"7"}"#.to_vec())
+            } else {
+                HttpResponse::new(
+                    200,
+                    br#"{"url":"https://cdn.invalid/file","direct_path":"/mms/sticker/file"}"#
+                        .to_vec(),
+                )
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl HttpClient for CaptureHttp {
+        async fn execute(&self, request: HttpRequest) -> Result<HttpResponse> {
+            if request.method == "GET" {
+                self.requests.lock().unwrap().push(request);
+                Ok(HttpResponse::new(200, self.download.clone()))
+            } else {
+                Ok(self.capture(request))
+            }
+        }
+        fn supports_streaming(&self) -> bool {
+            self.streaming
+        }
+        fn execute_streaming(&self, request: HttpRequest) -> Result<StreamingHttpResponse> {
+            self.requests.lock().unwrap().push(request);
+            Ok(StreamingHttpResponse::new(
+                200,
+                Box::new(std::io::Cursor::new(self.download.clone())),
+            ))
+        }
+        fn supports_upload_streaming(&self) -> bool {
+            true
+        }
+        fn execute_upload(
+            &self,
+            request: HttpRequest,
+            mut body: UploadBody,
+            length: u64,
+        ) -> Result<HttpResponse> {
+            let copied = std::io::copy(&mut body, &mut std::io::sink())?;
+            assert_eq!(copied, length);
+            Ok(self.capture(request))
+        }
+    }
+    fn assert_mobile_headers(request: &HttpRequest, origin: Option<&str>) {
+        assert_eq!(
+            request.headers.get("User-Agent").map(String::as_str),
+            Some("WhatsApp/synthetic-mobile A")
+        );
+        assert_eq!(request.headers.get("Origin").map(String::as_str), origin);
+        assert!(!request.headers.contains_key("origin"));
+    }
+    #[tokio::test]
+    async fn mobile_buffered_and_streamed_upload_resume_use_profile_headers_and_routes() {
+        for streaming in [false, true] {
+            for origin in [None, Some("https://adapted.invalid")] {
+                let http = Arc::new(CaptureHttp {
+                    requests: Mutex::new(Vec::new()),
+                    download: Vec::new(),
+                    streaming: true,
+                });
+                let data = Arc::new(vec![19; RESUMABLE_UPLOAD_THRESHOLD + 32]);
+                let profile = MobileMediaHttpProfile::new(
+                    "WhatsApp/synthetic-mobile A".into(),
+                    origin.map(str::to_owned),
+                    vec![(MediaType::Sticker, "/mms/sticker".into())],
+                )
+                .unwrap();
+                let result = upload_media_with_retry(
+                    UploadCrypto {
+                        media_key: [1; 32],
+                        file_sha256: [2; 32],
+                        file_enc_sha256: [3; 32],
+                        streaming_sidecar: None,
+                    },
+                    MediaType::Sticker,
+                    data.len() as u64,
+                    data.len() as u64,
+                    1,
+                    |_| async {
+                        Ok(crate::mediaconn::MediaConn {
+                            auth: "synthetic".into(),
+                            ttl: 60,
+                            auth_ttl: None,
+                            hosts: vec![crate::mediaconn::MediaConnHost::new("cdn.invalid".into())],
+                            fetched_at: wacore::time::Instant::now(),
+                        })
+                    },
+                    || async {},
+                    {
+                        let http = http.clone();
+                        move |request| {
+                            let http = http.clone();
+                            async move { http.execute(request).await }
+                        }
+                    },
+                    {
+                        let http = http.clone();
+                        let data = data.clone();
+                        move |request, offset, remaining| {
+                            let http = http.clone();
+                            let bytes = data[offset as usize..].to_vec();
+                            async move {
+                                assert_eq!(bytes.len() as u64, remaining);
+                                if streaming {
+                                    http.execute_upload(
+                                        request,
+                                        Box::new(std::io::Cursor::new(bytes)),
+                                        remaining,
+                                    )
+                                } else {
+                                    http.execute(request.with_body(bytes)).await
+                                }
+                            }
+                        }
+                    },
+                    Some(profile),
+                )
+                .await
+                .unwrap();
+                assert_eq!(result.direct_path, "/mms/sticker/file");
+                let requests = http.requests.lock().unwrap();
+                assert_eq!(requests.len(), 2);
+                assert!(requests[0].url.contains("/mms/sticker/"));
+                assert!(requests[0].url.contains("resume=1"));
+                assert!(requests[1].url.contains("file_offset=7"));
+                for request in requests.iter() {
+                    assert_mobile_headers(request, origin);
+                }
+            }
+        }
+    }
+    #[tokio::test]
+    async fn mobile_download_profile_reaches_buffered_and_streamed_http_without_rewriting_url() {
+        let profile =
+            MobileMediaHttpProfile::native_mms("WhatsApp/synthetic-mobile A".into()).unwrap();
+        let raw = Arc::new(CaptureHttp {
+            requests: Mutex::new(Vec::new()),
+            download: b"synthetic".to_vec(),
+            streaming: true,
+        });
+        let http = profile_media_http_client(raw.clone(), Some(profile));
+        let url = "https://cdn.invalid/mms/sticker/exact?sig=synthetic";
+        let response = http.execute(HttpRequest::get(url)).await.unwrap();
+        assert_eq!(response.body, b"synthetic");
+        let mut response = http.execute_streaming(HttpRequest::get(url)).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut response.body, &mut bytes).unwrap();
+        assert_eq!(bytes, b"synthetic");
+        assert!(http.supports_streaming());
+        assert!(http.supports_upload_streaming());
+        for request in raw.requests.lock().unwrap().iter() {
+            assert_eq!(request.url, url);
+            assert_mobile_headers(request, None);
+        }
+    }
+    #[test]
+    fn web_http_profile_is_the_original_adapter_and_request_defaults_stay_exact() {
+        let raw: Arc<dyn HttpClient> = Arc::new(CaptureHttp {
+            requests: Mutex::new(Vec::new()),
+            download: Vec::new(),
+            streaming: true,
+        });
+        let http = profile_media_http_client(raw.clone(), None);
+        assert!(Arc::ptr_eq(&raw, &http));
+        let upload = build_upload_request("cdn.invalid", "/mms/image", "auth", "token", None);
+        assert_eq!(
+            upload.headers.get("Origin").map(String::as_str),
+            Some(WHATSAPP_WEB_ORIGIN)
+        );
+        assert!(!upload.headers.contains_key("User-Agent"));
+    }
+    #[tokio::test]
+    async fn profiled_download_uses_real_decryption_and_preserves_host_validation() {
+        for streaming in [false, true] {
+            let plaintext = b"mobile CDN fixture with real media integrity";
+            let encrypted = wacore::upload::encrypt_media_with_key(
+                plaintext,
+                MediaType::Sticker,
+                Some(&[73; 32]),
+            )
+            .unwrap();
+            let params = crate::download::DownloadParams::encrypted(
+                "/mms/sticker/exact",
+                &encrypted.media_key,
+                &encrypted.file_sha256,
+                &encrypted.file_enc_sha256,
+                plaintext.len() as u64,
+                MediaType::Sticker,
+            )
+            .unwrap();
+            let raw = Arc::new(CaptureHttp {
+                requests: Mutex::new(Vec::new()),
+                download: encrypted.data_to_upload,
+                streaming,
+            });
+            let downloader = crate::download::MediaDownloader::new(
+                raw.clone(),
+                Arc::new(crate::TokioRuntime),
+                wacore::download::MediaRoute::new(vec![wacore::download::MediaHost::new(
+                    "cdn.invalid",
+                )]),
+            )
+            .with_mobile_http_profile(
+                MobileMediaHttpProfile::native_mms("WhatsApp/synthetic-mobile A".into()).unwrap(),
+            );
+            let bytes = downloader
+                .download(&params, Default::default())
+                .await
+                .unwrap();
+            assert_eq!(bytes, plaintext);
+            {
+                let requests = raw.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1);
+                assert!(
+                    requests[0]
+                        .url
+                        .starts_with("https://cdn.invalid/mms/sticker/exact?")
+                );
+                assert_mobile_headers(&requests[0], None);
+            }
+            let mut unsafe_static = waproto::whatsapp::message::ImageMessage::default();
+            unsafe_static.static_url = Some("https://untrusted.invalid/image".into());
+            unsafe_static.file_sha256 = Some(vec![0; 32]);
+            assert!(
+                downloader
+                    .download(&unsafe_static, Default::default())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(raw.requests.lock().unwrap().len(), 1);
+        }
     }
 }

@@ -327,6 +327,19 @@ pub fn run(root: &Path, options: Options) -> Result<()> {
         results,
     };
     std::fs::write(out.join("report.json"), serde_json::to_vec_pretty(&report)?)?;
+    for stream in &report.results {
+        for checkpoint in stream.checkpoints.iter().filter(|value| value.regression) {
+            eprintln!(
+                "connected retention {}/{}/{}: base={}/2 B, head={}/2 B, delta={}/2 B",
+                stream.backend,
+                stream.mode,
+                checkpoint.checkpoint,
+                checkpoint.base_retained_bytes.0,
+                checkpoint.head_retained_bytes.0,
+                checkpoint.delta_bytes.0,
+            );
+        }
+    }
     let regressions = report
         .results
         .iter()

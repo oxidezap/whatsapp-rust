@@ -5,6 +5,11 @@
 //! use [`from_websocket`]. This transport requires a native Tokio runtime; it
 //! does not support browser WASM.
 
+#[cfg(feature = "tcp")]
+mod tcp;
+#[cfg(feature = "tcp")]
+pub use tcp::{TokioTcpTransportFactory, from_byte_stream};
+
 use anyhow::Context;
 use async_trait::async_trait;
 use bytes::Bytes;

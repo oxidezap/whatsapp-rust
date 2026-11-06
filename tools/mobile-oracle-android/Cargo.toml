@@ -1,0 +1,22 @@
+[package]
+name = "mobile-oracle-android"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+publish = false
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow = { workspace = true, features = ["std"] }
+base64 = { workspace = true }
+hex = { workspace = true }
+jni = { version = "=0.22.4", default-features = false }
+serde_json = { workspace = true, features = ["std"] }
+sha2 = { workspace = true }
+zip = { version = "=9.1.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[lints]
+workspace = true
