@@ -704,24 +704,51 @@ mod tests {
         let workflow = include_str!("../../../.github/workflows/binary-size.yml");
         let (pr, push) = workflow.split_once("  binary-size-push:").unwrap();
         let steps = pr.split("\n      - ").collect::<Vec<_>>();
-        let step = |name: &str| {
-            *steps
+        let position = |name: &str| {
+            steps
                 .iter()
-                .find(|s| s.starts_with(&format!("name: {name}\n")))
+                .position(|s| s.starts_with(&format!("name: {name}\n")))
                 .unwrap()
         };
+        let step = |name: &str| steps[position(name)];
         let initial = step("Measure binary size");
         assert!(initial.contains("--gate-only --out-dir size-out"));
         assert!(!initial.contains("--skip-build"));
         let probe = step("Check whether size diagnostics are needed");
+        assert!(probe.contains("id: budget"));
         assert!(probe.contains("continue-on-error: true"));
         assert!(probe.contains("ci workflow size-gate"));
+        let diagnostic_guard = "if: ${{ !cancelled() && steps.budget.outcome == 'failure' }}";
+        let install = step("Install cargo-bloat and cargo-llvm-lines for a failed budget");
+        assert!(install.contains(diagnostic_guard));
         let diagnostic = step("Diagnose the measured binary");
-        assert!(diagnostic.contains("if: steps.budget.outcome == 'failure'"));
+        // A status function bypasses success(): a failed publication must not
+        // suppress diagnostics, and the authoritative final gate still runs.
+        assert!(diagnostic.contains(diagnostic_guard));
+        assert!(step("Upload size diagnostics").contains(diagnostic_guard));
         assert!(diagnostic.contains("--skip-build --out-dir size-diagnostics"));
         assert!(!diagnostic.contains("--gate-only"));
         assert!(!diagnostic.contains("--out-dir size-out"));
-        assert!(step("Generate report and evaluate gate").contains("id: report"));
+        let report = step("Generate report and evaluate gate");
+        assert!(report.contains("id: report"));
+        assert!(report.contains("ci binary-size-report --head size-out --out-dir size-out"));
+        let metrics = step("Upload size artifacts");
+        assert!(metrics.contains("if: ${{ !cancelled() }}"));
+        assert!(metrics.contains("path: size-out/"));
+        // Publish the canonical result before optional symbol analysis. Its
+        // failure cannot prevent the final enforcement of the same gate file.
+        let order = [
+            "Generate report and evaluate gate",
+            "Check whether size diagnostics are needed",
+            "Upload size artifacts",
+            "Post sticky PR comment",
+            "Install cargo-bloat and cargo-llvm-lines for a failed budget",
+            "Diagnose the measured binary",
+            "Upload size diagnostics",
+            "Enforce size budget",
+        ]
+        .map(position);
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]));
         let comment = step("Post sticky PR comment");
         // A fresh FAIL report must replace an older PASS even if diagnostics or
         // uploads fail. The status function avoids the implicit success() guard.
