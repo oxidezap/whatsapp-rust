@@ -307,6 +307,27 @@ fn diagnostics(
         println!("size function: {function}");
     }
     bloat["functions"] = Value::Array(functions);
+    let mobile_functions: Value = serde_json::from_str(&tools.text(
+        root,
+        "cargo",
+        &[
+            "bloat",
+            "--release",
+            "--example",
+            "demo",
+            "--message-format",
+            "json",
+            "--filter",
+            "(MobileSessionBinding|BindingWire|PersistenceManager|DeviceCommand|mobile_session|validate_mobile|SqliteStore)",
+            "-n",
+            "80",
+        ],
+    )?)?;
+    let mobile_functions = bounded_functions(&mobile_functions)?;
+    for function in &mobile_functions {
+        println!("size mobile function: {function}");
+    }
+    bloat["mobile-functions"] = Value::Array(mobile_functions);
 
     for (package, label) in [("wacore", "wacore"), ("whatsapp-rust", "whatsapp-rust lib")] {
         let (lines, copies) = llvm_total(&tools.text(
@@ -753,6 +774,8 @@ mod tests {
                     "cargo" => {
                         let call = if args[0] == "llvm-lines" {
                             format!("llvm-lines:{}", args[2])
+                        } else if args[0] == "bloat" && args.contains(&"--filter") {
+                            "bloat-mobile-functions".to_owned()
                         } else if args[0] == "bloat" && !args.contains(&"--crates") {
                             "bloat-functions".to_owned()
                         } else {
@@ -760,7 +783,7 @@ mod tests {
                         };
                         self.calls.push(call.clone());
                         ensure!(self.fail != Some(call.as_str()), "{call} failed");
-                        if call == "bloat-functions" {
+                        if call == "bloat-functions" || call == "bloat-mobile-functions" {
                             Ok(r#"{"functions":[{"crate":"wacore","name":"fixture::function","size":123}]}"#.into())
                         } else if args[0] == "bloat" {
                             Ok(r#"{"crates":[{"name":"wacore","size":1234}]}"#.into())
@@ -855,11 +878,15 @@ mod tests {
                     "build",
                     "bloat",
                     "bloat-functions",
+                    "bloat-mobile-functions",
                     "llvm-lines:wacore",
                     "llvm-lines:whatsapp-rust"
                 ]
             );
             assert!(out.join("size-attribution.json").exists());
+            let attribution = read_json(&out.join("size-attribution.json")).unwrap();
+            assert_eq!(attribution["functions"][0]["size"], 123);
+            assert_eq!(attribution["mobile-functions"][0]["size"], 123);
             assert_eq!(
                 read_json(&out.join("size-meta.json")).unwrap()["diagnostics"],
                 "complete"
@@ -912,6 +939,7 @@ mod tests {
                 "build",
                 "bloat",
                 "bloat-functions",
+                "bloat-mobile-functions",
                 "llvm-lines:wacore",
                 "llvm-lines:whatsapp-rust",
             ] {
