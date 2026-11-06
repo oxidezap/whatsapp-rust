@@ -1888,15 +1888,17 @@ impl Client {
                 .await?;
             drop(prekey_guard);
 
-            Some(wacore::protocol::retry::build_retry_keys_node_with_device_identity(
-                &device_snapshot.identity_key.public_key,
-                new_prekey_id,
-                &new_prekey_public,
-                device_snapshot.signed_pre_key_id,
-                &device_snapshot.signed_pre_key.public_key,
-                device_snapshot.signed_pre_key_signature.to_vec(),
-                device_identity_bytes,
-            ))
+            Some(
+                wacore::protocol::retry::build_retry_keys_node_with_device_identity(
+                    &device_snapshot.identity_key.public_key,
+                    new_prekey_id,
+                    &new_prekey_public,
+                    device_snapshot.signed_pre_key_id,
+                    &device_snapshot.signed_pre_key.public_key,
+                    device_snapshot.signed_pre_key_signature.to_vec(),
+                    device_identity_bytes,
+                ),
+            )
         } else {
             None
         };
@@ -2091,7 +2093,10 @@ mod tests {
         );
         let after = client.persistence_manager.get_device_snapshot();
         assert_eq!(after.next_pre_key_id, before.next_pre_key_id);
-        assert_eq!(after.first_unupload_pre_key_id, before.first_unupload_pre_key_id);
+        assert_eq!(
+            after.first_unupload_pre_key_id,
+            before.first_unupload_pre_key_id
+        );
         assert_eq!(transport.sent_count(), 0);
         client.notify_connection_shutdown();
     }

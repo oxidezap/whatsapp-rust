@@ -277,14 +277,12 @@ mod tests {
             "{}-{}.json",
             report.lock_sha256, report.recipe_sha256
         ));
-        let Err(error) =
-            export_private_material_with(dir.path(), &extracted, |file, bytes| {
-                assert_eq!(file.metadata()?.permissions().mode() & 0o777, 0o600);
-                file.write_all(&bytes[..37])?;
-                assert!(!final_path.exists());
-                Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
-            })
-        else {
+        let Err(error) = export_private_material_with(dir.path(), &extracted, |file, bytes| {
+            assert_eq!(file.metadata()?.permissions().mode() & 0o777, 0o600);
+            file.write_all(&bytes[..37])?;
+            assert!(!final_path.exists());
+            Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+        }) else {
             panic!("partial write must fail export");
         };
         assert!(error.downcast_ref::<std::io::Error>().is_some());

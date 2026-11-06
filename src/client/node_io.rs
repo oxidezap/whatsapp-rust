@@ -2881,8 +2881,7 @@ mod tests {
     async fn primary_identity_failure_waiting_for_transport_cannot_stop_a_retired_session() {
         let client = primary_startup_client().await;
         let old = Arc::new(crate::transport::mock::StallingMockTransport::new());
-        *client.transport.lock().await =
-            Some(old.clone() as Arc<dyn crate::transport::Transport>);
+        *client.transport.lock().await = Some(old.clone() as Arc<dyn crate::transport::Transport>);
         client.set_connected_for_test(true);
         let generation = client.connection_generation.load(Ordering::SeqCst);
         let reconnect = client.auto_reconnect_enabled();
@@ -2891,9 +2890,7 @@ mod tests {
         assert!(futures::poll!(rejection.as_mut()).is_pending());
 
         let cleanup_client = Arc::clone(&client);
-        let cleanup = tokio::spawn(async move {
-            cleanup_client.cleanup_connection_state().await
-        });
+        let cleanup = tokio::spawn(async move { cleanup_client.cleanup_connection_state().await });
         tokio::time::timeout(Duration::from_secs(2), async {
             while client.connection_generation.load(Ordering::SeqCst) == generation {
                 tokio::task::yield_now().await;
@@ -2957,11 +2954,14 @@ mod tests {
             client.invalidate_session_authentication();
             client.set_connected_for_test(true);
             client.offline_sync_completed.store(true, Ordering::Relaxed);
-            client.needs_initial_full_sync.settle(
-                client.connection_generation.load(Ordering::SeqCst),
-                true,
+            client
+                .needs_initial_full_sync
+                .settle(client.connection_generation.load(Ordering::SeqCst), true);
+            assert!(
+                !client
+                    .initial_app_state_keys_received
+                    .load(Ordering::Acquire)
             );
-            assert!(!client.initial_app_state_keys_received.load(Ordering::Acquire));
             let success = NodeBuilder::new("success").build();
             client.handle_success(&success.as_node_ref()).await;
 
@@ -3009,7 +3009,11 @@ mod tests {
             .await
             .expect("startup must reach bootstrap or readiness");
             assert_eq!(sent_snapshot_request, policy == SnapshotCompatible);
-            assert!(client.initial_app_state_keys_received.load(Ordering::Acquire));
+            assert!(
+                client
+                    .initial_app_state_keys_received
+                    .load(Ordering::Acquire)
+            );
             client.notify_connection_shutdown();
         }
     }

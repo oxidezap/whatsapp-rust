@@ -582,9 +582,8 @@ pub mod store;
 pub use features::{
     MobileAppStatePolicy, MobileEphemeralKeyProvider, MobileLoginAttempt,
     MobileLoginOptionsProvider, MobileMediaHttpProfile, PrimaryDeviceIdentityPolicy,
-    PrimarySelfIdentityProfile, RegisteredMobileSession, RegistrationLoginPhoneIdMapping,
-    mobile, mobile_primary, mobile_registration, mobile_session,
-    validate_registration_login_profile,
+    PrimarySelfIdentityProfile, RegisteredMobileSession, RegistrationLoginPhoneIdMapping, mobile,
+    mobile_primary, mobile_registration, mobile_session, validate_registration_login_profile,
 };
 pub mod transport;
 pub mod upload;

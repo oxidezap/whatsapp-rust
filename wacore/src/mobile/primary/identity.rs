@@ -459,8 +459,10 @@ mod tests {
             let encoded = waproto::codec::adv_device_identity_to_vec(&details);
             let account_message =
                 AccountSignatureMessage::new(&encoded, &primary.public_key, encryption_type);
-            let device_message = account_message
-                .for_device(&primary.public_key, crate::adv::DeviceSignatureKind::Companion);
+            let device_message = account_message.for_device(
+                &primary.public_key,
+                crate::adv::DeviceSignatureKind::Companion,
+            );
             let mut signed = wa::ADVSignedDeviceIdentity::default();
             signed.details = Some(encoded);
             signed.account_signature_key = Some(own.to_vec());
@@ -484,7 +486,11 @@ mod tests {
                 key_index == Some(0) && encryption_type.is_none()
             );
             assert!(
-                validate_primary_account_identity(&proof, other.public_key.public_key_bytes(), &jid)
+                validate_primary_account_identity(
+                    &proof,
+                    other.public_key.public_key_bytes(),
+                    &jid
+                )
                 .is_err()
             );
         }

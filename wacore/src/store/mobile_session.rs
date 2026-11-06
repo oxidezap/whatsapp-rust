@@ -70,13 +70,17 @@ where
         {
             let size_hint = sequence.size_hint();
             if size_hint.is_some_and(|size| size > MAX_BINDING_FIELD_BYTES) {
-                return Err(serde::de::Error::custom("mobile binding field exceeds limit"));
+                return Err(serde::de::Error::custom(
+                    "mobile binding field exceeds limit",
+                ));
             }
             let capacity = size_hint.unwrap_or(0).min(MAX_BINDING_FIELD_BYTES);
             let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(capacity));
             while let Some(byte) = sequence.next_element::<u8>()? {
                 if bytes.len() == MAX_BINDING_FIELD_BYTES {
-                    return Err(serde::de::Error::custom("mobile binding field exceeds limit"));
+                    return Err(serde::de::Error::custom(
+                        "mobile binding field exceeds limit",
+                    ));
                 }
                 bytes.push(byte);
             }
@@ -394,9 +398,8 @@ mod tests {
         assert!(serde_json::from_value::<MobileSessionBinding>(malformed).is_err());
         assert_eq!(
             serde_json::from_slice::<MobileSessionBinding>(&serde_json::to_vec(&binding).unwrap())
-            .unwrap(),
+                .unwrap(),
             binding
         );
     }
-
 }

@@ -361,7 +361,11 @@ mod tests {
         else {
             panic!("changed lock must fail");
         };
-        assert!(error.to_string().contains("lock changed after verification"));
+        assert!(
+            error
+                .to_string()
+                .contains("lock changed after verification")
+        );
     }
 
     #[cfg(unix)]

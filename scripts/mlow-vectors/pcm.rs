@@ -35,7 +35,9 @@ mod tests {
 
         let mut truncated = &[1, 2, 3][..];
         assert_eq!(
-            read_pcm_frame(&mut truncated, &mut frame).unwrap_err().kind(),
+            read_pcm_frame(&mut truncated, &mut frame)
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::UnexpectedEof
         );
     }

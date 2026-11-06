@@ -6436,11 +6436,15 @@ mod local_identity_change_on_send {
                     false,
                 ),
                 (
-                    SenderIdentityRole::MobilePrimary(PrimaryDeviceIdentityPolicy::AttachWhenAvailable),
+                    SenderIdentityRole::MobilePrimary(
+                        PrimaryDeviceIdentityPolicy::AttachWhenAvailable,
+                    ),
                     true,
                 ),
                 (
-                    SenderIdentityRole::MobilePrimary(PrimaryDeviceIdentityPolicy::AttachWhenAvailable),
+                    SenderIdentityRole::MobilePrimary(
+                        PrimaryDeviceIdentityPolicy::AttachWhenAvailable,
+                    ),
                     false,
                 ),
                 (SenderIdentityRole::Companion, true),

@@ -1279,7 +1279,11 @@ mod tests {
         common.registration_token = Some("synthetic%2Btoken%2F%3D");
         let builder = RegistrationRequestBuilder::new(&profile, &encoding, common).unwrap();
         let request = builder.submit_code("123456", Some(UUID), &fields).unwrap();
-        assert!(request.plaintext().contains("token=synthetic%2Btoken%2F%3D"));
+        assert!(
+            request
+                .plaintext()
+                .contains("token=synthetic%2Btoken%2F%3D")
+        );
         let mut peer = [0; 32];
         peer[0] = 9;
         let result = request

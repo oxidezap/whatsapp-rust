@@ -10045,9 +10045,9 @@ mod tests {
         .unwrap();
         client
             .persistence_manager()
-            .try_process_command(crate::store::commands::DeviceCommand::SetMobileSessionBinding(
-                binding,
-            ))
+            .try_process_command(
+                crate::store::commands::DeviceCommand::SetMobileSessionBinding(binding),
+            )
             .await
             .expect("valid persisted primary marker without a configured session");
         assert_eq!(

@@ -278,9 +278,12 @@ pub fn build_retry_keys_node_with_device_identity(
         .into_node(),
     ];
     NodeBuilder::new("keys")
-        .children(children.into_iter().chain(
-            device_identity.map(|identity| NodeBuilder::new("device-identity").bytes(identity).build()),
-        ))
+        .children(
+            children.into_iter().chain(
+                device_identity
+                    .map(|identity| NodeBuilder::new("device-identity").bytes(identity).build()),
+            ),
+        )
         .build()
 }
 
