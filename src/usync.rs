@@ -1163,8 +1163,35 @@ mod tests {
                 let users = users.to_vec();
                 tokio::spawn(async move { client.fetch_user_devices(users).await })
             };
-            for frame in 0..3 {
+            let mut frame = 0;
+            let mut targeted_attempts = 0;
+            loop {
                 let query = decode_sent_iq(&transport, frame).await;
+                let requested = query
+                    .get()
+                    .get_optional_child("usync")
+                    .unwrap()
+                    .get_optional_child("list")
+                    .unwrap()
+                    .children()
+                    .unwrap()
+                    .iter()
+                    .map(|user| user.attrs().jid("jid"))
+                    .collect::<Vec<_>>();
+                let targeted = requested.len() == 1;
+                let final_batch = frame > 0 && !targeted;
+                if targeted {
+                    assert_eq!(requested, vec![users[0].clone()]);
+                    targeted_attempts += 1;
+                    assert!(targeted_attempts <= DEVICE_REFRESH_MAX_ATTEMPTS);
+                    if targeted_attempts == 1 {
+                        // A topology change while the response is in flight
+                        // must cause a strict retry, not consume the final batch.
+                        client.device_topology.record([users[0].user.as_str()]);
+                    }
+                } else {
+                    assert_eq!(requested, users);
+                }
                 let id = query
                     .get()
                     .attrs()
@@ -1172,9 +1199,9 @@ mod tests {
                     .unwrap()
                     .into_owned();
                 let mut replies = Vec::new();
-                if frame == 0 || frame == 1 || expected_companion == 3 {
+                if !final_batch || expected_companion == 3 {
                     replies.push(adv_wire_response_with_device(
-                        if frame == 2 && lid_to_pn.is_some() {
+                        if final_batch && lid_to_pn.is_some() {
                             &alias
                         } else {
                             &users[0]
@@ -1184,16 +1211,16 @@ mod tests {
                         } else {
                             signed_key_index_bytes(vec![1], 1)
                         },
-                        if frame == 2 { 3 } else { 2 },
+                        if final_batch { 3 } else { 2 },
                     ));
                 }
-                if frame != 1 {
+                if !targeted {
                     replies.push(adv_wire_response(
                         &users[1],
                         signed_key_index_bytes(vec![1], 1),
                     ));
                 }
-                if frame == 2 && expected_companion == 4 {
+                if final_batch && expected_companion == 4 {
                     client
                         .update_device_list(DeviceListRecord {
                             user: users[0].user.as_str().into(),
@@ -1223,6 +1250,11 @@ mod tests {
                         .build()])
                     .build();
                 answer_iq(&client, &id, &response).await;
+                if final_batch {
+                    break;
+                }
+                frame += 1;
+                assert!(frame <= DEVICE_REFRESH_MAX_ATTEMPTS + 1);
             }
             let mut actual = operation.await.unwrap().unwrap();
             let expected_user = if lid_to_pn.is_some() {
@@ -1239,7 +1271,11 @@ mod tests {
             actual.sort_by_key(ToString::to_string);
             expected.sort_by_key(ToString::to_string);
             assert_eq!(actual, expected);
-            assert_eq!(transport.sent().len(), 3);
+            assert!(
+                targeted_attempts >= 2,
+                "the topology change must force a retry"
+            );
+            assert_eq!(transport.sent().len(), targeted_attempts + 2);
             client.signal_shutdown_sync();
         }
     }
