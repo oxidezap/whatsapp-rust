@@ -96,10 +96,9 @@ where
 /// Keep the retired allocation protected while its replacement copies the
 /// bytes. Its owner wipes it on drop before the decoder appends again.
 fn grow_secret_bytes(bytes: &mut zeroize::Zeroizing<Vec<u8>>) {
-    let capacity = bytes
-        .capacity()
-        .saturating_mul(2)
-        .clamp(8, MAX_BINDING_FIELD_BYTES);
+    // The decoder rejects len == MAX before growth, so doubling len.max(4)
+    // is bounded by 131070 on every supported usize width.
+    let capacity = (bytes.len().max(4) * 2).min(MAX_BINDING_FIELD_BYTES);
     debug_assert!(bytes.len() == bytes.capacity() && bytes.len() < capacity);
     let replacement = zeroize::Zeroizing::new(Vec::with_capacity(capacity));
     let retired = std::mem::replace(bytes, replacement);
@@ -420,7 +419,17 @@ mod tests {
     }
     #[test]
     fn secret_growth_preserves_bytes_and_reserves_capacity_before_append() {
-        for capacity in [1, 8, 15, MAX_BINDING_FIELD_BYTES / 2] {
+        // A supplied size hint can create an odd initial allocation.
+        for capacity in [
+            1,
+            3,
+            5,
+            7,
+            8,
+            15,
+            MAX_BINDING_FIELD_BYTES / 2,
+            MAX_BINDING_FIELD_BYTES - 1,
+        ] {
             let mut bytes = zeroize::Zeroizing::new(vec![0xA5; capacity]);
             grow_secret_bytes(&mut bytes);
 
