@@ -212,12 +212,41 @@ fn measure_with(
     Ok(())
 }
 
+const MAX_FUNCTION_ROWS: usize = 80;
+const MAX_FUNCTION_NAME_CHARS: usize = 512;
+
+fn bounded_functions(data: &Value) -> Result<Vec<Value>> {
+    data["functions"]
+        .as_array()
+        .context("cargo bloat returned no function data")?
+        .iter()
+        .take(MAX_FUNCTION_ROWS)
+        .map(|function| {
+            let name = function["name"]
+                .as_str()
+                .context("function name")?
+                .chars()
+                .take(MAX_FUNCTION_NAME_CHARS)
+                .collect::<String>();
+            let size = function["size"].as_u64().context("function size")?;
+            let crate_name = function["crate"]
+                .as_str()
+                .map(|name| name.chars().take(128).collect::<String>());
+            Ok(json!({
+                "crate": crate_name,
+                "name": name,
+                "size": size,
+            }))
+        })
+        .collect()
+}
+
 fn diagnostics(
     root: &Path,
     metrics: &mut Vec<Metric>,
     tools: &mut impl MeasurementTools,
 ) -> Result<Value> {
-    let bloat: Value = serde_json::from_str(&tools.text(
+    let mut bloat: Value = serde_json::from_str(&tools.text(
         root,
         "cargo",
         &[
@@ -257,6 +286,28 @@ fn diagnostics(
             .map(|(_, v)| v)
             .sum(),
     ));
+    // cargo-bloat 0.12.1 emits functions with name, size and optional crate
+    // when --crates is absent. Keep the measured release/example selection.
+    let functions: Value = serde_json::from_str(&tools.text(
+        root,
+        "cargo",
+        &[
+            "bloat",
+            "--release",
+            "--example",
+            "demo",
+            "--message-format",
+            "json",
+            "-n",
+            "80",
+        ],
+    )?)?;
+    let functions = bounded_functions(&functions)?;
+    for function in &functions {
+        println!("size function: {function}");
+    }
+    bloat["functions"] = Value::Array(functions);
+
     for (package, label) in [("wacore", "wacore"), ("whatsapp-rust", "whatsapp-rust lib")] {
         let (lines, copies) = llvm_total(&tools.text(
             root,
@@ -583,6 +634,25 @@ mod tests {
         assert_eq!(workflow.matches("git diff --exit-code").count(), 3);
     }
     #[test]
+    fn function_diagnostics_follow_the_external_schema_with_bounded_logs() {
+        let data = json!({
+            "functions": (0..MAX_FUNCTION_ROWS + 1)
+                .map(|_| json!({"name": "x".repeat(600), "size": 123}))
+                .collect::<Vec<_>>()
+        });
+        let functions = bounded_functions(&data).unwrap();
+        assert_eq!(functions.len(), MAX_FUNCTION_ROWS);
+        assert_eq!(
+            functions[0]["name"].as_str().unwrap().chars().count(),
+            MAX_FUNCTION_NAME_CHARS
+        );
+        assert!(functions[0]["crate"].is_null());
+        assert_eq!(functions[0]["size"], 123);
+        assert!(bounded_functions(&json!({"functions": [{"name": "missing size"}]})).is_err());
+        assert!(bounded_functions(&json!({"crates": []})).is_err());
+    }
+
+    #[test]
     fn gate_only_is_an_explicit_parser_opt_in() {
         use clap::Parser;
         for (flags, expected_gate, expected_skip) in [
@@ -683,12 +753,16 @@ mod tests {
                     "cargo" => {
                         let call = if args[0] == "llvm-lines" {
                             format!("llvm-lines:{}", args[2])
+                        } else if args[0] == "bloat" && !args.contains(&"--crates") {
+                            "bloat-functions".to_owned()
                         } else {
                             args[0].to_owned()
                         };
                         self.calls.push(call.clone());
                         ensure!(self.fail != Some(call.as_str()), "{call} failed");
-                        if args[0] == "bloat" {
+                        if call == "bloat-functions" {
+                            Ok(r#"{"functions":[{"crate":"wacore","name":"fixture::function","size":123}]}"#.into())
+                        } else if args[0] == "bloat" {
                             Ok(r#"{"crates":[{"name":"wacore","size":1234}]}"#.into())
                         } else {
                             Ok(" 123 4 (TOTAL)\n".into())
@@ -780,6 +854,7 @@ mod tests {
                 [
                     "build",
                     "bloat",
+                    "bloat-functions",
                     "llvm-lines:wacore",
                     "llvm-lines:whatsapp-rust"
                 ]
@@ -836,6 +911,7 @@ mod tests {
             for fail in [
                 "build",
                 "bloat",
+                "bloat-functions",
                 "llvm-lines:wacore",
                 "llvm-lines:whatsapp-rust",
             ] {
