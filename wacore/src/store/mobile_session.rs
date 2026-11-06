@@ -83,7 +83,7 @@ where
                     ));
                 }
                 if bytes.len() == bytes.capacity() {
-                    drop(grow_secret_bytes(&mut bytes));
+                    grow_secret_bytes(&mut bytes);
                 }
                 bytes.push(byte);
             }
@@ -93,22 +93,17 @@ where
     deserializer.deserialize_seq(SecretBytes)
 }
 
-/// Keep both allocations protected until every retired byte is wiped. Return
-/// that already-zeroed allocation for release without repeating the wipe.
-#[inline(never)]
-fn grow_secret_bytes(bytes: &mut zeroize::Zeroizing<Vec<u8>>) -> Vec<u8> {
-    use zeroize::Zeroize;
-
+/// Keep the retired allocation protected while its replacement copies the
+/// bytes. Its owner wipes it on drop before the decoder appends again.
+fn grow_secret_bytes(bytes: &mut zeroize::Zeroizing<Vec<u8>>) {
     let capacity = bytes
         .capacity()
         .saturating_mul(2)
         .clamp(8, MAX_BINDING_FIELD_BYTES);
     debug_assert!(bytes.len() == bytes.capacity() && bytes.len() < capacity);
-    let mut replacement = zeroize::Zeroizing::new(Vec::with_capacity(capacity));
-    replacement.extend_from_slice(bytes.as_slice());
-    std::mem::swap(bytes, &mut replacement);
-    replacement.as_mut_slice().zeroize();
-    std::mem::take(&mut *replacement)
+    let replacement = zeroize::Zeroizing::new(Vec::with_capacity(capacity));
+    let retired = std::mem::replace(bytes, replacement);
+    bytes.extend_from_slice(retired.as_slice());
 }
 
 fn deserialize_optional_secret_bytes<'de, D>(
@@ -424,21 +419,15 @@ mod tests {
         );
     }
     #[test]
-    fn secret_growth_wipes_the_retired_owned_allocation_before_release() {
+    fn secret_growth_preserves_bytes_and_reserves_capacity_before_append() {
         for capacity in [1, 8, 15, MAX_BINDING_FIELD_BYTES / 2] {
             let mut bytes = zeroize::Zeroizing::new(vec![0xA5; capacity]);
-            let original_pointer = bytes.as_ptr();
-            let retired = grow_secret_bytes(&mut bytes);
+            grow_secret_bytes(&mut bytes);
 
-            assert_eq!(retired.as_ptr(), original_pointer);
-            assert_eq!(retired.len(), capacity);
-            assert!(retired.iter().all(|byte| *byte == 0));
             assert_eq!(bytes.len(), capacity);
             assert!(bytes.iter().all(|byte| *byte == 0xA5));
             assert!(bytes.capacity() > capacity);
             assert!(bytes.capacity() <= MAX_BINDING_FIELD_BYTES);
-            assert_ne!(bytes.as_ptr(), retired.as_ptr());
-            drop(retired);
 
             let replacement_pointer = bytes.as_ptr();
             bytes.push(0x7C);

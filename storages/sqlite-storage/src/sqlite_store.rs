@@ -2234,7 +2234,7 @@ impl SqliteStore {
             .await?;
 
         if let Some(row) = row {
-            let mobile_session_binding = row.mobile_session_binding.into_bytes()?;
+            let mobile_session_binding = row.mobile_session_binding.as_bytes()?;
             let pn = if !row.pn.is_empty() {
                 row.pn.parse().ok()
             } else {
@@ -2269,7 +2269,6 @@ impl SqliteStore {
                 .transpose()?;
 
             let mobile_session = mobile_session_binding
-                .as_deref()
                 .map(|bytes| {
                     serde_json::from_slice(bytes).map_err(|_| {
                         StoreError::Validation("invalid persisted mobile session binding".into())

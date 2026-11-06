@@ -79,10 +79,10 @@ impl FromSql<Nullable<Binary>, Sqlite> for GuardedMobileBinding {
 }
 
 impl GuardedMobileBinding {
-    pub(crate) fn into_bytes(self) -> Result<Option<Vec<u8>>> {
-        match self.0 {
+    pub(crate) fn as_bytes(&self) -> Result<Option<&[u8]>> {
+        match &self.0 {
             BindingValue::Absent => Ok(None),
-            BindingValue::Bytes(bytes) => Ok(Some(bytes)),
+            BindingValue::Bytes(bytes) => Ok(Some(bytes.as_slice())),
             BindingValue::Rejected => Err(StoreError::Validation(
                 "oversized mobile session binding".into(),
             )),
@@ -157,7 +157,7 @@ mod tests {
                 .first(&mut conn)
                 .unwrap();
             assert_eq!(
-                column.into_bytes().unwrap().map(|bytes| bytes.len()),
+                column.as_bytes().unwrap().map(|bytes| bytes.len()),
                 expected_len
             );
         }
@@ -168,7 +168,7 @@ mod tests {
                 .first(&mut conn)
                 .unwrap();
             assert!(matches!(
-                column.into_bytes(),
+                column.as_bytes(),
                 Err(StoreError::Validation(_))
             ));
         }
