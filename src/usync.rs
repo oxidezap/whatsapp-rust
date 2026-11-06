@@ -211,9 +211,9 @@ impl Client {
             Err(error) => {
                 let failure = error.downcast::<DeviceListAdvError>()?;
                 let user = failure.user.into_non_ad();
-                // Retry resolution, before encryption or publication, rather than
-                // replaying a send. Keep Signal trust and unrelated registries.
-                self.invalidate_device_cache(&user.user).await;
+                // Strict refresh bypasses the cached list. Keep the previous
+                // record until verification so normal application can compare
+                // devices/raw_id and clean up removed devices and identity resets.
                 let refreshed = self
                     .fetch_user_devices_once(vec![user.clone()], crate::cache::Freshness::Refresh)
                     .await
@@ -894,6 +894,26 @@ mod tests {
                         .unwrap();
                 }
                 let session = seed_fresh_session(&client, &user.with_device(7)).await;
+                let group = "120363000000000130@g.us";
+                let rows = vec![
+                    (user.to_string(), true),
+                    (user.with_device(7).to_string(), true),
+                ];
+                client
+                    .persistence_manager
+                    .set_sender_key_status(
+                        group,
+                        &[(rows[0].0.as_str(), true), (rows[1].0.as_str(), true)],
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    client
+                        .skdm_device_map(group)
+                        .await
+                        .device_has_key(&user.user, 7),
+                    Some(true)
+                );
                 let operation = {
                     let client = client.clone();
                     let user = user.clone();
@@ -921,9 +941,11 @@ mod tests {
                 let requested = requested.children().unwrap();
                 assert_eq!(requested.len(), 1);
                 assert_eq!(requested[0].attrs().jid("jid"), user);
-                // Invalidation must be durable and scoped. Neither existing
-                // sessions nor the primary identity are discarded by bad input.
-                assert!(client.load_device_record_for_jid(&user).await.is_none());
+                // Bad input must not erase the history needed for cleanup after
+                // a verified replacement, or discard Signal trust and sessions.
+                let previous = client.load_device_record_for_jid(&user).await.unwrap();
+                assert_eq!(previous.raw_id, Some(1));
+                assert_eq!(previous.devices[1].device_id(), 7);
                 assert!(client.load_device_record_for_jid(&other).await.is_some());
                 assert!(has_session(&client, &session).await);
                 let id = node.attrs().optional_string("id").unwrap().into_owned();
@@ -936,11 +958,44 @@ mod tests {
                 let result = operation.await.unwrap();
                 if recover {
                     assert_eq!(result.unwrap(), vec![user.clone(), user.with_device(2)]);
+                    assert!(
+                        !has_session(&client, &session).await,
+                        "a verified replacement must remove the old device's session"
+                    );
+                    let stored = client
+                        .persistence_manager
+                        .get_sender_key_devices(group)
+                        .await
+                        .unwrap();
+                    assert_eq!(stored, vec![(user.to_string(), true)]);
+                    assert_eq!(
+                        client
+                            .skdm_device_map(group)
+                            .await
+                            .device_has_key(&user.user, 7),
+                        None
+                    );
                 } else {
                     let error = result.unwrap_err();
                     assert!(error.downcast_ref::<DeviceListAdvError>().is_some());
                     assert!(format!("{error:#}").contains(&user.to_string()));
-                    assert!(client.load_device_record_for_jid(&user).await.is_none());
+                    assert!(client.load_device_record_for_jid(&user).await.is_some());
+                    assert!(has_session(&client, &session).await);
+                    assert_eq!(
+                        client
+                            .persistence_manager
+                            .get_sender_key_devices(group)
+                            .await
+                            .unwrap(),
+                        rows
+                    );
+                    assert_eq!(
+                        client
+                            .skdm_device_map(group)
+                            .await
+                            .device_has_key(&user.user, 7),
+                        Some(true)
+                    );
                 }
                 assert_eq!(transport.sent().len(), 2, "recovery must be bounded");
                 assert_eq!(
@@ -1020,7 +1075,8 @@ mod tests {
                 if frame == 1 { 1 } else { 2 }
             );
             let response = if frame == 1 {
-                assert!(client.load_device_record_for_jid(&users[0]).await.is_none());
+                let previous = client.load_device_record_for_jid(&users[0]).await.unwrap();
+                assert_eq!(previous.devices[1].device_id(), 7);
                 let other = client.load_device_record_for_jid(&users[1]).await.unwrap();
                 assert_eq!(other.devices[1].device_id(), 7);
                 adv_wire_response(&users[0], signed_key_index_bytes(vec![1], 1))
