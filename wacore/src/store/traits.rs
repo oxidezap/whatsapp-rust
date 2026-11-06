@@ -1453,6 +1453,14 @@ pub trait DeviceStore: Send + Sync {
     /// Save device data.
     async fn save(&self, device: &crate::store::Device) -> Result<()>;
 
+    /// Atomically initialize an entirely empty namespace with supplied mobile keys.
+    /// Backends must reject any existing device or scoped protocol material.
+    async fn initialize_mobile_device(&self, _device: &crate::store::Device) -> Result<()> {
+        Err(crate::store::error::StoreError::InvalidConfig(
+            "atomic mobile initialization is unsupported by this backend".into(),
+        ))
+    }
+
     /// Load device data.
     async fn load(&self) -> Result<Option<crate::store::Device>>;
 

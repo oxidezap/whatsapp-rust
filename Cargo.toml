@@ -30,6 +30,9 @@ members = [
     "tests/bench-integration",
     "tests/e2e",
     "tools/whatspec-codegen",
+    "tools/mobile-oracle",
+    "tools/mobile-oracle-android",
+    "tools/web-oracle",
     "tools/oracle-cli",
     "tools/oracle-core",
     "tools/xtask",
@@ -170,6 +173,10 @@ zerocopy = { version = "0.8.55", default-features = false, features = ["derive"]
 zlib-rs = { version = "0.6.6", default-features = false, features = ["std", "rust-allocator"] }
 
 [features]
+# Mobile protocol and SDK using host-supplied runtime, clock, HTTP and storage.
+mobile-core = ["wacore/mobile", "instance-clock", "dep:subtle", "whatsapp-rust-sqlite-storage?/mobile"]
+# Optional native adapter; browser/embedded hosts supply their own transport.
+mobile-transport-native = ["mobile-core", "tokio-transport", "whatsapp-rust-tokio-transport/tcp"]
 instance-clock = ["wacore/instance-clock", "whatsapp-rust-sqlite-storage?/instance-clock"]
 # Source-qualified group parsing requires explicit effective account facts.
 # Kept opt-in to preserve the default runtime footprint.
@@ -325,6 +332,7 @@ wacore = { workspace = true }
 wacore-binary = { workspace = true }
 wacore-noise = { path = "./wacore/noise", version = "0.7.0", optional = true }
 waproto = { workspace = true }
+subtle = { workspace = true, optional = true }
 zeroize = { workspace = true }
 whatsapp-rust-sqlite-storage = { path = "./storages/sqlite-storage", version = "0.7.0", optional = true, default-features = false }
 whatsapp-rust-tokio-transport = { path = "./transports/tokio-transport", version = "0.7.0", optional = true }

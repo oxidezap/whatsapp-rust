@@ -1,0 +1,80 @@
+use std::io::Write;
+use std::path::PathBuf;
+
+use anyhow::{Context, Result, bail};
+
+fn main() -> Result<std::process::ExitCode> {
+    let mut args = std::env::args_os().skip(1);
+    let command = args
+        .next()
+        .context("usage: mobile-oracle bootstrap <output-dex> <guest-library-path> | material <lock> <root> <recipe> [--export-private <repository>] | verify <lock> <root> | diff <before-lock> <after-lock> | compare <lock> <root> <corpus> <apk-observations> <rust-observations>")?;
+    let first = PathBuf::from(args.next().context("missing first path")?);
+    let second = PathBuf::from(args.next().context("missing second path")?);
+    if command == "bootstrap" {
+        if args.next().is_some() {
+            bail!("unexpected bootstrap argument");
+        }
+        let library = second.to_str().context("library path must be UTF-8")?;
+        let dex = mobile_oracle::bootstrap::android_bootstrap(library)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&first)?;
+        file.write_all(&dex)?;
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
+    let (output, passed) = if command == "material" {
+        let recipe = PathBuf::from(args.next().context("missing recipe path")?);
+        let repository = match args.next() {
+            None => None,
+            Some(flag) if flag == "--export-private" => {
+                let root = args
+                    .next()
+                    .context("missing repository root after --export-private")?;
+                if root.to_str().is_some_and(|value| value.starts_with("--")) {
+                    bail!("expected repository path, received material flag");
+                }
+                let path = PathBuf::from(root);
+                if args.next().is_some() {
+                    bail!("unexpected or duplicate material argument");
+                }
+                Some(path)
+            }
+            Some(_) => bail!("unknown material argument"),
+        };
+        let extracted = mobile_oracle::extract_material(&first, &second, &recipe)?;
+        let receipt = repository
+            .map(|root| mobile_oracle::export_private_material(&root, &extracted))
+            .transpose()?;
+        let mut output = serde_json::to_value(extracted.report())?;
+        output["secret_exported"] = serde_json::Value::Bool(receipt.is_some());
+        if let Some(receipt) = receipt {
+            output["private_export"] = serde_json::to_value(receipt)?;
+        }
+        (serde_json::to_string_pretty(&output)?, true)
+    } else if command == "compare" {
+        let corpus = PathBuf::from(args.next().context("missing corpus path")?);
+        let apk = PathBuf::from(args.next().context("missing APK observations path")?);
+        let rust = PathBuf::from(args.next().context("missing Rust observations path")?);
+        if args.next().is_some() {
+            bail!("unexpected argument");
+        }
+        let report = mobile_oracle::compare_observations(&first, &second, &corpus, &apk, &rust)?;
+        let passed = report.status == mobile_oracle::ComparisonStatus::Pass;
+        (serde_json::to_string_pretty(&report)?, passed)
+    } else {
+        if args.next().is_some() {
+            bail!("unexpected argument");
+        }
+        let report = if command == "verify" {
+            serde_json::to_string_pretty(&mobile_oracle::verify(&first, &second)?)?
+        } else if command == "diff" {
+            serde_json::to_string_pretty(&mobile_oracle::compare_locks(&first, &second)?)?
+        } else {
+            bail!("unknown command; expected verify, diff, compare or material");
+        };
+        (report, true)
+    };
+    writeln!(std::io::stdout().lock(), "{output}")?;
+    Ok(std::process::ExitCode::from(if passed { 0 } else { 2 }))
+}

@@ -526,6 +526,31 @@ impl Client {
                         .unwrap_or(u64::MAX),
                     )
                 });
+        let mobile_session_binding =
+            device
+                .mobile_session
+                .as_ref()
+                .map_or_else(CollectionStats::default, |binding| {
+                    let bytes = 2 * size_of::<usize>()
+                        + size_of::<wacore::store::MobileSessionBinding>()
+                        + binding.registration_context.capacity()
+                        + binding
+                            .registration_checkpoint
+                            .as_ref()
+                            .map_or(0, Vec::capacity)
+                        + binding.primary_state.as_ref().map_or(0, Vec::capacity);
+                    CollectionStats::new(1, u64::try_from(bytes).unwrap_or(u64::MAX))
+                });
+        #[cfg(feature = "mobile-core")]
+        let mobile_session =
+            self.mobile_session
+                .as_ref()
+                .map_or_else(CollectionStats::default, |session| {
+                    let bytes = 2 * size_of::<usize>() + session.heap_bytes();
+                    CollectionStats::new(1, u64::try_from(bytes).unwrap_or(u64::MAX))
+                });
+        #[cfg(not(feature = "mobile-core"))]
+        let mobile_session = CollectionStats::default();
         let subsystems = subsystem::memory(&self.subsystems, || self.runtime.monotonic_time());
         #[cfg(feature = "plugins")]
         let plugin_stats = self.plugin_stats();
@@ -641,6 +666,8 @@ impl Client {
             signal_sessions,
             signal_identities,
             signal_sender_keys,
+            mobile_session,
+            mobile_session_binding,
             subsystems,
             #[cfg(feature = "plugins")]
             plugins,

@@ -99,6 +99,9 @@ pub enum DisconnectReason {
     StreamEnded,
     /// A transport-level read/IO error ended the connection.
     ReadError(String),
+    /// Local primary app-state initialization failed after authentication.
+    /// The connection may be retried once its backend or key material recovers.
+    PrimaryAppStateInitializationFailed,
     /// The reason was not reported by this transport (e.g. local shutdown).
     Unknown,
 }
@@ -114,6 +117,9 @@ impl std::fmt::Display for DisconnectReason {
             },
             Self::StreamEnded => write!(f, "stream ended (EOF)"),
             Self::ReadError(e) => write!(f, "read error: {e}"),
+            Self::PrimaryAppStateInitializationFailed => {
+                write!(f, "primary app-state initialization failed")
+            }
             Self::Unknown => write!(f, "unknown"),
         }
     }
@@ -136,7 +142,7 @@ impl DisconnectReason {
             // other code (protocol/server error, restart, etc.) stays loud.
             Self::ServerClose { code, .. } => matches!(code, None | Some(1000) | Some(1001)),
             // A transport read/IO error is a real failure — never quiet.
-            Self::ReadError(_) => false,
+            Self::ReadError(_) | Self::PrimaryAppStateInitializationFailed => false,
             // Unknown reason: stay loud, don't assume it was benign.
             Self::Unknown => false,
         }
@@ -502,6 +508,20 @@ mod tests {
 
     // Happy paths: benign server-initiated recycles must classify as clean so
     // their reconnect is logged quietly.
+    #[test]
+    fn local_primary_initialization_failure_is_reported_as_retryable_failure() {
+        let reason = DisconnectReason::PrimaryAppStateInitializationFailed;
+        assert!(!reason.is_clean_shutdown());
+        assert_eq!(
+            reason.to_string(),
+            "primary app-state initialization failed"
+        );
+        assert_eq!(
+            serde_json::to_string(&reason).unwrap(),
+            "\"primary_app_state_initialization_failed\""
+        );
+    }
+
     #[test]
     fn clean_shutdowns_are_classified_clean() {
         assert!(DisconnectReason::StreamEnded.is_clean_shutdown());

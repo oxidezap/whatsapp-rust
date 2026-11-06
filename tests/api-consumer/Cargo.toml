@@ -20,6 +20,10 @@ native = ["sdk", "whatsapp-rust/tokio-runtime", "dep:tokio", "dep:anyhow", "anyh
 native-default = ["native", "whatsapp-rust/default"]
 event-fixtures = ["native", "whatsapp-rust/bench-harness"]
 plugins = ["sdk", "whatsapp-rust/plugins"]
+mobile-core = ["sdk", "whatsapp-rust/mobile-core"]
+mobile-ports = ["mobile-core", "dep:async-trait", "dep:anyhow", "anyhow/std", "dep:rand"]
+mobile-execution = ["mobile-ports", "js", "dep:wasm-bindgen-test"]
+mobile-transport-native = ["mobile-core", "whatsapp-rust/mobile-transport-native"]
 voip-control = ["sdk", "whatsapp-rust/voip-control"]
 voip-runtime = ["voip-control", "whatsapp-rust/voip-runtime"]
 voip-mlow = ["voip-control", "whatsapp-rust/voip-mlow"]
@@ -75,6 +79,8 @@ group-action-exhaustive = []
 
 [dependencies]
 anyhow = { version = "1", default-features = false, optional = true }
+async-trait = { version = "0.1.91", optional = true }
+rand = { version = "0.10", optional = true }
 wacore = { path = "../../wacore", default-features = false }
 wacore-binary = { path = "../../wacore/binary" }
 whatsapp-rust = { path = "../..", default-features = false, optional = true }
@@ -84,14 +90,12 @@ serde_json = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 async-channel = { version = "2.5", optional = true }
-async-trait = { version = "0.1.91", optional = true }
 tokio = { version = "1.53.1", features = ["macros", "rt", "time"], optional = true }
 whatsapp-rust-sqlite-storage = { path = "../../storages/sqlite-storage", default-features = false, features = ["bundled-sqlite"], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 whatsapp-rust-sqlite-storage = { path = "../../storages/sqlite-storage", default-features = false, features = ["wasm-test"], optional = true }
 getrandom = { version = "0.4", features = ["wasm_js"], optional = true }
-rand = { version = "0.10", optional = true }
 portable-atomic = { version = "1", default-features = false, features = ["fallback"], optional = true }
 js-sys = { version = "=0.3.106", optional = true }
 wasm-bindgen = { version = "=0.2.129", optional = true }
@@ -171,3 +175,13 @@ required-features = ["event-fixtures"]
 name = "local_runtime"
 path = "tests/local_runtime.rs"
 required-features = ["runtime-execution"]
+
+[[bin]]
+name = "mobile_probe"
+path = "src/mobile_probe.rs"
+required-features = ["mobile-core"]
+
+[[test]]
+name = "mobile_workflow"
+path = "tests/mobile_workflow.rs"
+required-features = ["mobile-execution"]

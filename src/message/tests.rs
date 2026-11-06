@@ -14871,8 +14871,8 @@ async fn status_stanza_is_routed_to_the_message_pipeline() {
     assert_eq!(undecryptable.info.id, "ACSTATUSSTANZA2");
 }
 
-/// Baileys #2858/#2883: the rollout also sends contact-addressed status
-/// stanzas. A 488 NACK is not a successful transport acknowledgement.
+/// Exercise the ACK-only experiment across addressing and fixture flag values.
+/// This does not establish Web compliance or a server-side retention invariant.
 #[tokio::test]
 async fn non_broadcast_status_stanza_gets_plain_ack_without_becoming_a_message() {
     use wacore::iq::abprops::web::STATUS_E2EE_RECV_OVER_STATUS_STANZA;
@@ -14900,12 +14900,15 @@ async fn non_broadcast_status_stanza_gets_plain_ack_without_becoming_a_message()
                 .into_iter(),
             )
             .await;
+        // Inspect the explicitly watched fixture's applied snapshot, rather
+        // than making this test assertion look like a production cache gate.
         assert_eq!(
             client
                 .ab_props()
-                .is_enabled(STATUS_E2EE_RECV_OVER_STATUS_STANZA)
-                .await,
-            flag
+                .snapshot()
+                .await
+                .get_bool(STATUS_E2EE_RECV_OVER_STATUS_STANZA),
+            Some(flag)
         );
         let recorder = Arc::new(EventRecorder::default());
         client

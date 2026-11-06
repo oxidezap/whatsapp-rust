@@ -17,6 +17,67 @@ pub use wacore::handshake::runner::{
     select_pattern, send_first_handshake_message,
 };
 
+/// Connect a registered mobile primary using its flat-certificate XX profile.
+/// Transport, entropy, account keys and wall clock are all supplied by the host.
+#[cfg(feature = "mobile-core")]
+pub async fn do_mobile_handshake(
+    runtime: Arc<dyn Runtime>,
+    persistence_manager: &PersistenceManager,
+    transport: Arc<dyn Transport>,
+    transport_events: &mut async_channel::Receiver<TransportEvent>,
+    observers: crate::socket::noise_socket::SendObservers,
+    session: &crate::mobile_session::RegisteredMobileSession,
+    zero_based_attempt: u32,
+) -> Result<Arc<NoiseSocket>> {
+    use wacore::mobile::MobileSessionError;
+    use wacore::mobile::MobileXxHandshake;
+    let clock = runtime
+        .clock()
+        .ok_or(HandshakeError::Mobile(MobileSessionError::MissingClock))?;
+    let read_time = || {
+        let reading = clock
+            .reading()
+            .map_err(|_| HandshakeError::Mobile(MobileSessionError::MalformedClock))?;
+        u64::try_from(reading.wall_time_millis())
+            .map(|milliseconds| milliseconds / 1000)
+            .map_err(|_| HandshakeError::Mobile(MobileSessionError::MalformedClock))
+    };
+    read_time()?; // Validate the supplied clock before any transport write.
+    let device = persistence_manager.get_device_snapshot();
+    let payload = session
+        .encode_attempt_payload(&device, zero_based_attempt)
+        .map_err(HandshakeError::Mobile)?;
+    let handshake = MobileXxHandshake::new(
+        device.noise_key.clone(),
+        session
+            .fresh_ephemeral_key()
+            .map_err(HandshakeError::Mobile)?,
+        payload,
+        session.prologue(),
+        session.trust(),
+    )
+    .map_err(HandshakeError::Mobile)?;
+    let hello = handshake.client_hello();
+    let framed = wacore::framing::encode_frame(&hello, Some(session.prologue().as_bytes()))
+        .map_err(HandshakeError::Transport)?;
+    transport.send(bytes::Bytes::from(framed)).await?;
+    let mut decoder = wacore::framing::FrameDecoder::new();
+    let response = recv_frame(&runtime, transport_events, &mut decoder).await?;
+    let outcome = handshake
+        .receive_server_hello(&response, read_time()?)
+        .map_err(HandshakeError::Mobile)?;
+    let finish = wacore::framing::encode_frame(&outcome.client_finish, None)
+        .map_err(HandshakeError::Transport)?;
+    transport.send(bytes::Bytes::from(finish)).await?;
+    Ok(Arc::new(NoiseSocket::with_observers(
+        runtime,
+        transport,
+        outcome.write_cipher,
+        outcome.read_cipher,
+        observers,
+    )))
+}
+
 fn should_persist_cert_chain(device: &wacore::store::Device) -> bool {
     device.is_registered()
 }
@@ -432,5 +493,406 @@ mod tests {
         assert!(xx_used2);
         assert!(xx_h2.starts_with(b"ED\x00\x01"));
         assert!(xx_h2.ends_with(b"WA\x06\x03") || xx_h2.ends_with(b"WA\x06\x04"));
+    }
+}
+
+#[cfg(all(test, feature = "mobile-core"))]
+mod mobile_transport_tests {
+    use super::*;
+    use bytes::Bytes;
+    use rand::SeedableRng;
+    use wacore::libsignal::protocol::{KeyPair, PrivateKey, PublicKey};
+    use wacore::mobile::*;
+    use wacore::noise::NoiseState;
+    use wacore::store::{MobileSessionBinding, StoredMobilePlatform};
+    use waproto::whatsapp as wa;
+
+    fn key(seed: u8) -> KeyPair {
+        let private = PrivateKey::deserialize(&[seed; 32]).unwrap();
+        KeyPair::new(private.public_key().unwrap(), private)
+    }
+    struct Ephemeral(std::sync::atomic::AtomicU8);
+    impl crate::MobileEphemeralKeyProvider for Ephemeral {
+        fn generate(&self) -> std::result::Result<KeyPair, MobileSessionError> {
+            Ok(key(self.0.fetch_add(1, Ordering::Relaxed)))
+        }
+    }
+    struct Clock(i64);
+    impl wacore::time::Clock for Clock {
+        fn wall_time_millis(&self) -> i64 {
+            self.0
+        }
+        fn monotonic_time(&self) -> wacore::time::Instant {
+            wacore::time::Instant::now()
+        }
+    }
+    struct Capture(async_channel::Sender<Bytes>);
+    #[async_trait::async_trait]
+    impl Transport for Capture {
+        async fn send(&self, bytes: Bytes) -> anyhow::Result<()> {
+            self.0.send(bytes).await?;
+            Ok(())
+        }
+        async fn disconnect(&self) {}
+    }
+    struct Fixture {
+        pm: Arc<PersistenceManager>,
+        config: crate::RegisteredMobileSession,
+        transport: Arc<dyn Transport>,
+        outbound: async_channel::Receiver<Bytes>,
+        incoming: async_channel::Sender<TransportEvent>,
+        events: async_channel::Receiver<TransportEvent>,
+        runtime: Arc<dyn Runtime>,
+    }
+    async fn fixture() -> Fixture {
+        let pm = Arc::new(
+            PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                .await
+                .unwrap(),
+        );
+        pm.process_command(DeviceCommand::SetId(Some(
+            "12345@s.whatsapp.net".parse().unwrap(),
+        )))
+        .await;
+        let root = key(41);
+        let environment = MobileEnvironment::new(
+            "synthetic-sdk",
+            RegistrationEndpoint::for_test_http("http://mock.invalid/registration").unwrap(),
+            TcpEndpoint::new("mock.invalid", 5222).unwrap(),
+            MobileTrust::new([1; 32], *root.public_key.public_key_bytes()).unwrap(),
+        )
+        .unwrap();
+        let device = pm.get_device_snapshot();
+        let identity = RegistrationIdentity::from_public_keys(
+            device.identity_key.public_key.public_key_bytes(),
+            device.noise_key.public_key.public_key_bytes(),
+        );
+        let binding = MobileSessionBinding::new(
+            *environment.binding().as_bytes(),
+            *identity.as_bytes(),
+            StoredMobilePlatform::Android,
+            vec![],
+            None,
+        )
+        .unwrap();
+        pm.process_command(DeviceCommand::SetMobileSessionBinding(binding))
+            .await;
+        let profile = MobileLoginProfile::new(
+            MobilePlatform::Android,
+            MobileAppVersion::parse("2.26.1").unwrap(),
+            MobileDevice::builder()
+                .manufacturer("Acme".into())
+                .device("Model".into())
+                .os_version("1".into())
+                .os_build_number("B1".into())
+                .phone_id("synthetic-sdk".into())
+                .locale_language("en".into())
+                .locale_country("GB".into())
+                .build(),
+        )
+        .unwrap();
+        let config = crate::RegisteredMobileSession::new(
+            environment,
+            profile,
+            MobileLoginOptions::default(),
+            12345,
+            identity,
+            MobileNoisePrologue::new(3),
+            Arc::new(Ephemeral(std::sync::atomic::AtomicU8::new(44))),
+        )
+        .unwrap()
+        .with_primary_identity_policy(wacore::send::PrimaryDeviceIdentityPolicy::Omit);
+        let (send, outbound) = async_channel::bounded(8);
+        let (incoming, events) = async_channel::bounded(32);
+        Fixture {
+            pm,
+            config,
+            transport: Arc::new(Capture(send)),
+            outbound,
+            incoming,
+            events,
+            runtime: Arc::new(wacore::runtime::ClockedRuntime::new(
+                Arc::new(crate::TokioRuntime),
+                Arc::new(Clock(100_000)),
+            )),
+        }
+    }
+    // Independent uint24 framing, deliberately not the production frame encoder.
+    fn frame(payload: &[u8]) -> Vec<u8> {
+        let n = payload.len();
+        let mut out = vec![(n >> 16) as u8, (n >> 8) as u8, n as u8];
+        out.extend_from_slice(payload);
+        out
+    }
+    fn unframe(bytes: &[u8]) -> &[u8] {
+        assert!(bytes.len() >= 3);
+        assert_eq!(
+            ((bytes[0] as usize) << 16) | ((bytes[1] as usize) << 8) | bytes[2] as usize,
+            bytes.len() - 3
+        );
+        &bytes[3..]
+    }
+    fn varint(out: &mut Vec<u8>, mut value: u64) {
+        while value > 127 {
+            out.push((value as u8 & 127) | 128);
+            value >>= 7;
+        }
+        out.push(value as u8);
+    }
+    fn field(out: &mut Vec<u8>, number: u8, value: &[u8]) {
+        out.push(number << 3 | 2);
+        varint(out, value.len() as u64);
+        out.extend_from_slice(value);
+    }
+    fn certificate(server: &KeyPair, mismatch: bool) -> Vec<u8> {
+        let mut details = vec![8, 7, 24];
+        varint(&mut details, 1000);
+        let wrong_key = key(99);
+        field(
+            &mut details,
+            5,
+            if mismatch {
+                wrong_key.public_key.public_key_bytes()
+            } else {
+                server.public_key.public_key_bytes()
+            },
+        );
+        let signature = key(41)
+            .private_key
+            .calculate_signature(&details, &mut rand::rngs::StdRng::seed_from_u64(77))
+            .unwrap();
+        let mut certificate = Vec::new();
+        field(&mut certificate, 1, &details);
+        field(&mut certificate, 2, &signature);
+        certificate
+    }
+    async fn peer_hello(
+        outbound: &async_channel::Receiver<Bytes>,
+        incoming: &async_channel::Sender<TransportEvent>,
+        mismatch: bool,
+    ) -> (NoiseState, KeyPair) {
+        let first = outbound.recv().await.unwrap();
+        peer_response(first, incoming, mismatch).await
+    }
+    async fn peer_response(
+        first: Bytes,
+        incoming: &async_channel::Sender<TransportEvent>,
+        mismatch: bool,
+    ) -> (NoiseState, KeyPair) {
+        assert_eq!(&first[..4], &[b'W', b'A', 5, 3]);
+        let hello = waproto::codec::handshake_message_decode(unframe(&first[4..])).unwrap();
+        assert_eq!(
+            hello.client_hello.ephemeral.as_deref(),
+            Some(key(44).public_key.public_key_bytes().as_slice())
+        );
+        let client =
+            PublicKey::from_djb_public_key_bytes(hello.client_hello.ephemeral.as_ref().unwrap())
+                .unwrap();
+        let ephemeral = key(42);
+        let server = key(43);
+        let mut noise = NoiseState::new(
+            wacore_binary::consts::NOISE_PATTERN_XX.as_bytes(),
+            &[b'W', b'A', 5, 3],
+        )
+        .unwrap();
+        noise.authenticate(client.public_key_bytes());
+        noise.authenticate(ephemeral.public_key.public_key_bytes());
+        noise
+            .mix_key(&ephemeral.private_key.calculate_agreement(&client).unwrap())
+            .unwrap();
+        let encrypted_static = noise.encrypt(server.public_key.public_key_bytes()).unwrap();
+        noise
+            .mix_key(&server.private_key.calculate_agreement(&client).unwrap())
+            .unwrap();
+        let encrypted_cert = noise.encrypt(&certificate(&server, mismatch)).unwrap();
+        let mut response = wa::HandshakeMessage::default();
+        let mut server_hello = wa::handshake_message::ServerHello::default();
+        server_hello.ephemeral = Some(ephemeral.public_key.public_key_bytes().to_vec());
+        server_hello.r#static = Some(encrypted_static);
+        server_hello.payload = Some(encrypted_cert);
+        response.server_hello = buffa::MessageField::some(server_hello);
+        let framed = frame(&waproto::codec::handshake_message_to_vec(&response));
+        // Split inside both the length prefix and encrypted handshake fields.
+        for fragment in [&framed[..1], &framed[1..2], &framed[2..7], &framed[7..]] {
+            incoming
+                .send(TransportEvent::DataReceived(Bytes::copy_from_slice(
+                    fragment,
+                )))
+                .await
+                .unwrap();
+        }
+        (noise, ephemeral)
+    }
+    #[tokio::test]
+    async fn mobile_sdk_fragmented_xx_and_noise_socket_exchange() {
+        let mut f = fixture().await;
+        let expected_payload = f.config.encode_payload().unwrap();
+        let expected_static =
+            f.pm.get_device_snapshot()
+                .noise_key
+                .public_key
+                .public_key_bytes()
+                .to_vec();
+        let handshake = do_mobile_handshake(
+            f.runtime.clone(),
+            &f.pm,
+            f.transport.clone(),
+            &mut f.events,
+            Default::default(),
+            &f.config,
+            0,
+        );
+        let peer = async {
+            let (mut noise, ephemeral) = peer_hello(&f.outbound, &f.incoming, false).await;
+            let finish = f.outbound.recv().await.unwrap();
+            let finish = waproto::codec::handshake_message_decode(unframe(&finish)).unwrap();
+            let client_static = noise
+                .decrypt(finish.client_finish.r#static.as_ref().unwrap())
+                .unwrap();
+            assert_eq!(client_static, expected_static);
+            noise
+                .mix_key(
+                    &ephemeral
+                        .private_key
+                        .calculate_agreement(
+                            &PublicKey::from_djb_public_key_bytes(&client_static).unwrap(),
+                        )
+                        .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                noise
+                    .decrypt(finish.client_finish.payload.as_ref().unwrap())
+                    .unwrap(),
+                expected_payload
+            );
+            noise.split().unwrap()
+        };
+        let (socket, peer) = futures::join!(handshake, peer);
+        let socket = socket.unwrap();
+        socket
+            .encrypt_and_send(Bytes::from_static(b"sdk request"))
+            .await
+            .unwrap();
+        let sent = f.outbound.recv().await.unwrap();
+        let mut ciphertext = unframe(&sent).to_vec();
+        peer.write
+            .decrypt_in_place_with_counter(0, &mut ciphertext)
+            .unwrap();
+        assert_eq!(ciphertext, b"sdk request");
+        let ciphertext = peer.read.encrypt_with_counter(0, b"sdk response").unwrap();
+        assert_eq!(
+            socket
+                .decrypt_frame(bytes::BytesMut::from(ciphertext.as_slice()))
+                .unwrap()
+                .as_ref(),
+            b"sdk response"
+        );
+        socket.abort_sender();
+    }
+    #[tokio::test]
+    async fn mobile_sdk_signed_certificate_static_mismatch_sends_no_finish() {
+        let mut f = fixture().await;
+        let handshake = do_mobile_handshake(
+            f.runtime.clone(),
+            &f.pm,
+            f.transport.clone(),
+            &mut f.events,
+            Default::default(),
+            &f.config,
+            0,
+        );
+        let peer = peer_hello(&f.outbound, &f.incoming, true);
+        let (result, _) = futures::join!(handshake, peer);
+        assert!(matches!(
+            result,
+            Err(HandshakeError::Mobile(
+                MobileSessionError::InvalidCertificate(_)
+            ))
+        ));
+        assert!(f.outbound.try_recv().is_err());
+    }
+    #[tokio::test]
+    async fn mobile_sdk_missing_clock_rejects_without_transport_io() {
+        let mut f = fixture().await;
+        let result = do_mobile_handshake(
+            Arc::new(crate::TokioRuntime),
+            &f.pm,
+            f.transport.clone(),
+            &mut f.events,
+            Default::default(),
+            &f.config,
+            0,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(HandshakeError::Mobile(MobileSessionError::MissingClock))
+        ));
+        assert!(f.outbound.try_recv().is_err());
+    }
+    #[tokio::test]
+    async fn mobile_sdk_invalid_host_clock_rejects_without_transport_io() {
+        let mut f = fixture().await;
+        for wall_millis in [-1, i64::MAX] {
+            let runtime: Arc<dyn Runtime> = Arc::new(wacore::runtime::ClockedRuntime::new(
+                Arc::new(crate::TokioRuntime),
+                Arc::new(Clock(wall_millis)),
+            ));
+            let result = do_mobile_handshake(
+                runtime,
+                &f.pm,
+                f.transport.clone(),
+                &mut f.events,
+                Default::default(),
+                &f.config,
+                0,
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(HandshakeError::Mobile(MobileSessionError::MalformedClock))
+            ));
+            assert!(f.outbound.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mobile_sdk_timeout_and_cancellation_never_send_finish() {
+        let mut f = fixture().await;
+        let cancelled_hello = {
+            let handshake = do_mobile_handshake(
+                f.runtime.clone(),
+                &f.pm,
+                f.transport.clone(),
+                &mut f.events,
+                Default::default(),
+                &f.config,
+                0,
+            );
+            futures::pin_mut!(handshake);
+            let hello = tokio::select! { result=&mut handshake => panic!("unexpected early result: {}",result.is_ok()), hello=f.outbound.recv()=>hello.unwrap() };
+            // Dropping the handshake owns cancellation; no sender task exists yet.
+            hello
+        };
+        // A valid response arriving after cancellation cannot advance the transcript.
+        let _ = peer_response(cancelled_hello, &f.incoming, false).await;
+        tokio::task::yield_now().await;
+        assert!(f.outbound.try_recv().is_err());
+        let mut f = fixture().await;
+        let result = do_mobile_handshake(
+            f.runtime.clone(),
+            &f.pm,
+            f.transport.clone(),
+            &mut f.events,
+            Default::default(),
+            &f.config,
+            0,
+        )
+        .await;
+        assert!(matches!(result, Err(HandshakeError::Timeout)));
+        let hello = f.outbound.recv().await.unwrap();
+        assert_eq!(&hello[..4], &[b'W', b'A', 5, 3]);
+        assert!(f.outbound.try_recv().is_err());
     }
 }

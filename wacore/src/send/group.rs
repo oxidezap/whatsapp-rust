@@ -106,6 +106,8 @@ pub async fn prepare_group_stanza(
     resolver: &dyn SendContextResolver,
     request: GroupStanzaRequest<'_>,
 ) -> Result<PreparedGroupStanza> {
+    let sender_role = resolver.sender_identity_role();
+    sender_role.validate()?;
     let GroupStanzaRequest {
         group: group_info,
         own_jid,
@@ -478,12 +480,20 @@ pub async fn prepare_group_stanza(
                         );
                         let device_identity = match distribution_policy {
                             SenderKeyDistributionPolicy::BestEffort => {
-                                needs_device_identity(includes_prekey_message, account)
-                                    .ok()
-                                    .flatten()
+                                needs_device_identity_for_role(
+                                    includes_prekey_message,
+                                    account,
+                                    sender_role,
+                                )
+                                .ok()
+                                .flatten()
                             }
                             SenderKeyDistributionPolicy::Required => {
-                                needs_device_identity(includes_prekey_message, account)?
+                                needs_device_identity_for_role(
+                                    includes_prekey_message,
+                                    account,
+                                    sender_role,
+                                )?
                             }
                         };
                         if let Some(device_identity_bytes) = device_identity {

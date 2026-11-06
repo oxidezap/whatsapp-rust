@@ -68,3 +68,6 @@ pub mod group_notifications;
 
 #[cfg(feature = "plugins")]
 pub mod plugins;
+
+#[cfg(feature = "mobile-core")]
+pub mod mobile;

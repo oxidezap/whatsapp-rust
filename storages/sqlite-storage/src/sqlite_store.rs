@@ -108,6 +108,11 @@ struct DeviceRow {
     read_receipts_disabled: bool,
     server_client_expiration: Option<String>,
     status_privacy: Option<Vec<u8>>,
+    #[diesel(
+        select_expression = crate::bounded_mobile_binding::GuardedMobileBindingExpression,
+        select_expression_type = crate::bounded_mobile_binding::GuardedMobileBindingExpression
+    )]
+    mobile_session_binding: crate::bounded_mobile_binding::GuardedMobileBinding,
 }
 
 /// One account in a database that holds several, as [`crate::SqliteDatabase::list_devices`]
@@ -170,6 +175,7 @@ struct FreshDeviceRow {
     read_receipts_disabled: bool,
     server_client_expiration: Option<String>,
     status_privacy: Option<Vec<u8>>,
+    mobile_session_binding: Option<Vec<u8>>,
 }
 
 impl FreshDeviceRow {
@@ -205,8 +211,55 @@ impl FreshDeviceRow {
             last_signed_pre_key_rotation_ms: device.last_signed_pre_key_rotation_ms,
             read_receipts_disabled: false,
             server_client_expiration: None,
+            mobile_session_binding: device
+                .mobile_session
+                .as_ref()
+                .map(serde_json::to_vec)
+                .transpose()
+                .map_err(|e| StoreError::Serialization(Box::new(e)))?,
             status_privacy: None,
         })
+    }
+
+    #[cfg(feature = "mobile")]
+    fn from_mobile_device(id: Option<i32>, supplied: &CoreDevice) -> Result<Self> {
+        supplied.validate_mobile_session()?;
+        let mut row = Self::from_device(id, supplied.clone())?;
+        row.pn = supplied
+            .pn
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        row.lid = supplied
+            .lid
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        row.account = supplied
+            .account
+            .as_ref()
+            .map(|v| wacore::store::device::account_serde::to_bytes(v));
+        row.edge_routing_info = supplied.edge_routing_info.clone();
+        row.props_hash = supplied.props_hash.clone();
+        row.nct_salt = supplied.nct_salt.clone();
+        row.server_cert_chain = supplied
+            .server_cert_chain
+            .as_ref()
+            .map(crate::wire::encode_server_cert_chain);
+        row.login_counter = supplied.login_counter;
+        row.lid_migrated = supplied.lid_migrated;
+        row.read_receipts_disabled = supplied.read_receipts_disabled;
+        row.server_client_expiration = supplied
+            .server_client_expiration
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| StoreError::Serialization(Box::new(e)))?;
+        row.status_privacy = supplied
+            .status_privacy
+            .as_ref()
+            .map(|v| wacore::store::device::status_privacy_serde::to_bytes(v));
+        Ok(row)
     }
 
     fn insert(&self, conn: &mut SqliteConnection) -> std::result::Result<(), DieselError> {
@@ -264,6 +317,18 @@ const ACCOUNT_SCOPED_TABLES: &[&str] = &[
     "signed_prekeys",
     "tc_tokens",
 ];
+
+/// Check the indexed account ID without materializing credential BLOBs.
+fn device_row_exists(conn: &mut SqliteConnection, device_id: i32) -> Result<bool> {
+    use crate::schema::device;
+
+    let count: i64 = device::table
+        .filter(device::id.eq(device_id))
+        .count()
+        .get_result(conn)
+        .map_err(|e| StoreError::Database(Box::new(e)))?;
+    Ok(count > 0)
+}
 
 /// `last_insert_rowid()` on the connection that just inserted, which is why the
 /// insert and this read share one `write_blocking`/`with_retry` closure: the
@@ -323,6 +388,13 @@ fn serialize_keypair(key_pair: &KeyPair) -> Result<Vec<u8>> {
     bytes.extend_from_slice(key_pair.private_key.serialize());
     bytes.extend_from_slice(key_pair.public_key.public_key_bytes());
     Ok(bytes)
+}
+
+/// Decode persisted role data through the credential-redacted error boundary.
+#[inline(never)]
+fn decode_mobile_binding(bytes: &[u8]) -> Result<Arc<wacore::store::MobileSessionBinding>> {
+    serde_json::from_slice(bytes)
+        .map_err(|_| StoreError::Validation("invalid persisted mobile session binding".into()))
 }
 
 /// Max ids per `eq_any` list, under SQLite's default 999 host-parameter limit.
@@ -1732,6 +1804,9 @@ impl SqliteStore {
         device_id: i32,
         device_data: &CoreDevice,
     ) -> Result<()> {
+        if device_data.mobile_session.is_some() {
+            device_data.validate_mobile_session()?;
+        }
         // Use Arc so retry clones are just atomic increments, not deep copies.
         let noise_key_data: Arc<[u8]> = self.serialize_keypair(&device_data.noise_key)?.into();
         let identity_key_data: Arc<[u8]> =
@@ -1742,6 +1817,13 @@ impl SqliteStore {
             .account
             .as_ref()
             .map(|a| Arc::from(wacore::store::device::account_serde::to_bytes(a)));
+        let mobile_session_binding: Option<Arc<[u8]>> = device_data
+            .mobile_session
+            .as_ref()
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|e| StoreError::Serialization(Box::new(e)))?
+            .map(Arc::from);
         let registration_id = device_data.registration_id as i32;
         let signed_pre_key_id = device_data.signed_pre_key_id as i32;
         let signed_pre_key_signature: Arc<[u8]> =
@@ -1809,6 +1891,7 @@ impl SqliteStore {
             let props_hash = props_hash.clone();
             let server_client_expiration = server_client_expiration.clone();
             let nct_salt = nct_salt.clone();
+            let mobile_session_binding = mobile_session_binding.clone();
             let status_privacy = status_privacy.clone();
             let server_cert_chain = server_cert_chain.clone();
             let new_lid = Arc::clone(&new_lid);
@@ -1839,6 +1922,7 @@ impl SqliteStore {
                         device::first_unupload_pre_key_id.eq(first_unupload_pre_key_id),
                         device::server_has_prekeys.eq(server_has_prekeys),
                         device::nct_salt.eq(nct_salt.as_deref()),
+                        device::mobile_session_binding.eq(mobile_session_binding.as_deref()),
                         device::status_privacy.eq(status_privacy.as_deref()),
                         device::server_cert_chain.eq(server_cert_chain.as_deref()),
                         device::login_counter.eq(login_counter),
@@ -1874,6 +1958,7 @@ impl SqliteStore {
                             .eq(excluded(device::first_unupload_pre_key_id)),
                         device::server_has_prekeys.eq(excluded(device::server_has_prekeys)),
                         device::nct_salt.eq(excluded(device::nct_salt)),
+                        device::mobile_session_binding.eq(excluded(device::mobile_session_binding)),
                         device::status_privacy.eq(excluded(device::status_privacy)),
                         device::server_cert_chain.eq(excluded(device::server_cert_chain)),
                         device::login_counter.eq(excluded(device::login_counter)),
@@ -1947,6 +2032,7 @@ impl SqliteStore {
                         device::first_unupload_pre_key_id.eq(first_unupload_pre_key_id),
                         device::server_has_prekeys.eq(server_has_prekeys),
                         device::nct_salt.eq(None::<&[u8]>),
+                        device::mobile_session_binding.eq(None::<&[u8]>),
                         device::status_privacy.eq(None::<&[u8]>),
                         device::server_cert_chain.eq(None::<&[u8]>),
                         device::login_counter.eq(0i32),
@@ -2000,6 +2086,70 @@ impl SqliteStore {
                 .collect())
         })
         .await
+    }
+
+    #[cfg(feature = "mobile")]
+    pub(crate) async fn import_mobile_device_impl(
+        &self,
+        supplied: &CoreDevice,
+    ) -> Result<SqliteStore> {
+        let row = Arc::new(FreshDeviceRow::from_mobile_device(None, supplied)?);
+        let device_id = self
+            .with_retry("import_mobile_device", move || {
+                let row = Arc::clone(&row);
+                Box::new(move |conn: &mut SqliteConnection| {
+                    conn.immediate_transaction(|conn| {
+                        row.insert(conn)?;
+                        let id = last_insert_rowid(conn)?;
+                        // Explicitly reject stale orphan state at the newly allocated id.
+                        // Rolling back also rolls back the row and AUTOINCREMENT sequence.
+                        Self::ensure_mobile_namespace_empty(conn, id, false)?;
+                        Ok(id)
+                    })
+                })
+            })
+            .await?;
+        Ok(self.share_for_device(device_id))
+    }
+
+    #[cfg(feature = "mobile")]
+    fn ensure_mobile_namespace_empty(
+        conn: &mut SqliteConnection,
+        device_id: i32,
+        check_device: bool,
+    ) -> std::result::Result<(), DieselError> {
+        if check_device
+            && device::table
+                .filter(device::id.eq(device_id))
+                .count()
+                .get_result::<i64>(conn)?
+                != 0
+        {
+            return Err(DieselError::QueryBuilderError(Box::new(
+                StoreError::InvalidConfig(
+                    "mobile initialization requires an empty namespace".into(),
+                ),
+            )));
+        }
+        for table in ACCOUNT_SCOPED_TABLES {
+            #[derive(QueryableByName)]
+            struct Count {
+                #[diesel(sql_type=diesel::sql_types::BigInt)]
+                n: i64,
+            }
+            let sql = format!("SELECT COUNT(*) AS n FROM {table} WHERE device_id = ?");
+            let count: Count = diesel::sql_query(sql)
+                .bind::<diesel::sql_types::Integer, _>(device_id)
+                .get_result(conn)?;
+            if count.n != 0 {
+                return Err(DieselError::QueryBuilderError(Box::new(
+                    StoreError::InvalidConfig(
+                        "mobile initialization found existing protocol material".into(),
+                    ),
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn create_sibling_device_impl(&self) -> Result<(i32, SqliteStore)> {
@@ -2072,18 +2222,8 @@ impl SqliteStore {
     }
 
     pub(crate) async fn device_exists_impl(&self, device_id: i32) -> Result<bool> {
-        use crate::schema::device;
-
-        self.read_query(move |conn| {
-            let count: i64 = device::table
-                .filter(device::id.eq(device_id))
-                .count()
-                .get_result(conn)
-                .map_err(|e| StoreError::Database(Box::new(e)))?;
-
-            Ok(count > 0)
-        })
-        .await
+        self.read_query(move |conn| device_row_exists(conn, device_id))
+            .await
     }
 
     async fn load_device_data_for_device(&self, device_id: i32) -> Result<Option<CoreDevice>> {
@@ -2091,16 +2231,17 @@ impl SqliteStore {
 
         let row = self
             .read_query(move |conn| {
-                let result = device::table
+                device::table
                     .filter(device::id.eq(device_id))
+                    .select(DeviceRow::as_select())
                     .first::<DeviceRow>(conn)
                     .optional()
-                    .map_err(|e| StoreError::Database(Box::new(e)))?;
-                Ok(result)
+                    .map_err(|e| StoreError::Database(Box::new(e)))
             })
             .await?;
 
         if let Some(row) = row {
+            let mobile_session_binding = row.mobile_session_binding.as_bytes()?;
             let pn = if !row.pn.is_empty() {
                 row.pn.parse().ok()
             } else {
@@ -2116,15 +2257,18 @@ impl SqliteStore {
             let identity_key = self.deserialize_keypair(&row.identity_key)?;
             let signed_pre_key = self.deserialize_keypair(&row.signed_pre_key)?;
 
-            let signed_pre_key_signature: [u8; 64] =
-                row.signed_pre_key_signature.try_into().map_err(|_| {
+            let signed_pre_key_signature: [u8; 64] = row
+                .signed_pre_key_signature
+                .as_slice()
+                .try_into()
+                .map_err(|_| {
                     StoreError::Validation("Invalid signed_pre_key_signature length".to_string())
                 })?;
 
-            let adv_secret_key: [u8; 32] = row
-                .adv_secret_key
-                .try_into()
-                .map_err(|_| StoreError::Validation("Invalid adv_secret_key length".to_string()))?;
+            let adv_secret_key: [u8; 32] =
+                row.adv_secret_key.as_slice().try_into().map_err(|_| {
+                    StoreError::Validation("Invalid adv_secret_key length".to_string())
+                })?;
 
             let account = row
                 .account
@@ -2134,7 +2278,11 @@ impl SqliteStore {
                 })
                 .transpose()?;
 
+            let mobile_session = mobile_session_binding
+                .map(decode_mobile_binding)
+                .transpose()?;
             Ok(Some(CoreDevice {
+                mobile_session,
                 pn,
                 lid,
                 registration_id: row.registration_id as u32,
@@ -4947,6 +5095,29 @@ impl MsgSecretStore for SqliteStore {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl DeviceStore for SqliteStore {
+    #[cfg(feature = "mobile")]
+    async fn initialize_mobile_device(&self, supplied: &CoreDevice) -> Result<()> {
+        supplied.validate_mobile_session()?;
+        supplied
+            .mobile_session
+            .as_ref()
+            .ok_or_else(|| StoreError::Validation("missing mobile binding".into()))?
+            .validate()?;
+        let device_id = self.device_id;
+        let row = FreshDeviceRow::from_mobile_device(Some(device_id), supplied)?;
+        let row = Arc::new(row);
+        self.with_retry("initialize_mobile_device", move || {
+            let row = Arc::clone(&row);
+            Box::new(move |conn: &mut SqliteConnection| {
+                conn.immediate_transaction(|conn| {
+                    Self::ensure_mobile_namespace_empty(conn, device_id, true)?;
+                    row.insert(conn)
+                })
+            })
+        })
+        .await
+    }
+
     async fn save(&self, device: &CoreDevice) -> Result<()> {
         SqliteStore::save_device_data_for_device(self, self.device_id, device).await
     }
@@ -7835,6 +8006,566 @@ mod tests {
         assert_eq!(
             loaded.first_unupload_pre_key_id, 101,
             "first_unupload_pre_key_id must survive a save/load roundtrip"
+        );
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct MobileRollbackColumn {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        name: String,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct MobileRollbackSnapshot {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        snapshot: String,
+    }
+
+    fn mobile_rollback_table_snapshot(
+        conn: &mut SqliteConnection,
+        table: &str,
+        include_binding: bool,
+    ) -> Vec<String> {
+        let columns = diesel::sql_query("SELECT name FROM pragma_table_info(?) ORDER BY cid")
+            .bind::<diesel::sql_types::Text, _>(table)
+            .load::<MobileRollbackColumn>(conn)
+            .unwrap();
+        let projection = columns
+            .into_iter()
+            .filter(|column| include_binding || column.name != "mobile_session_binding")
+            .map(|column| format!("quote(\"{}\")", column.name.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" || '|' || ");
+        let table = table.replace('"', "\"\"");
+        diesel::sql_query(format!(
+            "SELECT {projection} AS snapshot FROM \"{table}\" ORDER BY snapshot"
+        ))
+        .load::<MobileRollbackSnapshot>(conn)
+        .unwrap()
+        .into_iter()
+        .map(|row| row.snapshot)
+        .collect()
+    }
+
+    fn mobile_rollback_schema_snapshot(conn: &mut SqliteConnection) -> Vec<String> {
+        diesel::sql_query(
+            "SELECT type || ':' || name || ':' || COALESCE(sql, '') AS snapshot \
+             FROM sqlite_master UNION ALL \
+             SELECT 'temp:' || type || ':' || name || ':' || COALESCE(sql, '') AS snapshot \
+             FROM sqlite_temp_master ORDER BY snapshot",
+        )
+        .load::<MobileRollbackSnapshot>(conn)
+        .unwrap()
+        .into_iter()
+        .map(|row| row.snapshot)
+        .collect()
+    }
+
+    fn mobile_rollback_test_connection(with_mobile: bool) -> SqliteConnection {
+        use wacore::store::commands::{DeviceCommand, apply_command_to_device};
+        use wacore::store::{MobileSessionBinding, StoredMobilePlatform};
+
+        let mut conn = SqliteConnection::establish(":memory:").unwrap();
+        conn.run_pending_migrations(MIGRATIONS).unwrap();
+        for id in [141, 142] {
+            let mut source = CoreDevice::new();
+            if with_mobile && id == 142 {
+                let binding = MobileSessionBinding::new(
+                    [1; 32],
+                    source.mobile_identity_hash(),
+                    StoredMobilePlatform::Android,
+                    vec![3],
+                    None,
+                )
+                .unwrap();
+                apply_command_to_device(
+                    &mut source,
+                    DeviceCommand::CompleteMobileRegistration {
+                        binding,
+                        pn: "15550000001@s.whatsapp.net".parse().unwrap(),
+                        lid: None,
+                    },
+                );
+            }
+            let pn = source
+                .pn
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            let mut row = FreshDeviceRow::from_device(Some(id), source).unwrap();
+            row.pn = pn;
+            row.insert(&mut conn).unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn mobile_binding_rollback_preserves_rows_schema_and_metadata_until_explicitly_cleared() {
+        use diesel::connection::SimpleConnection;
+
+        for (case, replacement) in [
+            ("valid", None),
+            ("empty blob", Some("X''")),
+            ("invalid blob", Some("X'00'")),
+            ("text", Some("'invalid-role'")),
+            ("integer", Some("0")),
+            ("real", Some("0.5")),
+        ] {
+            let mut conn = mobile_rollback_test_connection(true);
+            if let Some(value) = replacement {
+                conn.batch_execute(&format!(
+                    "UPDATE device SET mobile_session_binding = {value} WHERE id = 142"
+                ))
+                .unwrap();
+            }
+            let before_data = mobile_rollback_table_snapshot(&mut conn, "device", true);
+            let before_schema = mobile_rollback_schema_snapshot(&mut conn);
+            let before_metadata =
+                mobile_rollback_table_snapshot(&mut conn, "__diesel_schema_migrations", true);
+
+            assert!(conn.revert_last_migration(MIGRATIONS).is_err(), "{case}");
+            assert_eq!(
+                mobile_rollback_table_snapshot(&mut conn, "device", true),
+                before_data,
+                "{case}: device data changed"
+            );
+            assert_eq!(
+                mobile_rollback_schema_snapshot(&mut conn),
+                before_schema,
+                "{case}: schema or temporary guard changed"
+            );
+            assert_eq!(
+                mobile_rollback_table_snapshot(&mut conn, "__diesel_schema_migrations", true),
+                before_metadata,
+                "{case}: rollback metadata changed"
+            );
+
+            conn.batch_execute("UPDATE device SET mobile_session_binding = NULL WHERE id = 142")
+                .unwrap();
+            let cleared_data = mobile_rollback_table_snapshot(&mut conn, "device", false);
+            let reverted = conn.revert_last_migration(MIGRATIONS).unwrap();
+            assert_eq!(reverted.to_string(), "20261105000000");
+            assert_eq!(
+                mobile_rollback_table_snapshot(&mut conn, "device", true),
+                cleared_data,
+                "{case}: explicit rollback changed credentials"
+            );
+            assert_eq!(
+                mobile_rollback_table_snapshot(&mut conn, "__diesel_schema_migrations", true).len(),
+                before_metadata.len() - 1
+            );
+            assert!(
+                conn.batch_execute("SELECT mobile_session_binding FROM device")
+                    .is_err()
+            );
+            assert!(
+                mobile_rollback_schema_snapshot(&mut conn)
+                    .iter()
+                    .all(|entry| !entry.contains("__whatsapp_mobile_rollback_guard"))
+            );
+        }
+    }
+
+    #[test]
+    fn mobile_binding_rollback_accepts_normal_null_only_rows() {
+        use diesel::connection::SimpleConnection;
+
+        let mut conn = mobile_rollback_test_connection(false);
+        let before_data = mobile_rollback_table_snapshot(&mut conn, "device", false);
+        let before_metadata =
+            mobile_rollback_table_snapshot(&mut conn, "__diesel_schema_migrations", true);
+        let reverted = conn.revert_last_migration(MIGRATIONS).unwrap();
+        assert_eq!(reverted.to_string(), "20261105000000");
+        assert_eq!(
+            mobile_rollback_table_snapshot(&mut conn, "device", true),
+            before_data
+        );
+        assert_eq!(
+            mobile_rollback_table_snapshot(&mut conn, "__diesel_schema_migrations", true).len(),
+            before_metadata.len() - 1
+        );
+        assert!(
+            conn.batch_execute("SELECT mobile_session_binding FROM device")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn mobile_binding_reads_are_scoped_to_the_requested_account() {
+        use wacore::store::commands::{DeviceCommand, apply_command_to_device};
+        use wacore::store::{MobileSessionBinding, StoredMobilePlatform};
+
+        let db = format!(
+            "file:mobile_scoped_binding_reads_{}?mode=memory&cache=shared",
+            std::process::id()
+        );
+        let database = crate::SqliteDatabase::open(&db, Default::default())
+            .await
+            .unwrap();
+        let mut sources = Vec::new();
+        for (id, pn) in [(131, "15550000001"), (132, "15550000002")] {
+            let mut source = CoreDevice::new();
+            let binding = MobileSessionBinding::new(
+                [id as u8; 32],
+                source.mobile_identity_hash(),
+                StoredMobilePlatform::Android,
+                vec![id as u8],
+                None,
+            )
+            .unwrap();
+            apply_command_to_device(
+                &mut source,
+                DeviceCommand::CompleteMobileRegistration {
+                    binding,
+                    pn: format!("{pn}@s.whatsapp.net").parse().unwrap(),
+                    lid: None,
+                },
+            );
+            DeviceStore::save(&database.store(id), &source)
+                .await
+                .unwrap();
+            sources.push((id, source));
+        }
+
+        // Both valid BLOBs must remain present while each account is read.
+        // An ungrouped OR can otherwise admit the other account's row.
+        for (id, source) in sources {
+            let restored = DeviceStore::load(&database.store(id))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(restored.pn, source.pn);
+            assert_eq!(restored.mobile_session, source.mobile_session);
+            assert_eq!(restored.noise_key.public_key, source.noise_key.public_key);
+        }
+        let missing = database.store(133);
+        assert!(DeviceStore::load(&missing).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn mobile_save_rejects_mismatched_device_and_bounds_blob_reads() {
+        use wacore::store::commands::{DeviceCommand, apply_command_to_device};
+        use wacore::store::{MobileSessionBinding, StoredMobilePlatform};
+
+        let db = format!(
+            "file:mobile_checked_save_{}?mode=memory&cache=shared",
+            std::process::id()
+        );
+        let database = crate::SqliteDatabase::open(&db, Default::default())
+            .await
+            .unwrap();
+        let store = database.store(121);
+        let mut device = CoreDevice::new();
+        let binding = MobileSessionBinding::new(
+            [1; 32],
+            device.mobile_identity_hash(),
+            StoredMobilePlatform::Android,
+            vec![8, 9],
+            None,
+        )
+        .unwrap();
+        apply_command_to_device(
+            &mut device,
+            DeviceCommand::SetMobileSessionBinding(binding.clone()),
+        );
+        DeviceStore::save(&store, &device).await.unwrap();
+        let invalid_keys = CoreDevice {
+            noise_key: CoreDevice::new().noise_key,
+            ..device.clone()
+        };
+        assert!(DeviceStore::save(&store, &invalid_keys).await.is_err());
+        let mut invalid_identity = device.clone();
+        apply_command_to_device(
+            &mut invalid_identity,
+            DeviceCommand::SetId(Some("15551234567:1@s.whatsapp.net".parse().unwrap())),
+        );
+        assert!(DeviceStore::save(&store, &invalid_identity).await.is_err());
+        let restored = DeviceStore::load(&store).await.unwrap().unwrap();
+        restored.validate_mobile_session().unwrap();
+        assert_eq!(restored.mobile_session.as_deref(), Some(&binding));
+        assert_eq!(restored.noise_key.public_key, device.noise_key.public_key);
+        assert!(restored.pn.is_none());
+
+        store
+            .with_retry("oversized_mobile_binding", || {
+                Box::new(|conn| {
+                    diesel::sql_query(
+                        "UPDATE device SET mobile_session_binding = zeroblob(1048577) WHERE id = 121",
+                    )
+                    .execute(conn)
+                    .map(|_| ())
+                })
+            })
+            .await
+            .unwrap();
+        let error = DeviceStore::load(&store).await.err().unwrap();
+        assert!(format!("{error}").contains("oversized mobile session binding"));
+        store
+            .with_retry("text_mobile_binding", || {
+                Box::new(|conn| {
+                    diesel::sql_query(
+                        "UPDATE device SET mobile_session_binding = CAST(zeroblob(1048577) AS TEXT) WHERE id = 121",
+                    )
+                    .execute(conn)
+                    .map(|_| ())
+                })
+            })
+            .await
+            .unwrap();
+        assert!(DeviceStore::load(&store).await.is_err());
+        let missing = database.store(122);
+        assert!(DeviceStore::load(&missing).await.unwrap().is_none());
+    }
+
+    #[cfg(feature = "mobile")]
+    #[tokio::test]
+    async fn mobile_provisioning_preserves_protobuf_cached_certificates() {
+        use wacore::store::commands::{DeviceCommand, apply_command_to_device};
+        use wacore::store::device::{CachedNoiseCert, CachedServerCertChain};
+        use wacore::store::{MobileSessionBinding, StoredMobilePlatform};
+
+        let db = format!(
+            "file:mobile_provisioned_certificate_{}?mode=memory&cache=shared",
+            std::process::id()
+        );
+        let database = crate::SqliteDatabase::open(&db, Default::default())
+            .await
+            .unwrap();
+        let chain = CachedServerCertChain {
+            intermediate: CachedNoiseCert {
+                key: [0xAB; 32],
+                not_before: 1_700_000_000,
+                not_after: 1_900_000_000,
+            },
+            leaf: CachedNoiseCert {
+                key: [0xCD; 32],
+                not_before: 1_700_000_500,
+                not_after: 1_899_999_500,
+            },
+            signature_verified: true,
+        };
+        let mut device = CoreDevice {
+            server_cert_chain: Some(chain.clone()),
+            ..CoreDevice::new()
+        };
+        let binding = MobileSessionBinding::new(
+            [1; 32],
+            device.mobile_identity_hash(),
+            StoredMobilePlatform::Android,
+            vec![8, 9],
+            None,
+        )
+        .unwrap();
+        apply_command_to_device(
+            &mut device,
+            DeviceCommand::CompleteMobileRegistration {
+                binding,
+                pn: "15551234567@s.whatsapp.net".parse().unwrap(),
+                lid: None,
+            },
+        );
+        let store = database.store(123);
+        DeviceStore::initialize_mobile_device(&store, &device)
+            .await
+            .unwrap();
+        assert_eq!(
+            DeviceStore::load(&store)
+                .await
+                .unwrap()
+                .unwrap()
+                .server_cert_chain,
+            Some(chain.clone())
+        );
+        let imported = database.import_mobile_device(&device).await.unwrap();
+        assert_eq!(
+            DeviceStore::load(&imported)
+                .await
+                .unwrap()
+                .unwrap()
+                .server_cert_chain,
+            Some(chain)
+        );
+    }
+
+    #[cfg(not(feature = "mobile"))]
+    #[tokio::test]
+    async fn mobile_binding_remains_readable_without_provisioning_support() {
+        use wacore::store::commands::{DeviceCommand, apply_command_to_device};
+        use wacore::store::{MobileSessionBinding, StoredMobilePlatform};
+        let db = format!(
+            "file:mobile_binding_feature_off_{}?mode=memory&cache=shared",
+            std::process::id()
+        );
+        let database = crate::SqliteDatabase::open(&db, Default::default())
+            .await
+            .unwrap();
+        let store = database.store(117);
+        let mut device = CoreDevice::new();
+        let binding = MobileSessionBinding::new(
+            [1; 32],
+            device.mobile_identity_hash(),
+            StoredMobilePlatform::Android,
+            vec![8, 9],
+            Some(vec![3]),
+        )
+        .unwrap();
+        apply_command_to_device(
+            &mut device,
+            DeviceCommand::SetMobileSessionBinding(binding.clone()),
+        );
+        assert!(
+            DeviceStore::initialize_mobile_device(&store, &device)
+                .await
+                .is_err()
+        );
+        assert!(DeviceStore::load(&store).await.unwrap().is_none());
+        // Existing mobile namespaces must retain their role across a feature-off build.
+        DeviceStore::save(&store, &device).await.unwrap();
+        let restored = DeviceStore::load(&store).await.unwrap().unwrap();
+        assert_eq!(restored.mobile_session.as_deref(), Some(&binding));
+        store
+            .with_retry("corrupt_feature_off_mobile_binding", || {
+                Box::new(|conn| {
+                    diesel::update(device::table.filter(device::id.eq(117)))
+                        .set(device::mobile_session_binding.eq(Some(b"invalid-binding".as_slice())))
+                        .execute(conn)
+                        .map(|_| ())
+                })
+            })
+            .await
+            .unwrap();
+        assert!(DeviceStore::load(&store).await.is_err());
+    }
+
+    #[cfg(feature = "mobile")]
+    #[tokio::test]
+    async fn mobile_binding_roundtrip_fresh_namespace_and_corruption_fail_closed() {
+        use wacore::store::commands::{DeviceCommand, apply_command_to_device};
+        use wacore::store::{MobileSessionBinding, StoredMobilePlatform};
+        let db = format!(
+            "file:mobile_binding_{}?mode=memory&cache=shared",
+            std::process::id()
+        );
+        let database = crate::SqliteDatabase::open(&db, Default::default())
+            .await
+            .unwrap();
+        let store = database.store(117);
+        let mut device = CoreDevice::new();
+        let mut binding = MobileSessionBinding::new(
+            [1; 32],
+            device.mobile_identity_hash(),
+            StoredMobilePlatform::Android,
+            vec![8, 9],
+            Some(vec![3]),
+        )
+        .unwrap();
+        binding.primary_state = Some(vec![4, 5]);
+        apply_command_to_device(
+            &mut device,
+            DeviceCommand::SetMobileSessionBinding(binding.clone()),
+        );
+        DeviceStore::initialize_mobile_device(&store, &device)
+            .await
+            .unwrap();
+        assert_eq!(
+            DeviceStore::load(&store)
+                .await
+                .unwrap()
+                .unwrap()
+                .mobile_session,
+            Some(Arc::new(binding))
+        );
+        assert!(
+            DeviceStore::initialize_mobile_device(&store, &device)
+                .await
+                .is_err()
+        );
+        store
+            .with_retry("corrupt_mobile_binding", || {
+                Box::new(|conn| {
+                    diesel::update(device::table.filter(device::id.eq(117)))
+                        .set(device::mobile_session_binding.eq(Some(
+                            br#"{"schema_version":"registration-secret"}"#.as_slice(),
+                        )))
+                        .execute(conn)
+                        .map(|_| ())
+                })
+            })
+            .await
+            .unwrap();
+        let malformed = DeviceStore::load(&store)
+            .await
+            .err()
+            .expect("malformed binding rejected");
+        assert!(!format!("{malformed:?}").contains("registration-secret"));
+        let legacy = database.store(118);
+        DeviceStore::create(&legacy).await.unwrap();
+        assert!(
+            DeviceStore::load(&legacy)
+                .await
+                .unwrap()
+                .unwrap()
+                .mobile_session
+                .is_none()
+        );
+        assert!(
+            DeviceStore::initialize_mobile_device(&legacy, &device)
+                .await
+                .is_err()
+        );
+        let registered = database.store(120);
+        let pn: Jid = "15551234567@s.whatsapp.net".parse().unwrap();
+        let lid: Jid = "100000000000001@lid".parse().unwrap();
+        apply_command_to_device(&mut device, DeviceCommand::SetId(Some(pn.clone())));
+        apply_command_to_device(&mut device, DeviceCommand::SetLid(Some(lid.clone())));
+        DeviceStore::initialize_mobile_device(&registered, &device)
+            .await
+            .unwrap();
+        let restored = DeviceStore::load(&registered).await.unwrap().unwrap();
+        assert_eq!(restored.pn, Some(pn));
+        assert_eq!(restored.lid, Some(lid));
+        restored.validate_mobile_session().unwrap();
+        let stale = database.store(119);
+        stale.with_retry("orphan_mobile_signal", || Box::new(|conn| {
+            diesel::sql_query("INSERT INTO identities (address, key, device_id) VALUES ('orphan', X'00', 119)").execute(conn).map(|_| ())
+        })).await.unwrap();
+        assert!(
+            DeviceStore::initialize_mobile_device(&stale, &device)
+                .await
+                .is_err()
+        );
+        assert!(DeviceStore::load(&stale).await.unwrap().is_none());
+        let before = database.list_devices().await.unwrap().len();
+        let allocated = database.import_mobile_device(&device).await.unwrap();
+        let sibling = database.import_mobile_device(&device).await.unwrap();
+        assert_ne!(allocated.device_id(), sibling.device_id());
+        assert!(sibling.device_id() > allocated.device_id());
+        allocated
+            .put_identity("import-marker", [7; 32])
+            .await
+            .unwrap();
+        assert_eq!(allocated.load().await.unwrap().unwrap().pn, device.pn);
+        assert_eq!(sibling.load().await.unwrap().unwrap().pn, device.pn);
+        assert_eq!(
+            allocated.load_identity("import-marker").await.unwrap(),
+            Some([7; 32])
+        );
+        let future_id = sibling.device_id() + 1;
+        let orphan = database.store(future_id);
+        orphan
+            .put_identity("preexisting-orphan", [8; 32])
+            .await
+            .unwrap();
+        assert!(database.import_mobile_device(&device).await.is_err());
+        assert!(!database.device_exists(future_id).await.unwrap());
+        assert_eq!(
+            orphan.load_identity("preexisting-orphan").await.unwrap(),
+            Some([8; 32])
+        );
+        assert_eq!(database.list_devices().await.unwrap().len(), before + 2);
+        assert_eq!(
+            allocated.load_identity("import-marker").await.unwrap(),
+            Some([7; 32])
         );
     }
 

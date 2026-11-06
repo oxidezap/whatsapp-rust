@@ -1,5 +1,7 @@
 disallowed-methods = [
-    { path = "chrono::Utc::now", reason = "use wacore::time::now_utc() to respect the pluggable TimeProvider (WASM + deterministic tests)" },
+    # Host parsers can use chrono without its clock feature. Keep the ban when
+    # that method exists without requiring clock access just for lint resolution.
+    { path = "chrono::Utc::now", reason = "use wacore::time::now_utc() to respect the pluggable TimeProvider (WASM + deterministic tests)", allow-invalid = true },
     { path = "chrono::Local::now", reason = "use wacore::time::now_utc() to respect the pluggable TimeProvider and avoid direct system-clock access", allow-invalid = true },
     { path = "std::time::SystemTime::now", reason = "use wacore::time::now_millis() / now_utc()" },
     { path = "std::time::Instant::now", reason = "use wacore::time::Instant::now()" },

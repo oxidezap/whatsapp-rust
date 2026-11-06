@@ -960,6 +960,16 @@ impl MediaDownloader {
         Self::new(http_client, runtime, MediaRoute::default_hosts())
     }
 
+    /// Apply an explicit mobile profile for session-independent CDN downloads.
+    pub fn with_mobile_http_profile(
+        mut self,
+        profile: wacore::download::MobileMediaHttpProfile,
+    ) -> Self {
+        self.http_client =
+            crate::upload::profile_media_http_client(self.http_client, Some(profile));
+        self
+    }
+
     pub fn route(&self) -> &MediaRoute {
         &self.route
     }
@@ -1105,6 +1115,10 @@ impl Client {
         limits: DownloadLimits,
         runtime: &Arc<dyn Runtime>,
     ) -> std::result::Result<Vec<u8>, ClientDownloadError> {
+        let media_http = self
+            .media_http_client()
+            .map_err(ClientDownloadError::Preparation)?;
+        let media_http = &media_http;
         if limits.is_bounded() && !self.http_client.supports_streaming() {
             return Err(DownloadPolicyError::StreamingRequired.into());
         }
@@ -1124,7 +1138,7 @@ impl Client {
             || async { self.invalidate_media_conn().await },
             |request| async move {
                 execute_request_into_memory(
-                    &self.http_client,
+                    media_http,
                     runtime,
                     &request,
                     ExpectedMediaHashes {
@@ -1157,7 +1171,7 @@ impl Client {
         async {
             let url = wacore::sticker_pack::sticker_pack_data_url(pack_id, locale);
             let response = self
-                .http_client
+                .media_http_client()?
                 .execute(crate::http::HttpRequest::get(&url))
                 .await
                 .map_err(|e| e.context("sticker pack request failed"))?;
@@ -1312,6 +1326,19 @@ impl Client {
         T: MaybeSend + 'static,
         Finish: Fn(W) -> T + MaybeSend + Copy + 'static,
     {
+        let media_http = match self.media_http_client() {
+            Ok(http) => http,
+            Err(error) => {
+                return Err(discard_failed_write(
+                    &self.runtime,
+                    writer,
+                    DownloadRequestError::Prepare(error),
+                )
+                .await
+                .into());
+            }
+        };
+        let media_http = &media_http;
         let _cancel = CancelDownloadOnDrop(budget.clone());
         let budget = &budget;
 
@@ -1323,7 +1350,7 @@ impl Client {
             || async { self.invalidate_media_conn().await },
             |request, writer| async move {
                 streaming_download_and_decrypt_mapped(
-                    &self.http_client,
+                    media_http,
                     &self.runtime,
                     &request,
                     ExpectedMediaHashes {
@@ -4748,6 +4775,40 @@ mod tests {
                 "untouched"
             );
         }
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn missing_mobile_media_profile_clears_the_supplied_writer() {
+        let client = crate::test_utils::primary_startup_client().await;
+        let params = encrypted_params(b"unrequested").0;
+        let sink = SharedWriter::new();
+        sink.with(|writer| writer.write_all(b"old contents").unwrap());
+        let error = client
+            .download_to_writer(&params, sink.clone(), Default::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ClientDownloadError::Preparation(_)));
+        assert!(sink.contents().is_empty());
+
+        sink.with(|writer| writer.write_all(b"retained contents").unwrap());
+        let error = client
+            .download_to_writer(
+                &params,
+                CleanupRefusingWriter {
+                    sink: sink.clone(),
+                    cleared: true,
+                },
+                Default::default(),
+            )
+            .await
+            .unwrap_err();
+        let ClientDownloadError::WriterCleanup { failure, cleanup } = error else {
+            panic!("profile preparation must preserve cleanup failure: {error:?}");
+        };
+        assert!(matches!(*failure, ClientDownloadError::Preparation(_)));
+        assert_eq!(cleanup.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(sink.contents(), b"retained contents");
     }
 
     #[tokio::test]

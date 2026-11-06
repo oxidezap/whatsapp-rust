@@ -593,6 +593,23 @@ pub mod codec {
     }
 
     #[inline(never)]
+    pub fn adv_device_identity_to_vec(message: &whatsapp::ADVDeviceIdentity) -> Vec<u8> {
+        message.encode_to_vec()
+    }
+
+    #[inline(never)]
+    pub fn adv_signed_device_identity_hmac_to_vec(
+        message: &whatsapp::ADVSignedDeviceIdentityHMAC,
+    ) -> Vec<u8> {
+        message.encode_to_vec()
+    }
+
+    #[inline(never)]
+    pub fn client_pairing_props_to_vec(message: &whatsapp::ClientPairingProps) -> Vec<u8> {
+        message.encode_to_vec()
+    }
+
+    #[inline(never)]
     pub fn adv_device_identity_decode(
         bytes: &[u8],
     ) -> Result<whatsapp::ADVDeviceIdentity, buffa::DecodeError> {
@@ -690,6 +707,21 @@ pub mod codec {
         bytes: &[u8],
     ) -> Result<whatsapp::cert_chain::noise_certificate::Details, buffa::DecodeError> {
         whatsapp::cert_chain::noise_certificate::Details::decode_from_slice(bytes)
+    }
+
+    /// Native mobile uses a flat certificate, not the Web leaf/intermediate chain.
+    #[inline(never)]
+    pub fn mobile_noise_certificate_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::NoiseCertificate, buffa::DecodeError> {
+        whatsapp::NoiseCertificate::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
+    pub fn mobile_noise_certificate_details_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::noise_certificate::Details, buffa::DecodeError> {
+        whatsapp::noise_certificate::Details::decode_from_slice(bytes)
     }
 
     /// Business verified-name certificates (usync / business profile parsing).

@@ -3,6 +3,7 @@
 mod ci;
 mod compatibility;
 mod consumers;
+mod mobile_apk;
 mod package_consumers;
 mod prefetch_pair;
 mod session_retention;
@@ -26,6 +27,11 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Task {
+    /// Pin, restore or verify an APK by content hash without executing it.
+    MobileApk {
+        #[command(subcommand)]
+        task: mobile_apk::Task,
+    },
     /// SHA-256 of a file or explicit hexadecimal bytes.
     Sha256 {
         value: String,
@@ -59,6 +65,10 @@ enum Task {
 fn main() -> Result<std::process::ExitCode> {
     let root = workspace_root(Path::new(env!("CARGO_MANIFEST_DIR")))?;
     let status = match Args::parse().task {
+        Task::MobileApk { task } => {
+            mobile_apk::run(&root, task)?;
+            0
+        }
         Task::Sha256 { value, hex } => {
             println!("{}", xtask_support::hash_input(&value, hex)?);
             0

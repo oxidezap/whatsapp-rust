@@ -1149,7 +1149,7 @@ impl Client {
             RetransmissionRoute::Status => unreachable!("status handled above"),
         };
         let stanza = wacore::session_engine::publication::PreparedSignal::new(
-            wacore::send::prepare_pairwise_retry_stanza(
+            wacore::send::prepare_pairwise_retry_stanza_for_role(
                 &mut store_adapter.session_store,
                 &mut store_adapter.identity_store,
                 wacore::send::PairwiseRetryRequest {
@@ -1162,6 +1162,7 @@ impl Client {
                     edit,
                     pre_encoded: pre_encoded.as_deref().map(Vec::as_slice),
                 },
+                self.sending_identity_role(),
             )
             .await?,
         )
@@ -1867,14 +1868,14 @@ impl Client {
         );
 
         let keys_node = if include_keys {
-            // Validate the account BEFORE reserving/marking the prekey: a missing
-            // account bails here, and marking after would abandon a one-time
-            // prekey from the upload window without any receipt going out.
-            let device_identity_bytes = waproto::codec::adv_signed_device_identity_to_vec(
-                device_snapshot.account.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("Missing device account info for retry receipt")
-                })?,
-            );
+            // Resolve the validated role before reserving a one-time prekey.
+            // Primaries may omit ADV under their explicit policy; Companion and
+            // Unknown still fail before mutating the upload window.
+            let device_identity_bytes = wacore::send::needs_device_identity_for_role(
+                true,
+                device_snapshot.account.as_deref(),
+                self.sending_identity_role(),
+            )?;
 
             // markKeyAsUploaded: the retry prekey goes directly to the peer, so
             // it must not also be re-offered to the server pool (a third party
@@ -1887,15 +1888,17 @@ impl Client {
                 .await?;
             drop(prekey_guard);
 
-            Some(wacore::protocol::retry::build_retry_keys_node(
-                &device_snapshot.identity_key.public_key,
-                new_prekey_id,
-                &new_prekey_public,
-                device_snapshot.signed_pre_key_id,
-                &device_snapshot.signed_pre_key.public_key,
-                device_snapshot.signed_pre_key_signature.to_vec(),
-                device_identity_bytes,
-            ))
+            Some(
+                wacore::protocol::retry::build_retry_keys_node_with_device_identity(
+                    &device_snapshot.identity_key.public_key,
+                    new_prekey_id,
+                    &new_prekey_public,
+                    device_snapshot.signed_pre_key_id,
+                    &device_snapshot.signed_pre_key.public_key,
+                    device_snapshot.signed_pre_key_signature.to_vec(),
+                    device_identity_bytes,
+                ),
+            )
         } else {
             None
         };
@@ -1997,6 +2000,106 @@ mod tests {
     use wacore::types::jid::JidExt as _;
     use wacore_binary::{Jid, JidExt};
     use waproto::whatsapp as wa;
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn keyed_primary_retry_without_adv_reaches_the_wire() {
+        use wacore::handshake::NoiseCipher;
+        use wacore::send::PrimaryDeviceIdentityPolicy::{AttachWhenAvailable, Omit};
+
+        for policy in [Omit, AttachWhenAvailable] {
+            let client =
+                crate::test_utils::primary_startup_client_with_identity_policy(policy).await;
+            let transport =
+                crate::transport::mock::CapturingMockTransportFactory::new().transport();
+            let socket = crate::socket::NoiseSocket::with_observers(
+                client.runtime.clone(),
+                transport.clone() as Arc<dyn crate::transport::Transport>,
+                NoiseCipher::new(&[0; 32]).unwrap(),
+                NoiseCipher::new(&[0; 32]).unwrap(),
+                crate::socket::noise_socket::SendObservers::with_stats(client.stats.clone()),
+            );
+            *client.noise_socket.lock().unwrap() = Some(Arc::new(socket));
+            client.set_connected_for_test(true);
+            client.set_driver_running_for_test(true, std::sync::atomic::Ordering::Release);
+            client.enter_live_mode_for_tests();
+            let peer = Jid::pn("15550000002");
+            let info = crate::types::message::MessageInfo {
+                id: "PRIMARYKEYRETRY".into(),
+                source: crate::types::message::MessageSource {
+                    chat: peer.clone(),
+                    sender: peer,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert!(matches!(
+                client
+                    .send_retry_receipt(
+                        &info,
+                        2,
+                        RetryReason::UnknownError,
+                        false,
+                        crate::types::events::DecryptFailMode::Show,
+                    )
+                    .await
+                    .unwrap(),
+                RetryReceiptSendOutcome::Sent {
+                    included_keys: true
+                }
+            ));
+            let frames = crate::test_utils::decrypt_wire_frames(&transport.sent(), &[0; 32]);
+            assert_eq!(frames.len(), 1);
+            let unpacked = wacore_binary::util::unpack(&frames[0]).unwrap();
+            let node = OwnedNodeRef::new(unpacked.into_owned()).unwrap();
+            let keys = node.get().get_optional_child("keys").unwrap();
+            assert!(keys.get_optional_child("device-identity").is_none());
+            assert!(keys.get_optional_child("identity").is_some());
+            assert!(keys.get_optional_child("key").is_some());
+            assert!(keys.get_optional_child("skey").is_some());
+            client.notify_connection_shutdown();
+        }
+    }
+
+    #[tokio::test]
+    async fn keyed_companion_retry_without_adv_does_not_reserve_a_prekey() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetAccount(None))
+            .await;
+        let before = client.persistence_manager.get_device_snapshot();
+        let peer = Jid::pn("15550000002");
+        let info = crate::types::message::MessageInfo {
+            id: "COMPANIONKEYRETRY".into(),
+            source: crate::types::message::MessageSource {
+                chat: peer.clone(),
+                sender: peer,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            client
+                .send_retry_receipt(
+                    &info,
+                    2,
+                    RetryReason::UnknownError,
+                    false,
+                    crate::types::events::DecryptFailMode::Show,
+                )
+                .await
+                .is_err()
+        );
+        let after = client.persistence_manager.get_device_snapshot();
+        assert_eq!(after.next_pre_key_id, before.next_pre_key_id);
+        assert_eq!(
+            after.first_unupload_pre_key_id,
+            before.first_unupload_pre_key_id
+        );
+        assert_eq!(transport.sent_count(), 0);
+        client.notify_connection_shutdown();
+    }
 
     #[tokio::test]
     async fn retry_logs_keep_context_without_dedup_keys_or_legacy_phones() {

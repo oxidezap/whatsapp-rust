@@ -572,7 +572,54 @@ fn unaccounted_for(
     )
 }
 
+fn app_state_sync_node(collections: Vec<Node>, authoritative: bool) -> Node {
+    let builder = NodeBuilder::new("sync").children(collections);
+    if authoritative {
+        builder.attr("data_namespace", "3").build()
+    } else {
+        builder.build()
+    }
+}
+fn discard_authoritative_snapshot(
+    list: &mut wacore::appstate::patch_decode::PatchList,
+    authoritative: bool,
+) {
+    if authoritative {
+        list.snapshot = None;
+        list.snapshot_ref = None;
+    }
+}
+
 impl Client {
+    // Request policy is independent of platform. Pinned Zapo bceb268c846763a2cd0b494da830a54aacdc3818
+    // WaAppStateSyncClient.ts:598-665/744 uses authoritative local state, namespace 3
+    // and ignores server snapshots. Cobalt MutationRequestBuilder and whalibmob
+    // retain snapshot bootstrap, so the host must select a profile explicitly.
+    fn authoritative_app_state(&self) -> Result<bool> {
+        #[cfg(feature = "mobile-core")]
+        if let Some(session) = &self.mobile_session {
+            session.validate_device(&self.persistence_manager.get_device_snapshot())?;
+            return match session.app_state_policy() {
+                Some(crate::MobileAppStatePolicy::AuthoritativeZapo) => Ok(true),
+                Some(crate::MobileAppStatePolicy::SnapshotCompatible) => Ok(false),
+                None => Err(anyhow::anyhow!(
+                    "primary app-state requires an explicit policy"
+                )),
+            };
+        }
+        if self
+            .persistence_manager
+            .get_device_snapshot()
+            .mobile_session
+            .is_some()
+        {
+            return Err(anyhow::anyhow!(
+                "primary app-state requires a configured mobile session"
+            ));
+        }
+        Ok(false)
+    }
+
     pub(crate) fn get_app_state_processor(&self) -> &Arc<AppStateProcessor> {
         self.app_state_processor.get_or_init(|| {
             debug!("Initializing AppStateProcessor for the first time.");
@@ -1670,6 +1717,12 @@ impl Client {
         scope: SyncScope,
         request: BatchedSyncRequest,
     ) -> Result<BatchedSyncOutcome> {
+        let authoritative = self.authoritative_app_state()?;
+        if authoritative && request.rebuild {
+            return Err(anyhow::anyhow!(
+                "authoritative primary app-state cannot restore a server snapshot"
+            ));
+        }
         let mut outcome = BatchedSyncOutcome::default();
         if collections.is_empty() {
             return Ok(outcome);
@@ -1814,6 +1867,7 @@ impl Client {
         outcome: &mut BatchedSyncOutcome,
     ) -> Result<()> {
         use wacore::appstate::patch_decode::CollectionSyncError;
+        let authoritative = self.authoritative_app_state()?;
         // WA Web's own bound. Its loop reads `(l < y || (i.length > 0 && l < C))`
         // with `y = 5` and `C = 500`, and since the body only runs while there
         // is something left to refetch, that collapses to `l < 500` — the `y`
@@ -1881,7 +1935,8 @@ impl Client {
                 // could be either. The flag is what separates them, and it is
                 // false on every row that predates it -- so those bootstrap once
                 // more, which is the safe direction.
-                let want_snapshot = !stored.as_ref().is_some_and(|s| s.has_baseline());
+                let want_snapshot =
+                    !authoritative && !stored.as_ref().is_some_and(|s| s.has_baseline());
                 let state = stored.unwrap_or_default();
                 if want_snapshot {
                     replaying_snapshot.insert(name);
@@ -1914,7 +1969,7 @@ impl Client {
                 return Ok(());
             }
 
-            let sync_node = NodeBuilder::new("sync").children(collection_nodes).build();
+            let sync_node = app_state_sync_node(collection_nodes, authoritative);
             let iq = crate::request::InfoQuery {
                 namespace: "w:sync:app:state",
                 query_type: crate::request::InfoQueryType::Set,
@@ -2007,6 +2062,9 @@ impl Client {
                 });
             }
 
+            for list in &mut patch_lists {
+                discard_authoritative_snapshot(list, authoritative);
+            }
             let proc = self.get_app_state_processor();
             // Pre-download all external blobs for all collections in the response,
             // concurrently (independent CDN GETs, keyed by directPath).
@@ -2302,6 +2360,12 @@ impl Client {
         name: WAPatchName,
         full_sync: bool,
     ) -> Result<SyncOutcome> {
+        let authoritative = self.authoritative_app_state()?;
+        if authoritative && full_sync {
+            return Err(anyhow::anyhow!(
+                "authoritative primary app-state cannot restore a server snapshot"
+            ));
+        }
         // Two questions, where `is_shutting_down()` answered a blend of them: is
         // the client finished, and can a request reach the server at all. A
         // planned reconnect is neither — it clears `is_connected` and leaves
@@ -2320,7 +2384,7 @@ impl Client {
         // See the batched builder: a completed bootstrap is a fact the record
         // carries, not one its presence implies.
         let stored = backend.get_version(name.as_str()).await?;
-        if !stored.as_ref().is_some_and(|s| s.has_baseline()) {
+        if !authoritative && !stored.as_ref().is_some_and(|s| s.has_baseline()) {
             full_sync = true;
         }
         let mut state = stored.unwrap_or_default();
@@ -2367,9 +2431,7 @@ impl Client {
                     if want_snapshot { "true" } else { "false" },
                 )
                 .attr("version", state.version);
-            let sync_node = NodeBuilder::new("sync")
-                .children([collection_builder.build()])
-                .build();
+            let sync_node = app_state_sync_node(vec![collection_builder.build()], authoritative);
             let iq = crate::request::InfoQuery {
                 namespace: "w:sync:app:state",
                 query_type: crate::request::InfoQueryType::Set,
@@ -2392,7 +2454,8 @@ impl Client {
 
             // Parse the response once here; the same parsed list is handed to the
             // processor below (no second parse).
-            let pl = wacore::appstate::patch_decode::parse_patch_list_ref(resp.get())?;
+            let mut pl = wacore::appstate::patch_decode::parse_patch_list_ref(resp.get())?;
+            discard_authoritative_snapshot(&mut pl, authoritative);
             debug!(target: "Client/AppState", "Parsed patch list for {:?}: has_snapshot_ref={} has_more_patches={} patches_count={}",
                 name, pl.snapshot_ref.is_some(), pl.has_more_patches, pl.patches.len());
 
@@ -2838,6 +2901,7 @@ impl Client {
         mutations: Vec<wa::SyncdMutation>,
     ) -> Result<()> {
         use wacore::appstate::patch_decode::CollectionSyncError;
+        let authoritative = self.authoritative_app_state()?;
 
         let patch_name = collection_name.parse::<WAPatchName>().ok();
         // Held across the whole build-send-resolve cycle: the base version is
@@ -2873,7 +2937,7 @@ impl Client {
         // send one either -- `pendingCollectionsInBootstrap` holds the mutations
         // back and logs "skipping N collections in sync iq patch because initial
         // full sync is incomplete". Sync first, then build.
-        if let Some(name) = patch_name {
+        if !authoritative && let Some(name) = patch_name {
             let backend = self.persistence_manager.backend();
             if !backend
                 .get_version(collection_name)
@@ -2907,8 +2971,15 @@ impl Client {
             // Cloned per attempt because a conflict rebuilds the patch against
             // the winner's base; verbs carry one or two mutations, and this only
             // runs on the (rare) conflict path after the first attempt.
-            let (patch_bytes, base_version) =
+            let (mut patch_bytes, base_version) =
                 proc.build_patch(collection_name, mutations.clone()).await?;
+            if authoritative {
+                // Zapo's resolveDeviceIndex includes primary device zero. This
+                // field is added after the MACs; other profiles retain omission.
+                let mut patch = waproto::codec::syncd_patch_decode(&patch_bytes)?;
+                patch.device_index = Some(0);
+                patch_bytes = waproto::codec::syncd_patch_to_vec(&patch);
+            }
 
             let collection_node = NodeBuilder::new("collection")
                 .attr("name", collection_name)
@@ -2916,7 +2987,7 @@ impl Client {
                 .attr("return_snapshot", "false")
                 .children([NodeBuilder::new("patch").bytes(patch_bytes).build()])
                 .build();
-            let sync_node = NodeBuilder::new("sync").children([collection_node]).build();
+            let sync_node = app_state_sync_node(vec![collection_node], authoritative);
             let iq = crate::request::InfoQuery {
                 namespace: "w:sync:app:state",
                 query_type: crate::request::InfoQueryType::Set,
@@ -2995,7 +3066,13 @@ impl Client {
                     // failure into five round trips, with the collection
                     // reservation held throughout.
                     if let Recovery::Failed(e) = self
-                        .absorb_conflicting_patches(collection_name, patch_name, list, has_more)
+                        .absorb_conflicting_patches(
+                            collection_name,
+                            patch_name,
+                            list,
+                            has_more,
+                            authoritative,
+                        )
                         .await
                     {
                         return Err(e.context(format!(
@@ -3032,7 +3109,9 @@ impl Client {
         patch_name: Option<WAPatchName>,
         mut list: wacore::appstate::patch_decode::PatchList,
         has_more: bool,
+        authoritative: bool,
     ) -> Recovery {
+        discard_authoritative_snapshot(&mut list, authoritative);
         // What the recovery has to move, read before anything can move it.
         // `process_parsed_patch_list` persists each patch as it applies it, so
         // reading after it would compare the advanced version against itself and
@@ -3209,6 +3288,10 @@ impl Client {
         name: &str,
         recovery: waproto::whatsapp::SyncdSnapshotRecovery,
     ) {
+        if !matches!(self.authoritative_app_state(), Ok(false)) {
+            warn!(target: "Client/AppState", "Not restoring a peer snapshot without a snapshot-compatible app-state policy");
+            return;
+        }
         let patch_name = name.parse::<WAPatchName>().unwrap_or(WAPatchName::Unknown);
         let admitted = match RecoveryCollection::admit(patch_name) {
             Ok(admitted) => admitted,
@@ -3446,6 +3529,10 @@ impl Client {
     /// the one collection where being wrong means talking to somebody who was
     /// blocked.
     async fn escalate_to_snapshot_recovery(&self, name: WAPatchName, err: &anyhow::Error) {
+        if self.is_mobile_primary() {
+            warn!(target: "Client/AppState", "Not asking a primary session to recover its own snapshot");
+            return;
+        }
         match RecoveryRequest::for_error(name, err.downcast_ref()) {
             RecoveryRequest::NotNeeded => return,
             RecoveryRequest::BlockList => {
@@ -6046,6 +6133,301 @@ mod send_patch_response_tests {
         );
     }
 
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn primary_app_state_profiles_choose_bootstrap_and_wire_namespace_explicitly() {
+        for (policy, first_is_patch, namespace) in [
+            (
+                crate::MobileAppStatePolicy::AuthoritativeZapo,
+                true,
+                Some("3"),
+            ),
+            (crate::MobileAppStatePolicy::SnapshotCompatible, false, None),
+        ] {
+            let (client, transport) =
+                crate::test_utils::create_primary_iq_test_client_with_app_state_policy(
+                    crate::test_utils::primary_test_backend(),
+                    Some(policy),
+                )
+                .await;
+            let (result, first, patches) = send_named_after_an_empty_sync_with_client(
+                wacore::appstate::schemas::SETTING_PUSH_NAME
+                    .collection
+                    .as_str(),
+                None,
+                client,
+                transport,
+                namespace,
+                true,
+            )
+            .await;
+            result.expect("selected primary policy must complete shared patch path");
+            assert_eq!(first, first_is_patch);
+            assert_eq!(patches, 1);
+        }
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn primary_single_and_batched_sync_use_selected_snapshot_policy() {
+        for (policy, namespace, snapshot) in [
+            (
+                crate::MobileAppStatePolicy::AuthoritativeZapo,
+                Some("3"),
+                "false",
+            ),
+            (
+                crate::MobileAppStatePolicy::SnapshotCompatible,
+                None,
+                "true",
+            ),
+        ] {
+            for batched in [false, true] {
+                let (client, transport) =
+                    crate::test_utils::create_primary_iq_test_client_with_app_state_policy(
+                        crate::test_utils::primary_test_backend(),
+                        Some(policy),
+                    )
+                    .await;
+                client.set_logged_in_for_test(true, Ordering::Relaxed);
+                client.authenticated_generation.store(
+                    client.connection_generation.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
+                let backend = client.persistence_manager.backend();
+                let key_id = b"primary-incoming-patch";
+                backend
+                    .set_sync_key(
+                        key_id,
+                        crate::store::traits::AppStateSyncKey {
+                            key_data: vec![5; 32],
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                client
+                    .persistence_manager
+                    .process_command(DeviceCommand::SetPushName("Before patch".into()))
+                    .await;
+                let mut value = wa::SyncActionValue::default();
+                value.push_name_setting.get_or_insert_default().name = Some("Primary patch".into());
+                value.timestamp = Some(1_700_000_000_000);
+                let keys = wacore::appstate::keys::expand_app_state_keys(&[5; 32]);
+                let (mutation, _) = wacore::appstate::encode::encode_record(
+                    wa::syncd_mutation::SyncdOperation::Set,
+                    b"[\"setting_pushName\"]",
+                    &value,
+                    &keys,
+                    key_id,
+                    &[7; 16],
+                    1,
+                );
+                let (patch, base) = client
+                    .get_app_state_processor()
+                    .build_patch(WAPatchName::CriticalBlock.as_str(), vec![mutation])
+                    .await
+                    .unwrap();
+                assert_eq!(base, 0);
+                let mut patch = waproto::codec::syncd_patch_decode(&patch).unwrap();
+                patch.version.get_or_insert_default().version = Some(1);
+                let patch = waproto::codec::syncd_patch_to_vec(&patch);
+                let sync = async {
+                    if batched {
+                        client
+                            .sync_collections_batched(
+                                vec![WAPatchName::CriticalBlock],
+                                client.sync_scope(None),
+                            )
+                            .await
+                            .map(|_| ())
+                    } else {
+                        client
+                            .process_app_state_sync_task(WAPatchName::CriticalBlock, false)
+                            .await
+                            .map(|_| ())
+                    }
+                };
+                let server = async {
+                    let node = crate::test_utils::decode_sent_iq(&transport, 0).await;
+                    let node = node.get();
+                    let mut attrs = node.attrs();
+                    let id = attrs.optional_string("id").unwrap();
+                    let sync = node.get_optional_child("sync").unwrap();
+                    assert_eq!(
+                        sync.attrs().optional_string("data_namespace").as_deref(),
+                        namespace
+                    );
+                    let collection = sync.get_optional_child("collection").unwrap();
+                    assert_eq!(
+                        collection
+                            .attrs()
+                            .optional_string("return_snapshot")
+                            .as_deref(),
+                        Some(snapshot)
+                    );
+                    assert_eq!(
+                        collection.attrs().optional_string("version").as_deref(),
+                        Some("0")
+                    );
+                    crate::test_utils::answer_iq(
+                        &client,
+                        &id,
+                        &NodeBuilder::new("iq")
+                            .attr("type", "result")
+                            .attr("id", id.as_ref())
+                            .attr("from", "s.whatsapp.net")
+                            .children([NodeBuilder::new("sync")
+                                .children([NodeBuilder::new("collection")
+                                    .attr("name", WAPatchName::CriticalBlock.as_str())
+                                    .children([NodeBuilder::new("patches")
+                                        .children([NodeBuilder::new("patch").bytes(patch).build()])
+                                        .build()])
+                                    .build()])
+                                .build()])
+                            .build(),
+                    )
+                    .await;
+                };
+                let (result, ()) = futures::join!(sync, server);
+                result.unwrap();
+                assert_eq!(transport.sent_count(), 1);
+                assert_eq!(
+                    backend
+                        .get_version(WAPatchName::CriticalBlock.as_str())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .version,
+                    1
+                );
+                assert_eq!(
+                    client.persistence_manager.get_device_snapshot().push_name,
+                    "Primary patch"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn primary_missing_app_state_policy_fails_before_transport_or_snapshot_writes() {
+        let (client, transport) =
+            crate::test_utils::create_primary_iq_test_client_with_app_state_policy(
+                crate::test_utils::primary_test_backend(),
+                None,
+            )
+            .await;
+        assert!(
+            client
+                .send_app_state_patch(COLLECTION, vec![wa::SyncdMutation::default()])
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("explicit policy")
+        );
+        assert!(
+            client
+                .process_app_state_sync_task(WAPatchName::Regular, false)
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .sync_collections_batched(vec![WAPatchName::Regular], client.sync_scope(None))
+                .await
+                .is_err()
+        );
+        client
+            .apply_recovered_collection(COLLECTION, None, wa::SyncdSnapshotRecovery::default())
+            .await;
+        assert!(
+            client
+                .persistence_manager
+                .backend()
+                .get_version(COLLECTION)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(transport.sent_count(), 0);
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn authoritative_primary_rejects_destructive_rebuild_and_preserves_local_baseline() {
+        let (client, transport) =
+            crate::test_utils::create_primary_iq_test_client_with_app_state_policy(
+                crate::test_utils::primary_test_backend(),
+                Some(crate::MobileAppStatePolicy::AuthoritativeZapo),
+            )
+            .await;
+        let before = wacore::appstate::hash::HashState {
+            version: 9,
+            bootstrapped: true,
+            ..Default::default()
+        };
+        client
+            .persistence_manager
+            .backend()
+            .set_version(COLLECTION, before.clone())
+            .await
+            .unwrap();
+        assert!(
+            client
+                .process_app_state_sync_task(WAPatchName::Regular, true)
+                .await
+                .is_err()
+        );
+        let request = BatchedSyncRequest {
+            rebuild: true,
+            ..Default::default()
+        };
+        assert!(
+            client
+                .sync_collections_batched_with(
+                    vec![WAPatchName::Regular],
+                    client.sync_scope(None),
+                    request
+                )
+                .await
+                .is_err()
+        );
+        client
+            .apply_recovered_collection(COLLECTION, None, wa::SyncdSnapshotRecovery::default())
+            .await;
+        assert_eq!(
+            client
+                .persistence_manager
+                .backend()
+                .get_version(COLLECTION)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            before.version
+        );
+        assert_eq!(transport.sent_count(), 0);
+    }
+
+    #[test]
+    fn only_authoritative_profile_discards_inline_and_external_server_snapshots() {
+        use wacore::appstate::patch_decode::PatchList;
+        for authoritative in [false, true] {
+            let mut list = PatchList {
+                name: WAPatchName::Regular,
+                has_more_patches: false,
+                patches: vec![],
+                snapshot: Some(wa::SyncdSnapshot::default()),
+                snapshot_ref: Some(wa::ExternalBlobReference::default()),
+                error: None,
+            };
+            discard_authoritative_snapshot(&mut list, authoritative);
+            assert_eq!(list.snapshot.is_none(), authoritative);
+            assert_eq!(list.snapshot_ref.is_none(), authoritative);
+        }
+    }
+
     /// Send a patch on `COLLECTION`, seeded with `version` (or no record), to a
     /// server that answers every IQ with a clean, empty collection. Returns the
     /// send's result, whether the very first IQ already carried a patch, and
@@ -6072,6 +6454,20 @@ mod send_patch_response_tests {
         version: Option<wacore::appstate::hash::HashState>,
     ) -> (Result<()>, bool, usize) {
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        send_named_after_an_empty_sync_with_client(
+            collection, version, client, transport, None, false,
+        )
+        .await
+    }
+
+    async fn send_named_after_an_empty_sync_with_client(
+        collection: &'static str,
+        version: Option<wacore::appstate::hash::HashState>,
+        client: Arc<Client>,
+        transport: Arc<crate::transport::mock::CapturingMockTransport>,
+        expected_namespace: Option<&'static str>,
+        public_action: bool,
+    ) -> (Result<()>, bool, usize) {
         client.set_logged_in_for_test(true, Ordering::Relaxed);
         client.authenticated_generation.store(
             client.connection_generation.load(Ordering::SeqCst),
@@ -6101,9 +6497,17 @@ mod send_patch_response_tests {
         let mut send = {
             let client = Arc::clone(&client);
             tokio::spawn(async move {
-                client
-                    .send_app_state_patch(collection, vec![wa::SyncdMutation::default()])
-                    .await
+                if public_action {
+                    client
+                        .profile()
+                        .sync_push_name("Synthetic primary")
+                        .await
+                        .map_err(Into::into)
+                } else {
+                    client
+                        .send_app_state_patch(collection, vec![wa::SyncdMutation::default()])
+                        .await
+                }
             })
         };
 
@@ -6122,6 +6526,21 @@ mod send_patch_response_tests {
                         .optional_string("id")
                         .expect("every IQ carries an id")
                         .into_owned();
+                    let sync = node.get_optional_child("sync").expect("sync child");
+                    assert_eq!(
+                        sync.attrs().optional_string("data_namespace").as_deref(),
+                        expected_namespace
+                    );
+                    if expected_namespace.is_some() {
+                        assert_eq!(
+                            sync.get_optional_child("collection")
+                                .unwrap()
+                                .attrs()
+                                .optional_string("return_snapshot")
+                                .as_deref(),
+                            Some("false")
+                        );
+                    }
                     let requested = node
                         .get_optional_child_by_tag(&["sync", "collection"])
                         .expect("sync request collection")
@@ -6137,6 +6556,14 @@ mod send_patch_response_tests {
                         .get_optional_child_by_tag(&["sync", "collection", "patch"])
                         .is_some();
                     if is_patch {
+                        let patch_node = node
+                            .get_optional_child_by_tag(&["sync", "collection", "patch"])
+                            .unwrap();
+                        let patch = waproto::codec::syncd_patch_decode(
+                            patch_node.as_node_ref().content_bytes().unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(patch.device_index, expected_namespace.map(|_| 0));
                         patch_attempts.fetch_add(1, Ordering::Relaxed);
                         if frame == 0 {
                             first_iq_carried_a_patch.store(1, Ordering::Relaxed);

@@ -418,6 +418,11 @@ impl SessionLockGuard {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait SendContextResolver: crate::sync_marker::MaybeSendSync {
+    /// Default preserves companion identity requirements for existing hosts.
+    fn sender_identity_role(&self) -> crate::send::SenderIdentityRole {
+        crate::send::SenderIdentityRole::Companion
+    }
+
     async fn resolve_devices(&self, jids: &[Jid]) -> Result<Vec<Jid>, anyhow::Error>;
 
     async fn fetch_prekeys(

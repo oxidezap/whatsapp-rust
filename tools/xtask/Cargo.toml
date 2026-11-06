@@ -18,6 +18,10 @@ toml = "1"
 semver = "1"
 tar = "0.4"
 flate2.workspace = true
+sha2.workspace = true
+hex.workspace = true
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+url = "2"
 
 [lints]
 workspace = true

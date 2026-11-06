@@ -893,10 +893,9 @@ impl Client {
                 .await;
             }
             Some(StanzaTag::Status) if is_non_newsletter_status_stanza(nr) => {
-                // The rollout also addresses <status> from contacts/groups.
-                // NACK 488 leaves these IDs pending (Baileys #2858). Until we
-                // model their status metadata, acknowledge them without
-                // exposing their content as ordinary DMs or group messages.
+                // ACK-only experiment prompted by Baileys #2858/#2883.
+                // Server retention and equivalent Rust incidents are unproven;
+                // this branch does not implement the Web's status processing.
                 // The deferred gate below sends the single plain status ACK.
             }
             _ => {
@@ -1453,6 +1452,36 @@ impl Client {
             }
         };
 
+        // Primary sessions own their profile; they do not receive the Web
+        // companion's setting_pushName bootstrap. Only seed an absent local
+        // name so a reconnect cannot overwrite a newer local rename.
+        let primary_display_name = self
+            .is_mobile_primary()
+            .then(|| node.get_attr("display_name").map(|name| name.to_string()))
+            .flatten();
+        #[cfg(feature = "mobile-core")]
+        let primary_account = self
+            .is_mobile_primary()
+            .then(|| {
+                node.get_optional_child("device-identity")
+                    .and_then(wacore_binary::NodeRef::content_bytes)
+                    .map(|bytes| {
+                        let device = self.persistence_manager.get_device_snapshot();
+                        let own = device.pn.as_ref().ok_or("missing primary account")?;
+                        let identity: &[u8; 32] = device.identity_key.public_key.public_key_bytes();
+                        let profile = self
+                            .mobile_session
+                            .as_ref()
+                            .ok_or("missing primary session profile")?
+                            .self_identity_profile();
+                        wacore::mobile::primary::validate_primary_account_identity_with_profile(
+                            bytes, identity, own, profile,
+                        )
+                        .map(Box::new)
+                        .map_err(|_| "invalid primary success device identity")
+                    })
+            })
+            .flatten();
         let client_clone = self.clone();
         let task_generation = current_generation;
         #[cfg(feature = "bench-harness")]
@@ -1460,11 +1489,50 @@ impl Client {
         self.runtime.spawn_detached(Box::pin(async move {
             #[cfg(feature = "bench-harness")]
             let mut _startup_task = startup_task;
+            if client_clone.connection_generation.load(Ordering::SeqCst) != task_generation {
+                return;
+            }
+            #[cfg(feature = "mobile-core")]
+            match primary_account {
+                Some(Ok(account)) => {
+                    client_clone
+                        .persistence_manager
+                        .process_command(DeviceCommand::SetAccount(Some(*account)))
+                        .await;
+                }
+                Some(Err(error)) => {
+                    warn!("Primary startup rejected server device identity: {error}");
+                    Box::pin(client_clone.reject_primary_identity(task_generation)).await;
+                    return;
+                }
+                None => {}
+            }
+            if let Some(name) = primary_display_name
+                && client_clone.persistence_manager.get_device_snapshot().push_name.is_empty()
+            {
+                client_clone
+                    .persistence_manager
+                    .process_command(DeviceCommand::SetPushName(name))
+                    .await;
+            }
             // Update LID if changed (moved here to avoid blocking the read loop
             // on Device snapshot + write lock).
             if let Some(lid) = lid_from_server {
                 let device_snapshot =
                     client_clone.persistence_manager.get_device_snapshot();
+                // The tracing-expanded migration future must not inflate
+                // the task retained throughout the offline drain.
+                if client_clone.is_mobile_primary()
+                    && let Some(pn) = device_snapshot.pn.as_ref()
+                    && let Err(error) = Box::pin(client_clone.add_lid_pn_mapping(
+                        lid.user.as_str(),
+                        pn.user.as_str(),
+                        wacore::types::lid_pn::LearningSource::Other,
+                    ))
+                    .await
+                {
+                    warn!("Failed to persist primary own-account LID mapping: {error}");
+                }
                 if device_snapshot.lid.as_ref() != Some(&lid) {
                     debug!("Updating LID from server to '{}'", lid.observe());
                     client_clone
@@ -1510,7 +1578,8 @@ impl Client {
             // Check if we need initial app state sync (empty pushname indicates fresh pairing
             // where pushname will come from app state sync's setting_pushName mutation)
             let device_snapshot = client_clone.persistence_manager.get_device_snapshot();
-            let needs_pushname_from_sync = device_snapshot.push_name.is_empty();
+            let mobile_primary = client_clone.is_mobile_primary();
+            let needs_pushname_from_sync = !mobile_primary && device_snapshot.push_name.is_empty();
             if needs_pushname_from_sync {
                 debug!("Push name is empty - will be set from app state sync (setting_pushName)");
             }
@@ -1523,6 +1592,26 @@ impl Client {
                     "Skipping post-login init: connection closed (likely pairing phase reconnect)"
                 );
                 return;
+            }
+
+            check_generation!();
+            #[cfg(feature = "mobile-core")]
+            if let Some(session) = &client_clone.mobile_session {
+                if let Err(error) = client_clone
+                    .ensure_primary_app_state_key(session.app_state_key())
+                    .await
+                {
+                    warn!("Primary startup cannot initialize authoritative app-state: {error}");
+                    Box::pin(client_clone.fail_primary_app_state_startup(task_generation)).await;
+                    return;
+                }
+                check_generation!();
+                // The primary's validated durable key is its own bootstrap
+                // material. It must not wait for a companion key-share from itself.
+                client_clone
+                    .initial_app_state_keys_received
+                    .store(true, Ordering::Release);
+                client_clone.initial_keys_synced_notifier.notify(usize::MAX);
             }
 
             check_generation!();
@@ -1567,7 +1656,8 @@ impl Client {
                     // the first message). It used to sit between `<success>` and the
                     // `set_passive(false)` that gates offline delivery, where its two
                     // serial DB reads delayed the backlog for a log line.
-                    if let Err(e) = key_client.log_primary_phone_session_state().await
+                    if !key_client.is_mobile_primary()
+                        && let Err(e) = key_client.log_primary_phone_session_state().await
                         && !key_client.is_shutting_down()
                     {
                         warn!(target: "Client/PDO", "Failed to check the primary-phone session on login: {e:?}");
@@ -1605,6 +1695,19 @@ impl Client {
                 && !client_clone.is_shutting_down()
             {
                 warn!("Failed to send post-connect active IQ: {e:?}");
+            }
+
+            // Primary references announce availability immediately after active,
+            // before draining offline messages. A companion instead waits for
+            // its app-state profile bootstrap below. Preserve the host's manual
+            // presence policy through the shared presence API.
+            if mobile_primary {
+                check_generation!();
+                match Box::pin(client_clone.send_automatic_available()).await {
+                    Ok(true) => debug!("Primary initial presence sent successfully."),
+                    Ok(false) => {}
+                    Err(e) => warn!("Failed to send primary initial presence: {e:?}"),
+                }
             }
 
             // === Wait for offline sync to complete ===
@@ -1736,7 +1839,18 @@ impl Client {
             check_generation!();
 
             let flag_set = client_clone.needs_initial_full_sync.is_armed();
-            let needs_initial_sync = flag_set || needs_pushname_from_sync;
+            // The authoritative profile owns its baseline; the explicit
+            // SnapshotCompatible profile retains the shared bootstrap exchange.
+            // Peer snapshot recovery still rejects a primary asking itself.
+            #[cfg(feature = "mobile-core")]
+            let snapshot_bootstrap = client_clone.mobile_session.as_ref().is_some_and(|session| {
+                session.app_state_policy()
+                    == Some(crate::MobileAppStatePolicy::SnapshotCompatible)
+            });
+            #[cfg(not(feature = "mobile-core"))]
+            let snapshot_bootstrap = false;
+            let needs_initial_sync =
+                (!mobile_primary || snapshot_bootstrap) && (flag_set || needs_pushname_from_sync);
 
             if needs_initial_sync {
                 // Boxed, and the arm behind its own `async fn`, because a Rust
@@ -1758,7 +1872,7 @@ impl Client {
                 // === Reconnection path ===
                 // Pushname is already known, send presence and Connected immediately.
                 let device_snapshot = client_clone.persistence_manager.get_device_snapshot();
-                if !device_snapshot.push_name.is_empty() {
+                if !mobile_primary && !device_snapshot.push_name.is_empty() {
                     match client_clone.send_automatic_available().await {
                         Ok(true) => debug!("Initial presence sent successfully."),
                         Ok(false) => {}
@@ -1777,6 +1891,80 @@ impl Client {
                 client_clone.dispatch_connected(task_generation).await;
             }
         }));
+    }
+
+    /// A local bootstrap failure is retryable; retire only its authenticated socket.
+    #[cfg(feature = "mobile-core")]
+    async fn fail_primary_app_state_startup(self: &Arc<Self>, generation: u64) {
+        let transport = {
+            let _publish = self.connection_publish.lock().await;
+            let transport = self.transport.lock().await.clone();
+            let failed = self.session_state.transition(Ordering::SeqCst, |state| {
+                if state.snapshot().generation().get() != generation {
+                    return false;
+                }
+                state.invalidate_authentication();
+                self.session_state
+                    .status
+                    .fetch_or(SessionState::PRIMARY_APP_STATE_FAILURE, Ordering::Relaxed);
+                true
+            });
+            if !failed {
+                return;
+            }
+            // The driver consumes the local outcome before cleanup, then reports
+            // it after clearing connection state through its normal event path.
+            self.notify_connection_shutdown();
+            transport
+        };
+        if let Some(transport) = transport {
+            let _ = rt_timeout(
+                &*self.runtime,
+                Self::TRANSPORT_CLOSE_TIMEOUT,
+                transport.disconnect(),
+            )
+            .await;
+        }
+    }
+
+    #[cfg(feature = "mobile-core")]
+    async fn reject_primary_identity(self: &Arc<Self>, generation: u64) {
+        let transport = {
+            let _publish = self.connection_publish.lock().await;
+            if self.connection_generation.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            // Capture this transport before releasing publication. A replacement
+            // installed during the bounded close must not be closed in its place.
+            let transport = self.transport.lock().await.clone();
+            // Cleanup advances the generation under this same lifecycle lock,
+            // without taking connection_publish. Revalidate after transport capture
+            // and commit the terminal verdict atomically with that generation.
+            let rejected = self.session_state.transition(Ordering::SeqCst, |state| {
+                if state.snapshot().generation().get() != generation {
+                    return false;
+                }
+                self.record_protocol_terminal_reason(
+                    ProtocolTerminalReason::InvalidPrimaryIdentity,
+                );
+                state.forbid_reconnect();
+                state.invalidate_authentication();
+                true
+            });
+            if !rejected {
+                return;
+            }
+            self.notify_connection_shutdown();
+            transport
+        };
+        if let Some(transport) = transport {
+            let _ = rt_timeout(
+                &*self.runtime,
+                Self::TRANSPORT_CLOSE_TIMEOUT,
+                transport.disconnect(),
+            )
+            .await;
+        }
     }
 
     /// The fresh-pairing arm of the post-login sequence: await the critical
@@ -2641,6 +2829,504 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "mobile-core")]
+    use crate::test_utils::primary_startup_client;
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn primary_success_seeds_profile_but_cannot_be_ready_without_its_authoritative_key() {
+        let client = primary_startup_client().await;
+        let events = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(events.clone()).detach();
+        client.set_connected_for_test(true);
+        let success = NodeBuilder::new("success")
+            .attr("display_name", "Synthetic primary")
+            .attr("lid", "10000000001@lid")
+            .build();
+        client.handle_success(&success.as_node_ref()).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        let device = client.persistence_manager.get_device_snapshot();
+        assert_eq!(device.push_name, "Synthetic primary");
+        assert_eq!(device.lid.as_ref().unwrap().user.as_str(), "10000000001");
+        assert_eq!(
+            client
+                .persistence_manager
+                .backend()
+                .get_lid_mapping("10000000001")
+                .await
+                .unwrap()
+                .unwrap()
+                .phone_number,
+            "15550000001"
+        );
+        assert!(
+            !client.is_logged_in(),
+            "unusable primary startup must end authentication"
+        );
+        assert!(client.auto_reconnect_enabled());
+        assert!(client.connection_shutdown_signal().is_fired());
+        assert!(
+            events
+                .events()
+                .iter()
+                .all(|event| !matches!(&**event, Event::Connected(_)))
+        );
+        client.notify_connection_shutdown();
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn primary_success_does_not_persist_an_unverified_server_identity() {
+        let client = primary_startup_client().await;
+        let transport = Arc::new(crate::transport::mock::StallingMockTransport::new());
+        *client.transport.lock().await =
+            Some(transport.clone() as Arc<dyn crate::transport::Transport>);
+        client.set_connected_for_test(true);
+        let success = NodeBuilder::new("success")
+            .attr("display_name", "Unverified profile")
+            .children([NodeBuilder::new("device-identity")
+                .bytes(vec![0xff])
+                .build()])
+            .build();
+        client.handle_success(&success.as_node_ref()).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        let device = client.persistence_manager.get_device_snapshot();
+        assert!(device.account.is_none());
+        assert!(device.push_name.is_empty());
+        assert!(!client.is_logged_in());
+        assert!(!client.auto_reconnect_enabled());
+        assert!(client.connection_shutdown_signal().is_fired());
+        assert_eq!(transport.disconnects_started(), 1);
+        assert_eq!(
+            *client.protocol_terminal_reason.lock().unwrap(),
+            Some(ProtocolTerminalReason::InvalidPrimaryIdentity)
+        );
+        client.notify_connection_shutdown();
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[derive(Default)]
+    struct PrimaryStartupCloseRecorder {
+        closes: AtomicUsize,
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl crate::transport::Transport for PrimaryStartupCloseRecorder {
+        async fn send(&self, _data: bytes::Bytes) -> Result<()> {
+            Ok(())
+        }
+
+        async fn disconnect(&self) {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn primary_app_state_backend_failure_recycles_authenticated_socket() {
+        let (mut backend, _dropped) = crate::store::release::tests::ProbeBackend::new();
+        backend.backend = crate::test_utils::primary_test_backend();
+        let fail = Arc::new(AtomicBool::new(false));
+        backend.fail_before_method = Some(("get_latest_sync_key_id", fail.clone()));
+        let (client, _) =
+            crate::test_utils::create_primary_iq_test_client_with_backend(Arc::new(backend)).await;
+        let transport = Arc::new(PrimaryStartupCloseRecorder::default());
+        *client.transport.lock().await =
+            Some(transport.clone() as Arc<dyn crate::transport::Transport>);
+        struct ClearedStateObserver {
+            client: std::sync::Weak<Client>,
+            observed: AtomicBool,
+        }
+        impl wacore::types::events::EventHandler for ClearedStateObserver {
+            fn handle_event(&self, event: Arc<Event>) {
+                if matches!(&*event, Event::Disconnected(_)) {
+                    let client = self.client.upgrade().unwrap();
+                    assert!(!client.is_socket_connected());
+                    assert!(!client.is_logged_in());
+                    self.observed.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        let observer = Arc::new(ClearedStateObserver {
+            client: Arc::downgrade(&client),
+            observed: AtomicBool::new(false),
+        });
+        client.subscribe_handler(observer.clone()).detach();
+        let events = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(events.clone()).detach();
+        fail.store(true, Ordering::Relaxed);
+        let success = NodeBuilder::new("success").build();
+        client.handle_success(&success.as_node_ref()).await;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while transport.closes.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed bootstrap must close its authenticated transport");
+        assert!(!client.is_logged_in());
+        assert!(client.auto_reconnect_enabled());
+        assert!(client.connection_shutdown_signal().is_fired());
+        assert!(client.protocol_terminal_reason.lock().unwrap().is_none());
+        assert_eq!(transport.closes.load(Ordering::SeqCst), 1);
+        let reason = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.connection_for_test().read_until_disconnected(),
+        )
+        .await
+        .expect("driver must complete normal cleanup after bootstrap failure");
+        assert_eq!(
+            reason,
+            Some(DisconnectReason::PrimaryAppStateInitializationFailed)
+        );
+        assert!(observer.observed.load(Ordering::SeqCst));
+        assert!(client.auto_reconnect_enabled());
+        let observed = events.events();
+        assert!(observed.iter().any(|event| matches!(
+            &**event,
+            Event::Disconnected(disconnected)
+                if disconnected.reason == DisconnectReason::PrimaryAppStateInitializationFailed
+        )));
+        assert!(
+            !observed
+                .iter()
+                .any(|event| matches!(&**event, Event::Connected(_)))
+        );
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn retired_primary_app_state_failure_cannot_affect_replacement() {
+        let client = primary_startup_client().await;
+        let events = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(events.clone()).detach();
+        let transport = Arc::new(PrimaryStartupCloseRecorder::default());
+        *client.transport.lock().await =
+            Some(transport.clone() as Arc<dyn crate::transport::Transport>);
+        client.set_connected_for_test(true);
+        let generation = client.connection_generation.load(Ordering::SeqCst);
+        let capture = client.transport.lock().await;
+        let mut failure = Box::pin(client.fail_primary_app_state_startup(generation));
+        assert!(futures::poll!(failure.as_mut()).is_pending());
+        // Retirement uses the same lifecycle lock as the helper's transition.
+        client.set_generation_for_test(generation + 1, Ordering::SeqCst);
+        let shutdown = client.connection_shutdown_signal();
+        let reconnect = client.auto_reconnect_enabled();
+        drop(capture);
+        failure.await;
+        assert!(!shutdown.is_fired());
+        assert!(client.is_socket_connected());
+        assert_eq!(client.auto_reconnect_enabled(), reconnect);
+        assert!(client.protocol_terminal_reason.lock().unwrap().is_none());
+        assert_eq!(transport.closes.load(Ordering::SeqCst), 0);
+        assert!(events.events().is_empty());
+        assert_eq!(
+            client.session_state.status.load(Ordering::Relaxed)
+                & SessionState::PRIMARY_APP_STATE_FAILURE,
+            0
+        );
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn expected_disconnect_suppresses_primary_app_state_failure_event() {
+        let client = primary_startup_client().await;
+        let events = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(events.clone()).detach();
+        let generation = client.connection_generation.load(Ordering::SeqCst);
+        client.fail_primary_app_state_startup(generation).await;
+        client.expect_session_disconnect();
+        let reason = client.connection_for_test().read_until_disconnected().await;
+        assert_eq!(reason, None);
+        assert!(
+            !events
+                .events()
+                .iter()
+                .any(|event| matches!(&**event, Event::Disconnected(_)))
+        );
+        assert_eq!(
+            client.session_state.status.load(Ordering::Relaxed)
+                & SessionState::PRIMARY_APP_STATE_FAILURE,
+            0
+        );
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn primary_app_state_outcome_is_cleared_by_generation_retirement() {
+        let client = primary_startup_client().await;
+        let generation = client.connection_generation.load(Ordering::SeqCst);
+        client.fail_primary_app_state_startup(generation).await;
+        assert_ne!(
+            client.session_state.status.load(Ordering::Relaxed)
+                & SessionState::PRIMARY_APP_STATE_FAILURE,
+            0
+        );
+        client.advance_session_generation();
+        assert_eq!(
+            client.session_state.status.load(Ordering::Relaxed)
+                & SessionState::PRIMARY_APP_STATE_FAILURE,
+            0
+        );
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn retired_primary_identity_failure_cannot_close_a_replacement() {
+        let client = primary_startup_client().await;
+        let transport = Arc::new(crate::transport::mock::StallingMockTransport::new());
+        *client.transport.lock().await =
+            Some(transport.clone() as Arc<dyn crate::transport::Transport>);
+        client.set_generation_for_test(2, Ordering::Release);
+        let shutdown = client.connection_shutdown_signal();
+        let reconnect = client.auto_reconnect_enabled();
+        client.reject_primary_identity(1).await;
+        assert!(!shutdown.is_fired());
+        assert_eq!(client.auto_reconnect_enabled(), reconnect);
+        assert_eq!(transport.disconnects_started(), 0);
+        assert!(client.protocol_terminal_reason.lock().unwrap().is_none());
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn primary_identity_failure_waiting_for_transport_cannot_stop_a_retired_session() {
+        #[derive(Default)]
+        struct RecordingCloseTransport {
+            closes: AtomicUsize,
+        }
+
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        impl crate::transport::Transport for RecordingCloseTransport {
+            async fn send(&self, _data: bytes::Bytes) -> Result<()> {
+                Ok(())
+            }
+
+            async fn disconnect(&self) {
+                self.closes.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let client = primary_startup_client().await;
+        // The slot lock below creates the intended await gap. Stalling close
+        // would instead require advancing this primary fixture's VirtualClock.
+        let old = Arc::new(RecordingCloseTransport::default());
+        *client.transport.lock().await = Some(old.clone() as Arc<dyn crate::transport::Transport>);
+        client.set_connected_for_test(true);
+        let generation = client.connection_generation.load(Ordering::SeqCst);
+        let reconnect = client.auto_reconnect_enabled();
+        let capture = client.transport.lock().await;
+        let mut rejection = Box::pin(client.reject_primary_identity(generation));
+        assert!(futures::poll!(rejection.as_mut()).is_pending());
+
+        let cleanup_client = Arc::clone(&client);
+        let cleanup = tokio::spawn(async move { cleanup_client.cleanup_connection_state().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while client.connection_generation.load(Ordering::SeqCst) == generation {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup must retire the generation while transport capture is blocked");
+
+        drop(capture);
+        tokio::time::timeout(Duration::from_secs(2), rejection)
+            .await
+            .expect("retired rejection must finish once transport capture is released");
+        assert_eq!(client.auto_reconnect_enabled(), reconnect);
+        assert!(client.protocol_terminal_reason.lock().unwrap().is_none());
+        tokio::time::timeout(Duration::from_secs(2), cleanup)
+            .await
+            .expect("immediate transport cleanup must finish")
+            .unwrap();
+        assert_eq!(old.closes.load(Ordering::SeqCst), 1);
+
+        let replacement = Arc::new(crate::transport::mock::StallingMockTransport::new());
+        *client.transport.lock().await =
+            Some(replacement.clone() as Arc<dyn crate::transport::Transport>);
+        client.reset_connection_shutdown();
+        client.set_connected_for_test(true);
+        assert_eq!(replacement.disconnects_started(), 0);
+        assert!(!client.connection_shutdown_signal().is_fired());
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn primary_startup_honors_the_selected_snapshot_bootstrap_policy() {
+        use crate::MobileAppStatePolicy::{AuthoritativeZapo, SnapshotCompatible};
+
+        for policy in [AuthoritativeZapo, SnapshotCompatible] {
+            let (client, transport) =
+                crate::test_utils::create_primary_iq_test_client_with_app_state_policy(
+                    crate::test_utils::primary_test_backend(),
+                    Some(policy),
+                )
+                .await;
+            let mut fingerprint = waproto::whatsapp::message::AppStateSyncKeyFingerprint::default();
+            fingerprint.raw_id = Some(7);
+            fingerprint.current_index = Some(0);
+            fingerprint.device_indexes = vec![0];
+            client
+                .persistence_manager
+                .backend()
+                .set_sync_key(
+                    &[0, 0, 0, 0, 0, 1],
+                    crate::store::traits::AppStateSyncKey {
+                        key_data: vec![7; 32],
+                        fingerprint: waproto::codec::app_state_sync_key_fingerprint_to_vec(
+                            &fingerprint,
+                        ),
+                        timestamp: 1000,
+                    },
+                )
+                .await
+                .unwrap();
+            client
+                .persistence_manager
+                .process_command(DeviceCommand::SetPushName("Synthetic primary".into()))
+                .await;
+            let events = Arc::new(crate::test_utils::TestEventCollector::default());
+            client.subscribe_handler(events.clone()).detach();
+            client.invalidate_session_authentication();
+            client.set_connected_for_test(true);
+            client.offline_sync_completed.store(true, Ordering::Relaxed);
+            client
+                .needs_initial_full_sync
+                .settle(client.connection_generation.load(Ordering::SeqCst), true);
+            assert!(
+                !client
+                    .initial_app_state_keys_received
+                    .load(Ordering::Acquire)
+            );
+            let success = NodeBuilder::new("success").build();
+            client.handle_success(&success.as_node_ref()).await;
+
+            let sent_snapshot_request = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut handled = 0;
+                loop {
+                    let frames =
+                        crate::test_utils::decrypt_wire_frames(&transport.sent(), &[0; 32]);
+                    for frame in &frames[handled..] {
+                        let unpacked = wacore_binary::util::unpack(frame).unwrap();
+                        let owned =
+                            wacore_binary::OwnedNodeRef::new(unpacked.into_owned()).unwrap();
+                        let node = owned.get();
+                        if node.tag.as_ref() != StanzaTag::Iq.as_str() {
+                            continue;
+                        }
+                        if node.attrs().optional_string("xmlns").as_deref()
+                            == Some("w:sync:app:state")
+                        {
+                            return true;
+                        }
+                        if let Some(id) = node.attrs().optional_string("id") {
+                            let id = id.to_string();
+                            if client.response_waiters_guard().contains_key(&id) {
+                                let response = NodeBuilder::new("iq")
+                                    .attr("from", "s.whatsapp.net")
+                                    .attr("type", "result")
+                                    .attr("id", id.as_str())
+                                    .build();
+                                crate::test_utils::answer_iq(&client, &id, &response).await;
+                            }
+                        }
+                    }
+                    handled = frames.len();
+                    if events
+                        .events()
+                        .iter()
+                        .any(|event| matches!(&**event, Event::Connected(_)))
+                    {
+                        return false;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("startup must reach bootstrap or readiness");
+            assert_eq!(sent_snapshot_request, policy == SnapshotCompatible);
+            assert!(
+                client
+                    .initial_app_state_keys_received
+                    .load(Ordering::Acquire)
+            );
+            client.notify_connection_shutdown();
+        }
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn primary_with_a_durable_key_becomes_ready_without_companion_bootstrap() {
+        let client = primary_startup_client().await;
+        let key_id = [0, 0, 0, 0, 0, 1];
+        let mut fingerprint = waproto::whatsapp::message::AppStateSyncKeyFingerprint::default();
+        fingerprint.raw_id = Some(7);
+        fingerprint.current_index = Some(0);
+        fingerprint.device_indexes = vec![0];
+        client
+            .persistence_manager
+            .backend()
+            .set_sync_key(
+                &key_id,
+                crate::store::traits::AppStateSyncKey {
+                    key_data: vec![7; 32],
+                    fingerprint: waproto::codec::app_state_sync_key_fingerprint_to_vec(
+                        &fingerprint,
+                    ),
+                    timestamp: 1000,
+                },
+            )
+            .await
+            .unwrap();
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetPushName("New local profile".into()))
+            .await;
+        let events = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(events.clone()).detach();
+        client.set_connected_for_test(true);
+        client
+            .needs_initial_full_sync
+            .settle(client.connection_generation.load(Ordering::SeqCst), true);
+        // The transport intentionally has no peer: a companion bootstrap would
+        // block on its app-state request/key-share. A primary already owns its
+        // durable key and must publish readiness after its offline drain.
+        client.offline_sync_completed.store(true, Ordering::Relaxed);
+        let success = NodeBuilder::new("success")
+            .attr("display_name", "Older server profile")
+            .build();
+        client.handle_success(&success.as_node_ref()).await;
+        for _ in 0..200 {
+            if events
+                .events()
+                .iter()
+                .any(|event| matches!(&**event, Event::Connected(_)))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            events
+                .events()
+                .iter()
+                .any(|event| matches!(&**event, Event::Connected(_)))
+        );
+        assert_eq!(
+            client.persistence_manager.get_device_snapshot().push_name,
+            "New local profile",
+            "a stale success observation must not overwrite local intent"
+        );
+        client.notify_connection_shutdown();
+    }
+
     #[tokio::test]
     async fn an_ack_capacity_retry_releases_its_source_and_keeps_its_original_scope() {
         use crate::test_utils::{create_iq_test_client, node_to_owned_ref};
@@ -2975,8 +3661,9 @@ mod tests {
     /// `wait_for_offline_delivery_end` for the whole offline drain, so its
     /// future is resident for minutes on a client with a backlog. Inlining the
     /// fresh-pairing arm made it 8,224 B. The active IQ also needs a box when
-    /// tracing expands its future. Neither belongs in the drain's resident
-    /// storage. This bounds the spawned task, not the temporary boxed work.
+    /// tracing expands its future, as does primary LID/PN migration. None belongs
+    /// in the drain's resident storage. This bounds the spawned task, not the
+    /// temporary boxed work.
     /// Budget: rebaseline per [layout asserts](../../agent_docs/testing.md).
     #[tokio::test]
     async fn the_post_login_task_does_not_carry_the_fresh_pairing_arm() {

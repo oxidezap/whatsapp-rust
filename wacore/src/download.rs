@@ -5,6 +5,7 @@ use crate::libsignal::crypto::{
 use anyhow::{Result, anyhow};
 use base64::Engine as _;
 use base64::prelude::*;
+use core::mem::{size_of, size_of_val};
 use hmac::Hmac;
 use hmac::Mac;
 use sha2::Sha256;
@@ -106,14 +107,18 @@ pub enum MediaType {
     GroupHistory,
     MusicArtwork,
     NewsletterMusicArtwork,
+    /// Voice note: Audio crypto context; Web routes to audio, native profiles may select ptt.
+    Ptt,
+    /// Animated video: Video crypto context; Web routes to video, native profiles may select gif.
+    Gif,
 }
 
 impl MediaType {
     pub fn app_info(&self) -> &'static str {
         match self {
             MediaType::Image => "WhatsApp Image Keys",
-            MediaType::Video => "WhatsApp Video Keys",
-            MediaType::Audio => "WhatsApp Audio Keys",
+            MediaType::Video | MediaType::Gif => "WhatsApp Video Keys",
+            MediaType::Audio | MediaType::Ptt => "WhatsApp Audio Keys",
             MediaType::Document => "WhatsApp Document Keys",
             MediaType::History => "WhatsApp History Keys",
             MediaType::GroupHistory => "Group History",
@@ -135,8 +140,8 @@ impl MediaType {
     pub fn mms_type(&self) -> &'static str {
         match self {
             MediaType::Image | MediaType::Sticker => "image",
-            MediaType::Video => "video",
-            MediaType::Audio => "audio",
+            MediaType::Video | MediaType::Gif => "video",
+            MediaType::Audio | MediaType::Ptt => "audio",
             MediaType::Document => "document",
             MediaType::History => "md-msg-hist",
             MediaType::GroupHistory => "group-history",
@@ -154,8 +159,8 @@ impl MediaType {
     pub fn upload_path(&self) -> &'static str {
         match self {
             MediaType::Image | MediaType::Sticker => "/mms/image",
-            MediaType::Video => "/mms/video",
-            MediaType::Audio => "/mms/audio",
+            MediaType::Video | MediaType::Gif => "/mms/video",
+            MediaType::Audio | MediaType::Ptt => "/mms/audio",
             MediaType::Document => "/mms/document",
             MediaType::History => "/mms/md-msg-hist",
             MediaType::GroupHistory => "/mms/group-history",
@@ -1789,7 +1794,7 @@ mod tests {
     /// Every variant. The exhaustive match in
     /// `every_media_type_builds_download_urls` is what forces a new
     /// one to be named here instead of silently skipping the URL assertions.
-    const ALL_MEDIA_TYPES: [MediaType; 14] = [
+    const ALL_MEDIA_TYPES: [MediaType; 16] = [
         MediaType::Image,
         MediaType::Video,
         MediaType::Audio,
@@ -1804,6 +1809,8 @@ mod tests {
         MediaType::ProductCatalogImage,
         MediaType::MusicArtwork,
         MediaType::NewsletterMusicArtwork,
+        MediaType::Ptt,
+        MediaType::Gif,
     ];
 
     fn encrypted_media_fixture(
@@ -2373,7 +2380,9 @@ mod tests {
                 | MediaType::LinkThumbnail
                 | MediaType::ProductCatalogImage
                 | MediaType::MusicArtwork
-                | MediaType::NewsletterMusicArtwork => {}
+                | MediaType::NewsletterMusicArtwork
+                | MediaType::Ptt
+                | MediaType::Gif => {}
             }
 
             let d = MockDownloadable {
@@ -2626,5 +2635,242 @@ mod tests {
             .downcast_ref::<CryptoError>()
             .expect("downcasts to CryptoError");
         assert!(matches!(ce, CryptoError::UnknownAlgorithm("MAC", _)));
+    }
+}
+
+/// Immutable host-selected mobile CDN profile. Values are artifact/profile inputs,
+/// never a discovered current version. Origin is absent unless the host explicitly selects a validated adapted profile.
+/// Native routes follow pinned Zapo constants.ts and whalibmob MediaService.js;
+/// these references are not official APK qualification.
+///
+/// Source pins: Zapo `bceb268c846763a2cd0b494da830a54aacdc3818`,
+/// `src/media/constants.ts`; whalibmob `8f50db4c586534dc0af4d13b26bdd09ef42660c0`,
+/// `lib/MediaService.js` (`mediaHeaders`, `mediaPathFor`). Cobalt
+/// `cb9fbf172507626948fbc3611d0a6fb00bb3a0f1` uses an adapted Web Origin in
+/// `LiveMediaConnectionService.tryUpload`; select that Origin explicitly via
+/// [`Self::new`] rather than inheriting it into the native profile.
+#[derive(Clone)]
+pub struct MobileMediaHttpProfile {
+    user_agent: std::sync::Arc<str>,
+    origin: Option<std::sync::Arc<str>>,
+    upload_routes: std::sync::Arc<[(MediaType, String)]>,
+}
+
+impl crate::stats::HeapSize for MobileMediaHttpProfile {
+    fn heap_bytes(&self) -> usize {
+        let arc_header = 2 * size_of::<usize>();
+        arc_header
+            + self.user_agent.len()
+            + self
+                .origin
+                .as_ref()
+                .map_or(0, |value| arc_header + value.len())
+            + arc_header
+            + size_of_val(self.upload_routes.as_ref())
+            + self
+                .upload_routes
+                .iter()
+                .map(|(_, path)| path.capacity())
+                .sum::<usize>()
+    }
+}
+impl MobileMediaHttpProfile {
+    pub fn new(
+        user_agent: String,
+        origin: Option<String>,
+        upload_routes: Vec<(MediaType, String)>,
+    ) -> Result<Self> {
+        if user_agent.trim().is_empty()
+            || user_agent.len() > 1024
+            || !user_agent.bytes().all(|b| (0x20..=0x7e).contains(&b))
+            || upload_routes.len() > 64
+        {
+            anyhow::bail!("invalid mobile media HTTP profile");
+        }
+        if let Some(value) = &origin {
+            if value.len() > 512 {
+                anyhow::bail!("invalid mobile media Origin");
+            }
+            use fluent_uri::{Uri, component::Host};
+            let parsed =
+                Uri::parse(value.as_str()).map_err(|_| anyhow::anyhow!("invalid media Origin"))?;
+            let authority = parsed
+                .authority()
+                .ok_or_else(|| anyhow::anyhow!("invalid media Origin"))?;
+            let host_valid = match authority.host_parsed() {
+                Host::IpvFuture { .. } => false,
+                Host::RegName(name) => {
+                    !name.is_empty()
+                        && name
+                            .as_str()
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b))
+                }
+                _ => true,
+            };
+            if parsed.scheme().as_str() != "https"
+                || !host_valid
+                || authority.userinfo().is_some()
+                || !parsed.path().is_empty()
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+                || authority.port().is_some_and(|p| p.is_empty())
+                || authority.port_to_u16().is_err()
+            {
+                anyhow::bail!("invalid mobile media Origin");
+            }
+        }
+        for (index, (kind, path)) in upload_routes.iter().enumerate() {
+            if upload_routes[..index].iter().any(|(old, _)| old == kind)
+                || path.len() > 128
+                || !path.starts_with('/')
+                || path.ends_with('/')
+                || path.contains("..")
+                || path.contains("//")
+                || !path
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"/-_".contains(&b))
+            {
+                anyhow::bail!("invalid mobile media upload route");
+            }
+        }
+        Ok(Self {
+            user_agent: user_agent.into(),
+            origin: origin.map(Into::into),
+            upload_routes: upload_routes.into(),
+        })
+    }
+    /// Explicit native routing profile; the caller supplies the exact versioned UA.
+    pub fn native_mms(user_agent: String) -> Result<Self> {
+        Self::new(
+            user_agent,
+            None,
+            vec![
+                (MediaType::Sticker, "/mms/sticker".into()),
+                (MediaType::Ptt, "/mms/ptt".into()),
+                (MediaType::Gif, "/mms/gif".into()),
+            ],
+        )
+    }
+    pub fn origin(&self) -> Option<&str> {
+        self.origin.as_deref()
+    }
+    pub fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+    pub fn upload_path(&self, kind: MediaType) -> &str {
+        self.upload_routes
+            .iter()
+            .find(|(candidate, _)| *candidate == kind)
+            .map(|(_, path)| path.as_str())
+            .unwrap_or_else(|| kind.upload_path())
+    }
+    pub fn apply(&self, mut request: crate::net::HttpRequest) -> crate::net::HttpRequest {
+        request.headers.retain(|name, _| {
+            !name.eq_ignore_ascii_case("origin") && !name.eq_ignore_ascii_case("user-agent")
+        });
+        request = request.with_header("User-Agent", self.user_agent());
+        if let Some(origin) = self.origin() {
+            request = request.with_header("Origin", origin);
+        }
+        request
+    }
+}
+
+#[cfg(test)]
+mod mobile_media_profile_tests {
+    use super::*;
+    #[test]
+    fn native_routes_keep_web_routes_and_hkdf_contexts_separate() {
+        let profile = MobileMediaHttpProfile::native_mms("WhatsApp/synthetic A".into()).unwrap();
+        for (kind, web, native, context) in [
+            (
+                MediaType::Ptt,
+                "/mms/audio",
+                "/mms/ptt",
+                "WhatsApp Audio Keys",
+            ),
+            (
+                MediaType::Gif,
+                "/mms/video",
+                "/mms/gif",
+                "WhatsApp Video Keys",
+            ),
+            (
+                MediaType::Sticker,
+                "/mms/image",
+                "/mms/sticker",
+                "WhatsApp Image Keys",
+            ),
+        ] {
+            assert_eq!(kind.upload_path(), web);
+            assert_eq!(profile.upload_path(kind), native);
+            assert_eq!(kind.app_info(), context);
+        }
+    }
+    #[test]
+    fn native_voice_and_gif_routes_do_not_change_encrypted_bytes() {
+        for (native, shared) in [
+            (MediaType::Ptt, MediaType::Audio),
+            (MediaType::Gif, MediaType::Video),
+        ] {
+            let key = [41; 32];
+            let bytes = b"same plaintext, key and crypto context";
+            let actual = crate::upload::encrypt_media_with_key(bytes, native, Some(&key)).unwrap();
+            let expected =
+                crate::upload::encrypt_media_with_key(bytes, shared, Some(&key)).unwrap();
+            assert_eq!(actual.data_to_upload, expected.data_to_upload);
+            assert_eq!(actual.file_enc_sha256, expected.file_enc_sha256);
+            assert_eq!(actual.streaming_sidecar, expected.streaming_sidecar);
+        }
+    }
+
+    #[test]
+    fn profile_rejects_header_injection_ambiguous_origin_and_routes() {
+        for ua in ["", "test\r\nOrigin: injected"] {
+            assert!(MobileMediaHttpProfile::native_mms(ua.into()).is_err());
+        }
+        for origin in [
+            "http://example.com",
+            "https://user@example.com",
+            "https://example.com/path",
+            "https://example.com/",
+            "https://example.com?x=1",
+        ] {
+            assert!(
+                MobileMediaHttpProfile::new("test".into(), Some(origin.into()), vec![]).is_err()
+            );
+        }
+        for path in [
+            "//host/path",
+            "/mms/../image",
+            "/mms/image?x=1",
+            "/mms/%2fimage",
+        ] {
+            assert!(
+                MobileMediaHttpProfile::new(
+                    "test".into(),
+                    None,
+                    vec![(MediaType::Image, path.into())]
+                )
+                .is_err()
+            );
+        }
+        let profile = MobileMediaHttpProfile::new(
+            "test".into(),
+            Some("https://adapted.invalid".into()),
+            vec![],
+        )
+        .unwrap();
+        let request = profile.apply(
+            crate::net::HttpRequest::get("https://cdn.invalid/path")
+                .with_header("origin", "https://web.whatsapp.com")
+                .with_header("user-agent", "old"),
+        );
+        assert_eq!(request.headers.len(), 2);
+        assert_eq!(
+            request.headers.get("Origin").map(String::as_str),
+            Some("https://adapted.invalid")
+        );
     }
 }

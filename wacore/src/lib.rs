@@ -31,6 +31,8 @@ pub mod media_retry;
 pub mod message_edit;
 pub mod message_processing;
 pub mod messages;
+#[cfg(feature = "mobile")]
+pub mod mobile;
 pub mod msg_secret;
 pub mod net;
 pub mod pair;

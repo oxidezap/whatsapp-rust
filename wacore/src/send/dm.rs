@@ -220,6 +220,8 @@ pub async fn prepare_dm_stanza(
     resolver: &dyn SendContextResolver,
     request: DmStanzaRequest<'_>,
 ) -> Result<PreparedDmStanza> {
+    let sender_role = resolver.sender_identity_role();
+    sender_role.validate()?;
     let DmStanzaRequest {
         own_jid,
         own_lid,
@@ -404,9 +406,10 @@ pub async fn prepare_dm_stanza(
 
     // DM stays lenient when pkmsg lacks an account (no pre-flight here): map the
     // helper's error back to omission so the wire shape is unchanged.
-    if let Some(device_identity_bytes) = needs_device_identity(includes_prekey_message, account)
-        .ok()
-        .flatten()
+    if let Some(device_identity_bytes) =
+        needs_device_identity_for_role(includes_prekey_message, account, sender_role)
+            .ok()
+            .flatten()
     {
         message_content_nodes.push(
             NodeBuilder::new("device-identity")
@@ -588,6 +591,26 @@ where
     S: crate::libsignal::protocol::SessionStore,
     I: crate::libsignal::protocol::IdentityKeyStore,
 {
+    prepare_pairwise_retry_stanza_for_role(
+        session_store,
+        identity_store,
+        request,
+        SenderIdentityRole::Companion,
+    )
+    .await
+}
+
+pub async fn prepare_pairwise_retry_stanza_for_role<S, I>(
+    session_store: &mut S,
+    identity_store: &mut I,
+    request: PairwiseRetryRequest<'_>,
+    role: SenderIdentityRole,
+) -> Result<Node>
+where
+    S: crate::libsignal::protocol::SessionStore,
+    I: crate::libsignal::protocol::IdentityKeyStore,
+{
+    role.validate()?;
     let PairwiseRetryRequest {
         destination,
         encryption_jid,
@@ -615,7 +638,10 @@ where
     };
     let signal_address = encryption_jid.to_protocol_address();
 
-    if account.is_none() && pkmsg_would_be_emitted(session_store, &signal_address).await? {
+    if role.requires_account()
+        && account.is_none()
+        && pkmsg_would_be_emitted(session_store, &signal_address).await?
+    {
         bail!(
             "pairwise retry pkmsg requires <device-identity> (account is None); \
              refusing before message_encrypt to avoid advancing the sender chain"
@@ -646,7 +672,7 @@ where
     children.push(enc_node);
     // Defense in depth: pre-flight should have caught a no-account pkmsg, but a
     // corrupt session that triggers a fresh pkmsg mid-call would slip past.
-    if let Some(device_identity_bytes) = needs_device_identity(is_prekey, account)? {
+    if let Some(device_identity_bytes) = needs_device_identity_for_role(is_prekey, account, role)? {
         children.push(
             NodeBuilder::new("device-identity")
                 .bytes(device_identity_bytes)
