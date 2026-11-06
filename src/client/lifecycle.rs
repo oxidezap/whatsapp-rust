@@ -1380,30 +1380,55 @@ impl Client {
         // reason distinguishes a routine server recycle from a real failure so
         // consumers don't have to.
         let terminal_reason = self.take_protocol_terminal_reason();
-        let unexpected_disconnect = match loop_result {
-            Ok(node_io::ReadLoopExit::Expected) => {
-                debug!("Message loop exited gracefully (expected disconnect).");
+        // The pending SDK-local outcome shares the lifecycle lock with
+        // generation retirement. A replaced driver's owner cannot consume it.
+        #[cfg(feature = "mobile-core")]
+        let primary_app_state_failure = {
+            let state = self
+                .session_state
+                .lifecycle_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.connection_owner() == owner
+                && self.session_state.status.fetch_and(
+                    !SessionState::PRIMARY_APP_STATE_FAILURE,
+                    Ordering::Relaxed,
+                ) & SessionState::PRIMARY_APP_STATE_FAILURE != 0
+        };
+        #[cfg(not(feature = "mobile-core"))]
+        let primary_app_state_failure = false;
+        let unexpected_disconnect = if primary_app_state_failure {
+            if self.expected_session_disconnect(Ordering::Relaxed) || intentional {
                 None
+            } else {
+                Some(DisconnectReason::PrimaryAppStateInitializationFailed)
             }
-            Ok(node_io::ReadLoopExit::ServerRecycle(reason)) => {
-                if self.expected_session_disconnect(Ordering::Relaxed) || intentional {
-                    debug!("Message loop exited during expected disconnect.");
+        } else {
+            match loop_result {
+                Ok(node_io::ReadLoopExit::Expected) => {
+                    debug!("Message loop exited gracefully (expected disconnect).");
                     None
-                } else {
-                    // read_messages_loop already logged this at info; a clean
-                    // recycle stays quiet here too.
-                    Some(reason)
                 }
-            }
-            Err(e) => {
-                if self.expected_session_disconnect(Ordering::Relaxed) || intentional {
-                    debug!("Message loop exited during expected disconnect.");
-                    None
-                } else {
-                    // read_messages_loop already logged the cause at warn; keep
-                    // this at debug to avoid double-reporting.
-                    debug!("Message loop exited, will reconnect if enabled: {e:#}");
-                    Some(e.into_reason())
+                Ok(node_io::ReadLoopExit::ServerRecycle(reason)) => {
+                    if self.expected_session_disconnect(Ordering::Relaxed) || intentional {
+                        debug!("Message loop exited during expected disconnect.");
+                        None
+                    } else {
+                        // read_messages_loop already logged this at info; a clean
+                        // recycle stays quiet here too.
+                        Some(reason)
+                    }
+                }
+                Err(e) => {
+                    if self.expected_session_disconnect(Ordering::Relaxed) || intentional {
+                        debug!("Message loop exited during expected disconnect.");
+                        None
+                    } else {
+                        // read_messages_loop already logged the cause at warn; keep
+                        // this at debug to avoid double-reporting.
+                        debug!("Message loop exited, will reconnect if enabled: {e:#}");
+                        Some(e.into_reason())
+                    }
                 }
             }
         };

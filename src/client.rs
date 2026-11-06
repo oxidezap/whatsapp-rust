@@ -1705,6 +1705,9 @@ impl SessionState {
     const PAUSE_EXIT: u16 = 1024;
     const PENALTY: u16 = 2048;
     const ORPHANED: u16 = 4096;
+    // SDK-local, generation-scoped outcome; all access is under lifecycle_state.
+    #[cfg(feature = "mobile-core")]
+    const PRIMARY_APP_STATE_FAILURE: u16 = 8192;
 
     fn new(enabled: bool) -> Self {
         use wacore::session_engine::lifecycle::{Lifecycle, ReconnectPolicy};
@@ -1775,7 +1778,10 @@ impl SessionState {
     fn publish(&self, state: &wacore::session_engine::lifecycle::Lifecycle, ordering: Ordering) {
         self.reconnect_errors
             .store(state.snapshot().backoff_attempt(), Ordering::Relaxed);
-        self.status.store(Self::status_bits(state), ordering);
+        let bits = Self::status_bits(state);
+        #[cfg(feature = "mobile-core")]
+        let bits = bits | (self.status.load(Ordering::Relaxed) & Self::PRIMARY_APP_STATE_FAILURE);
+        self.status.store(bits, ordering);
     }
 
     fn transition<R>(
@@ -1821,7 +1827,10 @@ impl SessionState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = state.set_reconnect(enabled);
-        self.status.swap(Self::status_bits(&state), ordering);
+        let bits = Self::status_bits(&state);
+        #[cfg(feature = "mobile-core")]
+        let bits = bits | (self.status.load(Ordering::Relaxed) & Self::PRIMARY_APP_STATE_FAILURE);
+        self.status.swap(bits, ordering);
         previous
     }
 
@@ -1840,6 +1849,36 @@ impl SessionState {
 
     fn is_terminal(&self) -> bool {
         self.status.load(Ordering::Acquire) & Self::TERMINAL != 0
+    }
+}
+
+#[cfg(test)]
+mod session_state_status_tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_policy_swap_preserves_read_modify_write_orderings() {
+        let state = SessionState::new(true);
+        assert!(state.swap(false, Ordering::AcqRel));
+        assert!(!state.load(Ordering::Acquire));
+        assert!(!state.swap(true, Ordering::Acquire));
+        assert!(state.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[test]
+    fn reconnect_policy_toggle_preserves_pending_primary_failure() {
+        let state = SessionState::new(true);
+        state.status.fetch_or(
+            SessionState::PRIMARY_APP_STATE_FAILURE,
+            Ordering::Relaxed,
+        );
+        assert!(state.swap(false, Ordering::AcqRel));
+        assert!(!state.swap(true, Ordering::AcqRel));
+        assert_ne!(
+            state.status.load(Ordering::Acquire) & SessionState::PRIMARY_APP_STATE_FAILURE,
+            0
+        );
     }
 }
 

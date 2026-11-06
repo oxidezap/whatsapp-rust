@@ -321,6 +321,11 @@ impl Client {
         let ticket = state.claim_authentication().ok()?;
         self.connection_generation
             .store(ticket.generation().get(), Ordering::SeqCst);
+        #[cfg(feature = "mobile-core")]
+        self.session_state.status.fetch_and(
+            !SessionState::PRIMARY_APP_STATE_FAILURE,
+            Ordering::Relaxed,
+        );
         self.session_state.publish(&state, Ordering::SeqCst);
         Some(ticket)
     }
@@ -364,6 +369,11 @@ impl Client {
             .expect("worker generation exhausted");
         self.connection_generation
             .store(state.snapshot().generation().get(), Ordering::SeqCst);
+        #[cfg(feature = "mobile-core")]
+        self.session_state.status.fetch_and(
+            !SessionState::PRIMARY_APP_STATE_FAILURE,
+            Ordering::Relaxed,
+        );
         self.session_state.publish(&state, Ordering::SeqCst);
         previous.get()
     }
@@ -380,6 +390,11 @@ impl Client {
                 .expect("fixture generation"),
         );
         self.connection_generation.store(generation, ordering);
+        #[cfg(feature = "mobile-core")]
+        self.session_state.status.fetch_and(
+            !SessionState::PRIMARY_APP_STATE_FAILURE,
+            Ordering::Relaxed,
+        );
         self.session_state.publish(&state, Ordering::SeqCst);
     }
 
@@ -405,6 +420,11 @@ impl Client {
                 Ordering::Acquire => Ordering::Relaxed,
                 other => other,
             },
+        );
+        #[cfg(feature = "mobile-core")]
+        self.session_state.status.fetch_and(
+            !SessionState::PRIMARY_APP_STATE_FAILURE,
+            Ordering::Relaxed,
         );
         self.session_state.publish(&state, Ordering::SeqCst);
         previous

@@ -1593,6 +1593,7 @@ impl Client {
                     .await
                 {
                     warn!("Primary startup cannot initialize authoritative app-state: {error}");
+                    Box::pin(client_clone.fail_primary_app_state_startup(task_generation)).await;
                     return;
                 }
                 check_generation!();
@@ -1881,6 +1882,40 @@ impl Client {
                 client_clone.dispatch_connected(task_generation).await;
             }
         }));
+    }
+
+    /// A local bootstrap failure is retryable; retire only its authenticated socket.
+    #[cfg(feature = "mobile-core")]
+    async fn fail_primary_app_state_startup(self: &Arc<Self>, generation: u64) {
+        let transport = {
+            let _publish = self.connection_publish.lock().await;
+            let transport = self.transport.lock().await.clone();
+            let failed = self.session_state.transition(Ordering::SeqCst, |state| {
+                if state.snapshot().generation().get() != generation {
+                    return false;
+                }
+                state.invalidate_authentication();
+                self.session_state
+                    .status
+                    .fetch_or(SessionState::PRIMARY_APP_STATE_FAILURE, Ordering::Relaxed);
+                true
+            });
+            if !failed {
+                return;
+            }
+            // The driver consumes the local outcome before cleanup, then reports
+            // it after clearing connection state through its normal event path.
+            self.notify_connection_shutdown();
+            transport
+        };
+        if let Some(transport) = transport {
+            let _ = rt_timeout(
+                &*self.runtime,
+                Self::TRANSPORT_CLOSE_TIMEOUT,
+                transport.disconnect(),
+            )
+            .await;
+        }
     }
 
     #[cfg(feature = "mobile-core")]
@@ -2817,7 +2852,12 @@ mod tests {
                 .phone_number,
             "15550000001"
         );
-        assert!(client.is_logged_in(), "server authentication is retained");
+        assert!(
+            !client.is_logged_in(),
+            "unusable primary startup must end authentication"
+        );
+        assert!(client.auto_reconnect_enabled());
+        assert!(client.connection_shutdown_signal().is_fired());
         assert!(
             events
                 .events()
@@ -2857,6 +2897,175 @@ mod tests {
             Some(ProtocolTerminalReason::InvalidPrimaryIdentity)
         );
         client.notify_connection_shutdown();
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[derive(Default)]
+    struct PrimaryStartupCloseRecorder {
+        closes: AtomicUsize,
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl crate::transport::Transport for PrimaryStartupCloseRecorder {
+        async fn send(&self, _data: bytes::Bytes) -> Result<()> {
+            Ok(())
+        }
+
+        async fn disconnect(&self) {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn primary_app_state_backend_failure_recycles_authenticated_socket() {
+        let (mut backend, _dropped) = crate::store::release::tests::ProbeBackend::new();
+        backend.backend = crate::test_utils::primary_test_backend();
+        let fail = Arc::new(AtomicBool::new(false));
+        backend.fail_before_method = Some(("get_latest_sync_key_id", fail.clone()));
+        let (client, _) =
+            crate::test_utils::create_primary_iq_test_client_with_backend(Arc::new(backend)).await;
+        let transport = Arc::new(PrimaryStartupCloseRecorder::default());
+        *client.transport.lock().await =
+            Some(transport.clone() as Arc<dyn crate::transport::Transport>);
+        struct ClearedStateObserver {
+            client: std::sync::Weak<Client>,
+            observed: AtomicBool,
+        }
+        impl wacore::types::events::EventHandler for ClearedStateObserver {
+            fn handle_event(&self, event: Arc<Event>) {
+                if matches!(&*event, Event::Disconnected(_)) {
+                    let client = self.client.upgrade().unwrap();
+                    assert!(!client.is_socket_connected());
+                    assert!(!client.is_logged_in());
+                    self.observed.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        let observer = Arc::new(ClearedStateObserver {
+            client: Arc::downgrade(&client),
+            observed: AtomicBool::new(false),
+        });
+        client.subscribe_handler(observer.clone()).detach();
+        let events = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(events.clone()).detach();
+        fail.store(true, Ordering::Relaxed);
+        let success = NodeBuilder::new("success").build();
+        client.handle_success(&success.as_node_ref()).await;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while transport.closes.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed bootstrap must close its authenticated transport");
+        assert!(!client.is_logged_in());
+        assert!(client.auto_reconnect_enabled());
+        assert!(client.connection_shutdown_signal().is_fired());
+        assert!(client.protocol_terminal_reason.lock().unwrap().is_none());
+        assert_eq!(transport.closes.load(Ordering::SeqCst), 1);
+        let reason = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.connection_for_test().read_until_disconnected(),
+        )
+        .await
+        .expect("driver must complete normal cleanup after bootstrap failure");
+        assert_eq!(
+            reason,
+            Some(DisconnectReason::PrimaryAppStateInitializationFailed)
+        );
+        assert!(observer.observed.load(Ordering::SeqCst));
+        assert!(client.auto_reconnect_enabled());
+        let observed = events.events();
+        assert!(observed.iter().any(|event| matches!(
+            &**event,
+            Event::Disconnected(disconnected)
+                if disconnected.reason == DisconnectReason::PrimaryAppStateInitializationFailed
+        )));
+        assert!(
+            !observed
+                .iter()
+                .any(|event| matches!(&**event, Event::Connected(_)))
+        );
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn retired_primary_app_state_failure_cannot_affect_replacement() {
+        let client = primary_startup_client().await;
+        let events = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(events.clone()).detach();
+        let transport = Arc::new(PrimaryStartupCloseRecorder::default());
+        *client.transport.lock().await =
+            Some(transport.clone() as Arc<dyn crate::transport::Transport>);
+        client.set_connected_for_test(true);
+        let generation = client.connection_generation.load(Ordering::SeqCst);
+        let capture = client.transport.lock().await;
+        let mut failure = Box::pin(client.fail_primary_app_state_startup(generation));
+        assert!(futures::poll!(failure.as_mut()).is_pending());
+        // Retirement uses the same lifecycle lock as the helper's transition.
+        client.set_generation_for_test(generation + 1, Ordering::SeqCst);
+        let shutdown = client.connection_shutdown_signal();
+        let reconnect = client.auto_reconnect_enabled();
+        drop(capture);
+        failure.await;
+        assert!(!shutdown.is_fired());
+        assert!(client.is_socket_connected());
+        assert_eq!(client.auto_reconnect_enabled(), reconnect);
+        assert!(client.protocol_terminal_reason.lock().unwrap().is_none());
+        assert_eq!(transport.closes.load(Ordering::SeqCst), 0);
+        assert!(events.events().is_empty());
+        assert_eq!(
+            client.session_state.status.load(Ordering::Relaxed)
+                & SessionState::PRIMARY_APP_STATE_FAILURE,
+            0
+        );
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn expected_disconnect_suppresses_primary_app_state_failure_event() {
+        let client = primary_startup_client().await;
+        let events = Arc::new(crate::test_utils::TestEventCollector::default());
+        client.subscribe_handler(events.clone()).detach();
+        let generation = client.connection_generation.load(Ordering::SeqCst);
+        client.fail_primary_app_state_startup(generation).await;
+        client.expect_session_disconnect();
+        let reason = client.connection_for_test().read_until_disconnected().await;
+        assert_eq!(reason, None);
+        assert!(
+            !events
+                .events()
+                .iter()
+                .any(|event| matches!(&**event, Event::Disconnected(_)))
+        );
+        assert_eq!(
+            client.session_state.status.load(Ordering::Relaxed)
+                & SessionState::PRIMARY_APP_STATE_FAILURE,
+            0
+        );
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn primary_app_state_outcome_is_cleared_by_generation_retirement() {
+        let client = primary_startup_client().await;
+        let generation = client.connection_generation.load(Ordering::SeqCst);
+        client.fail_primary_app_state_startup(generation).await;
+        assert_ne!(
+            client.session_state.status.load(Ordering::Relaxed)
+                & SessionState::PRIMARY_APP_STATE_FAILURE,
+            0
+        );
+        client.advance_session_generation();
+        assert_eq!(
+            client.session_state.status.load(Ordering::Relaxed)
+                & SessionState::PRIMARY_APP_STATE_FAILURE,
+            0
+        );
     }
 
     #[cfg(feature = "mobile-core")]
