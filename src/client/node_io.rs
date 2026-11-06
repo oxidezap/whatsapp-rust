@@ -2877,10 +2877,29 @@ mod tests {
     }
 
     #[cfg(feature = "mobile-core")]
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn primary_identity_failure_waiting_for_transport_cannot_stop_a_retired_session() {
+        #[derive(Default)]
+        struct RecordingCloseTransport {
+            closes: AtomicUsize,
+        }
+
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        impl crate::transport::Transport for RecordingCloseTransport {
+            async fn send(&self, _data: bytes::Bytes) -> Result<()> {
+                Ok(())
+            }
+
+            async fn disconnect(&self) {
+                self.closes.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
         let client = primary_startup_client().await;
-        let old = Arc::new(crate::transport::mock::StallingMockTransport::new());
+        // The slot lock below creates the intended await gap. Stalling close
+        // would instead require advancing this primary fixture's VirtualClock.
+        let old = Arc::new(RecordingCloseTransport::default());
         *client.transport.lock().await = Some(old.clone() as Arc<dyn crate::transport::Transport>);
         client.set_connected_for_test(true);
         let generation = client.connection_generation.load(Ordering::SeqCst);
@@ -2900,10 +2919,16 @@ mod tests {
         .expect("cleanup must retire the generation while transport capture is blocked");
 
         drop(capture);
-        rejection.await;
+        tokio::time::timeout(Duration::from_secs(2), rejection)
+            .await
+            .expect("retired rejection must finish once transport capture is released");
         assert_eq!(client.auto_reconnect_enabled(), reconnect);
         assert!(client.protocol_terminal_reason.lock().unwrap().is_none());
-        cleanup.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), cleanup)
+            .await
+            .expect("immediate transport cleanup must finish")
+            .unwrap();
+        assert_eq!(old.closes.load(Ordering::SeqCst), 1);
 
         let replacement = Arc::new(crate::transport::mock::StallingMockTransport::new());
         *client.transport.lock().await =
