@@ -82,12 +82,33 @@ where
                         "mobile binding field exceeds limit",
                     ));
                 }
+                if bytes.len() == bytes.capacity() {
+                    drop(grow_secret_bytes(&mut bytes));
+                }
                 bytes.push(byte);
             }
             Ok(bytes)
         }
     }
     deserializer.deserialize_seq(SecretBytes)
+}
+
+/// Return the retired allocation while it is still owned, after wiping every
+/// live byte. The decoder drops it before appending; Vec growth must never
+/// reallocate a credential allocation before that wipe.
+fn grow_secret_bytes(bytes: &mut zeroize::Zeroizing<Vec<u8>>) -> zeroize::Zeroizing<Vec<u8>> {
+    use zeroize::Zeroize;
+
+    let capacity = bytes
+        .capacity()
+        .saturating_mul(2)
+        .clamp(8, MAX_BINDING_FIELD_BYTES);
+    debug_assert!(bytes.len() == bytes.capacity() && bytes.len() < capacity);
+    let mut replacement = zeroize::Zeroizing::new(Vec::with_capacity(capacity));
+    replacement.extend_from_slice(bytes.as_slice());
+    std::mem::swap(bytes, &mut replacement);
+    replacement.as_mut_slice().zeroize();
+    replacement
 }
 
 fn deserialize_optional_secret_bytes<'de, D>(
@@ -401,5 +422,83 @@ mod tests {
                 .unwrap(),
             binding
         );
+    }
+    #[test]
+    fn secret_growth_wipes_the_retired_owned_allocation_before_release() {
+        for capacity in [1, 8, 15, MAX_BINDING_FIELD_BYTES / 2] {
+            let mut bytes = zeroize::Zeroizing::new(vec![0xA5; capacity]);
+            let original_pointer = bytes.as_ptr();
+            let retired = grow_secret_bytes(&mut bytes);
+
+            assert_eq!(retired.as_ptr(), original_pointer);
+            assert_eq!(retired.len(), capacity);
+            assert!(retired.iter().all(|byte| *byte == 0));
+            assert_eq!(bytes.len(), capacity);
+            assert!(bytes.iter().all(|byte| *byte == 0xA5));
+            assert!(bytes.capacity() > capacity);
+            assert!(bytes.capacity() <= MAX_BINDING_FIELD_BYTES);
+            assert_ne!(bytes.as_ptr(), retired.as_ptr());
+            drop(retired);
+
+            let replacement_pointer = bytes.as_ptr();
+            bytes.push(0x7C);
+            assert_eq!(bytes.as_ptr(), replacement_pointer);
+            assert_eq!(bytes.len(), capacity + 1);
+            assert_eq!(bytes[capacity], 0x7C);
+        }
+    }
+
+    #[test]
+    fn json_credentials_keep_geometric_capacity_and_move_without_reallocation() {
+        for len in [0, 1, 7, 8, 9, 31, 32, 33, MAX_BINDING_FIELD_BYTES] {
+            let mut binding = MobileSessionBinding::new(
+                [1; 32],
+                [2; 32],
+                StoredMobilePlatform::Android,
+                vec![7; len],
+                (len != 0).then(|| vec![8; len]),
+            )
+            .unwrap();
+            binding.primary_state = (len != 0).then(|| vec![9; len]);
+            let encoded = serde_json::to_vec(&binding).unwrap();
+            let wire: BindingWire = serde_json::from_slice(&encoded).unwrap();
+            let context_pointer = wire.registration_context.as_ptr();
+            let checkpoint_pointer = wire
+                .registration_checkpoint
+                .as_ref()
+                .map(|bytes| bytes.as_ptr());
+            let primary_pointer = wire.primary_state.as_ref().map(|bytes| bytes.as_ptr());
+            let decoded = MobileSessionBinding::try_from(wire).unwrap();
+            assert_eq!(decoded.registration_context.as_ptr(), context_pointer);
+            assert_eq!(
+                decoded
+                    .registration_checkpoint
+                    .as_ref()
+                    .map(|bytes| bytes.as_ptr()),
+                checkpoint_pointer
+            );
+            assert_eq!(
+                decoded.primary_state.as_ref().map(|bytes| bytes.as_ptr()),
+                primary_pointer
+            );
+            assert_eq!(decoded, binding);
+            for bytes in std::iter::once(&decoded.registration_context)
+                .chain(decoded.registration_checkpoint.iter())
+                .chain(decoded.primary_state.iter())
+            {
+                let geometric_limit = len.next_power_of_two().max(8);
+                assert!(bytes.capacity() <= geometric_limit);
+                assert!(bytes.capacity() <= MAX_BINDING_FIELD_BYTES);
+            }
+
+            let mut malformed = serde_json::to_value(&binding).unwrap();
+            malformed["primary_state"] = serde_json::json!("malformed after credentials");
+            assert!(
+                serde_json::from_slice::<MobileSessionBinding>(
+                    &serde_json::to_vec(&malformed).unwrap()
+                )
+                .is_err()
+            );
+        }
     }
 }
