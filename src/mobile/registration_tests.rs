@@ -49,6 +49,7 @@ impl RegistrationAttestation for TestProof {
 enum Reply {
     Ready(&'static [u8]),
     Deferred(oneshot::Receiver<&'static [u8]>),
+    DeferredStatus(u16, oneshot::Receiver<&'static [u8]>),
     Failure,
 }
 struct MockHttp {
@@ -94,12 +95,13 @@ impl HttpClient for MockHttp {
             Some(UUID)
         );
         let reply = self.replies.lock().unwrap().pop_front().unwrap();
-        let bytes = match reply {
-            Reply::Ready(bytes) => bytes,
-            Reply::Deferred(receiver) => receiver.await?,
+        let (status, bytes) = match reply {
+            Reply::Ready(bytes) => (200, bytes),
+            Reply::Deferred(receiver) => (200, receiver.await?),
+            Reply::DeferredStatus(status, receiver) => (status, receiver.await?),
             Reply::Failure => anyhow::bail!("synthetic transport failure"),
         };
-        Ok(HttpResponse::new(200, bytes.to_vec()))
+        Ok(HttpResponse::new(status, bytes.to_vec()))
     }
 }
 const UUID: &str = "00000000-0000-4000-8000-000000000001";
@@ -1085,4 +1087,114 @@ async fn restore_cannot_publish_verified_or_registered_without_durable_phone_ide
         assert!(http.backend.load().await.unwrap().unwrap().pn.is_none());
         assert_eq!(http.calls.load(Ordering::SeqCst), 0);
     }
+}
+
+#[tokio::test]
+async fn durable_registered_checkpoint_restores_and_settles_without_http() {
+    let fixture = Fixture::new();
+    let (mut client, http) = fixture
+        .client(vec![Reply::Ready(br#"{"status":"verified"}"#)])
+        .await;
+    client.await_external_code().await.unwrap();
+    client
+        .submit_code(
+            &fixture.builder(),
+            "123456",
+            Some(UUID),
+            &fixture.fields,
+            EphemeralRegistrationKey::from_bytes([59; 32]),
+            POLICY,
+            &TestProof,
+        )
+        .await
+        .unwrap();
+    assert_eq!(client.stage(), RegistrationStage::Registered);
+    let mut registered = client.binding.clone();
+    registered.registration_checkpoint.zeroize();
+    registered.registration_checkpoint = Some(encode(&client.workflow).unwrap());
+    client.publication = Some(registered.clone());
+    client
+        .store
+        .process_command(wacore::store::DeviceCommand::SetMobileSessionBinding(
+            registered,
+        ))
+        .await;
+    client.store.flush().await.unwrap();
+
+    assert!(client.resume_pending().await.unwrap().is_none());
+    assert_eq!(client.stage(), RegistrationStage::Registered);
+    let restored = MobileRegistrationClient::restore(
+        client.store.clone(),
+        &fixture.builder(),
+        environment(),
+        http.clone(),
+        client.clock.clone(),
+        Arc::new(TestRuntime),
+    )
+    .unwrap();
+    assert_eq!(restored.stage(), RegistrationStage::Registered);
+    assert_eq!(
+        restored
+            .registered_account()
+            .unwrap()
+            .canonical_phone_number(),
+        "99901000000"
+    );
+    let (restored, _) = MobileRegistrationClient::restore_persisted(
+        client.store.clone(),
+        environment(),
+        http.clone(),
+        client.clock.clone(),
+        Arc::new(TestRuntime),
+    )
+    .unwrap();
+    assert_eq!(restored.stage(), RegistrationStage::Registered);
+    assert_eq!(http.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn canceled_exchange_retains_http_error_status_without_interpreting_or_resending_it() {
+    let fixture = Fixture::new();
+    let (sender, receiver) = oneshot::channel();
+    let (mut client, http) = fixture
+        .client(vec![Reply::DeferredStatus(429, receiver)])
+        .await;
+    let builder = fixture.builder();
+    let mut attempt = Box::pin(client.request_code(
+        &builder,
+        VerificationMethod::Sms,
+        Some(UUID),
+        &fixture.fields,
+        EphemeralRegistrationKey::from_bytes([60; 32]),
+        POLICY,
+        &TestProof,
+    ));
+    assert!(futures::poll!(&mut attempt).is_pending());
+    drop(attempt);
+    // Even a success-shaped body cannot qualify the non-success HTTP status.
+    sender.send(br#"{"status":"sent"}"#).unwrap();
+    for _ in 0..2 {
+        assert!(matches!(
+            client.resume_pending().await,
+            Err(MobileRegistrationError::HttpStatus)
+        ));
+        assert!(matches!(
+            client.stage(),
+            RegistrationStage::OutcomeUnknown { .. }
+        ));
+    }
+    let mut restarted = MobileRegistrationClient::restore(
+        client.store.clone(),
+        &builder,
+        environment(),
+        http.clone(),
+        client.clock.clone(),
+        Arc::new(TestRuntime),
+    )
+    .unwrap();
+    assert!(matches!(
+        restarted.resume_pending().await,
+        Err(MobileRegistrationError::DeliveryUnknown)
+    ));
+    assert_eq!(http.calls.load(Ordering::SeqCst), 1);
 }

@@ -103,6 +103,9 @@ pub enum RunCompletionReason {
 pub enum ProtocolTerminalReason {
     StreamErrorCode(u16),
     ConnectFailure(ConnectFailureReason),
+    /// The authenticated server supplied an invalid primary account identity.
+    /// This is a local validation failure, not a fabricated server error code.
+    InvalidPrimaryIdentity,
     /// A nonempty stream-conflict type, classified without retaining its text.
     Conflict(ConflictKind),
 }

@@ -1392,7 +1392,12 @@ mod tests {
         let builder = complete_builder().await;
         let binding = wacore::store::MobileSessionBinding::new(
             [1; 32],
-            [2; 32],
+            builder
+                .persistence_manager
+                .as_ref()
+                .unwrap()
+                .get_device_snapshot()
+                .mobile_identity_hash(),
             wacore::store::StoredMobilePlatform::Android,
             vec![],
             None,

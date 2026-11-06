@@ -1,6 +1,8 @@
 //! Opt-in comparison with separately captured original-DEX ART observations.
 //! Consuming a report does not authenticate the Android runner or its execution.
+use hmac::{Hmac, Mac};
 use serde_json::Value;
+use sha1::Sha1;
 use std::{env, fs, io::Read};
 use wacore::mobile::AndroidTokenMaterial;
 
@@ -40,6 +42,12 @@ fn original_dex_android_crypto_matches_synthetic_rust_inputs() {
         cases[1]["output_hex"],
         "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79"
     );
+    assert_eq!(cases[2]["id"], "synthetic-2");
+    let empty_mac = <Hmac<Sha1> as hmac::KeyInit>::new_from_slice(&[0x80, 0xff, 0, 1])
+        .unwrap()
+        .finalize()
+        .into_bytes();
+    assert_eq!(cases[2]["output_hex"], hex::encode(empty_mac));
     assert_eq!(cases[3]["id"], "synthetic-3");
     let material = AndroidTokenMaterial::from_derived(
         std::array::from_fn(|i| i as u8),

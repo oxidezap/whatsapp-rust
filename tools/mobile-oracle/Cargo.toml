@@ -21,5 +21,8 @@ url = { version = "2.5.8", default-features = false }
 zip = { version = "=9.1.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 tempfile = "3"
 
+[dev-dependencies]
+hmac = { workspace = true }
+
 [lints]
 workspace = true

@@ -671,3 +671,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "../../../scripts/mlow-vectors/pcm.rs"]
+mod pcm_frame_tests;

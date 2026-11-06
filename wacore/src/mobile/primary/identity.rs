@@ -148,19 +148,12 @@ pub fn validate_primary_account_identity(
     primary_identity: &[u8; 32],
     own_account: &wacore_binary::Jid,
 ) -> Result<wa::ADVSignedDeviceIdentity, PrimaryLinkError> {
-    super::validate_accounts(std::slice::from_ref(own_account))?;
-    if bytes.is_empty()
-        || bytes.len() > 16384
-        || validate_adv_with_identity_key(
-            bytes,
-            primary_identity,
-            Some(primary_identity),
-            own_account,
-        ) != AdvValidation::Valid
-    {
-        return Err(PrimaryLinkError::Authentication);
-    }
-    Ok(waproto::codec::adv_signed_device_identity_decode(bytes)?)
+    validate_primary_account_identity_with_profile(
+        bytes,
+        primary_identity,
+        own_account,
+        PrimarySelfIdentityProfile::RequireDeviceSignature,
+    )
 }
 
 /// Exact self-certificate shape selected by the host's qualified mobile profile.
@@ -445,37 +438,56 @@ mod tests {
     }
 
     #[test]
-    fn own_account_identity_requires_registered_primary_key() {
+    fn own_account_identity_requires_primary_index_and_registered_key() {
         let mut rng = rand::rngs::StdRng::seed_from_u64(111);
         let primary = KeyPair::generate(&mut rng);
-        let state = DeviceState {
-            identity_key: primary,
-            noise_key: KeyPair::generate(&mut rng),
-            adv_secret_key: [3; 32],
-        };
-        let own: &[u8; 32] = state.identity_key.public_key.public_key_bytes();
-        let issued = build_signed_companion_identity(
-            &state.identity_key,
-            own,
-            &state.adv_secret_key,
-            &IdentityParameters {
-                raw_id: 2,
-                timestamp_seconds: 9,
-                key_index: 1,
-                valid_indexes: &[0, 1],
-                default_encoding: AdvDefaultEncoding::Omit,
-            },
-            &mut rng,
-        )
-        .unwrap();
-        let (proof, _) = PairUtils::do_pair_crypto(&state, &issued.device_identity).unwrap();
-        let jid = wacore_binary::Jid::from_str("123@s.whatsapp.net").unwrap();
-        validate_primary_account_identity(&proof, own, &jid).unwrap();
         let other = KeyPair::generate(&mut rng);
-        assert!(
-            validate_primary_account_identity(&proof, other.public_key.public_key_bytes(), &jid)
+        let own = primary.public_key.public_key_bytes();
+        let jid = wacore_binary::Jid::from_str("123@s.whatsapp.net").unwrap();
+        for (key_index, encryption_type) in [
+            (Some(0), None),
+            (Some(1), None),
+            (None, None),
+            (Some(0), Some(wa::ADVEncryptionType::HOSTED)),
+        ] {
+            let mut details = wa::ADVDeviceIdentity::default();
+            details.raw_id = Some(2);
+            details.timestamp = Some(9);
+            details.key_index = key_index;
+            details.account_type = encryption_type;
+            details.device_type = encryption_type;
+            let encoded = waproto::codec::adv_device_identity_to_vec(&details);
+            let account_message =
+                AccountSignatureMessage::new(&encoded, &primary.public_key, encryption_type);
+            let device_message = account_message
+                .for_device(&primary.public_key, crate::adv::DeviceSignatureKind::Companion);
+            let mut signed = wa::ADVSignedDeviceIdentity::default();
+            signed.details = Some(encoded);
+            signed.account_signature_key = Some(own.to_vec());
+            signed.account_signature = Some(
+                primary
+                    .private_key
+                    .calculate_signature(account_message.as_bytes(), &mut rng)
+                    .unwrap()
+                    .to_vec(),
+            );
+            signed.device_signature = Some(
+                primary
+                    .private_key
+                    .calculate_signature(&device_message, &mut rng)
+                    .unwrap()
+                    .to_vec(),
+            );
+            let proof = waproto::codec::adv_signed_device_identity_to_vec(&signed);
+            assert_eq!(
+                validate_primary_account_identity(&proof, own, &jid).is_ok(),
+                key_index == Some(0) && encryption_type.is_none()
+            );
+            assert!(
+                validate_primary_account_identity(&proof, other.public_key.public_key_bytes(), &jid)
                 .is_err()
-        );
+            );
+        }
     }
     #[test]
     fn account_only_primary_profile_verifies_exact_bytes_and_rejects_forged_variants() {

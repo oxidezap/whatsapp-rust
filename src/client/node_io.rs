@@ -1493,6 +1493,7 @@ impl Client {
                 }
                 Some(Err(error)) => {
                     warn!("Primary startup rejected server device identity: {error}");
+                    Box::pin(client_clone.reject_primary_identity(task_generation)).await;
                     return;
                 }
                 None => {}
@@ -1586,13 +1587,21 @@ impl Client {
 
             check_generation!();
             #[cfg(feature = "mobile-core")]
-            if let Some(session) = &client_clone.mobile_session
-                && let Err(error) = client_clone
+            if let Some(session) = &client_clone.mobile_session {
+                if let Err(error) = client_clone
                     .ensure_primary_app_state_key(session.app_state_key())
                     .await
-            {
-                warn!("Primary startup cannot initialize authoritative app-state: {error}");
-                return;
+                {
+                    warn!("Primary startup cannot initialize authoritative app-state: {error}");
+                    return;
+                }
+                check_generation!();
+                // The primary's validated durable key is its own bootstrap
+                // material. It must not wait for a companion key-share from itself.
+                client_clone
+                    .initial_app_state_keys_received
+                    .store(true, Ordering::Release);
+                client_clone.initial_keys_synced_notifier.notify(usize::MAX);
             }
 
             check_generation!();
@@ -1820,10 +1829,18 @@ impl Client {
             check_generation!();
 
             let flag_set = client_clone.needs_initial_full_sync.is_armed();
-            // A primary is authoritative for app-state. Asking a companion
-            // snapshot/bootstrap path for its own state can wait forever for a
-            // key-share from a primary phone that is this very session.
-            let needs_initial_sync = !mobile_primary && (flag_set || needs_pushname_from_sync);
+            // The authoritative profile owns its baseline; the explicit
+            // SnapshotCompatible profile retains the shared bootstrap exchange.
+            // Peer snapshot recovery still rejects a primary asking itself.
+            #[cfg(feature = "mobile-core")]
+            let snapshot_bootstrap = client_clone.mobile_session.as_ref().is_some_and(|session| {
+                session.app_state_policy()
+                    == Some(crate::MobileAppStatePolicy::SnapshotCompatible)
+            });
+            #[cfg(not(feature = "mobile-core"))]
+            let snapshot_bootstrap = false;
+            let needs_initial_sync =
+                (!mobile_primary || snapshot_bootstrap) && (flag_set || needs_pushname_from_sync);
 
             if needs_initial_sync {
                 // Boxed, and the arm behind its own `async fn`, because a Rust
@@ -1864,6 +1881,46 @@ impl Client {
                 client_clone.dispatch_connected(task_generation).await;
             }
         }));
+    }
+
+    #[cfg(feature = "mobile-core")]
+    async fn reject_primary_identity(self: &Arc<Self>, generation: u64) {
+        let transport = {
+            let _publish = self.connection_publish.lock().await;
+            if self.connection_generation.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            // Capture this transport before releasing publication. A replacement
+            // installed during the bounded close must not be closed in its place.
+            let transport = self.transport.lock().await.clone();
+            // Cleanup advances the generation under this same lifecycle lock,
+            // without taking connection_publish. Revalidate after transport capture
+            // and commit the terminal verdict atomically with that generation.
+            let rejected = self.session_state.transition(Ordering::SeqCst, |state| {
+                if state.snapshot().generation().get() != generation {
+                    return false;
+                }
+                self.record_protocol_terminal_reason(
+                    ProtocolTerminalReason::InvalidPrimaryIdentity,
+                );
+                state.forbid_reconnect();
+                state.invalidate_authentication();
+                true
+            });
+            if !rejected {
+                return;
+            }
+            self.notify_connection_shutdown();
+            transport
+        };
+        if let Some(transport) = transport {
+            let _ = rt_timeout(
+                &*self.runtime,
+                Self::TRANSPORT_CLOSE_TIMEOUT,
+                transport.disconnect(),
+            )
+            .await;
+        }
     }
 
     /// The fresh-pairing arm of the post-login sequence: await the critical
@@ -2774,6 +2831,9 @@ mod tests {
     #[tokio::test]
     async fn primary_success_does_not_persist_an_unverified_server_identity() {
         let client = primary_startup_client().await;
+        let transport = Arc::new(crate::transport::mock::StallingMockTransport::new());
+        *client.transport.lock().await =
+            Some(transport.clone() as Arc<dyn crate::transport::Transport>);
         client.set_connected_for_test(true);
         let success = NodeBuilder::new("success")
             .attr("display_name", "Unverified profile")
@@ -2788,7 +2848,170 @@ mod tests {
         let device = client.persistence_manager.get_device_snapshot();
         assert!(device.account.is_none());
         assert!(device.push_name.is_empty());
+        assert!(!client.is_logged_in());
+        assert!(!client.auto_reconnect_enabled());
+        assert!(client.connection_shutdown_signal().is_fired());
+        assert_eq!(transport.disconnects_started(), 1);
+        assert_eq!(
+            *client.protocol_terminal_reason.lock().unwrap(),
+            Some(ProtocolTerminalReason::InvalidPrimaryIdentity)
+        );
         client.notify_connection_shutdown();
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn retired_primary_identity_failure_cannot_close_a_replacement() {
+        let client = primary_startup_client().await;
+        let transport = Arc::new(crate::transport::mock::StallingMockTransport::new());
+        *client.transport.lock().await =
+            Some(transport.clone() as Arc<dyn crate::transport::Transport>);
+        client.set_generation_for_test(2, Ordering::Release);
+        let shutdown = client.connection_shutdown_signal();
+        let reconnect = client.auto_reconnect_enabled();
+        client.reject_primary_identity(1).await;
+        assert!(!shutdown.is_fired());
+        assert_eq!(client.auto_reconnect_enabled(), reconnect);
+        assert_eq!(transport.disconnects_started(), 0);
+        assert!(client.protocol_terminal_reason.lock().unwrap().is_none());
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test(start_paused = true)]
+    async fn primary_identity_failure_waiting_for_transport_cannot_stop_a_retired_session() {
+        let client = primary_startup_client().await;
+        let old = Arc::new(crate::transport::mock::StallingMockTransport::new());
+        *client.transport.lock().await =
+            Some(old.clone() as Arc<dyn crate::transport::Transport>);
+        client.set_connected_for_test(true);
+        let generation = client.connection_generation.load(Ordering::SeqCst);
+        let reconnect = client.auto_reconnect_enabled();
+        let capture = client.transport.lock().await;
+        let mut rejection = Box::pin(client.reject_primary_identity(generation));
+        assert!(futures::poll!(rejection.as_mut()).is_pending());
+
+        let cleanup_client = Arc::clone(&client);
+        let cleanup = tokio::spawn(async move {
+            cleanup_client.cleanup_connection_state().await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while client.connection_generation.load(Ordering::SeqCst) == generation {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup must retire the generation while transport capture is blocked");
+
+        drop(capture);
+        rejection.await;
+        assert_eq!(client.auto_reconnect_enabled(), reconnect);
+        assert!(client.protocol_terminal_reason.lock().unwrap().is_none());
+        cleanup.await.unwrap();
+
+        let replacement = Arc::new(crate::transport::mock::StallingMockTransport::new());
+        *client.transport.lock().await =
+            Some(replacement.clone() as Arc<dyn crate::transport::Transport>);
+        client.reset_connection_shutdown();
+        client.set_connected_for_test(true);
+        assert_eq!(replacement.disconnects_started(), 0);
+        assert!(!client.connection_shutdown_signal().is_fired());
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[tokio::test]
+    async fn primary_startup_honors_the_selected_snapshot_bootstrap_policy() {
+        use crate::MobileAppStatePolicy::{AuthoritativeZapo, SnapshotCompatible};
+
+        for policy in [AuthoritativeZapo, SnapshotCompatible] {
+            let (client, transport) =
+                crate::test_utils::create_primary_iq_test_client_with_app_state_policy(
+                    crate::test_utils::primary_test_backend(),
+                    Some(policy),
+                )
+                .await;
+            let mut fingerprint = waproto::whatsapp::message::AppStateSyncKeyFingerprint::default();
+            fingerprint.raw_id = Some(7);
+            fingerprint.current_index = Some(0);
+            fingerprint.device_indexes = vec![0];
+            client
+                .persistence_manager
+                .backend()
+                .set_sync_key(
+                    &[0, 0, 0, 0, 0, 1],
+                    crate::store::traits::AppStateSyncKey {
+                        key_data: vec![7; 32],
+                        fingerprint: waproto::codec::app_state_sync_key_fingerprint_to_vec(
+                            &fingerprint,
+                        ),
+                        timestamp: 1000,
+                    },
+                )
+                .await
+                .unwrap();
+            client
+                .persistence_manager
+                .process_command(DeviceCommand::SetPushName("Synthetic primary".into()))
+                .await;
+            let events = Arc::new(crate::test_utils::TestEventCollector::default());
+            client.subscribe_handler(events.clone()).detach();
+            client.invalidate_session_authentication();
+            client.set_connected_for_test(true);
+            client.offline_sync_completed.store(true, Ordering::Relaxed);
+            client.needs_initial_full_sync.settle(
+                client.connection_generation.load(Ordering::SeqCst),
+                true,
+            );
+            assert!(!client.initial_app_state_keys_received.load(Ordering::Acquire));
+            let success = NodeBuilder::new("success").build();
+            client.handle_success(&success.as_node_ref()).await;
+
+            let sent_snapshot_request = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut handled = 0;
+                loop {
+                    let frames =
+                        crate::test_utils::decrypt_wire_frames(&transport.sent(), &[0; 32]);
+                    for frame in &frames[handled..] {
+                        let unpacked = wacore_binary::util::unpack(frame).unwrap();
+                        let owned =
+                            wacore_binary::OwnedNodeRef::new(unpacked.into_owned()).unwrap();
+                        let node = owned.as_node_ref();
+                        if node.tag() != "iq" {
+                            continue;
+                        }
+                        if node.attrs().optional_string("xmlns").as_deref()
+                            == Some("w:sync:app:state")
+                        {
+                            return true;
+                        }
+                        if let Some(id) = node.attrs().optional_string("id") {
+                            let id = id.to_string();
+                            if client.response_waiters_guard().contains_key(&id) {
+                                let response = NodeBuilder::new("iq")
+                                    .attr("from", "s.whatsapp.net")
+                                    .attr("type", "result")
+                                    .attr("id", id.as_str())
+                                    .build();
+                                crate::test_utils::answer_iq(&client, &id, &response).await;
+                            }
+                        }
+                    }
+                    handled = frames.len();
+                    if events
+                        .events()
+                        .iter()
+                        .any(|event| matches!(&**event, Event::Connected(_)))
+                    {
+                        return false;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("startup must reach bootstrap or readiness");
+            assert_eq!(sent_snapshot_request, policy == SnapshotCompatible);
+            assert!(client.initial_app_state_keys_received.load(Ordering::Acquire));
+            client.notify_connection_shutdown();
+        }
     }
 
     #[cfg(feature = "mobile-core")]

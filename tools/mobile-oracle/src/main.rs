@@ -42,13 +42,12 @@ fn main() -> Result<std::process::ExitCode> {
             }
             Some(_) => bail!("unknown material argument"),
         };
-        let (mut report, private_material) =
-            mobile_oracle::extract_material(&first, &second, &recipe)?;
+        let extracted = mobile_oracle::extract_material(&first, &second, &recipe)?;
         let receipt = repository
-            .map(|root| mobile_oracle::export_private_material(&root, &report, &private_material))
+            .map(|root| mobile_oracle::export_private_material(&root, &extracted))
             .transpose()?;
-        report.secret_exported = receipt.is_some();
-        let mut output = serde_json::to_value(&report)?;
+        let mut output = serde_json::to_value(extracted.report())?;
+        output["secret_exported"] = serde_json::Value::Bool(receipt.is_some());
         if let Some(receipt) = receipt {
             output["private_export"] = serde_json::to_value(receipt)?;
         }

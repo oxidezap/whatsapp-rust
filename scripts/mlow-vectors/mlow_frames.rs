@@ -3,9 +3,12 @@
 use std::{
     ffi::c_void,
     fs::File,
-    io::{self, Read, Write},
+    io::{self, Write},
     ptr::NonNull,
 };
+
+mod pcm;
+use pcm::read_pcm_frame;
 
 unsafe extern "C" {
     fn smpl_CreateCodec() -> i32;
@@ -121,10 +124,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut stdout = io::BufWriter::new(io::stdout().lock());
     let mut emitted = 0;
     while want < 0 || emitted < want {
-        match input.read_exact(&mut raw) {
-            Ok(()) => (),
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.into()),
+        if !read_pcm_frame(&mut input, &mut raw)? {
+            break;
         }
         for (sample, bytes) in pcm.iter_mut().zip(raw.chunks_exact(2)) {
             *sample = i16::from_le_bytes([bytes[0], bytes[1]]);

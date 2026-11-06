@@ -241,9 +241,7 @@ impl FreshDeviceRow {
         row.server_cert_chain = supplied
             .server_cert_chain
             .as_ref()
-            .map(serde_json::to_vec)
-            .transpose()
-            .map_err(|e| StoreError::Serialization(Box::new(e)))?;
+            .map(crate::wire::encode_server_cert_chain);
         row.login_counter = supplied.login_counter;
         row.lid_migrated = supplied.lid_migrated;
         row.read_receipts_disabled = supplied.read_receipts_disabled;
@@ -1783,6 +1781,9 @@ impl SqliteStore {
         device_id: i32,
         device_data: &CoreDevice,
     ) -> Result<()> {
+        if device_data.mobile_session.is_some() {
+            device_data.validate_mobile_session()?;
+        }
         // Use Arc so retry clones are just atomic increments, not deep copies.
         let noise_key_data: Arc<[u8]> = self.serialize_keypair(&device_data.noise_key)?.into();
         let identity_key_data: Arc<[u8]> =
@@ -1793,9 +1794,6 @@ impl SqliteStore {
             .account
             .as_ref()
             .map(|a| Arc::from(wacore::store::device::account_serde::to_bytes(a)));
-        if let Some(binding) = &device_data.mobile_session {
-            binding.validate()?;
-        }
         let mobile_session_binding: Option<Arc<[u8]>> = device_data
             .mobile_session
             .as_ref()
@@ -2220,11 +2218,31 @@ impl SqliteStore {
 
         let row = self
             .read_query(move |conn| {
+                // The SQL predicate runs before Diesel materializes the BLOB.
+                // Keep it on the row read itself so a concurrent writer cannot
+                // replace a checked length with an oversized value.
                 let result = device::table
                     .filter(device::id.eq(device_id))
+                    .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(concat!(
+                        "mobile_session_binding IS NULL OR ",
+                        "(typeof(mobile_session_binding) = 'blob' ",
+                        "AND length(mobile_session_binding) <= 1048576)",
+                    )))
                     .first::<DeviceRow>(conn)
                     .optional()
                     .map_err(|e| StoreError::Database(Box::new(e)))?;
+                if result.is_none() {
+                    let exists = diesel::select(diesel::dsl::exists(
+                        device::table.filter(device::id.eq(device_id)),
+                    ))
+                    .get_result::<bool>(conn)
+                    .map_err(|e| StoreError::Database(Box::new(e)))?;
+                    if exists {
+                        return Err(StoreError::Validation(
+                            "oversized mobile session binding".into(),
+                        ));
+                    }
+                }
                 Ok(result)
             })
             .await?;
@@ -8002,6 +8020,151 @@ mod tests {
         assert_eq!(
             loaded.first_unupload_pre_key_id, 101,
             "first_unupload_pre_key_id must survive a save/load roundtrip"
+        );
+    }
+
+    #[tokio::test]
+    async fn mobile_save_rejects_mismatched_device_and_bounds_blob_reads() {
+        use wacore::store::commands::{DeviceCommand, apply_command_to_device};
+        use wacore::store::{MobileSessionBinding, StoredMobilePlatform};
+
+        let db = format!(
+            "file:mobile_checked_save_{}?mode=memory&cache=shared",
+            std::process::id()
+        );
+        let database = crate::SqliteDatabase::open(&db, Default::default())
+            .await
+            .unwrap();
+        let store = database.store(121);
+        let mut device = CoreDevice::new();
+        let binding = MobileSessionBinding::new(
+            [1; 32],
+            device.mobile_identity_hash(),
+            StoredMobilePlatform::Android,
+            vec![8, 9],
+            None,
+        )
+        .unwrap();
+        apply_command_to_device(
+            &mut device,
+            DeviceCommand::SetMobileSessionBinding(binding.clone()),
+        );
+        DeviceStore::save(&store, &device).await.unwrap();
+        let invalid_keys = CoreDevice {
+            noise_key: CoreDevice::new().noise_key,
+            ..device.clone()
+        };
+        assert!(DeviceStore::save(&store, &invalid_keys).await.is_err());
+        let mut invalid_identity = device.clone();
+        apply_command_to_device(
+            &mut invalid_identity,
+            DeviceCommand::SetId(Some("15551234567:1@s.whatsapp.net".parse().unwrap())),
+        );
+        assert!(DeviceStore::save(&store, &invalid_identity).await.is_err());
+        let restored = DeviceStore::load(&store).await.unwrap().unwrap();
+        restored.validate_mobile_session().unwrap();
+        assert_eq!(restored.mobile_session.as_deref(), Some(&binding));
+        assert_eq!(restored.noise_key.public_key, device.noise_key.public_key);
+        assert!(restored.pn.is_none());
+
+        store
+            .with_retry("oversized_mobile_binding", || {
+                Box::new(|conn| {
+                    diesel::sql_query(
+                        "UPDATE device SET mobile_session_binding = zeroblob(1048577) WHERE id = 121",
+                    )
+                    .execute(conn)
+                    .map(|_| ())
+                })
+            })
+            .await
+            .unwrap();
+        let error = DeviceStore::load(&store).await.err().unwrap();
+        assert!(format!("{error}").contains("oversized mobile session binding"));
+        store
+            .with_retry("text_mobile_binding", || {
+                Box::new(|conn| {
+                    diesel::sql_query(
+                        "UPDATE device SET mobile_session_binding = CAST(zeroblob(1048577) AS TEXT) WHERE id = 121",
+                    )
+                    .execute(conn)
+                    .map(|_| ())
+                })
+            })
+            .await
+            .unwrap();
+        assert!(DeviceStore::load(&store).await.is_err());
+        let missing = database.store(122);
+        assert!(DeviceStore::load(&missing).await.unwrap().is_none());
+    }
+
+    #[cfg(feature = "mobile")]
+    #[tokio::test]
+    async fn mobile_provisioning_preserves_protobuf_cached_certificates() {
+        use wacore::store::commands::{DeviceCommand, apply_command_to_device};
+        use wacore::store::device::{CachedNoiseCert, CachedServerCertChain};
+        use wacore::store::{MobileSessionBinding, StoredMobilePlatform};
+
+        let db = format!(
+            "file:mobile_provisioned_certificate_{}?mode=memory&cache=shared",
+            std::process::id()
+        );
+        let database = crate::SqliteDatabase::open(&db, Default::default())
+            .await
+            .unwrap();
+        let chain = CachedServerCertChain {
+            intermediate: CachedNoiseCert {
+                key: [0xAB; 32],
+                not_before: 1_700_000_000,
+                not_after: 1_900_000_000,
+            },
+            leaf: CachedNoiseCert {
+                key: [0xCD; 32],
+                not_before: 1_700_000_500,
+                not_after: 1_899_999_500,
+            },
+            signature_verified: true,
+        };
+        let mut device = CoreDevice {
+            server_cert_chain: Some(chain.clone()),
+            ..CoreDevice::new()
+        };
+        let binding = MobileSessionBinding::new(
+            [1; 32],
+            device.mobile_identity_hash(),
+            StoredMobilePlatform::Android,
+            vec![8, 9],
+            None,
+        )
+        .unwrap();
+        apply_command_to_device(
+            &mut device,
+            DeviceCommand::CompleteMobileRegistration {
+                binding,
+                pn: "15551234567@s.whatsapp.net".parse().unwrap(),
+                lid: None,
+            },
+        );
+        let store = database.store(123);
+        DeviceStore::initialize_mobile_device(&store, &device)
+            .await
+            .unwrap();
+        assert_eq!(
+            DeviceStore::load(&store)
+                .await
+                .unwrap()
+                .unwrap()
+                .server_cert_chain,
+            Some(chain.clone())
+        );
+        let imported = database.import_mobile_device(&device).await.unwrap();
+        assert_eq!(
+            DeviceStore::load(&imported)
+                .await
+                .unwrap()
+                .unwrap()
+                .server_cert_chain,
+            Some(chain)
         );
     }
 

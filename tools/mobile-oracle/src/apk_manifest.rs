@@ -146,7 +146,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Manifest> {
         let header = u16le(bytes, p + 2)? as usize;
         let size = u32le(bytes, p + 4)? as usize;
         ensure!(
-            header >= 8 && size >= header && size.is_multiple_of(4) && p + size <= bytes.len(),
+            header >= 8 && size >= header && size.is_multiple_of(4) && size <= bytes.len() - p,
             "invalid XML chunk"
         );
         let b = &bytes[p..p + size];
@@ -348,6 +348,15 @@ pub(crate) mod tests {
         bad[end - 4] = 1;
         assert!(parse(&bad).is_err());
     }
+    #[test]
+    fn oversized_chunk_is_rejected_before_offset_addition() {
+        let mut bytes = fixture();
+        // Adding this untrusted u32 to the first chunk offset overflows usize on
+        // 32-bit hosts, even though the input itself fits the manifest budget.
+        bytes[12..16].copy_from_slice(&0xffff_fffc_u32.to_le_bytes());
+        assert!(parse(&bytes).is_err());
+    }
+
     #[test]
     fn bounded_invalid_inputs() {
         for size in 0..128 {

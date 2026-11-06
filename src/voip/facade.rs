@@ -1672,15 +1672,15 @@ async fn fanout_group_epoch_for_generation(
     update: &GroupCallUpdate,
     generation: Option<u64>,
 ) -> Result<GroupEpochFanout, CallError> {
-    let sender_role = client.sending_identity_role();
-    sender_role
-        .validate()
-        .map_err(|_| CallError::MissingDeviceIdentity)?;
     ensure_group_rekey_generation(client, &update.call_id, generation)?;
     // The authoritative roster transaction is already committed before this fan-out starts. Any
     // preparation failure would make an identical redelivery stale, so own teardown from the first
     // fallible step instead of leaving the generation alive without its requested epoch.
     let teardown = GroupRekeyTeardown::new(client, update, generation, true);
+    let sender_role = client.sending_identity_role();
+    sender_role
+        .validate()
+        .map_err(|_| CallError::MissingDeviceIdentity)?;
     let own_lid = client.lid().ok_or(CallError::Media("no own LID"))?;
     let own_pn = client.pn();
     let mut seen = std::collections::HashSet::new();
@@ -10016,6 +10016,54 @@ mod tests {
                 Some(generation)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn unknown_group_sender_role_terminates_the_committed_generation() {
+        let (client, _) = make_sending_client().await;
+        for command in [
+            crate::store::commands::DeviceCommand::SetId(Some(Jid::pn("15550000001"))),
+            crate::store::commands::DeviceCommand::SetLid(Some(Jid::new(
+                "111111111111111",
+                Server::Lid,
+            ))),
+        ] {
+            client
+                .persistence_manager()
+                .try_process_command(command)
+                .await
+                .expect("primary device-zero addresses");
+        }
+        let snapshot = client.persistence_manager().get_device_snapshot();
+        let binding = wacore::store::MobileSessionBinding::new(
+            [1; 32],
+            snapshot.mobile_identity_hash(),
+            wacore::store::StoredMobilePlatform::Android,
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        client
+            .persistence_manager()
+            .try_process_command(crate::store::commands::DeviceCommand::SetMobileSessionBinding(
+                binding,
+            ))
+            .await
+            .expect("valid persisted primary marker without a configured session");
+        assert_eq!(
+            client.sending_identity_role(),
+            wacore::send::SenderIdentityRole::Unknown
+        );
+        let update = rekey_update(&client, &[]);
+        register_group_update(&client, &update);
+        assert!(matches!(
+            fanout_group_epoch(&client, &update).await,
+            Err(CallError::MissingDeviceIdentity)
+        ));
+        assert!(
+            client.call_registry().snapshot(&update.call_id).is_none(),
+            "a failed role preflight must retire the already-committed rekey generation"
+        );
     }
 
     #[tokio::test]

@@ -21,6 +21,8 @@ pub const IK_FAILURE_THRESHOLD: u32 = 1;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum HandshakeError {
+    #[error("Mobile-bound devices require an explicitly configured mobile handshake")]
+    MobileDeviceRequiresProfile,
     #[cfg(feature = "mobile")]
     #[error("Mobile handshake error: {0}")]
     Mobile(#[from] crate::mobile::MobileSessionError),
@@ -50,7 +52,8 @@ impl HandshakeError {
             HandshakeError::Timeout => true,
             #[cfg(feature = "mobile")]
             HandshakeError::Mobile(_) => false,
-            HandshakeError::Transport(_)
+            HandshakeError::MobileDeviceRequiresProfile
+            | HandshakeError::Transport(_)
             | HandshakeError::Core(_)
             | HandshakeError::StreamClosed
             | HandshakeError::Disconnected
@@ -155,6 +158,9 @@ pub async fn run_xx_handshake(
     transport_events: &mut async_channel::Receiver<TransportEvent>,
     cert_policy: NoiseCertPolicy,
 ) -> Result<HandshakeSuccess> {
+    if device.mobile_session.is_some() {
+        return Err(HandshakeError::MobileDeviceRequiresProfile);
+    }
     let client_payload = waproto::codec::client_payload_to_vec(&device.get_client_payload());
     let mut handshake_state = XxHandshakeState::new_with_cert_policy(
         device.noise_key.clone(),
@@ -201,6 +207,9 @@ pub async fn run_ik_handshake(
     fallback_taken: &mut bool,
     cert_policy: NoiseCertPolicy,
 ) -> Result<HandshakeSuccess> {
+    if device.mobile_session.is_some() {
+        return Err(HandshakeError::MobileDeviceRequiresProfile);
+    }
     let client_payload = waproto::codec::client_payload_to_vec(&device.get_client_payload());
     let mut ik = IkHandshakeState::new(
         device.noise_key.clone(),
@@ -299,5 +308,97 @@ pub async fn recv_frame(
     match rt_timeout(&**runtime, NOISE_HANDSHAKE_RESPONSE_TIMEOUT, assemble).await {
         Ok(result) => result,
         Err(_) => Err(HandshakeError::Timeout),
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod mobile_boundary_tests {
+    use super::*;
+    use crate::runtime::{AbortHandle, BoxFuture};
+    use crate::store::{MobileDeviceKeys, MobileSessionBinding, StoredMobilePlatform};
+
+    struct NoRuntime;
+    impl Runtime for NoRuntime {
+        fn spawn(&self, _: BoxFuture<'static, ()>) -> AbortHandle {
+            panic!("rejected handshake must not spawn")
+        }
+        fn sleep(&self, _: Duration) -> BoxFuture<'static, ()> {
+            panic!("rejected handshake must not wait")
+        }
+        fn spawn_blocking(&self, _: Box<dyn FnOnce() + Send + 'static>) -> BoxFuture<'static, ()> {
+            panic!("rejected handshake must not perform blocking work")
+        }
+        fn yield_now(&self) -> Option<BoxFuture<'static, ()>> {
+            panic!("rejected handshake must not yield")
+        }
+    }
+
+    struct NoTransport;
+    #[async_trait::async_trait]
+    impl Transport for NoTransport {
+        async fn send(&self, _: bytes::Bytes) -> anyhow::Result<()> {
+            panic!("mobile credentials must never be sent by the Web runner")
+        }
+        async fn disconnect(&self) {
+            panic!("rejected handshake must leave the supplied transport untouched")
+        }
+    }
+
+    #[test]
+    fn web_runners_reject_mobile_bound_devices_before_io_with_mobile_feature_off_too() {
+        let keys = Device::new();
+        let binding = MobileSessionBinding::new(
+            [1; 32],
+            keys.mobile_identity_hash(),
+            StoredMobilePlatform::Android,
+            vec![],
+            None,
+        )
+        .unwrap();
+        let device = MobileDeviceKeys {
+            registration_id: keys.registration_id,
+            noise_key: keys.noise_key,
+            identity_key: keys.identity_key,
+            signed_pre_key: keys.signed_pre_key,
+            signed_pre_key_id: keys.signed_pre_key_id,
+            signed_pre_key_signature: keys.signed_pre_key_signature,
+            adv_secret_key: keys.adv_secret_key,
+        }
+        .into_device(binding)
+        .unwrap();
+        let runtime: Arc<dyn Runtime> = Arc::new(NoRuntime);
+        let transport: Arc<dyn Transport> = Arc::new(NoTransport);
+        let (_sender, mut events) = async_channel::unbounded();
+        futures::executor::block_on(async {
+            let error = run_xx_handshake(
+                &runtime,
+                &device,
+                transport.clone(),
+                &mut events,
+                NoiseCertPolicy::Strict,
+            )
+            .await
+            .err()
+            .unwrap();
+            assert!(matches!(error, HandshakeError::MobileDeviceRequiresProfile));
+            assert!(!error.is_timeout());
+            assert!(!error.is_transient());
+            assert!(!error.is_crypto_fatal());
+            let mut fallback_taken = false;
+            assert!(matches!(
+                run_ik_handshake(
+                    &runtime,
+                    &device,
+                    [2; 32],
+                    transport,
+                    &mut events,
+                    &mut fallback_taken,
+                    NoiseCertPolicy::Strict,
+                )
+                .await,
+                Err(HandshakeError::MobileDeviceRequiresProfile)
+            ));
+            assert!(!fallback_taken);
+        });
     }
 }

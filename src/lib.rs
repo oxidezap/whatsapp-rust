@@ -579,23 +579,11 @@ pub mod session;
 pub mod socket;
 pub mod store;
 #[cfg(feature = "mobile-core")]
-pub use wacore::mobile;
-#[cfg(feature = "mobile-core")]
-pub use wacore::mobile::primary::PrimarySelfIdentityProfile;
-#[cfg(feature = "mobile-core")]
-pub use wacore::{download::MobileMediaHttpProfile, send::PrimaryDeviceIdentityPolicy};
-#[cfg(feature = "mobile-core")]
-#[path = "mobile/primary.rs"]
-pub mod mobile_primary;
-#[cfg(feature = "mobile-core")]
-#[path = "mobile/registration.rs"]
-pub mod mobile_registration;
-#[cfg(feature = "mobile-core")]
-pub mod mobile_session;
-#[cfg(feature = "mobile-core")]
-pub use mobile_session::{
+pub use features::{
     MobileAppStatePolicy, MobileEphemeralKeyProvider, MobileLoginAttempt,
-    MobileLoginOptionsProvider, RegisteredMobileSession, RegistrationLoginPhoneIdMapping,
+    MobileLoginOptionsProvider, MobileMediaHttpProfile, PrimaryDeviceIdentityPolicy,
+    PrimarySelfIdentityProfile, RegisteredMobileSession, RegistrationLoginPhoneIdMapping,
+    mobile, mobile_primary, mobile_registration, mobile_session,
     validate_registration_login_profile,
 };
 pub mod transport;

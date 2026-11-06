@@ -7,21 +7,34 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
 };
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PrivateMaterial {
     schema_version: u32,
     lock_sha256: String,
     recipe_sha256: String,
-    secret_hex: String,
+    #[serde(
+        serialize_with = "serialize_secret_hex",
+        deserialize_with = "deserialize_secret_hex"
+    )]
+    secret_hex: Zeroizing<String>,
     dex_md5_hex: String,
     certificates_hex: Vec<String>,
 }
-impl Drop for PrivateMaterial {
-    fn drop(&mut self) {
-        self.secret_hex.zeroize();
-    }
+fn serialize_secret_hex<S: serde::Serializer>(
+    secret: &Zeroizing<String>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_str(secret.as_str())
+}
+
+fn deserialize_secret_hex<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Zeroizing<String>, D::Error> {
+    // Wrap the decoded field before Serde reads later fields, so an error while
+    // constructing the envelope still clears this allocation.
+    String::deserialize(deserializer).map(Zeroizing::new)
 }
 #[derive(Serialize)]
 pub struct PrivateExport {
@@ -57,15 +70,45 @@ fn private_file(path: &Path) -> Result<fs::File> {
 fn private_file(_path: &Path) -> Result<fs::File> {
     anyhow::bail!("private material files require Unix permission enforcement")
 }
+#[cfg(unix)]
+fn require_ignored_untracked(repository: &Path, relative: &Path) -> Result<()> {
+    let tracked = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(["ls-files", "--error-unmatch", "--"])
+        .arg(relative)
+        .output()
+        .context("checking private export index status")?;
+    ensure!(
+        tracked.status.code() == Some(1),
+        "private export path must be untracked in a Git repository"
+    );
+    // The directory must also be ignored so an in-progress temporary export
+    // cannot be staged by an ordinary Git add.
+    for ignored_path in [Path::new(".cache/mobile-oracle/private/"), relative] {
+        let ignored = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args(["check-ignore", "--quiet", "--"])
+            .arg(ignored_path)
+            .output()
+            .context("checking private export ignore status")?;
+        ensure!(
+            ignored.status.success(),
+            "Git must ignore the private export directory and path"
+        );
+    }
+    Ok(())
+}
+
 /// Explicit export under the repository's ignored `.cache/mobile-oracle/private`.
 /// Existing files are never overwritten; returned metadata contains no secret.
 #[cfg(unix)]
 pub fn export_private_material(
     repository: &Path,
-    report: &crate::MaterialReport,
-    material: &wacore::mobile::AndroidTokenMaterial,
+    extracted: &crate::ExtractedMaterial,
 ) -> Result<PrivateExport> {
-    export_private_material_with(repository, report, material, |file, bytes| {
+    export_private_material_with(repository, extracted, |file, bytes| {
         file.write_all(bytes)?;
         file.sync_all()
     })
@@ -73,21 +116,20 @@ pub fn export_private_material(
 #[cfg(unix)]
 fn export_private_material_with(
     repository: &Path,
-    report: &crate::MaterialReport,
-    material: &wacore::mobile::AndroidTokenMaterial,
+    extracted: &crate::ExtractedMaterial,
     write_and_sync: impl FnOnce(&mut fs::File, &[u8]) -> std::io::Result<()>,
 ) -> Result<PrivateExport> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let report = extracted.report();
     hash(&report.lock_sha256)?;
     hash(&report.recipe_sha256)?;
     let root = repository.canonicalize()?;
-    ensure!(
-        fs::read_to_string(root.join(".gitignore"))?
-            .lines()
-            .any(|line| line.trim() == "/.cache/"),
-        "repository must ignore /.cache/"
-    );
-    let mut directory = root;
+    let relative = Path::new(".cache/mobile-oracle/private").join(format!(
+        "{}-{}.json",
+        report.lock_sha256, report.recipe_sha256
+    ));
+    require_ignored_untracked(&root, &relative)?;
+    let mut directory = root.clone();
     for name in [".cache", "mobile-oracle", "private"] {
         directory.push(name);
         match fs::DirBuilder::new().mode(0o700).create(&directory) {
@@ -107,16 +149,13 @@ fn export_private_material_with(
             );
         }
     }
-    let path = directory.join(format!(
-        "{}-{}.json",
-        report.lock_sha256, report.recipe_sha256
-    ));
-    let (secret, dex, certificates) = material.export_private_parts();
+    let path = root.join(relative);
+    let (secret, dex, certificates) = extracted.material().export_private_parts();
     let envelope = PrivateMaterial {
         schema_version: 1,
         lock_sha256: report.lock_sha256.clone(),
         recipe_sha256: report.recipe_sha256.clone(),
-        secret_hex: hex::encode(*secret),
+        secret_hex: Zeroizing::new(hex::encode(*secret)),
         dex_md5_hex: hex::encode(dex),
         certificates_hex: certificates.iter().map(hex::encode).collect(),
     };
@@ -137,8 +176,7 @@ fn export_private_material_with(
 #[cfg(not(unix))]
 pub fn export_private_material(
     _repository: &Path,
-    _report: &crate::MaterialReport,
-    _material: &wacore::mobile::AndroidTokenMaterial,
+    _extracted: &crate::ExtractedMaterial,
 ) -> Result<PrivateExport> {
     anyhow::bail!("private export requires Unix permission enforcement")
 }
@@ -169,7 +207,7 @@ pub fn import_private_material(
         "private material provenance mismatch"
     );
     let mut secret = Zeroizing::new([0; 64]);
-    hex::decode_to_slice(&envelope.secret_hex, &mut secret[..])
+    hex::decode_to_slice(envelope.secret_hex.as_bytes(), &mut secret[..])
         .context("invalid private key encoding")?;
     let mut dex = [0; 16];
     hex::decode_to_slice(&envelope.dex_md5_hex, &mut dex)?;
@@ -193,12 +231,16 @@ pub fn import_private_material(
 mod tests {
     use super::*;
 
-    fn synthetic_inputs() -> (
-        tempfile::TempDir,
-        crate::MaterialReport,
-        wacore::mobile::AndroidTokenMaterial,
-    ) {
+    fn synthetic_inputs() -> (tempfile::TempDir, crate::ExtractedMaterial) {
         let dir = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
         fs::write(dir.path().join(".gitignore"), "/.cache/\n").unwrap();
         let material = wacore::mobile::AndroidTokenMaterial::from_derived(
             [7; 64],
@@ -221,20 +263,22 @@ mod tests {
             certificate_sha256: vec![],
             secret_exported: false,
         };
-        (dir, report, material)
+        (dir, crate::ExtractedMaterial::synthetic(report, material))
     }
 
     #[test]
     fn failed_partial_export_is_unpublished_and_retry_succeeds() {
         use std::os::unix::fs::PermissionsExt;
-        let (dir, report, material) = synthetic_inputs();
+        let (dir, extracted) = synthetic_inputs();
+        let report = extracted.report();
+        let material = extracted.material();
         let private = dir.path().join(".cache/mobile-oracle/private");
         let final_path = private.join(format!(
             "{}-{}.json",
             report.lock_sha256, report.recipe_sha256
         ));
         let Err(error) =
-            export_private_material_with(dir.path(), &report, &material, |file, bytes| {
+            export_private_material_with(dir.path(), &extracted, |file, bytes| {
                 assert_eq!(file.metadata()?.permissions().mode() & 0o777, 0o600);
                 file.write_all(&bytes[..37])?;
                 assert!(!final_path.exists());
@@ -247,7 +291,7 @@ mod tests {
         assert!(!final_path.exists());
         assert_eq!(fs::read_dir(&private).unwrap().count(), 0);
 
-        let receipt = export_private_material(dir.path(), &report, &material).unwrap();
+        let receipt = export_private_material(dir.path(), &extracted).unwrap();
         assert_eq!(receipt.path, final_path);
         assert_eq!(fs::read_dir(&private).unwrap().count(), 1);
         let restored = import_private_material(
@@ -266,8 +310,10 @@ mod tests {
     #[test]
     fn synthetic_private_roundtrip_binding_permissions_and_no_clobber() {
         use std::os::unix::fs::{PermissionsExt, symlink};
-        let (dir, report, material) = synthetic_inputs();
-        let receipt = export_private_material(dir.path(), &report, &material).unwrap();
+        let (dir, extracted) = synthetic_inputs();
+        let report = extracted.report();
+        let material = extracted.material();
+        let receipt = export_private_material(dir.path(), &extracted).unwrap();
         assert_eq!(
             fs::metadata(&receipt.path).unwrap().permissions().mode() & 0o777,
             0o600
@@ -284,7 +330,7 @@ mod tests {
             material.token_base64("01234").unwrap()
         );
         let original = fs::read(&receipt.path).unwrap();
-        assert!(export_private_material(dir.path(), &report, &material).is_err());
+        assert!(export_private_material(dir.path(), &extracted).is_err());
         assert_eq!(fs::read(&receipt.path).unwrap(), original);
         assert_eq!(
             fs::read_dir(receipt.path.parent().unwrap())
@@ -332,5 +378,59 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn export_rejects_effectively_unignored_path_before_writing() {
+        let (dir, extracted) = synthetic_inputs();
+        fs::write(dir.path().join(".gitignore"), "/.cache/\n!/.cache/\n").unwrap();
+        let Err(error) = export_private_material(dir.path(), &extracted) else {
+            panic!("unignored export must fail");
+        };
+        assert!(error.to_string().contains("Git must ignore"));
+        assert!(!dir.path().join(".cache").exists());
+    }
+
+    #[test]
+    fn export_rejects_ignore_rule_covering_only_the_final_file() {
+        let (dir, extracted) = synthetic_inputs();
+        let rule = format!(
+            "/.cache/mobile-oracle/private/{}-{}.json\n",
+            extracted.report().lock_sha256,
+            extracted.report().recipe_sha256
+        );
+        fs::write(dir.path().join(".gitignore"), rule).unwrap();
+        assert!(export_private_material(dir.path(), &extracted).is_err());
+        assert!(!dir.path().join(".cache").exists());
+    }
+
+    #[test]
+    fn export_rejects_tracked_destination_even_when_deleted() {
+        let (dir, extracted) = synthetic_inputs();
+        let relative = Path::new(".cache/mobile-oracle/private").join(format!(
+            "{}-{}.json",
+            extracted.report().lock_sha256,
+            extracted.report().recipe_sha256
+        ));
+        let path = dir.path().join(&relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"synthetic tracked placeholder").unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["add", "--force", "--"])
+                .arg(&relative)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::remove_file(&path).unwrap();
+        let Err(error) = export_private_material(dir.path(), &extracted) else {
+            panic!("tracked export must fail");
+        };
+        assert!(error.to_string().contains("must be untracked"));
+        assert!(!path.exists());
+        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 0);
     }
 }

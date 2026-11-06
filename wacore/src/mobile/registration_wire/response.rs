@@ -552,6 +552,27 @@ mod tests {
         assert_eq!(r.reason(), Some("new_rule"));
     }
     #[test]
+    fn finalization_status_aliases_match_the_pinned_references() {
+        // Cobalt isSuccessful and whalibmob isSuccessful are shared by their
+        // register, challenge and security handlers. This is reference
+        // compatibility, not an official-server acceptance claim.
+        for status in ["ok", "sent", "verified"] {
+            let json = format!(r#"{{"status":"{status}"}}"#);
+            let response = RegistrationResponse::parse(json.as_bytes()).unwrap();
+            for endpoint in [
+                RegistrationEndpointPath::Register,
+                RegistrationEndpointPath::Challenge,
+                RegistrationEndpointPath::Security,
+            ] {
+                assert_eq!(
+                    response.decision(endpoint),
+                    RegistrationResponseDecision::Registered
+                );
+            }
+        }
+    }
+
+    #[test]
     fn challenges_pins_waits_and_required_input_stay_distinct() {
         let r = RegistrationResponse::parse(br#"{"status":"fail","image_blob":"aW1hZ2U=","audio_blob":"YXVkaW8","sms_wait":"9","future_wait":12}"#).unwrap();
         assert_eq!(

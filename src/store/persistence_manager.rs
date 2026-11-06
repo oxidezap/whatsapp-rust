@@ -567,16 +567,88 @@ impl PersistenceManager {
 use super::commands::{DeviceCommand, apply_command_to_device, apply_command_to_device_at};
 
 impl PersistenceManager {
+    /// Apply a command, rejecting invalid mobile updates without publishing them.
+    /// Use [`Self::try_process_command`] when the caller needs the validation error.
     pub async fn process_command(&self, command: DeviceCommand) {
-        self.modify_device(|device| {
-            apply_command_to_device(device, command);
-        })
-        .await;
+        if let Err(error) = self.try_process_command(command).await {
+            error!("Rejected invalid device command: {error}");
+        }
+    }
+
+    /// Apply a command with checked mobile binding/identity publication.
+    pub async fn try_process_command(&self, command: DeviceCommand) -> Result<(), StoreError> {
+        if matches!(
+            &command,
+            DeviceCommand::SetMobileSessionBinding(_)
+                | DeviceCommand::CompleteMobileRegistration { .. }
+        ) {
+            return Box::pin(self.process_mobile_command(command)).await;
+        }
+        self.modify_device(|device| apply_command_to_device(device, command))
+            .await;
+        Ok(())
     }
 
     pub async fn process_command_at(&self, command: DeviceCommand, now_millis: i64) {
+        if let Err(error) = self.try_process_command_at(command, now_millis).await {
+            error!("Rejected invalid device command: {error}");
+        }
+    }
+
+    /// Apply a clocked command with the same checked mobile publication boundary.
+    pub async fn try_process_command_at(
+        &self,
+        command: DeviceCommand,
+        now_millis: i64,
+    ) -> Result<(), StoreError> {
+        if matches!(
+            &command,
+            DeviceCommand::SetMobileSessionBinding(_)
+                | DeviceCommand::CompleteMobileRegistration { .. }
+        ) {
+            return Box::pin(self.process_mobile_command(command)).await;
+        }
         self.modify_device(|device| apply_command_to_device_at(device, command, now_millis))
             .await;
+        Ok(())
+    }
+
+    async fn process_mobile_command(&self, command: DeviceCommand) -> Result<(), StoreError> {
+        let device = self.device.write().await;
+        let (binding, pn, lid) = match &command {
+            DeviceCommand::SetMobileSessionBinding(binding) => {
+                (binding, device.pn.as_ref(), device.lid.as_ref())
+            }
+            DeviceCommand::CompleteMobileRegistration { binding, pn, lid } => {
+                (binding, Some(pn), lid.as_ref())
+            }
+            _ => {
+                return Err(StoreError::InvalidConfig(
+                    "expected mobile session command".into(),
+                ));
+            }
+        };
+        if let Some(current) = device.mobile_session.as_deref()
+            && (current.environment_hash != binding.environment_hash
+                || current.identity_hash != binding.identity_hash
+                || current.platform != binding.platform
+                || current.role != binding.role)
+        {
+            return Err(StoreError::Validation(
+                "mobile session binding changed".into(),
+            ));
+        }
+        device
+            .core
+            .validate_mobile_session_update(binding, pn, lid)?;
+        // Validation and publication share the lock. Rejection never creates the
+        // publishing guard, so the snapshot, dirty bit and saver remain untouched.
+        let mut mutation = DeviceMutation {
+            manager: self,
+            device,
+        };
+        apply_command_to_device(&mut mutation.device, command);
+        Ok(())
     }
 
     pub(crate) async fn process_command_on(
@@ -584,8 +656,7 @@ impl PersistenceManager {
         command: DeviceCommand,
         runtime: &Arc<dyn Runtime>,
     ) {
-        let now = runtime.wall_time_millis();
-        self.modify_device(|device| apply_command_to_device_at(device, command, now))
+        self.process_command_at(command, runtime.wall_time_millis())
             .await;
     }
 
@@ -673,6 +744,92 @@ mod tests {
     use crate::runtime_impl::TokioRuntime;
     use wacore::store::traits::DeviceStore;
     use wacore::time::Instant;
+
+    #[tokio::test]
+    async fn mobile_commands_reject_invalid_updates_before_publication() {
+        use wacore::store::{MobileSessionBinding, StoredMobilePlatform};
+
+        let backend = Arc::new(wacore::store::InMemoryBackend::new());
+        let mut device = wacore::store::Device::new();
+        let binding = MobileSessionBinding::new(
+            [1; 32],
+            device.mobile_identity_hash(),
+            StoredMobilePlatform::Android,
+            vec![3],
+            None,
+        )
+        .unwrap();
+        apply_command_to_device(
+            &mut device,
+            DeviceCommand::SetMobileSessionBinding(binding.clone()),
+        );
+        let pm = PersistenceManager::initialize_mobile(backend.clone(), device)
+            .await
+            .unwrap();
+        let before = pm.get_device_snapshot();
+        let mut mismatch = binding.clone();
+        mismatch.identity_hash[0] ^= 1;
+        assert!(
+            pm.try_process_command(DeviceCommand::SetMobileSessionBinding(mismatch.clone()))
+                .await
+                .is_err()
+        );
+        let mut foreign_environment = binding.clone();
+        foreign_environment.environment_hash[0] ^= 1;
+        assert!(
+            pm.try_process_command(DeviceCommand::SetMobileSessionBinding(foreign_environment))
+                .await
+                .is_err()
+        );
+        assert!(
+            pm.try_process_command_at(
+                DeviceCommand::CompleteMobileRegistration {
+                    binding: binding.clone(),
+                    pn: "15551234567:1@s.whatsapp.net".parse().unwrap(),
+                    lid: None,
+                },
+                42,
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            pm.try_process_command(DeviceCommand::CompleteMobileRegistration {
+                binding: binding.clone(),
+                pn: "15551234567@s.whatsapp.net".parse().unwrap(),
+                lid: Some("100000000000001:1@lid".parse().unwrap()),
+            })
+            .await
+            .is_err()
+        );
+        pm.process_command(DeviceCommand::SetMobileSessionBinding(mismatch))
+            .await;
+        assert!(Arc::ptr_eq(&before, &pm.get_device_snapshot()));
+        assert!(!pm.dirty.load(Ordering::Acquire));
+        pm.flush().await.unwrap();
+        assert_eq!(
+            backend.load().await.unwrap().unwrap().mobile_session,
+            before.mobile_session
+        );
+
+        let mut next = binding;
+        next.registration_checkpoint = Some(vec![4]);
+        pm.try_process_command_at(DeviceCommand::SetMobileSessionBinding(next.clone()), 42)
+            .await
+            .unwrap();
+        let pn: wacore_binary::Jid = "15551234567@s.whatsapp.net".parse().unwrap();
+        pm.try_process_command(DeviceCommand::CompleteMobileRegistration {
+            binding: next.clone(),
+            pn: pn.clone(),
+            lid: None,
+        })
+        .await
+        .unwrap();
+        pm.flush().await.unwrap();
+        let stored = backend.load().await.unwrap().unwrap();
+        assert_eq!(stored.mobile_session.as_deref(), Some(&next));
+        assert_eq!(stored.pn, Some(pn));
+    }
 
     #[tokio::test]
     async fn registered_mobile_import_is_one_durable_fresh_identity() {

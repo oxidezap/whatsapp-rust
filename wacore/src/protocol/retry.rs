@@ -242,23 +242,45 @@ pub fn build_retry_keys_node(
     signed_prekey_signature: Vec<u8>,
     device_identity: Vec<u8>,
 ) -> Node {
+    build_retry_keys_node_with_device_identity(
+        identity_pub,
+        prekey_id,
+        prekey_pub,
+        signed_prekey_id,
+        signed_prekey_pub,
+        signed_prekey_signature,
+        Some(device_identity),
+    )
+}
+
+/// Build a retry key bundle after the caller has validated the sending role and
+/// selected its ADV policy. Omitting ADV never omits the Signal identity or prekeys.
+pub fn build_retry_keys_node_with_device_identity(
+    identity_pub: &PublicKey,
+    prekey_id: u32,
+    prekey_pub: &PublicKey,
+    signed_prekey_id: u32,
+    signed_prekey_pub: &PublicKey,
+    signed_prekey_signature: Vec<u8>,
+    device_identity: Option<Vec<u8>>,
+) -> Node {
+    let children = [
+        NodeBuilder::new("type").bytes(vec![5u8]).build(),
+        NodeBuilder::new("identity")
+            .bytes(identity_pub.public_key_bytes().to_vec())
+            .build(),
+        OneTimePreKeyNode::new(prekey_id, prekey_pub.public_key_bytes().to_vec()).into_node(),
+        SignedPreKeyNode::new(
+            signed_prekey_id,
+            signed_prekey_pub.public_key_bytes().to_vec(),
+            signed_prekey_signature,
+        )
+        .into_node(),
+    ];
     NodeBuilder::new("keys")
-        .children([
-            NodeBuilder::new("type").bytes(vec![5u8]).build(),
-            NodeBuilder::new("identity")
-                .bytes(identity_pub.public_key_bytes().to_vec())
-                .build(),
-            OneTimePreKeyNode::new(prekey_id, prekey_pub.public_key_bytes().to_vec()).into_node(),
-            SignedPreKeyNode::new(
-                signed_prekey_id,
-                signed_prekey_pub.public_key_bytes().to_vec(),
-                signed_prekey_signature,
-            )
-            .into_node(),
-            NodeBuilder::new("device-identity")
-                .bytes(device_identity)
-                .build(),
-        ])
+        .children(children.into_iter().chain(
+            device_identity.map(|identity| NodeBuilder::new("device-identity").bytes(identity).build()),
+        ))
         .build()
 }
 
@@ -523,6 +545,29 @@ mod tests {
             parsed_skey.public_bytes.as_slice(),
             signed_prekey.public_key.public_key_bytes()
         );
+    }
+
+    #[test]
+    fn primary_retry_bundle_omits_only_the_optional_adv_identity() {
+        use crate::libsignal::protocol::KeyPair;
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let identity = KeyPair::generate(&mut rng);
+        let prekey = KeyPair::generate(&mut rng);
+        let signed_prekey = KeyPair::generate(&mut rng);
+        let keys = build_retry_keys_node_with_device_identity(
+            &identity.public_key,
+            201,
+            &prekey.public_key,
+            100,
+            &signed_prekey.public_key,
+            vec![7; 64],
+            None,
+        );
+        assert!(keys.get_optional_child("device-identity").is_none());
+        assert!(keys.get_optional_child("identity").is_some());
+        OneTimePreKeyNode::try_from_node(keys.get_optional_child("key").unwrap()).unwrap();
+        SignedPreKeyNode::try_from_node(keys.get_optional_child("skey").unwrap()).unwrap();
     }
 
     // These strings are metric label values; drift silently breaks dashboards.

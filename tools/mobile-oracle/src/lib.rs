@@ -1222,7 +1222,7 @@ mod apk_der;
 mod apk_manifest;
 
 mod material;
-pub use material::{MaterialRecipe, MaterialReport, extract_material};
+pub use material::{ExtractedMaterial, MaterialRecipe, MaterialReport, extract_material};
 mod apk_signing;
 pub use apk_signing::SigningScheme;
 

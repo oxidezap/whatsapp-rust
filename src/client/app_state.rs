@@ -6194,18 +6194,56 @@ mod send_patch_response_tests {
                     client.connection_generation.load(Ordering::SeqCst),
                     Ordering::SeqCst,
                 );
+                let backend = client.persistence_manager.backend();
+                let key_id = b"primary-incoming-patch";
+                backend
+                    .set_sync_key(
+                        key_id,
+                        crate::store::traits::AppStateSyncKey {
+                            key_data: vec![5; 32],
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                client
+                    .persistence_manager
+                    .process_command(DeviceCommand::SetPushName("Before patch".into()))
+                    .await;
+                let mut value = wa::SyncActionValue::default();
+                value.push_name_setting.get_or_insert_default().name = Some("Primary patch".into());
+                value.timestamp = Some(1_700_000_000_000);
+                let keys = wacore::appstate::keys::expand_app_state_keys(&[5; 32]);
+                let (mutation, _) = wacore::appstate::encode::encode_record(
+                    wa::syncd_mutation::SyncdOperation::Set,
+                    b"[\"setting_pushName\"]",
+                    &value,
+                    &keys,
+                    key_id,
+                    &[7; 16],
+                    1,
+                );
+                let (patch, base) = client
+                    .get_app_state_processor()
+                    .build_patch(WAPatchName::CriticalBlock.as_str(), vec![mutation])
+                    .await
+                    .unwrap();
+                assert_eq!(base, 0);
+                let mut patch = waproto::codec::syncd_patch_decode(&patch).unwrap();
+                patch.version.get_or_insert_default().version = Some(1);
+                let patch = waproto::codec::syncd_patch_to_vec(&patch);
                 let sync = async {
                     if batched {
                         client
                             .sync_collections_batched(
-                                vec![WAPatchName::Regular],
+                                vec![WAPatchName::CriticalBlock],
                                 client.sync_scope(None),
                             )
                             .await
                             .map(|_| ())
                     } else {
                         client
-                            .process_app_state_sync_task(WAPatchName::Regular, false)
+                            .process_app_state_sync_task(WAPatchName::CriticalBlock, false)
                             .await
                             .map(|_| ())
                     }
@@ -6235,13 +6273,38 @@ mod send_patch_response_tests {
                     crate::test_utils::answer_iq(
                         &client,
                         &id,
-                        &empty_sync_result(&id, WAPatchName::Regular.as_str()),
+                        &NodeBuilder::new("iq")
+                            .attr("type", "result")
+                            .attr("id", id.as_ref())
+                            .attr("from", "s.whatsapp.net")
+                            .children([NodeBuilder::new("sync")
+                                .children([NodeBuilder::new("collection")
+                                    .attr("name", WAPatchName::CriticalBlock.as_str())
+                                    .children([NodeBuilder::new("patches")
+                                        .children([NodeBuilder::new("patch").bytes(patch).build()])
+                                        .build()])
+                                    .build()])
+                                .build()])
+                            .build(),
                     )
                     .await;
                 };
                 let (result, ()) = futures::join!(sync, server);
                 result.unwrap();
                 assert_eq!(transport.sent_count(), 1);
+                assert_eq!(
+                    backend
+                        .get_version(WAPatchName::CriticalBlock.as_str())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .version,
+                    1
+                );
+                assert_eq!(
+                    client.persistence_manager.get_device_snapshot().push_name,
+                    "Primary patch"
+                );
             }
         }
     }

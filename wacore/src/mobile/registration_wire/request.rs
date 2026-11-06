@@ -232,6 +232,8 @@ pub struct RegistrationCommonFields<'a> {
     pub locale_country: &'a str,
     pub family_device_id: &'a str,
     pub access_session_id: &'a str,
+    /// Already-form-encoded token, appended verbatim. Use `token_form_encoded`
+    /// for raw Android token material; encoding again would double-escape `%`.
     pub registration_token: Option<&'a str>,
     pub business_certificate: Option<&'a str>,
     pub identity: RegistrationIdentityFields<'a>,
@@ -256,6 +258,8 @@ pub struct AttestationPolicy {
 
 /// Opaque evidence supplied by a legitimate platform provider. No empty-success fallback.
 pub struct BodyAttestation<'a> {
+    /// Already-wire-encoded `H` value, appended verbatim as in the pinned mobile
+    /// references. The provider owns any form encoding; it is not raw proof text.
     pub body_attestation: Option<&'a str>,
     pub authorization: Option<&'a str>,
 }
@@ -1248,6 +1252,53 @@ mod tests {
                 .any(|(name, value)| name == "Authorization" && value == "synthetic-authorization")
         );
     }
+    #[test]
+    fn reference_code_branches_share_normalization() {
+        let fields = RegistrationForm::new();
+        let profile = profile(vec![]).unwrap();
+        let encoding = encoding();
+        let builder =
+            RegistrationRequestBuilder::new(&profile, &encoding, common(&fields)).unwrap();
+        // Cobalt handleChallenge/handle2FA and whalibmob handleChallenge/
+        // handle2FA reuse their code normalizer for these endpoints too.
+        for request in [
+            builder.submit_code("12-3 456", Some(UUID), &fields),
+            builder.submit_challenge("12-3 456", Some(UUID), &fields),
+            builder.submit_pin("12-3 456", Some(UUID), &fields),
+        ] {
+            assert!(request.unwrap().plaintext().ends_with("code=123456"));
+        }
+    }
+
+    #[test]
+    fn encoded_token_and_attestation_are_not_encoded_twice() {
+        let fields = RegistrationForm::new();
+        let profile = profile(vec![]).unwrap();
+        let encoding = encoding();
+        let mut common = common(&fields);
+        common.registration_token = Some("synthetic%2Btoken%2F%3D");
+        let builder = RegistrationRequestBuilder::new(&profile, &encoding, common).unwrap();
+        let request = builder.submit_code("123456", Some(UUID), &fields).unwrap();
+        assert!(request.plaintext().contains("token=synthetic%2Btoken%2F%3D"));
+        let mut peer = [0; 32];
+        peer[0] = 9;
+        let result = request
+            .seal(EphemeralRegistrationKey::from_bytes([9; 32]), &peer)
+            .unwrap()
+            .finish(
+                AttestationPolicy {
+                    require_body_attestation: true,
+                    require_authorization: false,
+                },
+                BodyAttestation {
+                    body_attestation: Some("synthetic%2Bproof%2F%3D"),
+                    authorization: None,
+                },
+            )
+            .unwrap();
+        assert!(result.body().ends_with(b"&H=synthetic%2Bproof%2F%3D"));
+    }
+
     #[test]
     fn context_binding_covers_profile_registration_keys_and_stable_ids() {
         let fields = RegistrationForm::new();

@@ -48,6 +48,30 @@ pub struct MaterialReport {
     pub certificate_sha256: Vec<String>,
     pub secret_exported: bool,
 }
+/// Material and its provenance are constructed together and cannot be relabelled
+/// by pairing independently obtained reports and credential material at export.
+pub struct ExtractedMaterial {
+    report: MaterialReport,
+    material: wacore::mobile::AndroidTokenMaterial,
+}
+impl ExtractedMaterial {
+    pub fn report(&self) -> &MaterialReport {
+        &self.report
+    }
+
+    pub fn material(&self) -> &wacore::mobile::AndroidTokenMaterial {
+        &self.material
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn synthetic(
+        report: MaterialReport,
+        material: wacore::mobile::AndroidTokenMaterial,
+    ) -> Self {
+        Self { report, material }
+    }
+}
+
 #[derive(Serialize)]
 pub struct Component {
     pub source: Member,
@@ -95,9 +119,22 @@ pub fn extract_material(
     lock_path: &Path,
     root: &Path,
     recipe_path: &Path,
-) -> Result<(MaterialReport, wacore::mobile::AndroidTokenMaterial)> {
+) -> Result<ExtractedMaterial> {
     let verified = crate::verify(lock_path, root)?;
-    let (lock, _) = crate::read_lock(lock_path)?;
+    extract_verified_material(lock_path, root, recipe_path, &verified.lock_sha256)
+}
+
+fn extract_verified_material(
+    lock_path: &Path,
+    root: &Path,
+    recipe_path: &Path,
+    verified_lock_sha256: &str,
+) -> Result<ExtractedMaterial> {
+    let (lock, lock_sha256) = crate::read_lock(lock_path)?;
+    ensure!(
+        lock_sha256 == verified_lock_sha256,
+        "lock changed after verification"
+    );
     let root = root.canonicalize()?;
     let mut recipe_bytes = Vec::new();
     std::fs::File::open(recipe_path)?
@@ -106,7 +143,7 @@ pub fn extract_material(
     ensure!(recipe_bytes.len() <= 64 * 1024, "recipe budget exceeded");
     let recipe: MaterialRecipe = serde_json::from_slice(&recipe_bytes)?;
     ensure!(
-        recipe.schema_version == 1 && recipe.lock_sha256 == verified.lock_sha256,
+        recipe.schema_version == 1 && recipe.lock_sha256 == verified_lock_sha256,
         "recipe/lock binding mismatch"
     );
     ensure!(
@@ -229,10 +266,10 @@ pub fn extract_material(
     )?;
     let material =
         wacore::mobile::AndroidTokenMaterial::from_derived(*secret, dex_md5, certificates)?;
-    Ok((
-        MaterialReport {
+    Ok(ExtractedMaterial {
+        report: MaterialReport {
             schema_version: 1,
-            lock_sha256: verified.lock_sha256,
+            lock_sha256,
             recipe_sha256: hex::encode(Sha256::digest(&recipe_bytes)),
             qualification: "pinned-reference-derived; not APK-oracle qualified",
             authenticity: "requires independent apksigner review; certificate extraction is not signature verification",
@@ -246,7 +283,7 @@ pub fn extract_material(
             secret_exported: false,
         },
         material,
-    ))
+    })
 }
 
 #[cfg(test)]
@@ -257,8 +294,7 @@ mod tests {
         fs,
         io::{Cursor, Write},
     };
-    #[test]
-    fn synthetic_archive_material_is_version_bound_and_redacted() {
+    fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
         for (name, data) in [
@@ -286,19 +322,98 @@ mod tests {
         let bytes = serde_json::to_vec(&lock).unwrap();
         let path = dir.path().join("lock.json");
         fs::write(&path, &bytes).unwrap();
-        let mut recipe = json!({"schema_version":1,"lock_sha256":hex::encode(Sha256::digest(&bytes)),"manifest":{"apk_path":"base.apk","member":"AndroidManifest.xml"},"dex":{"apk_path":"base.apk","member":"classes.dex"},"logo":{"apk_path":"base.apk","member":"logo.png"},"signatures":[{"apk_path":"base.apk","member":"META-INF/SYNTHETIC.RSA"}],"salt_hex":"090002","iterations":128});
+        let recipe = json!({"schema_version":1,"lock_sha256":hex::encode(Sha256::digest(&bytes)),"manifest":{"apk_path":"base.apk","member":"AndroidManifest.xml"},"dex":{"apk_path":"base.apk","member":"classes.dex"},"logo":{"apk_path":"base.apk","member":"logo.png"},"signatures":[{"apk_path":"base.apk","member":"META-INF/SYNTHETIC.RSA"}],"salt_hex":"090002","iterations":128});
         let recipe_path = dir.path().join("recipe.json");
         fs::write(&recipe_path, serde_json::to_vec(&recipe).unwrap()).unwrap();
-        let (report, material) = extract_material(&path, dir.path(), &recipe_path).unwrap();
+        (dir, path, recipe_path)
+    }
+
+    #[test]
+    fn synthetic_archive_material_is_version_bound_and_redacted() {
+        let (dir, path, recipe_path) = fixture();
+        let extracted = extract_material(&path, dir.path(), &recipe_path).unwrap();
+        let report = extracted.report();
+        let material = extracted.material();
         assert_eq!(report.version_code, 42);
         assert_eq!(report.components.len(), 4);
         assert!(material.token_base64("01234").is_ok());
-        let json = serde_json::to_string(&report).unwrap();
+        let json = serde_json::to_string(report).unwrap();
         assert!(!json.contains("090002"));
         assert!(!json.contains("secret_key"));
         assert!(json.contains("not_run"));
+        let mut recipe: serde_json::Value =
+            serde_json::from_slice(&fs::read(&recipe_path).unwrap()).unwrap();
         recipe["lock_sha256"] = json!("00".repeat(32));
         fs::write(&recipe_path, serde_json::to_vec(&recipe).unwrap()).unwrap();
         assert!(extract_material(&path, dir.path(), &recipe_path).is_err());
+    }
+
+    #[test]
+    fn changed_lock_is_rejected_before_material_extraction() {
+        let (dir, path, recipe_path) = fixture();
+        let verified = crate::verify(&path, dir.path()).unwrap();
+        let mut lock: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        lock["distribution_channel"] = json!("changed-after-verification");
+        fs::write(&path, serde_json::to_vec(&lock).unwrap()).unwrap();
+        let Err(error) =
+            extract_verified_material(&path, dir.path(), &recipe_path, &verified.lock_sha256)
+        else {
+            panic!("changed lock must fail");
+        };
+        assert!(error.to_string().contains("lock changed after verification"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn each_export_retains_its_extraction_provenance() {
+        let (dir, path, recipe_path) = fixture();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(dir.path().join(".gitignore"), "/.cache/\n").unwrap();
+        let first = extract_material(&path, dir.path(), &recipe_path).unwrap();
+        let mut recipe: serde_json::Value =
+            serde_json::from_slice(&fs::read(&recipe_path).unwrap()).unwrap();
+        recipe["salt_hex"] = json!("090003");
+        fs::write(&recipe_path, serde_json::to_vec(&recipe).unwrap()).unwrap();
+        let second = extract_material(&path, dir.path(), &recipe_path).unwrap();
+        assert_ne!(
+            first.material().token_base64("01234").unwrap(),
+            second.material().token_base64("01234").unwrap()
+        );
+        for extracted in [&first, &second] {
+            let receipt = crate::export_private_material(dir.path(), extracted).unwrap();
+            let restored = crate::import_private_material(
+                &receipt.path,
+                &receipt.sha256,
+                &extracted.report().lock_sha256,
+                &extracted.report().recipe_sha256,
+            )
+            .unwrap();
+            assert_eq!(
+                restored.token_base64("01234").unwrap(),
+                extracted.material().token_base64("01234").unwrap()
+            );
+            let other = if std::ptr::eq(extracted, &first) {
+                &second
+            } else {
+                &first
+            };
+            assert!(
+                crate::import_private_material(
+                    &receipt.path,
+                    &receipt.sha256,
+                    &other.report().lock_sha256,
+                    &other.report().recipe_sha256,
+                )
+                .is_err()
+            );
+        }
     }
 }

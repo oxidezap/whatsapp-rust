@@ -657,6 +657,16 @@ impl Device {
             .mobile_session
             .as_deref()
             .ok_or_else(|| super::error::StoreError::Validation("missing mobile binding".into()))?;
+        self.validate_mobile_session_update(binding, self.pn.as_ref(), self.lid.as_ref())
+    }
+
+    /// Validate a prospective mobile binding and identity without cloning or publishing state.
+    pub fn validate_mobile_session_update(
+        &self,
+        binding: &super::MobileSessionBinding,
+        pn: Option<&Jid>,
+        lid: Option<&Jid>,
+    ) -> super::error::Result<()> {
         Self::validate_mobile_keys(
             binding,
             self.registration_id,
@@ -666,10 +676,10 @@ impl Device {
             self.signed_pre_key_id,
             &self.signed_pre_key_signature,
         )?;
-        if let Some(pn) = &self.pn {
+        if let Some(pn) = pn {
             super::validate_mobile_primary_pn(pn)?;
         }
-        if self.lid.as_ref().is_some_and(|v| {
+        if lid.is_some_and(|v| {
             v.server != wacore_binary::Server::Lid
                 || v.device != 0
                 || v.agent != 0

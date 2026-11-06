@@ -193,6 +193,9 @@ struct PendingAttempt {
     deadline_ms: u64,
     exchange: Option<BoxFuture<'static, anyhow::Result<HttpResponse>>>,
     response: Option<RegistrationResponse>,
+    // Retain a completed HTTP status across cancellation/recovery. An error
+    // status is not a qualified registration outcome and never permits resend.
+    response_status: Option<u16>,
     // This candidate exists only while dispatch has provably never begun.
     unsent_rollback: Option<RegistrationCheckpoint>,
 }
@@ -343,10 +346,7 @@ impl MobileRegistrationClient {
             return Err(MobileRegistrationError::BindingMismatch);
         }
         if snapshot.pn.is_some() {
-            let token = workflow
-                .pending_persistence()
-                .ok_or(MobileRegistrationError::BindingMismatch)?;
-            workflow.confirm_persisted(token)?;
+            confirm_durable_registration(&mut workflow)?;
         }
         Ok(Self {
             environment,
@@ -756,6 +756,7 @@ impl MobileRegistrationClient {
             deadline_ms,
             exchange: None,
             response: None,
+            response_status: None,
             unsent_rollback: Some(rollback.checkpoint()),
         });
         self.recovering = true;
@@ -819,11 +820,7 @@ impl MobileRegistrationClient {
             self.binding = actual;
             self.publication = None;
             if snapshot.pn.is_some() {
-                let token = self
-                    .workflow
-                    .pending_persistence()
-                    .ok_or(MobileRegistrationError::BindingMismatch)?;
-                self.workflow.confirm_persisted(token)?;
+                confirm_durable_registration(&mut self.workflow)?;
             }
         }
         if let Some(checkpoint) = self
@@ -874,6 +871,12 @@ impl MobileRegistrationClient {
             .pending
             .as_mut()
             .ok_or(MobileRegistrationError::DeliveryUnknown)?;
+        if pending
+            .response_status
+            .is_some_and(|status| !(200..300).contains(&status))
+        {
+            return Err(MobileRegistrationError::HttpStatus);
+        }
         if pending.response.is_none() {
             let exchange = pending
                 .exchange
@@ -901,6 +904,7 @@ impl MobileRegistrationClient {
                 }
             };
             pending.exchange = None;
+            pending.response_status = Some(raw.status_code);
             let body = Zeroizing::new(raw.body);
             if !(200..300).contains(&raw.status_code) {
                 return Err(MobileRegistrationError::HttpStatus);
@@ -1011,6 +1015,22 @@ impl MobileRegistrationClient {
             decision,
             stage: self.stage(),
         })
+    }
+}
+
+fn confirm_durable_registration(
+    workflow: &mut RegistrationWorkflow,
+) -> Result<(), MobileRegistrationError> {
+    match workflow.stage() {
+        RegistrationStage::Registered => Ok(()),
+        RegistrationStage::Verified => {
+            let token = workflow
+                .pending_persistence()
+                .ok_or(MobileRegistrationError::BindingMismatch)?;
+            workflow.confirm_persisted(token)?;
+            Ok(())
+        }
+        _ => Err(MobileRegistrationError::BindingMismatch),
     }
 }
 

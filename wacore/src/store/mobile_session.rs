@@ -30,7 +30,7 @@ pub struct MobileSessionBinding {
     #[serde(default)]
     pub primary_state: Option<Vec<u8>>,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BindingWire {
     schema_version: u32,
@@ -38,10 +38,90 @@ struct BindingWire {
     identity_hash: [u8; 32],
     platform: StoredMobilePlatform,
     role: StoredMobileRole,
-    registration_context: Vec<u8>,
-    registration_checkpoint: Option<Vec<u8>>,
-    #[serde(default)]
-    primary_state: Option<Vec<u8>>,
+    #[serde(deserialize_with = "deserialize_secret_bytes")]
+    registration_context: zeroize::Zeroizing<Vec<u8>>,
+    #[serde(default, deserialize_with = "deserialize_optional_secret_bytes")]
+    registration_checkpoint: Option<zeroize::Zeroizing<Vec<u8>>>,
+    #[serde(default, deserialize_with = "deserialize_optional_secret_bytes")]
+    primary_state: Option<zeroize::Zeroizing<Vec<u8>>>,
+}
+
+const MAX_BINDING_FIELD_BYTES: usize = 65536;
+
+/// Decode into protected storage so malformed later fields also clear earlier
+/// credentials. Enforce bounds before allocation or each sequence append.
+fn deserialize_secret_bytes<'de, D>(
+    deserializer: D,
+) -> std::result::Result<zeroize::Zeroizing<Vec<u8>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct SecretBytes;
+    impl<'de> serde::de::Visitor<'de> for SecretBytes {
+        type Value = zeroize::Zeroizing<Vec<u8>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("at most 65536 credential bytes")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let size_hint = sequence.size_hint();
+            if size_hint.is_some_and(|size| size > MAX_BINDING_FIELD_BYTES) {
+                return Err(serde::de::Error::custom("mobile binding field exceeds limit"));
+            }
+            let capacity = size_hint.unwrap_or(0).min(MAX_BINDING_FIELD_BYTES);
+            let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(capacity));
+            while let Some(byte) = sequence.next_element::<u8>()? {
+                if bytes.len() == MAX_BINDING_FIELD_BYTES {
+                    return Err(serde::de::Error::custom("mobile binding field exceeds limit"));
+                }
+                bytes.push(byte);
+            }
+            Ok(bytes)
+        }
+    }
+    deserializer.deserialize_seq(SecretBytes)
+}
+
+fn deserialize_optional_secret_bytes<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<zeroize::Zeroizing<Vec<u8>>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OptionalSecretBytes;
+    impl<'de> serde::de::Visitor<'de> for OptionalSecretBytes {
+        type Value = Option<zeroize::Zeroizing<Vec<u8>>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an optional credential byte buffer")
+        }
+
+        fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserialize_secret_bytes(deserializer).map(Some)
+        }
+    }
+    deserializer.deserialize_option(OptionalSecretBytes)
 }
 impl MobileSessionBinding {
     pub fn new(
@@ -68,13 +148,13 @@ impl MobileSessionBinding {
         if self
             .primary_state
             .as_ref()
-            .is_some_and(|v| v.is_empty() || v.len() > 65536)
+            .is_some_and(|v| v.is_empty() || v.len() > MAX_BINDING_FIELD_BYTES)
             || self.schema_version != 1
-            || self.registration_context.len() > 65536
+            || self.registration_context.len() > MAX_BINDING_FIELD_BYTES
             || self
                 .registration_checkpoint
                 .as_ref()
-                .is_some_and(|v| v.is_empty() || v.len() > 65536)
+                .is_some_and(|v| v.is_empty() || v.len() > MAX_BINDING_FIELD_BYTES)
         {
             return Err(StoreError::Validation(
                 "invalid mobile session binding".into(),
@@ -107,16 +187,18 @@ impl std::fmt::Debug for MobileSessionBinding {
 }
 impl TryFrom<BindingWire> for MobileSessionBinding {
     type Error = StoreError;
-    fn try_from(v: BindingWire) -> Result<Self> {
+    fn try_from(mut v: BindingWire) -> Result<Self> {
         let value = Self {
             schema_version: v.schema_version,
             environment_hash: v.environment_hash,
             identity_hash: v.identity_hash,
             platform: v.platform,
             role: v.role,
-            registration_context: v.registration_context,
-            registration_checkpoint: v.registration_checkpoint,
-            primary_state: v.primary_state,
+            registration_context: std::mem::take(&mut *v.registration_context),
+            registration_checkpoint: v
+                .registration_checkpoint
+                .map(|mut bytes| std::mem::take(&mut *bytes)),
+            primary_state: v.primary_state.map(|mut bytes| std::mem::take(&mut *bytes)),
         };
         value.validate()?;
         Ok(value)
@@ -264,4 +346,57 @@ mod tests {
             .is_err()
         );
     }
+    #[test]
+    fn credential_fields_reject_oversized_streams_before_reading_to_the_end() {
+        let reads = std::cell::Cell::new(0);
+        let bytes = std::iter::from_fn(|| {
+            let count = reads.get() + 1;
+            reads.set(count);
+            assert!(count <= MAX_BINDING_FIELD_BYTES + 1);
+            Some(7_u8)
+        });
+        let deserializer =
+            serde::de::value::SeqDeserializer::<_, serde::de::value::Error>::new(bytes);
+        assert!(deserialize_secret_bytes(deserializer).is_err());
+        assert_eq!(reads.get(), MAX_BINDING_FIELD_BYTES + 1);
+    }
+
+    #[test]
+    fn credential_fields_keep_optional_defaults_and_reject_partial_records() {
+        let binding = MobileSessionBinding::new(
+            [1; 32],
+            [2; 32],
+            StoredMobilePlatform::Android,
+            vec![7; MAX_BINDING_FIELD_BYTES],
+            Some(vec![8; MAX_BINDING_FIELD_BYTES]),
+        )
+        .unwrap();
+        let value = serde_json::to_value(&binding).unwrap();
+        for field in [
+            "registration_context",
+            "registration_checkpoint",
+            "primary_state",
+        ] {
+            let mut oversized = value.clone();
+            oversized[field] = serde_json::json!(vec![9_u8; MAX_BINDING_FIELD_BYTES + 1]);
+            assert!(serde_json::from_value::<MobileSessionBinding>(oversized).is_err());
+        }
+        let mut missing_optional = value.clone();
+        let fields = missing_optional.as_object_mut().unwrap();
+        fields.remove("registration_checkpoint");
+        fields.remove("primary_state");
+        let restored: MobileSessionBinding = serde_json::from_value(missing_optional).unwrap();
+        assert!(restored.registration_checkpoint.is_none());
+        assert!(restored.primary_state.is_none());
+
+        let mut malformed = value;
+        malformed["primary_state"] = serde_json::json!("malformed after credential fields");
+        assert!(serde_json::from_value::<MobileSessionBinding>(malformed).is_err());
+        assert_eq!(
+            serde_json::from_slice::<MobileSessionBinding>(&serde_json::to_vec(&binding).unwrap())
+            .unwrap(),
+            binding
+        );
+    }
+
 }

@@ -125,6 +125,14 @@ fn invoke(
 fn material_cli_exports_private_receipt_imports_and_rejects_bad_flags() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(dir.path())
+            .status()
+            .unwrap()
+            .success()
+    );
     fs::write(dir.path().join(".gitignore"), "/.cache/\n").unwrap();
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
     for (name, bytes) in [

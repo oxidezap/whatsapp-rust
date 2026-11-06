@@ -2596,6 +2596,11 @@ mod group_retry {
             ),
             (
                 SenderIdentityRole::MobilePrimary(PrimaryDeviceIdentityPolicy::AttachWhenAvailable),
+                false,
+                false,
+            ),
+            (
+                SenderIdentityRole::MobilePrimary(PrimaryDeviceIdentityPolicy::AttachWhenAvailable),
                 true,
                 true,
             ),
@@ -4171,10 +4176,30 @@ mod mark_full_distribution_list {
 
     #[tokio::test]
     async fn primary_group_pkmsg_omits_identity_for_explicit_profile() {
-        for role in [
-            SenderIdentityRole::MobilePrimary(PrimaryDeviceIdentityPolicy::Omit),
-            SenderIdentityRole::Companion,
-            SenderIdentityRole::Unknown,
+        for (role, account_present, existing_sender_key) in [
+            (
+                SenderIdentityRole::MobilePrimary(PrimaryDeviceIdentityPolicy::Omit),
+                true,
+                false,
+            ),
+            (
+                SenderIdentityRole::MobilePrimary(PrimaryDeviceIdentityPolicy::Omit),
+                false,
+                false,
+            ),
+            (
+                SenderIdentityRole::MobilePrimary(PrimaryDeviceIdentityPolicy::AttachWhenAvailable),
+                true,
+                false,
+            ),
+            (
+                SenderIdentityRole::MobilePrimary(PrimaryDeviceIdentityPolicy::AttachWhenAvailable),
+                false,
+                false,
+            ),
+            (SenderIdentityRole::Companion, true, false),
+            (SenderIdentityRole::Unknown, true, false),
+            (SenderIdentityRole::Unknown, true, true),
         ] {
             let status = Jid::status_broadcast();
             let own_pn: Jid = "12025550120@s.whatsapp.net".parse().unwrap();
@@ -4182,6 +4207,24 @@ mod mark_full_distribution_list {
             let requester: Jid = "100000000000001:11@lid".parse().unwrap();
             let (mut sessions, mut identities) = established_stores(&requester).await;
             let mut sender_keys = MemSenderKeyStore::default();
+            if existing_sender_key {
+                let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+                let key = KeyPair::generate(&mut rng);
+                let mut record = SenderKeyRecord::new_empty();
+                record
+                    .add_sender_key_state(3, 1, 0, &[7; 32], key.public_key, Some(key.private_key))
+                    .unwrap();
+                sender_keys
+                    .records
+                    .insert(make_sender_key_name_for_jid(&status, &own_lid), record);
+            }
+            let sessions_before = sessions.0.lock().unwrap().clone();
+            let identities_before = identities.known.lock().unwrap().clone();
+            let sender_keys_before: HashMap<_, _> = sender_keys
+                .records
+                .iter()
+                .map(|(name, record)| (name.clone(), record.serialize().unwrap()))
+                .collect();
             let mut prekeys = UnusedPreKeyStore;
             let signed_prekeys = UnusedSignedPreKeyStore;
             let mut stores = SignalStores {
@@ -4212,7 +4255,7 @@ mod mark_full_distribution_list {
                     group: &group,
                     own_jid: &own_pn,
                     own_lid: &own_lid,
-                    account: Some(&account),
+                    account: account_present.then_some(&account),
                     to: &status,
                     message: &message,
                     message_id: "STATUS-RETRY-1",
@@ -4228,16 +4271,26 @@ mod mark_full_distribution_list {
             .await;
             if role == SenderIdentityRole::Unknown {
                 assert!(outcome.is_err());
+                assert_eq!(*sessions.0.lock().unwrap(), sessions_before);
+                assert_eq!(*identities.known.lock().unwrap(), identities_before);
+                let sender_keys_after: HashMap<_, _> = sender_keys
+                    .records
+                    .iter()
+                    .map(|(name, record)| (name.clone(), record.serialize().unwrap()))
+                    .collect();
+                assert_eq!(sender_keys_after, sender_keys_before);
                 continue;
             }
             let prepared = outcome.unwrap();
+            let omit_identity_role =
+                SenderIdentityRole::MobilePrimary(PrimaryDeviceIdentityPolicy::Omit);
 
             assert_eq!(
                 prepared
                     .node
                     .get_optional_child("device-identity")
                     .is_some(),
-                role == SenderIdentityRole::Companion
+                account_present && role != omit_identity_role
             );
             let participants = prepared.node.get_optional_child("participants").unwrap();
             assert!(participants.children().unwrap().iter().any(|p| {
@@ -6373,10 +6426,25 @@ mod local_identity_change_on_send {
         /// list, recipients first.
         #[tokio::test]
         async fn primary_dm_pkmsg_omits_even_supplied_identity() {
-            for role in [
-                SenderIdentityRole::MobilePrimary(PrimaryDeviceIdentityPolicy::Omit),
-                SenderIdentityRole::Companion,
-                SenderIdentityRole::Unknown,
+            for (role, account_present) in [
+                (
+                    SenderIdentityRole::MobilePrimary(PrimaryDeviceIdentityPolicy::Omit),
+                    true,
+                ),
+                (
+                    SenderIdentityRole::MobilePrimary(PrimaryDeviceIdentityPolicy::Omit),
+                    false,
+                ),
+                (
+                    SenderIdentityRole::MobilePrimary(PrimaryDeviceIdentityPolicy::AttachWhenAvailable),
+                    true,
+                ),
+                (
+                    SenderIdentityRole::MobilePrimary(PrimaryDeviceIdentityPolicy::AttachWhenAvailable),
+                    false,
+                ),
+                (SenderIdentityRole::Companion, true),
+                (SenderIdentityRole::Unknown, true),
             ] {
                 let own_jid: Jid = "5511900000010:0@s.whatsapp.net".parse().unwrap();
                 let recipient_a: Jid = "5511900000011:0@s.whatsapp.net".parse().unwrap();
@@ -6398,6 +6466,8 @@ mod local_identity_change_on_send {
                 let mut prekey_store = UnusedPreKeyStore;
                 let signed_prekey_store = UnusedSignedPreKeyStore;
                 let mut sender_key_store = MemSenderKeyStore::default();
+                let sessions_before = session_store.0.clone();
+                let identities_before = identity_store.known.clone();
                 let mut stores = raw_fanout_stores(
                     &mut sender_key_store,
                     &mut session_store,
@@ -6423,7 +6493,7 @@ mod local_identity_change_on_send {
                     DmStanzaRequest {
                         own_jid: &own_jid,
                         own_lid: None,
-                        account: Some(&account),
+                        account: account_present.then_some(&account),
                         to: &to,
                         message: &message,
                         message_id: "DM_SINK_1",
@@ -6436,16 +6506,21 @@ mod local_identity_change_on_send {
                 .await;
                 if role == SenderIdentityRole::Unknown {
                     assert!(outcome.is_err());
+                    assert_eq!(session_store.0, sessions_before);
+                    assert_eq!(identity_store.known, identities_before);
+                    assert!(sender_key_store.0.is_empty());
                     continue;
                 }
                 let prepared = outcome.expect("dm stanza");
+                let omit_identity_role =
+                    SenderIdentityRole::MobilePrimary(PrimaryDeviceIdentityPolicy::Omit);
 
                 assert_eq!(
                     prepared
                         .node
                         .get_optional_child("device-identity")
                         .is_some(),
-                    role == SenderIdentityRole::Companion
+                    account_present && role != omit_identity_role
                 );
                 let participants = prepared.node.get_optional_child("participants").unwrap();
                 assert!(participants.children().unwrap().iter().any(|p| {

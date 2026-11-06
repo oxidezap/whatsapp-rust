@@ -19,6 +19,8 @@ pub(crate) mod labels;
 mod media_reupload;
 pub mod message_edit;
 mod mex;
+#[cfg(feature = "mobile-core")]
+mod mobile_api;
 pub(crate) mod newsletter;
 #[cfg(test)]
 mod picture_mutation_tests;
@@ -144,3 +146,12 @@ pub use stanza::{
 pub use wacore::message_processing::EncType;
 
 pub use tctoken::{TcToken, TcTokenError};
+
+#[cfg(feature = "mobile-core")]
+pub use mobile_api::{
+    MobileAppStatePolicy, MobileEphemeralKeyProvider, MobileLoginAttempt,
+    MobileLoginOptionsProvider, MobileMediaHttpProfile, PrimaryDeviceIdentityPolicy,
+    PrimarySelfIdentityProfile, RegisteredMobileSession, RegistrationLoginPhoneIdMapping,
+    mobile, mobile_primary, mobile_registration, mobile_session,
+    validate_registration_login_profile,
+};
