@@ -400,6 +400,12 @@ required-features = ["sqlite-storage", "tokio-runtime", "tokio-transport", "ureq
 name = "demo"
 test = true
 
+# Modern high-level Multi-Device WhatsApp Bot with command routing, reactions, and polls.
+[[example]]
+name = "ultimate_bot"
+test = true
+required-features = ["sqlite-storage", "tokio-runtime", "tokio-transport", "ureq-client", "signal"]
+
 # The mock-capable benchmark client. `test = true` makes its `#[cfg(test)]`
 # config tests a nextest target, so the default CI run executes them instead of
 # only compiling the example. `required-features` names what the example

@@ -656,6 +656,7 @@ pub use features::{ProfilePictureRequest, ProfilePictureTarget, ProfilePictureTy
 
 pub mod bot;
 pub use bot::{
+    BotRouter, CommandContext,
     BotRunOutcome, BotShutdownReport, CallbackEventHandler, EventDelivery, EventDeliveryStats,
 };
 pub use store::StoreRelease;
@@ -671,7 +672,7 @@ pub mod version;
 /// One-import surface for the common bot path:
 /// `use whatsapp_rust::prelude::*;`.
 pub mod prelude {
-    pub use crate::bot::{Bot, BotBuilder, BotHandle, EventDelivery, MessageContext};
+    pub use crate::bot::{Bot, BotBuilder, BotHandle, BotRouter, CommandContext, EventDelivery, MessageContext};
     pub use crate::bot::{
         BotRunOutcome, BotShutdownReport, CallbackEventHandler, EventDeliveryStats,
     };

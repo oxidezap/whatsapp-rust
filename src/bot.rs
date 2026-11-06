@@ -297,7 +297,73 @@ impl MessageContext {
     ) -> Result<crate::send::SendResult, crate::send::SendError> {
         self.client.send_reaction(&self.message_ref()?, emoji).await
     }
+
+    /// Extracts the text content of the message, checking conversation, extendedTextMessage,
+    /// or any media caption (image, video, document).
+    pub fn text(&self) -> Option<&str> {
+        use wacore::proto_helpers::MessageExt;
+        let base = self.message.get_base_message();
+        base.text_content().or_else(|| base.get_caption())
+    }
+
+    /// Whether this message originated from a group chat.
+    pub fn is_group(&self) -> bool {
+        self.info.source.is_group
+    }
+
+    /// Whether this message was sent by the logged-in user/bot itself.
+    pub fn is_from_me(&self) -> bool {
+        self.info.source.is_from_me
+    }
+
+    /// Sender JID (for group chats, this is the author participant JID).
+    pub fn sender(&self) -> &wacore_binary::Jid {
+        &self.info.source.sender
+    }
+
+    /// Chat JID (DM peer, group, or newsletter).
+    pub fn chat(&self) -> &wacore_binary::Jid {
+        &self.info.source.chat
+    }
+
+    /// Sends a typing presence update (`composing`) to this chat.
+    pub async fn send_typing(&self) -> Result<(), crate::features::ChatStateError> {
+        self.client.chatstate().send(&self.info.source.chat, wacore::types::presence::ChatActivity::Typing).await
+    }
+
+    /// Sends a recording audio presence update to this chat.
+    pub async fn send_recording(&self) -> Result<(), crate::features::ChatStateError> {
+        self.client.chatstate().send(&self.info.source.chat, wacore::types::presence::ChatActivity::RecordingAudio).await
+    }
+
+    /// Sends a paused/idle presence update to this chat.
+    pub async fn send_paused(&self) -> Result<(), crate::features::ChatStateError> {
+        self.client.chatstate().send(&self.info.source.chat, wacore::types::presence::ChatActivity::Idle).await
+    }
+
+    /// Sends read receipts (blue checkmarks) for this incoming message.
+    pub async fn mark_as_read(&self) -> Result<(), anyhow::Error> {
+        let sender = if self.info.source.is_group {
+            Some(&self.info.source.sender)
+        } else {
+            None
+        };
+        self.client.mark_as_read(&self.info.source.chat, sender, &[self.info.id.as_str()]).await
+    }
+
+    /// Send a poll directly to this chat.
+    pub async fn send_poll(
+        &self,
+        name: &str,
+        options: &[String],
+        selectable_count: u32,
+    ) -> Result<crate::send::SendResult, crate::features::PollError> {
+        self.client.polls().create(&self.info.source.chat, name, options, selectable_count).await
+    }
 }
+
+pub mod router;
+pub use router::{BotRouter, CommandContext};
 
 mod event_delivery;
 use CallbackEventHandler as CallbackBusAdapter;
@@ -1095,6 +1161,18 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
             async move {
                 for future in futures {
                     future.await;
+                }
+            }
+        })
+    }
+
+    /// Register a [`BotRouter`] to handle prefix-based commands and automated routing.
+    pub fn with_router(self, router: router::BotRouter) -> Self {
+        self.on_message(move |ctx| {
+            let r = router.clone();
+            async move {
+                if let Err(err) = r.dispatch(ctx).await {
+                    log::error!(target: "Bot/Router", "Command error: {err:?}");
                 }
             }
         })

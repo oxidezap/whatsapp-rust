@@ -58,6 +58,73 @@ whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "<com
 
 See the [documentation](https://whatsapp-rust.jlucaso.com) for configuration, alternative backends, and API examples.
 
+
+## 🚀 Enhanced Bot Engine & Baileys / WhatsMeow Parity
+
+This fork by [@KazeDevID](https://github.com/KazeDevID/whatsapp-rust) introduces high-level bot abstractions inspired by [WhiskeySockets/Baileys](https://github.com/WhiskeySockets/Baileys) and [tulir/whatsmeow](https://github.com/tulir/whatsmeow):
+
+- **Fluent `BotRouter`:** Register prefix commands (`!`, `/`, `.`), multi-command aliases, and default fallbacks without boilerplate.
+- **Convenient `MessageContext`:**
+  - `ctx.text()`: Extracted text from conversation, extended text, or media captions.
+  - `ctx.reply("...")` / `ctx.reply_quoting("...")`: Send replies with automatic context quoting.
+  - `ctx.react("👍")`: Instant emoji reactions.
+  - `ctx.send_poll("Question", &options, 1)`: Multi-device interactive WhatsApp polls.
+  - `ctx.send_typing()` / `ctx.send_recording()` / `ctx.send_paused()`: Native chatstate presence indicators.
+  - `ctx.mark_as_read()`: Automated read receipt delivery (blue checkmarks).
+  - `ctx.is_group()` / `ctx.sender()` / `ctx.chat()`: Clean addressing helpers.
+
+### Baileys / WhatsMeow to whatsapp-rust Comparison
+
+| Feature | Baileys (Node.js) | WhatsMeow (Go) | whatsapp-rust (Rust) |
+| :--- | :--- | :--- | :--- |
+| **Send Text** | `sock.sendMessage(jid, { text: "hi" })` | `cli.SendMessage(ctx, jid, &waProto.Message{...})` | `ctx.reply("hi").await?` |
+| **Reaction** | `sock.sendMessage(jid, { react: { text: "❤️", key } })` | `cli.SendMessage(ctx, jid, cli.BuildReaction(...))` | `ctx.react("❤️").await?` |
+| **Polls** | `sock.sendMessage(jid, { poll: { name, values } })` | `cli.SendMessage(ctx, jid, cli.BuildPollCreation(...))` | `ctx.send_poll(name, &options, 1).await?` |
+| **Typing** | `sock.sendPresenceUpdate("composing", jid)` | `cli.SendChatPresence(jid, PresenceComposing)` | `ctx.send_typing().await?` |
+| **Read Receipt**| `sock.readMessages([msg.key])` | `cli.MarkRead([]types.MessageID{id}, ...)` | `ctx.mark_as_read().await?` |
+| **Performance** | V8 JavaScript Event Loop (~150MB RAM) | Goroutines (~45MB RAM) | Zero-copy `buffa` + Tokio (~8MB RAM) |
+
+### Fluent Bot Example
+
+```rust,no_run
+use whatsapp_rust::prelude::*;
+use whatsapp_rust::storages::SqliteStore;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let backend = SqliteStore::open("whatsapp.db").await?;
+    let mut router = BotRouter::new();
+
+    router.prefixes(&["!", "/", "."]);
+    router.command("ping", |cmd| async move {
+        cmd.mark_as_read().await?;
+        cmd.react("🏓").await?;
+        cmd.reply("Pong! 🦀 Powered by Rust & KazeDevID").await?;
+        Ok(())
+    });
+
+    router.command("poll", |cmd| async move {
+        let opts = vec!["Rust 🦀".into(), "Go 🐹".into(), "Node 🟩".into()];
+        cmd.send_poll("Best language for WhatsApp bots?", &opts, 1).await?;
+        Ok(())
+    });
+
+    let bot = Bot::builder()
+        .with_backend(backend)
+        .with_router(router)
+        .build()
+        .await?;
+
+    bot.run().await;
+    Ok(())
+}
+```
+
+Run the complete bot example:
+```bash
+cargo run --example ultimate_bot
+```
+
 ## Related projects
 
 - [oxidezap/client](https://github.com/oxidezap/client): desktop and browser client built on this library as a complete application.
