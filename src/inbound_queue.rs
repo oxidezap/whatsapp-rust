@@ -253,12 +253,24 @@ pub(crate) struct QueuedAck {
     pub shutdown: wacore::runtime::ShutdownSignal,
 }
 
+/// Owns an encoded ACK and its budget lease. Keeping the `Vec` itself (rather
+/// than converting it to `Bytes` first) avoids the `Bytes` shared-header
+/// allocation for a `Vec` whose length differs from its capacity, and keeps
+/// the `from_owner` allocation small. This offsets the boxed queue entry.
+struct RetainedAck {
+    bytes: Vec<u8>,
+    _lease: ByteLease,
+}
+impl AsRef<[u8]> for RetainedAck {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 pub(crate) fn retain_ack(bytes: Vec<u8>, lease: ByteLease) -> bytes::Bytes {
-    bytes::Bytes::from_owner(RetainedBytes {
-        bytes: bytes.into(),
-        _global: lease,
-        _chat: None,
-        _liveness: None,
+    bytes::Bytes::from_owner(RetainedAck {
+        bytes,
+        _lease: lease,
     })
 }
 
