@@ -111,7 +111,7 @@ impl CommandContext {
         name: &str,
         options: &[String],
         selectable_count: u32,
-    ) -> Result<crate::send::SendResult, crate::features::PollError> {
+    ) -> Result<crate::features::CreatedPoll, crate::features::PollError> {
         self.ctx.send_poll(name, options, selectable_count).await
     }
 
