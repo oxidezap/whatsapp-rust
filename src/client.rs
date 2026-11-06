@@ -482,7 +482,7 @@ use wacore::runtime::Runtime;
 pub(crate) struct ChatLane {
     pub generation: u64,
     pub enqueue_lock: Arc<Mutex<()>>,
-    pub queue_tx: async_channel::Sender<QueuedChatMessage>,
+    pub queue_tx: async_channel::Sender<Box<QueuedChatMessage>>,
     pub byte_budget: Arc<crate::inbound_queue::ByteBudget>,
     pub global_budget: Arc<crate::inbound_queue::ByteBudget>,
     pub work: Arc<crate::flush_scope::FlushScope>,
@@ -565,17 +565,19 @@ impl ChatLane {
         };
         let original = queued.node;
         self.queue_tx
-            .try_send(QueuedChatMessage {
+            .try_send(Box::new(QueuedChatMessage {
                 node: Arc::new(retained),
                 work: Some(work),
                 ..queued
-            })
+            }))
             .map_err(|error| match error {
-                async_channel::TrySendError::Full(mut queued) => {
+                async_channel::TrySendError::Full(queued) => {
+                    let mut queued = *queued;
                     queued.node = original;
                     async_channel::TrySendError::Full(queued)
                 }
-                async_channel::TrySendError::Closed(mut queued) => {
+                async_channel::TrySendError::Closed(queued) => {
+                    let mut queued = *queued;
                     queued.node = original;
                     async_channel::TrySendError::Closed(queued)
                 }

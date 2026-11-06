@@ -215,8 +215,10 @@ fn create_chat_lane(
     worker_running: Arc<async_lock::Mutex<()>>,
     byte_budget: Arc<crate::inbound_queue::ByteBudget>,
 ) -> ChatLane {
+    // Keep the offline-resume item bound without reserving each full entry
+    // for idle chats. Only accepted messages allocate their payload wrapper.
     let (tx, rx) =
-        async_channel::bounded::<QueuedChatMessage>(crate::inbound_queue::CHAT_QUEUE_ITEMS);
+        async_channel::bounded::<Box<QueuedChatMessage>>(crate::inbound_queue::CHAT_QUEUE_ITEMS);
     let rx = crate::inbound_queue::DrainingReceiver(rx);
 
     let client_for_worker = client.clone();
@@ -255,8 +257,12 @@ fn create_chat_lane(
                                 // replaces this lane.
                                 rx.close();
                                 while let Ok(queued) = rx.try_recv() {
-                                    if !process_queued(&client_for_worker, queued, spawn_generation)
-                                        .await
+                                    if !process_queued(
+                                        &client_for_worker,
+                                        *queued,
+                                        spawn_generation,
+                                    )
+                                    .await
                                     {
                                         break;
                                     }
@@ -267,7 +273,7 @@ fn create_chat_lane(
                         }
                     }
                 };
-                if !process_queued(&client_for_worker, next, spawn_generation).await {
+                if !process_queued(&client_for_worker, *next, spawn_generation).await {
                     break;
                 }
             }
@@ -391,6 +397,32 @@ mod tests {
         assert_eq!(fresh.queue_tx.len(), 1);
         fresh.queue_tx.close();
         drop(blocked);
+    }
+
+    #[tokio::test]
+    async fn idle_chat_lane_does_not_reserve_full_payload_slots() {
+        let client = crate::test_utils::create_test_client().await;
+        let running = Arc::new(async_lock::Mutex::new(()));
+        let blocked = running.lock().await;
+        let largest = crate::test_alloc::min_max_block(usize::MAX, || {
+            let lane = create_chat_lane(
+                &client,
+                Arc::default(),
+                Arc::clone(&running),
+                Arc::new(crate::inbound_queue::ByteBudget::new(
+                    crate::inbound_queue::CHAT_BYTES,
+                )),
+            );
+            assert_eq!(
+                lane.queue_tx.capacity(),
+                Some(crate::inbound_queue::CHAT_QUEUE_ITEMS)
+            );
+            lane.queue_tx.close();
+        });
+        drop(blocked);
+        // 512 inline entries cost 24 KiB on a 64-bit host (12 KiB on ESP32).
+        // Leave room for the worker task while catching that eager reservation.
+        assert!(largest <= 16 * 1024, "idle lane requested {largest} bytes");
     }
 
     #[tokio::test]

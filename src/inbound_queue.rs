@@ -123,7 +123,7 @@ pub(crate) async fn yield_for_capacity(runtime: &dyn wacore::runtime::Runtime) {
 }
 
 pub(crate) struct QueueBudgets {
-    pub ack_queue: std::sync::OnceLock<async_channel::Sender<QueuedAck>>,
+    pub ack_queue: std::sync::OnceLock<async_channel::Sender<Box<QueuedAck>>>,
     pub chat: Arc<ByteBudget>,
     pub ack: Arc<ByteBudget>,
     pub work: Arc<crate::flush_scope::FlushScope>,
@@ -347,7 +347,7 @@ mod tests {
         global: &Arc<ByteBudget>,
         bytes: usize,
         items: usize,
-    ) -> (ChatLane, DrainingReceiver<QueuedChatMessage>) {
+    ) -> (ChatLane, DrainingReceiver<Box<QueuedChatMessage>>) {
         let (queue_tx, rx) = async_channel::bounded(items);
         (
             ChatLane {
