@@ -116,7 +116,10 @@ impl Client {
                 "get_user_devices: Cache miss, fetching from network for {} unique users",
                 jids_to_fetch.len()
             );
-            all_devices.extend(self.fetch_user_devices(jids_to_fetch).await?);
+            let fetched = self.fetch_user_devices(jids_to_fetch).await?;
+            self.remove_superseded_cached_devices(&mut all_devices, &fetched)
+                .await;
+            all_devices.extend(fetched);
         }
 
         Ok(all_devices)
@@ -1303,6 +1306,186 @@ mod tests {
                 targeted_attempts >= 2,
                 "the topology change must force a retry"
             );
+            assert_eq!(transport.sent().len(), targeted_attempts + 2);
+            client.signal_shutdown_sync();
+        }
+    }
+
+    /// Learning an alias during recovery must replace its earlier cached fanout.
+    #[tokio::test]
+    async fn adv_recovery_reconciles_aliases_learned_after_the_cache_read() {
+        use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq};
+        use wacore_binary::builder::NodeBuilder;
+        for cached_is_lid in [false, true] {
+            let (client, transport) = create_iq_test_client().await;
+            let phone = Jid::pn("12025550138");
+            let lid = Jid::lid("100000000000138");
+            let other = Jid::pn("12025550140");
+            let cached_other = Jid::pn("12025550139");
+            let (cached, queried) = if cached_is_lid {
+                (lid.clone(), phone.clone())
+            } else {
+                (phone.clone(), lid.clone())
+            };
+            for (user, companion) in [(&cached, 7), (&cached_other, 9)] {
+                client
+                    .update_device_list(DeviceListRecord {
+                        user: user.user.as_str().into(),
+                        devices: [
+                            DeviceInfo::new(0, None),
+                            DeviceInfo::new(companion, Some(1)),
+                        ]
+                        .into(),
+                        timestamp: 1,
+                        phash: None,
+                        raw_id: Some(1),
+                    })
+                    .await
+                    .unwrap();
+            }
+            for user in [&phone, &lid, &other] {
+                crate::test_utils::seed_adv_primary(&client, user).await;
+            }
+            assert!(
+                client
+                    .lid_pn_cache
+                    .get_current_lid(&phone.user)
+                    .await
+                    .is_none()
+            );
+            let operation = {
+                let client = client.clone();
+                let users = vec![
+                    cached.clone(),
+                    queried.clone(),
+                    other.clone(),
+                    cached_other.clone(),
+                ];
+                tokio::spawn(async move { client.get_user_devices_owned(users).await })
+            };
+            let mut frame = 0;
+            let mut targeted_attempts = 0;
+            loop {
+                let query = decode_sent_iq(&transport, frame).await;
+                let requested: Vec<_> = query
+                    .get()
+                    .get_optional_child("usync")
+                    .unwrap()
+                    .get_optional_child("list")
+                    .unwrap()
+                    .children()
+                    .unwrap()
+                    .iter()
+                    .map(|user| user.attrs().jid("jid"))
+                    .collect();
+                let targeted = requested.len() == 1;
+                let final_batch = frame > 0 && !targeted;
+                if targeted {
+                    assert!(requested[0] == queried || requested[0] == lid);
+                    targeted_attempts += 1;
+                    assert!(targeted_attempts <= DEVICE_REFRESH_MAX_ATTEMPTS);
+                } else {
+                    assert_eq!(requested, vec![queried.clone(), other.clone()]);
+                }
+                if frame == 0 {
+                    assert!(
+                        client
+                            .lid_pn_cache
+                            .get_current_lid(&phone.user)
+                            .await
+                            .is_none()
+                    );
+                    let old = client.load_device_record_for_jid(&cached).await.unwrap();
+                    assert_eq!(old.devices[1].device_id(), 7);
+                }
+                if final_batch {
+                    assert_eq!(
+                        client
+                            .lid_pn_cache
+                            .get_current_lid(&phone.user)
+                            .await
+                            .as_deref(),
+                        Some(lid.user.as_str())
+                    );
+                    let current = client.load_device_record_for_jid(&queried).await.unwrap();
+                    assert_eq!(current.devices[1].device_id(), 2);
+                }
+                let mut replies = Vec::new();
+                if frame == 0 {
+                    replies.push(
+                        adv_wire_response(&queried, vec![0xff])
+                            .get_optional_child("usync")
+                            .unwrap()
+                            .get_optional_child("list")
+                            .unwrap()
+                            .get_optional_child("user")
+                            .unwrap()
+                            .clone(),
+                    );
+                } else if targeted {
+                    let valid = adv_wire_response(&lid, signed_key_index_bytes(vec![1], 1));
+                    let devices = valid
+                        .get_optional_child("usync")
+                        .unwrap()
+                        .get_optional_child("list")
+                        .unwrap()
+                        .get_optional_child("user")
+                        .unwrap()
+                        .get_optional_child("devices")
+                        .unwrap()
+                        .clone();
+                    replies.push(
+                        NodeBuilder::new("user")
+                            .attr("jid", lid.to_string())
+                            .attr("pn_jid", phone.to_string())
+                            .children([devices])
+                            .build(),
+                    );
+                }
+                if !targeted {
+                    replies.push(
+                        adv_wire_response(&other, signed_key_index_bytes(vec![1], 1))
+                            .get_optional_child("usync")
+                            .unwrap()
+                            .get_optional_child("list")
+                            .unwrap()
+                            .get_optional_child("user")
+                            .unwrap()
+                            .clone(),
+                    );
+                }
+                let response = NodeBuilder::new("iq")
+                    .attr("type", "result")
+                    .children([NodeBuilder::new("usync")
+                        .children([NodeBuilder::new("list").children(replies).build()])
+                        .build()])
+                    .build();
+                let id = query
+                    .get()
+                    .attrs()
+                    .optional_string("id")
+                    .unwrap()
+                    .into_owned();
+                answer_iq(&client, &id, &response).await;
+                if final_batch {
+                    break;
+                }
+                frame += 1;
+                assert!(frame <= DEVICE_REFRESH_MAX_ATTEMPTS + 1);
+            }
+            let mut actual = operation.await.unwrap().unwrap();
+            let mut expected = vec![
+                queried.clone(),
+                queried.with_device(2),
+                other.clone(),
+                other.with_device(2),
+                cached_other.clone(),
+                cached_other.with_device(9),
+            ];
+            actual.sort_by_key(ToString::to_string);
+            expected.sort_by_key(ToString::to_string);
+            assert_eq!(actual, expected);
+            assert!(targeted_attempts >= 1);
             assert_eq!(transport.sent().len(), targeted_attempts + 2);
             client.signal_shutdown_sync();
         }

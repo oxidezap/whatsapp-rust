@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use log::{debug, info, warn};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use wacore_binary::{Jid, JidExt as _, Server};
 
@@ -661,6 +661,29 @@ impl Client {
         lookup
             .all_keys()
             .any(|key| devices.iter().any(|device| device.user.as_str() == key))
+    }
+
+    /// Replace earlier cached aliases with the identities covered by a network result.
+    pub(crate) async fn remove_superseded_cached_devices(
+        &self,
+        cached: &mut Vec<Jid>,
+        fetched: &[Jid],
+    ) {
+        if cached.is_empty() || fetched.is_empty() {
+            return;
+        }
+        // A response may teach a mapping after the caller's initial cache read.
+        // Resolve each fetched identity once against one published mapping view.
+        let _mapping_guard = self.lid_pn_cache.lock_mutation().await;
+        let mut refreshed = HashSet::<wacore_binary::CompactString>::new();
+        for device in fetched {
+            if refreshed.contains(device.user.as_str()) {
+                continue;
+            }
+            let lookup = self.resolve_lookup_keys_for_jid(device).await;
+            refreshed.extend(lookup.all_keys().map(wacore_binary::CompactString::from));
+        }
+        cached.retain(|device| !refreshed.contains(device.user.as_str()));
     }
 
     /// Owned-key variant of `resolve_lookup_keys`. Test-only: production callers
@@ -1621,6 +1644,28 @@ impl Client {
                     record.devices.len()
                 );
 
+                // A verified LID response can publish before this detached
+                // migration obtains the registry guard. Do not revive an older
+                // PN snapshot over that newer record; prefer canonical on ties.
+                let canonical = if let Some(current) = self.device_registry_cache.get(lid).await {
+                    Some((*current).clone())
+                } else {
+                    match backend.get_devices(lid).await {
+                        Ok(current) => current,
+                        Err(error) => {
+                            warn!(
+                                "Failed to check canonical device registry during migration: {error}"
+                            );
+                            return;
+                        }
+                    }
+                };
+                if let Some(current) = canonical
+                    && !current.devices.is_empty()
+                    && (record.devices.is_empty() || current.timestamp >= record.timestamp)
+                {
+                    record = current;
+                }
                 record.user = Arc::from(lid);
 
                 if let Err(e) = backend.update_device_list(record.clone()).await {
@@ -3169,6 +3214,58 @@ mod tests {
         let lid_row = backend.get_devices(lid).await.unwrap();
         assert!(lid_row.is_some(), "new LID-keyed DB row must exist");
         assert_eq!(lid_row.unwrap().devices[0].device_id(), 7);
+    }
+
+    /// A delayed migration must preserve the newest valid device snapshot.
+    #[tokio::test]
+    async fn migration_preserves_newer_canonical_devices_and_prefers_lid_on_ties() {
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+        for canonical_cached in [false, true] {
+            for (pn_time, lid_time, expected_device) in [(1, 2, 2), (2, 1, 7), (1, 1, 2)] {
+                let client = create_test_client().await;
+                let pn = "12025550141";
+                let lid = "100000000000141";
+                let make_record = |user: &str, timestamp, companion| DeviceListRecord {
+                    user: user.into(),
+                    devices: [
+                        DeviceInfo::new(0, None),
+                        DeviceInfo::new(companion, Some(1)),
+                    ]
+                    .into(),
+                    timestamp,
+                    phash: None,
+                    raw_id: Some(1),
+                };
+                let phone_record = make_record(pn, pn_time, 7);
+                let canonical_record = make_record(lid, lid_time, 2);
+                let backend = client.persistence_manager.backend();
+                backend.update_device_list(phone_record).await.unwrap();
+                backend
+                    .update_device_list(canonical_record.clone())
+                    .await
+                    .unwrap();
+                if canonical_cached {
+                    client
+                        .device_registry_cache
+                        .raw_insert_for_tests(lid.into(), Arc::new(canonical_record))
+                        .await;
+                }
+                setup_lid_pn(&client, lid, pn).await;
+                client
+                    .migrate_device_registry_on_lid_discovery(pn, lid)
+                    .await;
+                let stored = backend.get_devices(lid).await.unwrap().unwrap();
+                assert_eq!(stored.devices[1].device_id(), expected_device);
+                assert_eq!(stored.timestamp, pn_time.max(lid_time));
+                assert!(backend.get_devices(pn).await.unwrap().is_none());
+                let devices = client
+                    .get_devices_from_registry(&Jid::lid(lid))
+                    .await
+                    .unwrap();
+                assert!(devices.contains(&Jid::lid(lid).with_device(expected_device)));
+                client.signal_shutdown_sync();
+            }
+        }
     }
 
     /// U2 — `migrate_device_registry_on_lid_discovery` deletes the PN-keyed DB
