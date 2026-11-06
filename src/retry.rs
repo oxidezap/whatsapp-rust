@@ -2051,8 +2051,8 @@ mod tests {
             let frames = crate::test_utils::decrypt_wire_frames(&transport.sent(), &[0; 32]);
             assert_eq!(frames.len(), 1);
             let unpacked = wacore_binary::util::unpack(&frames[0]).unwrap();
-            let node = wacore_binary::OwnedNodeRef::new(unpacked.into_owned()).unwrap();
-            let keys = node.as_node_ref().get_optional_child("keys").unwrap();
+            let node = OwnedNodeRef::new(unpacked.into_owned()).unwrap();
+            let keys = node.get().get_optional_child("keys").unwrap();
             assert!(keys.get_optional_child("device-identity").is_none());
             assert!(keys.get_optional_child("identity").is_some());
             assert!(keys.get_optional_child("key").is_some());

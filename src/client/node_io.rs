@@ -2974,7 +2974,7 @@ mod tests {
                         let unpacked = wacore_binary::util::unpack(frame).unwrap();
                         let owned =
                             wacore_binary::OwnedNodeRef::new(unpacked.into_owned()).unwrap();
-                        let node = owned.as_node_ref();
+                        let node = owned.get();
                         if node.tag() != "iq" {
                             continue;
                         }
