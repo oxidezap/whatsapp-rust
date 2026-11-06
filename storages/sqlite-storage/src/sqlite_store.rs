@@ -390,6 +390,14 @@ fn serialize_keypair(key_pair: &KeyPair) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Decode persisted role data through the credential-redacted error boundary.
+#[inline(never)]
+fn decode_mobile_binding(bytes: &[u8]) -> Result<Arc<wacore::store::MobileSessionBinding>> {
+    serde_json::from_slice(bytes).map_err(|_| {
+        StoreError::Validation("invalid persisted mobile session binding".into())
+    })
+}
+
 /// Max ids per `eq_any` list, under SQLite's default 999 host-parameter limit.
 const ID_PARAM_CHUNK: usize = 900;
 
@@ -2250,13 +2258,17 @@ impl SqliteStore {
             let identity_key = self.deserialize_keypair(&row.identity_key)?;
             let signed_pre_key = self.deserialize_keypair(&row.signed_pre_key)?;
 
-            let signed_pre_key_signature: [u8; 64] =
-                row.signed_pre_key_signature.try_into().map_err(|_| {
+            let signed_pre_key_signature: [u8; 64] = row
+                .signed_pre_key_signature
+                .as_slice()
+                .try_into()
+                .map_err(|_| {
                     StoreError::Validation("Invalid signed_pre_key_signature length".to_string())
                 })?;
 
             let adv_secret_key: [u8; 32] = row
                 .adv_secret_key
+                .as_slice()
                 .try_into()
                 .map_err(|_| StoreError::Validation("Invalid adv_secret_key length".to_string()))?;
 
@@ -2269,11 +2281,7 @@ impl SqliteStore {
                 .transpose()?;
 
             let mobile_session = mobile_session_binding
-                .map(|bytes| {
-                    serde_json::from_slice(bytes).map_err(|_| {
-                        StoreError::Validation("invalid persisted mobile session binding".into())
-                    })
-                })
+                .map(decode_mobile_binding)
                 .transpose()?;
             Ok(Some(CoreDevice {
                 mobile_session,
@@ -8000,6 +8008,183 @@ mod tests {
         assert_eq!(
             loaded.first_unupload_pre_key_id, 101,
             "first_unupload_pre_key_id must survive a save/load roundtrip"
+        );
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct MobileRollbackColumn {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        name: String,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct MobileRollbackSnapshot {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        snapshot: String,
+    }
+
+    fn mobile_rollback_table_snapshot(
+        conn: &mut SqliteConnection,
+        table: &str,
+        include_binding: bool,
+    ) -> Vec<String> {
+        let columns = diesel::sql_query("SELECT name FROM pragma_table_info(?) ORDER BY cid")
+            .bind::<diesel::sql_types::Text, _>(table)
+            .load::<MobileRollbackColumn>(conn)
+            .unwrap();
+        let projection = columns
+            .into_iter()
+            .filter(|column| include_binding || column.name != "mobile_session_binding")
+            .map(|column| format!("quote(\"{}\")", column.name.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" || '|' || ");
+        let table = table.replace('"', "\"\"");
+        diesel::sql_query(format!(
+            "SELECT {projection} AS snapshot FROM \"{table}\" ORDER BY snapshot"
+        ))
+        .load::<MobileRollbackSnapshot>(conn)
+        .unwrap()
+        .into_iter()
+        .map(|row| row.snapshot)
+        .collect()
+    }
+
+    fn mobile_rollback_schema_snapshot(conn: &mut SqliteConnection) -> Vec<String> {
+        diesel::sql_query(
+            "SELECT type || ':' || name || ':' || COALESCE(sql, '') AS snapshot \
+             FROM sqlite_master UNION ALL \
+             SELECT 'temp:' || type || ':' || name || ':' || COALESCE(sql, '') AS snapshot \
+             FROM sqlite_temp_master ORDER BY snapshot",
+        )
+        .load::<MobileRollbackSnapshot>(conn)
+        .unwrap()
+        .into_iter()
+        .map(|row| row.snapshot)
+        .collect()
+    }
+
+    fn mobile_rollback_test_connection(with_mobile: bool) -> SqliteConnection {
+        use wacore::store::commands::{DeviceCommand, apply_command_to_device};
+        use wacore::store::{MobileSessionBinding, StoredMobilePlatform};
+
+        let mut conn = SqliteConnection::establish(":memory:").unwrap();
+        conn.run_pending_migrations(MIGRATIONS).unwrap();
+        for id in [141, 142] {
+            let mut source = CoreDevice::new();
+            if with_mobile && id == 142 {
+                let binding = MobileSessionBinding::new(
+                    [1; 32],
+                    source.mobile_identity_hash(),
+                    StoredMobilePlatform::Android,
+                    vec![3],
+                    None,
+                )
+                .unwrap();
+                apply_command_to_device(
+                    &mut source,
+                    DeviceCommand::CompleteMobileRegistration {
+                        binding,
+                        pn: "15550000001@s.whatsapp.net".parse().unwrap(),
+                        lid: None,
+                    },
+                );
+            }
+            let pn = source.pn.as_ref().map(ToString::to_string).unwrap_or_default();
+            let mut row = FreshDeviceRow::from_device(Some(id), source).unwrap();
+            row.pn = pn;
+            row.insert(&mut conn).unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn mobile_binding_rollback_preserves_rows_schema_and_metadata_until_explicitly_cleared() {
+        use diesel::connection::SimpleConnection;
+
+        for (case, replacement) in [
+            ("valid", None),
+            ("empty blob", Some("X''")),
+            ("invalid blob", Some("X'00'")),
+            ("text", Some("'invalid-role'")),
+            ("integer", Some("0")),
+            ("real", Some("0.5")),
+        ] {
+            let mut conn = mobile_rollback_test_connection(true);
+            if let Some(value) = replacement {
+                conn.batch_execute(&format!(
+                    "UPDATE device SET mobile_session_binding = {value} WHERE id = 142"
+                ))
+                .unwrap();
+            }
+            let before_data = mobile_rollback_table_snapshot(&mut conn, "device", true);
+            let before_schema = mobile_rollback_schema_snapshot(&mut conn);
+            let before_metadata =
+                mobile_rollback_table_snapshot(&mut conn, "__diesel_schema_migrations", true);
+
+            assert!(conn.revert_last_migration(MIGRATIONS).is_err(), "{case}");
+            assert_eq!(
+                mobile_rollback_table_snapshot(&mut conn, "device", true),
+                before_data,
+                "{case}: device data changed"
+            );
+            assert_eq!(
+                mobile_rollback_schema_snapshot(&mut conn),
+                before_schema,
+                "{case}: schema or temporary guard changed"
+            );
+            assert_eq!(
+                mobile_rollback_table_snapshot(&mut conn, "__diesel_schema_migrations", true),
+                before_metadata,
+                "{case}: rollback metadata changed"
+            );
+
+            conn.batch_execute("UPDATE device SET mobile_session_binding = NULL WHERE id = 142")
+                .unwrap();
+            let cleared_data = mobile_rollback_table_snapshot(&mut conn, "device", false);
+            let reverted = conn.revert_last_migration(MIGRATIONS).unwrap();
+            assert_eq!(reverted.to_string(), "20261105000000");
+            assert_eq!(
+                mobile_rollback_table_snapshot(&mut conn, "device", true),
+                cleared_data,
+                "{case}: explicit rollback changed credentials"
+            );
+            assert_eq!(
+                mobile_rollback_table_snapshot(&mut conn, "__diesel_schema_migrations", true).len(),
+                before_metadata.len() - 1
+            );
+            assert!(
+                conn.batch_execute("SELECT mobile_session_binding FROM device")
+                    .is_err()
+            );
+            assert!(
+                mobile_rollback_schema_snapshot(&mut conn)
+                    .iter()
+                    .all(|entry| !entry.contains("__whatsapp_mobile_rollback_guard"))
+            );
+        }
+    }
+
+    #[test]
+    fn mobile_binding_rollback_accepts_normal_null_only_rows() {
+        use diesel::connection::SimpleConnection;
+
+        let mut conn = mobile_rollback_test_connection(false);
+        let before_data = mobile_rollback_table_snapshot(&mut conn, "device", false);
+        let before_metadata =
+            mobile_rollback_table_snapshot(&mut conn, "__diesel_schema_migrations", true);
+        let reverted = conn.revert_last_migration(MIGRATIONS).unwrap();
+        assert_eq!(reverted.to_string(), "20261105000000");
+        assert_eq!(
+            mobile_rollback_table_snapshot(&mut conn, "device", true),
+            before_data
+        );
+        assert_eq!(
+            mobile_rollback_table_snapshot(&mut conn, "__diesel_schema_migrations", true).len(),
+            before_metadata.len() - 1
+        );
+        assert!(
+            conn.batch_execute("SELECT mobile_session_binding FROM device")
+                .is_err()
         );
     }
 
