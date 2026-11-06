@@ -152,7 +152,12 @@ fn spec_bytes(value: &Value) -> Result<Vec<u8>> {
     // Preserve the locked JSON representation, including optional fields/comments.
     // Parsing the executable schema also rejects invalid recipe-generated programs.
     let _: oracle_core::derive::Spec = serde_json::from_value(value.clone())?;
-    let mut bytes = serde_json::to_vec_pretty(value)?;
+    // Workspace feature unification can enable serde_json/preserve_order. The
+    // locked representation predates that feature and sorts every object,
+    // including objects inside ordered step arrays. Make that contract explicit.
+    let mut canonical = value.clone();
+    canonical.sort_all_objects();
+    let mut bytes = serde_json::to_vec_pretty(&canonical)?;
     bytes.push(b'\n');
     Ok(bytes)
 }
@@ -285,6 +290,7 @@ pub(crate) fn verify(root: &Path, out: &Path, capture: &str, mode: VerifyMode) -
             assemble::all(out)?;
         }
         if update || refresh {
+            actual.sort_all_objects();
             write_json(&specs_root.join("mlow.lock.json"), &actual)?;
         }
         Ok(())
@@ -293,7 +299,7 @@ pub(crate) fn verify(root: &Path, out: &Path, capture: &str, mode: VerifyMode) -
     result
 }
 pub(crate) fn spec(root: &Path, kind: &str, out: &Path, count: usize, end: usize) -> Result<()> {
-    write_json(out, &trace(root, kind, count, end)?)
+    xtask_support::write(out, &spec_bytes(&trace(root, kind, count, end)?)?)
 }
 
 pub(crate) fn assemble(
@@ -323,5 +329,21 @@ mod tests {
     fn recipes_reproduce_every_locked_expansion() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         specs(&root, &root.join(".derive-mlow/specs"), true).unwrap();
+    }
+
+    #[test]
+    fn individual_trace_commands_reproduce_locked_bytes() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let lock = read_json(&specs_dir(&root).join("mlow.lock.json")).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        for kind in ["fe", "signal", "kernel", "postfilter", "params", "gennoise"] {
+            let run = format!("mlow_{kind}_trace");
+            let path = out.path().join(format!("{run}.json"));
+            spec(&root, kind, &path, 330, 1099).unwrap();
+            assert_eq!(
+                sha256(&std::fs::read(path).unwrap()),
+                lock["runs"][run]["spec_sha256"]
+            );
+        }
     }
 }

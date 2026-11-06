@@ -72,12 +72,34 @@ impl ProbeBackend {
 impl DeviceStore for ProbeBackend {
     async fn save(&self, device: &wacore::store::Device) -> Result<()> {
         self.before_call("save").await;
-        if self.fail_save {
+        if self.fail_save
+            || self
+                .fail_before_method
+                .as_ref()
+                .is_some_and(|(method, failing)| {
+                    *method == "save" && failing.load(Ordering::Relaxed)
+                })
+        {
             return Err(wacore::store::error::StoreError::Io(std::io::Error::other(
                 "synthetic save failure",
             )));
         }
-        self.backend.save(device).await
+        let result = self.backend.save(device).await;
+        if self.fail_after_method == Some("save") {
+            return Err(wacore::store::error::StoreError::Io(std::io::Error::other(
+                "synthetic save failure after commit",
+            )));
+        }
+        result
+    }
+    async fn initialize_mobile_device(&self, device: &wacore::store::Device) -> Result<()> {
+        self.backend.initialize_mobile_device(device).await
+    }
+    async fn snapshot_db(&self, name: &str, extra_content: Option<&[u8]>) -> Result<()> {
+        self.backend.snapshot_db(name, extra_content).await
+    }
+    async fn resource_report(&self) -> wacore::stats::StorageResourceReport {
+        self.backend.resource_report().await
     }
     async fn maintenance(&self) -> Result<()> {
         self.before_call("maintenance").await;

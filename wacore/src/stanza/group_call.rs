@@ -637,6 +637,21 @@ fn parse_indexed_tokens(children: &[NodeRef<'_>], tag: &str) -> Vec<Vec<u8>> {
 /// Build one keygen-v2 group epoch delivery.
 #[cold]
 pub fn build_group_enc_rekey(params: &GroupEncRekeyParams<'_>) -> Result<Node> {
+    build_group_enc_rekey_for_role(params, crate::send::SenderIdentityRole::Companion)
+}
+
+/// Build with an explicitly validated sender role. Primary ADV omission follows
+/// the same source-qualified policy as message and direct-call encryption.
+pub fn build_group_enc_rekey_for_role(
+    params: &GroupEncRekeyParams<'_>,
+    sender_role: crate::send::SenderIdentityRole,
+) -> Result<Node> {
+    use crate::send::{PrimaryDeviceIdentityPolicy, SenderIdentityRole};
+    sender_role.validate()?;
+    let device_identity = match sender_role {
+        SenderIdentityRole::MobilePrimary(PrimaryDeviceIdentityPolicy::Omit) => None,
+        _ => params.device_identity,
+    };
     validate_call_identity(params.call_id, params.id, params.call_creator)?;
     if params.transaction_id == 0 {
         bail!("group epoch transaction id must be non-zero");
@@ -650,7 +665,10 @@ pub fn build_group_enc_rekey(params: &GroupEncRekeyParams<'_>) -> Result<Node> {
     if !matches!(params.device_key.enc_type.as_str(), "msg" | "pkmsg") {
         bail!("unsupported group epoch encryption type");
     }
-    if params.device_key.enc_type == "pkmsg" && params.device_identity.is_none() {
+    if params.device_key.enc_type == "pkmsg"
+        && device_identity.is_none()
+        && sender_role == SenderIdentityRole::Companion
+    {
         bail!("pre-key group epoch requires device identity");
     }
     let mut children = vec![
@@ -662,7 +680,7 @@ pub fn build_group_enc_rekey(params: &GroupEncRekeyParams<'_>) -> Result<Node> {
             .bytes(params.device_key.ciphertext.clone())
             .build(),
     ];
-    if let Some(identity) = params.device_identity {
+    if let Some(identity) = device_identity {
         children.push(
             NodeBuilder::new("device-identity")
                 .bytes(identity.to_vec())
@@ -2230,6 +2248,62 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn primary_group_epoch_identity_profiles_are_explicit_and_unknown_fails_closed() {
+        use crate::send::{
+            PrimaryDeviceIdentityPolicy::{AttachWhenAvailable, Omit},
+            SenderIdentityRole,
+        };
+        let creator = jid("100001", 0);
+        let target = jid("200002", 2);
+        let identity = [7, 8, 9];
+        for enc_type in ["pkmsg", "msg"] {
+            let key = OfferDeviceKey {
+                device_jid: target.clone(),
+                ciphertext: vec![4, 5, 6],
+                enc_type: enc_type.into(),
+            };
+            for supplied in [None, Some(identity.as_slice())] {
+                let params = GroupEncRekeyParams {
+                    call_id: "CID",
+                    id: "REQ",
+                    to: &target,
+                    call_creator: &creator,
+                    transaction_id: 10,
+                    device_key: &key,
+                    device_identity: supplied,
+                };
+                assert!(
+                    build_group_enc_rekey_for_role(&params, SenderIdentityRole::Unknown).is_err()
+                );
+                for policy in [Omit, AttachWhenAvailable] {
+                    let node = build_group_enc_rekey_for_role(
+                        &params,
+                        SenderIdentityRole::MobilePrimary(policy),
+                    )
+                    .expect("explicit primary profile");
+                    let rekey = action(&node).as_node_ref();
+                    assert_eq!(
+                        rekey
+                            .get_optional_child("enc")
+                            .unwrap()
+                            .attrs()
+                            .optional_string("type")
+                            .as_deref(),
+                        Some(enc_type)
+                    );
+                    let encoded_identity = rekey
+                        .get_optional_child("device-identity")
+                        .and_then(|node| node.content_bytes());
+                    assert_eq!(
+                        encoded_identity,
+                        if policy == Omit { None } else { supplied }
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -10,6 +10,10 @@ use wacore_binary::Jid;
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl SendContextResolver for Client {
+    fn sender_identity_role(&self) -> wacore::send::SenderIdentityRole {
+        self.sending_identity_role()
+    }
+
     async fn resolve_devices(&self, jids: &[Jid]) -> Result<Vec<Jid>, anyhow::Error> {
         self.get_user_devices(jids).await
     }
@@ -91,5 +95,30 @@ impl SendContextResolver for Client {
         // Reuse the DM path's helpers so both lock the identical per-device mutexes.
         let keys = self.build_session_lock_keys(device_jids).await;
         SessionLockGuard::hold(Box::new(self.session_guards_for(&keys).await))
+    }
+}
+
+impl Client {
+    /// Derive omission permission from the current validated persisted binding,
+    /// never from a device-number heuristic or a missing account certificate.
+    pub(crate) fn sending_identity_role(&self) -> wacore::send::SenderIdentityRole {
+        use wacore::send::SenderIdentityRole;
+        let snapshot = self.persistence_manager.get_device_snapshot();
+        #[cfg(feature = "mobile-core")]
+        if let Some(session) = &self.mobile_session {
+            return if session.validate_device(&snapshot).is_ok() {
+                session
+                    .primary_identity_policy()
+                    .map(SenderIdentityRole::MobilePrimary)
+                    .unwrap_or(SenderIdentityRole::Unknown)
+            } else {
+                SenderIdentityRole::Unknown
+            };
+        }
+        if snapshot.mobile_session.is_some() {
+            SenderIdentityRole::Unknown
+        } else {
+            SenderIdentityRole::Companion
+        }
     }
 }

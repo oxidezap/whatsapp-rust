@@ -436,22 +436,17 @@ fn c_reference(root: &Path, check: bool) -> Result<()> {
     std::fs::create_dir_all(&cache)?;
     let work = tempfile::tempdir_in(cache)?;
     let binary = work.path().join("mlow_frames");
-    let mut cc = Command::new("cc");
-    cc.arg("-O2");
-    for path in [
-        reference.join("include"),
-        reference.join("src"),
-        reference.join("celt"),
-        reference.clone(),
-    ] {
-        cc.arg("-I").arg(path);
-    }
     execute(
-        cc.arg("-o")
+        Command::new("rustc")
+            .args(["--edition", "2024", "-O", "-o"])
             .arg(&binary)
-            .arg(root.join("scripts/mlow-vectors/mlow_frames.c"))
-            .arg(lib)
-            .arg("-lm"),
+            .arg(root.join("scripts/mlow-vectors/mlow_frames.rs"))
+            .arg("-L")
+            .arg(format!(
+                "native={}",
+                lib.parent().context("reference library parent")?.display()
+            ))
+            .args(["-l", "static=opus", "-l", "m"]),
     )?;
     for (ms, count, frames_name, pcm_name) in [
         (120, 8, "mlow_120ms_frames.json", "ref_120ms_expected.raw"),
@@ -676,3 +671,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "../../../scripts/mlow-vectors/pcm.rs"]
+mod pcm_frame_tests;

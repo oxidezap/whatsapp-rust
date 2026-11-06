@@ -1,0 +1,27 @@
+[package]
+name = "web-oracle"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+publish = false
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true, features = ["std"] }
+serde_json = { workspace = true, features = ["std", "preserve_order"] }
+sha2.workspace = true
+hex.workspace = true
+boa_engine = { version = "=0.22.0", default-features = false }
+oxc_allocator = "=0.133.0"
+oxc_ast = "=0.133.0"
+oxc_ast_visit = "=0.133.0"
+oxc_parser = "=0.133.0"
+oxc_span = "=0.133.0"
+clap = { version = "4", features = ["derive"] }
+tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3"

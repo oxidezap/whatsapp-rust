@@ -446,7 +446,10 @@ impl SidecarAccumulator {
 /// Audio and video are the only media types that benefit from a streaming
 /// sidecar (progressive playback/seek); images/documents are fetched whole.
 fn media_type_uses_sidecar(media_type: MediaType) -> bool {
-    matches!(media_type, MediaType::Audio | MediaType::Video)
+    matches!(
+        media_type,
+        MediaType::Audio | MediaType::Ptt | MediaType::Video | MediaType::Gif
+    )
 }
 
 /// A re-readable source of already-encrypted upload bytes.
@@ -1096,7 +1099,12 @@ mod tests {
     #[test]
     fn sidecar_only_for_audio_and_video_by_default() {
         let key = [1u8; 32];
-        for mt in [MediaType::Audio, MediaType::Video] {
+        for mt in [
+            MediaType::Audio,
+            MediaType::Ptt,
+            MediaType::Video,
+            MediaType::Gif,
+        ] {
             let enc = encrypt_media_with_key(&payload(1000, 1), mt, Some(&key)).unwrap();
             assert!(
                 enc.streaming_sidecar.is_some(),

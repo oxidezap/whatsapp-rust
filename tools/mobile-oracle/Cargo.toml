@@ -1,0 +1,28 @@
+[package]
+name = "mobile-oracle"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+publish = false
+license.workspace = true
+
+[dependencies]
+libc = "0.2"
+zeroize = { workspace = true }
+wacore = { path = "../../wacore", default-features = false, features = ["mobile"] }
+hex = "0.4.3"
+anyhow = { workspace = true }
+chrono = { workspace = true, features = ["std"] }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["std"] }
+sha2 = { workspace = true }
+sha1 = { workspace = true }
+url = { version = "2.5.8", default-features = false }
+zip = { version = "=9.1.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+tempfile = "3"
+
+[dev-dependencies]
+hmac = { workspace = true }
+
+[lints]
+workspace = true

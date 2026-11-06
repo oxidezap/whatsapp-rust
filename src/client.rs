@@ -792,6 +792,13 @@ pub struct MemoryReport {
     pub signal_sessions: CollectionStats,
     pub signal_identities: CollectionStats,
     pub signal_sender_keys: CollectionStats,
+    /// Retained native-mobile configuration and known provider object allocations.
+    /// Provider-owned captures are opaque; concrete profile buffers are walked.
+    /// Shared configuration is attributed once to each client that retains it.
+    pub mobile_session: CollectionStats,
+    /// Persisted mobile role/context/checkpoint/state buffers in the device snapshot.
+    /// Only sizes are exposed; registration context may contain credentials.
+    pub mobile_session_binding: CollectionStats,
     /// What the optional subsystems attached to this build retain. Empty when
     /// none is attached. One field rather than a `cfg`'d field per subsystem,
     /// so the report has one shape whatever was compiled; see
@@ -869,7 +876,7 @@ pub struct SubsystemMemory {
 impl MemoryReport {
     /// Common byte-carrying collections used by both totals and `Display`.
     /// Feature-specific collections stay beside their gated report section.
-    fn collections(&self) -> [(&'static str, &CollectionStats); 20] {
+    fn collections(&self) -> [(&'static str, &CollectionStats); 22] {
         [
             ("group_cache:", &self.group_cache),
             ("device_registry_cache:", &self.device_registry_cache),
@@ -891,6 +898,8 @@ impl MemoryReport {
             ("core_event_handlers:", &self.core_event_handlers),
             ("status_privacy:", &self.status_privacy),
             ("inbound_chat_budgets:", &self.inbound_chat_budgets),
+            ("mobile_session:", &self.mobile_session),
+            ("mobile_session_binding:", &self.mobile_session_binding),
         ]
     }
 
@@ -1186,6 +1195,8 @@ impl std::fmt::Display for MemoryReport {
         writeln!(f, "  custom_enc_handlers:    {}", self.custom_enc_handlers)?;
         writeln!(f, "  stanza_interceptors:    {}", self.stanza_interceptors)?;
         line(f, "core_event_handlers:", &self.core_event_handlers)?;
+        line(f, "mobile_session:", &self.mobile_session)?;
+        line(f, "mobile_session_binding:", &self.mobile_session_binding)?;
         writeln!(
             f,
             "  total estimated:        {} B",
@@ -1359,6 +1370,11 @@ impl std::fmt::Display for ConnectStage {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ConnectError {
+    #[cfg(feature = "mobile-core")]
+    #[error("{0}")]
+    PrimaryMobile(#[from] crate::mobile_primary::PrimaryManagementError),
+    #[error("persisted session role does not match the configured client")]
+    InvalidSessionRole,
     /// A connection is already up, or another attempt is already in flight.
     #[error("client is already connected")]
     AlreadyConnected,
@@ -1434,8 +1450,11 @@ impl ConnectError {
     pub fn is_timeout(&self) -> bool {
         match self {
             ConnectError::Timeout { .. } => true,
+            #[cfg(feature = "mobile-core")]
+            ConnectError::PrimaryMobile(_) => false,
             ConnectError::Handshake(handshake) => handshake.is_timeout(),
-            ConnectError::AlreadyConnected
+            ConnectError::InvalidSessionRole
+            | ConnectError::AlreadyConnected
             | ConnectError::NotActivated
             | ConnectError::Shutdown
             | ConnectError::Paused
@@ -1688,6 +1707,9 @@ impl SessionState {
     const PAUSE_EXIT: u16 = 1024;
     const PENALTY: u16 = 2048;
     const ORPHANED: u16 = 4096;
+    // SDK-local, generation-scoped outcome; all access is under lifecycle_state.
+    #[cfg(feature = "mobile-core")]
+    const PRIMARY_APP_STATE_FAILURE: u16 = 8192;
 
     fn new(enabled: bool) -> Self {
         use wacore::session_engine::lifecycle::{Lifecycle, ReconnectPolicy};
@@ -1758,7 +1780,10 @@ impl SessionState {
     fn publish(&self, state: &wacore::session_engine::lifecycle::Lifecycle, ordering: Ordering) {
         self.reconnect_errors
             .store(state.snapshot().backoff_attempt(), Ordering::Relaxed);
-        self.status.store(Self::status_bits(state), ordering);
+        let bits = Self::status_bits(state);
+        #[cfg(feature = "mobile-core")]
+        let bits = bits | (self.status.load(Ordering::Relaxed) & Self::PRIMARY_APP_STATE_FAILURE);
+        self.status.store(bits, ordering);
     }
 
     fn transition<R>(
@@ -1804,7 +1829,10 @@ impl SessionState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = state.set_reconnect(enabled);
-        self.status.swap(Self::status_bits(&state), ordering);
+        let bits = Self::status_bits(&state);
+        #[cfg(feature = "mobile-core")]
+        let bits = bits | (self.status.load(Ordering::Relaxed) & Self::PRIMARY_APP_STATE_FAILURE);
+        self.status.swap(bits, ordering);
         previous
     }
 
@@ -1824,6 +1852,41 @@ impl SessionState {
     fn is_terminal(&self) -> bool {
         self.status.load(Ordering::Acquire) & Self::TERMINAL != 0
     }
+}
+
+#[cfg(test)]
+mod session_state_status_tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_policy_swap_preserves_read_modify_write_orderings() {
+        let state = SessionState::new(true);
+        assert!(state.swap(false, Ordering::AcqRel));
+        assert!(!state.load(Ordering::Acquire));
+        assert!(!state.swap(true, Ordering::Acquire));
+        assert!(state.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "mobile-core")]
+    #[test]
+    fn reconnect_policy_toggle_preserves_pending_primary_failure() {
+        let state = SessionState::new(true);
+        state
+            .status
+            .fetch_or(SessionState::PRIMARY_APP_STATE_FAILURE, Ordering::Relaxed);
+        assert!(state.swap(false, Ordering::AcqRel));
+        assert!(!state.swap(true, Ordering::AcqRel));
+        assert_ne!(
+            state.status.load(Ordering::Acquire) & SessionState::PRIMARY_APP_STATE_FAILURE,
+            0
+        );
+    }
+}
+
+/// Device state belongs to PersistenceManager. Event dispatch does not need a
+/// second, stale copy of its keys, profile and persisted session metadata.
+pub(crate) struct ClientCore {
+    pub(crate) event_bus: wacore::types::events::CoreEventBus,
 }
 
 /// A single WhatsApp session: the connection, the Signal state, and every
@@ -1885,7 +1948,7 @@ impl SessionState {
 /// ```
 pub struct Client {
     pub(crate) runtime: Arc<dyn Runtime>,
-    pub(crate) core: wacore::client::CoreClient,
+    pub(crate) core: ClientCore,
 
     pub(crate) persistence_manager: Arc<PersistenceManager>,
     /// Write-behind buffer for inbound messageSecret captures; readers check
@@ -1930,6 +1993,11 @@ pub struct Client {
     /// including reconnects, reads this same value, so the policy cannot
     /// change under an in-flight handshake.
     pub(crate) noise_cert_policy: wacore::handshake::NoiseCertPolicy,
+    #[cfg(feature = "mobile-core")]
+    pub(crate) mobile_session: Option<Arc<crate::RegisteredMobileSession>>,
+    /// Reserved XX attempts per client; failed pre-dial attempts do not advance it.
+    #[cfg(feature = "mobile-core")]
+    pub(crate) mobile_handshake_attempts: AtomicU32,
     pub(crate) additional_static_media_hosts: Box<[wacore::download::MediaHost]>,
     /// Terminal shutdown (process-wide). Fired by shutdown, logout or synchronous drop cleanup.
     /// Long-lived subscribers that must outlive reconnect cycles (saver,

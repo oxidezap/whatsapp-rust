@@ -30,6 +30,37 @@ where
     .await
 }
 
+/// Role-aware peer path. The caller must validate its persisted primary binding.
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_peer_stanza_for_role<S, I>(
+    session_store: &mut S,
+    identity_store: &mut I,
+    transport_jid: Jid,
+    signal_address: &ProtocolAddress,
+    message: &wa::Message,
+    request_id: &str,
+    account: Option<&wa::ADVSignedDeviceIdentity>,
+    role: SenderIdentityRole,
+) -> Result<Node>
+where
+    S: crate::libsignal::protocol::SessionStore,
+    I: crate::libsignal::protocol::IdentityKeyStore,
+{
+    let options = peer_message_options_from_message(message);
+    prepare_peer_stanza_with_options_for_role(
+        session_store,
+        identity_store,
+        transport_jid,
+        signal_address,
+        message,
+        request_id,
+        account,
+        options,
+        role,
+    )
+    .await
+}
+
 #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.peer_prepare", level = "debug", skip_all, fields(to = %transport_jid.observe()), err(Debug)))]
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare_peer_stanza_with_options<S, I>(
@@ -46,9 +77,43 @@ where
     S: crate::libsignal::protocol::SessionStore,
     I: crate::libsignal::protocol::IdentityKeyStore,
 {
+    prepare_peer_stanza_with_options_for_role(
+        session_store,
+        identity_store,
+        transport_jid,
+        signal_address,
+        message,
+        request_id,
+        account,
+        options,
+        SenderIdentityRole::Companion,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_peer_stanza_with_options_for_role<S, I>(
+    session_store: &mut S,
+    identity_store: &mut I,
+    transport_jid: Jid,
+    signal_address: &ProtocolAddress,
+    message: &wa::Message,
+    request_id: &str,
+    account: Option<&wa::ADVSignedDeviceIdentity>,
+    options: PeerMessageOptions,
+    role: SenderIdentityRole,
+) -> Result<Node>
+where
+    S: crate::libsignal::protocol::SessionStore,
+    I: crate::libsignal::protocol::IdentityKeyStore,
+{
+    role.validate()?;
     let plaintext = MessageUtils::encode_and_pad(message);
 
-    if account.is_none() && pkmsg_would_be_emitted(session_store, signal_address).await? {
+    if role.requires_account()
+        && account.is_none()
+        && pkmsg_would_be_emitted(session_store, signal_address).await?
+    {
         bail!(
             "peer pkmsg requires <device-identity> (account is None); \
              refusing before message_encrypt to avoid advancing the sender chain"
@@ -71,7 +136,7 @@ where
     let mut children = vec![meta_node, enc_node];
     // Defense in depth: pre-flight should have caught a no-account pkmsg, but a
     // corrupt session that triggers a fresh pkmsg mid-call would slip past.
-    if let Some(device_identity_bytes) = needs_device_identity(is_prekey, account)? {
+    if let Some(device_identity_bytes) = needs_device_identity_for_role(is_prekey, account, role)? {
         children.push(
             NodeBuilder::new("device-identity")
                 .bytes(device_identity_bytes)

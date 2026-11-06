@@ -17,6 +17,8 @@
 //! To regenerate a vector, drive `writeGlobalAttribute`/`writeEvent`/`writeField`
 //! from those two modules with the same values, writing globals and the
 //! timestamp together in ascending id order.
+//! The maintained Rust driver is `cargo run -p web-oracle -- wam`; see
+//! `tools/web-oracle/README.md` for pinned references and independent baseline checks.
 
 use super::*;
 use crate::generated::{enums, events, globals};

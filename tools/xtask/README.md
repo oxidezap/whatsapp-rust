@@ -10,6 +10,7 @@ runtime libraries do not depend on this crate.
 | `cargo xt mlow verify` | Re-derive all locked J/S outputs |
 | `cargo xt mlow specs --check` | Check generated specs against their recipes |
 | `cargo xt oracle fetch` | Restore every hash-pinned WhatsApp wasm capture |
+| `cargo xt mobile-apk --help` | Pin, fetch, import or verify exact APK bytes without executing them |
 | `cargo xt oracle --help` | Capture-specific diagnostic patches |
 | `cargo xt mlow pack SOURCE OUTPUT` | Lossless canonical CBOR + zstd |
 | `cargo xt mlow pack-legacy --check` | Verify independent historical C auditors |

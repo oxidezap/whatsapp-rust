@@ -317,6 +317,8 @@ pub static DEVICE_PROPS: LazyLock<wa::DeviceProps> = LazyLock::new(|| {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Device {
+    #[serde(default)]
+    pub mobile_session: Option<Arc<super::MobileSessionBinding>>,
     pub pn: Option<Jid>,
     pub lid: Option<Jid>,
     pub registration_id: u32,
@@ -602,6 +604,7 @@ impl Device {
         rng.fill_bytes(&mut adv_secret_key);
 
         Self {
+            mobile_session: None,
             pn: None,
             lid: None,
             registration_id: rng.random_range(1..=2147483647),
@@ -637,6 +640,165 @@ impl Device {
             last_signed_pre_key_rotation_ms: now(),
             read_receipts_disabled: false,
         }
+    }
+
+    pub fn mobile_identity_hash(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"whatsapp-rust/mobile-registration-identity/v1");
+        hash.update(self.identity_key.public_key.public_key_bytes());
+        hash.update(self.noise_key.public_key.public_key_bytes());
+        hash.finalize().into()
+    }
+
+    /// Validate imported mobile key material and identity binding.
+    pub fn validate_mobile_session(&self) -> super::error::Result<()> {
+        let binding = self
+            .mobile_session
+            .as_deref()
+            .ok_or_else(|| super::error::StoreError::Validation("missing mobile binding".into()))?;
+        self.validate_mobile_session_update(binding, self.pn.as_ref(), self.lid.as_ref())
+    }
+
+    /// Validate a prospective mobile binding and identity without cloning or publishing state.
+    pub fn validate_mobile_session_update(
+        &self,
+        binding: &super::MobileSessionBinding,
+        pn: Option<&Jid>,
+        lid: Option<&Jid>,
+    ) -> super::error::Result<()> {
+        Self::validate_mobile_keys(
+            binding,
+            self.registration_id,
+            &self.noise_key,
+            &self.identity_key,
+            &self.signed_pre_key,
+            self.signed_pre_key_id,
+            &self.signed_pre_key_signature,
+        )?;
+        if let Some(pn) = pn {
+            super::validate_mobile_primary_pn(pn)?;
+        }
+        if lid.is_some_and(|v| {
+            v.server != wacore_binary::Server::Lid
+                || v.device != 0
+                || v.agent != 0
+                || v.integrator != 0
+                || v.user.is_empty()
+                || !v.user.bytes().all(|c| c.is_ascii_digit())
+        }) {
+            return Err(super::error::StoreError::Validation(
+                "invalid mobile LID identity".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_mobile_keys(
+        binding: &super::MobileSessionBinding,
+        registration_id: u32,
+        noise_key: &KeyPair,
+        identity_key: &KeyPair,
+        signed_pre_key: &KeyPair,
+        signed_pre_key_id: u32,
+        signed_pre_key_signature: &[u8; 64],
+    ) -> super::error::Result<()> {
+        binding.validate()?;
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"whatsapp-rust/mobile-registration-identity/v1");
+        hash.update(identity_key.public_key.public_key_bytes());
+        hash.update(noise_key.public_key.public_key_bytes());
+        let identity_hash: [u8; 32] = hash.finalize().into();
+        if binding.identity_hash != identity_hash {
+            return Err(super::error::StoreError::Validation(
+                "mobile identity binding mismatch".into(),
+            ));
+        }
+        if registration_id == 0 || registration_id > i32::MAX as u32 || signed_pre_key_id > 0xffffff
+        {
+            return Err(super::error::StoreError::Validation(
+                "invalid mobile key identifiers".into(),
+            ));
+        }
+        for key in [noise_key, identity_key, signed_pre_key] {
+            if key.private_key.public_key().map_err(|_| {
+                super::error::StoreError::Validation("invalid mobile private key".into())
+            })? != key.public_key
+            {
+                return Err(super::error::StoreError::Validation(
+                    "mobile keypair mismatch".into(),
+                ));
+            }
+        }
+        if !identity_key.public_key.verify_signature(
+            &signed_pre_key.public_key.serialize(),
+            signed_pre_key_signature,
+        ) {
+            return Err(super::error::StoreError::Validation(
+                "invalid mobile signed prekey signature".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Construct dedicated mobile state from supplied, validated key material without entropy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_mobile_keys(
+        binding: super::MobileSessionBinding,
+        registration_id: u32,
+        noise_key: KeyPair,
+        identity_key: KeyPair,
+        signed_pre_key: KeyPair,
+        signed_pre_key_id: u32,
+        signed_pre_key_signature: [u8; 64],
+        adv_secret_key: [u8; 32],
+    ) -> super::error::Result<Self> {
+        Self::validate_mobile_keys(
+            &binding,
+            registration_id,
+            &noise_key,
+            &identity_key,
+            &signed_pre_key,
+            signed_pre_key_id,
+            &signed_pre_key_signature,
+        )?;
+        Ok(Self {
+            mobile_session: Some(Arc::new(binding)),
+            pn: None,
+            lid: None,
+            registration_id,
+            noise_key,
+            identity_key,
+            signed_pre_key,
+            signed_pre_key_id,
+            signed_pre_key_signature,
+            adv_secret_key,
+            account: None,
+            push_name: String::new(),
+            // Mobile handshake versions come from the explicitly bound login profile.
+            app_version_primary: 0,
+            app_version_secondary: 0,
+            app_version_tertiary: 0,
+            app_version_last_fetched_ms: 0,
+            device_props: Arc::new(DEVICE_PROPS.clone()),
+            client_profile: ClientProfile::web(),
+            edge_routing_info: None,
+            props_hash: None,
+            next_pre_key_id: 1,
+            first_unupload_pre_key_id: 0,
+            server_has_prekeys: false,
+            nct_salt: None,
+            nct_salt_sync_seen: false,
+            status_privacy: None,
+            server_cert_chain: None,
+            login_counter: 0,
+            lid_migrated: false,
+            server_client_expiration: None,
+            last_signed_pre_key_rotation_ms: 0,
+            read_receipts_disabled: false,
+        })
     }
 
     /// Returns the default OS string used for device props

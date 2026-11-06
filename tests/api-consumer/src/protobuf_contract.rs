@@ -1,4 +1,7 @@
 //! Source compatibility of generated protobufs from a separate crate.
+// Explicit match arms exercise downstream enum/oneof matching and wildcard contracts.
+#![allow(clippy::match_like_matches_macro)]
+
 use whatsapp_rust::waproto::whatsapp as wa;
 
 pub fn owned(text: &str) -> wa::Message {

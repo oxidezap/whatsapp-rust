@@ -88,6 +88,7 @@ diesel::table! {
         read_receipts_disabled -> Bool,
         server_client_expiration -> Nullable<Text>,
         status_privacy -> Nullable<Binary>,
+        mobile_session_binding -> Nullable<Binary>,
     }
 }
 

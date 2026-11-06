@@ -10,6 +10,8 @@ description = "Tokio-based WebSocket transport for whatsapp-rust"
 
 [features]
 default = []
+# Raw byte streams; Noise and WhatsApp framing remain in wacore.
+tcp = ["tokio/net", "tokio/io-util"]
 # Skip TLS certificate verification (for testing with mock servers)
 danger-skip-tls-verify = []
 
