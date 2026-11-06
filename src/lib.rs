@@ -436,7 +436,7 @@ pub use wacore::{
 pub use wacore_binary::CompactString;
 pub use wacore_binary::OwnedNodeRef;
 pub use wacore_binary::builder::NodeBuilder;
-pub use wacore_binary::{Jid, Server};
+pub use wacore_binary::{Jid, JidExt, Server};
 
 // Whole-crate re-exports so a git consumer needs a single dependency:
 // every `wacore::…`/`wacore_binary::…`/`waproto::…` path is reachable as
@@ -715,7 +715,7 @@ pub mod prelude {
     };
     pub use crate::types::message::MessageInfo;
     pub use crate::{
-        CreatedEvent, CreatedPoll, EventRef, InvalidMessageSecret, Jid, MessageSecret, PollRef,
+        CreatedEvent, CreatedPoll, EventRef, InvalidMessageSecret, Jid, JidExt, MessageSecret, PollRef,
         Server, StoredMessageSecret,
     };
     pub use crate::{

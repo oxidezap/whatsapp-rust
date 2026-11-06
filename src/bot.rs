@@ -357,7 +357,7 @@ impl MessageContext {
         name: &str,
         options: &[String],
         selectable_count: u32,
-    ) -> Result<crate::send::SendResult, crate::features::PollError> {
+    ) -> Result<crate::features::CreatedPoll, crate::features::PollError> {
         self.client.polls().create(&self.info.source.chat, name, options, selectable_count).await
     }
 
@@ -395,7 +395,7 @@ impl MessageContext {
             content.push_str("📢 Announcement to all members:\n\n");
         }
         for (i, p) in meta.participants.iter().enumerate() {
-            content.push_str(&format!("{}. @{}\n", i + 1, p.jid.user()));
+            content.push_str(&format!("{}. @{}\n", i + 1, p.jid.user));
         }
         let result = self.reply_with_mentions(content, &mentions).await?;
         Ok(result)
@@ -429,7 +429,7 @@ impl MessageContext {
         };
         let meta = self.group_metadata().await?;
         Ok(meta.participants.iter().any(|p| {
-            (p.jid.user() == pn.user() || p.phone_number.as_ref().map(|j| j.user()) == Some(pn.user()))
+            (p.jid.user == pn.user || p.phone_number.as_ref().map(|j| &j.user) == Some(&pn.user))
                 && p.is_admin()
         }))
     }
@@ -456,7 +456,7 @@ impl MessageContext {
 
     /// Retrieve the group invite link code.
     pub async fn group_invite_code(&self) -> Result<String, crate::features::GroupError> {
-        self.client.groups().get_invite_link(&self.info.source.chat).await
+        self.client.groups().get_invite_link(&self.info.source.chat, false).await
     }
 
     /// Send a location pin message.

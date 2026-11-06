@@ -35,7 +35,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use crate::bot::MessageContext;
-use wacore_binary::Jid;
+use wacore_binary::{Jid, JidExt};
 
 pub type RouterResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -234,7 +234,7 @@ impl CommandContext {
 
     /// Sender phone number string (without server suffix).
     pub fn sender_phone(&self) -> &str {
-        self.ctx.sender().user()
+        &self.ctx.sender().user
     }
 
     /// Chat JID (DM peer, group, or newsletter).

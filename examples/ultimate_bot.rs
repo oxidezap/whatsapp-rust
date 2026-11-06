@@ -158,7 +158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let admins: Vec<_> = meta.participants.iter().filter(|p| p.is_admin()).collect();
         let mut msg = format!("🛡️ *Daftar Admin Grup ({})*:\n\n", admins.len());
         for (i, adm) in admins.iter().enumerate() {
-            msg.push_str(&format!("{}. @{}\n", i + 1, adm.jid.user()));
+            msg.push_str(&format!("{}. @{}\n", i + 1, adm.jid.user));
         }
         let admin_jids: Vec<_> = admins.iter().map(|p| p.jid.clone()).collect();
         cmd.reply_with_mentions(msg, &admin_jids).await?;
