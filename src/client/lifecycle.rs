@@ -1390,10 +1390,12 @@ impl Client {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.connection_owner() == owner
-                && self.session_state.status.fetch_and(
-                    !SessionState::PRIMARY_APP_STATE_FAILURE,
-                    Ordering::Relaxed,
-                ) & SessionState::PRIMARY_APP_STATE_FAILURE != 0
+                && self
+                    .session_state
+                    .status
+                    .fetch_and(!SessionState::PRIMARY_APP_STATE_FAILURE, Ordering::Relaxed)
+                    & SessionState::PRIMARY_APP_STATE_FAILURE
+                    != 0
         };
         #[cfg(not(feature = "mobile-core"))]
         let primary_app_state_failure = false;

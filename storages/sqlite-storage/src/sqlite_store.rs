@@ -393,9 +393,8 @@ fn serialize_keypair(key_pair: &KeyPair) -> Result<Vec<u8>> {
 /// Decode persisted role data through the credential-redacted error boundary.
 #[inline(never)]
 fn decode_mobile_binding(bytes: &[u8]) -> Result<Arc<wacore::store::MobileSessionBinding>> {
-    serde_json::from_slice(bytes).map_err(|_| {
-        StoreError::Validation("invalid persisted mobile session binding".into())
-    })
+    serde_json::from_slice(bytes)
+        .map_err(|_| StoreError::Validation("invalid persisted mobile session binding".into()))
 }
 
 /// Max ids per `eq_any` list, under SQLite's default 999 host-parameter limit.
@@ -2266,11 +2265,10 @@ impl SqliteStore {
                     StoreError::Validation("Invalid signed_pre_key_signature length".to_string())
                 })?;
 
-            let adv_secret_key: [u8; 32] = row
-                .adv_secret_key
-                .as_slice()
-                .try_into()
-                .map_err(|_| StoreError::Validation("Invalid adv_secret_key length".to_string()))?;
+            let adv_secret_key: [u8; 32] =
+                row.adv_secret_key.as_slice().try_into().map_err(|_| {
+                    StoreError::Validation("Invalid adv_secret_key length".to_string())
+                })?;
 
             let account = row
                 .account
@@ -8089,7 +8087,11 @@ mod tests {
                     },
                 );
             }
-            let pn = source.pn.as_ref().map(ToString::to_string).unwrap_or_default();
+            let pn = source
+                .pn
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default();
             let mut row = FreshDeviceRow::from_device(Some(id), source).unwrap();
             row.pn = pn;
             row.insert(&mut conn).unwrap();

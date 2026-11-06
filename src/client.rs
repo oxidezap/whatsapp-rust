@@ -1869,10 +1869,9 @@ mod session_state_status_tests {
     #[test]
     fn reconnect_policy_toggle_preserves_pending_primary_failure() {
         let state = SessionState::new(true);
-        state.status.fetch_or(
-            SessionState::PRIMARY_APP_STATE_FAILURE,
-            Ordering::Relaxed,
-        );
+        state
+            .status
+            .fetch_or(SessionState::PRIMARY_APP_STATE_FAILURE, Ordering::Relaxed);
         assert!(state.swap(false, Ordering::AcqRel));
         assert!(!state.swap(true, Ordering::AcqRel));
         assert_ne!(

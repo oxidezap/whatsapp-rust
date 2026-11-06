@@ -512,7 +512,10 @@ mod tests {
     fn local_primary_initialization_failure_is_reported_as_retryable_failure() {
         let reason = DisconnectReason::PrimaryAppStateInitializationFailed;
         assert!(!reason.is_clean_shutdown());
-        assert_eq!(reason.to_string(), "primary app-state initialization failed");
+        assert_eq!(
+            reason.to_string(),
+            "primary app-state initialization failed"
+        );
         assert_eq!(
             serde_json::to_string(&reason).unwrap(),
             "\"primary_app_state_initialization_failed\""
