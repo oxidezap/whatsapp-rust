@@ -2975,7 +2975,7 @@ mod tests {
                         let owned =
                             wacore_binary::OwnedNodeRef::new(unpacked.into_owned()).unwrap();
                         let node = owned.get();
-                        if node.tag() != "iq" {
+                        if node.tag.as_ref() != StanzaTag::Iq.as_str() {
                             continue;
                         }
                         if node.attrs().optional_string("xmlns").as_deref()
