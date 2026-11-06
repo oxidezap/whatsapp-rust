@@ -50,8 +50,6 @@ const MAX_BINDING_FIELD_BYTES: usize = 65536;
 
 /// Decode into protected storage so malformed later fields also clear earlier
 /// credentials. Enforce bounds before allocation or each sequence append.
-// Share decoding and failure cleanup between direct and optional credential fields.
-#[inline(never)]
 fn deserialize_secret_bytes<'de, D>(
     deserializer: D,
 ) -> std::result::Result<zeroize::Zeroizing<Vec<u8>>, D::Error>
@@ -92,7 +90,6 @@ where
     deserializer.deserialize_seq(SecretBytes)
 }
 
-#[inline(never)]
 fn deserialize_optional_secret_bytes<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Option<zeroize::Zeroizing<Vec<u8>>>, D::Error>

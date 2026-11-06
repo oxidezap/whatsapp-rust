@@ -314,6 +314,18 @@ const ACCOUNT_SCOPED_TABLES: &[&str] = &[
     "tc_tokens",
 ];
 
+/// Check the indexed account ID without materializing credential BLOBs.
+fn device_row_exists(conn: &mut SqliteConnection, device_id: i32) -> Result<bool> {
+    use crate::schema::device;
+
+    let count: i64 = device::table
+        .filter(device::id.eq(device_id))
+        .count()
+        .get_result(conn)
+        .map_err(|e| StoreError::Database(Box::new(e)))?;
+    Ok(count > 0)
+}
+
 /// `last_insert_rowid()` on the connection that just inserted, which is why the
 /// insert and this read share one `write_blocking`/`with_retry` closure: the
 /// value is per-connection state, not per-database.
@@ -2199,18 +2211,8 @@ impl SqliteStore {
     }
 
     pub(crate) async fn device_exists_impl(&self, device_id: i32) -> Result<bool> {
-        use crate::schema::device;
-
-        self.read_query(move |conn| {
-            let count: i64 = device::table
-                .filter(device::id.eq(device_id))
-                .count()
-                .get_result(conn)
-                .map_err(|e| StoreError::Database(Box::new(e)))?;
-
-            Ok(count > 0)
-        })
-        .await
+        self.read_query(move |conn| device_row_exists(conn, device_id))
+            .await
     }
 
     async fn load_device_data_for_device(&self, device_id: i32) -> Result<Option<CoreDevice>> {
@@ -2231,17 +2233,10 @@ impl SqliteStore {
                     .first::<DeviceRow>(conn)
                     .optional()
                     .map_err(|e| StoreError::Database(Box::new(e)))?;
-                if result.is_none() {
-                    let exists = diesel::select(diesel::dsl::exists(
-                        device::table.filter(device::id.eq(device_id)),
-                    ))
-                    .get_result::<bool>(conn)
-                    .map_err(|e| StoreError::Database(Box::new(e)))?;
-                    if exists {
-                        return Err(StoreError::Validation(
-                            "oversized mobile session binding".into(),
-                        ));
-                    }
+                if result.is_none() && device_row_exists(conn, device_id)? {
+                    return Err(StoreError::Validation(
+                        "oversized mobile session binding".into(),
+                    ));
                 }
                 Ok(result)
             })
