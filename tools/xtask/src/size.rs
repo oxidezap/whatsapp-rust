@@ -382,6 +382,13 @@ fn delta(n: i64, base: i64, unit: &str) -> String {
     }
     s
 }
+fn with_exact_bytes(display: String, n: i64, unit: &str) -> String {
+    if unit == "bytes" {
+        format!("{display} [{n} B]")
+    } else {
+        display
+    }
+}
 fn metrics(directory: &Path) -> Result<Vec<Metric>> {
     Ok(serde_json::from_value(read_json(
         &directory.join("size-metrics.json"),
@@ -533,12 +540,16 @@ fn render(
                 format!(
                     "| {} | {} | {} | {}{icon} |",
                     m.name,
-                    value(b.value, &m.unit),
-                    value(m.value, &m.unit),
-                    delta(d, b.value, &m.unit)
+                    with_exact_bytes(value(b.value, &m.unit), b.value, &m.unit),
+                    with_exact_bytes(value(m.value, &m.unit), m.value, &m.unit),
+                    with_exact_bytes(delta(d, b.value, &m.unit), d, &m.unit)
                 )
             } else {
-                format!("| {} | (new) | {} | |", m.name, value(m.value, &m.unit))
+                format!(
+                    "| {} | (new) | {} | |",
+                    m.name,
+                    with_exact_bytes(value(m.value, &m.unit), m.value, &m.unit)
+                )
             };
             if m.name.starts_with(".text ") {
                 crate_rows.push(row);
@@ -1149,6 +1160,30 @@ mod tests {
         head[1].value += 1;
         assert_eq!(render(&head, Some(&base), false).unwrap().2, "FAIL");
     }
+    #[test]
+    fn report_exposes_exact_bytes_without_changing_the_budget() {
+        let base = vec![
+            metric("bin size (stripped)", "bytes", 12100016),
+            metric("bin .text", "bytes", 9797091),
+        ];
+        let head = vec![
+            metric("bin size (stripped)", "bytes", 12142928),
+            metric("bin .text", "bytes", 9830627),
+        ];
+        let (lines, _, status) = render(&head, Some(&base), false).unwrap();
+        let report = lines.join("\n");
+        assert!(report.contains("9.34 MiB [9797091 B]"));
+        assert!(report.contains("9.38 MiB [9830627 B]"));
+        assert!(report.contains("+32.75 KiB (+0.34%) [33536 B]"));
+        assert_eq!(status, "FAIL");
+        assert_eq!(with_exact_bytes("12".into(), 12, "count"), "12");
+        assert_eq!(with_exact_bytes("0".into(), 0, "bytes"), "0 [0 B]");
+        assert_eq!(
+            with_exact_bytes("-1.00 KiB".into(), -1024, "bytes"),
+            "-1.00 KiB [-1024 B]"
+        );
+    }
+
     #[test]
     fn parses_tool_outputs_and_refuses_missing_measurements() {
         assert_eq!(
