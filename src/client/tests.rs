@@ -4046,7 +4046,7 @@ async fn held_group_distribution_lane_survives_capacity_pressure() {
 
 #[tokio::test]
 async fn active_chat_lane_survives_capacity_pressure() {
-    fn test_lane() -> (ChatLane, async_channel::Receiver<QueuedChatMessage>) {
+    fn test_lane() -> (ChatLane, async_channel::Receiver<Box<QueuedChatMessage>>) {
         let (queue_tx, queue_rx) = async_channel::unbounded();
         (
             ChatLane {
@@ -9327,7 +9327,7 @@ async fn reconnect_success_publishes_connected_while_prekey_upload_is_blocked() 
 fn detached_chat_lane(
     client: &Arc<Client>,
     items: usize,
-) -> (ChatLane, async_channel::Receiver<QueuedChatMessage>) {
+) -> (ChatLane, async_channel::Receiver<Box<QueuedChatMessage>>) {
     let (queue_tx, queue_rx) = async_channel::bounded(items);
     (
         ChatLane {
