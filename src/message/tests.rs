@@ -14937,17 +14937,11 @@ async fn non_broadcast_status_stanza_gets_plain_ack_without_becoming_a_message()
         client
             .process_node(crate::test_utils::node_to_owned_ref(&status.build()))
             .await;
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if let Some(frame) = transport.sent().first().cloned() {
-                    break frame;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("a contact status must get an acknowledgement");
-        let bytes = decode_frame(0, &frame).expect("ack frame should decrypt");
+        crate::test_utils::wait_for_outbound_tasks(&client).await;
+        let frames = transport.sent();
+        assert_eq!(frames.len(), 1, "exactly one acknowledgement");
+        let frame = &frames[0];
+        let bytes = decode_frame(0, frame).expect("ack frame should decrypt");
         let ack = wacore_binary::marshal::unmarshal_packed_ref(&bytes).unwrap();
         assert_eq!(ack.tag.as_ref(), "ack");
         assert_eq!(
@@ -14970,10 +14964,6 @@ async fn non_broadcast_status_stanza_gets_plain_ack_without_becoming_a_message()
         assert!(
             ack.get_attr("error").is_none(),
             "status acknowledgement must not be a NACK"
-        );
-        assert!(
-            !extra_frame_appears(&transport, 1).await,
-            "exactly one acknowledgement"
         );
         assert_eq!(
             client.chat_lanes.entry_count(),
@@ -15009,8 +14999,10 @@ async fn status_stanza_without_addressing_is_not_acked() {
             .process_node(crate::test_utils::node_to_owned_ref(&node))
             .await;
     }
-    assert!(
-        !extra_frame_appears(&transport, 0).await,
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    assert_eq!(
+        transport.sent_count(),
+        0,
         "status ACKs need both id and from"
     );
 }
