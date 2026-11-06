@@ -13,6 +13,21 @@ use wacore_binary::Jid;
 /// turns one send into an unbounded request loop.
 const DEVICE_REFRESH_MAX_ATTEMPTS: usize = 3;
 
+/// A failed list never authorizes replacing the account's trusted identity.
+#[derive(thiserror::Error)]
+#[error("device list ADV signature verification failed for {user}")]
+struct DeviceListAdvError {
+    user: Jid,
+    response_users: Vec<Jid>,
+}
+
+impl std::fmt::Debug for DeviceListAdvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Report the failed identity, without dumping the rest of the batch.
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DeviceListApplyMode {
     CachePreferred,
@@ -187,6 +202,34 @@ impl Client {
     }
 
     async fn fetch_user_devices_with_freshness(
+        &self,
+        jids: Vec<Jid>,
+        freshness: crate::cache::Freshness,
+    ) -> Result<Vec<Jid>, anyhow::Error> {
+        match self.fetch_user_devices_once(jids, freshness).await {
+            Ok(devices) => Ok(devices),
+            Err(error) => {
+                let failure = error.downcast::<DeviceListAdvError>()?;
+                let user = failure.user.into_non_ad();
+                // Retry resolution, before encryption or publication, rather than
+                // replaying a send. Keep Signal trust and unrelated registries.
+                self.invalidate_device_cache(&user.user).await;
+                let refreshed = self
+                    .fetch_user_devices_once(vec![user.clone()], crate::cache::Freshness::Refresh)
+                    .await
+                    .map_err(|error| {
+                        error.context(format!("ADV device-list refresh for {user}"))
+                    })?;
+                if failure.response_users.len() == 1 {
+                    return Ok(refreshed);
+                }
+                self.fetch_user_devices_once(failure.response_users, freshness)
+                    .await
+            }
+        }
+    }
+
+    async fn fetch_user_devices_once(
         &self,
         mut jids: Vec<Jid>,
         freshness: crate::cache::Freshness,
@@ -397,7 +440,18 @@ impl Client {
                     if mode == DeviceListApplyMode::GroupRefresh {
                         continue;
                     }
-                    anyhow::bail!("device list ADV signature verification failed");
+                    return Err(DeviceListAdvError {
+                        user: user_list.user.clone(),
+                        // Only the failure path retains a retry vector. Omitted
+                        // users contribute no devices to the original result;
+                        // strict refreshes already require complete responses.
+                        response_users: response
+                            .device_lists
+                            .iter()
+                            .map(|list| list.user.clone())
+                            .collect(),
+                    }
+                    .into());
                 }
                 decoded
             } else {
@@ -782,6 +836,247 @@ mod tests {
             .has_session(address, &*snapshot.backend)
             .await
             .unwrap()
+    }
+
+    fn adv_wire_response(user: &Jid, signature: Vec<u8>) -> wacore_binary::Node {
+        use wacore_binary::builder::NodeBuilder;
+        NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("usync")
+                .children([NodeBuilder::new("list")
+                    .children([NodeBuilder::new("user")
+                        .attr("jid", user.to_string())
+                        .children([NodeBuilder::new("devices")
+                            .children([
+                                NodeBuilder::new("device-list")
+                                    .children([
+                                        NodeBuilder::new("device").attr("id", "0").build(),
+                                        NodeBuilder::new("device")
+                                            .attr("id", "2")
+                                            .attr("key-index", "1")
+                                            .build(),
+                                    ])
+                                    .build(),
+                                NodeBuilder::new("key-index-list")
+                                    .attr("ts", "1700000000")
+                                    .bytes(signature)
+                                    .build(),
+                            ])
+                            .build()])
+                        .build()])
+                    .build()])
+                .build()])
+            .build()
+    }
+
+    #[tokio::test]
+    async fn adv_failure_refreshes_only_the_affected_user_once() {
+        use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq};
+        // Exercise both ordinary resolution and authoritative refresh. A failed
+        // refresh must never restart recovery recursively or replace Signal trust.
+        for freshness in [Freshness::CachePreferred, Freshness::Refresh] {
+            for recover in [true, false] {
+                let (client, transport) = create_iq_test_client().await;
+                let user = Jid::pn("12025550130");
+                let other = Jid::pn("12025550131");
+                crate::test_utils::seed_adv_primary(&client, &user).await;
+                let trusted = client.cached_adv_account_identity(&user).await.unwrap();
+                for jid in [&user, &other] {
+                    client
+                        .update_device_list(DeviceListRecord {
+                            user: jid.user.as_str().into(),
+                            devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(1))].into(),
+                            timestamp: 1,
+                            phash: None,
+                            raw_id: Some(1),
+                        })
+                        .await
+                        .unwrap();
+                }
+                let session = seed_fresh_session(&client, &user.with_device(7)).await;
+                let operation = {
+                    let client = client.clone();
+                    let user = user.clone();
+                    tokio::spawn(async move {
+                        client
+                            .fetch_user_devices_with_freshness(vec![user], freshness)
+                            .await
+                    })
+                };
+                let first = decode_sent_iq(&transport, 0).await;
+                let id = first
+                    .get()
+                    .attrs()
+                    .optional_string("id")
+                    .unwrap()
+                    .into_owned();
+                answer_iq(&client, &id, &adv_wire_response(&user, vec![0xff])).await;
+                let retry = decode_sent_iq(&transport, 1).await;
+                let node = retry.get();
+                let requested = node
+                    .get_optional_child("usync")
+                    .unwrap()
+                    .get_optional_child("list")
+                    .unwrap();
+                let requested = requested.children().unwrap();
+                assert_eq!(requested.len(), 1);
+                assert_eq!(requested[0].attrs().jid("jid"), user);
+                // Invalidation must be durable and scoped. Neither existing
+                // sessions nor the primary identity are discarded by bad input.
+                assert!(client.load_device_record_for_jid(&user).await.is_none());
+                assert!(client.load_device_record_for_jid(&other).await.is_some());
+                assert!(has_session(&client, &session).await);
+                let id = node.attrs().optional_string("id").unwrap().into_owned();
+                let signature = if recover {
+                    signed_key_index_bytes(vec![1], 1)
+                } else {
+                    vec![0xff]
+                };
+                answer_iq(&client, &id, &adv_wire_response(&user, signature)).await;
+                let result = operation.await.unwrap();
+                if recover {
+                    assert_eq!(result.unwrap(), vec![user.clone(), user.with_device(2)]);
+                } else {
+                    let error = result.unwrap_err();
+                    assert!(error.downcast_ref::<DeviceListAdvError>().is_some());
+                    assert!(format!("{error:#}").contains(&user.to_string()));
+                    assert!(client.load_device_record_for_jid(&user).await.is_none());
+                }
+                assert_eq!(transport.sent().len(), 2, "recovery must be bounded");
+                assert_eq!(
+                    client.cached_adv_account_identity(&user).await.unwrap(),
+                    trusted
+                );
+                assert!(client.load_device_record_for_jid(&other).await.is_some());
+                client.signal_shutdown_sync();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn adv_recovery_rebuilds_the_full_batch_without_invalidating_other_users() {
+        use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq};
+        use wacore_binary::builder::NodeBuilder;
+        let (client, transport) = create_iq_test_client().await;
+        let users = [Jid::pn("12025550132"), Jid::pn("12025550133")];
+        for user in &users {
+            crate::test_utils::seed_adv_primary(&client, user).await;
+            client
+                .update_device_list(DeviceListRecord {
+                    user: user.user.as_str().into(),
+                    devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(1))].into(),
+                    timestamp: 1,
+                    phash: None,
+                    raw_id: Some(1),
+                })
+                .await
+                .unwrap();
+        }
+        let batch_response = |bad| {
+            let responses = [
+                adv_wire_response(
+                    &users[0],
+                    if bad {
+                        vec![0xff]
+                    } else {
+                        signed_key_index_bytes(vec![1], 1)
+                    },
+                ),
+                adv_wire_response(&users[1], signed_key_index_bytes(vec![1], 1)),
+            ];
+            NodeBuilder::new("iq")
+                .attr("type", "result")
+                .children([NodeBuilder::new("usync")
+                    .children([NodeBuilder::new("list")
+                        .children(responses.iter().map(|response| {
+                            response
+                                .get_optional_child("usync")
+                                .unwrap()
+                                .get_optional_child("list")
+                                .unwrap()
+                                .get_optional_child("user")
+                                .unwrap()
+                                .clone()
+                        }))
+                        .build()])
+                    .build()])
+                .build()
+        };
+        let operation = {
+            let client = client.clone();
+            let users = users.to_vec();
+            tokio::spawn(async move { client.refresh_user_devices(users).await })
+        };
+        for frame in 0..3 {
+            let query = decode_sent_iq(&transport, frame).await;
+            let node = query.get();
+            let list = node
+                .get_optional_child("usync")
+                .unwrap()
+                .get_optional_child("list")
+                .unwrap();
+            assert_eq!(
+                list.children().unwrap().len(),
+                if frame == 1 { 1 } else { 2 }
+            );
+            let response = if frame == 1 {
+                assert!(client.load_device_record_for_jid(&users[0]).await.is_none());
+                let other = client.load_device_record_for_jid(&users[1]).await.unwrap();
+                assert_eq!(other.devices[1].device_id(), 7);
+                adv_wire_response(&users[0], signed_key_index_bytes(vec![1], 1))
+            } else {
+                batch_response(frame == 0)
+            };
+            let id = node.attrs().optional_string("id").unwrap().into_owned();
+            answer_iq(&client, &id, &response).await;
+        }
+        let devices = operation.await.unwrap().unwrap();
+        for user in users {
+            assert!(devices.contains(&user));
+            assert!(devices.contains(&user.with_device(2)));
+        }
+        assert_eq!(devices.len(), 4);
+        assert_eq!(transport.sent().len(), 3);
+        client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn ordinary_iq_failure_does_not_invalidate_devices_or_retry() {
+        use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq};
+        use wacore_binary::builder::NodeBuilder;
+        let (client, transport) = create_iq_test_client().await;
+        let user = Jid::pn("12025550134");
+        client
+            .update_device_list(DeviceListRecord {
+                user: user.user.as_str().into(),
+                devices: [DeviceInfo::new(0, None)].into(),
+                timestamp: 1,
+                phash: None,
+                raw_id: Some(1),
+            })
+            .await
+            .unwrap();
+        let operation = {
+            let client = client.clone();
+            let user = user.clone();
+            tokio::spawn(async move { client.refresh_user_devices(vec![user]).await })
+        };
+        let query = decode_sent_iq(&transport, 0).await;
+        let id = query
+            .get()
+            .attrs()
+            .optional_string("id")
+            .unwrap()
+            .into_owned();
+        let error = NodeBuilder::new("iq")
+            .attr("type", "error")
+            .children([NodeBuilder::new("error").attr("code", "500").build()])
+            .build();
+        answer_iq(&client, &id, &error).await;
+        assert!(operation.await.unwrap().is_err());
+        assert_eq!(transport.sent().len(), 1);
+        assert!(client.load_device_record_for_jid(&user).await.is_some());
+        client.signal_shutdown_sync();
     }
 
     #[tokio::test]
