@@ -1118,130 +1118,151 @@ impl Client {
         device: &wacore::stanza::devices::DeviceElement,
         key_index_info: Option<&wacore::stanza::devices::KeyIndexInfo>,
     ) -> bool {
-        // The notification carries the id as a `u32`; a registry device id is
-        // a `u16`, as it is on the wire, so anything wider names a device that
-        // cannot exist rather than one to add.
-        let Ok(device_id) = u16::try_from(device.device_id()) else {
-            warn!(
-                "patch_device_add: device_id {} exceeds u16 — ignoring",
-                device.device_id()
-            );
-            return true;
-        };
-        let is_hosted = wacore_binary::JidExt::is_hosted(&device.jid);
+        self.patch_device_add_inner(user, device, key_index_info)
+            .await
+    }
 
-        // Device notifications run off the socket read loop. Enter before
-        // the registry and persist retirement before publishing a new raw_id.
-        let Some(client) = self.self_weak.get().and_then(|weak| weak.upgrade()) else {
-            warn!("patch_device_add: client ownership unavailable");
-            return false;
-        };
-        let maintenance = match client.begin_signal_maintenance().await {
-            Ok(maintenance) => maintenance,
-            Err(error) => {
-                warn!("patch_device_add: cannot enter Signal maintenance: {error}");
-                return false;
-            }
-        };
-        let guard = self.device_topology.lock_registry().await;
-
-        let Some(mut record) = self.load_device_record(user).await else {
-            return true;
-        };
-
-        let signed_bytes = key_index_info.and_then(|ki| ki.signed_bytes.as_deref());
-
-        let Some(bytes) = signed_bytes else {
-            return true;
-        };
-        let Ok(Some(identity)) = self.cached_adv_account_identity(&device.jid).await else {
-            return true;
-        };
-        if let Some(decoded) = wacore::adv::verify_key_index_list(bytes, &identity) {
-            // Clear tracking before pruning, including an ID re-added by
-            // this same notification with a different key index.
-            let identity_changed = record.raw_id.is_some_and(|raw_id| raw_id != decoded.raw_id);
-            for previous in &record.devices {
-                if previous.device_id() != 0
-                    && (identity_changed
-                        || !wacore::adv::is_key_index_valid(previous.key_index(), &decoded))
-                    && let Err(error) = self
-                        .delete_sender_key_rows_for_device(user, previous.device_id())
-                        .await
-                {
-                    warn!(
-                        "patch_device_add: sender-key cleanup failed for {}: {error}",
-                        wacore_binary::jid::ObservedJid::from(user)
-                    );
-                    return false;
-                }
-            }
-            // Check raw_id mismatch (identity change)
-            // TODO: WA Web also triggers clearRecord on advAccountType change
-            // (HOSTED ↔ E2EE), gated behind bizCoexGatingUtils.bizHostedDevicesEnabled().
-            // Add when we implement hosted device coexistence support.
-            if let Some(stored_raw_id) = record.raw_id
-                && stored_raw_id != decoded.raw_id
-            {
-                info!(
-                    "raw_id mismatch for user {}: stored={stored_raw_id}, received={}. Resetting companion devices.",
-                    wacore_binary::jid::ObservedJid::from(user),
-                    decoded.raw_id
+    // Keep the notification dispatcher from embedding the maintenance scope's
+    // complete state and cancellation/drop paths in its add/remove branches.
+    #[inline(never)]
+    fn patch_device_add_inner<'a>(
+        &'a self,
+        user: &'a str,
+        device: &'a wacore::stanza::devices::DeviceElement,
+        key_index_info: Option<&'a wacore::stanza::devices::KeyIndexInfo>,
+    ) -> wacore::runtime::BoxFuture<'a, bool> {
+        Box::pin(async move {
+            // The notification carries the id as a `u32`; a registry device id is
+            // a `u16`, as it is on the wire, so anything wider names a device that
+            // cannot exist rather than one to add.
+            let Ok(device_id) = u16::try_from(device.device_id()) else {
+                warn!(
+                    "patch_device_add: device_id {} exceeds u16 — ignoring",
+                    device.device_id()
                 );
-                if let Err(error) = maintenance.clear_device_record(user, &record).await {
-                    warn!("patch_device_add: cannot persist session retirement: {error}");
+                return true;
+            };
+            let is_hosted = wacore_binary::JidExt::is_hosted(&device.jid);
+
+            // Device notifications run off the socket read loop. Enter before
+            // the registry and persist retirement before publishing a new raw_id.
+            let Some(client) = self.self_weak.get().and_then(|weak| weak.upgrade()) else {
+                warn!("patch_device_add: client ownership unavailable");
+                return false;
+            };
+            let maintenance = match client.begin_signal_maintenance().await {
+                Ok(maintenance) => maintenance,
+                Err(error) => {
+                    warn!("patch_device_add: cannot enter Signal maintenance: {error}");
                     return false;
                 }
-                record.edit_devices(|devices| devices.retain(|device| device.device_id() == 0));
+            };
+            let guard = self.device_topology.lock_registry().await;
+
+            let Some(mut record) = self.load_device_record(user).await else {
+                return true;
+            };
+
+            let signed_bytes = key_index_info.and_then(|ki| ki.signed_bytes.as_deref());
+
+            let Some(bytes) = signed_bytes else {
+                return true;
+            };
+            let Ok(Some(identity)) = self.cached_adv_account_identity(&device.jid).await else {
+                return true;
+            };
+            if let Some(decoded) = wacore::adv::verify_key_index_list(bytes, &identity) {
+                // Clear tracking before pruning, including an ID re-added by
+                // this same notification with a different key index.
+                let identity_changed = record.raw_id.is_some_and(|raw_id| raw_id != decoded.raw_id);
+                for previous in &record.devices {
+                    if previous.device_id() != 0
+                        && (identity_changed
+                            || !wacore::adv::is_key_index_valid(previous.key_index(), &decoded))
+                        && let Err(error) = self
+                            .delete_sender_key_rows_for_device(user, previous.device_id())
+                            .await
+                    {
+                        warn!(
+                            "patch_device_add: sender-key cleanup failed for {}: {error}",
+                            wacore_binary::jid::ObservedJid::from(user)
+                        );
+                        return false;
+                    }
+                }
+                // Check raw_id mismatch (identity change)
+                // TODO: WA Web also triggers clearRecord on advAccountType change
+                // (HOSTED ↔ E2EE), gated behind bizCoexGatingUtils.bizHostedDevicesEnabled().
+                // Add when we implement hosted device coexistence support.
+                if let Some(stored_raw_id) = record.raw_id
+                    && stored_raw_id != decoded.raw_id
+                {
+                    info!(
+                        "raw_id mismatch for user {}: stored={stored_raw_id}, received={}. Resetting companion devices.",
+                        wacore_binary::jid::ObservedJid::from(user),
+                        decoded.raw_id
+                    );
+                    if let Err(error) = maintenance.clear_device_record(user, &record).await {
+                        warn!("patch_device_add: cannot persist session retirement: {error}");
+                        return false;
+                    }
+                    record.edit_devices(|devices| devices.retain(|device| device.device_id() == 0));
+                } else {
+                    // Filter stale devices by valid_indexes. A raw_id reset already
+                    // removed every companion while preserving primary metadata.
+                    record.edit_devices(|devices| {
+                        wacore::adv::retain_devices_by_key_index(devices, &decoded)
+                    });
+                }
+                record.raw_id = Some(decoded.raw_id);
+
+                // Only trust notification metadata when its key index is accepted.
+                if device.key_index.is_some_and(|index| {
+                    decoded.valid_indexes.contains(&index)
+                        || index > decoded.current_index
+                            && record.devices.iter().any(|previous| {
+                                previous.device_id() == device_id
+                                    && previous.key_index() == Some(index)
+                            })
+                }) {
+                    self.append_or_refresh_device(
+                        &mut record,
+                        device_id,
+                        device.key_index,
+                        is_hosted,
+                    );
+                }
             } else {
-                // Filter stale devices by valid_indexes. A raw_id reset already
-                // removed every companion while preserving primary metadata.
+                warn!("patch_device_add: invalid key-index-list signature");
+                return true;
+            }
+
+            // WA Web `AdvDeviceNotificationApi.handleDeviceAddNotification` re-adds the
+            // primary (device 0) to the rebuilt list unconditionally. Preserve an
+            // existing primary and its metadata across a raw_id reset; restore a
+            // neutral entry only when the input record did not contain one.
+            //
+            // The primary's key_index is never read (`filter_devices_by_key_index` keeps
+            // device 0 regardless and `is_key_index_valid` is not applied to it), so store
+            // `None` to match how device 0 is recorded everywhere else. Hosting belongs
+            // to each device-list entry, so the companion notification cannot classify
+            // the primary.
+            if !record.devices.iter().any(|d| d.device_id() == 0) {
                 record.edit_devices(|devices| {
-                    wacore::adv::retain_devices_by_key_index(devices, &decoded)
+                    devices.push(wacore::store::traits::DeviceInfo::new(0, None))
                 });
             }
-            record.raw_id = Some(decoded.raw_id);
 
-            // Only trust notification metadata when its key index is accepted.
-            if device.key_index.is_some_and(|index| {
-                decoded.valid_indexes.contains(&index)
-                    || index > decoded.current_index
-                        && record.devices.iter().any(|previous| {
-                            previous.device_id() == device_id && previous.key_index() == Some(index)
-                        })
-            }) {
-                self.append_or_refresh_device(&mut record, device_id, device.key_index, is_hosted);
+            if let Err(error) = maintenance.ensure_current() {
+                warn!("patch_device_add: retired processing scope: {error}");
+                return false;
             }
-        } else {
-            warn!("patch_device_add: invalid key-index-list signature");
-            return true;
-        }
-
-        // WA Web `AdvDeviceNotificationApi.handleDeviceAddNotification` re-adds the
-        // primary (device 0) to the rebuilt list unconditionally. Preserve an
-        // existing primary and its metadata across a raw_id reset; restore a
-        // neutral entry only when the input record did not contain one.
-        //
-        // The primary's key_index is never read (`filter_devices_by_key_index` keeps
-        // device 0 regardless and `is_key_index_valid` is not applied to it), so store
-        // `None` to match how device 0 is recorded everywhere else. Hosting belongs
-        // to each device-list entry, so the companion notification cannot classify
-        // the primary.
-        if !record.devices.iter().any(|d| d.device_id() == 0) {
-            record.edit_devices(|devices| {
-                devices.push(wacore::store::traits::DeviceInfo::new(0, None))
-            });
-        }
-
-        if let Err(error) = maintenance.ensure_current() {
-            warn!("patch_device_add: retired processing scope: {error}");
-            return false;
-        }
-        if let Err(e) = self.update_device_list_guarded(record, &guard).await {
-            warn!("patch_device_add: failed to persist: {e}");
-            return false;
-        }
-        true
+            if let Err(e) = self.update_device_list_guarded(record, &guard).await {
+                warn!("patch_device_add: failed to persist: {e}");
+                return false;
+            }
+            true
+        })
     }
 
     /// Append a new device or refresh the addressing metadata of an existing one.
@@ -1352,68 +1373,79 @@ impl Client {
     /// redistributed on the next group send.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.patch_device_remove", level = "debug", skip_all, fields(device_id = device_id)))]
     pub(crate) async fn patch_device_remove(&self, user: &str, device_id: u32) -> bool {
-        // WA Web's remove path re-adds the primary unconditionally, mirroring its
-        // add path: device 0 is never dropped. Without this guard a remove for the
-        // primary would both delete its sender-key rows and persist a record with no
-        // device 0, which then suppresses the usync re-fetch forever (the symmetric
-        // failure to the add path fixed above).
-        if device_id == 0 {
-            return true;
-        }
-        // A registry device id is a `u16`, as it is on the wire and as the
-        // JID-keyed structures (Signal sessions, sender_key_devices) store it,
-        // so a wider id names no device the registry could be holding. This
-        // used to remove it from the record and then skip the session cleanup;
-        // there is now nothing to remove.
-        let Ok(device_id) = u16::try_from(device_id) else {
-            warn!("patch_device_remove: device_id {device_id} > u16::MAX — nothing to remove");
-            return true;
-        };
-        let Some(client) = self.self_weak.get().and_then(|weak| weak.upgrade()) else {
-            warn!("patch_device_remove: client ownership unavailable");
-            return false;
-        };
-        let maintenance = match client.begin_signal_maintenance().await {
-            Ok(maintenance) => maintenance,
-            Err(error) => {
-                warn!("patch_device_remove: cannot enter Signal maintenance: {error}");
+        self.patch_device_remove_inner(user, device_id).await
+    }
+
+    #[inline(never)]
+    fn patch_device_remove_inner<'a>(
+        &'a self,
+        user: &'a str,
+        device_id: u32,
+    ) -> wacore::runtime::BoxFuture<'a, bool> {
+        Box::pin(async move {
+            // WA Web's remove path re-adds the primary unconditionally, mirroring its
+            // add path: device 0 is never dropped. Without this guard a remove for the
+            // primary would both delete its sender-key rows and persist a record with no
+            // device 0, which then suppresses the usync re-fetch forever (the symmetric
+            // failure to the add path fixed above).
+            if device_id == 0 {
+                return true;
+            }
+            // A registry device id is a `u16`, as it is on the wire and as the
+            // JID-keyed structures (Signal sessions, sender_key_devices) store it,
+            // so a wider id names no device the registry could be holding. This
+            // used to remove it from the record and then skip the session cleanup;
+            // there is now nothing to remove.
+            let Ok(device_id) = u16::try_from(device_id) else {
+                warn!("patch_device_remove: device_id {device_id} > u16::MAX — nothing to remove");
+                return true;
+            };
+            let Some(client) = self.self_weak.get().and_then(|weak| weak.upgrade()) else {
+                warn!("patch_device_remove: client ownership unavailable");
                 return false;
-            }
-        };
-        let guard = self.device_topology.lock_registry().await;
-        if let Some(mut record) = self.load_device_record(user).await {
-            let before = record.devices.len();
-            record.edit_devices(|devices| devices.retain(|d| d.device_id() != device_id));
-            if record.devices.len() != before {
-                // WA Web's `updateGroupParticipantsInTransaction` deletes the
-                // device JID from each affected group's senderKey Map. Skip
-                // the registry update on failure: a half-applied state where
-                // `resolve_devices` says "gone" but the tracker still vouches
-                // `has_key=true` would silently skip SKDM redistribution.
-                if let Err(e) = self
-                    .delete_sender_key_rows_for_device(user, device_id)
-                    .await
-                {
-                    warn!(
-                        "patch_device_remove: sender-key cleanup failed for {user}:{device_id}: {e} \
+            };
+            let maintenance = match client.begin_signal_maintenance().await {
+                Ok(maintenance) => maintenance,
+                Err(error) => {
+                    warn!("patch_device_remove: cannot enter Signal maintenance: {error}");
+                    return false;
+                }
+            };
+            let guard = self.device_topology.lock_registry().await;
+            if let Some(mut record) = self.load_device_record(user).await {
+                let before = record.devices.len();
+                record.edit_devices(|devices| devices.retain(|d| d.device_id() != device_id));
+                if record.devices.len() != before {
+                    // WA Web's `updateGroupParticipantsInTransaction` deletes the
+                    // device JID from each affected group's senderKey Map. Skip
+                    // the registry update on failure: a half-applied state where
+                    // `resolve_devices` says "gone" but the tracker still vouches
+                    // `has_key=true` would silently skip SKDM redistribution.
+                    if let Err(e) = self
+                        .delete_sender_key_rows_for_device(user, device_id)
+                        .await
+                    {
+                        warn!(
+                            "patch_device_remove: sender-key cleanup failed for {user}:{device_id}: {e} \
                          — aborting registry update",
-                        user = wacore_binary::jid::ObservedJid::from(user)
-                    );
-                    return false;
-                }
-                self.delete_sessions_for_devices_unflushed(user, &[device_id])
-                    .await;
-                if let Err(error) = maintenance.flush().await {
-                    warn!("patch_device_remove: cannot persist session retirement: {error}");
-                    return false;
-                }
-                if let Err(e) = self.update_device_list_guarded(record, &guard).await {
-                    warn!("patch_device_remove: failed to persist: {e}");
-                    return false;
+                            user = wacore_binary::jid::ObservedJid::from(user)
+                        );
+                        return false;
+                    }
+                    self.delete_sessions_for_devices_unflushed(user, &[device_id])
+                        .await;
+                    if let Err(error) = maintenance.flush().await {
+                        warn!("patch_device_remove: cannot persist session retirement: {error}");
+                        return false;
+                    }
+                    if let Err(e) = self.update_device_list_guarded(record, &guard).await {
+                        warn!("patch_device_remove: failed to persist: {e}");
+                        return false;
+                    }
                 }
             }
-        }
-        true
+            true
+        })
     }
 
     /// Delete `sender_key_devices` rows whose `device_jid` matches the given
