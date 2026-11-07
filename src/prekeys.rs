@@ -191,10 +191,12 @@ impl Client {
             .collect();
         let mut requested = jids.to_vec();
         let mut bootstrap_primaries = Vec::new();
-        for jid in jids.iter().filter(|jid| jid.device != 0) {
+        for jid in &cold_companions {
             let primary = jid.with_device(0);
-            if !account_identities.contains_key(jid) && !requested.contains(&primary) {
+            if !bootstrap_primaries.contains(&primary) {
                 bootstrap_primaries.push(primary.clone());
+            }
+            if !requested.contains(&primary) {
                 requested.push(primary);
             }
         }
@@ -223,10 +225,10 @@ impl Client {
                 outcome.bundles.remove(companion);
             }
         }
-        // Remember authenticated bootstrap primaries before discarding their
-        // bundles. No session lock is acquired here: the session engine already
-        // holds companion locks, and taking the primary lock could invert its
-        // lock ordering. The cache operation compares and inserts atomically.
+        // Remember every cold account anchor before returning companions, even
+        // when device 0 was explicitly requested: fanout validates bundles
+        // before installing any primary session. The caller may already own
+        // session locks, so compare/insert atomically instead of reacquiring them.
         let backend = self.persistence_manager.backend();
         for jid in &bootstrap_primaries {
             if let Some(bundle) = outcome.bundles.get(jid) {
