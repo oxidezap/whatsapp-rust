@@ -16,6 +16,71 @@ use wacore::usync::{UserDeviceList, UsyncDevice};
 
 const GROUP: &str = "120363000000000170@g.us";
 
+/// Recovery includes a cached orphan even when a concurrent flush evicts it.
+#[tokio::test]
+async fn hosted_orphan_recovery_captures_state_flushed_during_enumeration() {
+    let (mut probe, _) = ProbeBackend::new();
+    let (release, gate) = async_channel::unbounded();
+    let (entered, arrived) = async_channel::unbounded();
+    probe.gate = Some(gate);
+    probe.entered = Some(entered);
+    probe.gate_method = "after:get_signal_addresses_for_user";
+    let fixture = Rotation::new(probe, Jid::pn("12025550188")).await;
+    let orphan = seed_fresh_session(&fixture.client, &fixture.user.with_device(7)).await;
+    fixture
+        .client
+        .invalidate_device_cache(&fixture.user.user)
+        .await;
+    assert!(
+        fixture
+            .raw
+            .get_session(orphan.as_str())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let operation = {
+        let client = fixture.client.clone();
+        let response = fixture.response.clone();
+        tokio::spawn(async move {
+            client
+                .process_device_list_response(&response, crate::cache::Freshness::Refresh)
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    fixture
+        .client
+        .flush_signal_cache_batch_safe()
+        .await
+        .unwrap();
+    fixture.client.signal_cache.clear_after_flush().await;
+    assert!(
+        fixture
+            .raw
+            .get_session(orphan.as_str())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    release.send(()).await.unwrap();
+    operation.await.unwrap().unwrap();
+    fixture.assert_completed().await;
+    assert!(!has_session(&fixture.client, &orphan).await);
+    assert!(
+        fixture
+            .raw
+            .get_session(orphan.as_str())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    fixture.client.signal_shutdown_sync();
+}
+
 /// Failed orphan recovery cannot discard valid members or replace partial trust.
 #[tokio::test]
 async fn group_refresh_preserves_members_when_orphan_recovery_fails() {
@@ -102,7 +167,7 @@ async fn orphan_discovery_covers_all_sources_without_crossing_users() {
         } else {
             probe.backend
         };
-        for user in ["12025550180", "100000000000180", "user_%\\"] {
+        for user in ["12025550180", "100000000000180", "user_%\\", "USER_%\\"] {
             let session_only = format!("{user}:6@hosted.0");
             let session = format!("{user}:7@c.us.0");
             let identity = format!("{user}:8@hosted.lid.0");
@@ -119,7 +184,8 @@ async fn orphan_discovery_covers_all_sources_without_crossing_users() {
                 .put_identity(&format!("{user}0:8@lid.0"), [4; 32])
                 .await
                 .unwrap();
-            let actual = backend.get_signal_addresses_for_user(user).await.unwrap();
+            let mut actual = backend.get_signal_addresses_for_user(user).await.unwrap();
+            actual.sort_unstable();
             let mut expected: Vec<Arc<str>> = [session_only, session, identity, tracked]
                 .into_iter()
                 .map(Arc::from)

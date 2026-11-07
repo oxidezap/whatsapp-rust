@@ -3020,12 +3020,7 @@ impl SignalStore for SqliteStore {
     /// Enumerate orphaned state within this account and an exact user prefix.
     async fn get_signal_addresses_for_user(&self, user: &str) -> Result<Vec<Arc<str>>> {
         let device_id = self.device_id;
-        let escaped = user
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        let pat_at = format!("{escaped}@%");
-        let pat_dev = format!("{escaped}:%");
+        let user = user.to_owned();
         let addresses: Vec<String> = self
             .read_query(move |conn| {
                 #[derive(QueryableByName)]
@@ -3034,20 +3029,23 @@ impl SignalStore for SqliteStore {
                     address: String,
                 }
                 // One UNION shares the decoder and query machinery across all
-                // sources. Numbered parameters bind the same account and escaped
-                // user patterns in each arm; UNION deduplicates and orders rows.
+                // sources. Binary prefix ranges match the exact user and
+                // separator without LIKE's case folding or pattern escaping.
+                // UNION deduplicates tracker rows from different groups.
                 diesel::sql_query(
                     "SELECT address FROM sessions WHERE device_id = ?1
-                   AND (address LIKE ?2 ESCAPE '\\' OR address LIKE ?3 ESCAPE '\\')
+                   AND ((address >= (?2 || ':') COLLATE BINARY AND address < (?2 || ';') COLLATE BINARY)
+                     OR (address >= (?2 || '@') COLLATE BINARY AND address < (?2 || 'A') COLLATE BINARY))
                  UNION SELECT address FROM identities WHERE device_id = ?1
-                   AND (address LIKE ?2 ESCAPE '\\' OR address LIKE ?3 ESCAPE '\\')
+                   AND ((address >= (?2 || ':') COLLATE BINARY AND address < (?2 || ';') COLLATE BINARY)
+                     OR (address >= (?2 || '@') COLLATE BINARY AND address < (?2 || 'A') COLLATE BINARY))
                  UNION SELECT device_jid AS address FROM sender_key_devices WHERE device_id = ?1
-                   AND (device_jid LIKE ?2 ESCAPE '\\' OR device_jid LIKE ?3 ESCAPE '\\')
+                   AND ((device_jid >= (?2 || ':') COLLATE BINARY AND device_jid < (?2 || ';') COLLATE BINARY)
+                     OR (device_jid >= (?2 || '@') COLLATE BINARY AND device_jid < (?2 || 'A') COLLATE BINARY))
                  ORDER BY address",
                 )
                 .bind::<diesel::sql_types::Integer, _>(device_id)
-                .bind::<diesel::sql_types::Text, _>(pat_at)
-                .bind::<diesel::sql_types::Text, _>(pat_dev)
+                .bind::<diesel::sql_types::Text, _>(user)
                 .load::<AddressRow>(conn)
                 .map(|rows| rows.into_iter().map(|row| row.address).collect())
                 .map_err(|e| StoreError::Database(Box::new(e)))

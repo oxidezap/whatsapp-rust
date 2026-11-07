@@ -672,7 +672,8 @@ impl Client {
         }
     }
 
-    /// Recover companion cleanup history after its registry row was invalidated.
+    /// Recover cleanup-only history after its registry row was invalidated.
+    /// This set of device IDs is never published as the current fanout.
     #[cold]
     #[inline(never)]
     pub(crate) async fn recover_device_cleanup_record(
@@ -682,7 +683,7 @@ impl Client {
         use wacore::store::traits::{DeviceInfo, DeviceListRecord};
         let lookup = self.resolve_lookup_keys_for_jid(user).await;
         let backend = self.persistence_manager.backend();
-        let mut ids = Vec::new();
+        let mut ids = HashSet::new();
         for key in lookup.all_keys() {
             for address in self
                 .signal_cache
@@ -708,12 +709,10 @@ impl Client {
                     "invalid stored Signal device during hosted identity recovery"
                 );
                 if jid.user == key && jid.device != 0 {
-                    ids.push(jid.device);
+                    ids.insert(jid.device);
                 }
             }
         }
-        ids.sort_unstable();
-        ids.dedup();
         Ok(DeviceListRecord {
             user: Arc::from(user.user.as_str()),
             devices: ids

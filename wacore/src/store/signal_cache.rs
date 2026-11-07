@@ -1303,13 +1303,15 @@ impl SignalStoreCache {
         Ok(backend.has_signal_state_for_user(user).await?)
     }
 
-    /// Merge persisted device history with unflushed and checked-out cache slots.
+    /// Collect cached history before reading durable history, so a concurrent
+    /// flush/eviction cannot hide an address from both sources. Addresses may
+    /// repeat across sources; recovery folds them into unique device IDs.
     pub async fn signal_addresses_for_user(
         &self,
         user: &str,
         backend: &dyn SignalStore,
     ) -> Result<Vec<Arc<str>>> {
-        let mut addresses = backend.get_signal_addresses_for_user(user).await?;
+        let mut addresses = Vec::new();
         addresses.extend(
             self.lock_sessions()
                 .await
@@ -1327,8 +1329,7 @@ impl SignalStoreCache {
                 .filter(|(address, _)| protocol_address_matches_user(address, user))
                 .map(|(address, _)| Arc::clone(address)),
         );
-        addresses.sort_unstable();
-        addresses.dedup();
+        addresses.extend(backend.get_signal_addresses_for_user(user).await?);
         Ok(addresses)
     }
 
