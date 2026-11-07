@@ -16,6 +16,82 @@ use wacore::usync::{UserDeviceList, UsyncDevice};
 
 const GROUP: &str = "120363000000000170@g.us";
 
+/// Failed orphan recovery cannot discard valid members or replace partial trust.
+#[tokio::test]
+async fn group_refresh_preserves_members_when_orphan_recovery_fails() {
+    for corrupt_row in [false, true] {
+        let (mut probe, _) = ProbeBackend::new();
+        let fail = Arc::new(AtomicBool::new(false));
+        probe.fail_before_method = Some(("get_signal_addresses_for_user", fail.clone()));
+        let fixture = Rotation::new(probe, Jid::pn("12025550182")).await;
+        fixture
+            .client
+            .invalidate_device_cache(&fixture.user.user)
+            .await;
+        if corrupt_row {
+            fixture
+                .raw
+                .put_identity("12025550182:65536@c.us.0", [4; 32])
+                .await
+                .unwrap();
+        } else {
+            fail.store(true, Ordering::Relaxed);
+        }
+        let member = Jid::pn("12025550183");
+        crate::test_utils::seed_adv_primary(&fixture.client, &member).await;
+        let mut response = fixture.response.clone();
+        response.device_lists.push(UserDeviceList {
+            user: member.clone(),
+            devices: vec![UsyncDevice::new(0, None), UsyncDevice::new(2, Some(1))],
+            phash: None,
+            key_index_bytes: Some(signed_key_index_bytes(vec![1], 1)),
+        });
+        let result = fixture
+            .client
+            .try_process_group_device_list_response(
+                &response,
+                &[fixture.user.clone(), member.clone()],
+                fixture.client.device_topology.current(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.contains(&member.with_device(2)));
+        assert!(!result.iter().any(|device| device.user == fixture.user.user));
+        assert!(
+            fixture
+                .raw
+                .get_devices(&fixture.user.user)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            fixture
+                .client
+                .cached_adv_account_identity(&fixture.user)
+                .await
+                .unwrap(),
+            Some(fixture.old_key)
+        );
+        assert!(has_session(&fixture.client, &fixture.session).await);
+        assert!(fixture.collector.events().is_empty());
+        assert!(
+            fixture.apply().await.is_err(),
+            "strict recovery must fail closed"
+        );
+        assert_eq!(
+            fixture
+                .client
+                .cached_adv_account_identity(&fixture.user)
+                .await
+                .unwrap(),
+            Some(fixture.old_key)
+        );
+        fixture.client.signal_shutdown_sync();
+    }
+}
+
 /// Orphan discovery includes every state source and respects exact user bounds.
 #[tokio::test]
 async fn orphan_discovery_covers_all_sources_without_crossing_users() {

@@ -1907,7 +1907,7 @@ impl SignalStoreCache {
     }
 
     /// Persist verified account aliases only if every previous key still matches.
-    /// The worker retains the flush/identity locks through storage completion,
+    /// The worker retains durable write ordering through storage completion,
     /// even if its requester is cancelled. Cache publication follows the entire
     /// write, so a failed batch retains the old keys for retry and reactions.
     /// This writes no unrelated session ratchets.
@@ -1940,19 +1940,25 @@ impl SignalStoreCache {
         data: &[u8; 32],
         backend: &dyn SignalStore,
     ) -> Result<bool> {
+        // Use the removal-stamped cold-read path before serializing writes.
+        // Recheck the cache under its mutex before pinning any previous key.
+        for (address, _) in identities {
+            self.get_identity(address, backend).await?;
+        }
+        // All durable identity writers/flushes share this guard. It must span
+        // backend acknowledgement so a detached adapter write cannot finish
+        // after a newer CAS or flush. Cache readers and saves do not need it.
         let _flush = self.flush_lock.lock().await;
         let mut state = self.identities.lock().await;
-        for (address, expected) in identities {
-            let previous = match state.cache.get(address.as_str()) {
-                Some(cached) => cached.clone(),
-                None => backend
-                    .load_identity(address.as_str())
-                    .await?
-                    .map(Arc::from),
-            };
-            if previous.as_deref() != expected.as_ref().map(|key| key.as_slice()) {
-                return Ok(false);
-            }
+        let matches_expected = |state: &ByteStoreState| {
+            identities.iter().all(|(address, expected)| {
+                state.cache.get(address.as_str()).is_some_and(|previous| {
+                    previous.as_deref() == expected.as_ref().map(|key| key.as_slice())
+                })
+            })
+        };
+        if !matches_expected(&state) {
+            return Ok(false);
         }
         // Pin every old anchor before an adapter can partially commit. A failed
         // write must not make cache eviction turn an unfinished rotation into
@@ -1968,8 +1974,16 @@ impl SignalStoreCache {
             .iter()
             .filter_map(|(address, _)| self.identity_write_change(&state, address, data))
             .collect();
+        drop(state);
         for (address, _) in identities {
             backend.put_identity(address.as_str(), *data).await?;
+        }
+        let mut state = self.identities.lock().await;
+        // Signal saves/deletes may have changed trust while storage was busy.
+        // Their dirty cache entries must survive for the next ordered flush;
+        // this verified replacement must not publish over the newer anchors.
+        if !matches_expected(&state) {
+            return Ok(false);
         }
         for (address, _) in identities {
             state.put_dedup(address.as_str(), data);
@@ -6752,6 +6766,21 @@ mod cold_read_race_tests {
         })
         .await
         .unwrap();
+        let unrelated = ProtocolAddress::new("12025550184", 0.into());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            assert_eq!(
+                cache
+                    .get_identity(&address, backend.as_ref())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .as_ref(),
+                &[1; 32]
+            );
+            cache.put_identity(&unrelated, &[7; 32]).await;
+        })
+        .await
+        .expect("hosted backend I/O must not hold the identity mutex");
         drop(write);
         let second = [(address.clone(), Some([2; 32]))];
         let mut newer = Box::pin(cache.persist_identities_if_equal(
@@ -6780,6 +6809,74 @@ mod cold_read_race_tests {
                 .as_ref(),
             &[3; 32]
         );
+        assert!(
+            !cache
+                .identities
+                .lock()
+                .await
+                .dirty
+                .contains(address.as_str())
+        );
+    }
+
+    /// A Signal save during hosted storage I/O wins cache publication and flush.
+    #[tokio::test]
+    async fn verified_identity_write_preserves_a_concurrent_signal_save() {
+        let backend = Arc::new(GatedColdRead::new(0));
+        let cache = Arc::new(SignalStoreCache::new());
+        let address = ProtocolAddress::new("12025550185", 0.into());
+        assert!(
+            cache
+                .persist_identity_if_absent_or_equal(&address, &[1; 32], backend.as_ref())
+                .await
+                .unwrap()
+        );
+        backend.pause_identity_write.store(true, Ordering::Relaxed);
+        let expected = [(address.clone(), Some([1; 32]))];
+        let mut write = Box::pin(cache.persist_identities_if_equal(
+            &expected,
+            &[2; 32],
+            backend.clone(),
+            &IdentityTestRuntime,
+        ));
+        assert!(futures::poll!(write.as_mut()).is_pending());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while backend.pending_identity.lock().unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let key = IdentityKey::new(PublicKey::from_djb_public_key_bytes(&[3; 32]).unwrap());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cache.save_identity(&address, &key, backend.as_ref()),
+        )
+        .await
+        .expect("Signal saves must not wait for hosted backend I/O")
+        .unwrap();
+        backend.pause_identity_write.store(false, Ordering::Relaxed);
+        backend.identity_write_release.wait().await;
+        assert!(!write.await.unwrap());
+        assert_eq!(
+            cache
+                .get_identity(&address, backend.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            &[3; 32]
+        );
+        assert!(
+            cache
+                .identities
+                .lock()
+                .await
+                .dirty
+                .contains(address.as_str())
+        );
+        cache.flush(backend.as_ref()).await.unwrap();
+        assert_eq!(*backend.identity.lock().unwrap(), Some([3; 32]));
         assert!(
             !cache
                 .identities

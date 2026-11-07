@@ -3019,7 +3019,6 @@ impl SignalStore for SqliteStore {
     /// Recover all persisted namespaces and tracker-only devices without a registry row.
     /// Enumerate orphaned state within this account and an exact user prefix.
     async fn get_signal_addresses_for_user(&self, user: &str) -> Result<Vec<Arc<str>>> {
-        use diesel::expression_methods::EscapeExpressionMethods as _;
         let device_id = self.device_id;
         let escaped = user
             .replace('\\', "\\\\")
@@ -3028,46 +3027,29 @@ impl SignalStore for SqliteStore {
         let pat_at = format!("{escaped}@%");
         let pat_dev = format!("{escaped}:%");
         self.read_query(move |conn| {
-            let mut addresses: Vec<String> = sessions::table
-                .select(sessions::address)
-                .filter(sessions::device_id.eq(device_id))
-                .filter(
-                    sessions::address
-                        .like(&pat_at)
-                        .escape('\\')
-                        .or(sessions::address.like(&pat_dev).escape('\\')),
-                )
-                .load(conn)
-                .map_err(|e| StoreError::Database(Box::new(e)))?;
-            addresses.extend(
-                identities::table
-                    .select(identities::address)
-                    .filter(identities::device_id.eq(device_id))
-                    .filter(
-                        identities::address
-                            .like(&pat_at)
-                            .escape('\\')
-                            .or(identities::address.like(&pat_dev).escape('\\')),
-                    )
-                    .load::<String>(conn)
-                    .map_err(|e| StoreError::Database(Box::new(e)))?,
-            );
-            addresses.extend(
-                sender_key_devices::table
-                    .select(sender_key_devices::device_jid)
-                    .filter(sender_key_devices::device_id.eq(device_id))
-                    .filter(
-                        sender_key_devices::device_jid
-                            .like(&pat_at)
-                            .escape('\\')
-                            .or(sender_key_devices::device_jid.like(&pat_dev).escape('\\')),
-                    )
-                    .load::<String>(conn)
-                    .map_err(|e| StoreError::Database(Box::new(e)))?,
-            );
-            addresses.sort_unstable();
-            addresses.dedup();
-            Ok(addresses.into_iter().map(Arc::from).collect())
+            #[derive(QueryableByName)]
+            struct AddressRow {
+                #[diesel(sql_type = diesel::sql_types::Text)]
+                address: String,
+            }
+            // One UNION shares the decoder and query machinery across all
+            // sources. Numbered parameters bind the same account and escaped
+            // user patterns in each arm; UNION deduplicates and orders rows.
+            diesel::sql_query(
+                "SELECT address FROM sessions WHERE device_id = ?1
+                   AND (address LIKE ?2 ESCAPE '\\' OR address LIKE ?3 ESCAPE '\\')
+                 UNION SELECT address FROM identities WHERE device_id = ?1
+                   AND (address LIKE ?2 ESCAPE '\\' OR address LIKE ?3 ESCAPE '\\')
+                 UNION SELECT device_jid AS address FROM sender_key_devices WHERE device_id = ?1
+                   AND (device_jid LIKE ?2 ESCAPE '\\' OR device_jid LIKE ?3 ESCAPE '\\')
+                 ORDER BY address",
+            )
+            .bind::<diesel::sql_types::Integer, _>(device_id)
+            .bind::<diesel::sql_types::Text, _>(pat_at)
+            .bind::<diesel::sql_types::Text, _>(pat_dev)
+            .load::<AddressRow>(conn)
+            .map(|rows| rows.into_iter().map(|row| Arc::from(row.address)).collect())
+            .map_err(|e| StoreError::Database(Box::new(e)))
         })
         .await
     }

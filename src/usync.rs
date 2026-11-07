@@ -420,36 +420,40 @@ impl Client {
     }
 
     /// Hold mapping and topology guards through CAS, cleanup and publication.
-    async fn apply_device_list_response_inner(
-        &self,
-        response: &DeviceListResponse,
+    /// Share one boxed state machine between ordinary and owned hosted callers.
+    #[inline(never)]
+    fn apply_device_list_response_inner<'a>(
+        &'a self,
+        response: &'a DeviceListResponse,
         mode: DeviceListApplyMode,
         topology_generation: Option<u64>,
-        group_users: Option<&[Jid]>,
-    ) -> anyhow::Result<Option<Vec<Jid>>> {
-        // Serialize both mutation classes across the CAS and publication. The
-        // response's own mappings are deliberately learned only after the CAS.
-        let mapping_guard = self.lid_pn_cache.lock_mutation().await;
-        let registry_guard = self.device_topology.lock_registry().await;
-        if let Some(generation) = topology_generation
-            && !self
-                .device_topology
-                .unchanged_for(generation, &device_response_users(response))
-        {
-            return Ok(None);
-        }
-        self.learn_device_list_mappings_guarded(response, &mapping_guard)
-            .await?;
-        let devices = self
-            .process_device_list_response_guarded(response, mode, &registry_guard)
-            .await?;
-        if let Some(users) = group_users {
-            // Include omitted group users under the same publication guards.
-            let (devices, _) = self.get_devices_from_registry_batch(users.to_vec()).await;
-            Ok(Some(devices))
-        } else {
-            Ok(Some(devices))
-        }
+        group_users: Option<&'a [Jid]>,
+    ) -> wacore::runtime::BoxFuture<'a, anyhow::Result<Option<Vec<Jid>>>> {
+        Box::pin(async move {
+            // Serialize both mutation classes across the CAS and publication. The
+            // response's own mappings are deliberately learned only after the CAS.
+            let mapping_guard = self.lid_pn_cache.lock_mutation().await;
+            let registry_guard = self.device_topology.lock_registry().await;
+            if let Some(generation) = topology_generation
+                && !self
+                    .device_topology
+                    .unchanged_for(generation, &device_response_users(response))
+            {
+                return Ok(None);
+            }
+            self.learn_device_list_mappings_guarded(response, &mapping_guard)
+                .await?;
+            let devices = self
+                .process_device_list_response_guarded(response, mode, &registry_guard)
+                .await?;
+            if let Some(users) = group_users {
+                // Include omitted group users under the same publication guards.
+                let (devices, _) = self.get_devices_from_registry_batch(users.to_vec()).await;
+                Ok(Some(devices))
+            } else {
+                Ok(Some(devices))
+            }
+        })
     }
 
     /// Load ordinary account anchors before taking mapping/registry guards.
@@ -627,7 +631,19 @@ impl Client {
                         previous_record: if changed {
                             Some(match existing_record.take() {
                                 Some(record) => record,
-                                None => self.recover_device_cleanup_record(&user_list.user).await?,
+                                None => {
+                                    match self.recover_device_cleanup_record(&user_list.user).await
+                                    {
+                                        Ok(record) => record,
+                                        Err(error) if mode == DeviceListApplyMode::GroupRefresh => {
+                                            warn!(
+                                                "Skipping hosted user after orphan cleanup recovery failed: {error:#}"
+                                            );
+                                            continue;
+                                        }
+                                        Err(error) => return Err(error),
+                                    }
+                                }
                             })
                         } else {
                             None

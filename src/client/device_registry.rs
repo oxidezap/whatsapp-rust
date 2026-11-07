@@ -689,15 +689,22 @@ impl Client {
             {
                 // Signal stores append the protocol device suffix; sender-key
                 // tracking stores the wire JID without it.
-                let jid: Jid = address
-                    .strip_suffix(".0")
-                    .unwrap_or(&address)
-                    .parse()
-                    .map_err(|_| {
-                        anyhow::anyhow!(
-                            "invalid stored Signal address during hosted identity recovery"
-                        )
-                    })?;
+                // Fail closed on corrupt/unsupported state: silently omitting a
+                // row would accept new trust without proving complete cleanup.
+                // Group refresh may skip this user and still apply valid peers.
+                let wire_address = address.strip_suffix(".0").unwrap_or(&address);
+                let jid: Jid = wire_address.parse().map_err(|_| {
+                    anyhow::anyhow!("invalid stored Signal address during hosted identity recovery")
+                })?;
+                // Jid's fast parser deliberately treats an overflowing device
+                // as device 0. Cleanup cannot silently drop that stored suffix.
+                anyhow::ensure!(
+                    wire_address
+                        .split_once('@')
+                        .and_then(|(local, _)| local.rsplit_once(':'))
+                        .is_none_or(|(_, device)| device.parse::<u16>().ok() == Some(jid.device)),
+                    "invalid stored Signal device during hosted identity recovery"
+                );
                 if jid.user == key && jid.device != 0 {
                     ids.push(jid.device);
                 }
