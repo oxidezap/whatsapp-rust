@@ -342,6 +342,26 @@ impl Client {
         };
         let (send, receive) = futures::channel::oneshot::channel();
         self.runtime.spawn_detached(Box::pin(async move {
+            use wacore::types::jid::JidExt as _;
+            let mut addresses: Vec<_> = recovered
+                .previous_identities
+                .iter()
+                .map(|(jid, _)| jid.to_protocol_address())
+                .collect();
+            // Match PN/LID migration's lock order. Acquire these before mapping
+            // and registry guards: session installation can itself need them.
+            addresses.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+            addresses.dedup();
+            let mut session_guards = Vec::with_capacity(addresses.len());
+            for address in addresses {
+                session_guards.push(
+                    client
+                        .session_lock_for(address.as_str())
+                        .await
+                        .lock_arc()
+                        .await,
+                );
+            }
             let result = client
                 .apply_device_list_response_inner(
                     &response,
@@ -351,6 +371,7 @@ impl Client {
                     Some(&recovered),
                 )
                 .await;
+            drop(session_guards);
             if let Err(Err(error)) = send.send(result) {
                 warn!("ADV identity recovery failed after caller cancellation: {error:#}");
             }
