@@ -472,8 +472,19 @@ impl Client {
         Ok(())
     }
 
+    /// Share the batch state machine instead of embedding it in each caller.
+    #[inline(never)]
+    fn process_device_list_response_guarded<'a>(
+        &'a self,
+        response: &'a DeviceListResponse,
+        mode: DeviceListApplyMode,
+        guard: &'a crate::client::device_topology::DeviceRegistryMutationGuard<'_>,
+    ) -> wacore::runtime::BoxFuture<'a, Result<Vec<Jid>, anyhow::Error>> {
+        Box::pin(self.process_device_list_response_guarded_inner(response, mode, guard))
+    }
+
     /// Validate the accepted batch, retire old state and publish verified lists.
-    async fn process_device_list_response_guarded(
+    async fn process_device_list_response_guarded_inner(
         &self,
         response: &DeviceListResponse,
         mode: DeviceListApplyMode,
@@ -499,12 +510,10 @@ impl Client {
             user: &'a Jid,
             identity: [u8; 32],
             previous_identity: Option<[u8; 32]>,
-            identities: smallvec::SmallVec<
-                [(
-                    wacore::libsignal::protocol::ProtocolAddress,
-                    Option<[u8; 32]>,
-                ); 2],
-            >,
+            identities: Vec<(
+                wacore::libsignal::protocol::ProtocolAddress,
+                Option<[u8; 32]>,
+            )>,
             previous_record: Option<wacore::store::traits::DeviceListRecord>,
         }
         let mut hosted_identities = Vec::new();
@@ -592,12 +601,7 @@ impl Client {
                     !is_self || previous_identity == Some(identity),
                     "hosted list cannot replace our paired primary identity"
                 );
-                let mut identities: smallvec::SmallVec<
-                    [(
-                        wacore::libsignal::protocol::ProtocolAddress,
-                        Option<[u8; 32]>,
-                    ); 2],
-                > = smallvec::SmallVec::new();
+                let mut identities = Vec::with_capacity(2);
                 use wacore::types::jid::JidExt as _;
                 identities.push((
                     user_list.user.with_device(0).to_protocol_address(),
