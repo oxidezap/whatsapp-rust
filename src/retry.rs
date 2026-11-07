@@ -4122,6 +4122,7 @@ mod tests {
     #[tokio::test]
     async fn primary_retry_cannot_rollback_recovery_during_its_initial_session_read() {
         use crate::store::release::tests::ProbeBackend;
+        use wacore::libsignal::protocol::SignalProtocolError;
         let (mut probe, _) = ProbeBackend::new();
         let (release, gate) = async_channel::unbounded();
         let (entered, arrived) = async_channel::unbounded();
