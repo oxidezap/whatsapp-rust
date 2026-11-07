@@ -20,16 +20,6 @@ use wacore_binary::Jid;
 
 pub use wacore::prekeys::PreKeyUtils;
 
-// Share the trusted-account read across receive, retry and installation
-// callers without adding a heap owner to those paths.
-#[inline(never)]
-fn poll_account_identity<F: std::future::Future<Output = anyhow::Result<Option<[u8; 32]>>>>(
-    future: std::pin::Pin<&mut F>,
-    cx: &mut std::task::Context<'_>,
-) -> std::task::Poll<F::Output> {
-    future.poll(cx)
-}
-
 /// Default number of one-time pre-keys generated and uploaded per batch.
 /// Mirrors WA Web's UPLOAD_KEYS_COUNT (`WAWebUploadPreKeysJob`).
 pub(crate) const DEFAULT_WANTED_PRE_KEY_COUNT: usize = 812;
@@ -280,14 +270,6 @@ impl Client {
     /// Read trust without requesting network data. Notification handling runs
     /// on the read loop and must never wait for an IQ response of its own.
     pub(crate) async fn cached_adv_account_identity(
-        &self,
-        jid: &Jid,
-    ) -> anyhow::Result<Option<[u8; 32]>> {
-        let mut future = std::pin::pin!(self.cached_adv_account_identity_inner(jid));
-        std::future::poll_fn(|cx| poll_account_identity(future.as_mut(), cx)).await
-    }
-
-    async fn cached_adv_account_identity_inner(
         &self,
         jid: &Jid,
     ) -> anyhow::Result<Option<[u8; 32]>> {

@@ -3,16 +3,6 @@
 use super::*;
 use anyhow::Context as _;
 
-// Keep one account-admission poll body across all pairwise writers. Like the
-// inbound phase fences, its future stays pinned on the caller's stack.
-#[inline(never)]
-fn poll_account_fence<F: std::future::Future<Output = Option<async_lock::MutexGuardArc<()>>>>(
-    future: std::pin::Pin<&mut F>,
-    cx: &mut std::task::Context<'_>,
-) -> std::task::Poll<F::Output> {
-    future.poll(cx)
-}
-
 /// Own the receive permit before acquiring session/mapping/registry locks.
 /// Pending rows are committed before this scope is exposed, so its flushes
 /// cannot persist a drain ratchet whose message is still only in memory.
@@ -71,14 +61,6 @@ impl SignalMaintenance<'_> {
 impl Client {
     /// Pairwise identity writes must take the account anchor before the device.
     pub(crate) async fn lock_companion_account(
-        &self,
-        jid: &Jid,
-    ) -> Option<async_lock::MutexGuardArc<()>> {
-        let mut future = std::pin::pin!(self.lock_companion_account_inner(jid));
-        std::future::poll_fn(|cx| poll_account_fence(future.as_mut(), cx)).await
-    }
-
-    async fn lock_companion_account_inner(
         &self,
         jid: &Jid,
     ) -> Option<async_lock::MutexGuardArc<()>> {
