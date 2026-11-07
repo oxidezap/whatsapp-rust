@@ -1748,7 +1748,7 @@ async fn fanout_group_epoch_for_generation(
             }
         }
         let plan = wacore::send::SessionPlan::assume_ready(recipients.len());
-        let mut adapter = client.signal_adapter();
+        let mut adapter = client.signal_adapter().with_session_fence(session_guards);
         let mut stores = adapter.as_signal_stores();
         let encrypted = wacore::send::encrypt_for_devices_with_sessions_raw(
             &*client.runtime,
@@ -1759,7 +1759,6 @@ async fn fanout_group_epoch_for_generation(
         )
         .await
         .map_err(|error| CallError::Setup(error.to_string()));
-        drop(session_guards);
         encrypted
     };
     let encrypted = encrypted?;
