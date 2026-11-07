@@ -7420,19 +7420,33 @@ mod ensure_sessions_concurrency {
     /// fanout validation, independent of request or response order.
     #[tokio::test]
     async fn cold_explicit_primary_is_saved_before_companion_validation() {
-        for primary_first in [true, false] {
+        for (primary_first, explicit_primary) in [(true, true), (false, true), (false, false)] {
             let (client, transport) = crate::test_utils::create_iq_test_client().await;
             let primary = Jid::pn("12025550126");
             let companion = primary.with_device(2);
+            let second_companion = primary.with_device(3);
             let requested = if primary_first {
-                vec![primary.clone(), companion.clone()]
+                vec![primary.clone(), companion.clone(), second_companion.clone()]
+            } else if explicit_primary {
+                vec![companion.clone(), second_companion.clone(), primary.clone()]
             } else {
-                vec![companion.clone(), primary.clone()]
+                vec![companion.clone(), second_companion.clone()]
             };
             let running = client.clone();
             let task = tokio::spawn(async move { running.fetch_pre_keys(&requested, None).await });
             let iq = crate::test_utils::decode_sent_iq(&transport, 0).await;
             let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+            let requested: Vec<_> = iq
+                .get()
+                .get_optional_child("key")
+                .unwrap()
+                .children()
+                .unwrap()
+                .iter()
+                .map(|user| user.attrs().optional_jid("jid").unwrap())
+                .collect();
+            assert_eq!(requested.len(), 3);
+            assert_eq!(requested.iter().filter(|jid| **jid == primary).count(), 1);
             let keys = PeerKeys::generate();
             let primary_user = keys
                 .bundle_response(&primary, &id, 1)
@@ -7448,10 +7462,17 @@ mod ensure_sessions_concurrency {
                 .children()
                 .unwrap()[0]
                 .clone();
+            let second_companion_user = keys
+                .bundle_response(&second_companion, &id, 3)
+                .get_optional_child("list")
+                .unwrap()
+                .children()
+                .unwrap()[0]
+                .clone();
             let users = if primary_first {
-                vec![primary_user, companion_user]
+                vec![primary_user, companion_user, second_companion_user]
             } else {
-                vec![companion_user, primary_user]
+                vec![companion_user, second_companion_user, primary_user]
             };
             let response = NodeBuilder::new("iq")
                 .attr("type", "result")
@@ -7459,7 +7480,7 @@ mod ensure_sessions_concurrency {
                 .build();
             crate::test_utils::answer_iq(&client, &id, &response).await;
             let outcome = task.await.unwrap().unwrap();
-            assert_eq!(outcome.bundles.len(), 2);
+            assert_eq!(outcome.bundles.len(), if explicit_primary { 3 } else { 2 });
             let expected = *keys.identity.public_key().public_key_bytes();
             assert_eq!(
                 client.cached_adv_account_identity(&primary).await.unwrap(),
@@ -7480,13 +7501,15 @@ mod ensure_sessions_concurrency {
                     .await
                     .unwrap()
             );
-            wacore::client::context::SendContextResolver::validate_prekey_account_identity(
-                client.as_ref(),
-                &companion,
-                outcome.bundles.get(&companion).unwrap(),
-            )
-            .await
-            .unwrap();
+            for companion in [&companion, &second_companion] {
+                wacore::client::context::SendContextResolver::validate_prekey_account_identity(
+                    client.as_ref(),
+                    companion,
+                    outcome.bundles.get(companion).unwrap(),
+                )
+                .await
+                .unwrap();
+            }
             assert_eq!(transport.sent().len(), 1);
             client.signal_shutdown_sync();
         }
