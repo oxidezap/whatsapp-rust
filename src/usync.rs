@@ -5,6 +5,7 @@
 use crate::client::{Client, SignalMaintenance};
 use crate::request::IqError;
 use log::{debug, warn};
+use std::sync::Arc;
 use wacore::iq::usync::{DeviceListResponse, DeviceListSpec};
 use wacore_binary::{Jid, JidExt as _};
 
@@ -435,41 +436,15 @@ impl Client {
                 identity,
                 previous_identities,
             };
-            let (send, receive) = futures::channel::oneshot::channel();
-            self.runtime.spawn_detached(Box::pin(async move {
-                let result = async {
-                    let maintenance = client.begin_signal_maintenance().await?;
-                    let mut addresses: Vec<_> = recovered
-                        .previous_identities
-                        .iter()
-                        .map(|(jid, _)| jid.with_device(0))
-                        .collect();
-                    // Match PN/LID migration's lock order. Acquire these before mapping
-                    // and registry guards: session installation can itself need them.
-                    addresses.sort_unstable_by(wacore::types::jid::cmp_for_lock_order);
-                    addresses.dedup_by(|a, b| wacore::types::jid::cmp_for_lock_order(a, b).is_eq());
-                    let session_guards = client.session_guards_for(&addresses).await;
-                    let result = client
-                        .apply_device_list_response_inner(
-                            &response,
-                            DeviceListApplyMode::StrictRefresh,
-                            Some(generation),
-                            None,
-                            Some(&recovered),
-                            Some(&maintenance),
-                        )
-                        .await;
-                    drop(session_guards);
-                    result
-                }
-                .await;
-                if let Err(Err(error)) = send.send(result) {
-                    warn!("ADV identity recovery failed after caller cancellation: {error:#}");
-                }
-            }));
-            receive
-                .await
-                .map_err(|_| anyhow::anyhow!("ADV identity recovery worker stopped"))??
+            client
+                .apply_owned_device_list_response(
+                    response,
+                    DeviceListApplyMode::StrictRefresh,
+                    Some(generation),
+                    None,
+                    Some(recovered),
+                )
+                .await?
                 .ok_or_else(|| {
                     anyhow::anyhow!("device topology changed during ADV identity recovery")
                 })
@@ -677,31 +652,71 @@ impl Client {
                     .await;
             }
             self.ensure_signal_maintenance_context()?;
-            let response = response.clone();
-            let group_users = group_users.map(<[Jid]>::to_vec);
+            client
+                .apply_owned_device_list_response(
+                    response.clone(),
+                    mode,
+                    topology_generation,
+                    group_users.map(<[Jid]>::to_vec),
+                    None,
+                )
+                .await
+        })
+    }
+
+    /// Share cancellation-safe publication for hosted lists and ordinary
+    /// recovery. The worker owns admission, account fences and all input data.
+    #[inline(never)]
+    fn apply_owned_device_list_response(
+        self: Arc<Self>,
+        response: DeviceListResponse,
+        mode: DeviceListApplyMode,
+        topology_generation: Option<u64>,
+        group_users: Option<Vec<Jid>>,
+        recovered: Option<RecoveredAccountIdentity>,
+    ) -> wacore::runtime::BoxFuture<'static, anyhow::Result<Option<Vec<Jid>>>> {
+        Box::pin(async move {
+            self.ensure_signal_maintenance_context()?;
             let (send, receive) = futures::channel::oneshot::channel();
-            self.runtime.spawn_detached(Box::pin(async move {
+            let runtime = self.runtime.clone();
+            runtime.spawn_detached(Box::pin(async move {
                 let result = async {
-                    let maintenance = client.begin_signal_maintenance().await?;
-                    client
+                    let maintenance = self.begin_signal_maintenance().await?;
+                    let session_guards = if let Some(recovered) = &recovered {
+                        let mut addresses: Vec<_> = recovered
+                            .previous_identities
+                            .iter()
+                            .map(|(jid, _)| jid.with_device(0))
+                            .collect();
+                        // Match PN/LID migration before taking mapping/registry locks.
+                        addresses.sort_unstable_by(wacore::types::jid::cmp_for_lock_order);
+                        addresses
+                            .dedup_by(|a, b| wacore::types::jid::cmp_for_lock_order(a, b).is_eq());
+                        self.session_guards_for(&addresses).await
+                    } else {
+                        Vec::new()
+                    };
+                    let result = self
                         .apply_device_list_response_inner(
                             &response,
                             mode,
                             topology_generation,
                             group_users.as_deref(),
-                            None,
+                            recovered.as_ref(),
                             Some(&maintenance),
                         )
-                        .await
+                        .await;
+                    drop(session_guards);
+                    result
                 }
                 .await;
                 if let Err(Err(error)) = send.send(result) {
-                    warn!("Hosted device sync failed after caller cancellation: {error:#}");
+                    warn!("Owned ADV device sync failed after caller cancellation: {error:#}");
                 }
             }));
             receive
                 .await
-                .map_err(|_| anyhow::anyhow!("hosted device sync worker stopped"))?
+                .map_err(|_| anyhow::anyhow!("owned ADV device sync worker stopped"))?
         })
     }
 
