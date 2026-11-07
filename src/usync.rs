@@ -5,7 +5,6 @@
 use crate::client::{Client, SignalMaintenance};
 use crate::request::IqError;
 use log::{debug, warn};
-use std::sync::Arc;
 use wacore::iq::usync::{DeviceListResponse, DeviceListSpec};
 use wacore_binary::{Jid, JidExt as _};
 
@@ -668,7 +667,7 @@ impl Client {
     /// recovery. The worker owns admission, account fences and all input data.
     #[inline(never)]
     fn apply_owned_device_list_response(
-        self: Arc<Self>,
+        self: std::sync::Arc<Self>,
         response: DeviceListResponse,
         mode: DeviceListApplyMode,
         topology_generation: Option<u64>,
