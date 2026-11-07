@@ -673,6 +673,8 @@ impl Client {
     }
 
     /// Recover companion cleanup history after its registry row was invalidated.
+    #[cold]
+    #[inline(never)]
     pub(crate) async fn recover_device_cleanup_record(
         &self,
         user: &Jid,

@@ -40,6 +40,18 @@ enum DeviceListApplyMode {
     GroupRefresh,
 }
 
+/// A verified hosted trust change staged until the complete batch is accepted.
+struct HostedIdentityUpdate<'a> {
+    user: &'a Jid,
+    identity: [u8; 32],
+    previous_identity: Option<[u8; 32]>,
+    identities: Vec<(
+        wacore::libsignal::protocol::ProtocolAddress,
+        Option<[u8; 32]>,
+    )>,
+    previous_record: Option<wacore::store::traits::DeviceListRecord>,
+}
+
 impl From<crate::cache::Freshness> for DeviceListApplyMode {
     fn from(freshness: crate::cache::Freshness) -> Self {
         match freshness {
@@ -472,6 +484,87 @@ impl Client {
         Ok(())
     }
 
+    /// Retire old hosted state and publish trust before applying the new topology.
+    /// Keep this rare reaction out of the common device-list polling loop.
+    #[cold]
+    #[inline(never)]
+    async fn apply_hosted_identity_update(
+        &self,
+        update: HostedIdentityUpdate<'_>,
+        guard: &crate::client::device_topology::DeviceRegistryMutationGuard<'_>,
+    ) -> anyhow::Result<()> {
+        let changed = update
+            .identities
+            .iter()
+            .any(|(_, previous)| previous.is_some_and(|previous| previous != update.identity));
+        if changed {
+            // Web re-adds primary membership: keep its session, require SKDM.
+            self.delete_sender_key_rows_for_device(&update.user.user, 0)
+                .await?;
+        }
+        if let Some(previous) = update.previous_record {
+            for device in &previous.devices {
+                if device.device_id() != 0 {
+                    self.delete_sender_key_rows_for_device(&update.user.user, device.device_id())
+                        .await?;
+                }
+            }
+            self.clear_device_record(&update.user.user, update.user.server.as_str(), &previous)
+                .await;
+            // Shared cleanup logs flush errors. Trust replacement additionally
+            // requires durable removal before the new account key is saved.
+            self.flush_signal_cache_batch_safe().await?;
+        }
+        if changed {
+            self.try_invalidate_device_cache_guarded(&update.user.user, guard)
+                .await?;
+        }
+        let backend = self.persistence_manager.backend();
+        anyhow::ensure!(
+            self.signal_cache
+                .persist_identities_if_equal(
+                    &update.identities,
+                    &update.identity,
+                    backend,
+                    self.runtime.as_ref(),
+                )
+                .await?,
+            "primary identity changed during hosted ADV verification for {}",
+            update.user
+        );
+        if let Some(previous) = update.previous_identity
+            && previous != update.identity
+        {
+            use crate::types::events::{Event, EventKind};
+            self.core
+                .event_bus
+                .dispatch_with(EventKind::IdentityChange, || {
+                    Event::IdentityChange(
+                        crate::types::events::IdentityChange::builder()
+                            .user(update.user.to_non_ad())
+                            .implicit(true)
+                            .previous_identity_key(previous)
+                            .current_identity_key(update.identity)
+                            .build(),
+                    )
+                });
+            // The token IQ stays outside registry locks and cannot reset the
+            // newly published topology a second time.
+            if !update.user.is_bot()
+                && !update.user.is_status_broadcast()
+                && let Some(client) = self.self_weak.get().and_then(|weak| weak.upgrade())
+            {
+                let user = update.user.clone();
+                self.runtime
+                    .spawn(Box::pin(async move {
+                        client.reissue_tc_token_after_identity_change(&user).await;
+                    }))
+                    .detach();
+            }
+        }
+        Ok(())
+    }
+
     /// Share the batch state machine instead of embedding it in each caller.
     #[inline(never)]
     fn process_device_list_response_guarded<'a>(
@@ -506,16 +599,6 @@ impl Client {
         // lets an authoritative refresh validate every user before any prior
         // Signal sessions or registry snapshot are discarded.
         let mut pending_identity_resets = Vec::new();
-        struct HostedIdentityUpdate<'a> {
-            user: &'a Jid,
-            identity: [u8; 32],
-            previous_identity: Option<[u8; 32]>,
-            identities: Vec<(
-                wacore::libsignal::protocol::ProtocolAddress,
-                Option<[u8; 32]>,
-            )>,
-            previous_record: Option<wacore::store::traits::DeviceListRecord>,
-        }
         let mut hosted_identities = Vec::new();
         let mut pending_removals = Vec::new();
         let mut retained_ids = std::collections::HashSet::new();
@@ -822,80 +905,7 @@ impl Client {
         // It is the retry record if any cleanup operation fails. Only then may
         // invalidation and the verified identity replacement consume that history.
         for update in hosted_identities {
-            let changed = update
-                .identities
-                .iter()
-                .any(|(_, previous)| previous.is_some_and(|previous| previous != update.identity));
-            if changed {
-                // Web's identity-change reaction removes and re-adds primary
-                // membership too: preserve its session, but require fresh SKDM.
-                self.delete_sender_key_rows_for_device(&update.user.user, 0)
-                    .await?;
-            }
-            if let Some(previous) = update.previous_record {
-                for device in &previous.devices {
-                    if device.device_id() != 0 {
-                        self.delete_sender_key_rows_for_device(
-                            &update.user.user,
-                            device.device_id(),
-                        )
-                        .await?;
-                    }
-                }
-                self.clear_device_record(&update.user.user, update.user.server.as_str(), &previous)
-                    .await;
-                // The shared cleanup logs flush errors. A trust replacement
-                // additionally requires durable removal before saving its key.
-                self.flush_signal_cache_batch_safe().await?;
-            }
-            if changed {
-                self.try_invalidate_device_cache_guarded(&update.user.user, guard)
-                    .await?;
-            }
-            let backend = self.persistence_manager.backend();
-            anyhow::ensure!(
-                self.signal_cache
-                    .persist_identities_if_equal(
-                        &update.identities,
-                        &update.identity,
-                        backend,
-                        self.runtime.as_ref(),
-                    )
-                    .await?,
-                "primary identity changed during hosted ADV verification for {}",
-                update.user
-            );
-            if let Some(previous) = update.previous_identity
-                && previous != update.identity
-            {
-                use crate::types::events::{Event, EventKind};
-                self.core
-                    .event_bus
-                    .dispatch_with(EventKind::IdentityChange, || {
-                        Event::IdentityChange(
-                            crate::types::events::IdentityChange::builder()
-                                .user(update.user.to_non_ad())
-                                .implicit(true)
-                                .previous_identity_key(previous)
-                                .current_identity_key(update.identity)
-                                .build(),
-                        )
-                    });
-                // Token issuance can wait for an IQ. Keep it outside the
-                // mapping/registry guards and do not schedule another topology
-                // reset after the freshly verified list has been published.
-                if !update.user.is_bot()
-                    && !update.user.is_status_broadcast()
-                    && let Some(client) = self.self_weak.get().and_then(|weak| weak.upgrade())
-                {
-                    let user = update.user.clone();
-                    self.runtime
-                        .spawn(Box::pin(async move {
-                            client.reissue_tc_token_after_identity_change(&user).await;
-                        }))
-                        .detach();
-                }
-            }
+            self.apply_hosted_identity_update(update, guard).await?;
         }
 
         // Ordinary lists publish before destructive cleanup so a failed write
