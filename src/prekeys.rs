@@ -162,19 +162,31 @@ impl Client {
     /// Read a fresh, signed primary key without publishing a trust change.
     pub(crate) async fn fetch_adv_account_identity(&self, jid: &Jid) -> anyhow::Result<[u8; 32]> {
         let primary = jid.with_device(0);
-        let response = self
-            .execute(PreKeyFetchSpec::with_reason(
-                vec![primary.clone()],
-                PreKeyFetchReason::Identity,
-            ))
-            .await?;
-        let bundle = response
-            .bundles
-            .get(&primary)
-            .ok_or_else(|| anyhow::anyhow!("primary identity unavailable for ADV recovery"))?;
-        Ok(*authenticated_primary_identity(bundle)?
-            .public_key()
-            .public_key_bytes())
+        self.query_adv_account_identity(&primary, Some(PreKeyFetchReason::Identity))
+            .await
+    }
+
+    /// Fetch and authenticate a primary without installing it. Cold bootstrap
+    /// and rotation recovery decide separately whether it may become trusted.
+    #[inline(never)]
+    fn query_adv_account_identity<'a>(
+        &'a self,
+        primary: &'a Jid,
+        reason: Option<PreKeyFetchReason>,
+    ) -> wacore::runtime::BoxFuture<'a, anyhow::Result<[u8; 32]>> {
+        Box::pin(async move {
+            let spec = match reason {
+                Some(reason) => PreKeyFetchSpec::with_reason(vec![primary.clone()], reason),
+                None => PreKeyFetchSpec::new(vec![primary.clone()]),
+            };
+            let response = self.execute(spec).await?;
+            let bundle = response.bundles.get(primary).ok_or_else(|| {
+                anyhow::anyhow!("primary identity unavailable for ADV verification")
+            })?;
+            Ok(*authenticated_primary_identity(bundle)?
+                .public_key()
+                .public_key_bytes())
+        })
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.fetch_pre_keys", level = "debug", skip_all, fields(count = jids.len()), err(Debug)))]
@@ -315,16 +327,7 @@ impl Client {
         if let Some(identity) = self.cached_adv_account_identity(jid).await? {
             return Ok(identity);
         }
-        let identity = {
-            let response = self
-                .execute(PreKeyFetchSpec::new(vec![primary.clone()]))
-                .await?;
-            let bundle = response.bundles.get(&primary).ok_or_else(|| {
-                anyhow::anyhow!("primary identity unavailable for ADV verification")
-            })?;
-            authenticated_primary_identity(bundle)?
-        };
-        let key = *identity.public_key().public_key_bytes();
+        let key = self.query_adv_account_identity(&primary, None).await?;
         let backend = self.persistence_manager.backend();
         if !self
             .signal_cache
