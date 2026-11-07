@@ -533,6 +533,48 @@ async fn offline_device_add_does_not_publish_raw_id_before_durable_session_retir
     client.signal_shutdown_sync();
 }
 
+/// Storage round trips stay bounded for cold groups while either direction's
+/// durable history still forces admission before publishing the mapping.
+#[tokio::test]
+async fn mapping_history_uses_batches_for_both_cold_and_persisted_aliases() {
+    use crate::store::release::tests::ProbeBackend;
+    use wacore::usync::UsyncLidMapping;
+    let mappings: Vec<_> = (0..256)
+        .map(|index| UsyncLidMapping {
+            phone_number: format!("1555000{index:05}").into(),
+            lid: format!("100000000{index:06}").into(),
+        })
+        .collect();
+    for method in ["get_devices", "get_devices_batch"] {
+        let (mut probe, _) = ProbeBackend::new();
+        let storage = probe.backend.clone();
+        let (entered, calls) = async_channel::unbounded();
+        probe.entered = Some(entered);
+        probe.gate_method = method;
+        let (client, _) =
+            crate::test_utils::create_iq_test_client_with_backend(Arc::new(probe)).await;
+        while calls.try_recv().is_ok() {}
+        assert!(!client.device_mapping_has_registry_history(&mappings).await);
+        storage
+            .update_device_list(DeviceListRecord {
+                user: mappings[255].lid.as_str().into(),
+                devices: [DeviceInfo::new(0, None)].into(),
+                raw_id: Some(1),
+                timestamp: 1,
+                phash: None,
+            })
+            .await
+            .unwrap();
+        assert!(client.device_mapping_has_registry_history(&mappings).await);
+        assert_eq!(
+            calls.len(),
+            if method == "get_devices_batch" { 2 } else { 0 },
+            "history checks must not issue individual record reads"
+        );
+        client.signal_shutdown_sync();
+    }
+}
+
 #[tokio::test]
 async fn group_recovery_budget_counts_requests_across_repeated_batches() {
     use wacore::usync::{UserDeviceList, UsyncDevice};

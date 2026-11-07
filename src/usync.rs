@@ -614,18 +614,9 @@ impl Client {
             // Learning a new alias can expose an old record and schedule its
             // migration. Admit maintenance before publishing that mapping,
             // rather than invalidating our own captured topology in a dry run.
-            let mut mapping_has_history = false;
-            for mapping in &response.lid_mappings {
-                if self
-                    .load_device_record(&mapping.phone_number)
-                    .await
-                    .is_some()
-                    || self.load_device_record(&mapping.lid).await.is_some()
-                {
-                    mapping_has_history = true;
-                    break;
-                }
-            }
+            let mapping_has_history = self
+                .device_mapping_has_registry_history(&response.lid_mappings)
+                .await;
             // Most responses only publish device metadata. A durability hook
             // already owns the drain permit, so do not acquire it for lookups
             // that never touch Signal state. The guarded planner refuses all
@@ -749,6 +740,27 @@ impl Client {
         Ok(())
     }
 
+    /// Inspect both alias directions in one registry batch before learning
+    /// mappings, so a cold group does not add per-contact storage round trips.
+    async fn device_mapping_has_registry_history(
+        &self,
+        mappings: &[wacore::usync::UsyncLidMapping],
+    ) -> bool {
+        let users: Vec<_> = mappings
+            .iter()
+            .flat_map(|mapping| {
+                [
+                    Jid::pn(mapping.phone_number.as_str()),
+                    Jid::lid(mapping.lid.as_str()),
+                ]
+            })
+            .collect();
+        self.load_device_records_batch(&users.iter().collect::<Vec<_>>())
+            .await
+            .into_iter()
+            .any(|record| record.is_some())
+    }
+
     /// Retire old account state and publish trust before applying the new topology.
     /// Keep this rare reaction out of the common device-list polling loop.
     #[cold]
@@ -757,12 +769,9 @@ impl Client {
         &self,
         update: AdvIdentityUpdate<'_>,
         guard: &crate::client::device_topology::DeviceRegistryMutationGuard<'_>,
-        maintenance: Option<&SignalMaintenance<'_>>,
+        maintenance: &SignalMaintenance<'_>,
     ) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !update.reset_primary_session || maintenance.is_some(),
-            "ordinary identity recovery requires a processing permit"
-        );
+        maintenance.ensure_current()?;
         let changed = update
             .identities
             .iter()
@@ -776,10 +785,7 @@ impl Client {
                 for (address, _) in &update.identities {
                     self.signal_cache.delete_session(address).await;
                 }
-                maintenance
-                    .ok_or_else(|| anyhow::anyhow!("ordinary recovery lost its processing scope"))?
-                    .flush()
-                    .await?;
+                maintenance.flush().await?;
             }
         }
         if let Some(previous) = update.previous_record {
@@ -789,30 +795,18 @@ impl Client {
                         .await?;
                 }
             }
-            if let Some(maintenance) = maintenance {
-                maintenance
-                    .clear_device_record(&update.user.user, &previous)
-                    .await?;
-            } else {
-                self.clear_device_record(&update.user.user, update.user.server.as_str(), &previous)
-                    .await;
-            }
-            // Shared cleanup logs flush errors. Trust replacement additionally
-            // requires durable removal before the new account key is saved.
-            if let Some(maintenance) = maintenance {
-                maintenance.flush().await?;
-            } else {
-                self.flush_signal_cache_batch_safe().await?;
-            }
+            // This scope propagates persistence failure, so one flush is the
+            // durable retirement barrier before publishing replacement trust.
+            maintenance
+                .clear_device_record(&update.user.user, &previous)
+                .await?;
         }
         if changed {
             self.try_invalidate_device_cache_guarded(&update.user.user, guard)
                 .await?;
         }
         let backend = self.persistence_manager.backend();
-        if let Some(maintenance) = maintenance {
-            maintenance.ensure_current()?;
-        }
+        maintenance.ensure_current()?;
         anyhow::ensure!(
             self.signal_cache
                 .persist_identities_if_equal(
@@ -1257,8 +1251,12 @@ impl Client {
         // It is the retry record if any cleanup operation fails. Only then may
         // invalidation and the verified identity replacement consume that history.
         for update in identity_updates {
-            self.apply_adv_identity_update(update, guard, maintenance)
-                .await?;
+            self.apply_adv_identity_update(
+                update,
+                guard,
+                maintenance.ok_or(DeviceListMaintenanceRequired)?,
+            )
+            .await?;
         }
 
         // Lists without trust changes publish before destructive cleanup so a
@@ -1276,14 +1274,10 @@ impl Client {
             .await?;
         for (user, device_id) in pending_removals {
             if device_id != 0 {
-                if let Some(maintenance) = maintenance {
-                    self.delete_sessions_for_devices_unflushed(&user.user, &[device_id])
-                        .await;
-                    maintenance.flush().await?;
-                } else {
-                    self.delete_sessions_for_devices(&user.user, &[device_id])
-                        .await;
-                }
+                let maintenance = maintenance.ok_or(DeviceListMaintenanceRequired)?;
+                self.delete_sessions_for_devices_unflushed(&user.user, &[device_id])
+                    .await;
+                maintenance.flush().await?;
             }
             if let Err(e) = self
                 .delete_sender_key_rows_for_device(&user.user, device_id)
@@ -1311,18 +1305,10 @@ impl Client {
                     return Err(e.into());
                 }
             }
-            if let Some(maintenance) = maintenance {
-                maintenance
-                    .clear_device_record(&reset.user.user, &reset.previous)
-                    .await?;
-            } else {
-                Box::pin(self.clear_device_record(
-                    &reset.user.user,
-                    reset.user.server.as_str(),
-                    &reset.previous,
-                ))
-                .await;
-            }
+            maintenance
+                .ok_or(DeviceListMaintenanceRequired)?
+                .clear_device_record(&reset.user.user, &reset.previous)
+                .await?;
             if reset.invalidate_registry {
                 self.invalidate_device_cache_guarded(&reset.user.user, guard)
                     .await;
