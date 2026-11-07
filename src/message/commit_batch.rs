@@ -2200,6 +2200,82 @@ mod tests {
         hook_lookup_during_drain(true).await;
     }
 
+    /// Failed drain admission must propagate through the real dispatcher, so
+    /// acknowledging the device notification cannot discard its unapplied work.
+    #[tokio::test]
+    async fn device_notification_maintenance_failure_withholds_transport_ack() {
+        use crate::test_utils::{
+            create_iq_test_client, node_to_owned_ref, wait_for_outbound_tasks,
+        };
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+        use wacore_binary::builder::NodeBuilder;
+        for operation in ["add", "remove"] {
+            let (client, transport) = create_iq_test_client().await;
+            let user = Jid::pn("12025550199");
+            crate::test_utils::seed_adv_primary(&client, &user).await;
+            client
+                .update_device_list(DeviceListRecord {
+                    user: user.user.as_str().into(),
+                    devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(1))].into(),
+                    raw_id: Some(1),
+                    timestamp: 1,
+                    phash: None,
+                })
+                .await
+                .unwrap();
+            client.enter_drain_mode_for_tests();
+            client
+                .inbound_commit_batch
+                .fail_flushes
+                .store(true, Ordering::Release);
+            let _ = client.enqueue_inbound_commit(
+                PendingDelivery::from(item("DEVICE_NOTIFY_PENDING")),
+                false,
+            );
+            let mut details = wa::ADVKeyIndexList::default();
+            details.raw_id = Some(1);
+            details.current_index = Some(1);
+            details.valid_indexes = vec![1];
+            let signed = crate::test_utils::sign_adv_key_index(
+                waproto::codec::adv_key_index_list_to_vec(&details),
+            );
+            let device = user.with_device(if operation == "add" { 8 } else { 7 });
+            let node = NodeBuilder::new("notification")
+                .attr("type", "devices")
+                .attr("id", "DEVICE_NOTIFY_RETRY")
+                .attr("from", user.to_string())
+                .children([NodeBuilder::new(operation)
+                    .children([
+                        NodeBuilder::new("device")
+                            .attr("jid", device.to_string())
+                            .attr("key-index", "1")
+                            .build(),
+                        NodeBuilder::new("key-index-list")
+                            .attr("ts", "100")
+                            .bytes(signed)
+                            .build(),
+                    ])
+                    .build()])
+                .build();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.process_node(node_to_owned_ref(&node)),
+            )
+            .await
+            .unwrap();
+            wait_for_outbound_tasks(&client).await;
+            assert!(
+                transport.sent().is_empty(),
+                "failed {operation} must not be ACKed"
+            );
+            let record = client.load_device_record(&user.user).await.unwrap();
+            assert_eq!(record.devices.len(), 2);
+            assert!(record.devices.iter().any(|device| device.device_id() == 7));
+            assert!(client.inbound_commit_batch.has_entries());
+            client.signal_shutdown_sync();
+        }
+    }
+
     async fn capture_pending_receipts(
         client: &Arc<Client>,
     ) -> Arc<crate::transport::mock::CapturingMockTransport> {

@@ -611,22 +611,39 @@ impl Client {
             .iter()
             .any(|list| list.devices.iter().any(|device| device.is_hosted))
         {
+            // Learning a new alias can expose an old record and schedule its
+            // migration. Admit maintenance before publishing that mapping,
+            // rather than invalidating our own captured topology in a dry run.
+            let mut mapping_has_history = false;
+            for mapping in &response.lid_mappings {
+                if self
+                    .load_device_record(&mapping.phone_number)
+                    .await
+                    .is_some()
+                    || self.load_device_record(&mapping.lid).await.is_some()
+                {
+                    mapping_has_history = true;
+                    break;
+                }
+            }
             // Most responses only publish device metadata. A durability hook
             // already owns the drain permit, so do not acquire it for lookups
             // that never touch Signal state. The guarded planner refuses all
             // destructive work without a maintenance scope.
-            let result = self
-                .apply_device_list_response_inner(
-                    response,
-                    mode,
-                    topology_generation,
-                    group_users,
-                    None,
-                    None,
-                )
-                .await;
-            if !matches!(&result, Err(error) if error.is::<DeviceListMaintenanceRequired>()) {
-                return result;
+            if !mapping_has_history {
+                let result = self
+                    .apply_device_list_response_inner(
+                        response,
+                        mode,
+                        topology_generation,
+                        group_users,
+                        None,
+                        None,
+                    )
+                    .await;
+                if !matches!(&result, Err(error) if error.is::<DeviceListMaintenanceRequired>()) {
+                    return result;
+                }
             }
             let maintenance = client.begin_signal_maintenance().await?;
             return self

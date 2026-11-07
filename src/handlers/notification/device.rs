@@ -528,12 +528,12 @@ async fn sync_hashed_contact(client: &Arc<Client>, wire_hash: Option<&str>) {
     feature = "tracing",
     tracing::instrument(name = "wa.notif.devices", level = "debug", skip_all)
 )]
-pub(crate) async fn handle_devices_notification(client: &Arc<Client>, node: &NodeRef<'_>) {
+pub(crate) async fn handle_devices_notification(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
     let notification = match DeviceNotification::try_parse(node) {
         Ok(n) => n,
         Err(e) => {
             warn!("Failed to parse device notification: {e}");
-            return;
+            return true;
         }
     };
 
@@ -563,16 +563,22 @@ pub(crate) async fn handle_devices_notification(client: &Arc<Client>, node: &Nod
     match op.operation_type {
         wacore::stanza::devices::DeviceNotificationType::Add => {
             for device in &op.devices {
-                client
+                if !client
                     .patch_device_add(notification.user(), device, op.key_index.as_ref())
-                    .await;
+                    .await
+                {
+                    return false;
+                }
             }
         }
         wacore::stanza::devices::DeviceNotificationType::Remove => {
             for device in &op.devices {
-                client
+                if !client
                     .patch_device_remove(notification.user(), device.device_id())
-                    .await;
+                    .await
+                {
+                    return false;
+                }
             }
         }
         wacore::stanza::devices::DeviceNotificationType::Update => {
@@ -620,6 +626,7 @@ pub(crate) async fn handle_devices_notification(client: &Arc<Client>, node: &Nod
                     .build(),
             )
         });
+    true
 }
 
 /// Parsed device info from account_sync notification

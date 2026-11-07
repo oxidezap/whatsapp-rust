@@ -4133,7 +4133,7 @@ mod tests {
         let user = Jid::pn("12025550196");
         let children = retry_key_bundle_children();
         let old: Vec<u8> = get_bytes_content_ref(
-            &children[1]
+            children[1]
                 .as_node_ref()
                 .get_optional_child("identity")
                 .unwrap(),
@@ -4173,9 +4173,11 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("before a newer identity was published"),
+            matches!(
+                error.downcast_ref::<SignalProtocolError>(),
+                Some(SignalProtocolError::InvalidArgument(reason))
+                    if reason.contains("before a newer identity was published")
+            ),
             "{error:#}"
         );
         assert_eq!(
