@@ -426,26 +426,16 @@ impl Client {
         self.runtime.spawn_detached(Box::pin(async move {
             let result = async {
                 let maintenance = client.begin_signal_maintenance().await?;
-                use wacore::types::jid::JidExt as _;
                 let mut addresses: Vec<_> = recovered
                     .previous_identities
                     .iter()
-                    .map(|(jid, _)| jid.to_protocol_address())
+                    .map(|(jid, _)| jid.with_device(0))
                     .collect();
                 // Match PN/LID migration's lock order. Acquire these before mapping
                 // and registry guards: session installation can itself need them.
-                addresses.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
-                addresses.dedup();
-                let mut session_guards = Vec::with_capacity(addresses.len());
-                for address in addresses {
-                    session_guards.push(
-                        client
-                            .session_lock_for(address.as_str())
-                            .await
-                            .lock_arc()
-                            .await,
-                    );
-                }
+                addresses.sort_unstable_by(wacore::types::jid::cmp_for_lock_order);
+                addresses.dedup_by(|a, b| wacore::types::jid::cmp_for_lock_order(a, b).is_eq());
+                let session_guards = client.session_guards_for(&addresses).await;
                 let result = client
                     .apply_device_list_response_inner(
                         &response,

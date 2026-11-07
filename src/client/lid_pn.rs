@@ -1059,20 +1059,18 @@ impl Client {
             let pn_proto = pn_jid.to_protocol_address();
             let lid_proto = lid_jid.to_protocol_address();
 
-            // Acquire both per-address locks in stable lexicographic order to
-            // avoid deadlock against concurrent paths that legitimately hold
-            // only one side. (Callers never hold either lock.)
-            let pn_lock = self.session_lock_for(pn_proto.as_str()).await;
-            let lid_lock = self.session_lock_for(lid_proto.as_str()).await;
-            let (_first_guard, _second_guard) = if pn_proto.as_str() <= lid_proto.as_str() {
-                let pn_g = pn_lock.lock_arc().await;
-                let lid_g = lid_lock.lock_arc().await;
-                (pn_g, lid_g)
-            } else {
-                let lid_g = lid_lock.lock_arc().await;
-                let pn_g = pn_lock.lock_arc().await;
-                (lid_g, pn_g)
-            };
+            // Include both account anchors for companion writes: recovery
+            // must not publish new trust while this iteration retains old
+            // session material. Use the send path's order for the whole set.
+            let mut keys = vec![
+                from.with_device(0),
+                to.with_device(0),
+                pn_jid.clone(),
+                lid_jid.clone(),
+            ];
+            keys.sort_unstable_by(wacore::types::jid::cmp_for_lock_order);
+            keys.dedup_by(|a, b| wacore::types::jid::cmp_for_lock_order(a, b).is_eq());
+            let _guards = self.session_guards_for(&keys).await;
 
             // PN wins on conflict — mirrors whatsmeow's `MigratePNToLID`
             // (`ON CONFLICT DO UPDATE SET session=excluded.session`).
@@ -2694,12 +2692,71 @@ mod tests {
         crate::test_utils::synthetic_serialized_session(remote_regid, None)
     }
 
-    /// Both PN and LID slots hold a session for the same peer; the
-    /// PN one is the working Double Ratchet state, the LID one was
-    /// built freshly by `process_prekey_bundle` and has no link to
-    /// the peer's outbound chain. Migration must keep the PN blob —
-    /// silently dropping it leaves the linked device pinned to the
-    /// fresh stub forever. Reg-id tags identify which side won.
+    /// After device 0 has migrated, a companion's retained old session must
+    /// still exclude identity recovery under both primary account locks.
+    #[tokio::test]
+    async fn companion_migration_holds_both_primary_fences_while_retaining_old_state() {
+        use crate::store::release::tests::ProbeBackend;
+        use wacore::types::jid::JidExt as _;
+        let (mut probe, _) = ProbeBackend::new();
+        let (release, gate) = async_channel::unbounded();
+        let (entered, arrived) = async_channel::unbounded();
+        probe.gate = Some(gate);
+        probe.entered = Some(entered);
+        probe.gate_method = "after:get_session";
+        let phone = Jid::pn("12025550198");
+        let lid = Jid::lid("100000000000198");
+        probe
+            .backend
+            .put_session(
+                phone.with_device(1).to_protocol_address().as_str(),
+                &tagged_session_blob(4242),
+            )
+            .await
+            .unwrap();
+        let (client, _) =
+            crate::test_utils::create_iq_test_client_with_backend(Arc::new(probe)).await;
+        let migration = {
+            let client = client.clone();
+            let phone = phone.clone();
+            let lid = lid.clone();
+            tokio::spawn(async move {
+                let backend = client.persistence_manager.backend();
+                client
+                    .migrate_signal_sessions_with_backend(&phone, &lid, backend.as_ref())
+                    .await
+            })
+        };
+        // Device 0 first, then device 1 with an old session retained by I/O.
+        tokio::time::timeout(std::time::Duration::from_secs(5), arrived.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        release.send(()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), arrived.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        for primary in [&phone, &lid] {
+            let mutex = client
+                .session_lock_for(primary.to_protocol_address().as_str())
+                .await;
+            assert!(
+                mutex.try_lock().is_none(),
+                "recovery cannot publish while companion migration retains old state"
+            );
+        }
+        for _ in 0..MIGRATION_DEVICE_RANGE {
+            release.send(()).await.unwrap();
+        }
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), migration)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.migrated, 1);
+        client.signal_shutdown_sync();
+    }
+
     #[tokio::test]
     async fn migration_preserves_working_session_when_both_namespaces_present() {
         use wacore::libsignal::protocol::SessionRecord;
