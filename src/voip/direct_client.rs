@@ -223,7 +223,7 @@ pub(crate) async fn encrypt_known_call_keys(
         let guards = client.session_guards_for(&lock_jids).await;
         client.voip_state().direct.ensure_epoch(epoch)?;
         let plan = wacore::send::SessionPlan::assume_ready(devices.len());
-        let mut adapter = client.signal_adapter();
+        let mut adapter = client.signal_adapter().with_session_fence(guards);
         let mut stores = adapter.as_signal_stores();
         let raw = wacore::send::encrypt_for_devices_with_sessions_raw(
             &*client.runtime,
@@ -237,14 +237,14 @@ pub(crate) async fn encrypt_known_call_keys(
         client
             .stats
             .record_unkeyable_devices(UnkeyableDevice::Encrypt, raw.unkeyed_at_encrypt);
-        drop(guards);
-        let raw = wacore::session_engine::publication::PreparedSignal::new(raw).begin_commit();
-        let confirmation = client
-            .confirm_signal_state_pre_wire()
-            .await
-            .map_err(|error| CallError::Setup(error.to_string()))?;
-        raw.confirm(confirmation).into_payload()
+        raw
     };
+    let raw = wacore::session_engine::publication::PreparedSignal::new(raw).begin_commit();
+    let confirmation = client
+        .confirm_signal_state_pre_wire()
+        .await
+        .map_err(|error| CallError::Setup(error.to_string()))?;
+    let raw = raw.confirm(confirmation).into_payload();
     let device_keys: Vec<OfferDeviceKey> = devices
         .iter()
         .filter_map(|device| raw.devices.iter().find(|entry| &entry.device_jid == device))

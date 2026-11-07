@@ -179,12 +179,29 @@ fn defer_plaintext(
     });
 }
 
+#[derive(Default)]
+struct IncomingAccountFence {
+    guard: Option<async_lock::MutexGuardArc<()>>,
+    retired: bool,
+}
+
 impl Client {
     async fn validate_incoming_companion_identity(
         &self,
         sender: &Jid,
         certificate: Option<&[u8]>,
         identity: &[u8; 32],
+    ) -> anyhow::Result<()> {
+        self.validate_incoming_companion_identity_inner(sender, certificate, identity, false)
+            .await
+    }
+
+    async fn validate_incoming_companion_identity_inner(
+        &self,
+        sender: &Jid,
+        certificate: Option<&[u8]>,
+        identity: &[u8; 32],
+        account_locked: bool,
     ) -> anyhow::Result<()> {
         let address = sender.to_protocol_address();
         let backend = self
@@ -202,7 +219,15 @@ impl Client {
         }
         let certificate = certificate
             .ok_or_else(|| anyhow::anyhow!("companion message omits ADV certificate"))?;
-        let primary = self.ensure_adv_account_identity(sender).await?;
+        let primary = if account_locked {
+            self.cached_adv_account_identity(sender)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("companion account identity unavailable after locking")
+                })?
+        } else {
+            self.ensure_adv_account_identity(sender).await?
+        };
         if wacore::adv::validate_adv_with_identity_key(
             certificate,
             identity,
@@ -213,6 +238,39 @@ impl Client {
             anyhow::bail!("companion message ADV validation failed");
         }
         Ok(())
+    }
+
+    /// Recheck prekeys after cold bootstrap and fence every companion decrypt:
+    /// even a regular msg saves identity before committing its session checkout.
+    async fn lock_incoming_companion_account(
+        &self,
+        sender: &Jid,
+        certificate: Option<&[u8]>,
+        payloads: &[EncPayload],
+    ) -> anyhow::Result<IncomingAccountFence> {
+        if sender.device == 0 || payloads.is_empty() {
+            return Ok(IncomingAccountFence::default());
+        }
+        let guard = self.lock_companion_account(sender).await;
+        for payload in payloads
+            .iter()
+            .filter(|payload| payload.enc_type == EncType::PreKeyMessage)
+        {
+            if let Ok(message) = PreKeySignalMessage::try_from(payload.ciphertext.clone()) {
+                let identity = *message.identity_key().public_key().public_key_bytes();
+                self.validate_incoming_companion_identity_inner(
+                    sender,
+                    certificate,
+                    &identity,
+                    true,
+                )
+                .await?;
+            }
+        }
+        Ok(IncomingAccountFence {
+            guard,
+            retired: false,
+        })
     }
 
     #[inline(never)]
@@ -843,6 +901,23 @@ impl Client {
         let session_payloads_empty = session_payloads.is_empty();
 
         let session_outcome = if !is_group_sender && !session_payloads_empty {
+            let account_fence = match self
+                .lock_incoming_companion_account(
+                    &sender_encryption_jid,
+                    device_identity.as_deref(),
+                    &session_payloads,
+                )
+                .await
+            {
+                Ok(fence) => fence,
+                Err(_) => {
+                    log::warn!(
+                        "Dropping companion session batch after account validation failed for {}",
+                        sender_encryption_jid.observe()
+                    );
+                    return;
+                }
+            };
             self.clone()
                 .process_session_enc_batch_with_origin(
                     session_payloads,
@@ -850,7 +925,7 @@ impl Client {
                     &sender_encryption_jid,
                     decrypt_fail_mode,
                     ack_recipient.as_ref(),
-                    stanza_origin,
+                    (stanza_origin, account_fence),
                 )
                 .await
         } else {
@@ -1067,7 +1142,33 @@ impl Client {
             sender_encryption_jid,
             decrypt_fail_mode,
             None,
-            raw_pending::StanzaOrigin::new(),
+            (
+                raw_pending::StanzaOrigin::new(),
+                IncomingAccountFence::default(),
+            ),
+        )
+        .await
+    }
+
+    /// Exercise the production account-fenced decrypt phase from crypto fixtures.
+    #[cfg(test)]
+    pub(crate) async fn process_session_enc_batch_account_fenced(
+        self: Arc<Self>,
+        payloads: Vec<EncPayload>,
+        info: &Arc<MessageInfo>,
+        sender: &Jid,
+    ) -> SessionBatchOutcome {
+        let fence = self
+            .lock_incoming_companion_account(sender, None, &payloads)
+            .await
+            .unwrap();
+        self.process_session_enc_batch_with_origin(
+            payloads,
+            info,
+            sender,
+            crate::types::events::DecryptFailMode::Show,
+            None,
+            (raw_pending::StanzaOrigin::new(), fence),
         )
         .await
     }
@@ -1079,8 +1180,9 @@ impl Client {
         sender_encryption_jid: &Jid,
         decrypt_fail_mode: crate::types::events::DecryptFailMode,
         ack_recipient: Option<&Jid>,
-        stanza_origin: raw_pending::StanzaOrigin,
+        scope: (raw_pending::StanzaOrigin, IncomingAccountFence),
     ) -> SessionBatchOutcome {
+        let stanza_origin = scope.0;
         // Decrypt and projection are sequential phases. Keeping their state in
         // separate futures lets idle lanes reuse the frame without a per-batch box.
         let (mut outcome, deferred, _timer) = {
@@ -1090,7 +1192,7 @@ impl Client {
                 sender_encryption_jid,
                 decrypt_fail_mode,
                 ack_recipient,
-                stanza_origin,
+                scope,
             ));
             std::future::poll_fn(|cx| poll_inbound_phase(future.as_mut(), cx)).await
         };
@@ -1160,12 +1262,13 @@ impl Client {
         sender_encryption_jid: &Jid,
         decrypt_fail_mode: crate::types::events::DecryptFailMode,
         ack_recipient: Option<&Jid>,
-        stanza_origin: raw_pending::StanzaOrigin,
+        scope: (raw_pending::StanzaOrigin, IncomingAccountFence),
     ) -> (
         SessionBatchOutcome,
         Vec<DeferredPlaintext>,
         Option<wacore::telemetry::Timer>,
     ) {
+        let (stanza_origin, mut account_fence) = scope;
         if payloads.is_empty() {
             return (SessionBatchOutcome::default(), Vec::new(), None);
         }
@@ -1198,6 +1301,10 @@ impl Client {
         let mut local_identity_reacted = false;
 
         for payload in payloads {
+            if account_fence.retired {
+                outcome.had_failure = true;
+                break;
+            }
             let EncPayload {
                 ciphertext,
                 enc_type,
@@ -1520,6 +1627,7 @@ impl Client {
                                                 info,
                                                 &session_mutex,
                                                 &mut session_guard,
+                                                &mut account_fence,
                                                 &mut deferred,
                                                 stanza_origin,
                                             ));
@@ -1653,6 +1761,7 @@ impl Client {
                                 info,
                                 &session_mutex,
                                 &mut session_guard,
+                                &mut account_fence,
                                 &mut deferred,
                                 stanza_origin,
                             ));
@@ -1718,6 +1827,7 @@ impl Client {
                                 info,
                                 &session_mutex,
                                 &mut session_guard,
+                                &mut account_fence,
                                 &mut deferred,
                                 stanza_origin,
                             ));
@@ -1801,6 +1911,7 @@ impl Client {
                                 info,
                                 &session_mutex,
                                 &mut session_guard,
+                                &mut account_fence,
                                 &mut deferred,
                                 stanza_origin,
                             ));
@@ -1924,6 +2035,7 @@ impl Client {
         // still precedes PASS 2's group decrypt) and per-chat order is owned by the
         // serial chat-lane worker, not this guard. Matches whatsmeow.
         drop(session_guard);
+        drop(account_fence);
 
         // Keep the existing measurement boundary through plaintext projection.
         (outcome, deferred, Some(timer))
@@ -2715,6 +2827,7 @@ impl Client {
         info: &Arc<MessageInfo>,
         session_mutex: &Arc<async_lock::Mutex<()>>,
         session_guard: &mut Option<async_lock::MutexGuardArc<()>>,
+        account_fence: &mut IncomingAccountFence,
         deferred: &mut Vec<DeferredPlaintext>,
         stanza_origin: raw_pending::StanzaOrigin,
     ) -> MigrationDecryptResult {
@@ -2728,7 +2841,22 @@ impl Client {
 
         // Release the address lock so the migration loop can acquire it for
         // the matching device without re-entering.
+        let account_identity = if account_fence.guard.is_some() {
+            match self
+                .cached_migration_account_identity(sender_jid, &pn)
+                .await
+            {
+                Ok(identity) => Some(identity),
+                Err(_) => {
+                    account_fence.retired = true;
+                    return MigrationDecryptResult::NotDecrypted(None, None);
+                }
+            }
+        } else {
+            None
+        };
         *session_guard = None;
+        account_fence.guard = None;
         let migrated = self
             .migrate_signal_sessions_on_lid_discovery(&pn, &sender_jid.user)
             .await;
@@ -2736,7 +2864,20 @@ impl Client {
         // for subsequent payloads in the batch. Every return below is past this
         // reacquire, so the caller always gets the guard back as `Some`; losing
         // that would silently drop same-sender serialization.
+        if account_identity.is_some() {
+            account_fence.guard = self.lock_companion_account(sender_jid).await;
+        }
         *session_guard = Some(session_mutex.lock_arc().await);
+        if let Some(previous) = account_identity
+            && self
+                .cached_migration_account_identity(sender_jid, &pn)
+                .await
+                .ok()
+                != Some(previous)
+        {
+            account_fence.retired = true;
+            return MigrationDecryptResult::NotDecrypted(None, None);
+        }
 
         // Nothing moved namespaces, so the retry would hit the exact same
         // state, fail identically, and log a second decrypt failure for
@@ -2807,6 +2948,19 @@ impl Client {
                 )
             }
         }
+    }
+
+    /// LID wins when present, but cold namespace migration may legitimately
+    /// move the only trusted primary from PN into the previously empty LID.
+    async fn cached_migration_account_identity(
+        &self,
+        lid: &Jid,
+        pn: &str,
+    ) -> anyhow::Result<Option<[u8; 32]>> {
+        if let Some(identity) = self.cached_adv_account_identity(lid).await? {
+            return Ok(Some(identity));
+        }
+        self.cached_adv_account_identity(&Jid::pn(pn)).await
     }
 
     pub(crate) async fn cache_lid_pn_from_message(
@@ -2961,6 +3115,174 @@ mod tests {
 #[cfg(test)]
 mod adv_tests {
     use super::*;
+
+    /// Real parsable Signal envelopes and a valid ADV certificate; crypto
+    /// failure is sufficient for the lock-lifetime test and changes no trust.
+    fn companion_payload_fixture() -> (Vec<EncPayload>, Vec<u8>, [u8; 32]) {
+        use wacore::libsignal::protocol::{IdentityKey, KeyPair};
+        let device = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let identity = IdentityKey::new(device.public_key);
+        let inner = SignalMessage::new(
+            3,
+            &[0; 32],
+            device.public_key,
+            0,
+            0,
+            &[0; 16],
+            &identity,
+            &identity,
+        )
+        .unwrap();
+        let message =
+            PreKeySignalMessage::new(3, 1234, None, 1.into(), device.public_key, identity, inner)
+                .unwrap();
+        let certificate = waproto::codec::adv_signed_device_identity_to_vec(
+            &wacore::adv::test_util::signed_identity(
+                crate::test_utils::adv_test_account(),
+                &device,
+                b"\x18\x07",
+                &[6, 0],
+                Some(&[6, 1]),
+                true,
+            ),
+        );
+        (
+            vec![EncPayload {
+                ciphertext: message.serialize().into(),
+                enc_type: EncType::PreKeyMessage,
+                padding_version: 2,
+                enc_index: 0,
+                state: None,
+                session_type: None,
+            }],
+            certificate,
+            *device.public_key.public_key_bytes(),
+        )
+    }
+
+    #[tokio::test]
+    async fn queued_companion_receive_rechecks_trust_after_recovery_publication() {
+        use wacore::libsignal::protocol::KeyPair;
+        let client = crate::test_utils::create_test_client().await;
+        let sender = Jid::pn_device("12025550128", 7);
+        crate::test_utils::seed_adv_primary(&client, &sender).await;
+        let (payloads, certificate, identity) = companion_payload_fixture();
+        client
+            .validate_incoming_companion_identity(&sender, Some(&certificate), &identity)
+            .await
+            .unwrap();
+        let primary = sender.with_device(0).to_protocol_address();
+        let lock = client.session_lock_for(primary.as_str()).await;
+        let recovery = lock.lock_arc().await;
+        let (entered, started) = futures::channel::oneshot::channel();
+        let receive = {
+            let client = client.clone();
+            let sender = sender.clone();
+            tokio::spawn(async move {
+                entered.send(()).unwrap();
+                client
+                    .lock_incoming_companion_account(&sender, Some(&certificate), &payloads)
+                    .await
+                    .map(|_| ())
+            })
+        };
+        started.await.unwrap();
+        client
+            .signal_cache
+            .delete_session(&sender.to_protocol_address())
+            .await;
+        client
+            .signal_cache
+            .delete_identity(&sender.to_protocol_address())
+            .await;
+        let replacement = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        client
+            .signal_cache
+            .put_identity(&primary, replacement.public_key.public_key_bytes())
+            .await;
+        drop(recovery);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), receive)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(
+            client.cached_adv_account_identity(&sender).await.unwrap(),
+            Some(*replacement.public_key.public_key_bytes())
+        );
+        client.signal_shutdown_sync();
+    }
+
+    async fn check_inbound_account_fence(regular_message: bool) {
+        let client = crate::test_utils::create_test_client().await;
+        let sender = Jid::pn_device("12025550129", 7);
+        crate::test_utils::seed_adv_primary(&client, &sender).await;
+        let (mut payloads, certificate, identity) = companion_payload_fixture();
+        if regular_message {
+            let message = PreKeySignalMessage::try_from(payloads[0].ciphertext.clone()).unwrap();
+            payloads[0].ciphertext = bytes::Bytes::copy_from_slice(message.message().serialized());
+            payloads[0].enc_type = EncType::Message;
+        }
+        client
+            .validate_incoming_companion_identity(&sender, Some(&certificate), &identity)
+            .await
+            .unwrap();
+        let fence = client
+            .lock_incoming_companion_account(&sender, Some(&certificate), &payloads)
+            .await
+            .unwrap();
+        let primary = client
+            .session_lock_for(sender.with_device(0).to_protocol_address().as_str())
+            .await;
+        let device = client
+            .session_lock_for(sender.to_protocol_address().as_str())
+            .await;
+        let device_guard = device.lock_arc().await;
+        let receive = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                let info = Arc::new(MessageInfo {
+                    id: "INBOUND_ACCOUNT_FENCE".into(),
+                    source: crate::types::message::MessageSource {
+                        chat: sender.to_non_ad(),
+                        sender: sender.clone(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
+                client
+                    .decrypt_session_enc_batch_with_origin(
+                        payloads,
+                        &info,
+                        &sender,
+                        crate::types::events::DecryptFailMode::Show,
+                        None,
+                        (raw_pending::StanzaOrigin::new(), fence),
+                    )
+                    .await
+            })
+        };
+        assert!(primary.try_lock().is_none());
+        drop(device_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(5), receive)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(primary.try_lock().is_some());
+        client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn inbound_companion_keeps_account_fence_while_waiting_on_its_device() {
+        check_inbound_account_fence(false).await;
+    }
+
+    #[tokio::test]
+    async fn regular_companion_receive_keeps_account_fence_through_session_commit() {
+        check_inbound_account_fence(true).await;
+    }
 
     #[tokio::test]
     async fn incoming_companions_require_adv_before_trusting_a_new_identity() {

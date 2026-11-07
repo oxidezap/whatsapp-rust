@@ -1748,9 +1748,9 @@ async fn fanout_group_epoch_for_generation(
             }
         }
         let plan = wacore::send::SessionPlan::assume_ready(recipients.len());
-        let mut adapter = client.signal_adapter();
+        let mut adapter = client.signal_adapter().with_session_fence(session_guards);
         let mut stores = adapter.as_signal_stores();
-        let encrypted = wacore::send::encrypt_for_devices_with_sessions_raw(
+        wacore::send::encrypt_for_devices_with_sessions_raw(
             &*client.runtime,
             &mut stores,
             &recipients,
@@ -1758,9 +1758,7 @@ async fn fanout_group_epoch_for_generation(
             plan,
         )
         .await
-        .map_err(|error| CallError::Setup(error.to_string()));
-        drop(session_guards);
-        encrypted
+        .map_err(|error| CallError::Setup(error.to_string()))
     };
     let encrypted = encrypted?;
     // This path asserts sessions upstream instead of establishing them, so

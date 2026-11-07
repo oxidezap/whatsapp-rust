@@ -156,7 +156,11 @@ async fn handle_notification_scoped(
         Some(NotificationType::AccountSync) => {
             Box::pin(handle_account_sync_notification(client, nr)).await
         }
-        Some(NotificationType::Devices) => Box::pin(handle_devices_notification(client, nr)).await,
+        Some(NotificationType::Devices) => {
+            if !Box::pin(handle_devices_notification(client, nr)).await {
+                return false;
+            }
+        }
         Some(NotificationType::LinkCodeCompanionReg) => {
             Box::pin(crate::pair_code::handle_pair_code_notification_scoped(
                 client, nr, shutdown,

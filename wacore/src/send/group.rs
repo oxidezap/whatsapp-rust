@@ -349,7 +349,16 @@ pub async fn prepare_group_stanza(
                 .session_setup_lock(&sender_key_name)
                 .await;
             let _setup_guard = setup_lock.lock().await;
-            match ensure_sessions_for_devices(runtime, stores, resolver, list).await {
+            match ensure_sessions_for_devices_guarded(
+                runtime,
+                stores,
+                resolver,
+                list,
+                None,
+                session_guard.clone(),
+            )
+            .await
+            {
                 Ok(plan) => Some(plan),
                 Err(error) if distribution_policy == SenderKeyDistributionPolicy::Required => {
                     return Err(error.context("required sender-key session setup failed"));

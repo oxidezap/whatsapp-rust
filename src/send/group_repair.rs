@@ -402,55 +402,56 @@ impl Client {
         } else {
             wacore::messages::MessageUtils::encode_dm_plaintexts(&message, context.as_ref(), group)
         };
-        let mut adapter = self.signal_adapter();
-        let mut stores = adapter.as_signal_stores();
         let mut participants = Vec::with_capacity(devices.devices().len());
         let mut prekey = false;
         let mut attempted_devices = 0;
         let split = devices.recipient_devices().len();
         let edit = wacore::types::message::EditAttribute::infer_from_message(&message);
-        for (targets, plaintext, addresses) in [
-            (
-                devices.recipient_devices(),
-                plaintexts.recipient.as_slice(),
-                &addresses[..split],
-            ),
-            (
-                devices.own_other_devices(),
-                plaintexts.own_devices.as_slice(),
-                &addresses[split..],
-            ),
-        ] {
-            let mut eligible_targets = Vec::with_capacity(targets.len());
-            let mut eligible_addresses = Vec::with_capacity(targets.len());
-            for (target, address) in targets.iter().zip(addresses) {
-                if sent.identity.unchanged_for(self, &target.user).await
-                    && (target.user == address.user
-                        || sent.identity.unchanged_for(self, &address.user).await)
-                {
-                    eligible_targets.push(target.clone());
-                    eligible_addresses.push(address.clone());
+        {
+            let mut adapter = self.signal_adapter().with_session_fence(guards);
+            let mut stores = adapter.as_signal_stores();
+            for (targets, plaintext, addresses) in [
+                (
+                    devices.recipient_devices(),
+                    plaintexts.recipient.as_slice(),
+                    &addresses[..split],
+                ),
+                (
+                    devices.own_other_devices(),
+                    plaintexts.own_devices.as_slice(),
+                    &addresses[split..],
+                ),
+            ] {
+                let mut eligible_targets = Vec::with_capacity(targets.len());
+                let mut eligible_addresses = Vec::with_capacity(targets.len());
+                for (target, address) in targets.iter().zip(addresses) {
+                    if sent.identity.unchanged_for(self, &target.user).await
+                        && (target.user == address.user
+                            || sent.identity.unchanged_for(self, &address.user).await)
+                    {
+                        eligible_targets.push(target.clone());
+                        eligible_addresses.push(address.clone());
+                    }
                 }
+                if eligible_targets.is_empty() {
+                    continue;
+                }
+                attempted_devices += eligible_targets.len();
+                let summary = wacore::send::encrypt_for_devices_into(
+                    &*self.runtime,
+                    &mut stores,
+                    self.as_ref(),
+                    &eligible_targets,
+                    plaintext,
+                    wacore::send::should_hide_decrypt_fail_for_send(edit.as_ref(), &message),
+                    wacore::send::media_type_from_message(&message),
+                    &mut participants,
+                    Some(&eligible_addresses),
+                )
+                .await?;
+                prekey |= summary.includes_prekey_message;
             }
-            if eligible_targets.is_empty() {
-                continue;
-            }
-            attempted_devices += eligible_targets.len();
-            let summary = wacore::send::encrypt_for_devices_into(
-                &*self.runtime,
-                &mut stores,
-                self.as_ref(),
-                &eligible_targets,
-                plaintext,
-                wacore::send::should_hide_decrypt_fail_for_send(edit.as_ref(), &message),
-                wacore::send::media_type_from_message(&message),
-                &mut participants,
-                Some(&eligible_addresses),
-            )
-            .await?;
-            prekey |= summary.includes_prekey_message;
         }
-        drop(guards);
         if attempted_devices == 0 {
             return Ok(());
         }

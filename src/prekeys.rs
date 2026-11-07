@@ -159,6 +159,36 @@ fn authenticated_primary_identity(
 }
 
 impl Client {
+    /// Read a fresh, signed primary key without publishing a trust change.
+    pub(crate) async fn fetch_adv_account_identity(&self, jid: &Jid) -> anyhow::Result<[u8; 32]> {
+        let primary = jid.with_device(0);
+        self.query_adv_account_identity(&primary, Some(PreKeyFetchReason::Identity))
+            .await
+    }
+
+    /// Fetch and authenticate a primary without installing it. Cold bootstrap
+    /// and rotation recovery decide separately whether it may become trusted.
+    #[inline(never)]
+    fn query_adv_account_identity<'a>(
+        &'a self,
+        primary: &'a Jid,
+        reason: Option<PreKeyFetchReason>,
+    ) -> wacore::runtime::BoxFuture<'a, anyhow::Result<[u8; 32]>> {
+        Box::pin(async move {
+            let spec = match reason {
+                Some(reason) => PreKeyFetchSpec::with_reason(vec![primary.clone()], reason),
+                None => PreKeyFetchSpec::new(vec![primary.clone()]),
+            };
+            let response = self.execute(spec).await?;
+            let bundle = response.bundles.get(primary).ok_or_else(|| {
+                anyhow::anyhow!("primary identity unavailable for ADV verification")
+            })?;
+            Ok(*authenticated_primary_identity(bundle)?
+                .public_key()
+                .public_key_bytes())
+        })
+    }
+
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.fetch_pre_keys", level = "debug", skip_all, fields(count = jids.len()), err(Debug)))]
     pub(crate) async fn fetch_pre_keys(
         &self,
@@ -166,6 +196,10 @@ impl Client {
         reason: Option<PreKeyFetchReason>,
     ) -> Result<wacore::prekeys::PreKeyFetchOutcome, anyhow::Error> {
         let account_identities = self.collect_account_identities(jids).await?;
+        let mut primary_snapshots = Vec::new();
+        for jid in jids.iter().filter(|jid| jid.device == 0) {
+            primary_snapshots.push((jid.clone(), self.cached_adv_account_identity(jid).await?));
+        }
         let cold_companions: Vec<_> = jids
             .iter()
             .filter(|jid| jid.device != 0 && !account_identities.contains_key(*jid))
@@ -173,10 +207,12 @@ impl Client {
             .collect();
         let mut requested = jids.to_vec();
         let mut bootstrap_primaries = Vec::new();
-        for jid in jids.iter().filter(|jid| jid.device != 0) {
+        for jid in &cold_companions {
             let primary = jid.with_device(0);
-            if !account_identities.contains_key(jid) && !requested.contains(&primary) {
+            if !bootstrap_primaries.contains(&primary) {
                 bootstrap_primaries.push(primary.clone());
+            }
+            if !requested.contains(&primary) {
                 requested.push(primary);
             }
         }
@@ -205,10 +241,10 @@ impl Client {
                 outcome.bundles.remove(companion);
             }
         }
-        // Remember authenticated bootstrap primaries before discarding their
-        // bundles. No session lock is acquired here: the session engine already
-        // holds companion locks, and taking the primary lock could invert its
-        // lock ordering. The cache operation compares and inserts atomically.
+        // Remember every cold account anchor before returning companions, even
+        // when device 0 was explicitly requested: fanout validates bundles
+        // before installing any primary session. The caller may already own
+        // session locks, so compare/insert atomically instead of reacquiring them.
         let backend = self.persistence_manager.backend();
         for jid in &bootstrap_primaries {
             if let Some(bundle) = outcome.bundles.get(jid) {
@@ -228,6 +264,11 @@ impl Client {
             }
         }
         // Keep the public fetch outcome scoped to the caller's requested devices.
+        for (jid, previous) in primary_snapshots {
+            if let Some(bundle) = outcome.bundles.get_mut(&jid) {
+                bundle.set_identity_snapshot(previous);
+            }
+        }
         outcome.bundles.retain(|jid, _| jids.contains(jid));
         outcome.rejected.retain(|entry| jids.contains(&entry.jid));
 
@@ -286,16 +327,7 @@ impl Client {
         if let Some(identity) = self.cached_adv_account_identity(jid).await? {
             return Ok(identity);
         }
-        let identity = {
-            let response = self
-                .execute(PreKeyFetchSpec::new(vec![primary.clone()]))
-                .await?;
-            let bundle = response.bundles.get(&primary).ok_or_else(|| {
-                anyhow::anyhow!("primary identity unavailable for ADV verification")
-            })?;
-            authenticated_primary_identity(bundle)?
-        };
-        let key = *identity.public_key().public_key_bytes();
+        let key = self.query_adv_account_identity(&primary, None).await?;
         let backend = self.persistence_manager.backend();
         if !self
             .signal_cache

@@ -10,6 +10,17 @@ use wacore_binary::Jid;
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl SendContextResolver for Client {
+    /// Recheck the retained certificate anchor under the fanout's account lock.
+    async fn validate_prekey_account_identity(
+        &self,
+        jid: &Jid,
+        bundle: &PreKeyBundle,
+    ) -> Result<(), anyhow::Error> {
+        self.check_prekey_account_identity(jid, bundle)
+            .await
+            .map_err(Into::into)
+    }
+
     fn sender_identity_role(&self) -> wacore::send::SenderIdentityRole {
         self.sending_identity_role()
     }

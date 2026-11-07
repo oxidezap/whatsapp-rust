@@ -30,6 +30,22 @@ const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
 /// timeout defaults to 0) because our durability hook must not lag.
 const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
+thread_local! {
+    // Poll-scoped rather than task/executor-specific: a hook may resume on a
+    // different worker, and unrelated tasks must not inherit its restriction.
+    static INBOUND_HOOK_CLIENT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+impl Client {
+    pub(crate) fn ensure_signal_maintenance_context(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            INBOUND_HOOK_CLIENT.get() != Some(std::ptr::from_ref(self) as usize),
+            "Signal maintenance cannot run inside an inbound durability hook; retry from a control task"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 struct BatchState {
     entries: Vec<PendingDelivery>,
@@ -1145,7 +1161,7 @@ impl Client {
     // The receive caller already owns the processing permit. Capacity pressure
     // must flush queued predecessors without reacquiring that same permit or
     // advancing the incoming ciphertext before admission succeeds.
-    pub(super) async fn flush_inbound_commits_while_processing(self: &Arc<Self>) -> bool {
+    pub(crate) async fn flush_inbound_commits_while_processing(self: &Arc<Self>) -> bool {
         let PendingInboundBatch {
             entries,
             commit_ticket,
@@ -1832,13 +1848,23 @@ impl Client {
             }
             if !items.is_empty()
                 && let Some(hook) = self.inbound_durability_hook()
-                && let Err(e) = hook.on_messages(self.clone(), &items).await
             {
-                log::warn!(
-                    "Inbound durability hook failed for batch of {}; suppressing acks for redelivery: {e:?}",
-                    items.len()
-                );
-                return PendingCommitOutcome::BUFFERED;
+                let mut hook_future = std::pin::pin!(hook.on_messages(self.clone(), &items));
+                let result = std::future::poll_fn(|cx| {
+                    let previous = INBOUND_HOOK_CLIENT
+                        .replace(Some(std::ptr::from_ref(self.as_ref()) as usize));
+                    let _restore =
+                        scopeguard::guard(previous, |previous| INBOUND_HOOK_CLIENT.set(previous));
+                    hook_future.as_mut().poll(cx)
+                })
+                .await;
+                if let Err(e) = result {
+                    log::warn!(
+                        "Inbound durability hook failed for batch of {}; suppressing acks for redelivery: {e:?}",
+                        items.len()
+                    );
+                    return PendingCommitOutcome::BUFFERED;
+                }
             }
             hook_committed = self.inbound_durability_hook.get().is_some();
 
@@ -2018,6 +2044,236 @@ mod tests {
                 ..Default::default()
             }))
             .build()
+    }
+
+    /// A metadata-only lookup for a user outside this batch must not try to
+    /// acquire the single processing permit already held by the hook's caller.
+    async fn hook_lookup_during_drain(recovery: bool) {
+        use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq};
+        use std::time::Duration;
+        use wacore_binary::builder::NodeBuilder;
+        struct LookupHook {
+            user: Jid,
+            recovery: bool,
+        }
+        #[async_trait::async_trait]
+        impl InboundDurabilityHook for LookupHook {
+            async fn on_messages(
+                &self,
+                client: Arc<Client>,
+                batch: &[InboundMessage],
+            ) -> anyhow::Result<()> {
+                assert!(
+                    batch
+                        .iter()
+                        .all(|message| message.info.source.sender != self.user)
+                );
+                let result = client
+                    .signal()
+                    .get_user_devices(std::slice::from_ref(&self.user))
+                    .await;
+                if self.recovery {
+                    let error = result.unwrap_err();
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("cannot run inside an inbound durability hook"),
+                        "{error:#}"
+                    );
+                    return Err(error.into());
+                }
+                let devices = result?;
+                assert_eq!(devices, vec![self.user.clone()]);
+                Ok(())
+            }
+        }
+        let (client, transport) = create_iq_test_client().await;
+        let user = Jid::pn("12025550195");
+        client
+            .inbound_durability_hook
+            .set(Arc::new(LookupHook {
+                user: user.clone(),
+                recovery,
+            }))
+            .ok()
+            .unwrap();
+        let old = wacore::libsignal::protocol::KeyPair::generate(&mut rand::make_rng::<
+            rand::rngs::StdRng,
+        >());
+        if recovery {
+            client
+                .signal_cache
+                .put_identity(
+                    &user.to_protocol_address(),
+                    old.public_key.public_key_bytes(),
+                )
+                .await;
+        }
+        client.enter_drain_mode_for_tests();
+        let commit = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                let _permit = client.acquire_message_processing_permit().await;
+                client
+                    .commit_pending_batch_result(
+                        vec![PendingDelivery::from(item("HOOK_DEVICE_LOOKUP"))].into(),
+                        BatchOrigin::OfflineDrain,
+                        None,
+                        true,
+                    )
+                    .await
+            })
+        };
+        let iq = decode_sent_iq(&transport, 0).await;
+        let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+        let mut devices = vec![NodeBuilder::new("device").attr("id", "0").build()];
+        if recovery {
+            devices.push(
+                NodeBuilder::new("device")
+                    .attr("id", "2")
+                    .attr("key-index", "1")
+                    .build(),
+            );
+        }
+        let mut children = vec![NodeBuilder::new("device-list").children(devices).build()];
+        if recovery {
+            let mut details = wa::ADVKeyIndexList::default();
+            details.raw_id = Some(1);
+            details.current_index = Some(1);
+            details.valid_indexes = vec![1];
+            children.push(
+                NodeBuilder::new("key-index-list")
+                    .attr("ts", "100")
+                    .bytes(crate::test_utils::sign_adv_key_index(
+                        waproto::codec::adv_key_index_list_to_vec(&details),
+                    ))
+                    .build(),
+            );
+        }
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("usync")
+                .children([NodeBuilder::new("list")
+                    .children([NodeBuilder::new("user")
+                        .attr("jid", user.to_string())
+                        .children([NodeBuilder::new("devices").children(children).build()])
+                        .build()])
+                    .build()])
+                .build()])
+            .build();
+        answer_iq(&client, &id, &response).await;
+        if recovery {
+            let iq = decode_sent_iq(&transport, 1).await;
+            let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+            answer_iq(&client, &id, &response).await;
+        }
+        let outcome = tokio::time::timeout(Duration::from_secs(5), commit)
+            .await
+            .expect("hook lookup must finish while it owns the drain permit")
+            .unwrap();
+        assert!(outcome.persisted);
+        assert_eq!(outcome.delivered, !recovery);
+        if recovery {
+            assert_eq!(
+                client.cached_adv_account_identity(&user).await.unwrap(),
+                Some(*old.public_key.public_key_bytes())
+            );
+            assert_eq!(
+                transport.sent().len(),
+                2,
+                "hook must not start a detached key-recovery worker"
+            );
+        } else {
+            assert!(client.load_device_record(&user.user).await.is_some());
+        }
+        client.ensure_signal_maintenance_context().unwrap();
+        client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn offline_durability_hook_can_resolve_an_uncached_ordinary_user() {
+        hook_lookup_during_drain(false).await;
+    }
+
+    #[tokio::test]
+    async fn offline_durability_hook_recovery_fails_without_stalling_or_changing_trust() {
+        hook_lookup_during_drain(true).await;
+    }
+
+    /// Failed drain admission must propagate through the real dispatcher, so
+    /// acknowledging the device notification cannot discard its unapplied work.
+    #[tokio::test]
+    async fn device_notification_maintenance_failure_withholds_transport_ack() {
+        use crate::test_utils::{
+            create_iq_test_client, node_to_owned_ref, wait_for_outbound_tasks,
+        };
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+        use wacore_binary::builder::NodeBuilder;
+        for operation in ["add", "remove"] {
+            let (client, transport) = create_iq_test_client().await;
+            let user = Jid::pn("12025550199");
+            crate::test_utils::seed_adv_primary(&client, &user).await;
+            client
+                .update_device_list(DeviceListRecord {
+                    user: user.user.as_str().into(),
+                    devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(1))].into(),
+                    raw_id: Some(1),
+                    timestamp: 1,
+                    phash: None,
+                })
+                .await
+                .unwrap();
+            client.enter_drain_mode_for_tests();
+            client
+                .inbound_commit_batch
+                .fail_flushes
+                .store(true, Ordering::Release);
+            let _ = client.enqueue_inbound_commit(
+                PendingDelivery::from(item("DEVICE_NOTIFY_PENDING")),
+                false,
+            );
+            let mut details = wa::ADVKeyIndexList::default();
+            details.raw_id = Some(1);
+            details.current_index = Some(1);
+            details.valid_indexes = vec![1];
+            let signed = crate::test_utils::sign_adv_key_index(
+                waproto::codec::adv_key_index_list_to_vec(&details),
+            );
+            let device = user.with_device(if operation == "add" { 8 } else { 7 });
+            let node = NodeBuilder::new("notification")
+                .attr("type", "devices")
+                .attr("id", "DEVICE_NOTIFY_RETRY")
+                .attr("from", user.to_string())
+                .children([NodeBuilder::new(operation)
+                    .children([
+                        NodeBuilder::new("device")
+                            .attr("jid", device.to_string())
+                            .attr("key-index", "1")
+                            .build(),
+                        NodeBuilder::new("key-index-list")
+                            .attr("ts", "100")
+                            .bytes(signed)
+                            .build(),
+                    ])
+                    .build()])
+                .build();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.process_node(node_to_owned_ref(&node)),
+            )
+            .await
+            .unwrap();
+            wait_for_outbound_tasks(&client).await;
+            assert!(
+                transport.sent().is_empty(),
+                "failed {operation} must not be ACKed"
+            );
+            let record = client.load_device_record(&user.user).await.unwrap();
+            assert_eq!(record.devices.len(), 2);
+            assert!(record.devices.iter().any(|device| device.device_id() == 7));
+            assert!(client.inbound_commit_batch.has_entries());
+            client.signal_shutdown_sync();
+        }
     }
 
     async fn capture_pending_receipts(

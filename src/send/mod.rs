@@ -365,6 +365,14 @@ where
 /// through here, which is what keeps two sends overlapping on a device from
 /// deadlocking; the DM memo stores the sorted result and serves it as is.
 fn sort_session_lock_keys(keys: &mut Vec<Jid>) {
+    // The primary lock protects the certificate anchor while a companion
+    // bundle is fetched, checked and installed by the core fanout engine.
+    let primaries: Vec<_> = keys
+        .iter()
+        .filter(|jid| jid.device != 0)
+        .map(|jid| jid.with_device(0))
+        .collect();
+    keys.extend(primaries);
     keys.sort_unstable_by(wacore::types::jid::cmp_for_lock_order);
     keys.dedup_by(|a, b| wacore::types::jid::cmp_for_lock_order(a, b).is_eq());
 }
@@ -3183,6 +3191,8 @@ impl Client {
             let encryption_jid = self.resolve_encryption_jid(&to).await;
             let signal_addr = encryption_jid.to_protocol_address();
 
+            let _account_guard = self.lock_companion_account(&encryption_jid).await;
+
             let session_mutex = self.session_lock_for(signal_addr.as_str()).await;
             let _session_guard = session_mutex.lock().await;
 
@@ -3816,9 +3826,9 @@ impl Client {
                 debug!(target: "Client/TcToken", "Scheduled tc token issuance after send for {}", to.observe());
             }
 
-            let _session_guards = self.session_guards_for(addressing.lock_keys()).await;
+            let session_guards = self.session_guards_for(addressing.lock_keys()).await;
 
-            let mut store_adapter = self.signal_adapter();
+            let mut store_adapter = self.signal_adapter().with_session_fence(session_guards);
 
             let mut stores = store_adapter.as_signal_stores();
 
@@ -3979,7 +3989,7 @@ impl Client {
         };
         self.ensure_e2e_sessions_resolved(addressing.encryption())
             .await?;
-        let _session_guards = self.session_guards_for(addressing.lock_keys()).await;
+        let session_guards = self.session_guards_for(addressing.lock_keys()).await;
 
         let shared_content = message
             .message_context_info
@@ -3987,7 +3997,7 @@ impl Client {
             .then(|| std::sync::Arc::new(waproto::codec::message_to_vec(message)));
         self.add_recent_message(&to, request_id, message, shared_content.clone())
             .await;
-        let mut store_adapter = self.signal_adapter();
+        let mut store_adapter = self.signal_adapter().with_session_fence(session_guards);
         let mut stores = store_adapter.as_signal_stores();
         let mut prepared = wacore::send::prepare_dm_stanza(
             &*self.runtime,
@@ -4512,9 +4522,9 @@ mod tests {
             .build_session_lock_keys(std::slice::from_ref(&device))
             .await;
         let dm_mutexes = client.session_mutexes_for(&keys).await;
-        assert_eq!(dm_mutexes.len(), 1);
+        assert_eq!(dm_mutexes.len(), 2);
         assert!(
-            dm_mutexes[0].try_lock().is_some(),
+            dm_mutexes.iter().all(|mutex| mutex.try_lock().is_some()),
             "uncontended before the group lock"
         );
 
@@ -4523,13 +4533,13 @@ mod tests {
             .lock_device_sessions(std::slice::from_ref(&device))
             .await;
         assert!(
-            dm_mutexes[0].try_lock().is_none(),
+            dm_mutexes.iter().all(|mutex| mutex.try_lock().is_none()),
             "group SKDM fan-out must block the DM per-device session lock"
         );
 
         drop(guard);
         assert!(
-            dm_mutexes[0].try_lock().is_some(),
+            dm_mutexes.iter().all(|mutex| mutex.try_lock().is_some()),
             "the per-device session lock releases when the group guard drops"
         );
     }
@@ -8686,11 +8696,15 @@ mod tests {
                     .map(|i| Jid::from_str(&format!("10000001234567{i}:5@lid")).unwrap())
                     .collect();
                 let keys = client.build_session_lock_keys(&devices).await;
-                assert_eq!(keys.len(), count, "one key per device at count {count}");
+                assert_eq!(keys.len(), count * 2, "device and primary at count {count}");
                 let mutexes = client.session_mutexes_for(&keys).await;
 
                 let guards = client.session_guards_for(&keys).await;
-                assert_eq!(guards.len(), count, "one guard per key at count {count}");
+                assert_eq!(
+                    guards.len(),
+                    keys.len(),
+                    "one guard per key at count {count}"
+                );
                 for (i, mutex) in mutexes.iter().enumerate() {
                     assert!(
                         mutex.try_lock().is_none(),
@@ -8725,7 +8739,7 @@ mod tests {
                 .map(|s| Jid::from_str(s).unwrap())
                 .collect();
             let keys = client.build_session_lock_keys(&devices).await;
-            assert_eq!(keys.len(), 2);
+            assert_eq!(keys.len(), 4);
             let mutexes = client.session_mutexes_for(&keys).await;
 
             let blocker = mutexes[1].lock_arc().await;
@@ -8752,7 +8766,7 @@ mod tests {
             );
 
             drop(blocker);
-            assert_eq!(taker.await.expect("taker finishes"), 2);
+            assert_eq!(taker.await.expect("taker finishes"), 4);
         }
     }
 

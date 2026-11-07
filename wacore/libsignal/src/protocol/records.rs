@@ -1103,6 +1103,8 @@ pub struct PreKeyBundle {
     pub(crate) signed_public: PublicKey,
     pub(crate) signature: Vec<u8>,
     pub(crate) identity: IdentityKey,
+    account_identity: Option<IdentityKey>,
+    identity_snapshot: Option<Option<[u8; 32]>>,
 }
 impl PreKeyBundle {
     #[allow(clippy::too_many_arguments)]
@@ -1129,7 +1131,33 @@ impl PreKeyBundle {
             signed_public,
             signature,
             identity,
+            account_identity: None,
+            identity_snapshot: None,
         })
+    }
+    /// Retain the parent identity that authenticated an upper-layer device
+    /// certificate. Hosts recheck this binding under their session locks before
+    /// installation; it is not part of Signal's X3DH wire material.
+    pub fn with_account_identity(mut self, identity: IdentityKey) -> Self {
+        self.account_identity = Some(identity);
+        self
+    }
+
+    /// The authenticated parent identity, if supplied by the certificate parser.
+    pub fn account_identity(&self) -> Option<&IdentityKey> {
+        self.account_identity.as_ref()
+    }
+
+    /// Record the host's primary identity before an asynchronous key fetch.
+    /// The outer option distinguishes an observed absence from a bundle whose
+    /// caller supplied no freshness metadata. This is never serialized.
+    pub fn set_identity_snapshot(&mut self, identity: Option<[u8; 32]>) {
+        self.identity_snapshot = Some(identity);
+    }
+
+    /// The primary identity observed before fetching this bundle, if recorded.
+    pub fn identity_snapshot(&self) -> Option<Option<[u8; 32]>> {
+        self.identity_snapshot
     }
     pub fn registration_id(&self) -> Result<u32> {
         Ok(self.registration)

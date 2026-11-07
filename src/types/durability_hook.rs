@@ -55,6 +55,10 @@ use waproto::whatsapp as wa;
 /// (e.g. a synchronous reply) — that can deadlock against the per-sender Signal
 /// lock held while a 1:1 message is processed; persist and return, and spawn
 /// any reply.
+/// Device metadata lookups for users outside the batch can complete here.
+/// If a lookup requires Signal cleanup or identity recovery, it returns an
+/// error instead of waiting for the hook's own processing permit. Run that
+/// maintenance from a separate control task and retry the durable batch.
 ///
 /// Scope and known limitations:
 /// - Covers end-to-end encrypted messages (1:1 and group). Newsletter / broadcast

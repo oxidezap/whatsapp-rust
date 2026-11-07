@@ -2,7 +2,7 @@
 //!
 //! Device list IQ specification is defined in `wacore::iq::usync`.
 
-use crate::client::Client;
+use crate::client::{Client, SignalMaintenance};
 use crate::request::IqError;
 use log::{debug, warn};
 use wacore::iq::usync::{DeviceListResponse, DeviceListSpec};
@@ -12,18 +12,40 @@ use wacore_binary::{Jid, JidExt as _};
 #[path = "usync/hosted_recovery_tests.rs"]
 mod hosted_recovery_tests;
 
+#[cfg(test)]
+mod ordinary_recovery_tests;
+
 /// An authoritative refresh retries when a newer registry mutation wins while
 /// its IQ is in flight. Bound retries so a continuously changing account never
 /// turns one send into an unbounded request loop.
 const DEVICE_REFRESH_MAX_ATTEMPTS: usize = 3;
+
+/// Bound sequential key recovery IQs across all topology retries of one group.
+const GROUP_ADV_RECOVERY_LIMIT: usize = 8;
+
+struct GroupAdvRecoveryBudget {
+    remaining: usize,
+    attempted: std::collections::HashSet<Jid>,
+}
+
+impl GroupAdvRecoveryBudget {
+    fn take(&mut self, user: &Jid) -> bool {
+        if self.remaining == 0 || !self.attempted.insert(user.to_non_ad()) {
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+}
 
 /// A failed list never authorizes replacing the account's trusted identity.
 #[derive(thiserror::Error)]
 #[error("device list ADV signature verification failed for {user} (hosted={hosted})")]
 struct DeviceListAdvError {
     user: Jid,
-    response_users: Vec<Jid>,
     hosted: bool,
+    response: DeviceListResponse,
+    topology_generation: u64,
 }
 
 impl std::fmt::Debug for DeviceListAdvError {
@@ -40,8 +62,19 @@ enum DeviceListApplyMode {
     GroupRefresh,
 }
 
-/// A verified hosted trust change staged until the complete batch is accepted.
-struct HostedIdentityUpdate<'a> {
+struct RecoveredAccountIdentity {
+    user: Jid,
+    identity: [u8; 32],
+    previous_identities: Vec<(Jid, Option<[u8; 32]>)>,
+}
+
+/// Retry outside topology guards when a response needs Signal mutation.
+#[derive(Debug, thiserror::Error)]
+#[error("device-list response requires Signal maintenance")]
+struct DeviceListMaintenanceRequired;
+
+/// A verified account trust change staged until the complete batch is accepted.
+struct AdvIdentityUpdate<'a> {
     user: &'a Jid,
     identity: [u8; 32],
     previous_identity: Option<[u8; 32]>,
@@ -50,6 +83,7 @@ struct HostedIdentityUpdate<'a> {
         Option<[u8; 32]>,
     )>,
     previous_record: Option<wacore::store::traits::DeviceListRecord>,
+    reset_primary_session: bool,
 }
 
 impl From<crate::cache::Freshness> for DeviceListApplyMode {
@@ -169,6 +203,10 @@ impl Client {
         if jids.is_empty() {
             return Ok(Vec::new());
         }
+        let mut recovery_budget = GroupAdvRecoveryBudget {
+            remaining: GROUP_ADV_RECOVERY_LIMIT,
+            attempted: std::collections::HashSet::new(),
+        };
         for _ in 0..DEVICE_REFRESH_MAX_ATTEMPTS {
             let generation = self.device_topology.current();
             let response = self
@@ -177,6 +215,8 @@ impl Client {
                     self.generate_request_id(),
                 ))
                 .await?;
+            self.recover_group_adv_identities(&response, &mut recovery_budget)
+                .await;
             if let Some(devices) = self
                 .try_process_group_device_list_response(&response, &jids, generation)
                 .await?
@@ -185,6 +225,58 @@ impl Client {
             }
         }
         anyhow::bail!("device registry kept changing while a group refresh was in flight")
+    }
+
+    /// Recover rotated contacts individually before the group topology CAS.
+    /// A successful recovery invalidates the old batch generation; failures
+    /// leave that contact's old record available while valid peers still apply.
+    async fn recover_group_adv_identities(
+        &self,
+        response: &DeviceListResponse,
+        budget: &mut GroupAdvRecoveryBudget,
+    ) {
+        for list in &response.device_lists {
+            if list.devices.iter().any(|device| device.is_hosted) {
+                continue;
+            }
+            let Some(bytes) = list.key_index_bytes.as_deref() else {
+                continue;
+            };
+            let Ok(Some(identity)) = self.cached_adv_account_identity(&list.user).await else {
+                continue;
+            };
+            if wacore::adv::verify_key_index_list(bytes, &identity).is_some()
+                || wacore::adv::decode_key_index_list(bytes).is_none()
+            {
+                continue;
+            }
+            let snapshot = self.persistence_manager.get_device_snapshot();
+            if snapshot
+                .pn
+                .iter()
+                .chain(snapshot.lid.iter())
+                .any(|own| own.is_same_chat_as(&list.user))
+                || !budget.take(&list.user)
+            {
+                continue;
+            }
+            if let Err(error) = Box::pin(self.fetch_user_devices_with_freshness(
+                vec![list.user.clone()],
+                crate::cache::Freshness::Refresh,
+            ))
+            .await
+            {
+                let category = if error.downcast_ref::<DeviceListAdvError>().is_some() {
+                    "signature verification"
+                } else {
+                    "request or persistence"
+                };
+                warn!(
+                    "Group ADV recovery failed for {} ({category}); retaining previous devices",
+                    list.user.observe()
+                );
+            }
+        }
     }
 
     /// Keep partial group results and omitted members under one topology CAS.
@@ -209,104 +301,214 @@ impl Client {
     }
 
     /// Retry one failed ADV identity authoritatively, then rebuild its batch.
-    async fn fetch_user_devices_with_freshness(
+    #[inline(never)]
+    fn fetch_user_devices_with_freshness(
         &self,
         jids: Vec<Jid>,
         freshness: crate::cache::Freshness,
-    ) -> Result<Vec<Jid>, anyhow::Error> {
-        match self.fetch_user_devices_once(jids, freshness).await {
-            Ok(devices) => Ok(devices),
-            Err(error) => {
-                let failure = error.downcast::<DeviceListAdvError>()?;
-                let user = failure.user.into_non_ad();
-                // Strict refresh bypasses the cached list. Keep the previous
-                // record until verification so normal application can compare
-                // devices/raw_id and clean up removed devices and identity resets.
-                let refreshed = self
-                    .fetch_user_devices_once(vec![user.clone()], crate::cache::Freshness::Refresh)
-                    .await
-                    .map_err(|error| {
-                        let context = format!("ADV device-list refresh for {user}: {error:#}");
-                        error.context(context)
-                    })?;
-                if failure.response_users.len() == 1 {
-                    return Ok(refreshed);
-                }
-                let mut devices = self
-                    .fetch_user_devices_once(failure.response_users, freshness)
-                    .await?;
-                if !self.device_list_contains_user(&devices, &user).await {
-                    // Partial replies may omit an unchanged user. Read its
-                    // current record, since notifications may have superseded
-                    // the targeted refresh while this batch was in flight.
-                    let (current, missing) = self
-                        .get_devices_from_registry_batch(vec![user.clone()])
+    ) -> wacore::runtime::BoxFuture<'_, Result<Vec<Jid>, anyhow::Error>> {
+        // Cache misses and explicit refreshes reuse one retry/recovery body.
+        Box::pin(async move {
+            match self.fetch_user_devices_once(jids, freshness).await {
+                Ok(devices) => Ok(devices),
+                Err(error) => {
+                    let failure = error.downcast::<DeviceListAdvError>()?;
+                    let user = failure.user.into_non_ad();
+                    // Strict refresh bypasses the cached list. Keep the previous
+                    // record until verification so normal application can compare
+                    // devices/raw_id and clean up removed devices and identity resets.
+                    let refreshed = self
+                        .fetch_user_devices_once(
+                            vec![user.clone()],
+                            crate::cache::Freshness::Refresh,
+                        )
                         .await;
-                    anyhow::ensure!(
-                        missing.is_empty(),
-                        "device registry no longer contains {user} after ADV recovery"
-                    );
-                    devices.extend(current);
+                    let refreshed =
+                        match refreshed {
+                            Ok(devices) => devices,
+                            Err(error) => self.recover_ordinary_adv_identity(error).await.map_err(
+                                |error| {
+                                    let context =
+                                        format!("ADV device-list refresh for {user}: {error:#}");
+                                    error.context(context)
+                                },
+                            )?,
+                        };
+                    if failure.response.device_lists.len() == 1 {
+                        return Ok(refreshed);
+                    }
+                    let response_users = failure
+                        .response
+                        .device_lists
+                        .into_iter()
+                        .map(|list| list.user)
+                        .collect();
+                    let mut devices = self
+                        .fetch_user_devices_once(response_users, freshness)
+                        .await?;
+                    if !self.device_list_contains_user(&devices, &user).await {
+                        // Partial replies may omit an unchanged user. Read its
+                        // current record, since notifications may have superseded
+                        // the targeted refresh while this batch was in flight.
+                        let (current, missing) = self
+                            .get_devices_from_registry_batch(vec![user.clone()])
+                            .await;
+                        anyhow::ensure!(
+                            missing.is_empty(),
+                            "device registry no longer contains {user} after ADV recovery"
+                        );
+                        devices.extend(current);
+                    }
+                    Ok(devices)
                 }
-                Ok(devices)
             }
-        }
+        })
+    }
+
+    /// A second ordinary failure can mean a missed primary identity rotation.
+    /// Authenticate both the fresh primary prekey and the complete refreshed list
+    /// before publishing trust. Never use the list's embedded key as an anchor.
+    #[cold]
+    #[inline(never)]
+    fn recover_ordinary_adv_identity(
+        &self,
+        error: anyhow::Error,
+    ) -> wacore::runtime::BoxFuture<'_, anyhow::Result<Vec<Jid>>> {
+        // Group and individual refreshes share the full authenticated recovery
+        // state machine, including its network request and owned publication.
+        Box::pin(async move {
+            let Some(failure) = error.downcast_ref::<DeviceListAdvError>() else {
+                return Err(error);
+            };
+            if failure.hosted {
+                return Err(error);
+            }
+            self.ensure_signal_maintenance_context()?;
+            let user = &failure.user;
+            let snapshot = self.persistence_manager.get_device_snapshot();
+            if snapshot
+                .pn
+                .iter()
+                .chain(snapshot.lid.iter())
+                .any(|own| own.is_same_chat_as(user))
+            {
+                return Err(error);
+            }
+            let Some(bytes) = failure
+                .response
+                .device_lists
+                .iter()
+                .find(|list| list.user == *user)
+                .and_then(|list| list.key_index_bytes.as_deref())
+            else {
+                return Err(error);
+            };
+            // Malformed input is not evidence of identity rotation.
+            if wacore::adv::decode_key_index_list(bytes).is_none() {
+                return Err(error);
+            }
+            let previous_identities = {
+                let _mapping_guard = self.lid_pn_cache.lock_mutation().await;
+                let mut identities =
+                    vec![(user.clone(), self.cached_adv_account_identity(user).await?)];
+                if let Some(alias) = self.device_list_identity_alias(user).await {
+                    let previous = self.cached_adv_account_identity(&alias).await?;
+                    identities.push((alias, previous));
+                }
+                identities
+            };
+            let identity = self.fetch_adv_account_identity(user).await?;
+            if wacore::adv::verify_key_index_list(bytes, &identity).is_none() {
+                return Err(error);
+            }
+            let client = self
+                .self_weak
+                .get()
+                .and_then(|weak| weak.upgrade())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("client ownership unavailable during ADV recovery")
+                })?;
+            let response = failure.response.clone();
+            let generation = failure.topology_generation;
+            let recovered = RecoveredAccountIdentity {
+                user: user.clone(),
+                identity,
+                previous_identities,
+            };
+            client
+                .apply_owned_device_list_response(
+                    response,
+                    DeviceListApplyMode::StrictRefresh,
+                    Some(generation),
+                    None,
+                    Some(recovered),
+                )
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("device topology changed during ADV identity recovery")
+                })
+        })
     }
 
     /// Fetch and verify a device list without starting ADV recovery recursively.
-    async fn fetch_user_devices_once(
+    #[inline(never)]
+    fn fetch_user_devices_once(
         &self,
         mut jids: Vec<Jid>,
         freshness: crate::cache::Freshness,
-    ) -> Result<Vec<Jid>, anyhow::Error> {
-        if jids.is_empty() {
-            return Ok(Vec::new());
-        }
-        if freshness == crate::cache::Freshness::CachePreferred {
-            let sid = self.generate_request_id();
-            let response = self
-                .execute_streaming(DeviceListSpec::new(jids, sid))
-                .await?;
-            return self
-                .process_device_list_response(&response, freshness)
-                .await;
-        }
-
-        for attempt in 0..DEVICE_REFRESH_MAX_ATTEMPTS {
-            let topology_generation = self.device_topology.current();
-            let sid = self.generate_request_id();
-            let response = self
-                .execute_streaming(DeviceListSpec::new(jids, sid).require_complete_response())
-                .await?;
-
-            if let Some(devices) = self
-                .try_process_refreshed_device_list_response(
-                    &response,
-                    freshness,
-                    topology_generation,
-                )
-                .await?
-            {
-                return Ok(devices);
+    ) -> wacore::runtime::BoxFuture<'_, Result<Vec<Jid>, anyhow::Error>> {
+        // Initial lookup, targeted refresh and batch rebuild all poll the same
+        // query/application implementation instead of embedding three copies.
+        Box::pin(async move {
+            if jids.is_empty() {
+                return Ok(Vec::new());
+            }
+            if freshness == crate::cache::Freshness::CachePreferred {
+                let sid = self.generate_request_id();
+                let response = self
+                    .execute_streaming(DeviceListSpec::new(jids, sid))
+                    .await?;
+                return self
+                    .process_device_list_response(&response, freshness)
+                    .await;
             }
 
-            if attempt + 1 == DEVICE_REFRESH_MAX_ATTEMPTS {
-                anyhow::bail!(
-                    "device registry kept changing while an authoritative refresh was in flight"
-                );
+            for attempt in 0..DEVICE_REFRESH_MAX_ATTEMPTS {
+                let topology_generation = self.device_topology.current();
+                let sid = self.generate_request_id();
+                let response = self
+                    .execute_streaming(DeviceListSpec::new(jids, sid).require_complete_response())
+                    .await?;
+
+                if let Some(devices) = self
+                    .try_process_refreshed_device_list_response(
+                        &response,
+                        freshness,
+                        topology_generation,
+                    )
+                    .await?
+                {
+                    return Ok(devices);
+                }
+
+                if attempt + 1 == DEVICE_REFRESH_MAX_ATTEMPTS {
+                    anyhow::bail!(
+                        "device registry kept changing while an authoritative refresh was in flight"
+                    );
+                }
+
+                // The complete response contains every requested identity. Move its
+                // canonical JIDs into the next attempt only on this rare race path;
+                // the ordinary refresh performs no duplicate query-vector clone.
+                jids = response
+                    .device_lists
+                    .into_iter()
+                    .map(|user| user.user)
+                    .collect();
             }
 
-            // The complete response contains every requested identity. Move its
-            // canonical JIDs into the next attempt only on this rare race path;
-            // the ordinary refresh performs no duplicate query-vector clone.
-            jids = response
-                .device_lists
-                .into_iter()
-                .map(|user| user.user)
-                .collect();
-        }
-
-        unreachable!("bounded device refresh loop always returns")
+            unreachable!("bounded device refresh loop always returns")
+        })
     }
 
     async fn learn_device_list_mappings_guarded(
@@ -386,49 +588,135 @@ impl Client {
     /// Finish hosted trust changes even if the requesting send is cancelled.
     /// The worker owns its guards, response and identity reactions, while
     /// ordinary responses retain their existing in-task application path.
-    async fn apply_device_list_response(
-        &self,
-        response: &DeviceListResponse,
+    #[inline(never)]
+    fn apply_device_list_response<'a>(
+        &'a self,
+        response: &'a DeviceListResponse,
         mode: DeviceListApplyMode,
         topology_generation: Option<u64>,
-        group_users: Option<&[Jid]>,
-    ) -> anyhow::Result<Option<Vec<Jid>>> {
-        self.prepare_device_list_identities(response).await?;
-        if !response
-            .device_lists
-            .iter()
-            .any(|list| list.devices.iter().any(|device| device.is_hosted))
-        {
-            return self
-                .apply_device_list_response_inner(response, mode, topology_generation, group_users)
-                .await;
-        }
-        let client = self
-            .self_weak
-            .get()
-            .and_then(|weak| weak.upgrade())
-            .ok_or_else(|| {
-                anyhow::anyhow!("client ownership unavailable during hosted device sync")
-            })?;
-        let response = response.clone();
-        let group_users = group_users.map(<[Jid]>::to_vec);
-        let (send, receive) = futures::channel::oneshot::channel();
-        self.runtime.spawn_detached(Box::pin(async move {
-            let result = client
-                .apply_device_list_response_inner(
-                    &response,
+        group_users: Option<&'a [Jid]>,
+    ) -> wacore::runtime::BoxFuture<'a, anyhow::Result<Option<Vec<Jid>>>> {
+        // Share admission and hosted-worker dispatch across strict, cached and
+        // group response callers, just as the guarded publication body is shared.
+        Box::pin(async move {
+            self.prepare_device_list_identities(response).await?;
+            let client = self
+                .self_weak
+                .get()
+                .and_then(|weak| weak.upgrade())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("client ownership unavailable during device sync")
+                })?;
+            if !response
+                .device_lists
+                .iter()
+                .any(|list| list.devices.iter().any(|device| device.is_hosted))
+            {
+                // Learning a new alias can expose an old record and schedule its
+                // migration. Admit maintenance before publishing that mapping,
+                // rather than invalidating our own captured topology in a dry run.
+                let mapping_has_history = self
+                    .device_mapping_has_registry_history(&response.lid_mappings)
+                    .await;
+                // Most responses only publish device metadata. A durability hook
+                // already owns the drain permit, so do not acquire it for lookups
+                // that never touch Signal state. The guarded planner refuses all
+                // destructive work without a maintenance scope.
+                if !mapping_has_history {
+                    let result = self
+                        .apply_device_list_response_inner(
+                            response,
+                            mode,
+                            topology_generation,
+                            group_users,
+                            None,
+                            None,
+                        )
+                        .await;
+                    if !matches!(&result, Err(error) if error.is::<DeviceListMaintenanceRequired>())
+                    {
+                        return result;
+                    }
+                }
+                let maintenance = client.begin_signal_maintenance().await?;
+                return self
+                    .apply_device_list_response_inner(
+                        response,
+                        mode,
+                        topology_generation,
+                        group_users,
+                        None,
+                        Some(&maintenance),
+                    )
+                    .await;
+            }
+            self.ensure_signal_maintenance_context()?;
+            client
+                .apply_owned_device_list_response(
+                    response.clone(),
                     mode,
                     topology_generation,
-                    group_users.as_deref(),
+                    group_users.map(<[Jid]>::to_vec),
+                    None,
                 )
+                .await
+        })
+    }
+
+    /// Share cancellation-safe publication for hosted lists and ordinary
+    /// recovery. The worker owns admission, account fences and all input data.
+    #[inline(never)]
+    fn apply_owned_device_list_response(
+        self: std::sync::Arc<Self>,
+        response: DeviceListResponse,
+        mode: DeviceListApplyMode,
+        topology_generation: Option<u64>,
+        group_users: Option<Vec<Jid>>,
+        recovered: Option<RecoveredAccountIdentity>,
+    ) -> wacore::runtime::BoxFuture<'static, anyhow::Result<Option<Vec<Jid>>>> {
+        Box::pin(async move {
+            self.ensure_signal_maintenance_context()?;
+            let (send, receive) = futures::channel::oneshot::channel();
+            let runtime = self.runtime.clone();
+            runtime.spawn_detached(Box::pin(async move {
+                let result = async {
+                    let maintenance = self.begin_signal_maintenance().await?;
+                    let session_guards = if let Some(recovered) = &recovered {
+                        let mut addresses: Vec<_> = recovered
+                            .previous_identities
+                            .iter()
+                            .map(|(jid, _)| jid.with_device(0))
+                            .collect();
+                        // Match PN/LID migration before taking mapping/registry locks.
+                        addresses.sort_unstable_by(wacore::types::jid::cmp_for_lock_order);
+                        addresses
+                            .dedup_by(|a, b| wacore::types::jid::cmp_for_lock_order(a, b).is_eq());
+                        self.session_guards_for(&addresses).await
+                    } else {
+                        Vec::new()
+                    };
+                    let result = self
+                        .apply_device_list_response_inner(
+                            &response,
+                            mode,
+                            topology_generation,
+                            group_users.as_deref(),
+                            recovered.as_ref(),
+                            Some(&maintenance),
+                        )
+                        .await;
+                    drop(session_guards);
+                    result
+                }
                 .await;
-            if let Err(Err(error)) = send.send(result) {
-                warn!("Hosted device sync failed after caller cancellation: {error:#}");
-            }
-        }));
-        receive
-            .await
-            .map_err(|_| anyhow::anyhow!("hosted device sync worker stopped"))?
+                if let Err(Err(error)) = send.send(result) {
+                    warn!("Owned ADV device sync failed after caller cancellation: {error:#}");
+                }
+            }));
+            receive
+                .await
+                .map_err(|_| anyhow::anyhow!("owned ADV device sync worker stopped"))?
+        })
     }
 
     /// Hold mapping and topology guards through CAS, cleanup and publication.
@@ -440,8 +728,13 @@ impl Client {
         mode: DeviceListApplyMode,
         topology_generation: Option<u64>,
         group_users: Option<&'a [Jid]>,
+        recovered_identity: Option<&'a RecoveredAccountIdentity>,
+        maintenance: Option<&'a SignalMaintenance<'a>>,
     ) -> wacore::runtime::BoxFuture<'a, anyhow::Result<Option<Vec<Jid>>>> {
         Box::pin(async move {
+            if let Some(maintenance) = maintenance {
+                maintenance.ensure_current()?;
+            }
             // Serialize both mutation classes across the CAS and publication. The
             // response's own mappings are deliberately learned only after the CAS.
             let mapping_guard = self.lid_pn_cache.lock_mutation().await;
@@ -456,7 +749,13 @@ impl Client {
             self.learn_device_list_mappings_guarded(response, &mapping_guard)
                 .await?;
             let devices = self
-                .process_device_list_response_guarded(response, mode, &registry_guard)
+                .process_device_list_response_guarded(
+                    response,
+                    mode,
+                    &registry_guard,
+                    recovered_identity,
+                    maintenance,
+                )
                 .await?;
             if let Some(users) = group_users {
                 // Include omitted group users under the same publication guards.
@@ -484,23 +783,53 @@ impl Client {
         Ok(())
     }
 
-    /// Retire old hosted state and publish trust before applying the new topology.
+    /// Inspect both alias directions in one registry batch before learning
+    /// mappings, so a cold group does not add per-contact storage round trips.
+    async fn device_mapping_has_registry_history(
+        &self,
+        mappings: &[wacore::usync::UsyncLidMapping],
+    ) -> bool {
+        let users: Vec<_> = mappings
+            .iter()
+            .flat_map(|mapping| {
+                [
+                    Jid::pn(mapping.phone_number.as_str()),
+                    Jid::lid(mapping.lid.as_str()),
+                ]
+            })
+            .collect();
+        self.load_device_records_batch(&users.iter().collect::<Vec<_>>())
+            .await
+            .into_iter()
+            .any(|record| record.is_some())
+    }
+
+    /// Retire old account state and publish trust before applying the new topology.
     /// Keep this rare reaction out of the common device-list polling loop.
     #[cold]
     #[inline(never)]
-    async fn apply_hosted_identity_update(
+    async fn apply_adv_identity_update(
         &self,
-        update: HostedIdentityUpdate<'_>,
+        update: AdvIdentityUpdate<'_>,
         guard: &crate::client::device_topology::DeviceRegistryMutationGuard<'_>,
+        maintenance: &SignalMaintenance<'_>,
     ) -> anyhow::Result<()> {
+        maintenance.ensure_current()?;
         let changed = update
             .identities
             .iter()
             .any(|(_, previous)| previous.is_some_and(|previous| previous != update.identity));
         if changed {
-            // Web re-adds primary membership: keep its session, require SKDM.
+            // Re-adding primary membership requires a fresh SKDM. Ordinary
+            // prekey recovery must also retire the session tied to the old key.
             self.delete_sender_key_rows_for_device(&update.user.user, 0)
                 .await?;
+            if update.reset_primary_session {
+                for (address, _) in &update.identities {
+                    self.signal_cache.delete_session(address).await;
+                }
+                maintenance.flush().await?;
+            }
         }
         if let Some(previous) = update.previous_record {
             for device in &previous.devices {
@@ -509,17 +838,18 @@ impl Client {
                         .await?;
                 }
             }
-            self.clear_device_record(&update.user.user, update.user.server.as_str(), &previous)
-                .await;
-            // Shared cleanup logs flush errors. Trust replacement additionally
-            // requires durable removal before the new account key is saved.
-            self.flush_signal_cache_batch_safe().await?;
+            // This scope propagates persistence failure, so one flush is the
+            // durable retirement barrier before publishing replacement trust.
+            maintenance
+                .clear_device_record(&update.user.user, &previous)
+                .await?;
         }
         if changed {
             self.try_invalidate_device_cache_guarded(&update.user.user, guard)
                 .await?;
         }
         let backend = self.persistence_manager.backend();
+        maintenance.ensure_current()?;
         anyhow::ensure!(
             self.signal_cache
                 .persist_identities_if_equal(
@@ -572,8 +902,16 @@ impl Client {
         response: &'a DeviceListResponse,
         mode: DeviceListApplyMode,
         guard: &'a crate::client::device_topology::DeviceRegistryMutationGuard<'_>,
+        recovered_identity: Option<&'a RecoveredAccountIdentity>,
+        maintenance: Option<&'a SignalMaintenance<'a>>,
     ) -> wacore::runtime::BoxFuture<'a, Result<Vec<Jid>, anyhow::Error>> {
-        Box::pin(self.process_device_list_response_guarded_inner(response, mode, guard))
+        Box::pin(self.process_device_list_response_guarded_inner(
+            response,
+            mode,
+            guard,
+            recovered_identity,
+            maintenance,
+        ))
     }
 
     /// Validate the accepted batch, retire old state and publish verified lists.
@@ -582,6 +920,8 @@ impl Client {
         response: &DeviceListResponse,
         mode: DeviceListApplyMode,
         guard: &crate::client::device_topology::DeviceRegistryMutationGuard<'_>,
+        recovered_identity: Option<&RecoveredAccountIdentity>,
+        maintenance: Option<&SignalMaintenance<'_>>,
     ) -> Result<Vec<Jid>, anyhow::Error> {
         let mut fetched_devices = Vec::new();
         if mode != DeviceListApplyMode::GroupRefresh {
@@ -599,7 +939,7 @@ impl Client {
         // lets an authoritative refresh validate every user before any prior
         // Signal sessions or registry snapshot are discarded.
         let mut pending_identity_resets = Vec::new();
-        let mut hosted_identities = Vec::new();
+        let mut identity_updates = Vec::new();
         let mut pending_removals = Vec::new();
         let mut retained_ids = std::collections::HashSet::new();
 
@@ -619,20 +959,39 @@ impl Client {
             let mut existing_record = existing_records.next().flatten();
 
             let hosted = user_list.devices.iter().any(|device| device.is_hosted);
-            let mut hosted_identity = None;
+            let mut verified_identity = None;
             let decoded_key_index = if let Some(bytes) = user_list.key_index_bytes.as_deref() {
                 let decoded = if hosted {
                     wacore::adv::verify_hosted_key_index_list(bytes).map(|(decoded, identity)| {
-                        hosted_identity = Some(identity);
+                        verified_identity = Some(identity);
                         decoded
                     })
                 } else {
-                    let identity = self
-                        .cached_adv_account_identity(&user_list.user)
-                        .await?
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("device list account identity unavailable")
-                        })?;
+                    let identity = if let Some(recovered) = recovered_identity
+                        && recovered.user == user_list.user
+                    {
+                        for (jid, previous) in &recovered.previous_identities {
+                            anyhow::ensure!(
+                                self.cached_adv_account_identity(jid).await? == *previous,
+                                "primary identity changed during ADV recovery"
+                            );
+                        }
+                        anyhow::ensure!(
+                            self.device_list_identity_alias(&user_list.user)
+                                .await
+                                .as_ref()
+                                == recovered.previous_identities.get(1).map(|(jid, _)| jid),
+                            "account alias changed during ADV recovery"
+                        );
+                        verified_identity = Some(recovered.identity);
+                        recovered.identity
+                    } else {
+                        self.cached_adv_account_identity(&user_list.user)
+                            .await?
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("device list account identity unavailable")
+                            })?
+                    };
                     wacore::adv::verify_key_index_list(bytes, &identity)
                 };
                 if decoded.is_none() {
@@ -642,14 +1001,8 @@ impl Client {
                     return Err(DeviceListAdvError {
                         user: user_list.user.clone(),
                         hosted,
-                        // Only the failure path retains a retry vector. Omitted
-                        // users contribute no devices to the original result;
-                        // strict refreshes already require complete responses.
-                        response_users: response
-                            .device_lists
-                            .iter()
-                            .map(|list| list.user.clone())
-                            .collect(),
+                        response: response.clone(),
+                        topology_generation: self.device_topology.current(),
                     }
                     .into());
                 }
@@ -664,16 +1017,16 @@ impl Client {
                 None
             };
 
-            // A hosted signature can authorize a different account key even
-            // with an unchanged raw_id. Do not retain old key indexes or sessions.
-            let hosted_update = if let Some(identity) = hosted_identity {
+            // A hosted signature or authenticated primary recovery can authorize
+            // a different key with unchanged raw_id. Retire the old trust epoch.
+            let identity_update = if let Some(identity) = verified_identity {
                 let previous_identity = self.cached_adv_account_identity(&user_list.user).await?;
                 let snapshot = self.persistence_manager.get_device_snapshot();
                 let is_self = snapshot
                     .pn
                     .iter()
                     .chain(snapshot.lid.iter())
-                    .any(|own| own.user == user_list.user.user);
+                    .any(|own| own.is_same_chat_as(&user_list.user));
                 if is_self
                     && previous_identity != Some(identity)
                     && mode == DeviceListApplyMode::GroupRefresh
@@ -690,11 +1043,21 @@ impl Client {
                     user_list.user.with_device(0).to_protocol_address(),
                     previous_identity,
                 ));
-                if !is_self
-                    && let Some(alias) = self.device_list_identity_alias(&user_list.user).await
-                {
-                    let previous = self.cached_adv_account_identity(&alias).await?;
-                    identities.push((alias.to_protocol_address(), previous));
+                if !is_self {
+                    let alias = if let Some(recovered) = recovered_identity
+                        && recovered.user == user_list.user
+                    {
+                        recovered
+                            .previous_identities
+                            .get(1)
+                            .map(|(jid, _)| jid.clone())
+                    } else {
+                        self.device_list_identity_alias(&user_list.user).await
+                    };
+                    if let Some(alias) = alias {
+                        let previous = self.cached_adv_account_identity(&alias).await?;
+                        identities.push((alias.to_protocol_address(), previous));
+                    }
                 }
                 let changed = identities
                     .iter()
@@ -706,7 +1069,7 @@ impl Client {
                 {
                     None
                 } else {
-                    Some(HostedIdentityUpdate {
+                    Some(AdvIdentityUpdate {
                         user: &user_list.user,
                         identity,
                         previous_identity: identities
@@ -715,8 +1078,26 @@ impl Client {
                             .find(|previous| *previous != identity)
                             .or(previous_identity),
                         identities,
+                        reset_primary_session: !hosted,
                         previous_record: if changed {
                             Some(match existing_record.take() {
+                                Some(mut record) if !hosted => {
+                                    // A selected registry row is not a complete
+                                    // history of sessions under both aliases.
+                                    let orphans =
+                                        self.recover_device_cleanup_record(&user_list.user).await?;
+                                    let mut devices = record.devices.into_vec();
+                                    for device in orphans.devices {
+                                        if !devices
+                                            .iter()
+                                            .any(|old| old.device_id() == device.device_id())
+                                        {
+                                            devices.push(device);
+                                        }
+                                    }
+                                    record.devices = devices.into_boxed_slice();
+                                    record
+                                }
                                 Some(record) => record,
                                 None => {
                                     match self.recover_device_cleanup_record(&user_list.user).await
@@ -864,11 +1245,11 @@ impl Client {
                 });
             }
 
-            if let Some(update) = hosted_update {
+            if let Some(update) = identity_update {
                 if let Some(earlier) =
-                    hosted_identities
+                    identity_updates
                         .iter()
-                        .find(|earlier: &&HostedIdentityUpdate<'_>| {
+                        .find(|earlier: &&AdvIdentityUpdate<'_>| {
                             earlier.identities.iter().any(|(address, _)| {
                                 update.identities.iter().any(|(other, _)| address == other)
                             })
@@ -879,7 +1260,7 @@ impl Client {
                         "conflicting hosted identities in one device-list response"
                     );
                 } else {
-                    hosted_identities.push(update);
+                    identity_updates.push(update);
                 }
             }
 
@@ -901,27 +1282,45 @@ impl Client {
             });
         }
 
+        if maintenance.is_none()
+            && (!identity_updates.is_empty()
+                || !pending_identity_resets.is_empty()
+                || !pending_removals.is_empty())
+        {
+            return Err(DeviceListMaintenanceRequired.into());
+        }
+
         // Keep the durable old topology until every companion removal finishes.
         // It is the retry record if any cleanup operation fails. Only then may
         // invalidation and the verified identity replacement consume that history.
-        for update in hosted_identities {
-            self.apply_hosted_identity_update(update, guard).await?;
+        for update in identity_updates {
+            self.apply_adv_identity_update(
+                update,
+                guard,
+                maintenance.ok_or(DeviceListMaintenanceRequired)?,
+            )
+            .await?;
         }
 
-        // Ordinary lists publish before destructive cleanup so a failed write
-        // preserves their previous sessions. Hosted key replacements above
+        // Lists without trust changes publish before destructive cleanup so a
+        // failed write preserves their previous sessions. Key replacements above
         // already cleared and invalidated the old trust epoch. Everything here
         // runs under the mapping and registry guards.
         //
         // One batched backend write for the whole usync response — for
         // large groups this collapses N spawn_blocking SQLite hops into
         // a single transaction, which dominated the per-send wall-clock.
+        if let Some(maintenance) = maintenance {
+            maintenance.ensure_current()?;
+        }
         self.update_device_lists_guarded(device_records, guard)
             .await?;
         for (user, device_id) in pending_removals {
             if device_id != 0 {
-                self.delete_sessions_for_devices(&user.user, &[device_id])
+                let maintenance = maintenance.ok_or(DeviceListMaintenanceRequired)?;
+                self.delete_sessions_for_devices_unflushed(&user.user, &[device_id])
                     .await;
+                maintenance.flush().await?;
             }
             if let Err(e) = self
                 .delete_sender_key_rows_for_device(&user.user, device_id)
@@ -949,12 +1348,10 @@ impl Client {
                     return Err(e.into());
                 }
             }
-            Box::pin(self.clear_device_record(
-                &reset.user.user,
-                reset.user.server.as_str(),
-                &reset.previous,
-            ))
-            .await;
+            maintenance
+                .ok_or(DeviceListMaintenanceRequired)?
+                .clear_device_record(&reset.user.user, &reset.previous)
+                .await?;
             if reset.invalidate_registry {
                 self.invalidate_device_cache_guarded(&reset.user.user, guard)
                     .await;
@@ -1163,7 +1560,7 @@ mod tests {
     }
 
     /// Build the standard primary-plus-companion ADV response fixture.
-    fn adv_wire_response(user: &Jid, signature: Vec<u8>) -> wacore_binary::Node {
+    pub(super) fn adv_wire_response(user: &Jid, signature: Vec<u8>) -> wacore_binary::Node {
         adv_wire_response_with_device(user, signature, 2)
     }
 

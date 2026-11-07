@@ -257,6 +257,42 @@ async fn await_leaders(deferred: Vec<(Jid, EnsureSlot)>) -> Vec<Jid> {
 }
 
 impl Client {
+    /// Reject retained companion bundles authenticated by a retired primary.
+    /// The caller holds the primary session lock through the installation.
+    pub(crate) async fn check_prekey_account_identity(
+        &self,
+        jid: &Jid,
+        bundle: &PreKeyBundle,
+    ) -> Result<(), SignalProtocolError> {
+        if jid.device == 0
+            && let Some(previous) = bundle.identity_snapshot()
+        {
+            let current = self
+                .cached_adv_account_identity(jid)
+                .await
+                .map_err(|error| SignalProtocolError::InvalidArgument(error.to_string()))?;
+            let incoming = Some(*bundle.identity_key()?.public_key().public_key_bytes());
+            if current != previous && current != incoming {
+                return Err(SignalProtocolError::InvalidArgument(
+                    "primary prekey bundle fetched before a newer identity was published".into(),
+                ));
+            }
+        }
+        if jid.device != 0
+            && let Some(expected) = bundle.account_identity()
+            && self
+                .cached_adv_account_identity(jid)
+                .await
+                .map_err(|error| SignalProtocolError::InvalidArgument(error.to_string()))?
+                != Some(*expected.public_key().public_key_bytes())
+        {
+            return Err(SignalProtocolError::InvalidArgument(
+                "companion prekey bundle authenticated by a retired primary".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Install a supplied pre-key bundle into the shared Signal cache.
     ///
     /// The caller owns batching and the final durability flush. Keeping those
@@ -269,8 +305,11 @@ impl Client {
         rng: &mut StdRng,
     ) -> Result<IdentityChange, SignalProtocolError> {
         let signal_address = jid.to_protocol_address();
+        let _account_guard = self.lock_companion_account(jid).await;
         let session_mutex = self.session_lock_for(signal_address.as_str()).await;
         let session_guard = session_mutex.lock().await;
+
+        self.check_prekey_account_identity(jid, bundle).await?;
 
         let identity_change = process_prekey_bundle(
             &signal_address,

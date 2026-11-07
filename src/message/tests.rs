@@ -1209,6 +1209,86 @@ async fn test_badmac_migrates_pn_session_when_lid_shadow_exists() {
     assert!(!pn_after, "PN session should be consumed by migration");
 }
 
+/// A regular companion message can discover its primary trust only when
+/// migration moves the existing PN account into the cold LID namespace.
+#[tokio::test]
+async fn companion_migration_keeps_cold_alias_primary_bootstrap_decryptable() {
+    use crate::lid_pn_cache::{LearningSource, LidPnEntry};
+    let client =
+        crate::test_utils::create_test_client_with_name("companion_cold_lid_primary").await;
+    let phone = Jid::pn_device("12025550130", 7);
+    let lid = Jid::lid_device("100000000000130", 7);
+    client
+        .lid_pn_cache
+        .add(&LidPnEntry::new(
+            lid.user.to_string(),
+            phone.user.to_string(),
+            LearningSource::PeerLidMessage,
+        ))
+        .await;
+    crate::test_utils::seed_adv_primary(&client, &phone).await;
+    let (bundle, bob) = bobs_prekey_bundle(&client).await;
+    let address = bob.to_protocol_address();
+    let mut alice = AlicePeer::new(&phone.to_string()).await;
+    alice.install_bob_session(&address, &bundle).await;
+    let prekey = alice.encrypt_text(&address, "establish under PN").await;
+    assert!(submit_and_check_session(&client, &phone, &prekey).await.0);
+    if let Some(record) = alice.sessions.0.get_mut(&address)
+        && let Some(state) = record.session_state_mut()
+    {
+        state.clear_unacknowledged_pre_key_message();
+    }
+    assert!(
+        client
+            .cached_adv_account_identity(&lid)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let regular = alice
+        .encrypt_text(&address, "migrate with account fence")
+        .await;
+    let CiphertextMessage::SignalMessage(message) = regular else {
+        panic!("regular Signal message expected")
+    };
+    let node = NodeBuilder::new("enc")
+        .attr("type", "msg")
+        .bytes(message.serialized().to_vec())
+        .build();
+    let payloads = vec![EncPayload::from_node_ref(&node.as_node_ref(), 0).unwrap()];
+    let info = Arc::new(MessageInfo {
+        id: "COLD_ALIAS_ACCOUNT_FENCE".into(),
+        source: crate::types::message::MessageSource {
+            chat: lid.to_non_ad(),
+            sender: lid.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client
+            .clone()
+            .process_session_enc_batch_account_fenced(payloads, &info, &lid),
+    )
+    .await
+    .unwrap();
+    assert!(
+        outcome.decrypted,
+        "cold primary migration must not be treated as rotation"
+    );
+    assert!(!outcome.undecryptable);
+    assert_eq!(
+        client.cached_adv_account_identity(&lid).await.unwrap(),
+        Some(
+            *crate::test_utils::adv_test_account()
+                .public_key
+                .public_key_bytes()
+        )
+    );
+    client.signal_shutdown_sync();
+}
+
 #[tokio::test]
 async fn migration_plaintext_failure_nacks_without_signal_retry() {
     use crate::lid_pn_cache::{LearningSource, LidPnEntry};

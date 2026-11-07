@@ -209,7 +209,8 @@ pub fn decode_key_index_list(signed_bytes: &[u8]) -> Option<DecodedKeyIndex> {
 
 /// Authenticate the device list against the trusted primary identity before decoding.
 /// WA Web `WAWebAdvKeyIndexSignatureVerify` signs `[6, 2] || details`.
-/// The key carried alongside a signature is never a substitute for local trust.
+/// Ordinary lists ignore the envelope key; only the supplied trusted key can
+/// authenticate them. Hosted callers explicitly select the envelope key instead.
 pub fn verify_key_index_list(
     signed_bytes: &[u8],
     account_identity: &[u8; 32],
@@ -217,11 +218,6 @@ pub fn verify_key_index_list(
     let signed = waproto::whatsapp::ADVSignedKeyIndexListView::decode_view(signed_bytes).ok()?;
     let details = signed.details?;
     let signature: &[u8; 64] = signed.account_signature?.try_into().ok()?;
-    if let Some(key) = signed.account_signature_key.filter(|key| !key.is_empty())
-        && key != account_identity.as_slice()
-    {
-        return None;
-    }
     let public = PublicKey::from_djb_public_key_bytes(account_identity).ok()?;
     let mut message = AdvSigBuffer::with_capacity(2 + details.len());
     message.extend_from_slice(&[6, 2]);
@@ -322,8 +318,15 @@ mod tests {
             vec![1, 2]
         );
         assert!(verify_key_index_list(&signed.encode_to_vec(), &id32(&foreign)).is_none());
+        // whatspec ae388092 / Web 2.3000.1052559453, verified bundle
+        // 33f068d88cd48d1bc584bc03a3f68aa9a2332fa698616c0975d4aa84d69f04d8:
+        // WAWebAdvKeyIndexSignatureVerify [730918,731530) verifies details and
+        // signature with its explicit key; the ordinary decoder [731532,733849)
+        // never compares accountSignatureKey. Metadata cannot veto valid trust.
         signed.account_signature_key = Some(id32(&foreign).to_vec());
-        assert!(verify_key_index_list(&signed.encode_to_vec(), &id32(&account)).is_none());
+        assert!(verify_key_index_list(&signed.encode_to_vec(), &id32(&account)).is_some());
+        assert!(verify_key_index_list(&signed.encode_to_vec(), &id32(&foreign)).is_none());
+        assert!(verify_hosted_key_index_list(&signed.encode_to_vec()).is_none());
         signed.account_signature_key = None;
         signed.details.as_mut().unwrap().push(0);
         assert!(verify_key_index_list(&signed.encode_to_vec(), &id32(&account)).is_none());

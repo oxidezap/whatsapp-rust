@@ -1,4 +1,5 @@
 use crate::libsignal::protocol::{IdentityKey, PreKeyBundle, PreKeyId, PublicKey, SignedPreKeyId};
+use buffa::MessageView as _;
 use std::collections::HashMap;
 use wacore_binary::CompactString;
 use wacore_binary::Jid;
@@ -370,7 +371,7 @@ impl PreKeyUtils {
         let signed_pre_key_public =
             PublicKey::from_djb_public_key_bytes(&signed_pre_key_public_bytes)?;
 
-        let bundle = PreKeyBundle::new(
+        let mut bundle = PreKeyBundle::new(
             registration_id,
             (jid.device as u32).into(),
             pre_key_tuple,
@@ -402,7 +403,18 @@ impl PreKeyUtils {
                     account_identity,
                     jid,
                 ) {
-                    crate::adv::AdvValidation::Valid => {}
+                    crate::adv::AdvValidation::Valid => {
+                        let signed =
+                            waproto::whatsapp::ADVSignedDeviceIdentityView::decode_view(di)?;
+                        let key = account_identity
+                            .map(|key| key.as_slice())
+                            .or(signed.account_signature_key.filter(|key| !key.is_empty()))
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("companion ADV account identity unavailable")
+                            })?;
+                        let parent = IdentityKey::new(PublicKey::from_djb_public_key_bytes(key)?);
+                        bundle = bundle.with_account_identity(parent);
+                    }
                     crate::adv::AdvValidation::Invalid => {
                         return Err(anyhow::anyhow!(
                             "device-identity ADV validation failed for companion {jid}"
@@ -832,6 +844,16 @@ mod tests {
                             correct_device_prefix,
                             "jid={jid} device_type={device_type:?} in_blob={include_account_key}"
                         );
+                        if let Some(bundle) = outcome.bundles.get(&jid) {
+                            assert_eq!(
+                                bundle
+                                    .account_identity()
+                                    .unwrap()
+                                    .public_key()
+                                    .public_key_bytes(),
+                                account_key
+                            );
+                        }
                     }
                 }
             }
