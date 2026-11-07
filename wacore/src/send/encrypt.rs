@@ -1589,7 +1589,7 @@ mod cancellation_lock_tests {
         let mutex = Arc::new(async_lock::Mutex::new(()));
         let owner = SessionLockGuard::hold(Box::new(mutex.lock_arc().await));
         let task_guard = owner.clone();
-        let (entered, running) = tokio::sync::oneshot::channel();
+        let (entered, running) = futures::channel::oneshot::channel();
         let (release, resume) = std::sync::mpsc::channel();
         let task_mutex = mutex.clone();
         let task = spawn_oneshot(&TokioRuntime, async move {
