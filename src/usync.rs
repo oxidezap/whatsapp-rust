@@ -908,6 +908,13 @@ impl Client {
                                 "primary identity changed during ADV recovery"
                             );
                         }
+                        anyhow::ensure!(
+                            self.device_list_identity_alias(&user_list.user)
+                                .await
+                                .as_ref()
+                                == recovered.previous_identities.get(1).map(|(jid, _)| jid),
+                            "account alias changed during ADV recovery"
+                        );
                         verified_identity = Some(recovered.identity);
                         recovered.identity
                     } else {
@@ -968,11 +975,21 @@ impl Client {
                     user_list.user.with_device(0).to_protocol_address(),
                     previous_identity,
                 ));
-                if !is_self
-                    && let Some(alias) = self.device_list_identity_alias(&user_list.user).await
-                {
-                    let previous = self.cached_adv_account_identity(&alias).await?;
-                    identities.push((alias.to_protocol_address(), previous));
+                if !is_self {
+                    let alias = if let Some(recovered) = recovered_identity
+                        && recovered.user == user_list.user
+                    {
+                        recovered
+                            .previous_identities
+                            .get(1)
+                            .map(|(jid, _)| jid.clone())
+                    } else {
+                        self.device_list_identity_alias(&user_list.user).await
+                    };
+                    if let Some(alias) = alias {
+                        let previous = self.cached_adv_account_identity(&alias).await?;
+                        identities.push((alias.to_protocol_address(), previous));
+                    }
                 }
                 let changed = identities
                     .iter()

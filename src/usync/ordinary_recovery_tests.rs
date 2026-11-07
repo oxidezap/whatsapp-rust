@@ -241,6 +241,79 @@ async fn stale_maintenance_permit_cannot_flush_a_new_drain() {
     client.signal_shutdown_sync();
 }
 
+/// Response replay may restore a mapping evicted before recovery captured its
+/// session locks. That newly visible alias must not be reset without its lock.
+#[tokio::test]
+async fn ordinary_recovery_rejects_an_alias_restored_after_its_lock_snapshot() {
+    use wacore::usync::{UserDeviceList, UsyncDevice, UsyncLidMapping};
+    let (client, transport) = create_iq_test_client().await;
+    let phone = Jid::pn("12025550193");
+    let lid = Jid::lid("100000000000193");
+    for user in [&phone, &lid] {
+        crate::test_utils::seed_adv_primary(&client, user).await;
+        seed_fresh_session(&client, user).await;
+    }
+    client
+        .lid_pn_cache
+        .add(&crate::lid_pn_cache::LidPnEntry::new(
+            lid.user.to_string(),
+            phone.user.to_string(),
+            crate::lid_pn_cache::LearningSource::Usync,
+        ))
+        .await;
+    client.lid_pn_cache.clear().await;
+    assert!(client.device_list_identity_alias(&phone).await.is_none());
+    let alias_lock = client
+        .session_lock_for(lid.to_protocol_address().as_str())
+        .await;
+    let alias_guard = alias_lock.lock_arc().await;
+    let replacement = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+    let error = DeviceListAdvError {
+        user: phone.clone(),
+        hosted: false,
+        response: DeviceListResponse {
+            device_lists: vec![UserDeviceList {
+                user: phone.clone(),
+                devices: vec![UsyncDevice::new(0, None)],
+                phash: None,
+                key_index_bytes: Some(signed_list(&replacement, false)),
+            }],
+            lid_mappings: vec![UsyncLidMapping {
+                phone_number: phone.user.clone(),
+                lid: lid.user.clone(),
+            }],
+        },
+        topology_generation: client.device_topology.current(),
+    };
+    let recovery = {
+        let client = client.clone();
+        tokio::spawn(async move { client.recover_ordinary_adv_identity(error.into()).await })
+    };
+    let iq = decode_sent_iq(&transport, 0).await;
+    let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+    answer_iq(&client, &id, &primary_response(&phone, &replacement, true)).await;
+    let error = tokio::time::timeout(Duration::from_secs(5), recovery)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("account alias changed"),
+        "{error:#}"
+    );
+    assert!(has_session(&client, &lid.to_protocol_address()).await);
+    assert_eq!(
+        client.cached_adv_account_identity(&lid).await.unwrap(),
+        Some(
+            *crate::test_utils::adv_test_account()
+                .public_key
+                .public_key_bytes()
+        )
+    );
+    drop(alias_guard);
+    client.signal_shutdown_sync();
+}
+
 /// A different contact's refresh must wait outside the global topology locks.
 /// Otherwise a recovery owning the drain permit can wait on that refresh
 /// forever while the refresh waits for the permit to persist its cleanup.

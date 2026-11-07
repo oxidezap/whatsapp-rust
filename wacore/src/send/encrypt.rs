@@ -644,6 +644,8 @@ pub async fn encrypt_for_devices_into(
 /// [`ensure_sessions_for_devices`]; consumed by
 /// [`encrypt_for_devices_with_sessions`] over the same `devices` slice.
 pub struct SessionPlan {
+    /// Keep group session locks alive in spawned tasks after caller cancellation.
+    session_guard: crate::client::context::SessionLockGuard,
     /// Device count the plan was built for. Kept alongside the (possibly empty)
     /// override map so the "same slice" invariant is still checkable now that an
     /// override-free plan carries no vector at all.
@@ -695,6 +697,7 @@ impl SessionPlan {
     /// and must not touch the network during the encrypt fan-out.
     pub fn assume_ready(device_count: usize) -> Self {
         Self {
+            session_guard: crate::client::context::SessionLockGuard::none(),
             device_count,
             encryption_overrides: Vec::new(),
             effective_addresses: Vec::new(),
@@ -820,6 +823,26 @@ pub async fn ensure_sessions_for_devices_resolved(
     resolver: &dyn SendContextResolver,
     devices: &[Jid],
     signal_addresses: Option<&[Jid]>,
+) -> Result<SessionPlan> {
+    ensure_sessions_for_devices_guarded(
+        runtime,
+        stores,
+        resolver,
+        devices,
+        signal_addresses,
+        crate::client::context::SessionLockGuard::none(),
+    )
+    .await
+}
+
+/// Share the caller's session locks with every spawned installer and encryptor.
+pub(crate) async fn ensure_sessions_for_devices_guarded(
+    runtime: &dyn Runtime,
+    stores: &mut SignalStores<'_>,
+    resolver: &dyn SendContextResolver,
+    devices: &[Jid],
+    signal_addresses: Option<&[Jid]>,
+    session_guard: crate::client::context::SessionLockGuard,
 ) -> Result<SessionPlan> {
     // A list that is not parallel to `devices` cannot be indexed by device;
     // resolving per device is always correct, so that is the fallback in
@@ -1087,7 +1110,9 @@ pub async fn ensure_sessions_for_devices_resolved(
             let mut session_store = stores.session_store.clone_box();
             let mut identity_store = stores.identity_store.clone_box();
 
+            let task_guard = session_guard.clone();
             let task = spawn_oneshot(runtime, async move {
+                let _session_guard = task_guard;
                 let mut addr = crate::types::jid::make_reusable_protocol_address();
                 let mut rng = rand::make_rng::<rand::rngs::StdRng>();
                 let mut out = Vec::with_capacity(jobs.len());
@@ -1196,6 +1221,7 @@ pub async fn ensure_sessions_for_devices_resolved(
     }
 
     Ok(SessionPlan {
+        session_guard,
         device_count: devices.len(),
         encryption_overrides,
         effective_addresses,
@@ -1347,6 +1373,7 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
         "SessionPlan consumed with different device identities than built from"
     );
     let SessionPlan {
+        session_guard,
         device_count: _,
         encryption_overrides,
         effective_addresses,
@@ -1432,7 +1459,9 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
                 .iter()
                 .filter(|(_, device_jid)| !unkeyed_devices.contains(device_jid))
                 .count() as u64;
+            let task_guard = session_guard.clone();
             let task = spawn_oneshot(runtime, async move {
+                let _session_guard = task_guard;
                 let mut out = Vec::with_capacity(jobs.len());
                 for (addr, device_jid) in jobs {
                     out.push(
@@ -1522,6 +1551,64 @@ mod participant_node_tests {
             panic!("an `<enc>` node carries the ciphertext as bytes");
         };
         assert_eq!(bytes.as_ptr(), expected_ptr, "the ciphertext was copied");
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod cancellation_lock_tests {
+    use super::*;
+    use crate::client::context::SessionLockGuard;
+    use std::{pin::Pin, sync::Arc, time::Duration};
+
+    struct TokioRuntime;
+    impl Runtime for TokioRuntime {
+        fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> AbortHandle {
+            let task = tokio::spawn(future);
+            AbortHandle::new(move || task.abort())
+        }
+        fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(tokio::time::sleep(duration))
+        }
+        fn spawn_blocking(
+            &self,
+            f: Box<dyn FnOnce() + Send + 'static>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(async move {
+                tokio::task::spawn_blocking(f).await.unwrap();
+            })
+        }
+        fn yield_now(&self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+            Some(Box::pin(tokio::task::yield_now()))
+        }
+    }
+
+    /// Abort cannot preempt a poll. The running chunk must retain its locks
+    /// until it actually stops touching Signal state, even after the send drops.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_chunk_retains_session_lock_until_its_current_poll_stops() {
+        let mutex = Arc::new(async_lock::Mutex::new(()));
+        let owner = SessionLockGuard::hold(Box::new(mutex.lock_arc().await));
+        let task_guard = owner.clone();
+        let (entered, running) = tokio::sync::oneshot::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let task_mutex = mutex.clone();
+        let task = spawn_oneshot(&TokioRuntime, async move {
+            let _session_guard = task_guard;
+            entered.send(()).unwrap();
+            // Deliberately remain inside one poll while cancellation occurs.
+            resume.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(task_mutex.try_lock().is_none());
+        });
+        running.await.unwrap();
+        drop(task);
+        drop(owner);
+        // This is the recovery lock: it must remain unavailable until the
+        // cancelled chunk has returned from its in-progress poll.
+        assert!(mutex.try_lock().is_none());
+        release.send(()).unwrap();
+        let _recovery = tokio::time::timeout(Duration::from_secs(5), mutex.lock_arc())
+            .await
+            .unwrap();
     }
 }
 

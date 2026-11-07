@@ -395,12 +395,14 @@ impl crate::stats::HeapSize for GroupRoutingInfo {
 
 /// Opaque RAII holder for the per-device pairwise session locks a
 /// [`SendContextResolver`] acquires around the group SKDM fan-out. Wacore holds it
-/// across the fan-out and drops it to release; the concrete guard type lives in the
+/// across the fan-out. Clones share ownership, so locks release only after the
+/// last running chunk drops its guard, including after cancellation. The concrete guard type lives in the
 /// platform crate, since the per-address lock cache is not part of the portable core.
 #[must_use = "the session locks release the moment this guard is dropped"]
+#[derive(Clone)]
 pub struct SessionLockGuard(
     // Held purely for its `Drop` (releases the locks); never read.
-    #[allow(dead_code)] Option<Box<dyn crate::sync_marker::MaybeSendSync>>,
+    #[allow(dead_code)] Option<Arc<dyn crate::sync_marker::MaybeSendSync>>,
 );
 
 impl SessionLockGuard {
@@ -411,7 +413,7 @@ impl SessionLockGuard {
 
     /// Hold `guards` until this value is dropped.
     pub fn hold(guards: Box<dyn crate::sync_marker::MaybeSendSync>) -> Self {
-        Self(Some(guards))
+        Self(Some(guards.into()))
     }
 }
 
