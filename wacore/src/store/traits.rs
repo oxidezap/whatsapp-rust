@@ -679,6 +679,19 @@ pub trait SignalStore: Send + Sync {
         Ok(true)
     }
 
+    /// Enumerate this user's addresses retained in sessions, identities or
+    /// sender-key device tracking, across all address namespaces. Recovery uses
+    /// this only when a verified account key changes without an old device list.
+    /// Backends without enumeration fail closed rather than retaining orphaned
+    /// companion state under the replacement key.
+    async fn get_signal_addresses_for_user(&self, user: &str) -> Result<Vec<Arc<str>>> {
+        let _ = user;
+        Err(crate::store::error::StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "backend cannot enumerate orphaned device state for hosted identity recovery",
+        )))
+    }
+
     // --- PreKey Operations ---
 
     /// Store a pre-key.

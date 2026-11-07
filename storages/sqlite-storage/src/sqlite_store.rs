@@ -3016,6 +3016,46 @@ impl SignalStore for SqliteStore {
         .await
     }
 
+    /// Recover all persisted namespaces and tracker-only devices without a registry row.
+    /// Enumerate orphaned state within this account and an exact user prefix.
+    async fn get_signal_addresses_for_user(&self, user: &str) -> Result<Vec<Arc<str>>> {
+        let device_id = self.device_id;
+        let user = user.to_owned();
+        let addresses: Vec<String> = self
+            .read_query(move |conn| {
+                #[derive(QueryableByName)]
+                struct AddressRow {
+                    #[diesel(sql_type = diesel::sql_types::Text)]
+                    address: String,
+                }
+                // One UNION shares the decoder and query machinery across all
+                // sources. Binary prefix ranges match the exact user and
+                // separator without LIKE's case folding or pattern escaping.
+                // UNION deduplicates tracker rows from different groups.
+                diesel::sql_query(
+                    "SELECT address FROM sessions WHERE device_id = ?1
+                   AND ((address >= (?2 || ':') COLLATE BINARY AND address < (?2 || ';') COLLATE BINARY)
+                     OR (address >= (?2 || '@') COLLATE BINARY AND address < (?2 || 'A') COLLATE BINARY))
+                 UNION SELECT address FROM identities WHERE device_id = ?1
+                   AND ((address >= (?2 || ':') COLLATE BINARY AND address < (?2 || ';') COLLATE BINARY)
+                     OR (address >= (?2 || '@') COLLATE BINARY AND address < (?2 || 'A') COLLATE BINARY))
+                 UNION SELECT device_jid AS address FROM sender_key_devices WHERE device_id = ?1
+                   AND ((device_jid >= (?2 || ':') COLLATE BINARY AND device_jid < (?2 || ';') COLLATE BINARY)
+                     OR (device_jid >= (?2 || '@') COLLATE BINARY AND device_jid < (?2 || 'A') COLLATE BINARY))
+                 ORDER BY address",
+                )
+                .bind::<diesel::sql_types::Integer, _>(device_id)
+                .bind::<diesel::sql_types::Text, _>(user)
+                .load::<AddressRow>(conn)
+                .map(|rows| rows.into_iter().map(|row| row.address).collect())
+                .map_err(|e| StoreError::Database(Box::new(e)))
+            })
+            .await?;
+        // Reuse the existing Vec<String> read pipeline rather than generating
+        // another blocking-task/snapshot implementation for Vec<Arc<str>>.
+        Ok(addresses.into_iter().map(Arc::from).collect())
+    }
+
     async fn has_signal_state_for_user(&self, user: &str) -> Result<bool> {
         let device_id = self.device_id;
         // Address is `user@server` (device 0) or `user:dev@server`; `user` is a
@@ -5430,6 +5470,43 @@ mod tests {
         SqliteStore::open(&db_name)
             .await
             .expect("Failed to create test store")
+    }
+
+    /// Hosted recovery must never enumerate another account in the same database.
+    #[tokio::test]
+    async fn orphan_signal_discovery_is_scoped_to_the_selected_account() {
+        let store = create_test_store().await;
+        // A fresh store has no device row yet. Reserve its default account
+        // before creating the distinct sibling being tested.
+        let (_, first) = store.create_sibling_device_impl().await.unwrap();
+        let (_, sibling) = store.create_sibling_device_impl().await.unwrap();
+        first
+            .put_session("12025550181:7@c.us.0", &[1])
+            .await
+            .unwrap();
+        sibling
+            .put_identity("12025550181:8@lid.0", [2; 32])
+            .await
+            .unwrap();
+        sibling
+            .set_sender_key_status("120363000000000181@g.us", &[("12025550181:9@lid", true)])
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .get_signal_addresses_for_user("12025550181")
+                .await
+                .unwrap(),
+            vec![Arc::<str>::from("12025550181:7@c.us.0")]
+        );
+        assert_eq!(
+            sibling
+                .get_signal_addresses_for_user("12025550181")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[cfg(not(target_family = "wasm"))]

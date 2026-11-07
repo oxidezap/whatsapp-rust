@@ -663,6 +663,68 @@ impl Client {
             .any(|key| devices.iter().any(|device| device.user.as_str() == key))
     }
 
+    /// Return the current account alias while the caller holds the mapping guard.
+    pub(crate) async fn device_list_identity_alias(&self, user: &Jid) -> Option<Jid> {
+        match self.resolve_lookup_keys_for_jid(user).await {
+            UserLookupKeys::LidWithPn { pn, .. } => Some(Jid::pn(pn)),
+            UserLookupKeys::PnWithLid { lid, .. } => Some(Jid::lid(lid)),
+            UserLookupKeys::Unknown { .. } => None,
+        }
+    }
+
+    /// Recover cleanup-only history after its registry row was invalidated.
+    /// This set of device IDs is never published as the current fanout.
+    #[cold]
+    #[inline(never)]
+    pub(crate) async fn recover_device_cleanup_record(
+        &self,
+        user: &Jid,
+    ) -> Result<wacore::store::traits::DeviceListRecord> {
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+        let lookup = self.resolve_lookup_keys_for_jid(user).await;
+        let backend = self.persistence_manager.backend();
+        let mut ids = HashSet::new();
+        for key in lookup.all_keys() {
+            for address in self
+                .signal_cache
+                .signal_addresses_for_user(key, backend.as_ref())
+                .await?
+            {
+                // Signal stores append the protocol device suffix; sender-key
+                // tracking stores the wire JID without it.
+                // Fail closed on corrupt/unsupported state: silently omitting a
+                // row would accept new trust without proving complete cleanup.
+                // Group refresh may skip this user and still apply valid peers.
+                let wire_address = address.strip_suffix(".0").unwrap_or(&address);
+                let jid: Jid = wire_address.parse().map_err(|_| {
+                    anyhow::anyhow!("invalid stored Signal address during hosted identity recovery")
+                })?;
+                // Jid's fast parser deliberately treats an overflowing device
+                // as device 0. Cleanup cannot silently drop that stored suffix.
+                anyhow::ensure!(
+                    wire_address
+                        .split_once('@')
+                        .and_then(|(local, _)| local.rsplit_once(':'))
+                        .is_none_or(|(_, device)| device.parse::<u16>().ok() == Some(jid.device)),
+                    "invalid stored Signal device during hosted identity recovery"
+                );
+                if jid.user == key && jid.device != 0 {
+                    ids.insert(jid.device);
+                }
+            }
+        }
+        Ok(DeviceListRecord {
+            user: Arc::from(user.user.as_str()),
+            devices: ids
+                .into_iter()
+                .map(|id| DeviceInfo::new(id, None))
+                .collect(),
+            timestamp: self.runtime.wall_time_secs(),
+            phash: None,
+            raw_id: None,
+        })
+    }
+
     /// Replace earlier cached aliases with the identities covered by a network result.
     pub(crate) async fn remove_superseded_cached_devices(
         &self,
@@ -990,11 +1052,22 @@ impl Client {
         self.invalidate_device_cache_guarded(user, &guard).await;
     }
 
+    /// Preserve best-effort invalidation for callers that cannot return storage errors.
     pub(crate) async fn invalidate_device_cache_guarded(
         &self,
         user: &str,
         guard: &crate::client::device_topology::DeviceRegistryMutationGuard<'_>,
     ) {
+        let _ = self.try_invalidate_device_cache_guarded(user, guard).await;
+    }
+
+    /// Identity replacement must abort if any stale persistent alias survives.
+    pub(crate) async fn try_invalidate_device_cache_guarded(
+        &self,
+        user: &str,
+        guard: &crate::client::device_topology::DeviceRegistryMutationGuard<'_>,
+    ) -> Result<()> {
+        let mut failure = None;
         let lookup = self.resolve_lookup_keys(user).await;
 
         for key in lookup.all_keys() {
@@ -1006,6 +1079,7 @@ impl Client {
                     "Failed to delete device registry from DB for {}: {e}",
                     wacore_binary::jid::ObservedJid::from(key)
                 );
+                failure.get_or_insert_with(|| e.into());
             }
             // Invalidate again after the delete: a concurrent reader that read
             // the doomed DB row can promote() it back between the first
@@ -1018,6 +1092,7 @@ impl Client {
             "Invalidated device cache for user: {}",
             wacore_binary::jid::ObservedJid::from(user)
         );
+        failure.map_or(Ok(()), Err)
     }
 
     /// Patch device registry after a device add notification.

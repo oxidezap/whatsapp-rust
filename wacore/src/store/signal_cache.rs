@@ -1303,6 +1303,36 @@ impl SignalStoreCache {
         Ok(backend.has_signal_state_for_user(user).await?)
     }
 
+    /// Collect cached history before reading durable history, so a concurrent
+    /// flush/eviction cannot hide an address from both sources. Addresses may
+    /// repeat across sources; recovery folds them into unique device IDs.
+    pub async fn signal_addresses_for_user(
+        &self,
+        user: &str,
+        backend: &dyn SignalStore,
+    ) -> Result<Vec<Arc<str>>> {
+        let mut addresses = Vec::new();
+        addresses.extend(
+            self.lock_sessions()
+                .await
+                .cache
+                .iter()
+                .filter(|(address, _)| protocol_address_matches_user(address, user))
+                .map(|(address, _)| Arc::clone(address)),
+        );
+        addresses.extend(
+            self.identities
+                .lock()
+                .await
+                .cache
+                .iter()
+                .filter(|(address, _)| protocol_address_matches_user(address, user))
+                .map(|(address, _)| Arc::clone(address)),
+        );
+        addresses.extend(backend.get_signal_addresses_for_user(user).await?);
+        Ok(addresses)
+    }
+
     /// Whether this user's pairwise session or identity writes still need a
     /// durability retry. Migration uses this after a failed flush, when the
     /// cache already reflects the move and a second pass makes no new changes.
@@ -1873,6 +1903,116 @@ impl SignalStoreCache {
         backend.put_identity(address.as_str(), key).await?;
         state.dirty.remove(address.as_str());
         state.deleted.remove(address.as_str());
+        state.evict_if_needed(self.max_entries);
+        Ok(true)
+    }
+
+    /// Persist verified account aliases only if every previous key still matches.
+    /// The worker retains durable write ordering through storage completion,
+    /// even if its requester is cancelled. Cache publication follows the entire
+    /// write, so a failed batch retains the old keys for retry and reactions.
+    /// This writes no unrelated session ratchets.
+    pub async fn persist_identities_if_equal(
+        self: &Arc<Self>,
+        identities: &[(ProtocolAddress, Option<[u8; 32]>)],
+        data: &[u8; 32],
+        backend: Arc<dyn SignalStore>,
+        runtime: &dyn crate::runtime::Runtime,
+    ) -> Result<bool> {
+        let cache = Arc::clone(self);
+        let identities = identities.to_vec();
+        let data = *data;
+        let (send, receive) = futures::channel::oneshot::channel();
+        runtime.spawn_detached(Box::pin(async move {
+            let result = cache
+                .persist_identities_if_equal_inner(&identities, &data, backend.as_ref())
+                .await;
+            let _ = send.send(result);
+        }));
+        receive
+            .await
+            .map_err(|_| anyhow::anyhow!("identity persistence worker stopped"))?
+    }
+
+    /// Serialize the complete alias write while retaining old anchors on errors.
+    async fn persist_identities_if_equal_inner(
+        &self,
+        identities: &[(ProtocolAddress, Option<[u8; 32]>)],
+        data: &[u8; 32],
+        backend: &dyn SignalStore,
+    ) -> Result<bool> {
+        let mut reloads = 0;
+        let (_flush, mut state) = loop {
+            // Preloads can be evicted while waiting for an earlier writer.
+            // A missing cache entry is not evidence of a trust change.
+            for (address, _) in identities {
+                self.get_identity(address, backend).await?;
+            }
+            // Retain durable ordering through acknowledgement, including
+            // detached adapter writes. Cache readers/saves do not use this.
+            let flush = self.flush_lock.lock().await;
+            let mut state = self.identities.lock().await;
+            if identities
+                .iter()
+                .all(|(address, _)| state.cache.get(address.as_str()).is_some())
+            {
+                break (flush, state);
+            }
+            if reloads == UNLOCKED_COLD_READ_ATTEMPTS {
+                // Match the established cold-read fallback under sustained
+                // churn. Do not evict between loading and pinning the batch.
+                for (address, _) in identities {
+                    if state.cache.get(address.as_str()).is_none() {
+                        let previous = backend.load_identity(address.as_str()).await?;
+                        state
+                            .cache
+                            .insert(Arc::from(address.as_str()), previous.map(Arc::from));
+                    }
+                }
+                break (flush, state);
+            }
+            reloads += 1;
+        };
+        let matches_expected = |state: &ByteStoreState| {
+            identities.iter().all(|(address, expected)| {
+                state.cache.get(address.as_str()).is_some_and(|previous| {
+                    previous.as_deref() == expected.as_ref().map(|key| key.as_slice())
+                })
+            })
+        };
+        if !matches_expected(&state) {
+            return Ok(false);
+        }
+        // Pin every old anchor before an adapter can partially commit. A failed
+        // write must not make cache eviction turn an unfinished rotation into
+        // an unchanged key. A later flush may restore these old anchors safely.
+        for (address, previous) in identities {
+            if let Some(previous) = previous {
+                state.put(address.as_str(), previous);
+            } else {
+                state.delete(address.as_str());
+            }
+        }
+        let _changes: Vec<_> = identities
+            .iter()
+            .filter_map(|(address, _)| self.identity_write_change(&state, address, data))
+            .collect();
+        drop(state);
+        for (address, _) in identities {
+            backend.put_identity(address.as_str(), *data).await?;
+        }
+        let mut state = self.identities.lock().await;
+        // Signal saves/deletes may have changed trust while storage was busy.
+        // Their dirty cache entries must survive for the next ordered flush;
+        // this verified replacement must not publish over the newer anchors.
+        if !matches_expected(&state) {
+            return Ok(false);
+        }
+        for (address, _) in identities {
+            state.put_dedup(address.as_str(), data);
+            state.dirty.remove(address.as_str());
+            state.deleted.remove(address.as_str());
+        }
         state.evict_if_needed(self.max_entries);
         Ok(true)
     }
@@ -6456,6 +6596,31 @@ mod pre_wire_gate_tests {
 /// Existence alone cannot separate that from "never written", so each of these
 /// asserts that the pre-write bytes do not land.
 #[cfg(test)]
+struct IdentityTestRuntime;
+
+#[cfg(test)]
+impl crate::runtime::Runtime for IdentityTestRuntime {
+    fn spawn(&self, future: crate::runtime::BoxFuture<'static, ()>) -> crate::runtime::AbortHandle {
+        let task = tokio::spawn(future);
+        crate::runtime::AbortHandle::new(move || task.abort())
+    }
+    fn sleep(&self, duration: std::time::Duration) -> crate::runtime::BoxFuture<'static, ()> {
+        Box::pin(tokio::time::sleep(duration))
+    }
+    fn spawn_blocking(
+        &self,
+        task: Box<dyn FnOnce() + Send + 'static>,
+    ) -> crate::runtime::BoxFuture<'static, ()> {
+        Box::pin(async move {
+            tokio::task::spawn_blocking(task).await.unwrap();
+        })
+    }
+    fn yield_now(&self) -> Option<crate::runtime::BoxFuture<'static, ()>> {
+        Some(Box::pin(tokio::task::yield_now()))
+    }
+}
+
+#[cfg(test)]
 mod cold_read_race_tests {
     use super::*;
     use crate::libsignal::protocol::{ChainKey, IdentityKey, KeyPair, RootKey, SessionState};
@@ -6477,6 +6642,7 @@ mod cold_read_race_tests {
         fail_identity_after_write: AtomicBool,
         pause_identity_write: AtomicBool,
         pending_identity: SyncMutex<Option<[u8; 32]>>,
+        identity_write_release: async_lock::Barrier,
     }
 
     impl GatedColdRead {
@@ -6491,6 +6657,7 @@ mod cold_read_race_tests {
                 fail_identity_after_write: AtomicBool::new(false),
                 pause_identity_write: AtomicBool::new(false),
                 pending_identity: SyncMutex::new(None),
+                identity_write_release: async_lock::Barrier::new(2),
             }
         }
 
@@ -6540,7 +6707,7 @@ mod cold_read_race_tests {
         async fn put_identity(&self, _: &str, key: [u8; 32]) -> StoreResult<()> {
             if self.pause_identity_write.load(Ordering::Relaxed) {
                 *self.pending_identity.lock().unwrap() = Some(key);
-                std::future::pending::<()>().await;
+                self.identity_write_release.wait().await;
             }
             *self.identity.lock().unwrap_or_else(|p| p.into_inner()) = Some(key);
             if self.fail_identity_after_write.load(Ordering::Relaxed) {
@@ -6592,6 +6759,245 @@ mod cold_read_race_tests {
         async fn delete_sender_key(&self, _: &str) -> StoreResult<()> {
             unreachable!()
         }
+    }
+
+    #[tokio::test]
+    /// Dropping a waiter cannot let an older storage write overtake a newer CAS.
+    async fn cancelled_verified_identity_write_finishes_before_a_newer_cas() {
+        let backend = Arc::new(GatedColdRead::new(0));
+        let cache = Arc::new(SignalStoreCache::new());
+        let address = ProtocolAddress::new("12025550168", 0.into());
+        assert!(
+            cache
+                .persist_identity_if_absent_or_equal(&address, &[1; 32], backend.as_ref())
+                .await
+                .unwrap()
+        );
+        backend.pause_identity_write.store(true, Ordering::Relaxed);
+        let first = [(address.clone(), Some([1; 32]))];
+        let mut write = Box::pin(cache.persist_identities_if_equal(
+            &first,
+            &[2; 32],
+            backend.clone(),
+            &IdentityTestRuntime,
+        ));
+        assert!(futures::poll!(write.as_mut()).is_pending());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while backend.pending_identity.lock().unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let unrelated = ProtocolAddress::new("12025550184", 0.into());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            assert_eq!(
+                cache
+                    .get_identity(&address, backend.as_ref())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .as_ref(),
+                &[1; 32]
+            );
+            cache.put_identity(&unrelated, &[7; 32]).await;
+        })
+        .await
+        .expect("hosted backend I/O must not hold the identity mutex");
+        drop(write);
+        let second = [(address.clone(), Some([2; 32]))];
+        let mut newer = Box::pin(cache.persist_identities_if_equal(
+            &second,
+            &[3; 32],
+            backend.clone(),
+            &IdentityTestRuntime,
+        ));
+        assert!(futures::poll!(newer.as_mut()).is_pending());
+        assert_eq!(*backend.identity.lock().unwrap(), Some([1; 32]));
+        backend.pause_identity_write.store(false, Ordering::Relaxed);
+        backend.identity_write_release.wait().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), newer)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert_eq!(*backend.identity.lock().unwrap(), Some([3; 32]));
+        assert_eq!(
+            cache
+                .get_identity(&address, backend.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            &[3; 32]
+        );
+        assert!(
+            !cache
+                .identities
+                .lock()
+                .await
+                .dirty
+                .contains(address.as_str())
+        );
+    }
+
+    /// Eviction while waiting for a writer is not a change of the trusted key.
+    #[tokio::test]
+    async fn verified_identity_cas_reloads_an_evicted_anchor_before_claiming_a_conflict() {
+        for previous in [Some([1; 32]), None] {
+            let backend = Arc::new(GatedColdRead::new(1));
+            *backend.identity.lock().unwrap() = previous;
+            let cache = Arc::new(SignalStoreCache::new());
+            let address = ProtocolAddress::new("12025550186", 0.into());
+            let flush = cache.flush_lock.lock().await;
+            let operation = {
+                let cache = cache.clone();
+                let backend = backend.clone();
+                let address = address.clone();
+                tokio::spawn(async move {
+                    cache
+                        .persist_identities_if_equal(
+                            &[(address, previous)],
+                            &[2; 32],
+                            backend,
+                            &IdentityTestRuntime,
+                        )
+                        .await
+                })
+            };
+            backend.arrived.wait().await;
+            backend.release.wait().await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while cache.try_get_identity(&address).is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            {
+                let mut state = cache.identities.lock().await;
+                for index in 0..=high_watermark(0) {
+                    state
+                        .cache
+                        .insert(Arc::from(format!("eviction-peer-{index}")), None);
+                }
+                state.evict_if_needed(0);
+            }
+            assert!(cache.try_get_identity(&address).is_none());
+            drop(flush);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), operation)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                "cache eviction is not a CAS conflict"
+            );
+            assert_eq!(*backend.identity.lock().unwrap(), Some([2; 32]));
+        }
+    }
+
+    /// A batch exceeding cache slack exercises bounded retries and the fallback.
+    #[tokio::test]
+    async fn verified_identity_cas_finishes_under_continuous_cache_eviction() {
+        for previous in [Some([1; 32]), None] {
+            let backend = Arc::new(GatedColdRead::new(0));
+            *backend.identity.lock().unwrap() = previous;
+            let cache = Arc::new(SignalStoreCache::with_max_entries(0));
+            let expected: Vec<_> = (0..=high_watermark(0))
+                .map(|index| {
+                    (
+                        ProtocolAddress::new(&format!("eviction-peer-{index}"), 0.into()),
+                        previous,
+                    )
+                })
+                .collect();
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    cache.persist_identities_if_equal(
+                        &expected,
+                        &[2; 32],
+                        backend.clone(),
+                        &IdentityTestRuntime
+                    )
+                )
+                .await
+                .unwrap()
+                .unwrap()
+            );
+            assert_eq!(*backend.identity.lock().unwrap(), Some([2; 32]));
+            assert!(backend.reads() <= expected.len() * (UNLOCKED_COLD_READ_ATTEMPTS + 2));
+        }
+    }
+
+    /// A Signal save during hosted storage I/O wins cache publication and flush.
+    #[tokio::test]
+    async fn verified_identity_write_preserves_a_concurrent_signal_save() {
+        let backend = Arc::new(GatedColdRead::new(0));
+        let cache = Arc::new(SignalStoreCache::new());
+        let address = ProtocolAddress::new("12025550185", 0.into());
+        assert!(
+            cache
+                .persist_identity_if_absent_or_equal(&address, &[1; 32], backend.as_ref())
+                .await
+                .unwrap()
+        );
+        backend.pause_identity_write.store(true, Ordering::Relaxed);
+        let expected = [(address.clone(), Some([1; 32]))];
+        let mut write = Box::pin(cache.persist_identities_if_equal(
+            &expected,
+            &[2; 32],
+            backend.clone(),
+            &IdentityTestRuntime,
+        ));
+        assert!(futures::poll!(write.as_mut()).is_pending());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while backend.pending_identity.lock().unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let key = IdentityKey::new(PublicKey::from_djb_public_key_bytes(&[3; 32]).unwrap());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cache.save_identity(&address, &key, backend.as_ref()),
+        )
+        .await
+        .expect("Signal saves must not wait for hosted backend I/O")
+        .unwrap();
+        backend.pause_identity_write.store(false, Ordering::Relaxed);
+        backend.identity_write_release.wait().await;
+        assert!(!write.await.unwrap());
+        assert_eq!(
+            cache
+                .get_identity(&address, backend.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            &[3; 32]
+        );
+        assert!(
+            cache
+                .identities
+                .lock()
+                .await
+                .dirty
+                .contains(address.as_str())
+        );
+        cache.flush(backend.as_ref()).await.unwrap();
+        assert_eq!(*backend.identity.lock().unwrap(), Some([3; 32]));
+        assert!(
+            !cache
+                .identities
+                .lock()
+                .await
+                .dirty
+                .contains(address.as_str())
+        );
     }
 
     #[tokio::test]
@@ -8155,6 +8561,85 @@ mod identity_continuity_tests {
         assert_eq!(continuity.snapshot(), None);
         drop(continuity.changing(["second"]));
         assert_eq!(continuity.snapshot(), None);
+    }
+
+    #[tokio::test]
+    /// Competing rotations preserve one winner without flushing unrelated ratchets.
+    async fn verified_identity_cas_preserves_concurrent_trust_and_unrelated_ratchets() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = Arc::new(crate::store::in_memory::InMemoryBackend::new());
+        let address = ProtocolAddress::new("12025550161", 0.into());
+        let unrelated = ProtocolAddress::new("12025550162", 1.into());
+        cache
+            .put_session(&unrelated, SessionRecord::new_fresh())
+            .await;
+        assert!(
+            cache
+                .persist_identities_if_equal(
+                    &[(address.clone(), None)],
+                    &[1; 32],
+                    backend.clone(),
+                    &IdentityTestRuntime
+                )
+                .await
+                .unwrap()
+        );
+        let expected = [(address.clone(), Some([1; 32]))];
+        let (first, second) = futures::join!(
+            cache.persist_identities_if_equal(
+                &expected,
+                &[2; 32],
+                backend.clone(),
+                &IdentityTestRuntime
+            ),
+            cache.persist_identities_if_equal(
+                &expected,
+                &[3; 32],
+                backend.clone(),
+                &IdentityTestRuntime
+            ),
+        );
+        assert_ne!(first.unwrap(), second.unwrap());
+        let accepted = cache
+            .get_identity(&address, backend.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            backend
+                .load_identity(address.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            accepted.as_ref()
+        );
+        assert!(
+            backend
+                .get_session(unrelated.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let cold = Arc::new(SignalStoreCache::new());
+        assert!(
+            !cold
+                .persist_identities_if_equal(
+                    &[(address.clone(), None)],
+                    &[4; 32],
+                    backend.clone(),
+                    &IdentityTestRuntime
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            cold.get_identity(&address, backend.as_ref())
+                .await
+                .unwrap()
+                .unwrap(),
+            accepted
+        );
     }
 
     #[tokio::test]
