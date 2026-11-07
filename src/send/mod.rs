@@ -3191,6 +3191,8 @@ impl Client {
             let encryption_jid = self.resolve_encryption_jid(&to).await;
             let signal_addr = encryption_jid.to_protocol_address();
 
+            let _account_guard = self.lock_companion_account(&encryption_jid).await;
+
             let session_mutex = self.session_lock_for(signal_addr.as_str()).await;
             let _session_guard = session_mutex.lock().await;
 
@@ -3824,9 +3826,9 @@ impl Client {
                 debug!(target: "Client/TcToken", "Scheduled tc token issuance after send for {}", to.observe());
             }
 
-            let _session_guards = self.session_guards_for(addressing.lock_keys()).await;
+            let session_guards = self.session_guards_for(addressing.lock_keys()).await;
 
-            let mut store_adapter = self.signal_adapter();
+            let mut store_adapter = self.signal_adapter().with_session_fence(session_guards);
 
             let mut stores = store_adapter.as_signal_stores();
 
@@ -3987,7 +3989,7 @@ impl Client {
         };
         self.ensure_e2e_sessions_resolved(addressing.encryption())
             .await?;
-        let _session_guards = self.session_guards_for(addressing.lock_keys()).await;
+        let session_guards = self.session_guards_for(addressing.lock_keys()).await;
 
         let shared_content = message
             .message_context_info
@@ -3995,7 +3997,7 @@ impl Client {
             .then(|| std::sync::Arc::new(waproto::codec::message_to_vec(message)));
         self.add_recent_message(&to, request_id, message, shared_content.clone())
             .await;
-        let mut store_adapter = self.signal_adapter();
+        let mut store_adapter = self.signal_adapter().with_session_fence(session_guards);
         let mut stores = store_adapter.as_signal_stores();
         let mut prepared = wacore::send::prepare_dm_stanza(
             &*self.runtime,

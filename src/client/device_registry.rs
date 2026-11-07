@@ -1266,8 +1266,8 @@ impl Client {
         });
     }
 
-    /// Delete Signal sessions for specific device IDs in every user namespace,
-    /// then flush. Shared by `clear_device_record` and `patch_device_remove`.
+    /// Fixture cleanup; production retirement uses its owned maintenance scope.
+    #[cfg(test)]
     pub(crate) async fn delete_sessions_for_devices(&self, user: &str, device_ids: &[u16]) {
         self.delete_sessions_for_devices_unflushed(user, device_ids)
             .await;

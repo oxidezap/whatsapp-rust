@@ -1117,6 +1117,7 @@ impl Client {
         self.ensure_e2e_sessions_resolved(std::slice::from_ref(&encryption_jid))
             .await?;
         let signal_address = encryption_jid.to_protocol_address();
+        let account_guard = self.lock_companion_account(&encryption_jid).await;
         let session_mutex = self.session_lock_for(signal_address.as_str()).await;
         let session_guard = session_mutex.lock().await;
         let mut store_adapter = self.signal_adapter();
@@ -1171,6 +1172,7 @@ impl Client {
         // Persistence may need the processing permit, whose holder may in turn
         // need this session lock. Release it before the durability gate.
         drop(session_guard);
+        drop(account_guard);
         if history {
             let confirmation = self.confirm_signal_state_pre_wire().await?;
             let groups = self.groups();

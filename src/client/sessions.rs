@@ -305,17 +305,7 @@ impl Client {
         rng: &mut StdRng,
     ) -> Result<IdentityChange, SignalProtocolError> {
         let signal_address = jid.to_protocol_address();
-        let _account_guard = if jid.device != 0 {
-            let primary = jid.with_device(0).to_protocol_address();
-            Some(
-                self.session_lock_for(primary.as_str())
-                    .await
-                    .lock_arc()
-                    .await,
-            )
-        } else {
-            None
-        };
+        let _account_guard = self.lock_companion_account(jid).await;
         let session_mutex = self.session_lock_for(signal_address.as_str()).await;
         let session_guard = session_mutex.lock().await;
 

@@ -65,7 +65,11 @@ impl SharedDevice {
 }
 
 #[derive(Clone)]
-pub struct SessionAdapter(SharedDevice);
+pub struct SessionAdapter(
+    SharedDevice,
+    // Cloned fanout stores keep the caller's locks until their task stops.
+    #[allow(dead_code)] Option<Arc<Vec<async_lock::MutexGuardArc<()>>>>,
+);
 #[derive(Clone)]
 pub struct IdentityAdapter(SharedDevice);
 #[derive(Clone)]
@@ -110,12 +114,18 @@ impl SignalProtocolStoreAdapter {
             cache,
         };
         Self {
-            session_store: SessionAdapter(shared.clone()),
+            session_store: SessionAdapter(shared.clone(), None),
             identity_store: IdentityAdapter(shared.clone()),
             pre_key_store: PreKeyAdapter(shared.clone()),
             signed_pre_key_store: SignedPreKeyAdapter(shared.clone()),
             sender_key_store: SenderKeyAdapter(shared),
         }
+    }
+
+    /// Share session ownership with cloned stores handed to fanout workers.
+    pub(crate) fn with_session_fence(mut self, fence: Vec<async_lock::MutexGuardArc<()>>) -> Self {
+        self.session_store.1 = Some(Arc::new(fence));
+        self
     }
 
     pub fn as_signal_stores(&mut self) -> wacore::send::SignalStores<'_> {
@@ -569,6 +579,83 @@ mod tests {
     use wacore::store::in_memory::InMemoryBackend;
 
     const PREKEY_ID: u32 = 7777;
+
+    /// Native cancellation cannot preempt a running chunk poll. Its cloned
+    /// store must retain account ownership until the final identity write stops.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_fanout_store_clone_keeps_account_fence_until_worker_stops() {
+        use wacore::libsignal::protocol::KeyPair;
+        use wacore::send::{CloneableIdentityStore, CloneableSessionStore};
+        use wacore::types::jid::JidExt as _;
+        use wacore_binary::Jid;
+        let backend = Arc::new(InMemoryBackend::new());
+        let pm = test_persistence_manager(backend.clone()).await;
+        let cache = Arc::new(SignalStoreCache::new());
+        let lock = Arc::new(async_lock::Mutex::new(()));
+        let adapter = SignalProtocolStoreAdapter::new(pm, cache.clone())
+            .with_session_fence(vec![lock.lock_arc().await]);
+        let session = adapter.session_store.clone_box();
+        let mut identities = adapter.identity_store.clone_box();
+        let device = Jid::pn_device("12025550131", 7).to_protocol_address();
+        let primary = Jid::pn("12025550131").to_protocol_address();
+        let old = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let replacement = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let replacement_identity = *replacement.public_key.public_key_bytes();
+        let (entered, running) = futures::channel::oneshot::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let task_device = device.clone();
+        let worker = tokio::spawn(async move {
+            let _session = session;
+            entered.send(()).unwrap();
+            resume
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            identities
+                .save_identity(&task_device, &IdentityKey::new(old.public_key))
+                .await
+                .unwrap();
+        });
+        running.await.unwrap();
+        worker.abort();
+        drop(adapter);
+        assert!(
+            lock.try_lock().is_none(),
+            "aborting a chunk must not release its caller's account fence early"
+        );
+        let recovery = {
+            let lock = lock.clone();
+            let cache = cache.clone();
+            let primary = primary.clone();
+            let device = device.clone();
+            tokio::spawn(async move {
+                let _guard = lock.lock_arc().await;
+                cache.delete_identity(&device).await;
+                cache.put_identity(&primary, &replacement_identity).await;
+            })
+        };
+        release.send(()).unwrap();
+        let _ = worker.await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), recovery)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            cache
+                .get_identity(&device, backend.as_ref())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            cache
+                .get_identity(&primary, backend.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            replacement_identity.as_slice()
+        );
+    }
 
     async fn test_persistence_manager(
         backend: Arc<dyn crate::store::Backend>,

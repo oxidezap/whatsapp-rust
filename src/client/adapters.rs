@@ -52,6 +52,24 @@ impl SignalMaintenance<'_> {
 }
 
 impl Client {
+    /// Pairwise identity writes must take the account anchor before the device.
+    pub(crate) async fn lock_companion_account(
+        &self,
+        jid: &Jid,
+    ) -> Option<async_lock::MutexGuardArc<()>> {
+        use wacore::types::jid::JidExt as _;
+        if jid.device == 0 {
+            return None;
+        }
+        let primary = jid.with_device(0).to_protocol_address();
+        Some(
+            self.session_lock_for(primary.as_str())
+                .await
+                .lock_arc()
+                .await,
+        )
+    }
+
     /// Drain buffered rows before taking any Signal or topology locks. Never
     /// call batch-safe flushing inside the returned scope: it would reacquire
     /// the same non-reentrant permit during offline delivery.

@@ -212,6 +212,7 @@ impl<'a> Signal<'a> {
         plaintext: &[u8],
     ) -> Result<CiphertextMessage, SignalError> {
         let address = jid.to_protocol_address();
+        let _account_guard = self.client.lock_companion_account(jid).await;
         let lock = self.client.session_lock_for(address.as_str()).await;
         let _guard = lock.lock().await;
         let mut adapter = self.client.signal_adapter();
@@ -242,6 +243,7 @@ impl<'a> Signal<'a> {
         parsed: &CiphertextMessage,
     ) -> Result<DecryptionResult, SignalError> {
         let address = jid.to_protocol_address();
+        let _account_guard = self.client.lock_companion_account(jid).await;
         let lock = self.client.session_lock_for(address.as_str()).await;
         let _guard = lock.lock().await;
         let mut adapter = self.client.signal_adapter();
@@ -730,29 +732,32 @@ impl<'a> Signal<'a> {
 
         // Acquire per-device session locks before encrypting (matches DM send path)
         let lock_jids = self.client.build_session_lock_keys(&device_jids).await;
-        let _session_guards = self.client.session_guards_for(&lock_jids).await;
+        let session_guards = self.client.session_guards_for(&lock_jids).await;
 
         let plaintext = MessageUtils::encode_and_pad(message);
-        let mut adapter = self.client.signal_adapter();
         let mediatype = wacore::send::media_type_from_message(message);
         let hide_decrypt_fail = wacore::send::should_hide_decrypt_fail(message);
 
-        let mut stores = adapter.as_signal_stores();
-        let result = wacore::session_engine::publication::PreparedSignal::new(
-            wacore::send::encrypt_for_devices(
-                &*self.client.runtime,
-                &mut stores,
-                self.client,
-                &device_jids,
-                &plaintext,
-                hide_decrypt_fail,
-                mediatype,
+        let result = {
+            let mut adapter = self
+                .client
+                .signal_adapter()
+                .with_session_fence(session_guards);
+            let mut stores = adapter.as_signal_stores();
+            wacore::session_engine::publication::PreparedSignal::new(
+                wacore::send::encrypt_for_devices(
+                    &*self.client.runtime,
+                    &mut stores,
+                    self.client,
+                    &device_jids,
+                    &plaintext,
+                    hide_decrypt_fail,
+                    mediatype,
+                )
+                .await?,
             )
-            .await?,
-        )
-        .begin_commit();
-
-        drop(_session_guards);
+            .begin_commit()
+        };
         let confirmation = self.client.confirm_signal_state_pre_wire().await?;
 
         let result = result.confirm(confirmation).into_payload();
@@ -963,6 +968,79 @@ impl Signal<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Gate the real cold session read after encryption/decryption has taken
+    /// its guards, so recovery cannot retire the account during identity writes.
+    #[tokio::test]
+    async fn direct_pairwise_writers_hold_account_before_cold_session_io() {
+        use crate::store::release::tests::ProbeBackend;
+        use std::sync::Arc;
+        use wacore::libsignal::protocol::{IdentityKey, KeyPair};
+        for decrypt in [false, true] {
+            let (mut probe, _) = ProbeBackend::new();
+            let (release, gate) = async_channel::unbounded();
+            let (entered, arrived) = async_channel::unbounded();
+            probe.gate = Some(gate);
+            probe.entered = Some(entered);
+            probe.gate_method = "get_session";
+            let (client, _) =
+                crate::test_utils::create_iq_test_client_with_backend(Arc::new(probe)).await;
+            let user = Jid::pn_device("12025550132", 7);
+            let operation = {
+                let client = client.clone();
+                let user = user.clone();
+                tokio::spawn(async move {
+                    if decrypt {
+                        let key = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+                        let identity = IdentityKey::new(key.public_key);
+                        let message = SignalMessage::new(
+                            3,
+                            &[0; 32],
+                            key.public_key,
+                            0,
+                            0,
+                            &[0; 16],
+                            &identity,
+                            &identity,
+                        )
+                        .unwrap();
+                        client
+                            .signal()
+                            .decrypt_pairwise_at(&user, &CiphertextMessage::SignalMessage(message))
+                            .await
+                            .map(|_| ())
+                    } else {
+                        client
+                            .signal()
+                            .encrypt_pairwise_at(&user, b"fictitious plaintext")
+                            .await
+                            .map(|_| ())
+                    }
+                })
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), arrived.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let primary = client
+                .session_lock_for(user.with_device(0).to_protocol_address().as_str())
+                .await;
+            assert!(
+                primary.try_lock().is_none(),
+                "direct pairwise writers must fence the account before reading the session"
+            );
+            release.send(()).await.unwrap();
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), operation)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err()
+            );
+            assert!(primary.try_lock().is_some());
+            client.signal_shutdown_sync();
+        }
+    }
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 

@@ -251,12 +251,7 @@ impl Client {
         if sender.device == 0 || payloads.is_empty() {
             return Ok(IncomingAccountFence::default());
         }
-        let primary = sender.with_device(0).to_protocol_address();
-        let guard = self
-            .session_lock_for(primary.as_str())
-            .await
-            .lock_arc()
-            .await;
+        let guard = self.lock_companion_account(sender).await;
         for payload in payloads
             .iter()
             .filter(|payload| payload.enc_type == EncType::PreKeyMessage)
@@ -273,7 +268,7 @@ impl Client {
             }
         }
         Ok(IncomingAccountFence {
-            guard: Some(guard),
+            guard,
             retired: false,
         })
     }
@@ -915,8 +910,11 @@ impl Client {
                 .await
             {
                 Ok(fence) => fence,
-                Err(error) => {
-                    log::warn!("Dropping companion prekey message after account changed: {error}");
+                Err(_) => {
+                    log::warn!(
+                        "Dropping companion session batch after account validation failed for {}",
+                        sender_encryption_jid.observe()
+                    );
                     return;
                 }
             };
@@ -1148,6 +1146,29 @@ impl Client {
                 raw_pending::StanzaOrigin::new(),
                 IncomingAccountFence::default(),
             ),
+        )
+        .await
+    }
+
+    /// Exercise the production account-fenced decrypt phase from crypto fixtures.
+    #[cfg(test)]
+    pub(crate) async fn process_session_enc_batch_account_fenced(
+        self: Arc<Self>,
+        payloads: Vec<EncPayload>,
+        info: &Arc<MessageInfo>,
+        sender: &Jid,
+    ) -> SessionBatchOutcome {
+        let fence = self
+            .lock_incoming_companion_account(sender, None, &payloads)
+            .await
+            .unwrap();
+        self.process_session_enc_batch_with_origin(
+            payloads,
+            info,
+            sender,
+            crate::types::events::DecryptFailMode::Show,
+            None,
+            (raw_pending::StanzaOrigin::new(), fence),
         )
         .await
     }
@@ -2821,7 +2842,10 @@ impl Client {
         // Release the address lock so the migration loop can acquire it for
         // the matching device without re-entering.
         let account_identity = if account_fence.guard.is_some() {
-            match self.cached_adv_account_identity(sender_jid).await {
+            match self
+                .cached_migration_account_identity(sender_jid, &pn)
+                .await
+            {
                 Ok(identity) => Some(identity),
                 Err(_) => {
                     account_fence.retired = true;
@@ -2841,17 +2865,15 @@ impl Client {
         // reacquire, so the caller always gets the guard back as `Some`; losing
         // that would silently drop same-sender serialization.
         if account_identity.is_some() {
-            let primary = sender_jid.with_device(0).to_protocol_address();
-            account_fence.guard = Some(
-                self.session_lock_for(primary.as_str())
-                    .await
-                    .lock_arc()
-                    .await,
-            );
+            account_fence.guard = self.lock_companion_account(sender_jid).await;
         }
         *session_guard = Some(session_mutex.lock_arc().await);
         if let Some(previous) = account_identity
-            && self.cached_adv_account_identity(sender_jid).await.ok() != Some(previous)
+            && self
+                .cached_migration_account_identity(sender_jid, &pn)
+                .await
+                .ok()
+                != Some(previous)
         {
             account_fence.retired = true;
             return MigrationDecryptResult::NotDecrypted(None, None);
@@ -2926,6 +2948,19 @@ impl Client {
                 )
             }
         }
+    }
+
+    /// LID wins when present, but cold namespace migration may legitimately
+    /// move the only trusted primary from PN into the previously empty LID.
+    async fn cached_migration_account_identity(
+        &self,
+        lid: &Jid,
+        pn: &str,
+    ) -> anyhow::Result<Option<[u8; 32]>> {
+        if let Some(identity) = self.cached_adv_account_identity(lid).await? {
+            return Ok(Some(identity));
+        }
+        self.cached_adv_account_identity(&Jid::pn(pn)).await
     }
 
     pub(crate) async fn cache_lid_pn_from_message(
