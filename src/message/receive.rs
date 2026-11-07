@@ -240,19 +240,15 @@ impl Client {
         Ok(())
     }
 
-    /// Recheck under the account fence after the initial cold-key bootstrap.
-    /// Keep the fence through Signal commit, even while waiting on the device.
+    /// Recheck prekeys after cold bootstrap and fence every companion decrypt:
+    /// even a regular msg saves identity before committing its session checkout.
     async fn lock_incoming_companion_account(
         &self,
         sender: &Jid,
         certificate: Option<&[u8]>,
         payloads: &[EncPayload],
     ) -> anyhow::Result<IncomingAccountFence> {
-        if sender.device == 0
-            || !payloads
-                .iter()
-                .any(|payload| payload.enc_type == EncType::PreKeyMessage)
-        {
+        if sender.device == 0 || payloads.is_empty() {
             return Ok(IncomingAccountFence::default());
         }
         let primary = sender.with_device(0).to_protocol_address();
@@ -3184,12 +3180,16 @@ mod adv_tests {
         client.signal_shutdown_sync();
     }
 
-    #[tokio::test]
-    async fn inbound_companion_keeps_account_fence_while_waiting_on_its_device() {
+    async fn check_inbound_account_fence(regular_message: bool) {
         let client = crate::test_utils::create_test_client().await;
         let sender = Jid::pn_device("12025550129", 7);
         crate::test_utils::seed_adv_primary(&client, &sender).await;
-        let (payloads, certificate, identity) = companion_payload_fixture();
+        let (mut payloads, certificate, identity) = companion_payload_fixture();
+        if regular_message {
+            let message = PreKeySignalMessage::try_from(payloads[0].ciphertext.clone()).unwrap();
+            payloads[0].ciphertext = bytes::Bytes::copy_from_slice(message.message().serialized());
+            payloads[0].enc_type = EncType::Message;
+        }
         client
             .validate_incoming_companion_identity(&sender, Some(&certificate), &identity)
             .await
@@ -3237,6 +3237,16 @@ mod adv_tests {
             .unwrap();
         assert!(primary.try_lock().is_some());
         client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn inbound_companion_keeps_account_fence_while_waiting_on_its_device() {
+        check_inbound_account_fence(false).await;
+    }
+
+    #[tokio::test]
+    async fn regular_companion_receive_keeps_account_fence_through_session_commit() {
+        check_inbound_account_fence(true).await;
     }
 
     #[tokio::test]
