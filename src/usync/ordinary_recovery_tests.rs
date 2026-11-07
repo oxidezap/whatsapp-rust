@@ -4,7 +4,6 @@ use super::tests::{adv_wire_response, has_session, seed_fresh_session, signed_ke
 use super::*;
 use crate::cache::Freshness;
 use crate::test_utils::{TestEventCollector, answer_iq, create_iq_test_client, decode_sent_iq};
-use futures::FutureExt as _;
 use std::sync::Arc;
 use std::time::Duration;
 use wacore::libsignal::protocol::KeyPair;
@@ -112,6 +111,238 @@ enum Outcome {
     AliasIdentityChanged,
 }
 
+/// Report the real processing-permit slow path, so the test can order a
+/// receiver's primary lock attempt after recovery has started waiting.
+struct PermitWaitRuntime(async_channel::Sender<()>);
+
+impl wacore::runtime::Runtime for PermitWaitRuntime {
+    fn spawn(
+        &self,
+        future: wacore::runtime::BoxFuture<'static, ()>,
+    ) -> wacore::runtime::AbortHandle {
+        wacore::runtime::Runtime::spawn(&crate::runtime_impl::TokioRuntime, future)
+    }
+    fn sleep(&self, duration: Duration) -> wacore::runtime::BoxFuture<'static, ()> {
+        if duration == Duration::from_secs(10) {
+            let _ = self.0.try_send(());
+        }
+        wacore::runtime::Runtime::sleep(&crate::runtime_impl::TokioRuntime, duration)
+    }
+    fn spawn_blocking(
+        &self,
+        f: Box<dyn FnOnce() + Send + 'static>,
+    ) -> wacore::runtime::BoxFuture<'static, ()> {
+        wacore::runtime::Runtime::spawn_blocking(&crate::runtime_impl::TokioRuntime, f)
+    }
+    fn yield_now(&self) -> Option<wacore::runtime::BoxFuture<'static, ()>> {
+        wacore::runtime::Runtime::yield_now(&crate::runtime_impl::TokioRuntime)
+    }
+}
+
+/// Before the fix this parks the recovery on the sole permit while the
+/// permit's receiver waits for the primary mutex held by that recovery.
+#[tokio::test]
+async fn offline_recovery_admits_processing_before_primary_locks() {
+    use crate::test_utils::{create_iq_test_client_with_runtime, create_test_backend};
+    use wacore::usync::{UserDeviceList, UsyncDevice};
+    let (waiting, recovery_waiting) = async_channel::unbounded();
+    let (client, transport) = create_iq_test_client_with_runtime(
+        create_test_backend().await,
+        Arc::new(PermitWaitRuntime(waiting)),
+    )
+    .await;
+    let user = Jid::pn("12025550199");
+    crate::test_utils::seed_adv_primary(&client, &user).await;
+    let old = client.cached_adv_account_identity(&user).await.unwrap();
+    seed_fresh_session(&client, &user).await;
+    seed_fresh_session(&client, &user.with_device(7)).await;
+    client
+        .update_device_list(DeviceListRecord {
+            user: user.user.as_str().into(),
+            devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(1))].into(),
+            raw_id: Some(1),
+            timestamp: 1,
+            phash: None,
+        })
+        .await
+        .unwrap();
+    client.flush_signal_cache_batch_safe().await.unwrap();
+    let replacement = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+    let response = DeviceListResponse {
+        device_lists: vec![UserDeviceList {
+            user: user.clone(),
+            devices: vec![UsyncDevice::new(0, None)],
+            phash: None,
+            key_index_bytes: Some(signed_list(&replacement, false)),
+        }],
+        lid_mappings: vec![],
+    };
+    let error = client
+        .process_device_list_response(&response, Freshness::Refresh)
+        .await
+        .unwrap_err();
+    client.enter_drain_mode_for_tests();
+    assert!(!client.inbound_commit_batch.has_entries());
+    let mutex = client
+        .session_lock_for(user.to_protocol_address().as_str())
+        .await;
+    let (entered, owns_permit) = async_channel::unbounded();
+    let (decrypt, start_decrypt) = async_channel::unbounded();
+    let inbound = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            let _permit = client.acquire_message_processing_permit().await;
+            entered.send(()).await.unwrap();
+            start_decrypt.recv().await.unwrap();
+            let _session = mutex.lock_arc().await;
+        })
+    };
+    owns_permit.recv().await.unwrap();
+    let recovery = {
+        let client = client.clone();
+        tokio::spawn(async move { client.recover_ordinary_adv_identity(error).await })
+    };
+    let iq = decode_sent_iq(&transport, 0).await;
+    let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+    answer_iq(&client, &id, &primary_response(&user, &replacement, true)).await;
+    tokio::time::timeout(Duration::from_secs(5), recovery_waiting.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        client.cached_adv_account_identity(&user).await.unwrap(),
+        old
+    );
+    decrypt.send(()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), inbound)
+        .await
+        .expect("recovery must not own the primary while awaiting the drain permit")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), recovery)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        client.cached_adv_account_identity(&user).await.unwrap(),
+        Some(*replacement.public_key.public_key_bytes())
+    );
+    assert!(!has_session(&client, &user.with_device(7).to_protocol_address()).await);
+    client.signal_shutdown_sync();
+}
+
+#[tokio::test]
+async fn stale_maintenance_permit_cannot_flush_a_new_drain() {
+    let (client, _) = create_iq_test_client().await;
+    let scope = client.begin_signal_maintenance().await.unwrap();
+    client.enter_drain_mode_for_tests();
+    assert!(scope.flush().await.is_err());
+    drop(scope);
+    client.signal_shutdown_sync();
+}
+
+#[tokio::test]
+async fn group_recovery_budget_counts_requests_across_repeated_batches() {
+    use wacore::usync::{UserDeviceList, UsyncDevice};
+    let (client, transport) = create_iq_test_client().await;
+    let users = [
+        Jid::pn("12025550201"),
+        Jid::pn("12025550202"),
+        Jid::pn("12025550203"),
+    ];
+    for user in &users {
+        crate::test_utils::seed_adv_primary(&client, user).await;
+    }
+    let signer = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+    let bytes = signed_list(&signer, false);
+    let response_for = |users: &[Jid]| DeviceListResponse {
+        device_lists: users
+            .iter()
+            .map(|user| UserDeviceList {
+                user: user.clone(),
+                devices: vec![UsyncDevice::new(0, None)],
+                phash: None,
+                key_index_bytes: Some(bytes.clone()),
+            })
+            .collect(),
+        lid_mappings: vec![],
+    };
+    let first = response_for(&users[..1]);
+    let later = response_for(&users[1..]);
+    let operation = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            let mut budget = GroupAdvRecoveryBudget {
+                remaining: 2,
+                attempted: std::collections::HashSet::new(),
+            };
+            client
+                .recover_group_adv_identities(&first, &mut budget)
+                .await;
+            // A topology retry must not repeat a known failed member.
+            client
+                .recover_group_adv_identities(&first, &mut budget)
+                .await;
+            client
+                .recover_group_adv_identities(&later, &mut budget)
+                .await;
+            budget
+        })
+    };
+    let wrong_primary = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+    for (round, user) in users[..2].iter().enumerate() {
+        for step in 0..3 {
+            let iq = decode_sent_iq(&transport, round * 3 + step).await;
+            let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+            if step == 2 {
+                let requested = iq
+                    .get()
+                    .get_optional_child("key")
+                    .unwrap()
+                    .get_optional_child("user")
+                    .unwrap()
+                    .attrs()
+                    .jid("jid");
+                assert_eq!(&requested, user);
+                answer_iq(&client, &id, &primary_response(user, &wrong_primary, true)).await;
+            } else {
+                let requested = iq
+                    .get()
+                    .get_optional_child("usync")
+                    .unwrap()
+                    .get_optional_child("list")
+                    .unwrap()
+                    .children()
+                    .unwrap();
+                assert_eq!(requested[0].attrs().jid("jid"), *user);
+                answer_iq(&client, &id, &adv_wire_response(user, bytes.clone())).await;
+            }
+        }
+    }
+    let budget = tokio::time::timeout(Duration::from_secs(5), operation)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(budget.remaining, 0);
+    assert_eq!(budget.attempted.len(), 2);
+    assert_eq!(
+        transport.sent().len(),
+        6,
+        "only two eligible members may issue recovery IQs"
+    );
+    for user in &users {
+        assert_eq!(
+            client.cached_adv_account_identity(user).await.unwrap(),
+            Some(
+                *crate::test_utils::adv_test_account()
+                    .public_key
+                    .public_key_bytes()
+            )
+        );
+    }
+    client.signal_shutdown_sync();
+}
+
 /// Real installers cannot restore old sessions while a cancelled caller's
 /// recovery worker saves trust; orphan companions are retired under both aliases.
 #[tokio::test]
@@ -193,28 +424,36 @@ async fn ordinary_recovery_holds_both_primary_locks_through_identity_publication
     let iq = decode_sent_iq(&transport, 0).await;
     let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
     answer_iq(&client, &id, &primary_response(&phone, &account, true)).await;
+    let mut installers = Vec::new();
     for _ in 0..2 {
         tokio::time::timeout(Duration::from_secs(5), arrived.recv())
             .await
             .unwrap()
             .unwrap();
-        let mut completed = Vec::new();
+        let (started, entered) = async_channel::unbounded();
         for user in [&phone, &lid] {
-            let bundle = session_bundle(crate::test_utils::adv_test_account(), 0, None);
-            let mut adapter = client.signal_adapter();
-            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-            completed.push(
+            let mut bundle = session_bundle(crate::test_utils::adv_test_account(), 0, None);
+            // The SDK records this observation before a primary key IQ.
+            bundle.set_identity_snapshot(Some(
+                *crate::test_utils::adv_test_account()
+                    .public_key
+                    .public_key_bytes(),
+            ));
+            let client = client.clone();
+            let user = user.clone();
+            let started = started.clone();
+            installers.push(tokio::spawn(async move {
+                started.send(()).await.unwrap();
                 client
-                    .install_prekey_bundle_cached(user, &bundle, &mut adapter, &mut rng)
-                    .now_or_never()
-                    .is_some(),
-            );
+                    .install_prekey_bundle_cached(
+                        &user,
+                        &bundle,
+                        &mut client.signal_adapter(),
+                        &mut rand::make_rng::<rand::rngs::StdRng>(),
+                    )
+                    .await
+            }));
         }
-        assert_eq!(
-            completed,
-            vec![false, false],
-            "PN and LID old-primary installers must both block during publication"
-        );
         for user in [&phone, &lid] {
             let mutex = client
                 .session_lock_for(user.to_protocol_address().as_str())
@@ -226,20 +465,48 @@ async fn ordinary_recovery_holds_both_primary_locks_through_identity_publication
             assert!(!has_session(&client, &user.to_protocol_address()).await);
         }
         assert!(!has_session(&client, &orphan.to_protocol_address()).await);
-        let mut adapter = client.signal_adapter();
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let running = client.clone();
+        let waiting_orphan = orphan.clone();
+        let waiting_bundle = old_companion.clone();
+        installers.push(tokio::spawn(async move {
+            started.send(()).await.unwrap();
+            running
+                .install_prekey_bundle_cached(
+                    &waiting_orphan,
+                    &waiting_bundle,
+                    &mut running.signal_adapter(),
+                    &mut rand::make_rng::<rand::rngs::StdRng>(),
+                )
+                .await
+        }));
+        for _ in 0..3 {
+            tokio::time::timeout(Duration::from_secs(5), entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
         assert!(
-            client
-                .install_prekey_bundle_cached(&orphan, &old_companion, &mut adapter, &mut rng)
-                .now_or_never()
-                .is_none(),
-            "companion installation must wait for account publication"
+            installers.iter().all(|task| !task.is_finished()),
+            "real installers must remain blocked until both aliases publish"
         );
         if let Some(caller) = caller.take() {
             caller.abort();
             assert!(caller.await.unwrap_err().is_cancelled());
         }
         release.send(()).await.unwrap();
+    }
+    for installer in installers {
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), installer)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err(),
+            "a retained primary or companion bundle must not restore old trust"
+        );
     }
     // Acquiring the guards is a completion barrier for the detached worker,
     // independent of the cancelled requester's join handle.

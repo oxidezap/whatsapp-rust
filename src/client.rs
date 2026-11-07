@@ -1,5 +1,6 @@
 mod accessors;
 mod adapters;
+pub(crate) use adapters::SignalMaintenance;
 mod app_state;
 #[cfg(feature = "bench-harness")]
 #[doc(hidden)]

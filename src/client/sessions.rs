@@ -264,6 +264,20 @@ impl Client {
         jid: &Jid,
         bundle: &PreKeyBundle,
     ) -> Result<(), SignalProtocolError> {
+        if jid.device == 0
+            && let Some(previous) = bundle.identity_snapshot()
+        {
+            let current = self
+                .cached_adv_account_identity(jid)
+                .await
+                .map_err(|error| SignalProtocolError::InvalidArgument(error.to_string()))?;
+            let incoming = Some(*bundle.identity_key()?.public_key().public_key_bytes());
+            if current != previous && current != incoming {
+                return Err(SignalProtocolError::InvalidArgument(
+                    "primary prekey bundle fetched before a newer identity was published".into(),
+                ));
+            }
+        }
         if jid.device != 0
             && let Some(expected) = bundle.account_identity()
             && self

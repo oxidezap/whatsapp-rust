@@ -1782,6 +1782,9 @@ impl Client {
 
         let mut adapter = self.signal_adapter();
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        if requester_jid.device == 0 {
+            bundle.set_identity_snapshot(self.cached_adv_account_identity(requester_jid).await?);
+        }
         self.install_prekey_bundle_cached(requester_jid, &bundle, &mut adapter, &mut rng)
             .await?;
 

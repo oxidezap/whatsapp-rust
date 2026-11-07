@@ -184,6 +184,10 @@ impl Client {
         reason: Option<PreKeyFetchReason>,
     ) -> Result<wacore::prekeys::PreKeyFetchOutcome, anyhow::Error> {
         let account_identities = self.collect_account_identities(jids).await?;
+        let mut primary_snapshots = Vec::new();
+        for jid in jids.iter().filter(|jid| jid.device == 0) {
+            primary_snapshots.push((jid.clone(), self.cached_adv_account_identity(jid).await?));
+        }
         let cold_companions: Vec<_> = jids
             .iter()
             .filter(|jid| jid.device != 0 && !account_identities.contains_key(*jid))
@@ -248,6 +252,11 @@ impl Client {
             }
         }
         // Keep the public fetch outcome scoped to the caller's requested devices.
+        for (jid, previous) in primary_snapshots {
+            if let Some(bundle) = outcome.bundles.get_mut(&jid) {
+                bundle.set_identity_snapshot(previous);
+            }
+        }
         outcome.bundles.retain(|jid, _| jids.contains(jid));
         outcome.rejected.retain(|entry| jids.contains(&entry.jid));
 

@@ -1042,7 +1042,10 @@ pub async fn ensure_sessions_for_devices_resolved(
             if let Some(bundle) = prekey_bundles.get(jid)
                 && let Err(error) = resolver.validate_prekey_account_identity(jid, bundle).await
             {
-                log::warn!("Discarding stale prekey bundle for {jid}: {error}");
+                log::warn!(
+                    "Discarding stale prekey bundle for {}: {error}",
+                    jid.observe()
+                );
                 prekey_bundles.remove(jid);
             }
         }

@@ -1145,7 +1145,7 @@ impl Client {
     // The receive caller already owns the processing permit. Capacity pressure
     // must flush queued predecessors without reacquiring that same permit or
     // advancing the incoming ciphertext before admission succeeds.
-    pub(super) async fn flush_inbound_commits_while_processing(self: &Arc<Self>) -> bool {
+    pub(crate) async fn flush_inbound_commits_while_processing(self: &Arc<Self>) -> bool {
         let PendingInboundBatch {
             entries,
             commit_ticket,

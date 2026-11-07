@@ -1247,6 +1247,18 @@ impl Client {
     /// Delete Signal sessions for specific device IDs in every user namespace,
     /// then flush. Shared by `clear_device_record` and `patch_device_remove`.
     pub(crate) async fn delete_sessions_for_devices(&self, user: &str, device_ids: &[u16]) {
+        self.delete_sessions_for_devices_unflushed(user, device_ids)
+            .await;
+        self.flush_signal_cache_batch_safe_logged("delete_sessions_for_devices", None)
+            .await;
+    }
+
+    /// Stage removals for a caller that owns its durability/processing scope.
+    pub(crate) async fn delete_sessions_for_devices_unflushed(
+        &self,
+        user: &str,
+        device_ids: &[u16],
+    ) {
         let lookup = self.resolve_lookup_keys(user).await;
         for (key, server) in lookup.signal_namespaces() {
             for &device_id in device_ids {
@@ -1257,8 +1269,6 @@ impl Client {
                 self.signal_cache.delete_identity(&addr).await;
             }
         }
-        self.flush_signal_cache_batch_safe_logged("delete_sessions_for_devices", None)
-            .await;
     }
 
     /// Clear device record on raw_id mismatch (identity change).
@@ -1282,6 +1292,16 @@ impl Client {
         record: &wacore::store::traits::DeviceListRecord,
     ) {
         let _identity_change = self.signal_cache.identity_continuity.changing([user]);
+        self.clear_device_record_unflushed(user, record).await;
+        self.flush_signal_cache_batch_safe_logged("delete_sessions_for_devices", None)
+            .await;
+    }
+
+    pub(crate) async fn clear_device_record_unflushed(
+        &self,
+        user: &str,
+        record: &wacore::store::traits::DeviceListRecord,
+    ) {
         let non_primary_ids: Vec<u16> = record
             .devices
             .iter()
@@ -1294,7 +1314,7 @@ impl Client {
             non_primary_ids.len()
         );
 
-        self.delete_sessions_for_devices(user, &non_primary_ids)
+        self.delete_sessions_for_devices_unflushed(user, &non_primary_ids)
             .await;
 
         // WA Web's `WAWebUpdateLocalSignalSession` only calls `markForgetSenderKey`

@@ -3,7 +3,96 @@
 use super::*;
 use anyhow::Context as _;
 
+/// Own the receive permit before acquiring session/mapping/registry locks.
+/// Pending rows are committed before this scope is exposed, so its flushes
+/// cannot persist a drain ratchet whose message is still only in memory.
+pub(crate) struct SignalMaintenance<'a> {
+    client: &'a Client,
+    _permit: async_lock::SemaphoreGuardArc,
+    connection_generation: u64,
+    semaphore_generation: u64,
+}
+
+impl SignalMaintenance<'_> {
+    pub(crate) fn ensure_current(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.client.connection_generation.load(Ordering::Acquire) == self.connection_generation
+                && self
+                    .client
+                    .message_semaphore_generation
+                    .load(Ordering::SeqCst)
+                    == self.semaphore_generation,
+            "connection or processing permit changed during Signal maintenance"
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn flush(&self) -> anyhow::Result<()> {
+        self.ensure_current()?;
+        self.client.flush_signal_cache().await?;
+        self.ensure_current()
+    }
+
+    pub(crate) async fn clear_device_record(
+        &self,
+        user: &str,
+        record: &wacore::store::traits::DeviceListRecord,
+    ) -> anyhow::Result<()> {
+        self.ensure_current()?;
+        let _change = self
+            .client
+            .signal_cache
+            .identity_continuity
+            .changing([user]);
+        self.client
+            .clear_device_record_unflushed(user, record)
+            .await;
+        self.flush().await
+    }
+}
+
 impl Client {
+    /// Drain buffered rows before taking any Signal or topology locks. Never
+    /// call batch-safe flushing inside the returned scope: it would reacquire
+    /// the same non-reentrant permit during offline delivery.
+    pub(crate) async fn begin_signal_maintenance(
+        self: &Arc<Self>,
+    ) -> anyhow::Result<SignalMaintenance<'_>> {
+        let connection_generation = self.connection_generation.load(Ordering::Acquire);
+        loop {
+            let (semaphore_generation, _) = self.read_message_semaphore();
+            let permit = self.acquire_message_processing_permit().await;
+            anyhow::ensure!(
+                self.connection_generation.load(Ordering::Acquire) == connection_generation,
+                "connection changed while entering Signal maintenance"
+            );
+            if self.message_semaphore_generation.load(Ordering::SeqCst) != semaphore_generation {
+                drop(permit);
+                continue;
+            }
+            anyhow::ensure!(
+                self.flush_inbound_commits_while_processing().await,
+                "pending inbound rows could not commit before Signal maintenance"
+            );
+            anyhow::ensure!(
+                self.connection_generation.load(Ordering::Acquire) == connection_generation,
+                "connection changed while committing Signal maintenance rows"
+            );
+            // Completing a deferred drain can widen the semaphore. Re-enter
+            // on the new instance before exposing a permit ownership proof.
+            if self.message_semaphore_generation.load(Ordering::SeqCst) != semaphore_generation {
+                drop(permit);
+                continue;
+            }
+            return Ok(SignalMaintenance {
+                client: self.as_ref(),
+                _permit: permit,
+                connection_generation,
+                semaphore_generation,
+            });
+        }
+    }
+
     /// Build a [`SignalProtocolStoreAdapter`] from the current device state and signal cache.
     pub(crate) fn signal_adapter(
         &self,

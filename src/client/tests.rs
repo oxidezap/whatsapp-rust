@@ -7493,6 +7493,151 @@ mod ensure_sessions_concurrency {
     }
 
     #[tokio::test]
+    async fn cold_companions_share_one_primary_request_and_bootstrap_write() {
+        use crate::store::release::tests::ProbeBackend;
+        let (mut probe, _) = ProbeBackend::new();
+        let raw = probe.backend.clone();
+        let (release, gate) = async_channel::unbounded();
+        let (entered, writes) = async_channel::unbounded();
+        probe.gate = Some(gate);
+        probe.entered = Some(entered);
+        probe.gate_method = "put_identity";
+        let (client, transport) =
+            crate::test_utils::create_iq_test_client_with_backend(Arc::new(probe)).await;
+        let primary = Jid::pn("12025550127");
+        let companions = [primary.with_device(2), primary.with_device(7)];
+        let task = {
+            let client = client.clone();
+            let requested = companions.to_vec();
+            tokio::spawn(async move { client.fetch_pre_keys(&requested, None).await })
+        };
+        let iq = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let requested = iq
+            .get()
+            .get_optional_child("key")
+            .unwrap()
+            .children()
+            .unwrap();
+        assert_eq!(requested.len(), 3);
+        assert_eq!(
+            requested
+                .iter()
+                .filter(|node| node.attrs().jid("jid") == primary)
+                .count(),
+            1
+        );
+        let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+        let keys = PeerKeys::generate();
+        let users: Vec<_> = [&companions[1], &primary, &companions[0]]
+            .into_iter()
+            .map(|jid| {
+                keys.bundle_response(jid, &id, u32::from(jid.device))
+                    .get_optional_child("list")
+                    .unwrap()
+                    .children()
+                    .unwrap()[0]
+                    .clone()
+            })
+            .collect();
+        crate::test_utils::answer_iq(
+            &client,
+            &id,
+            &NodeBuilder::new("iq")
+                .attr("type", "result")
+                .children([NodeBuilder::new("list").children(users).build()])
+                .build(),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), writes.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        release.send(()).await.unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            writes.try_recv().is_err(),
+            "the primary bootstrap must write exactly once"
+        );
+        assert_eq!(outcome.bundles.len(), 2);
+        for companion in &companions {
+            wacore::client::context::SendContextResolver::validate_prekey_account_identity(
+                client.as_ref(),
+                companion,
+                outcome.bundles.get(companion).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            raw.load_identity(primary.to_protocol_address().as_str())
+                .await
+                .unwrap(),
+            Some(*keys.identity.public_key().public_key_bytes())
+        );
+        assert_eq!(transport.sent().len(), 1);
+        client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn fetched_primary_cannot_rollback_an_identity_published_while_it_waited() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let primary = Jid::pn("12025550128");
+        let keys = PeerKeys::generate();
+        let old = *keys.identity.public_key().public_key_bytes();
+        client
+            .signal_cache
+            .put_identity(&primary.to_protocol_address(), &old)
+            .await;
+        let task = {
+            let client = client.clone();
+            let primary = primary.clone();
+            tokio::spawn(async move { client.fetch_pre_keys(&[primary], None).await })
+        };
+        let iq = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+        crate::test_utils::answer_iq(&client, &id, &keys.bundle_response(&primary, &id, 1)).await;
+        let outcome = task.await.unwrap().unwrap();
+        let newer = wacore::libsignal::protocol::KeyPair::generate(&mut rand::make_rng::<
+            rand::rngs::StdRng,
+        >());
+        client
+            .signal_cache
+            .put_identity(
+                &primary.to_protocol_address(),
+                newer.public_key.public_key_bytes(),
+            )
+            .await;
+        let result = client
+            .install_prekey_bundle_cached(
+                &primary,
+                outcome.bundles.get(&primary).unwrap(),
+                &mut client.signal_adapter(),
+                &mut rand::make_rng::<rand::rngs::StdRng>(),
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(
+            client.cached_adv_account_identity(&primary).await.unwrap(),
+            Some(*newer.public_key.public_key_bytes())
+        );
+        assert!(
+            !client
+                .signal_cache
+                .has_session(
+                    &primary.to_protocol_address(),
+                    client.persistence_manager.backend().as_ref()
+                )
+                .await
+                .unwrap()
+        );
+        client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
     async fn cold_companion_cannot_omit_requested_primary_even_with_embedded_account_key() {
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
         let peer = Jid::pn("12025550129").with_device(2);

@@ -2,7 +2,7 @@
 //!
 //! Device list IQ specification is defined in `wacore::iq::usync`.
 
-use crate::client::Client;
+use crate::client::{Client, SignalMaintenance};
 use crate::request::IqError;
 use log::{debug, warn};
 use wacore::iq::usync::{DeviceListResponse, DeviceListSpec};
@@ -19,6 +19,24 @@ mod ordinary_recovery_tests;
 /// its IQ is in flight. Bound retries so a continuously changing account never
 /// turns one send into an unbounded request loop.
 const DEVICE_REFRESH_MAX_ATTEMPTS: usize = 3;
+
+/// Bound sequential key recovery IQs across all topology retries of one group.
+const GROUP_ADV_RECOVERY_LIMIT: usize = 8;
+
+struct GroupAdvRecoveryBudget {
+    remaining: usize,
+    attempted: std::collections::HashSet<Jid>,
+}
+
+impl GroupAdvRecoveryBudget {
+    fn take(&mut self, user: &Jid) -> bool {
+        if self.remaining == 0 || !self.attempted.insert(user.to_non_ad()) {
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+}
 
 /// A failed list never authorizes replacing the account's trusted identity.
 #[derive(thiserror::Error)]
@@ -180,6 +198,10 @@ impl Client {
         if jids.is_empty() {
             return Ok(Vec::new());
         }
+        let mut recovery_budget = GroupAdvRecoveryBudget {
+            remaining: GROUP_ADV_RECOVERY_LIMIT,
+            attempted: std::collections::HashSet::new(),
+        };
         for _ in 0..DEVICE_REFRESH_MAX_ATTEMPTS {
             let generation = self.device_topology.current();
             let response = self
@@ -188,7 +210,8 @@ impl Client {
                     self.generate_request_id(),
                 ))
                 .await?;
-            self.recover_group_adv_identities(&response).await;
+            self.recover_group_adv_identities(&response, &mut recovery_budget)
+                .await;
             if let Some(devices) = self
                 .try_process_group_device_list_response(&response, &jids, generation)
                 .await?
@@ -202,7 +225,11 @@ impl Client {
     /// Recover rotated contacts individually before the group topology CAS.
     /// A successful recovery invalidates the old batch generation; failures
     /// leave that contact's old record available while valid peers still apply.
-    async fn recover_group_adv_identities(&self, response: &DeviceListResponse) {
+    async fn recover_group_adv_identities(
+        &self,
+        response: &DeviceListResponse,
+        budget: &mut GroupAdvRecoveryBudget,
+    ) {
         for list in &response.device_lists {
             if list.devices.iter().any(|device| device.is_hosted) {
                 continue;
@@ -218,13 +245,31 @@ impl Client {
             {
                 continue;
             }
+            let snapshot = self.persistence_manager.get_device_snapshot();
+            if snapshot
+                .pn
+                .iter()
+                .chain(snapshot.lid.iter())
+                .any(|own| own.is_same_chat_as(&list.user))
+                || !budget.take(&list.user)
+            {
+                continue;
+            }
             if let Err(error) = Box::pin(self.fetch_user_devices_with_freshness(
                 vec![list.user.clone()],
                 crate::cache::Freshness::Refresh,
             ))
             .await
             {
-                warn!("Group ADV recovery failed for {}: {error:#}", list.user);
+                let category = if error.downcast_ref::<DeviceListAdvError>().is_some() {
+                    "signature verification"
+                } else {
+                    "request or persistence"
+                };
+                warn!(
+                    "Group ADV recovery failed for {} ({category}); retaining previous devices",
+                    list.user.observe()
+                );
             }
         }
     }
@@ -373,36 +418,42 @@ impl Client {
         };
         let (send, receive) = futures::channel::oneshot::channel();
         self.runtime.spawn_detached(Box::pin(async move {
-            use wacore::types::jid::JidExt as _;
-            let mut addresses: Vec<_> = recovered
-                .previous_identities
-                .iter()
-                .map(|(jid, _)| jid.to_protocol_address())
-                .collect();
-            // Match PN/LID migration's lock order. Acquire these before mapping
-            // and registry guards: session installation can itself need them.
-            addresses.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
-            addresses.dedup();
-            let mut session_guards = Vec::with_capacity(addresses.len());
-            for address in addresses {
-                session_guards.push(
-                    client
-                        .session_lock_for(address.as_str())
-                        .await
-                        .lock_arc()
-                        .await,
-                );
+            let result = async {
+                let maintenance = client.begin_signal_maintenance().await?;
+                use wacore::types::jid::JidExt as _;
+                let mut addresses: Vec<_> = recovered
+                    .previous_identities
+                    .iter()
+                    .map(|(jid, _)| jid.to_protocol_address())
+                    .collect();
+                // Match PN/LID migration's lock order. Acquire these before mapping
+                // and registry guards: session installation can itself need them.
+                addresses.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+                addresses.dedup();
+                let mut session_guards = Vec::with_capacity(addresses.len());
+                for address in addresses {
+                    session_guards.push(
+                        client
+                            .session_lock_for(address.as_str())
+                            .await
+                            .lock_arc()
+                            .await,
+                    );
+                }
+                let result = client
+                    .apply_device_list_response_inner(
+                        &response,
+                        DeviceListApplyMode::StrictRefresh,
+                        Some(generation),
+                        None,
+                        Some(&recovered),
+                        Some(&maintenance),
+                    )
+                    .await;
+                drop(session_guards);
+                result
             }
-            let result = client
-                .apply_device_list_response_inner(
-                    &response,
-                    DeviceListApplyMode::StrictRefresh,
-                    Some(generation),
-                    None,
-                    Some(&recovered),
-                )
-                .await;
-            drop(session_guards);
+            .await;
             if let Err(Err(error)) = send.send(result) {
                 warn!("ADV identity recovery failed after caller cancellation: {error:#}");
             }
@@ -566,6 +617,7 @@ impl Client {
                     topology_generation,
                     group_users,
                     None,
+                    None,
                 )
                 .await;
         }
@@ -586,6 +638,7 @@ impl Client {
                     mode,
                     topology_generation,
                     group_users.as_deref(),
+                    None,
                     None,
                 )
                 .await;
@@ -608,8 +661,12 @@ impl Client {
         topology_generation: Option<u64>,
         group_users: Option<&'a [Jid]>,
         recovered_identity: Option<&'a RecoveredAccountIdentity>,
+        maintenance: Option<&'a SignalMaintenance<'a>>,
     ) -> wacore::runtime::BoxFuture<'a, anyhow::Result<Option<Vec<Jid>>>> {
         Box::pin(async move {
+            if let Some(maintenance) = maintenance {
+                maintenance.ensure_current()?;
+            }
             // Serialize both mutation classes across the CAS and publication. The
             // response's own mappings are deliberately learned only after the CAS.
             let mapping_guard = self.lid_pn_cache.lock_mutation().await;
@@ -629,6 +686,7 @@ impl Client {
                     mode,
                     &registry_guard,
                     recovered_identity,
+                    maintenance,
                 )
                 .await?;
             if let Some(users) = group_users {
@@ -665,7 +723,12 @@ impl Client {
         &self,
         update: AdvIdentityUpdate<'_>,
         guard: &crate::client::device_topology::DeviceRegistryMutationGuard<'_>,
+        maintenance: Option<&SignalMaintenance<'_>>,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !update.reset_primary_session || maintenance.is_some(),
+            "ordinary identity recovery requires a processing permit"
+        );
         let changed = update
             .identities
             .iter()
@@ -679,7 +742,10 @@ impl Client {
                 for (address, _) in &update.identities {
                     self.signal_cache.delete_session(address).await;
                 }
-                self.flush_signal_cache_batch_safe().await?;
+                maintenance
+                    .ok_or_else(|| anyhow::anyhow!("ordinary recovery lost its processing scope"))?
+                    .flush()
+                    .await?;
             }
         }
         if let Some(previous) = update.previous_record {
@@ -689,17 +755,30 @@ impl Client {
                         .await?;
                 }
             }
-            self.clear_device_record(&update.user.user, update.user.server.as_str(), &previous)
-                .await;
+            if let Some(maintenance) = maintenance {
+                maintenance
+                    .clear_device_record(&update.user.user, &previous)
+                    .await?;
+            } else {
+                self.clear_device_record(&update.user.user, update.user.server.as_str(), &previous)
+                    .await;
+            }
             // Shared cleanup logs flush errors. Trust replacement additionally
             // requires durable removal before the new account key is saved.
-            self.flush_signal_cache_batch_safe().await?;
+            if let Some(maintenance) = maintenance {
+                maintenance.flush().await?;
+            } else {
+                self.flush_signal_cache_batch_safe().await?;
+            }
         }
         if changed {
             self.try_invalidate_device_cache_guarded(&update.user.user, guard)
                 .await?;
         }
         let backend = self.persistence_manager.backend();
+        if let Some(maintenance) = maintenance {
+            maintenance.ensure_current()?;
+        }
         anyhow::ensure!(
             self.signal_cache
                 .persist_identities_if_equal(
@@ -753,12 +832,14 @@ impl Client {
         mode: DeviceListApplyMode,
         guard: &'a crate::client::device_topology::DeviceRegistryMutationGuard<'_>,
         recovered_identity: Option<&'a RecoveredAccountIdentity>,
+        maintenance: Option<&'a SignalMaintenance<'a>>,
     ) -> wacore::runtime::BoxFuture<'a, Result<Vec<Jid>, anyhow::Error>> {
         Box::pin(self.process_device_list_response_guarded_inner(
             response,
             mode,
             guard,
             recovered_identity,
+            maintenance,
         ))
     }
 
@@ -769,6 +850,7 @@ impl Client {
         mode: DeviceListApplyMode,
         guard: &crate::client::device_topology::DeviceRegistryMutationGuard<'_>,
         recovered_identity: Option<&RecoveredAccountIdentity>,
+        maintenance: Option<&SignalMaintenance<'_>>,
     ) -> Result<Vec<Jid>, anyhow::Error> {
         let mut fetched_devices = Vec::new();
         if mode != DeviceListApplyMode::GroupRefresh {
@@ -1116,7 +1198,8 @@ impl Client {
         // It is the retry record if any cleanup operation fails. Only then may
         // invalidation and the verified identity replacement consume that history.
         for update in identity_updates {
-            self.apply_adv_identity_update(update, guard).await?;
+            self.apply_adv_identity_update(update, guard, maintenance)
+                .await?;
         }
 
         // Lists without trust changes publish before destructive cleanup so a
@@ -1127,12 +1210,21 @@ impl Client {
         // One batched backend write for the whole usync response — for
         // large groups this collapses N spawn_blocking SQLite hops into
         // a single transaction, which dominated the per-send wall-clock.
+        if let Some(maintenance) = maintenance {
+            maintenance.ensure_current()?;
+        }
         self.update_device_lists_guarded(device_records, guard)
             .await?;
         for (user, device_id) in pending_removals {
             if device_id != 0 {
-                self.delete_sessions_for_devices(&user.user, &[device_id])
-                    .await;
+                if let Some(maintenance) = maintenance {
+                    self.delete_sessions_for_devices_unflushed(&user.user, &[device_id])
+                        .await;
+                    maintenance.flush().await?;
+                } else {
+                    self.delete_sessions_for_devices(&user.user, &[device_id])
+                        .await;
+                }
             }
             if let Err(e) = self
                 .delete_sender_key_rows_for_device(&user.user, device_id)
@@ -1160,12 +1252,18 @@ impl Client {
                     return Err(e.into());
                 }
             }
-            Box::pin(self.clear_device_record(
-                &reset.user.user,
-                reset.user.server.as_str(),
-                &reset.previous,
-            ))
-            .await;
+            if let Some(maintenance) = maintenance {
+                maintenance
+                    .clear_device_record(&reset.user.user, &reset.previous)
+                    .await?;
+            } else {
+                Box::pin(self.clear_device_record(
+                    &reset.user.user,
+                    reset.user.server.as_str(),
+                    &reset.previous,
+                ))
+                .await;
+            }
             if reset.invalidate_registry {
                 self.invalidate_device_cache_guarded(&reset.user.user, guard)
                     .await;
