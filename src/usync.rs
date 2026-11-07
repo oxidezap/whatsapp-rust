@@ -188,6 +188,7 @@ impl Client {
                     self.generate_request_id(),
                 ))
                 .await?;
+            self.recover_group_adv_identities(&response).await;
             if let Some(devices) = self
                 .try_process_group_device_list_response(&response, &jids, generation)
                 .await?
@@ -196,6 +197,36 @@ impl Client {
             }
         }
         anyhow::bail!("device registry kept changing while a group refresh was in flight")
+    }
+
+    /// Recover rotated contacts individually before the group topology CAS.
+    /// A successful recovery invalidates the old batch generation; failures
+    /// leave that contact's old record available while valid peers still apply.
+    async fn recover_group_adv_identities(&self, response: &DeviceListResponse) {
+        for list in &response.device_lists {
+            if list.devices.iter().any(|device| device.is_hosted) {
+                continue;
+            }
+            let Some(bytes) = list.key_index_bytes.as_deref() else {
+                continue;
+            };
+            let Ok(Some(identity)) = self.cached_adv_account_identity(&list.user).await else {
+                continue;
+            };
+            if wacore::adv::verify_key_index_list(bytes, &identity).is_some()
+                || wacore::adv::decode_key_index_list(bytes).is_none()
+            {
+                continue;
+            }
+            if let Err(error) = Box::pin(self.fetch_user_devices_with_freshness(
+                vec![list.user.clone()],
+                crate::cache::Freshness::Refresh,
+            ))
+            .await
+            {
+                warn!("Group ADV recovery failed for {}: {error:#}", list.user);
+            }
+        }
     }
 
     /// Keep partial group results and omitted members under one topology CAS.
@@ -297,7 +328,7 @@ impl Client {
             .pn
             .iter()
             .chain(snapshot.lid.iter())
-            .any(|own| own.user == user.user)
+            .any(|own| own.is_same_chat_as(user))
         {
             return Err(error);
         }
@@ -835,7 +866,7 @@ impl Client {
                     .pn
                     .iter()
                     .chain(snapshot.lid.iter())
-                    .any(|own| own.user == user_list.user.user);
+                    .any(|own| own.is_same_chat_as(&user_list.user));
                 if is_self
                     && previous_identity != Some(identity)
                     && mode == DeviceListApplyMode::GroupRefresh
@@ -880,6 +911,23 @@ impl Client {
                         reset_primary_session: !hosted,
                         previous_record: if changed {
                             Some(match existing_record.take() {
+                                Some(mut record) if !hosted => {
+                                    // A selected registry row is not a complete
+                                    // history of sessions under both aliases.
+                                    let orphans =
+                                        self.recover_device_cleanup_record(&user_list.user).await?;
+                                    let mut devices = record.devices.into_vec();
+                                    for device in orphans.devices {
+                                        if !devices
+                                            .iter()
+                                            .any(|old| old.device_id() == device.device_id())
+                                        {
+                                            devices.push(device);
+                                        }
+                                    }
+                                    record.devices = devices.into_boxed_slice();
+                                    record
+                                }
                                 Some(record) => record,
                                 None => {
                                     match self.recover_device_cleanup_record(&user_list.user).await

@@ -973,7 +973,7 @@ pub async fn ensure_sessions_for_devices_resolved(
         // A per-device rejection is the better-informed case: the server names
         // the device in its own `<user>`, so it sets the same flag without
         // condemning the rest of the batch.
-        let prekey_bundles = match resolver
+        let mut prekey_bundles = match resolver
             .fetch_prekeys_for_identity_check(&jids_for_fetch)
             .await
         {
@@ -1035,6 +1035,17 @@ pub async fn ensure_sessions_for_devices_resolved(
                 return Err(e);
             }
         };
+
+        // Account locks owned by the host cover this recheck and every spawned
+        // installation. A bundle authenticated before a rotation is discarded.
+        for jid in &jids_for_fetch {
+            if let Some(bundle) = prekey_bundles.get(jid)
+                && let Err(error) = resolver.validate_prekey_account_identity(jid, bundle).await
+            {
+                log::warn!("Discarding stale prekey bundle for {jid}: {error}");
+                prekey_bundles.remove(jid);
+            }
+        }
 
         // Parallel session establishment via process_prekey_bundle. Each
         // recipient device has an independent Signal session and an

@@ -1712,6 +1712,7 @@ impl Client {
 
         // A companion retry must carry a certificate anchored to the primary,
         // just like a fetched prekey bundle. Missing proof fails closed.
+        let mut authenticated_account = None;
         if requester_jid.device != 0
             && let Some(device_identity) = keys_node
                 .get_optional_child("device-identity")
@@ -1727,7 +1728,7 @@ impl Client {
                 account_identity.as_ref(),
                 requester_jid,
             ) {
-                wacore::adv::AdvValidation::Valid => {}
+                wacore::adv::AdvValidation::Valid => authenticated_account = account_identity,
                 wacore::adv::AdvValidation::Invalid => {
                     return Err(anyhow::anyhow!(
                         "device-identity ADV validation failed for companion {requester_jid}",
@@ -1765,7 +1766,7 @@ impl Client {
             .map_err(|_| anyhow::anyhow!("Invalid signature length"))?;
 
         // Build and process the prekey bundle.
-        let bundle = PreKeyBundle::new(
+        let mut bundle = PreKeyBundle::new(
             registration_id,
             u32::from(requester_jid.device).into(),
             prekey_data,
@@ -1774,6 +1775,10 @@ impl Client {
             skey_signature,
             identity_key.into(),
         )?;
+        if let Some(account) = authenticated_account {
+            bundle = bundle
+                .with_account_identity(PublicKey::from_djb_public_key_bytes(&account)?.into());
+        }
 
         let mut adapter = self.signal_adapter();
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();

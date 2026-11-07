@@ -438,6 +438,16 @@ pub trait SendContextResolver: crate::sync_marker::MaybeSendSync {
         jids: &[Jid],
     ) -> Result<crate::prekeys::PreKeyFetchOutcome, anyhow::Error>;
 
+    /// Recheck a fetched bundle's certificate anchor before installation.
+    /// Hosts serialize this check and installation with account-key rotation.
+    async fn validate_prekey_account_identity(
+        &self,
+        _jid: &Jid,
+        _bundle: &PreKeyBundle,
+    ) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+
     async fn resolve_group_routing_info(
         &self,
         jid: &Jid,

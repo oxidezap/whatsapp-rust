@@ -4,6 +4,7 @@ use super::tests::{adv_wire_response, has_session, seed_fresh_session, signed_ke
 use super::*;
 use crate::cache::Freshness;
 use crate::test_utils::{TestEventCollector, answer_iq, create_iq_test_client, decode_sent_iq};
+use futures::FutureExt as _;
 use std::sync::Arc;
 use std::time::Duration;
 use wacore::libsignal::protocol::KeyPair;
@@ -12,6 +13,36 @@ use wacore::types::events::{Event, EventInterest, EventKind};
 use wacore::types::jid::JidExt as _;
 use wacore_binary::builder::NodeBuilder;
 
+/// Produce real signed Signal material, retaining the validated certificate anchor.
+fn session_bundle(
+    identity: &KeyPair,
+    device: u16,
+    account: Option<&KeyPair>,
+) -> wacore::libsignal::protocol::PreKeyBundle {
+    use wacore::libsignal::protocol::{IdentityKey, PreKeyBundle};
+    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    let signed = KeyPair::generate(&mut rng);
+    let signature = identity
+        .private_key
+        .calculate_signature(&signed.public_key.serialize(), &mut rng)
+        .unwrap();
+    let bundle = PreKeyBundle::new(
+        1234,
+        u32::from(device).into(),
+        None,
+        1.into(),
+        signed.public_key,
+        signature.to_vec(),
+        IdentityKey::new(identity.public_key),
+    )
+    .unwrap();
+    match account {
+        Some(account) => bundle.with_account_identity(IdentityKey::new(account.public_key)),
+        None => bundle,
+    }
+}
+
+/// Encode a fictitious primary IQ response with a valid or corrupted prekey.
 fn primary_response(user: &Jid, account: &KeyPair, valid: bool) -> wacore_binary::Node {
     let mut rng = rand::make_rng::<rand::rngs::StdRng>();
     let signed = KeyPair::generate(&mut rng);
@@ -51,6 +82,7 @@ fn primary_response(user: &Jid, account: &KeyPair, valid: bool) -> wacore_binary
         .build()
 }
 
+/// Sign the shared device-list fixture with a chosen account key.
 fn signed_list(account: &KeyPair, embedded_key: bool) -> Vec<u8> {
     let mut signed =
         waproto::codec::adv_signed_key_index_list_decode(&signed_key_index_bytes(vec![1], 1))
@@ -80,7 +112,8 @@ enum Outcome {
     AliasIdentityChanged,
 }
 
-/// Primary installers cannot restore an old session while trust is being saved.
+/// Real installers cannot restore old sessions while a cancelled caller's
+/// recovery worker saves trust; orphan companions are retired under both aliases.
 #[tokio::test]
 async fn ordinary_recovery_holds_both_primary_locks_through_identity_publication() {
     use crate::store::release::tests::ProbeBackend;
@@ -106,8 +139,29 @@ async fn ordinary_recovery_holds_both_primary_locks_through_identity_publication
         .await;
     for user in [&phone, &lid] {
         crate::test_utils::seed_adv_primary(&client, user).await;
-        seed_fresh_session(&client, user).await;
+        let bundle = session_bundle(crate::test_utils::adv_test_account(), 0, None);
+        client
+            .install_prekey_bundle_cached(
+                user,
+                &bundle,
+                &mut client.signal_adapter(),
+                &mut rand::make_rng::<rand::rngs::StdRng>(),
+            )
+            .await
+            .unwrap();
     }
+    let orphan = lid.with_device(7);
+    let device = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+    let old_companion = session_bundle(&device, 7, Some(crate::test_utils::adv_test_account()));
+    client
+        .install_prekey_bundle_cached(
+            &orphan,
+            &old_companion,
+            &mut client.signal_adapter(),
+            &mut rand::make_rng::<rand::rngs::StdRng>(),
+        )
+        .await
+        .unwrap();
     client
         .update_device_list(DeviceListRecord {
             user: phone.user.as_str().into(),
@@ -132,10 +186,10 @@ async fn ordinary_recovery_holds_both_primary_locks_through_identity_publication
         .process_device_list_response(&response, Freshness::Refresh)
         .await
         .unwrap_err();
-    let caller = {
+    let mut caller = Some({
         let client = client.clone();
         tokio::spawn(async move { client.recover_ordinary_adv_identity(error).await })
-    };
+    });
     let iq = decode_sent_iq(&transport, 0).await;
     let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
     answer_iq(&client, &id, &primary_response(&phone, &account, true)).await;
@@ -144,6 +198,23 @@ async fn ordinary_recovery_holds_both_primary_locks_through_identity_publication
             .await
             .unwrap()
             .unwrap();
+        let mut completed = Vec::new();
+        for user in [&phone, &lid] {
+            let bundle = session_bundle(crate::test_utils::adv_test_account(), 0, None);
+            let mut adapter = client.signal_adapter();
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            completed.push(
+                client
+                    .install_prekey_bundle_cached(user, &bundle, &mut adapter, &mut rng)
+                    .now_or_never()
+                    .is_some(),
+            );
+        }
+        assert_eq!(
+            completed,
+            vec![false, false],
+            "PN and LID old-primary installers must both block during publication"
+        );
         for user in [&phone, &lid] {
             let mutex = client
                 .session_lock_for(user.to_protocol_address().as_str())
@@ -154,13 +225,34 @@ async fn ordinary_recovery_holds_both_primary_locks_through_identity_publication
             );
             assert!(!has_session(&client, &user.to_protocol_address()).await);
         }
+        assert!(!has_session(&client, &orphan.to_protocol_address()).await);
+        let mut adapter = client.signal_adapter();
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        assert!(
+            client
+                .install_prekey_bundle_cached(&orphan, &old_companion, &mut adapter, &mut rng)
+                .now_or_never()
+                .is_none(),
+            "companion installation must wait for account publication"
+        );
+        if let Some(caller) = caller.take() {
+            caller.abort();
+            assert!(caller.await.unwrap_err().is_cancelled());
+        }
         release.send(()).await.unwrap();
     }
-    tokio::time::timeout(Duration::from_secs(5), caller)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    // Acquiring the guards is a completion barrier for the detached worker,
+    // independent of the cancelled requester's join handle.
+    for user in [&phone, &lid] {
+        let mutex = client
+            .session_lock_for(user.to_protocol_address().as_str())
+            .await;
+        drop(
+            tokio::time::timeout(Duration::from_secs(5), mutex.lock_arc())
+                .await
+                .unwrap(),
+        );
+    }
     for user in [&phone, &lid] {
         assert_eq!(
             client.cached_adv_account_identity(user).await.unwrap(),
@@ -172,9 +264,130 @@ async fn ordinary_recovery_holds_both_primary_locks_through_identity_publication
         assert!(mutex.try_lock().is_some());
         assert!(!has_session(&client, &user.to_protocol_address()).await);
     }
+    let record = client.load_device_record_for_jid(&phone).await.unwrap();
+    assert!(
+        record.timestamp > 1,
+        "the detached worker must publish topology"
+    );
+    assert!(
+        client
+            .install_prekey_bundle_cached(
+                &orphan,
+                &old_companion,
+                &mut client.signal_adapter(),
+                &mut rand::make_rng::<rand::rngs::StdRng>()
+            )
+            .await
+            .is_err(),
+        "a retained old certificate must fail after rotation"
+    );
+    assert!(!has_session(&client, &orphan.to_protocol_address()).await);
+    let fresh = session_bundle(&device, 7, Some(&account));
+    client
+        .install_prekey_bundle_cached(
+            &orphan,
+            &fresh,
+            &mut client.signal_adapter(),
+            &mut rand::make_rng::<rand::rngs::StdRng>(),
+        )
+        .await
+        .unwrap();
+    assert!(has_session(&client, &orphan.to_protocol_address()).await);
     client.signal_shutdown_sync();
 }
 
+/// Mix a rotated contact, a valid contact and an omitted cached group member.
+#[tokio::test]
+async fn group_refresh_recovers_rotations_and_preserves_members_on_failure() {
+    for recover in [true, false] {
+        let (client, transport) = create_iq_test_client().await;
+        let rotated = Jid::pn("12025550193");
+        let valid = Jid::pn("12025550194");
+        let omitted = Jid::pn("12025550195");
+        for user in [&rotated, &valid, &omitted] {
+            crate::test_utils::seed_adv_primary(&client, user).await;
+            client
+                .update_device_list(DeviceListRecord {
+                    user: user.user.as_str().into(),
+                    devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(1))].into(),
+                    raw_id: Some(1),
+                    timestamp: 1,
+                    phash: None,
+                })
+                .await
+                .unwrap();
+        }
+        let old = client.cached_adv_account_identity(&rotated).await.unwrap();
+        let account = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let rotated_wire = adv_wire_response(&rotated, signed_list(&account, true));
+        let valid_wire = adv_wire_response(&valid, signed_key_index_bytes(vec![1], 1));
+        let users: Vec<_> = [&rotated_wire, &valid_wire]
+            .iter()
+            .map(|wire| {
+                wire.get_optional_child("usync")
+                    .unwrap()
+                    .get_optional_child("list")
+                    .unwrap()
+                    .children()
+                    .unwrap()[0]
+                    .clone()
+            })
+            .collect();
+        let group_wire = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("usync")
+                .children([NodeBuilder::new("list").children(users).build()])
+                .build()])
+            .build();
+        let caller = {
+            let client = client.clone();
+            let users = vec![rotated.clone(), valid.clone(), omitted.clone()];
+            tokio::spawn(async move { client.refresh_group_user_devices(users).await })
+        };
+        for index in 0..3 {
+            let iq = decode_sent_iq(&transport, index).await;
+            let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+            answer_iq(
+                &client,
+                &id,
+                if index == 0 {
+                    &group_wire
+                } else {
+                    &rotated_wire
+                },
+            )
+            .await;
+        }
+        let iq = decode_sent_iq(&transport, 3).await;
+        let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+        answer_iq(&client, &id, &primary_response(&rotated, &account, recover)).await;
+        if recover {
+            let iq = decode_sent_iq(&transport, 4).await;
+            let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+            answer_iq(&client, &id, &group_wire).await;
+        }
+        let devices = tokio::time::timeout(Duration::from_secs(5), caller)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(devices.contains(&valid.with_device(2)));
+        assert!(devices.contains(&omitted.with_device(7)));
+        assert!(devices.contains(&rotated.with_device(if recover { 2 } else { 7 })));
+        assert_eq!(
+            client.cached_adv_account_identity(&rotated).await.unwrap(),
+            if recover {
+                Some(*account.public_key.public_key_bytes())
+            } else {
+                old
+            }
+        );
+        assert_eq!(transport.sent().len(), if recover { 5 } else { 4 });
+        client.signal_shutdown_sync();
+    }
+}
+
+/// A valid trusted signature must not let envelope metadata rotate trust.
 #[tokio::test]
 async fn ordinary_list_ignores_envelope_key_without_rotating_trust() {
     for freshness in [Freshness::CachePreferred, Freshness::Refresh] {
@@ -229,6 +442,7 @@ async fn ordinary_list_ignores_envelope_key_without_rotating_trust() {
     }
 }
 
+/// Rotations preserve the paired identity even with colliding numeric PN/LID IDs.
 #[tokio::test]
 async fn ordinary_rotation_recovers_only_with_a_fresh_authenticated_primary() {
     for user in [Jid::pn("12025550190"), Jid::lid("100000000000190")] {
@@ -243,6 +457,29 @@ async fn ordinary_rotation_recovers_only_with_a_fresh_authenticated_primary() {
                     Outcome::AliasIdentityChanged,
                 ] {
                     let (client, transport) = create_iq_test_client().await;
+                    // A peer's numeric ID may equal our ID in the other
+                    // namespace; it must still be recoverable as a peer.
+                    use wacore::store::commands::DeviceCommand;
+                    let own = if user.is_pn() {
+                        Jid::lid(user.user.clone())
+                    } else {
+                        Jid::pn(user.user.clone())
+                    };
+                    client
+                        .persistence_manager
+                        .process_command(if user.is_pn() {
+                            DeviceCommand::SetLid(Some(own.clone()))
+                        } else {
+                            DeviceCommand::SetId(Some(own.clone()))
+                        })
+                        .await;
+                    let own_key = *KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>())
+                        .public_key
+                        .public_key_bytes();
+                    client
+                        .signal_cache
+                        .put_identity(&own.to_protocol_address(), &own_key)
+                        .await;
                     let alias = if user.is_pn() {
                         Jid::lid("100000000000190")
                     } else {
@@ -394,6 +631,10 @@ async fn ordinary_rotation_recovers_only_with_a_fresh_authenticated_primary() {
                         assert!(collector.events().is_empty());
                     }
                     assert_eq!(transport.sent().len(), 3, "recovery must be bounded");
+                    assert_eq!(
+                        client.cached_adv_account_identity(&own).await.unwrap(),
+                        Some(own_key)
+                    );
                     client.signal_shutdown_sync();
                 }
             }

@@ -1103,6 +1103,7 @@ pub struct PreKeyBundle {
     pub(crate) signed_public: PublicKey,
     pub(crate) signature: Vec<u8>,
     pub(crate) identity: IdentityKey,
+    account_identity: Option<IdentityKey>,
 }
 impl PreKeyBundle {
     #[allow(clippy::too_many_arguments)]
@@ -1129,7 +1130,20 @@ impl PreKeyBundle {
             signed_public,
             signature,
             identity,
+            account_identity: None,
         })
+    }
+    /// Retain the parent identity that authenticated an upper-layer device
+    /// certificate. Hosts recheck this binding under their session locks before
+    /// installation; it is not part of Signal's X3DH wire material.
+    pub fn with_account_identity(mut self, identity: IdentityKey) -> Self {
+        self.account_identity = Some(identity);
+        self
+    }
+
+    /// The authenticated parent identity, if supplied by the certificate parser.
+    pub fn account_identity(&self) -> Option<&IdentityKey> {
+        self.account_identity.as_ref()
     }
     pub fn registration_id(&self) -> Result<u32> {
         Ok(self.registration)
