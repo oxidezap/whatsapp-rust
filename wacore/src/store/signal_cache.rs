@@ -1303,6 +1303,35 @@ impl SignalStoreCache {
         Ok(backend.has_signal_state_for_user(user).await?)
     }
 
+    /// Merge persisted device history with unflushed and checked-out cache slots.
+    pub async fn signal_addresses_for_user(
+        &self,
+        user: &str,
+        backend: &dyn SignalStore,
+    ) -> Result<Vec<Arc<str>>> {
+        let mut addresses = backend.get_signal_addresses_for_user(user).await?;
+        addresses.extend(
+            self.lock_sessions()
+                .await
+                .cache
+                .iter()
+                .filter(|(address, _)| protocol_address_matches_user(address, user))
+                .map(|(address, _)| Arc::clone(address)),
+        );
+        addresses.extend(
+            self.identities
+                .lock()
+                .await
+                .cache
+                .iter()
+                .filter(|(address, _)| protocol_address_matches_user(address, user))
+                .map(|(address, _)| Arc::clone(address)),
+        );
+        addresses.sort_unstable();
+        addresses.dedup();
+        Ok(addresses)
+    }
+
     /// Whether this user's pairwise session or identity writes still need a
     /// durability retry. Migration uses this after a failed flush, when the
     /// cache already reflects the move and a second pass makes no new changes.
@@ -1877,32 +1906,76 @@ impl SignalStoreCache {
         Ok(true)
     }
 
-    /// Persist a protocol-verified identity only if trust has not changed since
-    /// verification. Like bootstrap, this writes no unrelated session ratchets.
-    pub async fn persist_identity_if_equal(
+    /// Persist verified account aliases only if every previous key still matches.
+    /// The worker retains the flush/identity locks through storage completion,
+    /// even if its requester is cancelled. Cache publication follows the entire
+    /// write, so a failed batch retains the old keys for retry and reactions.
+    /// This writes no unrelated session ratchets.
+    pub async fn persist_identities_if_equal(
+        self: &Arc<Self>,
+        identities: &[(ProtocolAddress, Option<[u8; 32]>)],
+        data: &[u8; 32],
+        backend: Arc<dyn SignalStore>,
+        runtime: &dyn crate::runtime::Runtime,
+    ) -> Result<bool> {
+        let cache = Arc::clone(self);
+        let identities = identities.to_vec();
+        let data = *data;
+        let (send, receive) = futures::channel::oneshot::channel();
+        runtime.spawn_detached(Box::pin(async move {
+            let result = cache
+                .persist_identities_if_equal_inner(&identities, &data, backend.as_ref())
+                .await;
+            let _ = send.send(result);
+        }));
+        receive
+            .await
+            .map_err(|_| anyhow::anyhow!("identity persistence worker stopped"))?
+    }
+
+    /// Serialize the complete alias write while retaining old anchors on errors.
+    async fn persist_identities_if_equal_inner(
         &self,
-        address: &ProtocolAddress,
-        expected: Option<&[u8; 32]>,
+        identities: &[(ProtocolAddress, Option<[u8; 32]>)],
         data: &[u8; 32],
         backend: &dyn SignalStore,
     ) -> Result<bool> {
         let _flush = self.flush_lock.lock().await;
         let mut state = self.identities.lock().await;
-        let previous = match state.cache.get(address.as_str()) {
-            Some(cached) => cached.clone(),
-            None => backend
-                .load_identity(address.as_str())
-                .await?
-                .map(Arc::from),
-        };
-        if previous.as_deref() != expected.map(|key| key.as_slice()) {
-            return Ok(false);
+        for (address, expected) in identities {
+            let previous = match state.cache.get(address.as_str()) {
+                Some(cached) => cached.clone(),
+                None => backend
+                    .load_identity(address.as_str())
+                    .await?
+                    .map(Arc::from),
+            };
+            if previous.as_deref() != expected.as_ref().map(|key| key.as_slice()) {
+                return Ok(false);
+            }
         }
-        let _change = self.identity_write_change(&state, address, data);
-        state.put_dedup(address.as_str(), data);
-        backend.put_identity(address.as_str(), *data).await?;
-        state.dirty.remove(address.as_str());
-        state.deleted.remove(address.as_str());
+        // Pin every old anchor before an adapter can partially commit. A failed
+        // write must not make cache eviction turn an unfinished rotation into
+        // an unchanged key. A later flush may restore these old anchors safely.
+        for (address, previous) in identities {
+            if let Some(previous) = previous {
+                state.put(address.as_str(), previous);
+            } else {
+                state.delete(address.as_str());
+            }
+        }
+        let _changes: Vec<_> = identities
+            .iter()
+            .filter_map(|(address, _)| self.identity_write_change(&state, address, data))
+            .collect();
+        for (address, _) in identities {
+            backend.put_identity(address.as_str(), *data).await?;
+        }
+        for (address, _) in identities {
+            state.put_dedup(address.as_str(), data);
+            state.dirty.remove(address.as_str());
+            state.deleted.remove(address.as_str());
+        }
         state.evict_if_needed(self.max_entries);
         Ok(true)
     }
@@ -6486,6 +6559,31 @@ mod pre_wire_gate_tests {
 /// Existence alone cannot separate that from "never written", so each of these
 /// asserts that the pre-write bytes do not land.
 #[cfg(test)]
+struct IdentityTestRuntime;
+
+#[cfg(test)]
+impl crate::runtime::Runtime for IdentityTestRuntime {
+    fn spawn(&self, future: crate::runtime::BoxFuture<'static, ()>) -> crate::runtime::AbortHandle {
+        let task = tokio::spawn(future);
+        crate::runtime::AbortHandle::new(move || task.abort())
+    }
+    fn sleep(&self, duration: std::time::Duration) -> crate::runtime::BoxFuture<'static, ()> {
+        Box::pin(tokio::time::sleep(duration))
+    }
+    fn spawn_blocking(
+        &self,
+        task: Box<dyn FnOnce() + Send + 'static>,
+    ) -> crate::runtime::BoxFuture<'static, ()> {
+        Box::pin(async move {
+            tokio::task::spawn_blocking(task).await.unwrap();
+        })
+    }
+    fn yield_now(&self) -> Option<crate::runtime::BoxFuture<'static, ()>> {
+        Some(Box::pin(tokio::task::yield_now()))
+    }
+}
+
+#[cfg(test)]
 mod cold_read_race_tests {
     use super::*;
     use crate::libsignal::protocol::{ChainKey, IdentityKey, KeyPair, RootKey, SessionState};
@@ -6507,6 +6605,7 @@ mod cold_read_race_tests {
         fail_identity_after_write: AtomicBool,
         pause_identity_write: AtomicBool,
         pending_identity: SyncMutex<Option<[u8; 32]>>,
+        identity_write_release: async_lock::Barrier,
     }
 
     impl GatedColdRead {
@@ -6521,6 +6620,7 @@ mod cold_read_race_tests {
                 fail_identity_after_write: AtomicBool::new(false),
                 pause_identity_write: AtomicBool::new(false),
                 pending_identity: SyncMutex::new(None),
+                identity_write_release: async_lock::Barrier::new(2),
             }
         }
 
@@ -6570,7 +6670,7 @@ mod cold_read_race_tests {
         async fn put_identity(&self, _: &str, key: [u8; 32]) -> StoreResult<()> {
             if self.pause_identity_write.load(Ordering::Relaxed) {
                 *self.pending_identity.lock().unwrap() = Some(key);
-                std::future::pending::<()>().await;
+                self.identity_write_release.wait().await;
             }
             *self.identity.lock().unwrap_or_else(|p| p.into_inner()) = Some(key);
             if self.fail_identity_after_write.load(Ordering::Relaxed) {
@@ -6625,48 +6725,68 @@ mod cold_read_race_tests {
     }
 
     #[tokio::test]
-    async fn cancelled_verified_identity_write_stays_dirty_until_persisted() {
-        let backend = GatedColdRead::new(0);
-        let cache = SignalStoreCache::new();
+    /// Dropping a waiter cannot let an older storage write overtake a newer CAS.
+    async fn cancelled_verified_identity_write_finishes_before_a_newer_cas() {
+        let backend = Arc::new(GatedColdRead::new(0));
+        let cache = Arc::new(SignalStoreCache::new());
         let address = ProtocolAddress::new("12025550168", 0.into());
         assert!(
             cache
-                .persist_identity_if_absent_or_equal(&address, &[1; 32], &backend)
+                .persist_identity_if_absent_or_equal(&address, &[1; 32], backend.as_ref())
                 .await
                 .unwrap()
         );
         backend.pause_identity_write.store(true, Ordering::Relaxed);
-        let mut write =
-            Box::pin(cache.persist_identity_if_equal(&address, Some(&[1; 32]), &[2; 32], &backend));
+        let first = [(address.clone(), Some([1; 32]))];
+        let mut write = Box::pin(cache.persist_identities_if_equal(
+            &first,
+            &[2; 32],
+            backend.clone(),
+            &IdentityTestRuntime,
+        ));
         assert!(futures::poll!(write.as_mut()).is_pending());
-        assert_eq!(
-            backend.pending_identity.lock().unwrap().take(),
-            Some([2; 32])
-        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while backend.pending_identity.lock().unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         drop(write);
+        let second = [(address.clone(), Some([2; 32]))];
+        let mut newer = Box::pin(cache.persist_identities_if_equal(
+            &second,
+            &[3; 32],
+            backend.clone(),
+            &IdentityTestRuntime,
+        ));
+        assert!(futures::poll!(newer.as_mut()).is_pending());
+        assert_eq!(*backend.identity.lock().unwrap(), Some([1; 32]));
         backend.pause_identity_write.store(false, Ordering::Relaxed);
+        backend.identity_write_release.wait().await;
         assert!(
-            !cache
-                .persist_identity_if_equal(&address, Some(&[1; 32]), &[3; 32], &backend)
+            tokio::time::timeout(std::time::Duration::from_secs(5), newer)
                 .await
                 .unwrap()
+                .unwrap()
         );
-        {
-            let mut state = cache.identities.lock().await;
-            assert!(state.dirty.contains(address.as_str()));
-            state.evict_if_needed(0);
-            assert!(state.cache.get(address.as_str()).is_some());
-        }
-        cache.flush(&backend).await.unwrap();
-        cache.clear_after_flush().await;
+        assert_eq!(*backend.identity.lock().unwrap(), Some([3; 32]));
         assert_eq!(
             cache
-                .get_identity(&address, &backend)
+                .get_identity(&address, backend.as_ref())
                 .await
                 .unwrap()
                 .unwrap()
                 .as_ref(),
-            &[2; 32]
+            &[3; 32]
+        );
+        assert!(
+            !cache
+                .identities
+                .lock()
+                .await
+                .dirty
+                .contains(address.as_str())
         );
     }
 
@@ -8234,9 +8354,10 @@ mod identity_continuity_tests {
     }
 
     #[tokio::test]
+    /// Competing rotations preserve one winner without flushing unrelated ratchets.
     async fn verified_identity_cas_preserves_concurrent_trust_and_unrelated_ratchets() {
-        let cache = SignalStoreCache::new();
-        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = Arc::new(crate::store::in_memory::InMemoryBackend::new());
         let address = ProtocolAddress::new("12025550161", 0.into());
         let unrelated = ProtocolAddress::new("12025550162", 1.into());
         cache
@@ -8244,17 +8365,33 @@ mod identity_continuity_tests {
             .await;
         assert!(
             cache
-                .persist_identity_if_equal(&address, None, &[1; 32], &backend)
+                .persist_identities_if_equal(
+                    &[(address.clone(), None)],
+                    &[1; 32],
+                    backend.clone(),
+                    &IdentityTestRuntime
+                )
                 .await
                 .unwrap()
         );
+        let expected = [(address.clone(), Some([1; 32]))];
         let (first, second) = futures::join!(
-            cache.persist_identity_if_equal(&address, Some(&[1; 32]), &[2; 32], &backend),
-            cache.persist_identity_if_equal(&address, Some(&[1; 32]), &[3; 32], &backend),
+            cache.persist_identities_if_equal(
+                &expected,
+                &[2; 32],
+                backend.clone(),
+                &IdentityTestRuntime
+            ),
+            cache.persist_identities_if_equal(
+                &expected,
+                &[3; 32],
+                backend.clone(),
+                &IdentityTestRuntime
+            ),
         );
         assert_ne!(first.unwrap(), second.unwrap());
         let accepted = cache
-            .get_identity(&address, &backend)
+            .get_identity(&address, backend.as_ref())
             .await
             .unwrap()
             .unwrap();
@@ -8274,15 +8411,20 @@ mod identity_continuity_tests {
                 .unwrap()
                 .is_none()
         );
-        let cold = SignalStoreCache::new();
+        let cold = Arc::new(SignalStoreCache::new());
         assert!(
             !cold
-                .persist_identity_if_equal(&address, None, &[4; 32], &backend)
+                .persist_identities_if_equal(
+                    &[(address.clone(), None)],
+                    &[4; 32],
+                    backend.clone(),
+                    &IdentityTestRuntime
+                )
                 .await
                 .unwrap()
         );
         assert_eq!(
-            cold.get_identity(&address, &backend)
+            cold.get_identity(&address, backend.as_ref())
                 .await
                 .unwrap()
                 .unwrap(),

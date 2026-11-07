@@ -663,6 +663,60 @@ impl Client {
             .any(|key| devices.iter().any(|device| device.user.as_str() == key))
     }
 
+    /// Return the current account alias while the caller holds the mapping guard.
+    pub(crate) async fn device_list_identity_alias(&self, user: &Jid) -> Option<Jid> {
+        match self.resolve_lookup_keys_for_jid(user).await {
+            UserLookupKeys::LidWithPn { pn, .. } => Some(Jid::pn(pn)),
+            UserLookupKeys::PnWithLid { lid, .. } => Some(Jid::lid(lid)),
+            UserLookupKeys::Unknown { .. } => None,
+        }
+    }
+
+    /// Recover companion cleanup history after its registry row was invalidated.
+    pub(crate) async fn recover_device_cleanup_record(
+        &self,
+        user: &Jid,
+    ) -> Result<wacore::store::traits::DeviceListRecord> {
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+        let lookup = self.resolve_lookup_keys_for_jid(user).await;
+        let backend = self.persistence_manager.backend();
+        let mut ids = Vec::new();
+        for key in lookup.all_keys() {
+            for address in self
+                .signal_cache
+                .signal_addresses_for_user(key, backend.as_ref())
+                .await?
+            {
+                // Signal stores append the protocol device suffix; sender-key
+                // tracking stores the wire JID without it.
+                let jid: Jid = address
+                    .strip_suffix(".0")
+                    .unwrap_or(&address)
+                    .parse()
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "invalid stored Signal address during hosted identity recovery"
+                        )
+                    })?;
+                if jid.user == key && jid.device != 0 {
+                    ids.push(jid.device);
+                }
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(DeviceListRecord {
+            user: Arc::from(user.user.as_str()),
+            devices: ids
+                .into_iter()
+                .map(|id| DeviceInfo::new(id, None))
+                .collect(),
+            timestamp: self.runtime.wall_time_secs(),
+            phash: None,
+            raw_id: None,
+        })
+    }
+
     /// Replace earlier cached aliases with the identities covered by a network result.
     pub(crate) async fn remove_superseded_cached_devices(
         &self,
@@ -990,6 +1044,7 @@ impl Client {
         self.invalidate_device_cache_guarded(user, &guard).await;
     }
 
+    /// Preserve best-effort invalidation for callers that cannot return storage errors.
     pub(crate) async fn invalidate_device_cache_guarded(
         &self,
         user: &str,

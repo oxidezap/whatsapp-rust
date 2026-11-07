@@ -51,6 +51,7 @@ macro_rules! forward_domains {
                 fn delete_sessions_batch<'s, 'a>(this: &'s Self, addresses: &'a [Arc<str>]) -> Result<()>;
                 fn has_session<'s, 'a>(this: &'s Self, address: &'a str) -> Result<bool>;
                 fn has_signal_state_for_user<'s, 'a>(this: &'s Self, user: &'a str) -> Result<bool>;
+                fn get_signal_addresses_for_user<'s, 'a>(this: &'s Self, user: &'a str) -> Result<Vec<Arc<str>>>;
                 fn store_prekey<'s, 'a>(this: &'s Self, id: u32, record: &'a [u8], uploaded: bool) -> Result<()>;
                 fn store_prekeys_batch<'s, 'a>(this: &'s Self, keys: &'a [(u32, Bytes)], uploaded: bool) -> Result<()>;
                 fn load_prekey<'s>(this: &'s Self, id: u32) -> Result<Option<Bytes>>;

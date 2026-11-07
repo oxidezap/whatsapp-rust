@@ -545,6 +545,31 @@ impl SignalStore for InMemoryBackend {
         Ok(())
     }
 
+    /// Merge orphaned session, identity and sender-key tracking addresses.
+    async fn get_signal_addresses_for_user(&self, user: &str) -> Result<Vec<Arc<str>>> {
+        let state = self.state.lock().await;
+        let mut addresses: Vec<Arc<str>> = state
+            .sessions
+            .keys()
+            .chain(state.identities.keys())
+            .chain(
+                state
+                    .sender_key_devices
+                    .values()
+                    .flat_map(|devices| devices.keys()),
+            )
+            .filter(|address| {
+                address
+                    .strip_prefix(user)
+                    .is_some_and(|rest| rest.starts_with('@') || rest.starts_with(':'))
+            })
+            .map(|address| Arc::from(address.as_str()))
+            .collect();
+        addresses.sort_unstable();
+        addresses.dedup();
+        Ok(addresses)
+    }
+
     async fn store_prekey(&self, id: u32, record: &[u8], _uploaded: bool) -> Result<()> {
         self.state.lock().await.prekeys.insert(
             id,

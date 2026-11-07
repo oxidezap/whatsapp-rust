@@ -8,6 +8,10 @@ use log::{debug, warn};
 use wacore::iq::usync::{DeviceListResponse, DeviceListSpec};
 use wacore_binary::{Jid, JidExt as _};
 
+#[cfg(test)]
+#[path = "usync/hosted_recovery_tests.rs"]
+mod hosted_recovery_tests;
+
 /// An authoritative refresh retries when a newer registry mutation wins while
 /// its IQ is in flight. Bound retries so a continuously changing account never
 /// turns one send into an unbounded request loop.
@@ -171,33 +175,20 @@ impl Client {
         anyhow::bail!("device registry kept changing while a group refresh was in flight")
     }
 
+    /// Keep partial group results and omitted members under one topology CAS.
     async fn try_process_group_device_list_response(
         &self,
         response: &DeviceListResponse,
         users: &[Jid],
         topology_generation: u64,
     ) -> Result<Option<Vec<Jid>>, anyhow::Error> {
-        self.prepare_device_list_identities(response).await?;
-        let mapping_guard = self.lid_pn_cache.lock_mutation().await;
-        let registry_guard = self.device_topology.lock_registry().await;
-        if !self
-            .device_topology
-            .unchanged_for(topology_generation, &device_response_users(response))
-        {
-            return Ok(None);
-        }
-        self.learn_device_list_mappings_guarded(response, &mapping_guard)
-            .await?;
-        self.process_device_list_response_guarded(
+        self.apply_device_list_response(
             response,
             DeviceListApplyMode::GroupRefresh,
-            &registry_guard,
+            Some(topology_generation),
+            Some(users),
         )
-        .await?;
-        // Read under the publication guards, including users omitted by the
-        // response. Retrying a partial response must retain the original query.
-        let (devices, _) = self.get_devices_from_registry_batch(users.to_vec()).await;
-        Ok(Some(devices))
+        .await
     }
 
     async fn fetch_user_devices(&self, jids: Vec<Jid>) -> Result<Vec<Jid>, anyhow::Error> {
@@ -362,44 +353,108 @@ impl Client {
         response: &DeviceListResponse,
         freshness: crate::cache::Freshness,
     ) -> Result<Vec<Jid>, anyhow::Error> {
-        // Keep this order stable: mapping writers never acquire the registry
-        // guard while holding their lock, so mapping -> registry cannot cycle.
-        self.prepare_device_list_identities(response).await?;
-        let mapping_guard = self.lid_pn_cache.lock_mutation().await;
-        let registry_guard = self.device_topology.lock_registry().await;
-        self.learn_device_list_mappings_guarded(response, &mapping_guard)
-            .await?;
-        self.process_device_list_response_guarded(response, freshness.into(), &registry_guard)
+        self.apply_device_list_response(response, freshness.into(), None, None)
             .await
+            .and_then(|devices| {
+                devices.ok_or_else(|| anyhow::anyhow!("unchecked device response was stale"))
+            })
     }
 
+    /// Apply an authoritative result only if its queried topology is still current.
     async fn try_process_refreshed_device_list_response(
         &self,
         response: &DeviceListResponse,
         freshness: crate::cache::Freshness,
         topology_generation: u64,
     ) -> Result<Option<Vec<Jid>>, anyhow::Error> {
+        self.apply_device_list_response(response, freshness.into(), Some(topology_generation), None)
+            .await
+    }
+
+    /// Finish hosted trust changes even if the requesting send is cancelled.
+    /// The worker owns its guards, response and identity reactions, while
+    /// ordinary responses retain their existing in-task application path.
+    async fn apply_device_list_response(
+        &self,
+        response: &DeviceListResponse,
+        mode: DeviceListApplyMode,
+        topology_generation: Option<u64>,
+        group_users: Option<&[Jid]>,
+    ) -> anyhow::Result<Option<Vec<Jid>>> {
+        self.prepare_device_list_identities(response).await?;
+        if !response
+            .device_lists
+            .iter()
+            .any(|list| list.devices.iter().any(|device| device.is_hosted))
+        {
+            return self
+                .apply_device_list_response_inner(response, mode, topology_generation, group_users)
+                .await;
+        }
+        let client = self
+            .self_weak
+            .get()
+            .and_then(|weak| weak.upgrade())
+            .ok_or_else(|| {
+                anyhow::anyhow!("client ownership unavailable during hosted device sync")
+            })?;
+        let response = response.clone();
+        let group_users = group_users.map(<[Jid]>::to_vec);
+        let (send, receive) = futures::channel::oneshot::channel();
+        self.runtime.spawn_detached(Box::pin(async move {
+            let result = client
+                .apply_device_list_response_inner(
+                    &response,
+                    mode,
+                    topology_generation,
+                    group_users.as_deref(),
+                )
+                .await;
+            if let Err(Err(error)) = send.send(result) {
+                warn!("Hosted device sync failed after caller cancellation: {error:#}");
+            }
+        }));
+        receive
+            .await
+            .map_err(|_| anyhow::anyhow!("hosted device sync worker stopped"))?
+    }
+
+    /// Hold mapping and topology guards through CAS, cleanup and publication.
+    async fn apply_device_list_response_inner(
+        &self,
+        response: &DeviceListResponse,
+        mode: DeviceListApplyMode,
+        topology_generation: Option<u64>,
+        group_users: Option<&[Jid]>,
+    ) -> anyhow::Result<Option<Vec<Jid>>> {
         // Serialize both mutation classes across the CAS and publication. The
         // response's own mappings are deliberately learned only after the CAS.
-        self.prepare_device_list_identities(response).await?;
         let mapping_guard = self.lid_pn_cache.lock_mutation().await;
         let registry_guard = self.device_topology.lock_registry().await;
-        if !self
-            .device_topology
-            .unchanged_for(topology_generation, &device_response_users(response))
+        if let Some(generation) = topology_generation
+            && !self
+                .device_topology
+                .unchanged_for(generation, &device_response_users(response))
         {
             return Ok(None);
         }
         self.learn_device_list_mappings_guarded(response, &mapping_guard)
             .await?;
-        self.process_device_list_response_guarded(response, freshness.into(), &registry_guard)
-            .await
-            .map(Some)
+        let devices = self
+            .process_device_list_response_guarded(response, mode, &registry_guard)
+            .await?;
+        if let Some(users) = group_users {
+            // Include omitted group users under the same publication guards.
+            let (devices, _) = self.get_devices_from_registry_batch(users.to_vec()).await;
+            Ok(Some(devices))
+        } else {
+            Ok(Some(devices))
+        }
     }
 
-    // Network lookups must finish before taking mapping/registry guards: a
-    // device notification on the read loop may need those guards before the IQ
-    // reply can be read. The guarded phase re-reads the current trust anchor.
+    /// Load ordinary account anchors before taking mapping/registry guards.
+    /// A device notification on the read loop may need those guards before the
+    /// IQ reply is read. Hosted lists carry their separately verified anchor.
     async fn prepare_device_list_identities(
         &self,
         response: &DeviceListResponse,
@@ -413,6 +468,7 @@ impl Client {
         Ok(())
     }
 
+    /// Validate the accepted batch, retire old state and publish verified lists.
     async fn process_device_list_response_guarded(
         &self,
         response: &DeviceListResponse,
@@ -439,6 +495,12 @@ impl Client {
             user: &'a Jid,
             identity: [u8; 32],
             previous_identity: Option<[u8; 32]>,
+            identities: smallvec::SmallVec<
+                [(
+                    wacore::libsignal::protocol::ProtocolAddress,
+                    Option<[u8; 32]>,
+                ); 2],
+            >,
             previous_record: Option<wacore::store::traits::DeviceListRecord>,
         }
         let mut hosted_identities = Vec::new();
@@ -510,26 +572,63 @@ impl Client {
             // with an unchanged raw_id. Do not retain old key indexes or sessions.
             let hosted_update = if let Some(identity) = hosted_identity {
                 let previous_identity = self.cached_adv_account_identity(&user_list.user).await?;
-                let changed = previous_identity.is_some_and(|previous| previous != identity);
                 let snapshot = self.persistence_manager.get_device_snapshot();
                 let is_self = snapshot
                     .pn
                     .iter()
                     .chain(snapshot.lid.iter())
                     .any(|own| own.user == user_list.user.user);
+                if is_self
+                    && previous_identity != Some(identity)
+                    && mode == DeviceListApplyMode::GroupRefresh
+                {
+                    continue;
+                }
                 anyhow::ensure!(
                     !is_self || previous_identity == Some(identity),
                     "hosted list cannot replace our paired primary identity"
                 );
-                if is_self || previous_identity == Some(identity) {
+                let mut identities: smallvec::SmallVec<
+                    [(
+                        wacore::libsignal::protocol::ProtocolAddress,
+                        Option<[u8; 32]>,
+                    ); 2],
+                > = smallvec::SmallVec::new();
+                use wacore::types::jid::JidExt as _;
+                identities.push((
+                    user_list.user.with_device(0).to_protocol_address(),
+                    previous_identity,
+                ));
+                if !is_self
+                    && let Some(alias) = self.device_list_identity_alias(&user_list.user).await
+                {
+                    let previous = self.cached_adv_account_identity(&alias).await?;
+                    identities.push((alias.to_protocol_address(), previous));
+                }
+                let changed = identities
+                    .iter()
+                    .any(|(_, previous)| previous.is_some_and(|previous| previous != identity));
+                if is_self
+                    || identities
+                        .iter()
+                        .all(|(_, previous)| *previous == Some(identity))
+                {
                     None
                 } else {
                     Some(HostedIdentityUpdate {
                         user: &user_list.user,
                         identity,
-                        previous_identity,
+                        previous_identity: identities
+                            .iter()
+                            .filter_map(|(_, previous)| *previous)
+                            .find(|previous| *previous != identity)
+                            .or(previous_identity),
+                        identities,
                         previous_record: if changed {
-                            existing_record.take()
+                            Some(match existing_record.take() {
+                                Some(record) => record,
+                                None => self.recover_device_cleanup_record(&user_list.user).await?,
+                            })
                         } else {
                             None
                         },
@@ -663,7 +762,22 @@ impl Client {
             }
 
             if let Some(update) = hosted_update {
-                hosted_identities.push(update);
+                if let Some(earlier) =
+                    hosted_identities
+                        .iter()
+                        .find(|earlier: &&HostedIdentityUpdate<'_>| {
+                            earlier.identities.iter().any(|(address, _)| {
+                                update.identities.iter().any(|(other, _)| address == other)
+                            })
+                        })
+                {
+                    anyhow::ensure!(
+                        earlier.identity == update.identity,
+                        "conflicting hosted identities in one device-list response"
+                    );
+                } else {
+                    hosted_identities.push(update);
+                }
             }
 
             // Convert filtered DeviceInfo list back to JIDs for return
@@ -684,17 +798,15 @@ impl Client {
             });
         }
 
-        // Authenticate the whole batch before changing hosted trust. Clear and
-        // invalidate old topology first: a failed/cancelled identity write must
-        // not leave an old cached list paired with a new primary key.
+        // Keep the durable old topology until every companion removal finishes.
+        // It is the retry record if any cleanup operation fails. Only then may
+        // invalidation and the verified identity replacement consume that history.
         for update in hosted_identities {
-            use wacore::types::jid::JidExt as _;
-            if update
-                .previous_identity
-                .is_some_and(|previous| previous != update.identity)
-            {
-                self.try_invalidate_device_cache_guarded(&update.user.user, guard)
-                    .await?;
+            let changed = update
+                .identities
+                .iter()
+                .any(|(_, previous)| previous.is_some_and(|previous| previous != update.identity));
+            if changed {
                 // Web's identity-change reaction removes and re-adds primary
                 // membership too: preserve its session, but require fresh SKDM.
                 self.delete_sender_key_rows_for_device(&update.user.user, 0)
@@ -716,14 +828,18 @@ impl Client {
                 // additionally requires durable removal before saving its key.
                 self.flush_signal_cache_batch_safe().await?;
             }
+            if changed {
+                self.try_invalidate_device_cache_guarded(&update.user.user, guard)
+                    .await?;
+            }
             let backend = self.persistence_manager.backend();
             anyhow::ensure!(
                 self.signal_cache
-                    .persist_identity_if_equal(
-                        &update.user.with_device(0).to_protocol_address(),
-                        update.previous_identity.as_ref(),
+                    .persist_identities_if_equal(
+                        &update.identities,
                         &update.identity,
-                        &*backend,
+                        backend,
+                        self.runtime.as_ref(),
                     )
                     .await?,
                 "primary identity changed during hosted ADV verification for {}",
@@ -773,8 +889,10 @@ impl Client {
         self.update_device_lists_guarded(device_records, guard)
             .await?;
         for (user, device_id) in pending_removals {
-            self.delete_sessions_for_devices(&user.user, &[device_id])
-                .await;
+            if device_id != 0 {
+                self.delete_sessions_for_devices(&user.user, &[device_id])
+                    .await;
+            }
             if let Err(e) = self
                 .delete_sender_key_rows_for_device(&user.user, device_id)
                 .await
@@ -918,7 +1036,8 @@ mod tests {
     use wacore::store::traits::{DeviceInfo, DeviceListRecord};
     use wacore::types::jid::JidExt;
 
-    fn signed_key_index_bytes(valid_indexes: Vec<u32>, current_index: u32) -> Vec<u8> {
+    /// Sign fictitious key-index details with the shared test account.
+    pub(super) fn signed_key_index_bytes(valid_indexes: Vec<u32>, current_index: u32) -> Vec<u8> {
         let key_index = {
             let mut proto_ = waproto::whatsapp::ADVKeyIndexList::default();
             proto_.raw_id = Some(1);
@@ -930,6 +1049,7 @@ mod tests {
         crate::test_utils::sign_adv_key_index(waproto::codec::adv_key_index_list_to_vec(&key_index))
     }
 
+    /// Authenticate fixture lists, including the required hosted envelope key.
     async fn authenticated_response_fixture(
         client: &Client,
         mut response: DeviceListResponse,
@@ -992,7 +1112,8 @@ mod tests {
         response
     }
 
-    async fn seed_fresh_session(client: &Client, jid: &Jid) -> ProtocolAddress {
+    /// Seed a distinguishable session for preservation and cleanup assertions.
+    pub(super) async fn seed_fresh_session(client: &Client, jid: &Jid) -> ProtocolAddress {
         let address = jid.to_protocol_address();
         client
             .signal_cache
@@ -1001,7 +1122,8 @@ mod tests {
         address
     }
 
-    async fn has_session(client: &Client, address: &ProtocolAddress) -> bool {
+    /// Observe both pending cache state and the persisted session fallback.
+    pub(super) async fn has_session(client: &Client, address: &ProtocolAddress) -> bool {
         let snapshot = client.persistence_manager.get_device_snapshot();
         client
             .signal_cache
@@ -1024,6 +1146,7 @@ mod tests {
         adv_wire_response_with_hosting(user, signature, companion, false)
     }
 
+    /// Build a wire fixture that preserves a companion's hosted addressing.
     fn adv_wire_response_with_hosting(
         user: &Jid,
         signature: Vec<u8>,

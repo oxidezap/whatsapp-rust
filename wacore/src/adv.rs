@@ -332,6 +332,7 @@ mod tests {
     }
 
     #[test]
+    /// Hosted verification requires its key, signature and complete signed details.
     fn hosted_key_index_requires_embedded_key_and_authenticated_complete_details() {
         use crate::libsignal::protocol::KeyPair;
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
