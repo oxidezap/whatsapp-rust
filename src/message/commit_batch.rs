@@ -2020,6 +2020,85 @@ mod tests {
             .build()
     }
 
+    /// A metadata-only lookup for a user outside this batch must not try to
+    /// acquire the single processing permit already held by the hook's caller.
+    #[tokio::test]
+    async fn offline_durability_hook_can_resolve_an_uncached_ordinary_user() {
+        use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq};
+        use std::time::Duration;
+        use wacore_binary::builder::NodeBuilder;
+        struct LookupHook {
+            user: Jid,
+        }
+        #[async_trait::async_trait]
+        impl InboundDurabilityHook for LookupHook {
+            async fn on_messages(
+                &self,
+                client: Arc<Client>,
+                batch: &[InboundMessage],
+            ) -> anyhow::Result<()> {
+                assert!(
+                    batch
+                        .iter()
+                        .all(|message| message.info.source.sender != self.user)
+                );
+                let devices = client
+                    .signal()
+                    .get_user_devices(std::slice::from_ref(&self.user))
+                    .await?;
+                assert_eq!(devices, vec![self.user.clone()]);
+                Ok(())
+            }
+        }
+        let (client, transport) = create_iq_test_client().await;
+        let user = Jid::pn("12025550195");
+        client
+            .inbound_durability_hook
+            .set(Arc::new(LookupHook { user: user.clone() }))
+            .ok()
+            .unwrap();
+        client.enter_drain_mode_for_tests();
+        let commit = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                let _permit = client.acquire_message_processing_permit().await;
+                client
+                    .commit_pending_batch_result(
+                        vec![PendingDelivery::from(item("HOOK_DEVICE_LOOKUP"))].into(),
+                        BatchOrigin::OfflineDrain,
+                        None,
+                        true,
+                    )
+                    .await
+            })
+        };
+        let iq = decode_sent_iq(&transport, 0).await;
+        let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("usync")
+                .children([NodeBuilder::new("list")
+                    .children([NodeBuilder::new("user")
+                        .attr("jid", user.to_string())
+                        .children([NodeBuilder::new("devices")
+                            .children([NodeBuilder::new("device-list")
+                                .children([NodeBuilder::new("device").attr("id", "0").build()])
+                                .build()])
+                            .build()])
+                        .build()])
+                    .build()])
+                .build()])
+            .build();
+        answer_iq(&client, &id, &response).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(5), commit)
+            .await
+            .expect("hook lookup must finish while it owns the drain permit")
+            .unwrap();
+        assert!(outcome.persisted && outcome.delivered);
+        assert!(client.load_device_record(&user.user).await.is_some());
+        client.signal_shutdown_sync();
+    }
+
     async fn capture_pending_receipts(
         client: &Arc<Client>,
     ) -> Arc<crate::transport::mock::CapturingMockTransport> {

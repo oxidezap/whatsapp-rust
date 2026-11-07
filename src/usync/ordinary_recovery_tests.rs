@@ -320,12 +320,24 @@ async fn ordinary_recovery_rejects_an_alias_restored_after_its_lock_snapshot() {
 #[tokio::test]
 async fn offline_refresh_waits_for_processing_before_global_topology_locks() {
     use crate::test_utils::{create_iq_test_client_with_runtime, create_test_backend};
+    use wacore::usync::{UserDeviceList, UsyncDevice};
     let (waiting, permit_wait) = async_channel::unbounded();
     let (client, _) = create_iq_test_client_with_runtime(
         create_test_backend().await,
         Arc::new(PermitWaitRuntime(waiting)),
     )
     .await;
+    let user = Jid::pn("12025550194");
+    client
+        .update_device_list(DeviceListRecord {
+            user: user.user.as_str().into(),
+            devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(1))].into(),
+            raw_id: Some(1),
+            timestamp: 1,
+            phash: None,
+        })
+        .await
+        .unwrap();
     client.enter_drain_mode_for_tests();
     let permit = client.acquire_message_processing_permit().await;
     let refresh = {
@@ -334,7 +346,12 @@ async fn offline_refresh_waits_for_processing_before_global_topology_locks() {
             client
                 .process_device_list_response(
                     &DeviceListResponse {
-                        device_lists: vec![],
+                        device_lists: vec![UserDeviceList {
+                            user,
+                            devices: vec![UsyncDevice::new(0, None)],
+                            phash: None,
+                            key_index_bytes: None,
+                        }],
                         lid_mappings: vec![],
                     },
                     Freshness::Refresh,

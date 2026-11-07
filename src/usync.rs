@@ -68,6 +68,11 @@ struct RecoveredAccountIdentity {
     previous_identities: Vec<(Jid, Option<[u8; 32]>)>,
 }
 
+/// Retry outside topology guards when a response needs Signal mutation.
+#[derive(Debug, thiserror::Error)]
+#[error("device-list response requires Signal maintenance")]
+struct DeviceListMaintenanceRequired;
+
 /// A verified account trust change staged until the complete batch is accepted.
 struct AdvIdentityUpdate<'a> {
     user: &'a Jid,
@@ -615,6 +620,23 @@ impl Client {
             .iter()
             .any(|list| list.devices.iter().any(|device| device.is_hosted))
         {
+            // Most responses only publish device metadata. A durability hook
+            // already owns the drain permit, so do not acquire it for lookups
+            // that never touch Signal state. The guarded planner refuses all
+            // destructive work without a maintenance scope.
+            let result = self
+                .apply_device_list_response_inner(
+                    response,
+                    mode,
+                    topology_generation,
+                    group_users,
+                    None,
+                    None,
+                )
+                .await;
+            if !matches!(&result, Err(error) if error.is::<DeviceListMaintenanceRequired>()) {
+                return result;
+            }
             let maintenance = client.begin_signal_maintenance().await?;
             return self
                 .apply_device_list_response_inner(
@@ -1212,6 +1234,14 @@ impl Client {
                 phash: user_list.phash.clone().map(Box::<str>::from),
                 raw_id,
             });
+        }
+
+        if maintenance.is_none()
+            && (!identity_updates.is_empty()
+                || !pending_identity_resets.is_empty()
+                || !pending_removals.is_empty())
+        {
+            return Err(DeviceListMaintenanceRequired.into());
         }
 
         // Keep the durable old topology until every companion removal finishes.
