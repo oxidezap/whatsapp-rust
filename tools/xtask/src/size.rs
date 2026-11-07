@@ -212,7 +212,9 @@ fn measure_with(
     Ok(())
 }
 
-const MAX_FUNCTION_ROWS: usize = 80;
+// Include medium-sized recovery/maintenance futures below the largest proto
+// encoders, while keeping the diagnostic artifact bounded.
+const MAX_FUNCTION_ROWS: usize = 320;
 const MAX_FUNCTION_NAME_CHARS: usize = 512;
 
 fn bounded_functions(data: &Value) -> Result<Vec<Value>> {
@@ -299,7 +301,7 @@ fn diagnostics(
             "--message-format",
             "json",
             "-n",
-            "80",
+            "320",
         ],
     )?)?;
     let functions = bounded_functions(&functions)?;
@@ -320,7 +322,7 @@ fn diagnostics(
             "--filter",
             "(MobileSessionBinding|BindingWire|PersistenceManager|DeviceCommand|mobile_session|validate_mobile|SqliteStore)",
             "-n",
-            "80",
+            "320",
         ],
     )?)?;
     let mobile_functions = bounded_functions(&mobile_functions)?;
