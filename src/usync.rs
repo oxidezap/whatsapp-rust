@@ -477,59 +477,64 @@ impl Client {
     }
 
     /// Fetch and verify a device list without starting ADV recovery recursively.
-    async fn fetch_user_devices_once(
+    #[inline(never)]
+    fn fetch_user_devices_once(
         &self,
         mut jids: Vec<Jid>,
         freshness: crate::cache::Freshness,
-    ) -> Result<Vec<Jid>, anyhow::Error> {
-        if jids.is_empty() {
-            return Ok(Vec::new());
-        }
-        if freshness == crate::cache::Freshness::CachePreferred {
-            let sid = self.generate_request_id();
-            let response = self
-                .execute_streaming(DeviceListSpec::new(jids, sid))
-                .await?;
-            return self
-                .process_device_list_response(&response, freshness)
-                .await;
-        }
-
-        for attempt in 0..DEVICE_REFRESH_MAX_ATTEMPTS {
-            let topology_generation = self.device_topology.current();
-            let sid = self.generate_request_id();
-            let response = self
-                .execute_streaming(DeviceListSpec::new(jids, sid).require_complete_response())
-                .await?;
-
-            if let Some(devices) = self
-                .try_process_refreshed_device_list_response(
-                    &response,
-                    freshness,
-                    topology_generation,
-                )
-                .await?
-            {
-                return Ok(devices);
+    ) -> wacore::runtime::BoxFuture<'_, Result<Vec<Jid>, anyhow::Error>> {
+        // Initial lookup, targeted refresh and batch rebuild all poll the same
+        // query/application implementation instead of embedding three copies.
+        Box::pin(async move {
+            if jids.is_empty() {
+                return Ok(Vec::new());
+            }
+            if freshness == crate::cache::Freshness::CachePreferred {
+                let sid = self.generate_request_id();
+                let response = self
+                    .execute_streaming(DeviceListSpec::new(jids, sid))
+                    .await?;
+                return self
+                    .process_device_list_response(&response, freshness)
+                    .await;
             }
 
-            if attempt + 1 == DEVICE_REFRESH_MAX_ATTEMPTS {
-                anyhow::bail!(
-                    "device registry kept changing while an authoritative refresh was in flight"
-                );
+            for attempt in 0..DEVICE_REFRESH_MAX_ATTEMPTS {
+                let topology_generation = self.device_topology.current();
+                let sid = self.generate_request_id();
+                let response = self
+                    .execute_streaming(DeviceListSpec::new(jids, sid).require_complete_response())
+                    .await?;
+
+                if let Some(devices) = self
+                    .try_process_refreshed_device_list_response(
+                        &response,
+                        freshness,
+                        topology_generation,
+                    )
+                    .await?
+                {
+                    return Ok(devices);
+                }
+
+                if attempt + 1 == DEVICE_REFRESH_MAX_ATTEMPTS {
+                    anyhow::bail!(
+                        "device registry kept changing while an authoritative refresh was in flight"
+                    );
+                }
+
+                // The complete response contains every requested identity. Move its
+                // canonical JIDs into the next attempt only on this rare race path;
+                // the ordinary refresh performs no duplicate query-vector clone.
+                jids = response
+                    .device_lists
+                    .into_iter()
+                    .map(|user| user.user)
+                    .collect();
             }
 
-            // The complete response contains every requested identity. Move its
-            // canonical JIDs into the next attempt only on this rare race path;
-            // the ordinary refresh performs no duplicate query-vector clone.
-            jids = response
-                .device_lists
-                .into_iter()
-                .map(|user| user.user)
-                .collect();
-        }
-
-        unreachable!("bounded device refresh loop always returns")
+            unreachable!("bounded device refresh loop always returns")
+        })
     }
 
     async fn learn_device_list_mappings_guarded(
@@ -609,87 +614,95 @@ impl Client {
     /// Finish hosted trust changes even if the requesting send is cancelled.
     /// The worker owns its guards, response and identity reactions, while
     /// ordinary responses retain their existing in-task application path.
-    async fn apply_device_list_response(
-        &self,
-        response: &DeviceListResponse,
+    #[inline(never)]
+    fn apply_device_list_response<'a>(
+        &'a self,
+        response: &'a DeviceListResponse,
         mode: DeviceListApplyMode,
         topology_generation: Option<u64>,
-        group_users: Option<&[Jid]>,
-    ) -> anyhow::Result<Option<Vec<Jid>>> {
-        self.prepare_device_list_identities(response).await?;
-        let client = self
-            .self_weak
-            .get()
-            .and_then(|weak| weak.upgrade())
-            .ok_or_else(|| anyhow::anyhow!("client ownership unavailable during device sync"))?;
-        if !response
-            .device_lists
-            .iter()
-            .any(|list| list.devices.iter().any(|device| device.is_hosted))
-        {
-            // Learning a new alias can expose an old record and schedule its
-            // migration. Admit maintenance before publishing that mapping,
-            // rather than invalidating our own captured topology in a dry run.
-            let mapping_has_history = self
-                .device_mapping_has_registry_history(&response.lid_mappings)
-                .await;
-            // Most responses only publish device metadata. A durability hook
-            // already owns the drain permit, so do not acquire it for lookups
-            // that never touch Signal state. The guarded planner refuses all
-            // destructive work without a maintenance scope.
-            if !mapping_has_history {
-                let result = self
+        group_users: Option<&'a [Jid]>,
+    ) -> wacore::runtime::BoxFuture<'a, anyhow::Result<Option<Vec<Jid>>>> {
+        // Share admission and hosted-worker dispatch across strict, cached and
+        // group response callers, just as the guarded publication body is shared.
+        Box::pin(async move {
+            self.prepare_device_list_identities(response).await?;
+            let client = self
+                .self_weak
+                .get()
+                .and_then(|weak| weak.upgrade())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("client ownership unavailable during device sync")
+                })?;
+            if !response
+                .device_lists
+                .iter()
+                .any(|list| list.devices.iter().any(|device| device.is_hosted))
+            {
+                // Learning a new alias can expose an old record and schedule its
+                // migration. Admit maintenance before publishing that mapping,
+                // rather than invalidating our own captured topology in a dry run.
+                let mapping_has_history = self
+                    .device_mapping_has_registry_history(&response.lid_mappings)
+                    .await;
+                // Most responses only publish device metadata. A durability hook
+                // already owns the drain permit, so do not acquire it for lookups
+                // that never touch Signal state. The guarded planner refuses all
+                // destructive work without a maintenance scope.
+                if !mapping_has_history {
+                    let result = self
+                        .apply_device_list_response_inner(
+                            response,
+                            mode,
+                            topology_generation,
+                            group_users,
+                            None,
+                            None,
+                        )
+                        .await;
+                    if !matches!(&result, Err(error) if error.is::<DeviceListMaintenanceRequired>())
+                    {
+                        return result;
+                    }
+                }
+                let maintenance = client.begin_signal_maintenance().await?;
+                return self
                     .apply_device_list_response_inner(
                         response,
                         mode,
                         topology_generation,
                         group_users,
                         None,
-                        None,
-                    )
-                    .await;
-                if !matches!(&result, Err(error) if error.is::<DeviceListMaintenanceRequired>()) {
-                    return result;
-                }
-            }
-            let maintenance = client.begin_signal_maintenance().await?;
-            return self
-                .apply_device_list_response_inner(
-                    response,
-                    mode,
-                    topology_generation,
-                    group_users,
-                    None,
-                    Some(&maintenance),
-                )
-                .await;
-        }
-        self.ensure_signal_maintenance_context()?;
-        let response = response.clone();
-        let group_users = group_users.map(<[Jid]>::to_vec);
-        let (send, receive) = futures::channel::oneshot::channel();
-        self.runtime.spawn_detached(Box::pin(async move {
-            let result = async {
-                let maintenance = client.begin_signal_maintenance().await?;
-                client
-                    .apply_device_list_response_inner(
-                        &response,
-                        mode,
-                        topology_generation,
-                        group_users.as_deref(),
-                        None,
                         Some(&maintenance),
                     )
-                    .await
+                    .await;
             }
-            .await;
-            if let Err(Err(error)) = send.send(result) {
-                warn!("Hosted device sync failed after caller cancellation: {error:#}");
-            }
-        }));
-        receive
-            .await
-            .map_err(|_| anyhow::anyhow!("hosted device sync worker stopped"))?
+            self.ensure_signal_maintenance_context()?;
+            let response = response.clone();
+            let group_users = group_users.map(<[Jid]>::to_vec);
+            let (send, receive) = futures::channel::oneshot::channel();
+            self.runtime.spawn_detached(Box::pin(async move {
+                let result = async {
+                    let maintenance = client.begin_signal_maintenance().await?;
+                    client
+                        .apply_device_list_response_inner(
+                            &response,
+                            mode,
+                            topology_generation,
+                            group_users.as_deref(),
+                            None,
+                            Some(&maintenance),
+                        )
+                        .await
+                }
+                .await;
+                if let Err(Err(error)) = send.send(result) {
+                    warn!("Hosted device sync failed after caller cancellation: {error:#}");
+                }
+            }));
+            receive
+                .await
+                .map_err(|_| anyhow::anyhow!("hosted device sync worker stopped"))?
+        })
     }
 
     /// Hold mapping and topology guards through CAS, cleanup and publication.
