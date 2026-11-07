@@ -1668,6 +1668,14 @@ impl Client {
         // here would undo that normalization.
         let signal_address = requester_jid.to_protocol_address();
 
+        // Observe freshness before the session read can park on backend I/O.
+        // Otherwise recovery during that wait makes an old receipt appear new.
+        let primary_identity_snapshot = if requester_jid.device == 0 {
+            Some(self.cached_adv_account_identity(requester_jid).await?)
+        } else {
+            None
+        };
+
         // Check if the registration ID changed (indicates device reinstall).
         // Read session through cache for consistent state.
         {
@@ -1782,8 +1790,8 @@ impl Client {
 
         let mut adapter = self.signal_adapter();
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-        if requester_jid.device == 0 {
-            bundle.set_identity_snapshot(self.cached_adv_account_identity(requester_jid).await?);
+        if let Some(previous) = primary_identity_snapshot {
+            bundle.set_identity_snapshot(previous);
         }
         self.install_prekey_bundle_cached(requester_jid, &bundle, &mut adapter, &mut rng)
             .await?;
@@ -4107,6 +4115,74 @@ mod tests {
                 Vec::new(),
             ),
         ]
+    }
+
+    /// A retry already parked on its initial storage read must not treat an
+    /// identity published during that wait as the receipt's original anchor.
+    #[tokio::test]
+    async fn primary_retry_cannot_rollback_recovery_during_its_initial_session_read() {
+        use crate::store::release::tests::ProbeBackend;
+        let (mut probe, _) = ProbeBackend::new();
+        let (release, gate) = async_channel::unbounded();
+        let (entered, arrived) = async_channel::unbounded();
+        probe.gate = Some(gate);
+        probe.entered = Some(entered);
+        probe.gate_method = "get_session";
+        let (client, _) =
+            crate::test_utils::create_iq_test_client_with_backend(Arc::new(probe)).await;
+        let user = Jid::pn("12025550196");
+        let children = retry_key_bundle_children();
+        let old: Vec<u8> = get_bytes_content_ref(
+            &children[1]
+                .as_node_ref()
+                .get_optional_child("identity")
+                .unwrap(),
+        )
+        .unwrap()
+        .to_vec();
+        client
+            .signal_cache
+            .put_identity(&user.to_protocol_address(), &old)
+            .await;
+        let receipt = NodeBuilder::new("receipt").children(children).build();
+        let retry = {
+            let client = client.clone();
+            let user = user.clone();
+            tokio::spawn(async move {
+                client
+                    .process_retry_key_bundle(&receipt.as_node_ref(), &user, false, false)
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), arrived.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let replacement = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        client
+            .signal_cache
+            .put_identity(
+                &user.to_protocol_address(),
+                replacement.public_key.public_key_bytes(),
+            )
+            .await;
+        release.send(()).await.unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), retry)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("before a newer identity was published"),
+            "{error:#}"
+        );
+        assert_eq!(
+            client.cached_adv_account_identity(&user).await.unwrap(),
+            Some(*replacement.public_key.public_key_bytes())
+        );
+        client.signal_shutdown_sync();
     }
 
     async fn has_session(client: &Client, jid: &Jid) -> bool {

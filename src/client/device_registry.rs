@@ -1118,9 +1118,6 @@ impl Client {
         device: &wacore::stanza::devices::DeviceElement,
         key_index_info: Option<&wacore::stanza::devices::KeyIndexInfo>,
     ) {
-        let guard = self.device_topology.lock_registry().await;
-        let mut sessions_changed = false;
-        let mut identity_change = None;
         // The notification carries the id as a `u32`; a registry device id is
         // a `u16`, as it is on the wire, so anything wider names a device that
         // cannot exist rather than one to add.
@@ -1132,6 +1129,21 @@ impl Client {
             return;
         };
         let is_hosted = wacore_binary::JidExt::is_hosted(&device.jid);
+
+        // Device notifications run off the socket read loop. Enter before
+        // the registry and persist retirement before publishing a new raw_id.
+        let Some(client) = self.self_weak.get().and_then(|weak| weak.upgrade()) else {
+            warn!("patch_device_add: client ownership unavailable");
+            return;
+        };
+        let maintenance = match client.begin_signal_maintenance().await {
+            Ok(maintenance) => maintenance,
+            Err(error) => {
+                warn!("patch_device_add: cannot enter Signal maintenance: {error}");
+                return;
+            }
+        };
+        let guard = self.device_topology.lock_registry().await;
 
         let Some(mut record) = self.load_device_record(user).await else {
             return;
@@ -1176,9 +1188,10 @@ impl Client {
                     wacore_binary::jid::ObservedJid::from(user),
                     decoded.raw_id
                 );
-                identity_change = Some(self.signal_cache.identity_continuity.changing([user]));
-                self.clear_device_record_unflushed(user, &record).await;
-                sessions_changed = true;
+                if let Err(error) = maintenance.clear_device_record(user, &record).await {
+                    warn!("patch_device_add: cannot persist session retirement: {error}");
+                    return;
+                }
                 record.edit_devices(|devices| devices.retain(|device| device.device_id() == 0));
             } else {
                 // Filter stale devices by valid_indexes. A raw_id reset already
@@ -1220,17 +1233,13 @@ impl Client {
             });
         }
 
+        if let Err(error) = maintenance.ensure_current() {
+            warn!("patch_device_add: retired processing scope: {error}");
+            return;
+        }
         if let Err(e) = self.update_device_list_guarded(record, &guard).await {
             warn!("patch_device_add: failed to persist: {e}");
         }
-        drop(guard);
-        // A recovery worker owns its processing permit before acquiring the
-        // registry. Never wait for that permit while holding the registry.
-        if sessions_changed {
-            self.flush_signal_cache_batch_safe_logged("patch_device_add", None)
-                .await;
-        }
-        drop(identity_change);
     }
 
     /// Append a new device or refresh the addressing metadata of an existing one.
@@ -1358,6 +1367,17 @@ impl Client {
             warn!("patch_device_remove: device_id {device_id} > u16::MAX — nothing to remove");
             return;
         };
+        let Some(client) = self.self_weak.get().and_then(|weak| weak.upgrade()) else {
+            warn!("patch_device_remove: client ownership unavailable");
+            return;
+        };
+        let maintenance = match client.begin_signal_maintenance().await {
+            Ok(maintenance) => maintenance,
+            Err(error) => {
+                warn!("patch_device_remove: cannot enter Signal maintenance: {error}");
+                return;
+            }
+        };
         let guard = self.device_topology.lock_registry().await;
         if let Some(mut record) = self.load_device_record(user).await {
             let before = record.devices.len();
@@ -1381,12 +1401,13 @@ impl Client {
                 }
                 self.delete_sessions_for_devices_unflushed(user, &[device_id])
                     .await;
+                if let Err(error) = maintenance.flush().await {
+                    warn!("patch_device_remove: cannot persist session retirement: {error}");
+                    return;
+                }
                 if let Err(e) = self.update_device_list_guarded(record, &guard).await {
                     warn!("patch_device_remove: failed to persist: {e}");
                 }
-                drop(guard);
-                self.flush_signal_cache_batch_safe_logged("patch_device_remove", None)
-                    .await;
             }
         }
     }

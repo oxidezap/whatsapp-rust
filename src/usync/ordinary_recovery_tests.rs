@@ -432,6 +432,107 @@ async fn offline_device_removal_releases_registry_before_waiting_for_processing(
     client.signal_shutdown_sync();
 }
 
+/// A crash while waiting for the drain permit must still leave the previous
+/// raw_id in durable storage, so replay knows companion cleanup is required.
+#[tokio::test]
+async fn offline_device_add_does_not_publish_raw_id_before_durable_session_retirement() {
+    use crate::test_utils::{create_iq_test_client_with_runtime, create_test_backend};
+    use wacore::stanza::devices::{DeviceElement, KeyIndexInfo};
+    let (waiting, permit_wait) = async_channel::unbounded();
+    let (client, _) = create_iq_test_client_with_runtime(
+        create_test_backend().await,
+        Arc::new(PermitWaitRuntime(waiting)),
+    )
+    .await;
+    let user = Jid::pn("12025550197");
+    crate::test_utils::seed_adv_primary(&client, &user).await;
+    seed_fresh_session(&client, &user.with_device(7)).await;
+    client
+        .update_device_list(DeviceListRecord {
+            user: user.user.as_str().into(),
+            devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(1))].into(),
+            raw_id: Some(2),
+            timestamp: 1,
+            phash: None,
+        })
+        .await
+        .unwrap();
+    client.flush_signal_cache_batch_safe().await.unwrap();
+    let backend = client.persistence_manager.backend();
+    let address = user.with_device(7).to_protocol_address();
+    assert!(
+        backend
+            .get_session(address.as_str())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    client.enter_drain_mode_for_tests();
+    let permit = client.acquire_message_processing_permit().await;
+    let add = {
+        let client = client.clone();
+        let user = user.clone();
+        tokio::spawn(async move {
+            client
+                .patch_device_add(
+                    &user.user,
+                    &DeviceElement {
+                        jid: user.with_device(7),
+                        key_index: Some(1),
+                        lid: None,
+                    },
+                    Some(&KeyIndexInfo {
+                        timestamp: 100,
+                        signed_bytes: Some(signed_key_index_bytes(vec![1], 1)),
+                    }),
+                )
+                .await;
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), permit_wait.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        backend
+            .get_devices(&user.user)
+            .await
+            .unwrap()
+            .unwrap()
+            .raw_id,
+        Some(2)
+    );
+    assert!(
+        backend
+            .get_session(address.as_str())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    drop(permit);
+    tokio::time::timeout(Duration::from_secs(5), add)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        backend
+            .get_devices(&user.user)
+            .await
+            .unwrap()
+            .unwrap()
+            .raw_id,
+        Some(1)
+    );
+    assert!(
+        backend
+            .get_session(address.as_str())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    client.signal_shutdown_sync();
+}
+
 #[tokio::test]
 async fn group_recovery_budget_counts_requests_across_repeated_batches() {
     use wacore::usync::{UserDeviceList, UsyncDevice};

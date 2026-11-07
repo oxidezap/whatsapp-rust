@@ -30,6 +30,22 @@ const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
 /// timeout defaults to 0) because our durability hook must not lag.
 const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
+thread_local! {
+    // Poll-scoped rather than task/executor-specific: a hook may resume on a
+    // different worker, and unrelated tasks must not inherit its restriction.
+    static INBOUND_HOOK_CLIENT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+impl Client {
+    pub(crate) fn ensure_signal_maintenance_context(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            INBOUND_HOOK_CLIENT.get() != Some(std::ptr::from_ref(self) as usize),
+            "Signal maintenance cannot run inside an inbound durability hook; retry from a control task"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 struct BatchState {
     entries: Vec<PendingDelivery>,
@@ -1832,13 +1848,23 @@ impl Client {
             }
             if !items.is_empty()
                 && let Some(hook) = self.inbound_durability_hook()
-                && let Err(e) = hook.on_messages(self.clone(), &items).await
             {
-                log::warn!(
-                    "Inbound durability hook failed for batch of {}; suppressing acks for redelivery: {e:?}",
-                    items.len()
-                );
-                return PendingCommitOutcome::BUFFERED;
+                let mut hook_future = std::pin::pin!(hook.on_messages(self.clone(), &items));
+                let result = std::future::poll_fn(|cx| {
+                    let previous = INBOUND_HOOK_CLIENT
+                        .replace(Some(std::ptr::from_ref(self.as_ref()) as usize));
+                    let _restore =
+                        scopeguard::guard(previous, |previous| INBOUND_HOOK_CLIENT.set(previous));
+                    hook_future.as_mut().poll(cx)
+                })
+                .await;
+                if let Err(e) = result {
+                    log::warn!(
+                        "Inbound durability hook failed for batch of {}; suppressing acks for redelivery: {e:?}",
+                        items.len()
+                    );
+                    return PendingCommitOutcome::BUFFERED;
+                }
             }
             hook_committed = self.inbound_durability_hook.get().is_some();
 
@@ -2022,13 +2048,13 @@ mod tests {
 
     /// A metadata-only lookup for a user outside this batch must not try to
     /// acquire the single processing permit already held by the hook's caller.
-    #[tokio::test]
-    async fn offline_durability_hook_can_resolve_an_uncached_ordinary_user() {
+    async fn hook_lookup_during_drain(recovery: bool) {
         use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq};
         use std::time::Duration;
         use wacore_binary::builder::NodeBuilder;
         struct LookupHook {
             user: Jid,
+            recovery: bool,
         }
         #[async_trait::async_trait]
         impl InboundDurabilityHook for LookupHook {
@@ -2042,10 +2068,21 @@ mod tests {
                         .iter()
                         .all(|message| message.info.source.sender != self.user)
                 );
-                let devices = client
+                let result = client
                     .signal()
                     .get_user_devices(std::slice::from_ref(&self.user))
-                    .await?;
+                    .await;
+                if self.recovery {
+                    let error = result.unwrap_err();
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("cannot run inside an inbound durability hook"),
+                        "{error:#}"
+                    );
+                    return Err(error.into());
+                }
+                let devices = result?;
                 assert_eq!(devices, vec![self.user.clone()]);
                 Ok(())
             }
@@ -2054,9 +2091,24 @@ mod tests {
         let user = Jid::pn("12025550195");
         client
             .inbound_durability_hook
-            .set(Arc::new(LookupHook { user: user.clone() }))
+            .set(Arc::new(LookupHook {
+                user: user.clone(),
+                recovery,
+            }))
             .ok()
             .unwrap();
+        let old = wacore::libsignal::protocol::KeyPair::generate(&mut rand::make_rng::<
+            rand::rngs::StdRng,
+        >());
+        if recovery {
+            client
+                .signal_cache
+                .put_identity(
+                    &user.to_protocol_address(),
+                    old.public_key.public_key_bytes(),
+                )
+                .await;
+        }
         client.enter_drain_mode_for_tests();
         let commit = {
             let client = client.clone();
@@ -2074,29 +2126,78 @@ mod tests {
         };
         let iq = decode_sent_iq(&transport, 0).await;
         let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+        let mut devices = vec![NodeBuilder::new("device").attr("id", "0").build()];
+        if recovery {
+            devices.push(
+                NodeBuilder::new("device")
+                    .attr("id", "2")
+                    .attr("key-index", "1")
+                    .build(),
+            );
+        }
+        let mut children = vec![NodeBuilder::new("device-list").children(devices).build()];
+        if recovery {
+            let mut details = wa::ADVKeyIndexList::default();
+            details.raw_id = Some(1);
+            details.current_index = Some(1);
+            details.valid_indexes = vec![1];
+            children.push(
+                NodeBuilder::new("key-index-list")
+                    .attr("ts", "100")
+                    .bytes(crate::test_utils::sign_adv_key_index(
+                        waproto::codec::adv_key_index_list_to_vec(&details),
+                    ))
+                    .build(),
+            );
+        }
         let response = NodeBuilder::new("iq")
             .attr("type", "result")
             .children([NodeBuilder::new("usync")
                 .children([NodeBuilder::new("list")
                     .children([NodeBuilder::new("user")
                         .attr("jid", user.to_string())
-                        .children([NodeBuilder::new("devices")
-                            .children([NodeBuilder::new("device-list")
-                                .children([NodeBuilder::new("device").attr("id", "0").build()])
-                                .build()])
-                            .build()])
+                        .children([NodeBuilder::new("devices").children(children).build()])
                         .build()])
                     .build()])
                 .build()])
             .build();
         answer_iq(&client, &id, &response).await;
+        if recovery {
+            let iq = decode_sent_iq(&transport, 1).await;
+            let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+            answer_iq(&client, &id, &response).await;
+        }
         let outcome = tokio::time::timeout(Duration::from_secs(5), commit)
             .await
             .expect("hook lookup must finish while it owns the drain permit")
             .unwrap();
-        assert!(outcome.persisted && outcome.delivered);
-        assert!(client.load_device_record(&user.user).await.is_some());
+        assert!(outcome.persisted);
+        assert_eq!(outcome.delivered, !recovery);
+        if recovery {
+            assert_eq!(
+                client.cached_adv_account_identity(&user).await.unwrap(),
+                Some(*old.public_key.public_key_bytes())
+            );
+            assert_eq!(
+                transport.sent().len(),
+                2,
+                "hook must not start a detached key-recovery worker"
+            );
+        } else {
+            assert!(client.load_device_record(&user.user).await.is_some());
+        }
+        client.ensure_signal_maintenance_context().unwrap();
         client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn offline_durability_hook_can_resolve_an_uncached_ordinary_user() {
+        hook_lookup_during_drain(false).await;
+    }
+
+    #[tokio::test]
+    async fn offline_durability_hook_recovery_fails_without_stalling_or_changing_trust() {
+        hook_lookup_during_drain(true).await;
     }
 
     async fn capture_pending_receipts(

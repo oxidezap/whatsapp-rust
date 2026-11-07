@@ -58,6 +58,7 @@ impl Client {
     pub(crate) async fn begin_signal_maintenance(
         self: &Arc<Self>,
     ) -> Result<SignalMaintenance<'_>> {
+        self.ensure_signal_maintenance_context()?;
         let connection_generation = self.connection_generation.load(Ordering::Acquire);
         loop {
             let (semaphore_generation, _) = self.read_message_semaphore();

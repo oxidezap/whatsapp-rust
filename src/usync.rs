@@ -372,6 +372,7 @@ impl Client {
         if failure.hosted {
             return Err(error);
         }
+        self.ensure_signal_maintenance_context()?;
         let user = &failure.user;
         let snapshot = self.persistence_manager.get_device_snapshot();
         if snapshot
@@ -649,6 +650,7 @@ impl Client {
                 )
                 .await;
         }
+        self.ensure_signal_maintenance_context()?;
         let response = response.clone();
         let group_users = group_users.map(<[Jid]>::to_vec);
         let (send, receive) = futures::channel::oneshot::channel();
