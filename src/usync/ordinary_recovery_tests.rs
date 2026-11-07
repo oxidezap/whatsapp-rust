@@ -241,6 +241,107 @@ async fn stale_maintenance_permit_cannot_flush_a_new_drain() {
     client.signal_shutdown_sync();
 }
 
+/// A different contact's refresh must wait outside the global topology locks.
+/// Otherwise a recovery owning the drain permit can wait on that refresh
+/// forever while the refresh waits for the permit to persist its cleanup.
+#[tokio::test]
+async fn offline_refresh_waits_for_processing_before_global_topology_locks() {
+    use crate::test_utils::{create_iq_test_client_with_runtime, create_test_backend};
+    let (waiting, permit_wait) = async_channel::unbounded();
+    let (client, _) = create_iq_test_client_with_runtime(
+        create_test_backend().await,
+        Arc::new(PermitWaitRuntime(waiting)),
+    )
+    .await;
+    client.enter_drain_mode_for_tests();
+    let permit = client.acquire_message_processing_permit().await;
+    let refresh = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .process_device_list_response(
+                    &DeviceListResponse {
+                        device_lists: vec![],
+                        lid_mappings: vec![],
+                    },
+                    Freshness::Refresh,
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), permit_wait.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let mapping = tokio::time::timeout(Duration::from_secs(5), client.lid_pn_cache.lock_mutation())
+        .await
+        .expect("refresh must not hold mappings while waiting for processing");
+    let registry = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.device_topology.lock_registry(),
+    )
+    .await
+    .expect("refresh must not hold registry while waiting for processing");
+    drop(registry);
+    drop(mapping);
+    drop(permit);
+    tokio::time::timeout(Duration::from_secs(5), refresh)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    client.signal_shutdown_sync();
+}
+
+#[tokio::test]
+async fn offline_device_removal_releases_registry_before_waiting_for_processing() {
+    use crate::test_utils::{create_iq_test_client_with_runtime, create_test_backend};
+    let (waiting, permit_wait) = async_channel::unbounded();
+    let (client, _) = create_iq_test_client_with_runtime(
+        create_test_backend().await,
+        Arc::new(PermitWaitRuntime(waiting)),
+    )
+    .await;
+    let user = Jid::pn("12025550199");
+    seed_fresh_session(&client, &user.with_device(7)).await;
+    client
+        .update_device_list(DeviceListRecord {
+            user: user.user.as_str().into(),
+            devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(1))].into(),
+            raw_id: Some(1),
+            timestamp: 1,
+            phash: None,
+        })
+        .await
+        .unwrap();
+    client.flush_signal_cache_batch_safe().await.unwrap();
+    client.enter_drain_mode_for_tests();
+    let permit = client.acquire_message_processing_permit().await;
+    let removal = {
+        let client = client.clone();
+        let user = user.clone();
+        tokio::spawn(async move { client.patch_device_remove(&user.user, 7).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), permit_wait.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let registry = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.device_topology.lock_registry(),
+    )
+    .await
+    .expect("notification must release registry before waiting for processing");
+    drop(registry);
+    drop(permit);
+    tokio::time::timeout(Duration::from_secs(5), removal)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!has_session(&client, &user.with_device(7).to_protocol_address()).await);
+    client.signal_shutdown_sync();
+}
+
 #[tokio::test]
 async fn group_recovery_budget_counts_requests_across_repeated_batches() {
     use wacore::usync::{UserDeviceList, UsyncDevice};

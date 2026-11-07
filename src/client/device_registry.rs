@@ -1119,6 +1119,8 @@ impl Client {
         key_index_info: Option<&wacore::stanza::devices::KeyIndexInfo>,
     ) {
         let guard = self.device_topology.lock_registry().await;
+        let mut sessions_changed = false;
+        let mut identity_change = None;
         // The notification carries the id as a `u32`; a registry device id is
         // a `u16`, as it is on the wire, so anything wider names a device that
         // cannot exist rather than one to add.
@@ -1174,8 +1176,9 @@ impl Client {
                     wacore_binary::jid::ObservedJid::from(user),
                     decoded.raw_id
                 );
-                self.clear_device_record(user, device.jid.server.as_str(), &record)
-                    .await;
+                identity_change = Some(self.signal_cache.identity_continuity.changing([user]));
+                self.clear_device_record_unflushed(user, &record).await;
+                sessions_changed = true;
                 record.edit_devices(|devices| devices.retain(|device| device.device_id() == 0));
             } else {
                 // Filter stale devices by valid_indexes. A raw_id reset already
@@ -1220,6 +1223,14 @@ impl Client {
         if let Err(e) = self.update_device_list_guarded(record, &guard).await {
             warn!("patch_device_add: failed to persist: {e}");
         }
+        drop(guard);
+        // A recovery worker owns its processing permit before acquiring the
+        // registry. Never wait for that permit while holding the registry.
+        if sessions_changed {
+            self.flush_signal_cache_batch_safe_logged("patch_device_add", None)
+                .await;
+        }
+        drop(identity_change);
     }
 
     /// Append a new device or refresh the addressing metadata of an existing one.
@@ -1352,7 +1363,6 @@ impl Client {
             let before = record.devices.len();
             record.edit_devices(|devices| devices.retain(|d| d.device_id() != device_id));
             if record.devices.len() != before {
-                self.delete_sessions_for_devices(user, &[device_id]).await;
                 // WA Web's `updateGroupParticipantsInTransaction` deletes the
                 // device JID from each affected group's senderKey Map. Skip
                 // the registry update on failure: a half-applied state where
@@ -1369,9 +1379,14 @@ impl Client {
                     );
                     return;
                 }
+                self.delete_sessions_for_devices_unflushed(user, &[device_id])
+                    .await;
                 if let Err(e) = self.update_device_list_guarded(record, &guard).await {
                     warn!("patch_device_remove: failed to persist: {e}");
                 }
+                drop(guard);
+                self.flush_signal_cache_batch_safe_logged("patch_device_remove", None)
+                    .await;
             }
         }
     }

@@ -7601,9 +7601,7 @@ mod ensure_sessions_concurrency {
         let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
         crate::test_utils::answer_iq(&client, &id, &keys.bundle_response(&primary, &id, 1)).await;
         let outcome = task.await.unwrap().unwrap();
-        let newer = wacore::libsignal::protocol::KeyPair::generate(&mut rand::make_rng::<
-            rand::rngs::StdRng,
-        >());
+        let newer = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
         client
             .signal_cache
             .put_identity(

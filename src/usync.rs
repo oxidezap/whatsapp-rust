@@ -605,11 +605,17 @@ impl Client {
         group_users: Option<&[Jid]>,
     ) -> anyhow::Result<Option<Vec<Jid>>> {
         self.prepare_device_list_identities(response).await?;
+        let client = self
+            .self_weak
+            .get()
+            .and_then(|weak| weak.upgrade())
+            .ok_or_else(|| anyhow::anyhow!("client ownership unavailable during device sync"))?;
         if !response
             .device_lists
             .iter()
             .any(|list| list.devices.iter().any(|device| device.is_hosted))
         {
+            let maintenance = client.begin_signal_maintenance().await?;
             return self
                 .apply_device_list_response_inner(
                     response,
@@ -617,31 +623,28 @@ impl Client {
                     topology_generation,
                     group_users,
                     None,
-                    None,
+                    Some(&maintenance),
                 )
                 .await;
         }
-        let client = self
-            .self_weak
-            .get()
-            .and_then(|weak| weak.upgrade())
-            .ok_or_else(|| {
-                anyhow::anyhow!("client ownership unavailable during hosted device sync")
-            })?;
         let response = response.clone();
         let group_users = group_users.map(<[Jid]>::to_vec);
         let (send, receive) = futures::channel::oneshot::channel();
         self.runtime.spawn_detached(Box::pin(async move {
-            let result = client
-                .apply_device_list_response_inner(
-                    &response,
-                    mode,
-                    topology_generation,
-                    group_users.as_deref(),
-                    None,
-                    None,
-                )
-                .await;
+            let result = async {
+                let maintenance = client.begin_signal_maintenance().await?;
+                client
+                    .apply_device_list_response_inner(
+                        &response,
+                        mode,
+                        topology_generation,
+                        group_users.as_deref(),
+                        None,
+                        Some(&maintenance),
+                    )
+                    .await
+            }
+            .await;
             if let Err(Err(error)) = send.send(result) {
                 warn!("Hosted device sync failed after caller cancellation: {error:#}");
             }

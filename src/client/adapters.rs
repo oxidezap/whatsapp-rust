@@ -14,7 +14,7 @@ pub(crate) struct SignalMaintenance<'a> {
 }
 
 impl SignalMaintenance<'_> {
-    pub(crate) fn ensure_current(&self) -> anyhow::Result<()> {
+    pub(crate) fn ensure_current(&self) -> Result<()> {
         anyhow::ensure!(
             self.client.connection_generation.load(Ordering::Acquire) == self.connection_generation
                 && self
@@ -27,7 +27,7 @@ impl SignalMaintenance<'_> {
         Ok(())
     }
 
-    pub(crate) async fn flush(&self) -> anyhow::Result<()> {
+    pub(crate) async fn flush(&self) -> Result<()> {
         self.ensure_current()?;
         self.client.flush_signal_cache().await?;
         self.ensure_current()
@@ -37,7 +37,7 @@ impl SignalMaintenance<'_> {
         &self,
         user: &str,
         record: &wacore::store::traits::DeviceListRecord,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         self.ensure_current()?;
         let _change = self
             .client
@@ -57,7 +57,7 @@ impl Client {
     /// the same non-reentrant permit during offline delivery.
     pub(crate) async fn begin_signal_maintenance(
         self: &Arc<Self>,
-    ) -> anyhow::Result<SignalMaintenance<'_>> {
+    ) -> Result<SignalMaintenance<'_>> {
         let connection_generation = self.connection_generation.load(Ordering::Acquire);
         loop {
             let (semaphore_generation, _) = self.read_message_semaphore();
