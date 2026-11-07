@@ -232,6 +232,18 @@ pub fn verify_key_index_list(
     decode_key_index_list(signed_bytes)
 }
 
+/// Verify the hosted USync branch with the envelope's account signature key.
+///
+/// WA Web `WAWebHandleAdvKeyIndexResultApi` selects this trust policy only
+/// when the returned device list contains `isHosted`. A valid result authorizes
+/// saving this account identity. Never use it as fallback for an ordinary list.
+pub fn verify_hosted_key_index_list(signed_bytes: &[u8]) -> Option<(DecodedKeyIndex, [u8; 32])> {
+    let signed = waproto::whatsapp::ADVSignedKeyIndexListView::decode_view(signed_bytes).ok()?;
+    let identity: [u8; 32] = signed.account_signature_key?.try_into().ok()?;
+    let decoded = verify_key_index_list(signed_bytes, &identity)?;
+    Some((decoded, identity))
+}
+
 /// Filter a device list using `valid_indexes` and `current_index` from an
 /// `ADVKeyIndexList`, matching WA Web's filtering algorithm.
 ///
@@ -317,6 +329,61 @@ mod tests {
         assert!(verify_key_index_list(&signed.encode_to_vec(), &id32(&account)).is_none());
         signed.account_signature = None;
         assert!(verify_key_index_list(&signed.encode_to_vec(), &id32(&account)).is_none());
+    }
+
+    #[test]
+    fn hosted_key_index_requires_embedded_key_and_authenticated_complete_details() {
+        use crate::libsignal::protocol::KeyPair;
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let account = KeyPair::generate(&mut rng);
+        let mut details = waproto::whatsapp::ADVKeyIndexList::default();
+        details.raw_id = Some(7);
+        details.timestamp = Some(42);
+        details.current_index = Some(1);
+        details.valid_indexes = vec![1];
+        let mut signed = waproto::whatsapp::ADVSignedKeyIndexList::default();
+        signed.details = Some(details.encode_to_vec());
+        signed.account_signature_key = Some(account.public_key.public_key_bytes().to_vec());
+        let sign = |signed: &mut waproto::whatsapp::ADVSignedKeyIndexList| {
+            signed.account_signature = Some(
+                account
+                    .private_key
+                    .calculate_signature(
+                        &[&[6, 2], signed.details.as_deref().unwrap()].concat(),
+                        &mut rand::make_rng::<rand::rngs::StdRng>(),
+                    )
+                    .unwrap()
+                    .to_vec(),
+            );
+        };
+        sign(&mut signed);
+        let (_, key) = verify_hosted_key_index_list(&signed.encode_to_vec()).unwrap();
+        assert_eq!(key.as_slice(), account.public_key.public_key_bytes());
+        let valid = signed.clone();
+        for missing in [None, Some(vec![]), Some(vec![1; 31]), Some(vec![1; 33])] {
+            signed = valid.clone();
+            signed.account_signature_key = missing;
+            assert!(verify_hosted_key_index_list(&signed.encode_to_vec()).is_none());
+        }
+        signed = valid.clone();
+        signed.account_signature.as_mut().unwrap()[0] ^= 1;
+        assert!(verify_hosted_key_index_list(&signed.encode_to_vec()).is_none());
+        signed = valid.clone();
+        signed.account_signature = None;
+        assert!(verify_hosted_key_index_list(&signed.encode_to_vec()).is_none());
+        for no_timestamp in [true, false] {
+            let mut incomplete = details.clone();
+            if no_timestamp {
+                incomplete.timestamp = None;
+            } else {
+                incomplete.raw_id = None;
+            }
+            signed = valid.clone();
+            signed.details = Some(incomplete.encode_to_vec());
+            sign(&mut signed);
+            assert!(verify_hosted_key_index_list(&signed.encode_to_vec()).is_none());
+        }
+        assert!(verify_hosted_key_index_list(&[255]).is_none());
     }
 
     #[test]

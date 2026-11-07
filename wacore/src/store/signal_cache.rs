@@ -1877,6 +1877,36 @@ impl SignalStoreCache {
         Ok(true)
     }
 
+    /// Persist a protocol-verified identity only if trust has not changed since
+    /// verification. Like bootstrap, this writes no unrelated session ratchets.
+    pub async fn persist_identity_if_equal(
+        &self,
+        address: &ProtocolAddress,
+        expected: Option<&[u8; 32]>,
+        data: &[u8; 32],
+        backend: &dyn SignalStore,
+    ) -> Result<bool> {
+        let _flush = self.flush_lock.lock().await;
+        let mut state = self.identities.lock().await;
+        let previous = match state.cache.get(address.as_str()) {
+            Some(cached) => cached.clone(),
+            None => backend
+                .load_identity(address.as_str())
+                .await?
+                .map(Arc::from),
+        };
+        if previous.as_deref() != expected.map(|key| key.as_slice()) {
+            return Ok(false);
+        }
+        let _change = self.identity_write_change(&state, address, data);
+        state.put_dedup(address.as_str(), data);
+        backend.put_identity(address.as_str(), *data).await?;
+        state.dirty.remove(address.as_str());
+        state.deleted.remove(address.as_str());
+        state.evict_if_needed(self.max_entries);
+        Ok(true)
+    }
+
     pub async fn put_identity(&self, address: &ProtocolAddress, data: &[u8]) {
         let mut state = self.identities.lock().await;
         let _change = self.identity_write_change(&state, address, data);
@@ -6595,6 +6625,52 @@ mod cold_read_race_tests {
     }
 
     #[tokio::test]
+    async fn cancelled_verified_identity_write_stays_dirty_until_persisted() {
+        let backend = GatedColdRead::new(0);
+        let cache = SignalStoreCache::new();
+        let address = ProtocolAddress::new("12025550168", 0.into());
+        assert!(
+            cache
+                .persist_identity_if_absent_or_equal(&address, &[1; 32], &backend)
+                .await
+                .unwrap()
+        );
+        backend.pause_identity_write.store(true, Ordering::Relaxed);
+        let mut write =
+            Box::pin(cache.persist_identity_if_equal(&address, Some(&[1; 32]), &[2; 32], &backend));
+        assert!(futures::poll!(write.as_mut()).is_pending());
+        assert_eq!(
+            backend.pending_identity.lock().unwrap().take(),
+            Some([2; 32])
+        );
+        drop(write);
+        backend.pause_identity_write.store(false, Ordering::Relaxed);
+        assert!(
+            !cache
+                .persist_identity_if_equal(&address, Some(&[1; 32]), &[3; 32], &backend)
+                .await
+                .unwrap()
+        );
+        {
+            let mut state = cache.identities.lock().await;
+            assert!(state.dirty.contains(address.as_str()));
+            state.evict_if_needed(0);
+            assert!(state.cache.get(address.as_str()).is_some());
+        }
+        cache.flush(&backend).await.unwrap();
+        cache.clear_after_flush().await;
+        assert_eq!(
+            cache
+                .get_identity(&address, &backend)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            &[2; 32]
+        );
+    }
+
+    #[tokio::test]
     async fn cancelled_bootstrap_write_cannot_replace_a_saved_primary() {
         let mut outcomes = Vec::new();
         // Commit before cancellation, after it, or after the replacement attempt.
@@ -8155,6 +8231,63 @@ mod identity_continuity_tests {
         assert_eq!(continuity.snapshot(), None);
         drop(continuity.changing(["second"]));
         assert_eq!(continuity.snapshot(), None);
+    }
+
+    #[tokio::test]
+    async fn verified_identity_cas_preserves_concurrent_trust_and_unrelated_ratchets() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let address = ProtocolAddress::new("12025550161", 0.into());
+        let unrelated = ProtocolAddress::new("12025550162", 1.into());
+        cache
+            .put_session(&unrelated, SessionRecord::new_fresh())
+            .await;
+        assert!(
+            cache
+                .persist_identity_if_equal(&address, None, &[1; 32], &backend)
+                .await
+                .unwrap()
+        );
+        let (first, second) = futures::join!(
+            cache.persist_identity_if_equal(&address, Some(&[1; 32]), &[2; 32], &backend),
+            cache.persist_identity_if_equal(&address, Some(&[1; 32]), &[3; 32], &backend),
+        );
+        assert_ne!(first.unwrap(), second.unwrap());
+        let accepted = cache
+            .get_identity(&address, &backend)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            backend
+                .load_identity(address.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            accepted.as_ref()
+        );
+        assert!(
+            backend
+                .get_session(unrelated.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let cold = SignalStoreCache::new();
+        assert!(
+            !cold
+                .persist_identity_if_equal(&address, None, &[4; 32], &backend)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            cold.get_identity(&address, &backend)
+                .await
+                .unwrap()
+                .unwrap(),
+            accepted
+        );
     }
 
     #[tokio::test]

@@ -995,6 +995,16 @@ impl Client {
         user: &str,
         guard: &crate::client::device_topology::DeviceRegistryMutationGuard<'_>,
     ) {
+        let _ = self.try_invalidate_device_cache_guarded(user, guard).await;
+    }
+
+    /// Identity replacement must abort if any stale persistent alias survives.
+    pub(crate) async fn try_invalidate_device_cache_guarded(
+        &self,
+        user: &str,
+        guard: &crate::client::device_topology::DeviceRegistryMutationGuard<'_>,
+    ) -> Result<()> {
+        let mut failure = None;
         let lookup = self.resolve_lookup_keys(user).await;
 
         for key in lookup.all_keys() {
@@ -1006,6 +1016,7 @@ impl Client {
                     "Failed to delete device registry from DB for {}: {e}",
                     wacore_binary::jid::ObservedJid::from(key)
                 );
+                failure.get_or_insert_with(|| e.into());
             }
             // Invalidate again after the delete: a concurrent reader that read
             // the doomed DB row can promote() it back between the first
@@ -1018,6 +1029,7 @@ impl Client {
             "Invalidated device cache for user: {}",
             wacore_binary::jid::ObservedJid::from(user)
         );
+        failure.map_or(Ok(()), Err)
     }
 
     /// Patch device registry after a device add notification.
