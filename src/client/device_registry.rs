@@ -1432,36 +1432,50 @@ impl Client {
         user: &str,
         device_id: u16,
     ) -> Result<(), wacore::store::error::StoreError> {
-        let lookup = self.resolve_lookup_keys(user).await;
-        let namespaces = lookup.signal_namespaces();
-        let mut device_id_buffer = itoa::Buffer::new();
-        let device_id_text = device_id_buffer.format(device_id);
-        let separator_len = ':'.len_utf8() + '@'.len_utf8();
-        let capacity = namespaces
-            .iter()
-            .map(|(key, server)| {
-                key.len() + device_id_text.len() + server.as_str().len() + separator_len
-            })
-            .sum();
-        let mut candidates = String::with_capacity(capacity);
-        let mut ranges = [(0, 0); SIGNAL_NAMESPACE_COUNT];
-        for ((key, server), range) in namespaces.into_iter().zip(&mut ranges) {
-            let start = candidates.len();
-            wacore_binary::push_jid_to_string(key, server, 0, device_id, &mut candidates);
-            *range = (start, candidates.len());
-        }
-        let refs: [&str; SIGNAL_NAMESPACE_COUNT] =
-            ranges.map(|(start, end)| &candidates[start..end]);
-        self.persistence_manager
-            .delete_sender_key_device_rows(&refs)
-            .await?;
+        self.delete_sender_key_rows_for_device_inner(user, device_id)
+            .await
+    }
 
-        for key in lookup.all_keys() {
-            self.sender_key_device_cache
-                .invalidate_entries_for_device(key, device_id)
-                .await;
-        }
-        Ok(())
+    // Notifications and USync share this cold cleanup state machine instead
+    // of embedding its namespace construction and cache polling in each caller.
+    #[inline(never)]
+    fn delete_sender_key_rows_for_device_inner<'a>(
+        &'a self,
+        user: &'a str,
+        device_id: u16,
+    ) -> wacore::runtime::BoxFuture<'a, Result<(), wacore::store::error::StoreError>> {
+        Box::pin(async move {
+            let lookup = self.resolve_lookup_keys(user).await;
+            let namespaces = lookup.signal_namespaces();
+            let mut device_id_buffer = itoa::Buffer::new();
+            let device_id_text = device_id_buffer.format(device_id);
+            let separator_len = ':'.len_utf8() + '@'.len_utf8();
+            let capacity = namespaces
+                .iter()
+                .map(|(key, server)| {
+                    key.len() + device_id_text.len() + server.as_str().len() + separator_len
+                })
+                .sum();
+            let mut candidates = String::with_capacity(capacity);
+            let mut ranges = [(0, 0); SIGNAL_NAMESPACE_COUNT];
+            for ((key, server), range) in namespaces.into_iter().zip(&mut ranges) {
+                let start = candidates.len();
+                wacore_binary::push_jid_to_string(key, server, 0, device_id, &mut candidates);
+                *range = (start, candidates.len());
+            }
+            let refs: [&str; SIGNAL_NAMESPACE_COUNT] =
+                ranges.map(|(start, end)| &candidates[start..end]);
+            self.persistence_manager
+                .delete_sender_key_device_rows(&refs)
+                .await?;
+
+            for key in lookup.all_keys() {
+                self.sender_key_device_cache
+                    .invalidate_entries_for_device(key, device_id)
+                    .await;
+            }
+            Ok(())
+        })
     }
 
     /// Update key_index for a device in the registry.

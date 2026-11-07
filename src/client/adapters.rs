@@ -27,27 +27,34 @@ impl SignalMaintenance<'_> {
         Ok(())
     }
 
-    pub(crate) async fn flush(&self) -> Result<()> {
-        self.ensure_current()?;
-        self.client.flush_signal_cache().await?;
-        self.ensure_current()
+    // Keep the cache-flush polling body shared by recovery and notifications.
+    #[inline(never)]
+    pub(crate) fn flush(&self) -> wacore::runtime::BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            self.ensure_current()?;
+            self.client.flush_signal_cache().await?;
+            self.ensure_current()
+        })
     }
 
-    pub(crate) async fn clear_device_record(
-        &self,
-        user: &str,
-        record: &wacore::store::traits::DeviceListRecord,
-    ) -> Result<()> {
-        self.ensure_current()?;
-        let _change = self
-            .client
-            .signal_cache
-            .identity_continuity
-            .changing([user]);
-        self.client
-            .clear_device_record_unflushed(user, record)
-            .await;
-        self.flush().await
+    #[inline(never)]
+    pub(crate) fn clear_device_record<'a>(
+        &'a self,
+        user: &'a str,
+        record: &'a wacore::store::traits::DeviceListRecord,
+    ) -> wacore::runtime::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.ensure_current()?;
+            let _change = self
+                .client
+                .signal_cache
+                .identity_continuity
+                .changing([user]);
+            self.client
+                .clear_device_record_unflushed(user, record)
+                .await;
+            self.flush().await
+        })
     }
 }
 
