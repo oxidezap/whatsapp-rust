@@ -62,11 +62,29 @@ enum DeviceListApplyMode {
     GroupRefresh,
 }
 
-type PreparedDeviceListIdentities = Vec<(Jid, [u8; 32])>;
+#[derive(Clone, Copy)]
+enum PreparedAccountIdentity {
+    Trusted([u8; 32]),
+    /// Keep a group contact rejected even if its conflict disappears later.
+    Rejected,
+}
+
+type PreparedDeviceListIdentities = Vec<(Jid, PreparedAccountIdentity)>;
+
+/// Group partial success applies only to trust conflicts, never storage faults.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum DeviceListIdentityConflict {
+    #[error("conflicting account alias during ADV verification")]
+    Alias,
+    #[error("conflicting primary identities during ADV verification")]
+    Primary,
+    #[error("primary identity changed during ADV bootstrap")]
+    Bootstrap,
+}
 
 #[derive(Default)]
 struct DeviceListIdentityContext<'a> {
-    prepared: &'a [(Jid, [u8; 32])],
+    prepared: &'a [(Jid, PreparedAccountIdentity)],
     recovered: Option<&'a RecoveredAccountIdentity>,
 }
 
@@ -251,7 +269,7 @@ impl Client {
                 continue;
             };
             let identity = {
-                let Ok((_sessions, _mapping)) = self
+                let Ok((_sessions, _bootstrap, _mapping)) = self
                     .device_list_identity_guards(std::slice::from_ref(&list.user))
                     .await
                 else {
@@ -617,7 +635,7 @@ impl Client {
         // Share admission and hosted-worker dispatch across strict, cached and
         // group response callers, just as the guarded publication body is shared.
         Box::pin(async move {
-            let prepared = self.prepare_device_list_identities(response).await?;
+            let prepared = self.prepare_device_list_identities(response, mode).await?;
             let client = self
                 .self_weak
                 .get()
@@ -775,7 +793,8 @@ impl Client {
                         .map(|(jid, _)| jid.with_device(0)),
                 );
             }
-            let (_session_guards, mapping_guard) = self.device_list_identity_guards(&users).await?;
+            let (_session_guards, _bootstrap, mapping_guard) =
+                self.device_list_identity_guards(&users).await?;
             let registry_guard = self.device_topology.lock_registry().await;
             if let Some(generation) = topology_generation
                 && !self
@@ -786,15 +805,40 @@ impl Client {
             }
             self.learn_device_list_mappings_guarded(response, &mapping_guard)
                 .await?;
+            let mut rejected = Vec::new();
             for (user, identity) in identities.prepared {
+                if let PreparedAccountIdentity::Trusted(identity) = identity {
+                    match self.device_list_account_identity(user).await {
+                        Ok(current) if current == Some(*identity) => continue,
+                        Err(error)
+                            if mode != DeviceListApplyMode::GroupRefresh
+                                || !error.is::<DeviceListIdentityConflict>() =>
+                        {
+                            return Err(error);
+                        }
+                        _ => {}
+                    }
+                }
                 anyhow::ensure!(
-                    self.device_list_account_identity(user).await? == Some(*identity),
+                    mode == DeviceListApplyMode::GroupRefresh,
                     "primary identity changed during ADV preparation"
                 );
+                rejected.push(user);
             }
+            // Rejected group contacts retain their old fanout. Never let a
+            // later read turn a rejected preparation into newly accepted trust.
+            let accepted = if rejected.is_empty() {
+                std::borrow::Cow::Borrowed(response)
+            } else {
+                let mut accepted = response.clone();
+                accepted
+                    .device_lists
+                    .retain(|list| !rejected.contains(&&list.user));
+                std::borrow::Cow::Owned(accepted)
+            };
             let devices = self
                 .process_device_list_response_guarded(
-                    response,
+                    &accepted,
                     mode,
                     &registry_guard,
                     recovered_identity,
@@ -818,6 +862,7 @@ impl Client {
         users: &[Jid],
     ) -> anyhow::Result<(
         Vec<async_lock::MutexGuardArc<()>>,
+        async_lock::RwLockReadGuard<'_, ()>,
         crate::lid_pn_cache::LidPnMutationGuard<'_>,
     )> {
         for _ in 0..DEVICE_REFRESH_MAX_ATTEMPTS {
@@ -831,13 +876,14 @@ impl Client {
             addresses.sort_unstable_by(wacore::types::jid::cmp_for_lock_order);
             addresses.dedup_by(|a, b| wacore::types::jid::cmp_for_lock_order(a, b).is_eq());
             let sessions = self.session_guards_for(&addresses).await;
+            let bootstrap = self.adv_bootstrap_fence.read().await;
             let mapping = self.lid_pn_cache.lock_mutation().await;
             let mut unchanged = true;
             for (user, alias) in users.iter().zip(&aliases) {
                 unchanged &= self.device_list_identity_alias(user).await == *alias;
             }
             if unchanged {
-                return Ok((sessions, mapping));
+                return Ok((sessions, bootstrap, mapping));
             }
         }
         anyhow::bail!("account aliases changed during ADV lock acquisition")
@@ -845,22 +891,49 @@ impl Client {
 
     /// Only a known reciprocal alias can carry the same trusted primary across
     /// migration. Never resolve a conflict by choosing one stored key over another.
-    /// Callers hold both primary session locks and the mapping mutation guard.
+    /// Callers hold mapping plus either the primary sessions/read fence for
+    /// publication, or the exclusive bootstrap fence for a cold CAS write.
     async fn device_list_account_identity(&self, user: &Jid) -> anyhow::Result<Option<[u8; 32]>> {
         let primary = self.cached_adv_account_identity(user).await?;
         let Some(alias) = self.device_list_identity_alias(user).await else {
             return Ok(primary);
         };
-        anyhow::ensure!(
-            self.device_list_identity_alias(&alias).await.as_ref() == Some(&user.with_device(0)),
-            "conflicting account alias during ADV verification"
-        );
+        if self.device_list_identity_alias(&alias).await.as_ref() != Some(&user.with_device(0)) {
+            return Err(DeviceListIdentityConflict::Alias.into());
+        }
         let other = self.cached_adv_account_identity(&alias).await?;
-        anyhow::ensure!(
-            primary.is_none() || other.is_none() || primary == other,
-            "conflicting primary identities during ADV verification"
-        );
+        if primary.is_some() && other.is_some() && primary != other {
+            return Err(DeviceListIdentityConflict::Primary.into());
+        }
         Ok(primary.or(other))
+    }
+
+    /// First-contact writes share publication's fence, but never reacquire
+    /// session locks: companion fetchers may already hold them. Network fetch
+    /// and authentication finish before entering this write scope.
+    pub(crate) async fn persist_adv_bootstrap_identity(
+        &self,
+        primary: &Jid,
+        key: &[u8; 32],
+    ) -> anyhow::Result<bool> {
+        use wacore::types::jid::JidExt;
+        let _bootstrap = self.adv_bootstrap_fence.write().await;
+        let _mapping = self.lid_pn_cache.lock_mutation().await;
+        if self
+            .device_list_account_identity(primary)
+            .await?
+            .is_some_and(|current| current != *key)
+        {
+            return Ok(false);
+        }
+        let backend = self.persistence_manager.backend();
+        self.signal_cache
+            .persist_identity_if_absent_or_equal(
+                &primary.to_protocol_address(),
+                key,
+                backend.as_ref(),
+            )
+            .await
     }
 
     /// Load ordinary account anchors before taking mapping/registry guards.
@@ -869,20 +942,32 @@ impl Client {
     async fn prepare_device_list_identities(
         &self,
         response: &DeviceListResponse,
+        mode: DeviceListApplyMode,
     ) -> anyhow::Result<PreparedDeviceListIdentities> {
         let mut prepared = Vec::new();
         for user in &response.device_lists {
             if user.key_index_bytes.is_some() && !user.devices.iter().any(|device| device.is_hosted)
             {
                 let cached = {
-                    let (_sessions, _mapping) = self
+                    let (_sessions, _bootstrap, _mapping) = self
                         .device_list_identity_guards(std::slice::from_ref(&user.user))
                         .await?;
-                    self.device_list_account_identity(&user.user).await?
+                    self.device_list_account_identity(&user.user).await
                 };
                 let identity = match cached {
-                    Some(identity) => identity,
-                    None => self.ensure_adv_account_identity(&user.user).await?,
+                    Ok(Some(identity)) => Ok(identity),
+                    Ok(None) => self.ensure_adv_account_identity(&user.user).await,
+                    Err(error) => Err(error),
+                };
+                let identity = match identity {
+                    Ok(identity) => PreparedAccountIdentity::Trusted(identity),
+                    Err(error)
+                        if mode == DeviceListApplyMode::GroupRefresh
+                            && error.is::<DeviceListIdentityConflict>() =>
+                    {
+                        PreparedAccountIdentity::Rejected
+                    }
+                    Err(error) => return Err(error),
                 };
                 prepared.push((user.user.clone(), identity));
             }

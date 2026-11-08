@@ -244,19 +244,13 @@ impl Client {
         // Remember every cold account anchor before returning companions, even
         // when device 0 was explicitly requested: fanout validates bundles
         // before installing any primary session. The caller may already own
-        // session locks, so compare/insert atomically instead of reacquiring them.
-        let backend = self.persistence_manager.backend();
+        // session locks: the bootstrap fence excludes ADV publication without
+        // reacquiring sessions, and checks known reciprocal account aliases.
         for jid in &bootstrap_primaries {
             if let Some(bundle) = outcome.bundles.get(jid) {
-                use wacore::types::jid::JidExt;
                 let identity = authenticated_primary_identity(bundle)?;
                 if !self
-                    .signal_cache
-                    .persist_identity_if_absent_or_equal(
-                        &jid.to_protocol_address(),
-                        identity.public_key().public_key_bytes(),
-                        &*backend,
-                    )
+                    .persist_adv_bootstrap_identity(jid, identity.public_key().public_key_bytes())
                     .await?
                 {
                     anyhow::bail!("primary identity changed during companion bootstrap");
@@ -328,13 +322,8 @@ impl Client {
             return Ok(identity);
         }
         let key = self.query_adv_account_identity(&primary, None).await?;
-        let backend = self.persistence_manager.backend();
-        if !self
-            .signal_cache
-            .persist_identity_if_absent_or_equal(&address, &key, &*backend)
-            .await?
-        {
-            anyhow::bail!("primary identity changed during ADV bootstrap");
+        if !self.persist_adv_bootstrap_identity(&primary, &key).await? {
+            anyhow::bail!(crate::usync::DeviceListIdentityConflict::Bootstrap);
         }
         Ok(key)
     }

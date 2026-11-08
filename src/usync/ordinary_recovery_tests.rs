@@ -1300,7 +1300,7 @@ async fn prepared_primary_survives_known_namespace_migration() {
             lid_mappings: vec![],
         };
         let anchors = client
-            .prepare_device_list_identities(&response)
+            .prepare_device_list_identities(&response, DeviceListApplyMode::StrictRefresh)
             .await
             .unwrap();
         let prepared = client.cached_adv_account_identity(&pn).await.unwrap();
@@ -1328,8 +1328,9 @@ async fn prepared_primary_survives_known_namespace_migration() {
                 None,
             )
             .await;
+        let devices = result.unwrap().unwrap();
+        assert_migration_publication(&client, &pn, &devices).await;
         client.signal_shutdown_sync();
-        assert!(result.is_ok(), "migrate={migrate}: {result:?}");
     }
 }
 
@@ -1346,6 +1347,18 @@ fn migration_response(user: &Jid) -> DeviceListResponse {
     }
 }
 
+/// Check the returned view and the registry independently of a successful status.
+async fn assert_migration_publication(client: &Client, user: &Jid, devices: &[Jid]) {
+    assert_eq!(devices, [user.clone(), user.with_device(7)]);
+    let record = client.load_device_record_for_jid(user).await.unwrap();
+    let ids: Vec<_> = record
+        .devices
+        .iter()
+        .map(|device| device.device_id())
+        .collect();
+    assert_eq!(ids, [0, 7]);
+}
+
 #[tokio::test]
 async fn prepared_primary_rejects_missing_changed_and_conflicting_identity() {
     use crate::lid_pn_cache::LearningSource;
@@ -1356,7 +1369,7 @@ async fn prepared_primary_rejects_missing_changed_and_conflicting_identity() {
         let response = migration_response(&pn);
         crate::test_utils::seed_adv_primary(&client, &pn).await;
         let prepared = client
-            .prepare_device_list_identities(&response)
+            .prepare_device_list_identities(&response, DeviceListApplyMode::StrictRefresh)
             .await
             .unwrap();
         if case == "unknown-alias" {
@@ -1420,21 +1433,24 @@ async fn migrated_primary_survives_cache_reload_and_client_reopen() {
     client.signal_cache.flush(backend.as_ref()).await.unwrap();
     client.signal_cache.clear().await;
     let response = migration_response(&pn);
-    assert!(
-        client
-            .process_device_list_response(&response, Freshness::Refresh)
-            .await
-            .is_ok()
-    );
+    let devices = client
+        .process_device_list_response(&response, Freshness::Refresh)
+        .await
+        .unwrap();
+    assert_migration_publication(&client, &pn, &devices).await;
     client.signal_shutdown_sync();
+    // Reopen with durable trust/mapping but no prior topology to reuse.
+    for user in [&pn, &lid] {
+        backend.delete_devices(&user.user).await.unwrap();
+    }
     let (reopened, _) = create_iq_test_client_with_backend(backend.clone()).await;
     reopened.warm_up_lid_pn_cache().await.unwrap();
-    assert!(
-        reopened
-            .process_device_list_response(&response, Freshness::Refresh)
-            .await
-            .is_ok()
-    );
+    assert!(reopened.load_device_record_for_jid(&pn).await.is_none());
+    let devices = reopened
+        .process_device_list_response(&response, Freshness::Refresh)
+        .await
+        .unwrap();
+    assert_migration_publication(&reopened, &pn, &devices).await;
     assert_eq!(
         reopened.cached_adv_account_identity(&pn).await.unwrap(),
         None
@@ -1505,13 +1521,256 @@ async fn stale_reverse_alias_cannot_supply_an_adv_primary() {
     }
     crate::test_utils::seed_adv_primary(&client, &pn).await;
     let error = client
-        .prepare_device_list_identities(&migration_response(&old_lid))
+        .prepare_device_list_identities(
+            &migration_response(&old_lid),
+            DeviceListApplyMode::StrictRefresh,
+        )
         .await
-        .unwrap_err();
+        .err()
+        .unwrap();
     assert!(
         error.to_string().contains("conflicting account alias"),
         "{error:#}"
     );
+    client.signal_shutdown_sync();
+}
+
+/// Reject one contact's trust conflict while valid and omitted peers keep fanout.
+#[tokio::test]
+async fn group_identity_conflicts_retain_only_the_affected_contact() {
+    use crate::lid_pn_cache::{LearningSource, LidPnEntry};
+    for case in [
+        "conflict",
+        "nonreciprocal",
+        "changed-after-prepare",
+        "conflict-after-prepare",
+        "repaired-after-prepare",
+        "malformed",
+    ] {
+        for group in [false, true] {
+            if case == "repaired-after-prepare" && !group {
+                continue;
+            }
+            let (client, transport) = create_iq_test_client().await;
+            let pn = Jid::pn("12025550193");
+            let lid = Jid::lid("100000000000193");
+            client
+                .lid_pn_cache
+                .add(&LidPnEntry::new(
+                    lid.user.as_str(),
+                    pn.user.as_str(),
+                    LearningSource::Usync,
+                ))
+                .await;
+            let bad = if case == "nonreciprocal" {
+                lid.clone()
+            } else {
+                pn.clone()
+            };
+            let good = Jid::pn("12025550194");
+            let omitted = Jid::pn("12025550195");
+            for user in [&pn, &lid, &good, &omitted] {
+                crate::test_utils::seed_adv_primary(&client, user).await;
+            }
+            for user in [&bad, &good, &omitted] {
+                client
+                    .update_device_list(DeviceListRecord {
+                        user: user.user.as_str().into(),
+                        devices: [DeviceInfo::new(0, None), DeviceInfo::new(3, Some(1))].into(),
+                        raw_id: Some(1),
+                        timestamp: 1,
+                        phash: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let mut response = migration_response(&bad);
+            let prior_bad_session = seed_fresh_session(&client, &bad.with_device(3)).await;
+            response
+                .device_lists
+                .extend(migration_response(&good).device_lists);
+            let after = case.ends_with("after-prepare");
+            if case == "repaired-after-prepare" {
+                client
+                    .signal_cache
+                    .put_identity(&lid.to_protocol_address(), &[42; 32])
+                    .await;
+            }
+            let prepared = if after {
+                Some(
+                    client
+                        .prepare_device_list_identities(
+                            &response,
+                            if group {
+                                DeviceListApplyMode::GroupRefresh
+                            } else {
+                                DeviceListApplyMode::StrictRefresh
+                            },
+                        )
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            if case == "nonreciprocal" {
+                client
+                    .lid_pn_cache
+                    .add(&LidPnEntry::new(
+                        "100000000000194",
+                        pn.user.as_str(),
+                        LearningSource::Usync,
+                    ))
+                    .await;
+            } else if case == "repaired-after-prepare" {
+                crate::test_utils::seed_adv_primary(&client, &lid).await;
+            } else if case == "malformed" {
+                client
+                    .signal_cache
+                    .put_identity(&lid.to_protocol_address(), &[42; 31])
+                    .await;
+            } else {
+                client
+                    .signal_cache
+                    .put_identity(&lid.to_protocol_address(), &[42; 32])
+                    .await;
+                if case == "changed-after-prepare" {
+                    client
+                        .signal_cache
+                        .put_identity(&pn.to_protocol_address(), &[42; 32])
+                        .await;
+                }
+            }
+            let users = [bad.clone(), good.clone(), omitted.clone()];
+            let result = if let Some(prepared) = &prepared {
+                // The public wrapper obtains this on a removal/cleanup retry.
+                let maintenance = client.begin_signal_maintenance().await.unwrap();
+                client
+                    .apply_device_list_response_inner(
+                        &response,
+                        if group {
+                            DeviceListApplyMode::GroupRefresh
+                        } else {
+                            DeviceListApplyMode::StrictRefresh
+                        },
+                        None,
+                        group.then_some(users.as_slice()),
+                        DeviceListIdentityContext {
+                            prepared,
+                            recovered: None,
+                        },
+                        Some(&maintenance),
+                    )
+                    .await
+            } else if group {
+                client
+                    .try_process_group_device_list_response(
+                        &response,
+                        &users,
+                        client.device_topology.current(),
+                    )
+                    .await
+            } else {
+                client
+                    .apply_device_list_response(
+                        &response,
+                        DeviceListApplyMode::StrictRefresh,
+                        None,
+                        None,
+                    )
+                    .await
+            };
+            let partial = group && case != "malformed";
+            if partial {
+                let devices = result
+                    .unwrap_or_else(|error| panic!("{case}: {error:#}"))
+                    .unwrap();
+                assert!(devices.contains(&good.with_device(7)), "{case}");
+                assert!(devices.contains(&bad.with_device(3)), "{case}");
+                assert!(devices.contains(&omitted.with_device(3)), "{case}");
+                assert!(!devices.contains(&bad.with_device(7)), "{case}");
+            } else {
+                assert!(result.is_err(), "{case}");
+            }
+            for (user, expected) in [
+                (&bad, 3),
+                (&good, if partial { 7 } else { 3 }),
+                (&omitted, 3),
+            ] {
+                let record = client.load_device_record_for_jid(user).await.unwrap();
+                let ids: Vec<_> = record
+                    .devices
+                    .iter()
+                    .map(|device| device.device_id())
+                    .collect();
+                assert_eq!(ids, [0, expected], "{case}, group={group}, user={user}");
+            }
+            assert!(
+                transport.sent().is_empty(),
+                "conflicts must not spend recovery IQs"
+            );
+            assert!(
+                has_session(&client, &prior_bad_session).await,
+                "{case}: rejected contact must retain its session"
+            );
+            client.signal_shutdown_sync();
+        }
+    }
+}
+
+/// A store fault must not masquerade as a per-contact trust rejection.
+#[tokio::test]
+async fn group_identity_storage_failure_is_not_partial_success() {
+    use crate::store::release::tests::ProbeBackend;
+    use crate::test_utils::create_iq_test_client_with_backend;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let failing = Arc::new(AtomicBool::new(false));
+    let (mut probe, _) = ProbeBackend::new();
+    probe.fail_before_method = Some(("load_identity", failing.clone()));
+    let (client, transport) = create_iq_test_client_with_backend(Arc::new(probe)).await;
+    let users = [Jid::pn("12025550193"), Jid::pn("12025550194")];
+    for user in &users {
+        crate::test_utils::seed_adv_primary(&client, user).await;
+        client
+            .update_device_list(DeviceListRecord {
+                user: user.user.as_str().into(),
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(3, Some(1))].into(),
+                raw_id: Some(1),
+                timestamp: 1,
+                phash: None,
+            })
+            .await
+            .unwrap();
+    }
+    client
+        .signal_cache
+        .flush(client.persistence_manager.backend().as_ref())
+        .await
+        .unwrap();
+    client.signal_cache.clear().await;
+    let mut response = migration_response(&users[0]);
+    response
+        .device_lists
+        .extend(migration_response(&users[1]).device_lists);
+    failing.store(true, Ordering::SeqCst);
+    let error = client
+        .try_process_group_device_list_response(&response, &users, client.device_topology.current())
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("synthetic failure before commit"));
+    for user in &users {
+        let record = client.load_device_record_for_jid(user).await.unwrap();
+        assert_eq!(
+            record
+                .devices
+                .iter()
+                .map(|device| device.device_id())
+                .collect::<Vec<_>>(),
+            [0, 3]
+        );
+    }
+    assert!(transport.sent().is_empty());
+    failing.store(false, Ordering::SeqCst);
     client.signal_shutdown_sync();
 }
 
@@ -1539,7 +1798,9 @@ async fn migrated_primary_cancellation_releases_adv_guards() {
         .await;
     let blocked = second.lock_arc().await;
     let response = migration_response(&pn);
-    let mut preparation = Box::pin(client.prepare_device_list_identities(&response));
+    let mut preparation = Box::pin(
+        client.prepare_device_list_identities(&response, DeviceListApplyMode::StrictRefresh),
+    );
     assert!(futures::poll!(preparation.as_mut()).is_pending());
     assert!(first.try_lock().is_none());
     drop(preparation);
@@ -1567,11 +1828,132 @@ async fn migrated_primary_cancellation_releases_adv_guards() {
         anchor
     );
     assert_eq!(client.cached_adv_account_identity(&pn).await.unwrap(), None);
-    client
+    let devices = client
         .process_device_list_response(&response, Freshness::Refresh)
         .await
         .unwrap();
+    assert_migration_publication(&client, &pn, &devices).await;
     client.signal_shutdown_sync();
+}
+
+/// A companion's authenticated IQ cannot replace an absent alias behind the
+/// publication check, even when its caller already owns a companion session.
+#[tokio::test]
+async fn companion_bootstrap_waits_for_publication_and_checks_the_known_alias() {
+    use crate::store::release::tests::ProbeBackend;
+    use crate::test_utils::create_iq_test_client_with_backend;
+    for conflicting in [true, false] {
+        let (mut probe, _) = ProbeBackend::new();
+        let (release, gate) = async_channel::unbounded();
+        let (entered, arrived) = async_channel::unbounded();
+        probe.gate_method = "update_device_lists";
+        probe.gate = Some(gate);
+        probe.entered = Some(entered);
+        let (client, transport) = create_iq_test_client_with_backend(Arc::new(probe)).await;
+        let pn = Jid::pn("12025550123");
+        let lid = Jid::lid("100000000000123");
+        client
+            .add_lid_pn_mapping(
+                &lid.user,
+                &pn.user,
+                crate::lid_pn_cache::LearningSource::Usync,
+            )
+            .await
+            .unwrap();
+        crate::test_utils::seed_adv_primary(&client, &pn).await;
+        let old = client.cached_adv_account_identity(&pn).await.unwrap();
+        assert_eq!(
+            client.cached_adv_account_identity(&lid).await.unwrap(),
+            None
+        );
+        let response = migration_response(&pn);
+        let mut publication =
+            Box::pin(client.process_device_list_response(&response, Freshness::Refresh));
+        assert!(futures::poll!(publication.as_mut()).is_pending());
+        assert_eq!(arrived.try_recv(), Ok(()));
+        let companion = lid.with_device(7);
+        let companion_mutex = client
+            .session_lock_for(companion.to_protocol_address().as_str())
+            .await;
+        let _companion_guard = companion_mutex.lock_arc().await;
+        let requested = [companion.clone()];
+        let mut bootstrap = Box::pin(client.fetch_pre_keys(&requested, None));
+        assert!(futures::poll!(bootstrap.as_mut()).is_pending());
+        let iq = decode_sent_iq(&transport, 0).await;
+        let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+        let changed = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let account = if conflicting {
+            &changed
+        } else {
+            crate::test_utils::adv_test_account()
+        };
+        let primary_wire = primary_response(&lid, account, true);
+        let companion_wire = primary_response(&companion, account, true);
+        let primary_user = primary_wire
+            .get_optional_child("list")
+            .unwrap()
+            .children()
+            .unwrap()[0]
+            .clone();
+        let companion_user = &companion_wire
+            .get_optional_child("list")
+            .unwrap()
+            .children()
+            .unwrap()[0];
+        let certificate = waproto::codec::adv_signed_device_identity_to_vec(
+            &wacore::adv::test_util::signed_identity(
+                account,
+                account,
+                b"\x18\x01",
+                &[6, 0],
+                Some(&[6, 1]),
+                true,
+            ),
+        );
+        let mut fields = companion_user.children().unwrap().to_vec();
+        fields.push(
+            NodeBuilder::new("device-identity")
+                .bytes(certificate)
+                .build(),
+        );
+        let companion_user = NodeBuilder::new("user")
+            .attr("jid", companion.to_string())
+            .children(fields)
+            .build();
+        let answer = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("list")
+                .children([primary_user, companion_user])
+                .build()])
+            .build();
+        answer_iq(&client, &id, &answer).await;
+        assert!(
+            futures::poll!(bootstrap.as_mut()).is_pending(),
+            "conflicting={conflicting}: bootstrap must wait through publication"
+        );
+        release.send(()).await.unwrap();
+        let devices = publication.await.unwrap();
+        assert_migration_publication(&client, &pn, &devices).await;
+        let outcome = bootstrap.await;
+        if conflicting {
+            assert!(
+                outcome
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("primary identity changed during companion bootstrap")
+            );
+            assert_eq!(
+                client.cached_adv_account_identity(&lid).await.unwrap(),
+                None
+            );
+        } else {
+            assert!(outcome.unwrap().bundles.contains_key(&companion));
+            assert_eq!(client.cached_adv_account_identity(&lid).await.unwrap(), old);
+        }
+        assert_eq!(client.cached_adv_account_identity(&pn).await.unwrap(), old);
+        client.signal_shutdown_sync();
+    }
 }
 
 /// A registry persistence rejection after real migration must preserve the
@@ -1658,4 +2040,90 @@ async fn migrated_primary_registry_failure_preserves_anchor_and_allows_retry() {
             .is_some()
     );
     client.signal_shutdown_sync();
+}
+
+/// A failed/cancelled cold write releases the new fences without rolling back
+/// the authenticated dirty anchor that already protects against another key.
+#[tokio::test]
+async fn bootstrap_fence_failure_and_cancellation_keep_the_pinned_anchor() {
+    use crate::store::release::tests::ProbeBackend;
+    use crate::test_utils::create_iq_test_client_with_backend;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    for cancel in [false, true] {
+        let failing = Arc::new(AtomicBool::new(!cancel));
+        let (mut probe, _) = ProbeBackend::new();
+        let raw = probe.backend.clone();
+        probe.fail_before_method = Some(("put_identity", failing.clone()));
+        let (release, gate) = async_channel::unbounded();
+        let (entered, arrived) = async_channel::unbounded();
+        if cancel {
+            probe.gate_method = "put_identity";
+            probe.gate = Some(gate);
+            probe.entered = Some(entered);
+        }
+        let (client, _) = create_iq_test_client_with_backend(Arc::new(probe)).await;
+        let pn = Jid::pn("12025550183");
+        let lid = Jid::lid("100000000000183");
+        client
+            .add_lid_pn_mapping(
+                &lid.user,
+                &pn.user,
+                crate::lid_pn_cache::LearningSource::Usync,
+            )
+            .await
+            .unwrap();
+        let key = *crate::test_utils::adv_test_account()
+            .public_key
+            .public_key_bytes();
+        let mut bootstrap = Box::pin(client.persist_adv_bootstrap_identity(&lid, &key));
+        if cancel {
+            assert!(futures::poll!(bootstrap.as_mut()).is_pending());
+            assert_eq!(arrived.try_recv(), Ok(()));
+        } else {
+            assert!(bootstrap.as_mut().await.is_err());
+        }
+        drop(bootstrap);
+        assert!(client.adv_bootstrap_fence.try_write().is_some());
+        drop(
+            tokio::time::timeout(Duration::from_secs(5), client.lid_pn_cache.lock_mutation())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            client.cached_adv_account_identity(&lid).await.unwrap(),
+            Some(key)
+        );
+        assert_eq!(
+            raw.load_identity(lid.to_protocol_address().as_str())
+                .await
+                .unwrap(),
+            None
+        );
+        let other = *KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>())
+            .public_key
+            .public_key_bytes();
+        assert!(
+            !client
+                .persist_adv_bootstrap_identity(&lid, &other)
+                .await
+                .unwrap()
+        );
+        failing.store(false, Ordering::SeqCst);
+        if cancel {
+            release.send(()).await.unwrap();
+        }
+        assert!(
+            client
+                .persist_adv_bootstrap_identity(&lid, &key)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            raw.load_identity(lid.to_protocol_address().as_str())
+                .await
+                .unwrap(),
+            Some(key)
+        );
+        client.signal_shutdown_sync();
+    }
 }

@@ -2071,6 +2071,10 @@ pub struct Client {
     /// and coalesced on the receive path (see `signal_flush.rs`).
     pub(crate) signal_cache: Arc<crate::store::signal_cache::SignalStoreCache>,
 
+    /// Companion fetchers may already own session locks. Fence their cold
+    /// account writes without reacquiring those locks during ADV publication.
+    pub(crate) adv_bootstrap_fence: RwLock<()>,
+
     /// Limits message processing concurrency (1 permit during offline sync, N after).
     /// Wrapped in Mutex to allow replacing on reconnect.
     pub(crate) message_processing_semaphore: std::sync::Mutex<Arc<async_lock::Semaphore>>,
