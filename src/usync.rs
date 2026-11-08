@@ -62,6 +62,14 @@ enum DeviceListApplyMode {
     GroupRefresh,
 }
 
+type PreparedDeviceListIdentities = Vec<(Jid, [u8; 32])>;
+
+#[derive(Default)]
+struct DeviceListIdentityContext<'a> {
+    prepared: &'a [(Jid, [u8; 32])],
+    recovered: Option<&'a RecoveredAccountIdentity>,
+}
+
 struct RecoveredAccountIdentity {
     user: Jid,
     identity: [u8; 32],
@@ -441,6 +449,7 @@ impl Client {
                     DeviceListApplyMode::StrictRefresh,
                     Some(generation),
                     None,
+                    Vec::new(),
                     Some(recovered),
                 )
                 .await?
@@ -599,7 +608,7 @@ impl Client {
         // Share admission and hosted-worker dispatch across strict, cached and
         // group response callers, just as the guarded publication body is shared.
         Box::pin(async move {
-            self.prepare_device_list_identities(response).await?;
+            let prepared = self.prepare_device_list_identities(response).await?;
             let client = self
                 .self_weak
                 .get()
@@ -629,7 +638,10 @@ impl Client {
                             mode,
                             topology_generation,
                             group_users,
-                            None,
+                            DeviceListIdentityContext {
+                                prepared: &prepared,
+                                recovered: None,
+                            },
                             None,
                         )
                         .await;
@@ -645,7 +657,10 @@ impl Client {
                         mode,
                         topology_generation,
                         group_users,
-                        None,
+                        DeviceListIdentityContext {
+                            prepared: &prepared,
+                            recovered: None,
+                        },
                         Some(&maintenance),
                     )
                     .await;
@@ -657,6 +672,7 @@ impl Client {
                     mode,
                     topology_generation,
                     group_users.map(<[Jid]>::to_vec),
+                    prepared,
                     None,
                 )
                 .await
@@ -672,6 +688,7 @@ impl Client {
         mode: DeviceListApplyMode,
         topology_generation: Option<u64>,
         group_users: Option<Vec<Jid>>,
+        prepared: PreparedDeviceListIdentities,
         recovered: Option<RecoveredAccountIdentity>,
     ) -> wacore::runtime::BoxFuture<'static, anyhow::Result<Option<Vec<Jid>>>> {
         Box::pin(async move {
@@ -681,32 +698,18 @@ impl Client {
             runtime.spawn_detached(Box::pin(async move {
                 let result = async {
                     let maintenance = self.begin_signal_maintenance().await?;
-                    let session_guards = if let Some(recovered) = &recovered {
-                        let mut addresses: Vec<_> = recovered
-                            .previous_identities
-                            .iter()
-                            .map(|(jid, _)| jid.with_device(0))
-                            .collect();
-                        // Match PN/LID migration before taking mapping/registry locks.
-                        addresses.sort_unstable_by(wacore::types::jid::cmp_for_lock_order);
-                        addresses
-                            .dedup_by(|a, b| wacore::types::jid::cmp_for_lock_order(a, b).is_eq());
-                        self.session_guards_for(&addresses).await
-                    } else {
-                        Vec::new()
-                    };
-                    let result = self
-                        .apply_device_list_response_inner(
-                            &response,
-                            mode,
-                            topology_generation,
-                            group_users.as_deref(),
-                            recovered.as_ref(),
-                            Some(&maintenance),
-                        )
-                        .await;
-                    drop(session_guards);
-                    result
+                    self.apply_device_list_response_inner(
+                        &response,
+                        mode,
+                        topology_generation,
+                        group_users.as_deref(),
+                        DeviceListIdentityContext {
+                            prepared: &prepared,
+                            recovered: recovered.as_ref(),
+                        },
+                        Some(&maintenance),
+                    )
+                    .await
                 }
                 .await;
                 if let Err(Err(error)) = send.send(result) {
@@ -728,16 +731,42 @@ impl Client {
         mode: DeviceListApplyMode,
         topology_generation: Option<u64>,
         group_users: Option<&'a [Jid]>,
-        recovered_identity: Option<&'a RecoveredAccountIdentity>,
+        identities: DeviceListIdentityContext<'a>,
         maintenance: Option<&'a SignalMaintenance<'a>>,
     ) -> wacore::runtime::BoxFuture<'a, anyhow::Result<Option<Vec<Jid>>>> {
         Box::pin(async move {
+            let recovered_identity = identities.recovered;
             if let Some(maintenance) = maintenance {
                 maintenance.ensure_current()?;
             }
             // Serialize both mutation classes across the CAS and publication. The
             // response's own mappings are deliberately learned only after the CAS.
-            let mapping_guard = self.lid_pn_cache.lock_mutation().await;
+            let mut users: Vec<_> = response
+                .device_lists
+                .iter()
+                .map(|list| list.user.with_device(0))
+                .collect();
+            for mapping in &response.lid_mappings {
+                // Recovery must reject a response-restored alias outside its
+                // captured identity set before waiting on that alias's mutex.
+                if recovered_identity.is_some_and(|recovered| {
+                    recovered.user == Jid::pn(mapping.phone_number.as_str())
+                        || recovered.user == Jid::lid(mapping.lid.as_str())
+                }) {
+                    continue;
+                }
+                users.push(Jid::pn(mapping.phone_number.as_str()));
+                users.push(Jid::lid(mapping.lid.as_str()));
+            }
+            if let Some(recovered) = recovered_identity {
+                users.extend(
+                    recovered
+                        .previous_identities
+                        .iter()
+                        .map(|(jid, _)| jid.with_device(0)),
+                );
+            }
+            let (_session_guards, mapping_guard) = self.device_list_identity_guards(&users).await?;
             let registry_guard = self.device_topology.lock_registry().await;
             if let Some(generation) = topology_generation
                 && !self
@@ -748,6 +777,12 @@ impl Client {
             }
             self.learn_device_list_mappings_guarded(response, &mapping_guard)
                 .await?;
+            for (user, identity) in identities.prepared {
+                anyhow::ensure!(
+                    self.device_list_account_identity(user).await? == Some(*identity),
+                    "primary identity changed during ADV preparation"
+                );
+            }
             let devices = self
                 .process_device_list_response_guarded(
                     response,
@@ -767,20 +802,83 @@ impl Client {
         })
     }
 
+    /// Lock every known primary before mappings or registry, matching migration.
+    /// Recheck aliases after acquiring the locks: a mapping can change while we wait.
+    async fn device_list_identity_guards(
+        &self,
+        users: &[Jid],
+    ) -> anyhow::Result<(
+        Vec<async_lock::MutexGuardArc<()>>,
+        crate::lid_pn_cache::LidPnMutationGuard<'_>,
+    )> {
+        for _ in 0..DEVICE_REFRESH_MAX_ATTEMPTS {
+            let mut aliases = Vec::with_capacity(users.len());
+            let mut addresses: Vec<_> = users.iter().map(|user| user.with_device(0)).collect();
+            for user in users {
+                let alias = self.device_list_identity_alias(user).await;
+                addresses.extend(alias.iter().map(|alias| alias.with_device(0)));
+                aliases.push(alias);
+            }
+            addresses.sort_unstable_by(wacore::types::jid::cmp_for_lock_order);
+            addresses.dedup_by(|a, b| wacore::types::jid::cmp_for_lock_order(a, b).is_eq());
+            let sessions = self.session_guards_for(&addresses).await;
+            let mapping = self.lid_pn_cache.lock_mutation().await;
+            let mut unchanged = true;
+            for (user, alias) in users.iter().zip(&aliases) {
+                unchanged &= self.device_list_identity_alias(user).await == *alias;
+            }
+            if unchanged {
+                return Ok((sessions, mapping));
+            }
+        }
+        anyhow::bail!("account aliases changed during ADV lock acquisition")
+    }
+
+    /// Only a known reciprocal alias can carry the same trusted primary across
+    /// migration. Never resolve a conflict by choosing one stored key over another.
+    /// Callers hold both primary session locks and the mapping mutation guard.
+    async fn device_list_account_identity(&self, user: &Jid) -> anyhow::Result<Option<[u8; 32]>> {
+        let primary = self.cached_adv_account_identity(user).await?;
+        let Some(alias) = self.device_list_identity_alias(user).await else {
+            return Ok(primary);
+        };
+        anyhow::ensure!(
+            self.device_list_identity_alias(&alias).await.as_ref() == Some(&user.with_device(0)),
+            "conflicting account alias during ADV verification"
+        );
+        let other = self.cached_adv_account_identity(&alias).await?;
+        anyhow::ensure!(
+            primary.is_none() || other.is_none() || primary == other,
+            "conflicting primary identities during ADV verification"
+        );
+        Ok(primary.or(other))
+    }
+
     /// Load ordinary account anchors before taking mapping/registry guards.
     /// A device notification on the read loop may need those guards before the
     /// IQ reply is read. Hosted lists carry their separately verified anchor.
     async fn prepare_device_list_identities(
         &self,
         response: &DeviceListResponse,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<PreparedDeviceListIdentities> {
+        let mut prepared = Vec::new();
         for user in &response.device_lists {
             if user.key_index_bytes.is_some() && !user.devices.iter().any(|device| device.is_hosted)
             {
-                self.ensure_adv_account_identity(&user.user).await?;
+                let cached = {
+                    let (_sessions, _mapping) = self
+                        .device_list_identity_guards(std::slice::from_ref(&user.user))
+                        .await?;
+                    self.device_list_account_identity(&user.user).await?
+                };
+                let identity = match cached {
+                    Some(identity) => identity,
+                    None => self.ensure_adv_account_identity(&user.user).await?,
+                };
+                prepared.push((user.user.clone(), identity));
             }
         }
-        Ok(())
+        Ok(prepared)
     }
 
     /// Inspect both alias directions in one registry batch before learning
@@ -986,7 +1084,7 @@ impl Client {
                         verified_identity = Some(recovered.identity);
                         recovered.identity
                     } else {
-                        self.cached_adv_account_identity(&user_list.user)
+                        self.device_list_account_identity(&user_list.user)
                             .await?
                             .ok_or_else(|| {
                                 anyhow::anyhow!("device list account identity unavailable")

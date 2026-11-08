@@ -1242,3 +1242,238 @@ async fn ordinary_rotation_recovers_only_with_a_fresh_authenticated_primary() {
         }
     }
 }
+
+/// A learned PN/LID mapping must preserve the local primary trust anchor.
+#[tokio::test]
+async fn prepared_primary_survives_known_namespace_migration() {
+    use crate::lid_pn_cache::LearningSource;
+    use wacore::usync::{UserDeviceList, UsyncDevice};
+    for migrate in [false, true] {
+        let (client, _) = create_iq_test_client().await;
+        let pn = Jid::pn("12025550123");
+        let lid = Jid::lid("100000000000123");
+        crate::test_utils::seed_adv_primary(&client, &pn).await;
+        let response = DeviceListResponse {
+            device_lists: vec![UserDeviceList {
+                user: pn.clone(),
+                devices: vec![UsyncDevice::new(0, None), UsyncDevice::new(7, Some(1))],
+                phash: None,
+                key_index_bytes: Some(signed_key_index_bytes(vec![1], 1)),
+            }],
+            lid_mappings: vec![],
+        };
+        let anchors = client
+            .prepare_device_list_identities(&response)
+            .await
+            .unwrap();
+        let prepared = client.cached_adv_account_identity(&pn).await.unwrap();
+        if migrate {
+            client
+                .add_lid_pn_mapping(&lid.user, &pn.user, LearningSource::Usync)
+                .await
+                .unwrap();
+            assert_eq!(client.cached_adv_account_identity(&pn).await.unwrap(), None);
+            assert_eq!(
+                client.cached_adv_account_identity(&lid).await.unwrap(),
+                prepared
+            );
+        }
+        let result = client
+            .apply_device_list_response_inner(
+                &response,
+                DeviceListApplyMode::StrictRefresh,
+                None,
+                None,
+                DeviceListIdentityContext {
+                    prepared: &anchors,
+                    recovered: None,
+                },
+                None,
+            )
+            .await;
+        client.signal_shutdown_sync();
+        assert!(result.is_ok(), "migrate={migrate}: {result:?}");
+    }
+}
+
+fn migration_response(user: &Jid) -> DeviceListResponse {
+    use wacore::usync::{UserDeviceList, UsyncDevice};
+    DeviceListResponse {
+        device_lists: vec![UserDeviceList {
+            user: user.clone(),
+            devices: vec![UsyncDevice::new(0, None), UsyncDevice::new(7, Some(1))],
+            phash: None,
+            key_index_bytes: Some(signed_key_index_bytes(vec![1], 1)),
+        }],
+        lid_mappings: vec![],
+    }
+}
+
+#[tokio::test]
+async fn prepared_primary_rejects_missing_changed_and_conflicting_identity() {
+    use crate::lid_pn_cache::LearningSource;
+    for case in ["unknown-alias", "missing", "changed", "conflict"] {
+        let (client, _) = create_iq_test_client().await;
+        let pn = Jid::pn("12025550123");
+        let lid = Jid::lid("100000000000123");
+        let response = migration_response(&pn);
+        crate::test_utils::seed_adv_primary(&client, &pn).await;
+        let prepared = client
+            .prepare_device_list_identities(&response)
+            .await
+            .unwrap();
+        if case == "unknown-alias" {
+            client.migrate_signal_sessions(&pn, &lid).await;
+        } else if case == "missing" {
+            client
+                .signal_cache
+                .delete_identity(&pn.to_protocol_address())
+                .await;
+        } else {
+            client
+                .add_lid_pn_mapping(&lid.user, &pn.user, LearningSource::Usync)
+                .await
+                .unwrap();
+            client
+                .signal_cache
+                .put_identity(&lid.to_protocol_address(), &[42; 32])
+                .await;
+            if case == "conflict" {
+                crate::test_utils::seed_adv_primary(&client, &pn).await;
+            }
+        }
+        assert!(
+            client
+                .apply_device_list_response_inner(
+                    &response,
+                    DeviceListApplyMode::StrictRefresh,
+                    None,
+                    None,
+                    DeviceListIdentityContext {
+                        prepared: &prepared,
+                        recovered: None
+                    },
+                    None,
+                )
+                .await
+                .is_err(),
+            "{case}"
+        );
+        assert!(
+            client.load_device_record_for_jid(&pn).await.is_none(),
+            "{case}"
+        );
+        client.signal_shutdown_sync();
+    }
+}
+
+#[tokio::test]
+async fn migrated_primary_survives_cache_reload_and_client_reopen() {
+    use crate::lid_pn_cache::LearningSource;
+    use crate::test_utils::{create_iq_test_client_with_backend, create_test_backend};
+    let backend = create_test_backend().await;
+    let (client, _) = create_iq_test_client_with_backend(backend.clone()).await;
+    let pn = Jid::pn("12025550123");
+    let lid = Jid::lid("100000000000123");
+    crate::test_utils::seed_adv_primary(&client, &pn).await;
+    client
+        .add_lid_pn_mapping(&lid.user, &pn.user, LearningSource::Usync)
+        .await
+        .unwrap();
+    client.signal_cache.flush(backend.as_ref()).await.unwrap();
+    client.signal_cache.clear().await;
+    let response = migration_response(&pn);
+    assert!(
+        client
+            .process_device_list_response(&response, Freshness::Refresh)
+            .await
+            .is_ok()
+    );
+    client.signal_shutdown_sync();
+    let (reopened, _) = create_iq_test_client_with_backend(backend.clone()).await;
+    reopened.warm_up_lid_pn_cache().await.unwrap();
+    assert!(
+        reopened
+            .process_device_list_response(&response, Freshness::Refresh)
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        reopened.cached_adv_account_identity(&pn).await.unwrap(),
+        None
+    );
+    reopened.signal_shutdown_sync();
+}
+
+/// The registry wait is a deterministic pause after primary/mapping locks.
+#[tokio::test]
+async fn primary_migration_waits_until_adv_publication_finishes() {
+    use crate::lid_pn_cache::{LearningSource, LidPnEntry};
+    let (client, _) = create_iq_test_client().await;
+    let pn = Jid::pn("12025550123");
+    let lid = Jid::lid("100000000000123");
+    client
+        .lid_pn_cache
+        .add(&LidPnEntry::new(
+            lid.user.as_str(),
+            pn.user.as_str(),
+            LearningSource::Usync,
+        ))
+        .await;
+    crate::test_utils::seed_adv_primary(&client, &pn).await;
+    let response = migration_response(&pn);
+    let registry = client.device_topology.lock_registry().await;
+    let publication = client.process_device_list_response(&response, Freshness::Refresh);
+    futures::pin_mut!(publication);
+    assert!(futures::poll!(publication.as_mut()).is_pending());
+    let migration = client.migrate_signal_sessions(&pn, &lid);
+    futures::pin_mut!(migration);
+    assert!(futures::poll!(migration.as_mut()).is_pending());
+    drop(registry);
+    assert!(publication.await.is_ok());
+    migration.await;
+    assert!(
+        client
+            .cached_adv_account_identity(&pn)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        client
+            .cached_adv_account_identity(&lid)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    client.signal_shutdown_sync();
+}
+
+#[tokio::test]
+async fn stale_reverse_alias_cannot_supply_an_adv_primary() {
+    use crate::lid_pn_cache::{LearningSource, LidPnEntry};
+    let (client, _) = create_iq_test_client().await;
+    let pn = Jid::pn("12025550123");
+    let old_lid = Jid::lid("100000000000123");
+    let new_lid = Jid::lid("100000000000124");
+    for lid in [&old_lid, &new_lid] {
+        client
+            .lid_pn_cache
+            .add(&LidPnEntry::new(
+                lid.user.as_str(),
+                pn.user.as_str(),
+                LearningSource::Usync,
+            ))
+            .await;
+    }
+    crate::test_utils::seed_adv_primary(&client, &pn).await;
+    let error = client
+        .prepare_device_list_identities(&migration_response(&old_lid))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("conflicting account alias"),
+        "{error:#}"
+    );
+    client.signal_shutdown_sync();
+}
