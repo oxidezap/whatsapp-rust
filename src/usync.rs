@@ -250,8 +250,17 @@ impl Client {
             let Some(bytes) = list.key_index_bytes.as_deref() else {
                 continue;
             };
-            let Ok(Some(identity)) = self.cached_adv_account_identity(&list.user).await else {
-                continue;
+            let identity = {
+                let Ok((_sessions, _mapping)) = self
+                    .device_list_identity_guards(std::slice::from_ref(&list.user))
+                    .await
+                else {
+                    continue;
+                };
+                let Ok(Some(identity)) = self.device_list_account_identity(&list.user).await else {
+                    continue;
+                };
+                identity
             };
             if wacore::adv::verify_key_index_list(bytes, &identity).is_some()
                 || wacore::adv::decode_key_index_list(bytes).is_none()

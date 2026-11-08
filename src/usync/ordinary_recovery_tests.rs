@@ -898,8 +898,7 @@ async fn ordinary_recovery_holds_both_primary_locks_through_identity_publication
 }
 
 /// Mix a rotated contact, a valid contact and an omitted cached group member.
-#[tokio::test]
-async fn group_refresh_recovers_rotations_and_preserves_members_on_failure() {
+async fn check_group_rotation_after_migration(migrate: bool) {
     for recover in [true, false] {
         let (client, transport) = create_iq_test_client().await;
         let rotated = Jid::pn("12025550193");
@@ -918,7 +917,23 @@ async fn group_refresh_recovers_rotations_and_preserves_members_on_failure() {
                 .await
                 .unwrap();
         }
+        let lid = Jid::lid("100000000000193");
         let old = client.cached_adv_account_identity(&rotated).await.unwrap();
+        if migrate {
+            client
+                .add_lid_pn_mapping(
+                    &lid.user,
+                    &rotated.user,
+                    crate::lid_pn_cache::LearningSource::Usync,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                client.cached_adv_account_identity(&rotated).await.unwrap(),
+                None
+            );
+            assert_eq!(client.cached_adv_account_identity(&lid).await.unwrap(), old);
+        }
         let account = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
         let rotated_wire = adv_wire_response(&rotated, signed_list(&account, true));
         let valid_wire = adv_wire_response(&valid, signed_key_index_bytes(vec![1], 1));
@@ -979,13 +994,35 @@ async fn group_refresh_recovers_rotations_and_preserves_members_on_failure() {
             client.cached_adv_account_identity(&rotated).await.unwrap(),
             if recover {
                 Some(*account.public_key.public_key_bytes())
+            } else if migrate {
+                None
             } else {
                 old
             }
         );
+        if migrate {
+            assert_eq!(
+                client.cached_adv_account_identity(&lid).await.unwrap(),
+                if recover {
+                    Some(*account.public_key.public_key_bytes())
+                } else {
+                    old
+                }
+            );
+        }
         assert_eq!(transport.sent().len(), if recover { 5 } else { 4 });
         client.signal_shutdown_sync();
     }
+}
+
+#[tokio::test]
+async fn group_refresh_recovers_rotations_and_preserves_members_on_failure() {
+    check_group_rotation_after_migration(false).await;
+}
+
+#[tokio::test]
+async fn group_refresh_recovers_rotated_primary_after_namespace_migration() {
+    check_group_rotation_after_migration(true).await;
 }
 
 /// A valid trusted signature must not let envelope metadata rotate trust.
