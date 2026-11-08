@@ -1514,3 +1514,148 @@ async fn stale_reverse_alias_cannot_supply_an_adv_primary() {
     );
     client.signal_shutdown_sync();
 }
+
+/// Cancellation must release partially acquired session locks and the complete
+/// alias guard set while publication is waiting for the registry.
+#[tokio::test]
+async fn migrated_primary_cancellation_releases_adv_guards() {
+    use crate::lid_pn_cache::LearningSource;
+    let (client, _) = create_iq_test_client().await;
+    let pn = Jid::pn("12025550123");
+    let lid = Jid::lid("100000000000123");
+    crate::test_utils::seed_adv_primary(&client, &pn).await;
+    client
+        .add_lid_pn_mapping(&lid.user, &pn.user, LearningSource::Usync)
+        .await
+        .unwrap();
+    let anchor = client.cached_adv_account_identity(&lid).await.unwrap();
+    let mut addresses = [pn.clone(), lid.clone()];
+    addresses.sort_unstable_by(wacore::types::jid::cmp_for_lock_order);
+    let first = client
+        .session_lock_for(addresses[0].to_protocol_address().as_str())
+        .await;
+    let second = client
+        .session_lock_for(addresses[1].to_protocol_address().as_str())
+        .await;
+    let blocked = second.lock_arc().await;
+    let response = migration_response(&pn);
+    let mut preparation = Box::pin(client.prepare_device_list_identities(&response));
+    assert!(futures::poll!(preparation.as_mut()).is_pending());
+    assert!(first.try_lock().is_none());
+    drop(preparation);
+    assert!(first.try_lock().is_some());
+    drop(blocked);
+
+    let registry = client.device_topology.lock_registry().await;
+    let mut publication =
+        Box::pin(client.process_device_list_response(&response, Freshness::Refresh));
+    assert!(futures::poll!(publication.as_mut()).is_pending());
+    assert!(first.try_lock().is_none());
+    assert!(second.try_lock().is_none());
+    drop(publication);
+    assert!(first.try_lock().is_some());
+    assert!(second.try_lock().is_some());
+    drop(
+        tokio::time::timeout(Duration::from_secs(5), client.lid_pn_cache.lock_mutation())
+            .await
+            .unwrap(),
+    );
+    drop(registry);
+    assert!(client.load_device_record_for_jid(&pn).await.is_none());
+    assert_eq!(
+        client.cached_adv_account_identity(&lid).await.unwrap(),
+        anchor
+    );
+    assert_eq!(client.cached_adv_account_identity(&pn).await.unwrap(), None);
+    client
+        .process_device_list_response(&response, Freshness::Refresh)
+        .await
+        .unwrap();
+    client.signal_shutdown_sync();
+}
+
+/// A registry persistence rejection after real migration must preserve the
+/// current anchor, release all newly held guards and permit an unchanged retry.
+#[tokio::test]
+async fn migrated_primary_registry_failure_preserves_anchor_and_allows_retry() {
+    use crate::lid_pn_cache::LearningSource;
+    use crate::store::release::tests::ProbeBackend;
+    use crate::test_utils::create_iq_test_client_with_backend;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let failing = Arc::new(AtomicBool::new(false));
+    let (mut probe, _) = ProbeBackend::new();
+    probe.fail_before_method = Some(("update_device_lists", failing.clone()));
+    let (client, _) = create_iq_test_client_with_backend(Arc::new(probe)).await;
+    let pn = Jid::pn("12025550123");
+    let lid = Jid::lid("100000000000123");
+    crate::test_utils::seed_adv_primary(&client, &pn).await;
+    client
+        .add_lid_pn_mapping(&lid.user, &pn.user, LearningSource::Usync)
+        .await
+        .unwrap();
+    let anchor = client.cached_adv_account_identity(&lid).await.unwrap();
+    let response = migration_response(&pn);
+    failing.store(true, Ordering::SeqCst);
+    let error = client
+        .process_device_list_response(&response, Freshness::Refresh)
+        .await
+        .expect_err("the injected registry write rejection must surface");
+    assert!(format!("{error:#}").contains("synthetic failure before commit"));
+    // Existing registry semantics publish the already-verified cache row before
+    // the durable write; distinguish that from a committed backend record.
+    assert!(client.load_device_record_for_jid(&pn).await.is_some());
+    for user in [&pn, &lid] {
+        assert!(
+            client
+                .persistence_manager
+                .backend()
+                .get_devices(&user.user)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert_eq!(
+        client.cached_adv_account_identity(&lid).await.unwrap(),
+        anchor
+    );
+    assert_eq!(client.cached_adv_account_identity(&pn).await.unwrap(), None);
+    for user in [&pn, &lid] {
+        assert!(
+            client
+                .session_lock_for(user.to_protocol_address().as_str())
+                .await
+                .try_lock()
+                .is_some()
+        );
+    }
+    drop(
+        tokio::time::timeout(Duration::from_secs(5), client.lid_pn_cache.lock_mutation())
+            .await
+            .unwrap(),
+    );
+    drop(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client.device_topology.lock_registry(),
+        )
+        .await
+        .unwrap(),
+    );
+    failing.store(false, Ordering::SeqCst);
+    client
+        .process_device_list_response(&response, Freshness::Refresh)
+        .await
+        .unwrap();
+    assert!(client.load_device_record_for_jid(&pn).await.is_some());
+    assert!(
+        client
+            .persistence_manager
+            .backend()
+            .get_devices(&lid.user)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    client.signal_shutdown_sync();
+}
