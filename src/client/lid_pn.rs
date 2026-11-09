@@ -744,9 +744,8 @@ impl Client {
     /// migrated here; the token was the one piece keyed the same way that was
     /// left behind.
     ///
-    /// `sender_timestamp` is not carried over: it only gates re-issuing our own
-    /// token, so losing it costs at most one extra issue, whereas the received
-    /// token is what the send path cannot do without.
+    /// Carry the original sender timestamp too, preserving the issuance bucket.
+    /// A sender-only placeholder must never overwrite received token bytes.
     async fn migrate_tc_token_on_lid_discovery(&self, pn: &str, lid: &str) {
         use log::warn;
 
@@ -770,11 +769,20 @@ impl Client {
 
         // Newer-wins in the store, so a token already filed under the LID by a
         // later arrival is not regressed by the older PN-keyed one.
-        if let Err(e) = backend
-            .store_received_tc_token(lid, &entry.token, entry.token_timestamp)
-            .await
+        if !entry.token.is_empty()
+            && let Err(e) = backend
+                .store_received_tc_token(lid, &entry.token, entry.token_timestamp)
+                .await
         {
             warn!("tc token migration: writing LID-keyed token failed: {e}");
+            return;
+        }
+        if let Some(timestamp) = entry.sender_timestamp
+            && let Err(e) = backend
+                .touch_tc_token_sender_timestamp(lid, timestamp)
+                .await
+        {
+            warn!("tc token migration: writing LID sender timestamp failed: {e}");
             return;
         }
         // Only after the write succeeded: a failure here leaves a stale but

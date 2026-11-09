@@ -16,21 +16,6 @@ pub(crate) fn is_own_identity(own_pn: Option<&Jid>, own_lid: Option<&Jid>, jid: 
 }
 
 // The echoed token and issuance bucket each have independent merge rules.
-// Keep the original caller's timestamps, but never replace a row captured before
-// another notification/issuance. Each merge is atomic; the pair is not a transaction.
-async fn persist_issued_tc_token(
-    backend: &dyn wacore::store::traits::ProtocolStore,
-    received: &wacore::iq::tctoken::ReceivedTcToken,
-    sender_timestamp: i64,
-) -> wacore::store::error::Result<()> {
-    backend
-        .store_received_tc_token(&received.jid.user, &received.token, received.timestamp)
-        .await?;
-    backend
-        .touch_tc_token_sender_timestamp(&received.jid.user, sender_timestamp)
-        .await
-}
-
 impl Client {
     /// Whether `jid` is our own account (PN or LID). The privacy-token paths
     /// never attach to or issue for ourselves; a single source of truth keeps
@@ -210,7 +195,6 @@ impl Client {
         &self,
         tokens: &[wacore::iq::tctoken::ReceivedTcToken],
     ) {
-        let backend = self.persistence_manager.backend();
         let now = self.runtime.wall_time_secs();
         for received in tokens {
             if received.token.is_empty() {
@@ -218,7 +202,15 @@ impl Client {
                 continue;
             }
 
-            if let Err(e) = persist_issued_tc_token(backend.as_ref(), received, now).await {
+            if let Err(e) = self
+                .persist_tc_token_owned(
+                    received.jid.clone(),
+                    Some((received.token.clone(), received.timestamp)),
+                    Some(now),
+                    false,
+                )
+                .await
+            {
                 log::warn!(target: "Client/TcToken", "Failed to store issued tc_token: {e}");
             }
         }
@@ -231,12 +223,19 @@ impl Client {
         tokens: &[wacore::iq::tctoken::ReceivedTcToken],
         sender_ts: i64,
     ) {
-        let backend = self.persistence_manager.backend();
         for received in tokens {
             if received.token.is_empty() {
                 continue;
             }
-            if let Err(e) = persist_issued_tc_token(backend.as_ref(), received, sender_ts).await {
+            if let Err(e) = self
+                .persist_tc_token_owned(
+                    received.jid.clone(),
+                    Some((received.token.clone(), received.timestamp)),
+                    Some(sender_ts),
+                    false,
+                )
+                .await
+            {
                 log::warn!(target: "Client/TcToken", "Failed to store re-issued tc_token: {e}");
             }
         }
@@ -250,14 +249,11 @@ impl Client {
     /// the update from it would leave the sender bucket unset and re-issue on
     /// every 1:1 message — hence the byte-less placeholder when no entry exists.
     async fn record_tc_token_sender_timestamp(&self, to: &Jid) {
-        let key = self.resolve_tc_token_key(to).await;
         let now = self.runtime.wall_time_secs();
         // Atomic merge so a concurrent privacy_token notification writing the real
         // token isn't clobbered by this placeholder's read-modify-write.
         if let Err(e) = self
-            .persistence_manager
-            .backend()
-            .touch_tc_token_sender_timestamp(&key, now)
+            .persist_tc_token_owned(to.clone(), None, Some(now), false)
             .await
         {
             log::warn!(target: "Client/TcToken", "Failed to record tc_token sender_timestamp for {}: {e}", to.observe());

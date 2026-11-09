@@ -623,6 +623,29 @@ mod tests {
                 11
             );
         }
+        let wrapper = sdk_wrapper();
+        for (name, widths) in [
+            ("DM_CASES", &[1, 2, 5][..]),
+            ("GROUP_CASES", &[8, 32, 128, 512][..]),
+            ("WARM_UP_CASES", &[64, 512, 3443, 4096][..]),
+        ] {
+            let cases = wrapper
+                .split_once(&format!("const {name}: &[&str] = &["))
+                .unwrap()
+                .1
+                .split_once("];")
+                .unwrap()
+                .0;
+            let actual: Vec<_> = cases.split('"').skip(1).step_by(2).collect();
+            let expected: Vec<_> = (0..4)
+                .flat_map(|round| {
+                    widths
+                        .iter()
+                        .map(move |width| format!("{width}_round{round}"))
+                })
+                .collect();
+            assert_eq!(actual, expected, "wrapper widths must match {name}");
+        }
     }
 
     #[test]

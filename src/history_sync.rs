@@ -1128,35 +1128,22 @@ impl Client {
             Err(_) => return,
         };
 
-        let resolved_lid = if jid.is_lid() {
-            None
-        } else {
-            self.lid_pn_cache.get_current_lid(&jid.user).await
-        };
-        let token_key: &str = resolved_lid.as_deref().unwrap_or(&jid.user);
-
-        let backend = self.persistence_manager.backend();
-
-        // Newer-wins lives in the store now (atomic, lock-free), so concurrent
-        // history-sync chunks and the privacy path converge without a
-        // get-then-store or a lock.
-        if let Err(e) = backend
-            .store_received_tc_token(
-                token_key,
-                &candidate.tc_token,
-                candidate.tc_token_timestamp as i64,
+        if let Err(e) = self
+            .persist_tc_token_owned(
+                jid.clone(),
+                Some((
+                    candidate.tc_token.into_vec(),
+                    candidate.tc_token_timestamp as i64,
+                )),
+                candidate
+                    .tc_token_sender_timestamp
+                    .map(|timestamp| timestamp as i64),
+                false,
             )
             .await
         {
             log::warn!(target: "Client/TcToken", "Failed to store history sync tctoken for {}: {e}", jid.observe());
             return;
-        }
-        if let Some(sender_ts) = candidate.tc_token_sender_timestamp
-            && let Err(e) = backend
-                .touch_tc_token_sender_timestamp(token_key, sender_ts as i64)
-                .await
-        {
-            log::warn!(target: "Client/TcToken", "Failed to record history sync sender_timestamp for {}: {e}", jid.observe());
         }
         log::debug!(target: "Client/TcToken", "Stored tctoken from history sync for {} (t={})", jid.observe(), candidate.tc_token_timestamp);
     }

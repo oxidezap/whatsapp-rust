@@ -3317,18 +3317,14 @@ async fn adv_review_bootstrap_rechecks_retirement_after_backend_ack() {
             .unwrap()
             .unwrap()
     );
-    // Rejection does not roll back an acknowledged host write. Keep it pinned
-    // until the reset's ordered deletion has reached persistence.
+    // Rejection must retire the acknowledged address itself: reset cleanup
+    // may know only its alias and cannot be relied on to find this write.
     assert_eq!(
         raw.load_identity(primary.to_protocol_address().as_str())
             .await
             .unwrap(),
-        Some(key)
+        None
     );
-    client
-        .signal_cache
-        .delete_identity(&primary.to_protocol_address())
-        .await;
     client
         .signal_cache
         .flush(client.persistence_manager.backend().as_ref())
@@ -3492,6 +3488,14 @@ async fn adv_review_paired_ownership_waits_through_recovery_persistence() {
         wacore::store::commands::DeviceCommand::SetLid(Some(lid.clone())),
     ));
     let blocked = futures::poll!(paired.as_mut()).is_pending();
+    let watermarks = client.persistence_manager.get_device_snapshot();
+    let mut unrelated = Box::pin(client.persistence_manager.process_command(
+        wacore::store::commands::DeviceCommand::SetPreKeyWatermarks {
+            next_pre_key_id: watermarks.next_pre_key_id + 1,
+            first_unupload_pre_key_id: watermarks.first_unupload_pre_key_id,
+        },
+    ));
+    assert!(futures::poll!(unrelated.as_mut()).is_pending());
     release.send(()).await.unwrap();
     release.send(()).await.unwrap();
     let result = tokio::time::timeout(Duration::from_secs(5), recovery)
@@ -3501,6 +3505,14 @@ async fn adv_review_paired_ownership_waits_through_recovery_persistence() {
     if blocked {
         paired.await;
     }
+    unrelated.await;
+    assert_eq!(
+        client
+            .persistence_manager
+            .get_device_snapshot()
+            .next_pre_key_id,
+        watermarks.next_pre_key_id + 1
+    );
     assert!(
         blocked,
         "paired-account ownership changed inside recovery persistence"
@@ -4334,6 +4346,267 @@ async fn adv_review_round2_pn_notification_retires_the_resolved_lid() {
             retry.await.unwrap().unwrap(),
             *fresh.public_key.public_key_bytes()
         );
+        client.signal_shutdown_sync();
+    }
+}
+
+#[tokio::test]
+async fn adv_review_round3_unknown_counterpart_retires_inflight_primary() {
+    for reset_phone in [true, false] {
+        let (client, transport) = create_iq_test_client().await;
+        let phone = Jid::pn("12025550274");
+        let lid = Jid::lid("100000000000274");
+        let requested = if reset_phone { &lid } else { &phone };
+        let reset = if reset_phone { &phone } else { &lid };
+        assert!(client.device_list_identity_alias(requested).await.is_none());
+        let stale = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let operation = {
+            let client = client.clone();
+            let requested = requested.clone();
+            tokio::spawn(async move { client.ensure_adv_account_identity(&requested).await })
+        };
+        let iq = decode_sent_iq(&transport, 0).await;
+        deliver_identity_reset(&client, reset, None).await;
+        let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+        answer_iq(&client, &id, &primary_response(requested, &stale, true)).await;
+        let result = operation.await.unwrap();
+        // The response did not disclose this relation before authentication.
+        // Learn it through the real API only after the old IQ has completed.
+        client
+            .add_lid_pn_mapping(
+                &lid.user,
+                &phone.user,
+                crate::lid_pn_cache::LearningSource::Usync,
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "unknown counterpart must not authorize the pre-reset reply"
+        );
+        assert_eq!(
+            client.cached_adv_account_identity(requested).await.unwrap(),
+            None
+        );
+        client.signal_shutdown_sync();
+    }
+}
+
+#[tokio::test]
+async fn adv_review_round3_ambiguous_reset_aliases_do_not_prove_the_counterpart() {
+    use crate::lid_pn_cache::{LearningSource, LidPnEntry};
+    for case in ["reciprocal", "missing_reverse", "conflicting_reverse"] {
+        let (client, transport) = create_iq_test_client().await;
+        let phone = Jid::pn("12025550278");
+        let old_lid = Jid::lid("100000000000279");
+        let unknown_lid = Jid::lid("100000000000278");
+        client
+            .lid_pn_cache
+            .add(&LidPnEntry::new(
+                old_lid.user.as_str(),
+                phone.user.as_str(),
+                LearningSource::Usync,
+            ))
+            .await;
+        if case == "missing_reverse" {
+            client
+                .lid_pn_cache
+                .evict_reverse_for_tests(&old_lid.user)
+                .await;
+        } else if case == "conflicting_reverse" {
+            client
+                .lid_pn_cache
+                .add(&LidPnEntry::new(
+                    old_lid.user.as_str(),
+                    "12025550280",
+                    LearningSource::Usync,
+                ))
+                .await;
+        }
+        assert_eq!(
+            client.device_list_identity_alias(&phone).await,
+            Some(old_lid.clone())
+        );
+        assert_eq!(
+            client.device_list_identity_alias(&old_lid).await.as_ref() == Some(&phone),
+            case == "reciprocal"
+        );
+        let stale = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let operation = {
+            let client = client.clone();
+            let requested = unknown_lid.clone();
+            tokio::spawn(async move { client.ensure_adv_account_identity(&requested).await })
+        };
+        let iq = decode_sent_iq(&transport, 0).await;
+        deliver_identity_reset(&client, &phone, None).await;
+        let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+        answer_iq(&client, &id, &primary_response(&unknown_lid, &stale, true)).await;
+        let result = operation.await.unwrap();
+        assert_eq!(result.is_ok(), case == "reciprocal", "scope case {case}");
+        if case != "reciprocal" {
+            // Disclose the actual counterpart only after the old request has
+            // been rejected; cache ambiguity cannot authorize that earlier IQ.
+            client
+                .add_lid_pn_mapping(&unknown_lid.user, &phone.user, LearningSource::Usync)
+                .await
+                .unwrap();
+            assert_eq!(
+                client
+                    .cached_adv_account_identity(&unknown_lid)
+                    .await
+                    .unwrap(),
+                None
+            );
+            let fresh = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+            let retry = {
+                let client = client.clone();
+                let requested = unknown_lid.clone();
+                tokio::spawn(async move { client.ensure_adv_account_identity(&requested).await })
+            };
+            let iq = decode_sent_iq(&transport, 1).await;
+            let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+            answer_iq(&client, &id, &primary_response(&unknown_lid, &fresh, true)).await;
+            assert_eq!(
+                retry.await.unwrap().unwrap(),
+                *fresh.public_key.public_key_bytes()
+            );
+        }
+        client.signal_shutdown_sync();
+    }
+}
+
+#[tokio::test]
+async fn adv_review_round3_lid_reset_retires_an_existing_reciprocal_pn_anchor() {
+    let (client, _) = create_iq_test_client().await;
+    let phone = Jid::pn("12025550283");
+    let lid = Jid::lid("100000000000283");
+    client
+        .add_lid_pn_mapping(
+            &lid.user,
+            &phone.user,
+            crate::lid_pn_cache::LearningSource::Usync,
+        )
+        .await
+        .unwrap();
+    crate::test_utils::seed_adv_primary(&client, &phone).await;
+    let backend = client.persistence_manager.backend();
+    client.signal_cache.flush(backend.as_ref()).await.unwrap();
+    deliver_identity_reset(&client, &lid, None).await;
+    for user in [&phone, &lid] {
+        assert_eq!(
+            client.cached_adv_account_identity(user).await.unwrap(),
+            None
+        );
+        assert!(
+            backend
+                .load_identity(user.to_protocol_address().as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    client.signal_shutdown_sync();
+}
+
+#[tokio::test]
+async fn adv_review_round3_alias_reset_retires_the_acknowledged_bootstrap() {
+    for reset_known_alias in [true, false] {
+        use crate::store::release::tests::ProbeBackend;
+        use crate::test_utils::create_iq_test_client_with_backend;
+        let key = *crate::test_utils::adv_test_account()
+            .public_key
+            .public_key_bytes();
+        let (mut probe, _) = ProbeBackend::new();
+        let raw = probe.backend.clone();
+        let (release, gate) = async_channel::unbounded();
+        let (entered, arrived) = async_channel::unbounded();
+        probe.detach_identity_writes = true;
+        probe.identity_gate_key = Some(key);
+        probe.gate_method = "put_identity";
+        probe.gate = Some(gate);
+        probe.entered = Some(entered);
+        let (client, _) = create_iq_test_client_with_backend(Arc::new(probe)).await;
+        let phone = Jid::pn("12025550275");
+        let lid = Jid::lid("100000000000275");
+        let reset = if reset_known_alias {
+            lid.clone()
+        } else {
+            Jid::lid("100000000000284")
+        };
+        client
+            .add_lid_pn_mapping(
+                &lid.user,
+                &phone.user,
+                crate::lid_pn_cache::LearningSource::Usync,
+            )
+            .await
+            .unwrap();
+        let epoch = client.signal_cache.identity_continuity.snapshot();
+        let writer = {
+            let client = client.clone();
+            let phone = phone.clone();
+            tokio::spawn(async move { client.persist_adv_bootstrap_identity(&phone, &key).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let notification = {
+            let client = client.clone();
+            let lid = reset.clone();
+            tokio::spawn(async move { deliver_identity_reset(&client, &lid, None).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while client
+                .signal_cache
+                .identity_continuity
+                .unchanged_primary_for(epoch, [lid.user.as_str()])
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        release.send(()).await.unwrap();
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(5), writer)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+        );
+        tokio::time::timeout(Duration::from_secs(5), notification)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            client.cached_adv_account_identity(&phone).await.unwrap(),
+            None
+        );
+        assert!(
+            raw.load_identity(phone.to_protocol_address().as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        client.signal_cache.flush(raw.as_ref()).await.unwrap();
+        assert!(
+            raw.load_identity(phone.to_protocol_address().as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        if !reset_known_alias {
+            client
+                .add_lid_pn_mapping(
+                    &reset.user,
+                    &phone.user,
+                    crate::lid_pn_cache::LearningSource::Usync,
+                )
+                .await
+                .unwrap();
+            assert_eq!(client.device_list_identity_alias(&phone).await, Some(reset));
+        }
         client.signal_shutdown_sync();
     }
 }
