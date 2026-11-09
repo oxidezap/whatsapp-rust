@@ -32,7 +32,7 @@ env:
 
 jobs:
   prefetch-pair:
-    name: Prefetch, addresses and SDK CPU and memory against base
+    name: Prefetch, addresses and SDK CPU, memory and walltime against base
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -61,12 +61,12 @@ jobs:
           install -m 755 target/debug/whatsapp-xtask "$RUNNER_TEMP/prefetch-compare"
           "$RUNNER_TEMP/prefetch-compare" ci prefetch-pair-prepare --base-revision "$BASE_REVISION" --head-revision "$HEAD_REVISION"
           lscpu > .prefetch-pair-out/results/host.txt
-      # Both instruments measure immutable base/head workloads under distinct names.
+      # Instruments measure immutable base/head workloads under distinct names.
       # No git/CI metadata or baseline is replaced.
-      - name: Measure alternating base/head CPU and allocation samples
+      - name: Measure alternating base/head CPU, allocation and SDK walltime samples
         uses: CodSpeedHQ/action@61efe07e57e55bedeab750c434504de272a56e8c # v5.6.1
         with:
-          mode: simulation,memory
+          mode: simulation,memory,walltime
           disable-memory-capture-stack: "false"
           disable-memory-track-physical: "false"
           runner-version: "5.4.2"
