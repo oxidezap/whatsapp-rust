@@ -1516,12 +1516,12 @@ mod tests {
                 probe.fail_after_method = Some("put_lid_mappings");
             }
             let (client, _) = create_iq_test_client_with_backend(Arc::new(probe)).await;
-            let phone = "12025550274";
+            let phone = "12025550174";
             let lid = "100000000000274";
             client
                 .learn_lid_pn_mapping_fast(
                     "100000000000275",
-                    "12025550275",
+                    "12025550175",
                     LearningSource::Other,
                     true,
                 )
@@ -1553,7 +1553,7 @@ mod tests {
             assert_eq!(
                 tokio::time::timeout(
                     Duration::from_secs(1),
-                    client.lid_pn_cache.get_current_lid("12025550275")
+                    client.lid_pn_cache.get_current_lid("12025550175")
                 )
                 .await
                 .unwrap()
@@ -1601,7 +1601,7 @@ mod tests {
         probe.gate = Some(gate);
         probe.entered = Some(entered);
         let (client, _) = create_iq_test_client_with_backend(Arc::new(probe)).await;
-        let phone = "12025550263";
+        let phone = "12025550163";
         let lid = "100000000000263";
         let token = b"synthetic-cancelled-migration";
         raw.store_received_tc_token(phone, token, client.runtime.wall_time_secs())
@@ -1640,7 +1640,7 @@ mod tests {
     #[tokio::test]
     async fn adv_review_round2_single_public_mapping_migrates_the_received_token() {
         let client = create_test_client().await;
-        let phone = "12025550264";
+        let phone = "12025550164";
         let lid = "100000000000264";
         let token = b"synthetic-single-migration";
         client
@@ -1670,7 +1670,7 @@ mod tests {
         let failing = Arc::new(AtomicBool::new(true));
         probe.fail_before_method = Some(("store_received_tc_token", failing.clone()));
         let (client, _) = create_iq_test_client_with_backend(Arc::new(probe)).await;
-        let phone = "12025550276";
+        let phone = "12025550176";
         let lid = "100000000000276";
         client
             .add_lid_pn_mapping(lid, phone, LearningSource::Usync)
@@ -1715,7 +1715,7 @@ mod tests {
         probe.gate = Some(gate);
         probe.entered = Some(entered);
         let (client, _) = create_iq_test_client_with_backend(Arc::new(probe)).await;
-        let phone = "12025550277";
+        let phone = "12025550177";
         let lid = "100000000000277";
         client
             .add_lid_pn_mapping(lid, phone, LearningSource::Usync)
@@ -1765,7 +1765,7 @@ mod tests {
         for single in [true, false] {
             for case in ["missing", "newer_lid", "expired_pn", "different_owner"] {
                 let client = create_test_client().await;
-                let phone = "12025550272";
+                let phone = "12025550172";
                 let lid = "100000000000272";
                 client
                     .add_lid_pn_mapping(lid, phone, LearningSource::Usync)
@@ -1789,7 +1789,7 @@ mod tests {
                 }
                 if case == "different_owner" {
                     client
-                        .learn_lid_pn_mapping_fast(lid, "12025550273", LearningSource::Usync, true)
+                        .learn_lid_pn_mapping_fast(lid, "12025550173", LearningSource::Usync, true)
                         .await;
                     client.migrate_tc_token_on_lid_discovery(phone, lid).await;
                     assert!(backend.get_tc_token(lid).await.unwrap().is_none());

@@ -262,12 +262,28 @@ struct RecoveredAccountIdentity {
 }
 
 struct AdvRecoverySnapshot {
+    primary_epoch: Option<u64>,
     observed_alias: Option<Jid>,
     publication_alias: Option<Jid>,
     identities: Vec<(Jid, Option<[u8; 32]>)>,
 }
 
 impl AdvRecoverySnapshot {
+    #[inline(never)]
+    fn validate_primary_epoch(
+        &self,
+        continuity: &wacore::store::signal_cache::IdentityContinuity,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            continuity.unchanged_primary_for(
+                self.primary_epoch,
+                self.identities.iter().map(|(jid, _)| jid.user.as_str())
+            ),
+            "primary identity retired during ADV recovery"
+        );
+        Ok(())
+    }
+
     fn matches_observed_alias(&self, root: &Jid, user: &Jid, alias: Option<&Jid>) -> bool {
         if user == root {
             alias == self.observed_alias.as_ref()
@@ -308,6 +324,7 @@ struct DeviceListMaintenanceRequired;
 
 /// A verified account trust change staged until the complete batch is accepted.
 struct AdvIdentityUpdate<'a> {
+    authentication_epoch: Option<u64>,
     user: &'a Jid,
     identity: [u8; 32],
     previous_identity: Option<[u8; 32]>,
@@ -693,6 +710,7 @@ impl Client {
         user: &Jid,
         response: &DeviceListResponse,
     ) -> anyhow::Result<AdvRecoverySnapshot> {
+        let primary_epoch = self.signal_cache.identity_continuity.primary_snapshot();
         let mut proposed = None;
         for mapping in &response.lid_mappings {
             let pn = Jid::pn(mapping.phone_number.as_str());
@@ -743,6 +761,7 @@ impl Client {
                 );
             }
             AdvRecoverySnapshot {
+                primary_epoch,
                 observed_alias,
                 publication_alias,
                 identities: Vec::new(),
@@ -1237,6 +1256,10 @@ impl Client {
                     recovered_identity.map(|recovered| (&recovered.user, &recovered.snapshot)),
                 )
                 .await?;
+            if let Some(recovered) = recovered_identity {
+                self.validate_adv_recovery_publication(response, recovered, &mapping_guard)
+                    .await?;
+            }
             let registry_guard = self.device_topology.lock_registry().await;
             if let Some(generation) = topology_generation
                 && !self
@@ -1265,8 +1288,18 @@ impl Client {
                 )
             };
             let response = staged.as_ref().map_or(response, |staged| &staged.response);
+            if let Some(recovered) = recovered_identity {
+                recovered
+                    .snapshot
+                    .validate_primary_epoch(&self.signal_cache.identity_continuity)?;
+            }
             self.learn_device_list_mappings_guarded(response, &mapping_guard)
                 .await?;
+            if let Some(recovered) = recovered_identity {
+                recovered
+                    .snapshot
+                    .validate_primary_epoch(&self.signal_cache.identity_continuity)?;
+            }
             let mut rejected = Vec::new();
             for (user, identity) in identities.prepared {
                 if let PreparedAccountIdentity::Trusted(identity) = identity {
@@ -1328,6 +1361,56 @@ impl Client {
         })
     }
 
+    /// Revalidate every recovery before mappings or cleanup, including replies
+    /// without mappings, which do not need prospective graph staging.
+    async fn validate_adv_recovery_publication(
+        &self,
+        response: &DeviceListResponse,
+        recovered: &RecoveredAccountIdentity,
+        mapping_guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
+    ) -> anyhow::Result<()> {
+        recovered
+            .snapshot
+            .validate_primary_epoch(&self.signal_cache.identity_continuity)?;
+        self.validate_adv_recovery_ownership(
+            &recovered.user,
+            recovered.snapshot.publication_alias.as_ref(),
+        )?;
+        self.validate_adv_recovery_durable_alias(
+            &recovered.user,
+            recovered.snapshot.publication_alias.as_ref(),
+            mapping_guard,
+        )
+        .await?;
+        for (jid, previous) in &recovered.snapshot.identities {
+            anyhow::ensure!(
+                self.cached_adv_account_identity(jid).await? == *previous,
+                "primary identity changed during ADV recovery"
+            );
+        }
+        let expected = recovered.snapshot.observed_alias.as_ref();
+        anyhow::ensure!(
+            self.device_list_identity_alias(&recovered.user)
+                .await
+                .as_ref()
+                == expected,
+            "account alias changed during ADV recovery"
+        );
+        if expected.is_none()
+            && let Some(alias) = &recovered.snapshot.publication_alias
+        {
+            anyhow::ensure!(
+                self.device_list_identity_alias(alias).await.is_none(),
+                "account alias changed during ADV recovery"
+            );
+        }
+        validate_recovery_mappings(
+            response,
+            &recovered.user,
+            recovered.snapshot.publication_alias.as_ref(),
+        )
+    }
+
     /// Validate the prospective account graph before publishing mappings or
     /// scheduling migration. Rejection is monotonic across a batch: removing a
     /// bad list must also remove the binding that could redirect its old fanout.
@@ -1336,49 +1419,10 @@ impl Client {
         response: &DeviceListResponse,
         mode: DeviceListApplyMode,
         identities: &DeviceListIdentityContext<'_>,
-        mapping_guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
+        _mapping_guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
         metadata_only: bool,
     ) -> anyhow::Result<StagedDeviceLists> {
         use std::collections::HashMap;
-        if let Some(recovered) = identities.recovered {
-            self.validate_adv_recovery_ownership(
-                &recovered.user,
-                recovered.snapshot.publication_alias.as_ref(),
-            )?;
-            self.validate_adv_recovery_durable_alias(
-                &recovered.user,
-                recovered.snapshot.publication_alias.as_ref(),
-                mapping_guard,
-            )
-            .await?;
-            for (jid, previous) in &recovered.snapshot.identities {
-                anyhow::ensure!(
-                    self.cached_adv_account_identity(jid).await? == *previous,
-                    "primary identity changed during ADV recovery"
-                );
-            }
-            let expected = recovered.snapshot.observed_alias.as_ref();
-            anyhow::ensure!(
-                self.device_list_identity_alias(&recovered.user)
-                    .await
-                    .as_ref()
-                    == expected,
-                "account alias changed during ADV recovery"
-            );
-            if expected.is_none()
-                && let Some(alias) = &recovered.snapshot.publication_alias
-            {
-                anyhow::ensure!(
-                    self.device_list_identity_alias(alias).await.is_none(),
-                    "account alias changed during ADV recovery"
-                );
-            }
-            validate_recovery_mappings(
-                response,
-                &recovered.user,
-                recovered.snapshot.publication_alias.as_ref(),
-            )?;
-        }
         let mut accounts = StagedAccounts::default();
         for list in &response.device_lists {
             accounts.track(&list.user.with_device(0));
@@ -1388,6 +1432,18 @@ impl Client {
         for mapping in &response.lid_mappings {
             let pn = Jid::pn(mapping.phone_number.as_str());
             let lid = Jid::lid(mapping.lid.as_str());
+            // A cold cache is not proof that this LID is unowned. Historical
+            // LIDs for this PN remain allowed; another durable PN owner does not.
+            if let Some(owner) = self
+                .persistence_manager
+                .backend_ref()
+                .get_lid_mapping(&lid.user)
+                .await?
+                && (owner.lid != lid.user.as_str() || owner.phone_number != pn.user.as_str())
+            {
+                accounts.reject(&pn);
+                accounts.reject(&lid);
+            }
             accounts.track(&pn);
             accounts.track(&lid);
             edges.push((pn.clone(), lid.clone()));
@@ -1817,7 +1873,7 @@ impl Client {
         self.persist_adv_bootstrap_identity_in_epoch(
             primary,
             key,
-            self.signal_cache.identity_continuity.snapshot(),
+            self.signal_cache.identity_continuity.primary_snapshot(),
         )
         .await
     }
@@ -1958,6 +2014,17 @@ impl Client {
     ) -> anyhow::Result<()> {
         maintenance.ensure_current()?;
         let ownership = self.persistence_manager.lock_device_ownership().await;
+        anyhow::ensure!(
+            self.signal_cache.identity_continuity.unchanged_primary_for(
+                update.authentication_epoch,
+                update.identities.iter().map(|(address, _)| address
+                    .name()
+                    .split(['@', ':'])
+                    .next()
+                    .unwrap_or(address.name())),
+            ),
+            "primary identity retired before ADV publication"
+        );
         let alias = self.device_list_identity_alias(update.user).await;
         self.validate_adv_recovery_ownership(update.user, alias.as_ref())?;
         let changed = update
@@ -1997,11 +2064,12 @@ impl Client {
         maintenance.ensure_current()?;
         anyhow::ensure!(
             self.signal_cache
-                .persist_identities_if_equal(
+                .persist_identities_if_equal_in_epoch(
                     &update.identities,
                     &update.identity,
                     backend,
                     self.runtime.as_ref(),
+                    update.authentication_epoch,
                 )
                 .await?,
             "primary identity changed during hosted ADV verification for {}",
@@ -2250,6 +2318,12 @@ impl Client {
                     None
                 } else {
                     Some(AdvIdentityUpdate {
+                        authentication_epoch: recovered_identity
+                            .filter(|recovered| recovered.user == user_list.user)
+                            .map_or_else(
+                                || self.signal_cache.identity_continuity.primary_snapshot(),
+                                |recovered| recovered.snapshot.primary_epoch,
+                            ),
                         user: &user_list.user,
                         identity,
                         previous_identity: identities

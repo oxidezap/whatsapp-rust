@@ -2140,7 +2140,7 @@ mod tests {
     #[test]
     fn device_lists_scope_hosted_subjects_to_the_logical_account() {
         for (raw, logical) in [
-            ("12025550241:99@hosted", Jid::pn("12025550241")),
+            ("12025550141:99@hosted", Jid::pn("12025550141")),
             ("100000000000241:99@hosted.lid", Jid::lid("100000000000241")),
         ] {
             let raw: Jid = raw.parse().unwrap();

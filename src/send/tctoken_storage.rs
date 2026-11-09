@@ -110,7 +110,7 @@ mod tests {
             probe.gate = Some(gate);
             probe.entered = Some(entered);
             let (client, _) = create_iq_test_client_with_backend(Arc::new(probe)).await;
-            let phone = Jid::pn("12025550281");
+            let phone = Jid::pn("12025550181");
             let lid = Jid::lid("100000000000281");
             let now = client.runtime.wall_time_secs();
             if existing_lid {

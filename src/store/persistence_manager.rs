@@ -2,7 +2,7 @@ use super::error::StoreError;
 use super::release::{BackendLease, StoreRelease};
 use crate::store::Device;
 use crate::store::traits::Backend;
-use async_lock::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use async_lock::{Mutex, MutexGuard, RwLock, RwLockWriteGuard};
 use event_listener::Event;
 use futures::FutureExt;
 use log::{debug, error};
@@ -70,7 +70,7 @@ pub struct PersistenceManager {
 /// Prevent managed paired-account mutations through a trust publication ACK.
 /// No writable Device reference escapes the manager.
 pub(crate) struct DeviceOwnershipGuard<'a> {
-    _device: RwLockReadGuard<'a, Device>,
+    _save: MutexGuard<'a, Option<PendingDeviceSave>>,
 }
 
 /// Publish even when an advanced modifier unwinds or its future is cancelled.
@@ -330,7 +330,7 @@ impl PersistenceManager {
     /// Serialize primary wire operations across handles sharing this manager.
     /// Durable journal state separately protects cancellation and restart.
     #[cfg(feature = "mobile-core")]
-    pub async fn mobile_primary_operation_guard(&self) -> async_lock::MutexGuard<'_, ()> {
+    pub async fn mobile_primary_operation_guard(&self) -> MutexGuard<'_, ()> {
         self.mobile_primary_operation.lock().await
     }
 
@@ -346,7 +346,7 @@ impl PersistenceManager {
 
     pub(crate) async fn lock_device_ownership(&self) -> DeviceOwnershipGuard<'_> {
         DeviceOwnershipGuard {
-            _device: self.device.read().await,
+            _save: self.pending_save.lock().await,
         }
     }
 
@@ -379,7 +379,19 @@ impl PersistenceManager {
     /// Mutate managed device state and publish its snapshot, dirty flag and save
     /// notification before returning. Prefer [`Self::process_command`] for named
     /// operations. Unwinding publishes any partial mutation; this is not rollback.
+    /// Arbitrary modifiers serialize with device saves and paired-trust publication;
+    /// typed commands for unrelated fields can proceed during that publication.
     pub async fn modify_device<F, R>(&self, modifier: F) -> R
+    where
+        F: FnOnce(&mut Device) -> R,
+    {
+        // Arbitrary modifiers can replace paired identity. Reuse save ordering
+        // before taking Device, while typed unrelated commands bypass this fence.
+        let _ownership = self.pending_save.lock().await;
+        self.modify_device_unfenced(modifier).await
+    }
+
+    async fn modify_device_unfenced<F, R>(&self, modifier: F) -> R
     where
         F: FnOnce(&mut Device) -> R,
     {
@@ -402,10 +414,12 @@ impl PersistenceManager {
     /// manager (including `flush`) from it. Ordinary Signal operations should use
     /// [`super::signal_adapter::SignalProtocolStoreAdapter`] instead, which reads
     /// snapshots per call without holding the device lock over backend I/O.
+    /// The save/paired-identity fence is acquired before the device write lock.
     pub async fn modify_device_async<F, R>(&self, modifier: F) -> R
     where
         F: for<'a> FnOnce(&'a mut Device) -> wacore::runtime::BoxFuture<'a, R>,
     {
+        let _ownership = self.pending_save.lock().await;
         let mut mutation = DeviceMutation {
             manager: self,
             device: self.device.write().await,
@@ -578,6 +592,36 @@ impl PersistenceManager {
 
 use super::commands::{DeviceCommand, apply_command_to_device, apply_command_to_device_at};
 
+// Exhaustive so a new command cannot silently acquire ownership-changing
+// behavior without choosing its serialization boundary.
+fn command_changes_paired_identity(command: &DeviceCommand) -> bool {
+    match command {
+        DeviceCommand::SetId(_)
+        | DeviceCommand::SetLid(_)
+        | DeviceCommand::SetAccount(_)
+        | DeviceCommand::SetMobileSessionBinding(_)
+        | DeviceCommand::CompleteMobileRegistration { .. } => true,
+        DeviceCommand::SetPushName(_)
+        | DeviceCommand::SetAppVersion(_)
+        | DeviceCommand::SetDeviceProps(_)
+        | DeviceCommand::SetClientProfile(_)
+        | DeviceCommand::SetPropsHash(_)
+        | DeviceCommand::SetPreKeyWatermarks { .. }
+        | DeviceCommand::SetAdvSecretKey(_)
+        | DeviceCommand::SetNctSalt(_)
+        | DeviceCommand::SetNctSaltFromHistorySync(_)
+        | DeviceCommand::SetStatusPrivacy(_)
+        | DeviceCommand::SetServerCertChain(_)
+        | DeviceCommand::ClearServerCertChain
+        | DeviceCommand::IncrementLoginCounter
+        | DeviceCommand::SetLidMigrated(_)
+        | DeviceCommand::SetServerClientExpiration(_)
+        | DeviceCommand::SetSignedPreKey { .. }
+        | DeviceCommand::SetSignedPreKeyRotationBaseline(_)
+        | DeviceCommand::SetReadReceiptsDisabled(_) => false,
+    }
+}
+
 impl PersistenceManager {
     /// Apply a command, rejecting invalid mobile updates without publishing them.
     /// Use [`Self::try_process_command`] when the caller needs the validation error.
@@ -596,7 +640,12 @@ impl PersistenceManager {
         ) {
             return Box::pin(self.process_mobile_command(command)).await;
         }
-        self.modify_device(|device| apply_command_to_device(device, command))
+        let _ownership = if command_changes_paired_identity(&command) {
+            Some(self.pending_save.lock().await)
+        } else {
+            None
+        };
+        self.modify_device_unfenced(|device| apply_command_to_device(device, command))
             .await;
         Ok(())
     }
@@ -620,12 +669,20 @@ impl PersistenceManager {
         ) {
             return Box::pin(self.process_mobile_command(command)).await;
         }
-        self.modify_device(|device| apply_command_to_device_at(device, command, now_millis))
-            .await;
+        let _ownership = if command_changes_paired_identity(&command) {
+            Some(self.pending_save.lock().await)
+        } else {
+            None
+        };
+        self.modify_device_unfenced(|device| {
+            apply_command_to_device_at(device, command, now_millis)
+        })
+        .await;
         Ok(())
     }
 
     async fn process_mobile_command(&self, command: DeviceCommand) -> Result<(), StoreError> {
+        let _ownership = self.pending_save.lock().await;
         let device = self.device.write().await;
         let (binding, pn, lid) = match &command {
             DeviceCommand::SetMobileSessionBinding(binding) => {
@@ -756,6 +813,60 @@ mod tests {
     use crate::runtime_impl::TokioRuntime;
     use wacore::store::traits::DeviceStore;
     use wacore::time::Instant;
+
+    #[tokio::test]
+    async fn adv_review_round4_ownership_fence_keeps_pending_save_and_allows_unrelated_commands() {
+        let backend = Arc::new(wacore::store::InMemoryBackend::new());
+        let device = Device::new(backend.clone());
+        let pm = PersistenceManager::with_device(backend, device);
+        let mut certificate = waproto::whatsapp::ADVSignedDeviceIdentity::default();
+        certificate.account_signature_key = Some(vec![7; 32]);
+        pm.process_command(DeviceCommand::SetAccount(Some(certificate)))
+            .await;
+        let resumed = Arc::new(AtomicBool::new(false));
+        let flag = resumed.clone();
+        *pm.pending_save.lock().await = Some(pending_device_save(Box::pin(async move {
+            flag.store(true, Ordering::Release);
+            Ok(())
+        })));
+        let owner = pm.lock_device_ownership().await;
+        let phone = wacore_binary::Jid::pn("12025550107");
+        let mut paired = Box::pin(pm.process_command(DeviceCommand::SetId(Some(phone.clone()))));
+        assert!(futures::poll!(paired.as_mut()).is_pending());
+        let mut account = Box::pin(pm.process_command(DeviceCommand::SetAccount(None)));
+        assert!(futures::poll!(account.as_mut()).is_pending());
+        pm.try_process_command_at(
+            DeviceCommand::SetPreKeyWatermarks {
+                next_pre_key_id: 17,
+                first_unupload_pre_key_id: 11,
+            },
+            42,
+        )
+        .await
+        .unwrap();
+        pm.process_command(DeviceCommand::SetPushName("synthetic".into()))
+            .await;
+        assert_eq!(pm.get_device_snapshot().next_pre_key_id, 17);
+        assert!(pm.get_device_snapshot().pn.is_none());
+        assert_eq!(
+            pm.get_device_snapshot()
+                .account
+                .as_ref()
+                .unwrap()
+                .account_signature_key
+                .as_deref(),
+            Some([7; 32].as_slice())
+        );
+        assert!(!resumed.load(Ordering::Acquire));
+        drop(owner);
+        paired.await;
+        account.await;
+        assert_eq!(pm.get_device_snapshot().pn, Some(phone));
+        assert!(pm.get_device_snapshot().account.is_none());
+        pm.flush().await.unwrap();
+        assert!(resumed.load(Ordering::Acquire));
+        assert!(pm.pending_save.lock().await.is_none());
+    }
 
     #[tokio::test]
     async fn mobile_commands_reject_invalid_updates_before_publication() {

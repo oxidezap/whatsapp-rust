@@ -2310,6 +2310,7 @@ mod tests {
         use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq};
         use std::time::Duration;
         use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+        use wacore::types::jid::JidExt as _;
         use wacore_binary::builder::NodeBuilder;
 
         struct TwoUserHook(Vec<Jid>);
@@ -2336,9 +2337,9 @@ mod tests {
 
         for in_hook in [true, false] {
             let (client, transport) = create_iq_test_client().await;
-            let phone = Jid::pn("12025550267");
+            let phone = Jid::pn("12025550167");
             let lid = Jid::lid("100000000000267");
-            let peer = Jid::pn("12025550268");
+            let peer = Jid::pn("12025550168");
             let users = vec![phone.clone(), peer.clone()];
             if in_hook {
                 client
@@ -2378,6 +2379,28 @@ mod tests {
                     timestamp: 1,
                     phash: None,
                 })
+                .await
+                .unwrap();
+            let old_device = peer.with_device(3);
+            let old_address = old_device.to_protocol_address();
+            let old_device_key = old_device.to_string();
+            let old_session = crate::test_utils::synthetic_serialized_session(73, None);
+            let backend = client.persistence_manager.backend();
+            backend
+                .put_session(old_address.as_str(), &old_session)
+                .await
+                .unwrap();
+            assert!(
+                client
+                    .signal_cache
+                    .peek_session(&old_address, backend.as_ref())
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            let group = "12025550108-1@g.us";
+            backend
+                .set_sender_key_status(group, &[(&old_device_key, true)])
                 .await
                 .unwrap();
             let mut details = wa::ADVKeyIndexList::default();
@@ -2451,6 +2474,33 @@ mod tests {
                 .unwrap();
             assert_eq!(delivered, !in_hook);
             let backend = client.persistence_manager.backend();
+            assert_eq!(
+                backend
+                    .get_session(old_address.as_str())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                in_hook.then_some(old_session.as_slice()),
+                "rejected hook admission must preserve the companion session"
+            );
+            assert_eq!(
+                client
+                    .signal_cache
+                    .peek_session(&old_address, backend.as_ref())
+                    .await
+                    .unwrap()
+                    .is_some(),
+                in_hook
+            );
+            assert_eq!(
+                backend.get_sender_key_devices(group).await.unwrap(),
+                if in_hook {
+                    vec![(old_device_key, true)]
+                } else {
+                    Vec::new()
+                },
+                "rejected hook admission must preserve sender-key distribution tracking"
+            );
             assert_eq!(
                 client.device_list_identity_alias(&phone).await.is_some(),
                 !in_hook,

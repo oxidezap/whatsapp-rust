@@ -959,6 +959,8 @@ mod tests {
                 cache.can_skip_relearn("pn1", "lid1").await,
                 stored_lid == "lid1" && stored_pn == "pn1"
             );
+            assert!(!cache.is_persisted("old_pn", "lid1").await);
+            assert!(!cache.can_skip_relearn("old_pn", "lid1").await);
             if stored_lid != "lid1" {
                 assert_eq!(
                     cache.get_phone_number(stored_lid).await.as_deref(),

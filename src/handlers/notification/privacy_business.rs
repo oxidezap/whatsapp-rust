@@ -231,7 +231,7 @@ mod tests {
         probe.entered = Some(entered);
         probe.gate_once = true;
         let (client, transport) = create_iq_test_client_with_backend(Arc::new(probe)).await;
-        let phone = Jid::pn("12025550260");
+        let phone = Jid::pn("12025550160");
         let lid = Jid::lid("100000000000260");
         client.track_presence_subscription(phone.clone());
         let token = b"synthetic-legacy-token".to_vec();
@@ -338,7 +338,7 @@ mod tests {
             })
             .await
             .unwrap();
-            let phone = Jid::pn("12025550277");
+            let phone = Jid::pn("12025550177");
             let lid = Jid::lid("100000000000277");
             let now = client.runtime.wall_time_secs();
             raw.store_received_tc_token(&phone.user, b"synthetic-old", now - 1)
@@ -441,7 +441,7 @@ mod tests {
 
         for explicit_lid in [true, false] {
             let (client, transport) = create_iq_test_client().await;
-            let phone = Jid::pn("12025550262");
+            let phone = Jid::pn("12025550162");
             let lid = Jid::lid("100000000000262");
             if !explicit_lid {
                 client
@@ -503,7 +503,7 @@ mod tests {
         use crate::test_utils::{create_iq_test_client, decode_sent_iq};
         use wacore_binary::Jid;
         let (client, transport) = create_iq_test_client().await;
-        let phone = Jid::pn("12025550261");
+        let phone = Jid::pn("12025550161");
         let lid = Jid::lid("100000000000261");
         client.track_presence_subscription(phone.clone());
         client
