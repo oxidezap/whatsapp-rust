@@ -329,12 +329,18 @@ impl Client {
     ///
     /// Used by profile picture, presence subscribe, and other features that need tctoken gating.
     pub(crate) async fn lookup_tc_token_for_jid(&self, jid: &Jid) -> Option<Vec<u8>> {
+        let token_key = self.resolve_tc_token_key(jid).await;
+        self.lookup_tc_token_for_key(&token_key).await
+    }
+
+    /// Notification retries must read the same account key they just stored,
+    /// even if PN/LID discovery changes while that store operation awaits.
+    pub(crate) async fn lookup_tc_token_for_key(&self, token_key: &str) -> Option<Vec<u8>> {
         use wacore::iq::tctoken::is_tc_token_expired_with_at;
 
-        let token_key = self.resolve_tc_token_key(jid).await;
         let tc_config = self.tc_token_config().await;
         let backend = self.persistence_manager.backend();
-        match backend.get_tc_token(&token_key).await {
+        match backend.get_tc_token(token_key).await {
             Ok(Some(entry))
                 if !entry.token.is_empty()
                     && !is_tc_token_expired_with_at(
@@ -347,7 +353,7 @@ impl Client {
             }
             Ok(_) => None,
             Err(e) => {
-                log::warn!(target: "Client/TcToken", "Failed to get tc_token for {}: {e}", jid.observe());
+                log::warn!(target: "Client/TcToken", "Failed to get tc_token: {e}");
                 None
             }
         }
