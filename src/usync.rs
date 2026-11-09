@@ -673,21 +673,46 @@ impl Client {
         let Some(alias) = alias else {
             return Ok(());
         };
+        let (phone, lid) = match (user.server, alias.server) {
+            (Server::Pn, Server::Lid) => (user, alias),
+            (Server::Lid, Server::Pn) => (alias, user),
+            _ => anyhow::bail!("invalid recovery alias namespaces"),
+        };
         let backend = self.persistence_manager.backend();
-        for (endpoint, other) in [(user, alias), (alias, user)] {
-            let entry = match (endpoint.server, other.server) {
-                (Server::Pn, Server::Lid) => backend.get_pn_mapping(&endpoint.user).await?,
-                (Server::Lid, Server::Pn) => backend.get_lid_mapping(&endpoint.user).await?,
-                _ => anyhow::bail!("invalid recovery alias namespaces"),
-            };
-            if let Some(entry) = entry {
-                let (phone, lid) = if endpoint.server == Server::Pn {
-                    (endpoint, other)
-                } else {
-                    (other, endpoint)
-                };
+        let candidate = backend.get_lid_mapping(&lid.user).await?;
+        if let Some(entry) = &candidate {
+            anyhow::ensure!(
+                entry.phone_number == phone.user.as_str() && entry.lid == lid.user.as_str(),
+                "durable account alias changed during ADV recovery"
+            );
+        }
+        if let Some(entry) = backend.get_pn_mapping(&phone.user).await? {
+            anyhow::ensure!(
+                entry.phone_number == phone.user.as_str(),
+                "durable account alias changed during ADV recovery"
+            );
+            if entry.lid != lid.user.as_str() {
+                // Historical LIDs are retained. A seconds-resolution tie in
+                // get_pn_mapping cannot overrule the live, durably ACKed pair.
+                // This exception proves ownership from the candidate's own
+                // durable row; cold/cache-only aliases and newer rows still fail.
                 anyhow::ensure!(
-                    entry.phone_number == phone.user.as_str() && entry.lid == lid.user.as_str(),
+                    candidate
+                        .as_ref()
+                        .is_some_and(|row| row.updated_at == entry.updated_at)
+                        && self
+                            .lid_pn_cache
+                            .get_current_lid(&phone.user)
+                            .await
+                            .as_deref()
+                            == Some(lid.user.as_str())
+                        && self
+                            .lid_pn_cache
+                            .get_phone_number(&lid.user)
+                            .await
+                            .as_deref()
+                            == Some(phone.user.as_str())
+                        && self.lid_pn_cache.is_persisted(&phone.user, &lid.user).await,
                     "durable account alias changed during ADV recovery"
                 );
             }

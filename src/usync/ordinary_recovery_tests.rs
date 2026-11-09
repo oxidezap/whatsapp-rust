@@ -4354,3 +4354,134 @@ async fn adv_review_mapping_store_failure_leaves_the_pair_retryable() {
         client.signal_shutdown_sync();
     }
 }
+
+#[tokio::test]
+async fn adv_review_equal_timestamp_history_preserves_authenticated_rotation() {
+    use crate::lid_pn_cache::{LearningSource, LidPnEntry};
+    use wacore::store::traits::LidPnMappingEntry;
+    for by_lid in [false, true] {
+        for case in ["tie", "cold", "unmarked", "foreign", "newer"] {
+            let (client, transport) = create_iq_test_client().await;
+            let backend = client.persistence_manager.backend();
+            let phone = Jid::pn("12025550252");
+            let lids = ["100000000000252", "100000000000253"];
+            for lid in lids {
+                backend
+                    .put_lid_mapping(&LidPnMappingEntry {
+                        lid: lid.into(),
+                        phone_number: phone.user.to_string(),
+                        created_at: 1000,
+                        updated_at: 1000,
+                        learning_source: "usync".into(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            // The backend is free to choose either historical row on a tie.
+            // Make the other row the later, already-ACKed live observation.
+            let historical = backend.get_pn_mapping(&phone.user).await.unwrap().unwrap();
+            let lid = Jid::lid(lids.into_iter().find(|lid| *lid != historical.lid).unwrap());
+            if case == "foreign" {
+                backend
+                    .put_lid_mapping(&LidPnMappingEntry {
+                        lid: lid.user.to_string(),
+                        phone_number: "12025550253".into(),
+                        created_at: 1000,
+                        updated_at: 1000,
+                        learning_source: "usync".into(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            if case == "newer" {
+                backend
+                    .put_lid_mapping(&LidPnMappingEntry {
+                        updated_at: 1001,
+                        ..historical.clone()
+                    })
+                    .await
+                    .unwrap();
+            }
+            if case != "cold" {
+                client
+                    .lid_pn_cache
+                    .add(&LidPnEntry::with_timestamp(
+                        lid.user.to_string(),
+                        phone.user.to_string(),
+                        1000,
+                        LearningSource::Usync,
+                    ))
+                    .await;
+                if case != "unmarked" {
+                    client
+                        .lid_pn_cache
+                        .mark_persisted(
+                            &Arc::from(phone.user.as_str()),
+                            &Arc::from(lid.user.as_str()),
+                        )
+                        .await;
+                }
+            }
+            for user in [&phone, &lid] {
+                crate::test_utils::seed_adv_primary(&client, user).await;
+            }
+            let replacement = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+            let mut failure = first_mapping_failure(&client, &phone, &lid, &replacement);
+            let user = if by_lid { &lid } else { &phone };
+            if by_lid {
+                failure.user = lid.clone();
+                failure.response.device_lists[0].user = lid.clone();
+            }
+            let snapshot = client
+                .capture_adv_recovery_snapshot(user, &failure.response)
+                .await;
+            assert_eq!(snapshot.is_ok(), case == "tie", "{case}, by_lid={by_lid}");
+            assert!(transport.sent().is_empty());
+            if case == "tie" {
+                let recovery = {
+                    let client = client.clone();
+                    tokio::spawn(async move {
+                        client.recover_ordinary_adv_identity(failure.into()).await
+                    })
+                };
+                let iq = decode_sent_iq(&transport, 0).await;
+                let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+                answer_iq(&client, &id, &primary_response(user, &replacement, true)).await;
+                let devices = tokio::time::timeout(Duration::from_secs(5), recovery)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert!(devices.iter().any(|device| device.device == 2));
+                for endpoint in [&phone, &lid] {
+                    assert_eq!(
+                        client.cached_adv_account_identity(endpoint).await.unwrap(),
+                        Some(*replacement.public_key.public_key_bytes())
+                    );
+                    assert_eq!(
+                        client
+                            .load_device_record_for_jid(endpoint)
+                            .await
+                            .unwrap()
+                            .devices
+                            .iter()
+                            .map(|device| device.device_id())
+                            .collect::<Vec<_>>(),
+                        [0, 2]
+                    );
+                }
+                assert_eq!(
+                    backend
+                        .get_pn_mapping(&phone.user)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .lid,
+                    historical.lid,
+                    "rotation must not rewrite historical rows to hide the tie"
+                );
+            }
+            client.signal_shutdown_sync();
+        }
+    }
+}
