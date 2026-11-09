@@ -258,6 +258,13 @@ impl LidPnCache {
     }
 
     #[cfg(test)]
+    pub(crate) fn try_lock_mutation(&self) -> Option<LidPnMutationGuard<'_>> {
+        self.mutation
+            .try_lock()
+            .map(|guard| LidPnMutationGuard { _guard: guard })
+    }
+
+    #[cfg(test)]
     pub(crate) fn startup_finished_for_tests(&self) -> bool {
         self.startup_finished.load(Ordering::Acquire)
     }

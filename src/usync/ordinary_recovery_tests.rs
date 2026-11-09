@@ -139,6 +139,55 @@ impl wacore::runtime::Runtime for PermitWaitRuntime {
     }
 }
 
+/// Observe the selected owned worker itself, rather than assuming mutex waiter
+/// ordering proves that a cancelled request's detached work has completed.
+struct BootstrapWorkerRuntime {
+    armed: std::sync::atomic::AtomicBool,
+    pending: async_channel::Sender<()>,
+    completed: async_channel::Sender<()>,
+}
+
+impl wacore::runtime::Runtime for BootstrapWorkerRuntime {
+    fn spawn(
+        &self,
+        mut future: wacore::runtime::BoxFuture<'static, ()>,
+    ) -> wacore::runtime::AbortHandle {
+        let observe = self.armed.swap(false, std::sync::atomic::Ordering::SeqCst);
+        let pending = self.pending.clone();
+        let completed = self.completed.clone();
+        wacore::runtime::Runtime::spawn(
+            &crate::runtime_impl::TokioRuntime,
+            Box::pin(async move {
+                let mut reported = false;
+                futures::future::poll_fn(|cx| {
+                    let result = future.as_mut().poll(cx);
+                    if observe && !reported && result.is_pending() {
+                        reported = true;
+                        pending.try_send(()).unwrap();
+                    }
+                    result
+                })
+                .await;
+                if observe {
+                    completed.try_send(()).unwrap();
+                }
+            }),
+        )
+    }
+    fn sleep(&self, duration: Duration) -> wacore::runtime::BoxFuture<'static, ()> {
+        wacore::runtime::Runtime::sleep(&crate::runtime_impl::TokioRuntime, duration)
+    }
+    fn spawn_blocking(
+        &self,
+        f: Box<dyn FnOnce() + Send + 'static>,
+    ) -> wacore::runtime::BoxFuture<'static, ()> {
+        wacore::runtime::Runtime::spawn_blocking(&crate::runtime_impl::TokioRuntime, f)
+    }
+    fn yield_now(&self) -> Option<wacore::runtime::BoxFuture<'static, ()>> {
+        wacore::runtime::Runtime::yield_now(&crate::runtime_impl::TokioRuntime)
+    }
+}
+
 /// Before the fix this parks the recovery on the sole permit while the
 /// permit's receiver waits for the primary mutex held by that recovery.
 #[tokio::test]
@@ -2144,10 +2193,10 @@ async fn bootstrap_fence_failure_and_cancellation_keep_the_pinned_anchor() {
                 .unwrap();
             worker.abort();
             assert!(worker.await.unwrap_err().is_cancelled());
-            assert!(client.adv_bootstrap_fence.try_write().is_none());
+            assert!(client.lid_pn_cache.try_lock_mutation().is_none());
             release.send(()).await.unwrap();
             drop(
-                tokio::time::timeout(Duration::from_secs(5), client.adv_bootstrap_fence.write())
+                tokio::time::timeout(Duration::from_secs(5), client.lid_pn_cache.lock_mutation())
                     .await
                     .unwrap(),
             );
@@ -2159,7 +2208,7 @@ async fn bootstrap_fence_failure_and_cancellation_keep_the_pinned_anchor() {
                     .is_err()
             );
         }
-        assert!(client.adv_bootstrap_fence.try_write().is_some());
+        assert!(client.lid_pn_cache.try_lock_mutation().is_some());
         drop(
             tokio::time::timeout(Duration::from_secs(5), client.lid_pn_cache.lock_mutation())
                 .await
@@ -2406,7 +2455,7 @@ async fn bootstrap_alias_is_rechecked_after_waiting_for_the_flush_order() {
         // Also works when the bootstrap is admitted by an owned worker.
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                match client.adv_bootstrap_fence.try_write() {
+                match client.lid_pn_cache.try_lock_mutation() {
                     None => break,
                     Some(guard) => drop(guard),
                 }
@@ -2517,7 +2566,7 @@ async fn cancelled_bootstrap_waits_for_outstanding_host_write_before_new_trust()
         client.cached_adv_account_identity(&primary).await.unwrap(),
         Some(newer_key)
     );
-    assert!(client.adv_bootstrap_fence.try_write().is_some());
+    assert!(client.lid_pn_cache.try_lock_mutation().is_some());
     client.signal_shutdown_sync();
 }
 
@@ -2988,7 +3037,7 @@ async fn first_mapping_recovery_rejects_changes_during_authentication() {
         assert!(client.device_list_identity_alias(&phone).await.is_none());
         assert!(client.device_list_identity_alias(&lid).await.is_none());
         assert!(
-            client.adv_bootstrap_fence.try_write().is_some(),
+            client.lid_pn_cache.try_lock_mutation().is_some(),
             "snapshot fence must be released before the IQ"
         );
         let other_key = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
@@ -4054,7 +4103,18 @@ async fn deliver_identity_reset(client: &Arc<Client>, user: &Jid, lid: Option<&J
 async fn adv_review_cancelled_bootstrap_cannot_restore_a_reset_primary() {
     for aliased in [false, true] {
         for reset in [true, false] {
-            let (client, _) = create_iq_test_client().await;
+            let (pending, waiting) = async_channel::unbounded();
+            let (completed, finished) = async_channel::unbounded();
+            let runtime = Arc::new(BootstrapWorkerRuntime {
+                armed: std::sync::atomic::AtomicBool::new(false),
+                pending,
+                completed,
+            });
+            let (client, _) = crate::test_utils::create_iq_test_client_with_runtime(
+                crate::test_utils::create_test_backend().await,
+                runtime.clone(),
+            )
+            .await;
             let phone = Jid::pn("12025550230");
             let lid = Jid::lid("100000000000230");
             if aliased {
@@ -4077,19 +4137,15 @@ async fn adv_review_cancelled_bootstrap_cannot_restore_a_reset_primary() {
             let backend = client.persistence_manager.backend();
             client.signal_cache.flush(backend.as_ref()).await.unwrap();
             let mapping = client.lid_pn_cache.lock_mutation().await;
+            runtime
+                .armed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             let mut requester = Box::pin(client.persist_adv_bootstrap_identity(primary, &key));
             assert!(futures::poll!(requester.as_mut()).is_pending());
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    match client.adv_bootstrap_fence.try_write() {
-                        None => break,
-                        Some(guard) => drop(guard),
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), waiting.recv())
+                .await
+                .unwrap()
+                .unwrap();
             drop(requester);
             if reset {
                 deliver_identity_reset(&client, &phone, aliased.then_some(&lid)).await;
@@ -4106,12 +4162,10 @@ async fn adv_review_cancelled_bootstrap_cannot_restore_a_reset_primary() {
                 );
             }
             drop(mapping);
-            // The old worker already owns the fence, so this waits for its ACK.
-            drop(
-                tokio::time::timeout(Duration::from_secs(5), client.adv_bootstrap_fence.write())
-                    .await
-                    .unwrap(),
-            );
+            tokio::time::timeout(Duration::from_secs(5), finished.recv())
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(
                 client.cached_adv_account_identity(primary).await.unwrap(),
                 (!reset).then_some(key),

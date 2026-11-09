@@ -612,7 +612,6 @@ impl Client {
             unified_session: crate::unified_session::UnifiedSessionManager::new(),
 
             signal_cache: Arc::new(crate::store::signal_cache::SignalStoreCache::new()),
-            adv_bootstrap_fence: RwLock::new(()),
             message_processing_semaphore: std::sync::Mutex::new(Arc::new(
                 async_lock::Semaphore::new(1),
             )),
