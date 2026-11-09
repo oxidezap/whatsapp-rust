@@ -3619,8 +3619,24 @@ async fn adv_review_wire_hosted_subjects_cannot_bypass_the_account_epoch_graph()
                 );
             }
         }
-        for user in [&phone, &lid] {
-            assert_eq!(client.cached_adv_account_identity(user).await.unwrap(), old);
+        if conflicting {
+            for user in [&phone, &lid] {
+                assert_eq!(client.cached_adv_account_identity(user).await.unwrap(), old);
+            }
+        } else {
+            let pn_before = client.cached_adv_account_identity(&phone).await.unwrap();
+            assert!(pn_before.is_none() || pn_before == old);
+            assert_eq!(client.cached_adv_account_identity(&lid).await.unwrap(), old);
+            // A successful mapping may already have removed the redundant PN
+            // copy. Complete that legal migration and check its canonical key.
+            client
+                .migrate_signal_sessions_on_lid_discovery(&phone.user, &lid.user)
+                .await;
+            assert_eq!(
+                client.cached_adv_account_identity(&phone).await.unwrap(),
+                None
+            );
+            assert_eq!(client.cached_adv_account_identity(&lid).await.unwrap(), old);
         }
         assert!(
             client

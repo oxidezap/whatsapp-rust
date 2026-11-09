@@ -38,8 +38,8 @@ pub(crate) async fn handle_privacy_token_notification(client: &Arc<Client>, node
     // Resolve to a LID key. We borrow from Jid.user (CompactString) or from
     // get_current_lid (CompactString), then pass as &str to the storage layer.
     let resolved_lid: Option<wacore_binary::CompactString>;
-    let sender_lid: &str = if let Some(ref lid_jid) = sender_lid_jid {
-        &lid_jid.user
+    let (sender_lid, stored_under_pn): (&str, bool) = if let Some(ref lid_jid) = sender_lid_jid {
+        (&lid_jid.user, false)
     } else {
         let from = match &from_jid {
             Some(jid) => jid,
@@ -50,18 +50,18 @@ pub(crate) async fn handle_privacy_token_notification(client: &Arc<Client>, node
         };
 
         if from.is_lid() {
-            &from.user
+            (&from.user, false)
         } else {
             resolved_lid = client.lid_pn_cache.get_current_lid(&from.user).await;
             match &resolved_lid {
-                Some(lid) => lid.as_str(),
+                Some(lid) => (lid.as_str(), false),
                 None => {
                     debug!(
                         target: "Client/TcToken",
                         "Cannot resolve LID for privacy_token sender {}, storing under PN",
                         from.observe()
                     );
-                    &from.user
+                    (&from.user, true)
                 }
             }
         }
@@ -137,7 +137,7 @@ pub(crate) async fn handle_privacy_token_notification(client: &Arc<Client>, node
         && let Some(from) = &from_jid
         && let Err(e) = client
             .presence()
-            .re_subscribe_when_active(from, sender_lid_jid.as_ref().map(|jid| jid.user.as_str()))
+            .re_subscribe_when_active(from, sender_lid, stored_under_pn)
             .await
     {
         debug!(target: "Client/TcToken", "Failed to re-subscribe presence for {}: {e}", from.observe());
@@ -247,6 +247,128 @@ mod tests {
                     .build()])
                 .build()])
             .build()
+    }
+
+    async fn assert_legacy_token_retry_during_mapping_change(after_store: bool) {
+        use crate::lid_pn_cache::LearningSource;
+        use crate::store::release::tests::ProbeBackend;
+        use crate::test_utils::{create_iq_test_client_with_backend, decode_sent_iq};
+        use std::time::Duration;
+        use wacore_binary::Jid;
+
+        let (mut probe, _) = ProbeBackend::new();
+        let raw = probe.backend.clone();
+        let (release, gate) = async_channel::unbounded();
+        let (entered, arrived) = async_channel::unbounded();
+        probe.gate_method = if after_store {
+            "after:store_received_tc_token"
+        } else {
+            "store_received_tc_token"
+        };
+        probe.gate = Some(gate);
+        probe.entered = Some(entered);
+        let (client, transport) = create_iq_test_client_with_backend(Arc::new(probe)).await;
+        let phone = Jid::pn("12025550260");
+        let lid = Jid::lid("100000000000260");
+        client.track_presence_subscription(phone.clone());
+        let token = b"synthetic-legacy-token".to_vec();
+        let timestamp = client.runtime.wall_time_secs();
+        let notification = privacy_token_notification(&phone.to_string(), timestamp, token.clone());
+        let handler = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                handle_privacy_token_notification(&client, &notification.as_node_ref()).await;
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .learn_lid_pn_mapping_fast(&lid.user, &phone.user, LearningSource::Usync, true)
+            .await;
+        assert_eq!(
+            client
+                .lid_pn_cache
+                .get_current_lid(&phone.user)
+                .await
+                .as_deref(),
+            Some(lid.user.as_str())
+        );
+        if after_store {
+            // Apply the durable state transition made by token migration while
+            // the notification is paused after its PN write and before retry.
+            assert_eq!(
+                raw.get_tc_token(&phone.user).await.unwrap().unwrap().token,
+                token
+            );
+            raw.store_received_tc_token(&lid.user, &token, timestamp)
+                .await
+                .unwrap();
+            raw.delete_tc_token(&phone.user).await.unwrap();
+        } else {
+            assert!(raw.get_tc_token(&phone.user).await.unwrap().is_none());
+        }
+        release.send(()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handler)
+            .await
+            .unwrap()
+            .unwrap();
+        let sent = decode_sent_iq(&transport, 0).await;
+        assert_eq!(sent.get().tag, "presence");
+        assert_eq!(
+            sent.get()
+                .get_optional_child("tctoken")
+                .and_then(|child| child.content_bytes()),
+            Some(token.as_slice())
+        );
+        client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn review_token_retry_keeps_pn_key_when_mapping_appears_during_save() {
+        assert_legacy_token_retry_during_mapping_change(false).await;
+    }
+
+    #[tokio::test]
+    async fn review_token_retry_finds_a_pn_token_moved_before_retry() {
+        assert_legacy_token_retry_during_mapping_change(true).await;
+    }
+
+    #[tokio::test]
+    async fn review_token_retry_does_not_replace_expired_explicit_lid_with_pn_token() {
+        use crate::test_utils::{create_iq_test_client, decode_sent_iq};
+        use wacore_binary::Jid;
+        let (client, transport) = create_iq_test_client().await;
+        let phone = Jid::pn("12025550261");
+        let lid = Jid::lid("100000000000261");
+        client.track_presence_subscription(phone.clone());
+        client
+            .persistence_manager
+            .backend()
+            .store_received_tc_token(
+                &phone.user,
+                b"synthetic-current-pn",
+                client.runtime.wall_time_secs(),
+            )
+            .await
+            .unwrap();
+        let notification = NodeBuilder::new("notification")
+            .attr("type", "privacy_token")
+            .attr("from", phone.to_string())
+            .attr("sender_lid", lid.to_string())
+            .children([NodeBuilder::new("tokens")
+                .children([NodeBuilder::new("token")
+                    .attr("type", "trusted_contact")
+                    .attr("t", "1")
+                    .bytes(b"synthetic-expired-lid".to_vec())
+                    .build()])
+                .build()])
+            .build();
+        handle_privacy_token_notification(&client, &notification.as_node_ref()).await;
+        let sent = decode_sent_iq(&transport, 0).await;
+        assert!(sent.get().get_optional_child("tctoken").is_none());
+        client.signal_shutdown_sync();
     }
 
     #[tokio::test]

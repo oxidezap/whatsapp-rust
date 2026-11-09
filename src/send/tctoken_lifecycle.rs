@@ -333,8 +333,7 @@ impl Client {
         self.lookup_tc_token_for_key(&token_key).await
     }
 
-    /// An explicit notification LID must not be re-resolved through a cold PN
-    /// mapping after its token has already been stored under that LID.
+    /// Read a chosen token storage key without resolving it through aliases.
     pub(crate) async fn lookup_tc_token_for_key(&self, token_key: &str) -> Option<Vec<u8>> {
         use wacore::iq::tctoken::is_tc_token_expired_with_at;
 
