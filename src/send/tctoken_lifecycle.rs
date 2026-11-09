@@ -333,8 +333,8 @@ impl Client {
         self.lookup_tc_token_for_key(&token_key).await
     }
 
-    /// Notification retries must read the same account key they just stored,
-    /// even if PN/LID discovery changes while that store operation awaits.
+    /// An explicit notification LID must not be re-resolved through a cold PN
+    /// mapping after its token has already been stored under that LID.
     pub(crate) async fn lookup_tc_token_for_key(&self, token_key: &str) -> Option<Vec<u8>> {
         use wacore::iq::tctoken::is_tc_token_expired_with_at;
 

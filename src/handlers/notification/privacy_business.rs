@@ -137,7 +137,7 @@ pub(crate) async fn handle_privacy_token_notification(client: &Arc<Client>, node
         && let Some(from) = &from_jid
         && let Err(e) = client
             .presence()
-            .re_subscribe_when_active(from, sender_lid)
+            .re_subscribe_when_active(from, sender_lid_jid.as_ref().map(|jid| jid.user.as_str()))
             .await
     {
         debug!(target: "Client/TcToken", "Failed to re-subscribe presence for {}: {e}", from.observe());
