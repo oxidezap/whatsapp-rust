@@ -8032,6 +8032,227 @@ async fn status_broadcast_decrypt_failure_acks_to_chat() {
     );
 }
 
+/// Runs a companion pkmsg through `process_classified_message` with the given
+/// certificate and sender-echoed retry count, and returns the wire frames once
+/// the stanza has been acked.
+async fn run_unverifiable_companion_adv(
+    test_id: &str,
+    certificate: Option<Vec<u8>>,
+    max_sender_retry_count: u8,
+) -> Vec<bytes::Bytes> {
+    let (client, transport) = capturing_client(test_id).await;
+    // Retries after the first carry `<keys>`, which need our own ADV account.
+    client
+        .persistence_manager
+        .process_command(crate::store::commands::DeviceCommand::SetAccount(Some(
+            wa::ADVSignedDeviceIdentity::default(),
+        )))
+        .await;
+    let (bundle, receiver) = bobs_prekey_bundle(&client).await;
+    let mut companion = AlicePeer::new("777000000000082:3@lid").await;
+    crate::test_utils::seed_adv_primary(&client, &companion.jid).await;
+    companion
+        .install_bob_session(&receiver.to_protocol_address(), &bundle)
+        .await;
+    let ciphertext = companion
+        .encrypt_text(&receiver.to_protocol_address(), "unverifiable")
+        .await;
+    let payload = enc_payload_from_ciphertext(&ciphertext);
+    assert_eq!(payload.enc_type.as_wire_str(), "pkmsg");
+    let info = Arc::new(MessageInfo {
+        id: "ADV-FAIL".into(),
+        source: crate::types::message::MessageSource {
+            sender: companion.jid.clone(),
+            chat: companion.jid.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    client
+        .clone()
+        .process_classified_message(
+            ClassifiedMessage {
+                device_identity: certificate.map(bytes::Bytes::from),
+                info,
+                sender_encryption_jid: companion.jid.clone(),
+                session_payloads: vec![payload],
+                group_payloads: vec![],
+                bot_payloads: vec![],
+                max_sender_retry_count,
+                decrypt_fail_mode: DecryptFailMode::Show,
+                ack_recipient: None,
+            },
+            client.connection_generation.load(Ordering::Acquire),
+        )
+        .await;
+
+    for _ in 0..80 {
+        if find_message_ack(&transport.sent()).is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    transport.sent()
+}
+
+/// `(count, error)` of each `<retry>` in the retry receipts for `id`.
+fn retry_counts_for(frames: &[bytes::Bytes], id: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (i, frame) in frames.iter().enumerate() {
+        let Some(buf) = decode_frame(i, frame) else {
+            continue;
+        };
+        let Ok(node) = wacore_binary::marshal::unmarshal_packed_ref(&buf) else {
+            continue;
+        };
+        if node.tag.as_ref() == "receipt"
+            && node.get_attr("id").is_some_and(|v| v.as_str() == id)
+            && node.get_attr("type").is_some_and(|v| v.as_str() == "retry")
+            && let Some(retry) = node.get_optional_child("retry")
+        {
+            let attr = |name| {
+                retry
+                    .get_attr(name)
+                    .map(|v| v.as_str().to_string())
+                    .unwrap_or_default()
+            };
+            out.push((attr("count"), attr("error")));
+        }
+    }
+    out
+}
+
+/// Regression: a companion pkmsg whose ADV identity cannot be verified was
+/// dropped with no response, so the server kept it queued, redelivered it on
+/// every reconnect and eventually closed the stream with `<stream:error><ack/>`.
+/// WA Web (`WAWebMsgProcessingDecryptApi`) answers with an AdvFailure retry.
+#[tokio::test]
+async fn unverifiable_companion_adv_requests_retry_and_acks() {
+    let adv_failure = (RetryReason::AdvFailure as u8).to_string();
+
+    let missing = run_unverifiable_companion_adv("adv_missing", None, 0).await;
+    assert_eq!(
+        retry_counts_for(&missing, "ADV-FAIL"),
+        vec![("1".to_string(), adv_failure.clone())],
+        "a missing certificate must request one AdvFailure retry"
+    );
+    assert!(
+        find_message_ack(&missing).is_some(),
+        "the stanza must be acked"
+    );
+
+    // Signed by the test account, but for another device's identity key.
+    let other = AlicePeer::new("777000000000083:4@lid").await;
+    let invalid =
+        run_unverifiable_companion_adv("adv_invalid", Some(other.adv_certificate()), 0).await;
+    assert_eq!(
+        retry_counts_for(&invalid, "ADV-FAIL"),
+        vec![("1".to_string(), adv_failure.clone())],
+        "a certificate for another identity must request one AdvFailure retry"
+    );
+    assert!(
+        find_message_ack(&invalid).is_some(),
+        "the stanza must be acked"
+    );
+}
+
+/// The sender-echoed `<enc count>` must reach the retry cache before the ADV
+/// retry, or an empty cache (restart, eviction) restarts the cap at 1.
+#[tokio::test]
+async fn unverifiable_companion_adv_honors_sender_retry_count() {
+    let continued = run_unverifiable_companion_adv("adv_count_3", None, 3).await;
+    assert_eq!(
+        retry_counts_for(&continued, "ADV-FAIL"),
+        vec![("4".to_string(), (RetryReason::AdvFailure as u8).to_string())],
+        "the retry must continue from the sender's count"
+    );
+    assert!(find_message_ack(&continued).is_some());
+
+    let exhausted =
+        run_unverifiable_companion_adv("adv_count_max", None, MAX_DECRYPT_RETRIES).await;
+    assert!(
+        retry_counts_for(&exhausted, "ADV-FAIL").is_empty(),
+        "an exhausted budget must not request another retry"
+    );
+    assert!(
+        find_message_ack(&exhausted).is_some(),
+        "an exhausted budget must still ack the stanza"
+    );
+}
+
+/// Only the pkmsg whose ADV identity failed was judged; every other `<enc>` in
+/// the stanza, a second pkmsg included, was abandoned without an attempt.
+#[tokio::test]
+async fn unverifiable_companion_adv_reports_only_the_failing_enc() {
+    let (client, _transport) = capturing_client("adv_report_encs").await;
+    let (recorder, _leases) = watch_enc_outcomes(&client);
+    let (bundle, receiver) = bobs_prekey_bundle(&client).await;
+    let mut companion = AlicePeer::new("777000000000084:5@lid").await;
+    crate::test_utils::seed_adv_primary(&client, &companion.jid).await;
+    companion
+        .install_bob_session(&receiver.to_protocol_address(), &bundle)
+        .await;
+    let first = companion
+        .encrypt_text(&receiver.to_protocol_address(), "first")
+        .await;
+    let second = companion
+        .encrypt_text(&receiver.to_protocol_address(), "second")
+        .await;
+    let second = enc_payload_from_ciphertext(&second);
+    assert_eq!(second.enc_type.as_wire_str(), "pkmsg");
+
+    client
+        .clone()
+        .process_classified_message(
+            ClassifiedMessage {
+                device_identity: None,
+                info: dm_info("ADV-ENCS", &companion.jid),
+                sender_encryption_jid: companion.jid.clone(),
+                session_payloads: vec![
+                    enc_payload_from_ciphertext(&first),
+                    enc_payload_at("pkmsg", second.ciphertext.to_vec(), 1),
+                ],
+                group_payloads: vec![enc_payload_at("skmsg", vec![7u8; 16], 2)],
+                bot_payloads: vec![],
+                max_sender_retry_count: 0,
+                decrypt_fail_mode: DecryptFailMode::Show,
+                ack_recipient: None,
+            },
+            client.connection_generation.load(Ordering::Acquire),
+        )
+        .await;
+
+    let mut failures = Vec::new();
+    for _ in 0..40 {
+        failures = recorder.failures();
+        if failures.len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        failures,
+        vec![
+            (
+                0,
+                Some("pkmsg".to_string()),
+                EncDecryptFailureReason::UntrustedIdentity
+            ),
+            (
+                1,
+                Some("pkmsg".to_string()),
+                EncDecryptFailureReason::NotAttempted
+            ),
+            (
+                2,
+                Some("skmsg".to_string()),
+                EncDecryptFailureReason::NotAttempted
+            ),
+        ]
+    );
+}
+
 /// Run a single session ciphertext through the full classify->process path.
 async fn process_session_ct(
     client: &Arc<Client>,

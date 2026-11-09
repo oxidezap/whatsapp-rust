@@ -186,6 +186,21 @@ struct IncomingAccountFence {
 }
 
 impl Client {
+    async fn preseed_sender_retry_count(&self, info: &MessageInfo, sender_count: u8) {
+        if sender_count == 0 {
+            return;
+        }
+        let cache_key = self
+            .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
+            .await;
+        self.preseed_retry_count(&cache_key, sender_count).await;
+        log::debug!(
+            "[msg:{}] Sender retry count {} pre-seeded into cache",
+            ObservedId::new(info.id.as_str()),
+            sender_count
+        );
+    }
+
     async fn validate_incoming_companion_identity(
         &self,
         sender: &Jid,
@@ -748,9 +763,41 @@ impl Client {
                     .await
                     .is_err()
                 {
+                    // WA Web answers this with a retry receipt (reason
+                    // AdvFailure). A bare return leaves the stanza unacked
+                    // and the server redelivers it every reconnect, then
+                    // closes the stream with `<stream:error><ack/>`.
                     log::warn!(
-                        "Dropping companion prekey message with an unverifiable ADV identity"
+                        "Companion prekey message with an unverifiable ADV identity; requesting retry"
                     );
+                    for abandoned in session_payloads
+                        .iter()
+                        .chain(&group_payloads)
+                        .chain(&bot_payloads)
+                    {
+                        let reason = if abandoned.enc_index == payload.enc_index {
+                            EncDecryptFailureReason::UntrustedIdentity
+                        } else {
+                            EncDecryptFailureReason::NotAttempted
+                        };
+                        self.report_enc_decrypt_failure(
+                            &info,
+                            abandoned.enc_index,
+                            abandoned.enc_type.as_wire_str(),
+                            reason,
+                        );
+                    }
+                    // Otherwise a sender-echoed count is lost after a restart or
+                    // eviction and the retry cap restarts at 1.
+                    self.preseed_sender_retry_count(&info, max_sender_retry_count)
+                        .await;
+                    self.handle_decrypt_failure(
+                        &info,
+                        RetryReason::AdvFailure,
+                        decrypt_fail_mode,
+                        ack_recipient.as_ref(),
+                    )
+                    .await;
                     return;
                 }
             }
@@ -875,18 +922,8 @@ impl Client {
         if let (Some(admission), Some(producer)) = (&_live_admission, &receipt_producer) {
             admission.attach_receipts(producer);
         }
-        if max_sender_retry_count > 0 {
-            let cache_key = self
-                .make_retry_cache_key(&info.source.chat, &info.id, &info.source.sender)
-                .await;
-            self.preseed_retry_count(&cache_key, max_sender_retry_count)
-                .await;
-            log::debug!(
-                "[msg:{}] Sender retry count {} pre-seeded into cache",
-                ObservedId::new(info.id.as_str()),
-                max_sender_retry_count
-            );
-        }
+        self.preseed_sender_retry_count(&info, max_sender_retry_count)
+            .await;
 
         log::debug!(
             "Starting PASS 1: Processing {} session establishment messages (pkmsg/msg)",
