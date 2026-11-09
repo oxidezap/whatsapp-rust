@@ -83,6 +83,59 @@ struct StagedDeviceLists {
     proofs: Vec<Option<VerifiedDeviceListEnvelope>>,
 }
 
+#[derive(Default)]
+struct StagedAccounts {
+    index: std::collections::HashMap<Jid, usize>,
+    rows: Vec<StagedAccount>,
+    rejected: usize,
+}
+
+struct StagedAccount {
+    user: Jid,
+    identity: Option<[u8; 32]>,
+    prepared: Option<[u8; 32]>,
+    desired: Option<[u8; 32]>,
+    rejected: bool,
+    empty: bool,
+    requires_maintenance: bool,
+}
+
+impl StagedAccounts {
+    #[inline(never)]
+    fn track(&mut self, user: &Jid) -> usize {
+        if let Some(index) = self.index.get(user) {
+            return *index;
+        }
+        let index = self.rows.len();
+        self.index.insert(user.clone(), index);
+        self.rows.push(StagedAccount {
+            user: user.clone(),
+            identity: None,
+            prepared: None,
+            desired: None,
+            rejected: false,
+            empty: false,
+            requires_maintenance: false,
+        });
+        index
+    }
+
+    #[inline(never)]
+    fn reject(&mut self, user: &Jid) {
+        let index = self.track(user);
+        let row = &mut self.rows[index];
+        if !row.rejected {
+            row.rejected = true;
+            self.rejected += 1;
+        }
+    }
+
+    #[inline(never)]
+    fn row(&self, user: &Jid) -> Option<&StagedAccount> {
+        self.index.get(user).map(|index| &self.rows[*index])
+    }
+}
+
 // Share collection probes without changing the full JID hash/equality or
 // the caller's alias priority, identity selection and rejection rules.
 #[inline(never)]
@@ -94,16 +147,13 @@ fn staged_mapping<'a>(
 }
 
 #[inline(never)]
-fn staged_identity(
-    keys: &std::collections::HashMap<Jid, Option<[u8; 32]>>,
-    user: &Jid,
-) -> Option<[u8; 32]> {
-    keys.get(user).copied().flatten()
+fn staged_identity(keys: &StagedAccounts, user: &Jid) -> Option<[u8; 32]> {
+    keys.row(user).and_then(|row| row.identity)
 }
 
 #[inline(never)]
-fn staged_rejected(rejected: &std::collections::HashSet<Jid>, user: &Jid) -> bool {
-    rejected.contains(user)
+fn staged_rejected(rejected: &StagedAccounts, user: &Jid) -> bool {
+    rejected.row(user).is_some_and(|row| row.rejected)
 }
 
 fn project_adv_devices(
@@ -142,6 +192,50 @@ fn project_adv_devices(
             })
         })
         .collect()
+}
+
+fn device_requires_cleanup(
+    previous: &wacore::store::traits::DeviceInfo,
+    current: &[wacore::store::traits::DeviceInfo],
+    decoded: Option<&wacore::adv::DecodedKeyIndex>,
+    retained: &std::collections::HashSet<u16>,
+) -> bool {
+    !retained.contains(&previous.device_id())
+        || current.iter().any(|device| {
+            device.device_id() == previous.device_id() && device.is_hosted() != previous.is_hosted()
+        })
+        || (previous.device_id() != 0
+            && decoded.is_some_and(|decoded| {
+                !wacore::adv::is_key_index_valid(previous.key_index(), decoded)
+            }))
+}
+
+fn projection_requires_maintenance(
+    previous: Option<&wacore::store::traits::DeviceListRecord>,
+    current: &[wacore::store::traits::DeviceInfo],
+    decoded: Option<&wacore::adv::DecodedKeyIndex>,
+    mode: DeviceListApplyMode,
+    retained: &mut std::collections::HashSet<u16>,
+) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+    let raw_changed = previous
+        .raw_id
+        .zip(decoded.map(|decoded| decoded.raw_id))
+        .is_some_and(|(old, new)| old != new);
+    if current.is_empty() {
+        return raw_changed && mode == DeviceListApplyMode::CachePreferred;
+    }
+    if raw_changed {
+        return true;
+    }
+    retained.clear();
+    retained.extend(current.iter().map(|device| device.device_id()));
+    previous
+        .devices
+        .iter()
+        .any(|device| device_requires_cleanup(device, current, decoded, retained))
 }
 
 /// Group partial success applies only to trust conflicts, never storage faults.
@@ -1160,8 +1254,14 @@ impl Client {
                 None
             } else {
                 Some(
-                    self.stage_device_list_identities(response, mode, &identities, &mapping_guard)
-                        .await?,
+                    self.stage_device_list_identities(
+                        response,
+                        mode,
+                        &identities,
+                        &mapping_guard,
+                        maintenance.is_none(),
+                    )
+                    .await?,
                 )
             };
             let response = staged.as_ref().map_or(response, |staged| &staged.response);
@@ -1237,8 +1337,9 @@ impl Client {
         mode: DeviceListApplyMode,
         identities: &DeviceListIdentityContext<'_>,
         mapping_guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
+        metadata_only: bool,
     ) -> anyhow::Result<StagedDeviceLists> {
-        use std::collections::{HashMap, HashSet};
+        use std::collections::HashMap;
         if let Some(recovered) = identities.recovered {
             self.validate_adv_recovery_ownership(
                 &recovered.user,
@@ -1278,41 +1379,42 @@ impl Client {
                 recovered.snapshot.publication_alias.as_ref(),
             )?;
         }
-        let mut users: HashSet<Jid> = response
-            .device_lists
-            .iter()
-            .map(|list| list.user.with_device(0))
-            .collect();
+        let mut accounts = StagedAccounts::default();
+        for list in &response.device_lists {
+            accounts.track(&list.user.with_device(0));
+        }
         let mut proposed = HashMap::new();
         let mut edges = Vec::new();
-        let mut rejected = HashSet::new();
         for mapping in &response.lid_mappings {
             let pn = Jid::pn(mapping.phone_number.as_str());
             let lid = Jid::lid(mapping.lid.as_str());
-            users.extend([pn.clone(), lid.clone()]);
+            accounts.track(&pn);
+            accounts.track(&lid);
             edges.push((pn.clone(), lid.clone()));
             for (user, alias) in [(pn.clone(), lid.clone()), (lid, pn)] {
                 if let Some(previous) = proposed.insert(user.clone(), alias.clone())
                     && previous != alias
                 {
-                    rejected.extend([user, alias, previous]);
+                    for rejected in [user, alias, previous] {
+                        accounts.reject(&rejected);
+                    }
                 }
             }
         }
         let mut current = HashMap::new();
-        for user in users.clone() {
+        let initial_users: Vec<_> = accounts.rows.iter().map(|row| row.user.clone()).collect();
+        for user in initial_users {
             if let Some(alias) = self.device_list_identity_alias(&user).await {
                 if self.device_list_identity_alias(&alias).await.as_ref() == Some(&user) {
                     edges.push((user.clone(), alias.clone()));
                     current.insert(alias.clone(), user.clone());
                 }
-                users.insert(alias.clone());
+                accounts.track(&alias);
                 current.insert(user, alias);
             }
         }
-        let mut keys = HashMap::new();
-        for user in &users {
-            keys.insert(user.clone(), self.cached_adv_account_identity(user).await?);
+        for row in &mut accounts.rows {
+            row.identity = self.cached_adv_account_identity(&row.user).await?;
         }
         let alias_for =
             |user: &Jid| staged_mapping(&proposed, user).or_else(|| staged_mapping(&current, user));
@@ -1331,9 +1433,10 @@ impl Client {
                 .chain(staged_mapping(&current, &pn))
                 .chain(staged_mapping(&current, &lid))
             {
-                if let Some(key) = staged_identity(&keys, address) {
+                if let Some(key) = staged_identity(&accounts, address) {
                     if anchor.is_some_and(|anchor| anchor != key) {
-                        rejected.extend([pn.clone(), lid.clone()]);
+                        accounts.reject(&pn);
+                        accounts.reject(&lid);
                     }
                     anchor = Some(key);
                 }
@@ -1342,29 +1445,29 @@ impl Client {
         for (user, prepared) in identities.prepared {
             let user = user.with_device(0);
             let PreparedAccountIdentity::Trusted(expected) = prepared else {
-                rejected.insert(user);
+                accounts.reject(&user);
                 continue;
             };
-            let primary = staged_identity(&keys, &user);
+            let primary = staged_identity(&accounts, &user);
             let mut live = primary;
             if let Some(alias) = alias_for(&user) {
                 if alias_for(alias) != Some(&user) {
-                    rejected.insert(user.clone());
+                    accounts.reject(&user);
                 }
-                let other = staged_identity(&keys, alias);
+                let other = staged_identity(&accounts, alias);
                 if primary.is_some() && other.is_some() && primary != other {
-                    rejected.insert(user.clone());
+                    accounts.reject(&user);
                 }
                 live = primary.or(other);
             }
             if live != Some(*expected) {
-                rejected.insert(user);
+                accounts.reject(&user);
             }
         }
-        let mut prepared_keys = HashMap::new();
         for (jid, key) in identities.prepared {
             if let PreparedAccountIdentity::Trusted(key) = key {
-                prepared_keys.entry(jid).or_insert(*key);
+                let index = accounts.track(jid);
+                accounts.rows[index].prepared.get_or_insert(*key);
             }
         }
         let projection_users: Vec<_> = response
@@ -1373,20 +1476,31 @@ impl Client {
             .map(|list| &list.user)
             .collect();
         let mut projection_records = self
-            .load_device_records_batch_projected(&projection_users, &proposed)
-            .await
+            .load_device_records_batch_projected_checked(&projection_users, &proposed)
+            .await?
             .into_iter();
-        let mut desired = HashMap::new();
         let mut proofs = vec![None; response.device_lists.len()];
+        let mut retained = std::collections::HashSet::new();
         for (position, list) in response.device_lists.iter().enumerate() {
-            let mut previous_record = projection_records.next().flatten();
+            let previous_record = projection_records.next().flatten();
             let Some(bytes) = list.key_index_bytes.as_deref() else {
+                if metadata_only && previous_record.is_some() {
+                    let devices = project_adv_devices(list, None, previous_record.as_ref());
+                    let index = accounts.track(&list.user.with_device(0));
+                    accounts.rows[index].requires_maintenance |= projection_requires_maintenance(
+                        previous_record.as_ref(),
+                        &devices,
+                        None,
+                        mode,
+                        &mut retained,
+                    );
+                }
                 if list.devices.iter().any(|device| device.device != 0) {
                     anyhow::ensure!(
                         mode == DeviceListApplyMode::GroupRefresh,
                         "companion device list omits ADV signature"
                     );
-                    rejected.insert(list.user.with_device(0));
+                    accounts.reject(&list.user.with_device(0));
                 }
                 if list.devices.is_empty() {
                     anyhow::ensure!(
@@ -1394,7 +1508,12 @@ impl Client {
                         "device-list refresh left no valid devices for {}",
                         list.user
                     );
-                    rejected.insert(list.user.with_device(0));
+                    if mode == DeviceListApplyMode::CachePreferred {
+                        let index = accounts.track(&list.user.with_device(0));
+                        accounts.rows[index].empty = true;
+                    } else {
+                        accounts.reject(&list.user.with_device(0));
+                    }
                 }
                 continue;
             };
@@ -1402,22 +1521,22 @@ impl Client {
             if let Some(alias) = alias_for(&user)
                 && alias_for(alias) != Some(&user)
             {
-                rejected.insert(user.clone());
+                accounts.reject(&user);
             }
             let hosted = list.devices.iter().any(|device| device.is_hosted);
             let verified = if hosted {
                 wacore::adv::verify_hosted_key_index_list(bytes)
             } else {
-                let primary = staged_identity(&keys, &user);
-                let other = alias_for(&user).and_then(|alias| staged_identity(&keys, alias));
+                let primary = staged_identity(&accounts, &user);
+                let other = alias_for(&user).and_then(|alias| staged_identity(&accounts, alias));
                 if primary.is_some() && other.is_some() && primary != other {
-                    rejected.insert(user.clone());
+                    accounts.reject(&user);
                 }
                 let key = identities
                     .recovered
                     .filter(|recovered| recovered.user == list.user)
                     .map(|recovered| recovered.identity)
-                    .or_else(|| prepared_keys.get(&list.user).copied())
+                    .or_else(|| accounts.row(&list.user).and_then(|row| row.prepared))
                     .or(primary.or(other));
                 key.and_then(|key| {
                     wacore::adv::verify_key_index_list(bytes, &key).map(|decoded| (decoded, key))
@@ -1425,7 +1544,7 @@ impl Client {
             };
             let Some((decoded, key)) = verified else {
                 if mode == DeviceListApplyMode::GroupRefresh {
-                    rejected.insert(user);
+                    accounts.reject(&user);
                     continue;
                 }
                 return Err(DeviceListAdvError {
@@ -1443,62 +1562,158 @@ impl Client {
             let changes_key = replacement
                 && std::iter::once(&user)
                     .chain(alias_for(&user))
-                    .any(|jid| staged_identity(&keys, jid).is_some_and(|old| old != key));
-            if changes_key
+                    .any(|jid| staged_identity(&accounts, jid).is_some_and(|old| old != key));
+            let discard_previous = changes_key
                 || previous_record
                     .as_ref()
                     .and_then(|record| record.raw_id)
-                    .is_some_and(|raw| raw != decoded.raw_id)
-            {
-                previous_record = None;
+                    .is_some_and(|raw| raw != decoded.raw_id);
+            let devices = project_adv_devices(
+                list,
+                Some(&decoded),
+                if discard_previous {
+                    None
+                } else {
+                    previous_record.as_ref()
+                },
+            );
+            if metadata_only {
+                let index = accounts.track(&user);
+                accounts.rows[index].requires_maintenance |= projection_requires_maintenance(
+                    previous_record.as_ref(),
+                    &devices,
+                    Some(&decoded),
+                    mode,
+                    &mut retained,
+                );
             }
-            if project_adv_devices(list, Some(&decoded), previous_record.as_ref()).is_empty() {
+            if devices.is_empty() {
                 anyhow::ensure!(
                     mode != DeviceListApplyMode::StrictRefresh,
                     "device-list refresh left no valid devices for {}",
                     list.user
                 );
-                rejected.insert(user);
+                if mode == DeviceListApplyMode::CachePreferred {
+                    let index = accounts.track(&user);
+                    accounts.rows[index].empty = true;
+                    // Keep the authenticated row for raw-id cleanup. It cannot
+                    // authorize a new mapping or become a published fanout.
+                    proofs[position] = Some(VerifiedDeviceListEnvelope { decoded, key });
+                } else {
+                    accounts.reject(&user);
+                }
                 continue;
             }
             proofs[position] = Some(VerifiedDeviceListEnvelope { decoded, key });
             for address in std::iter::once(&user).chain(alias_for(&user)) {
-                if let Some(previous) = desired.insert(address.clone(), key)
+                let index = accounts.track(address);
+                if let Some(previous) = accounts.rows[index].desired.replace(key)
                     && previous != key
                 {
-                    rejected.insert(user.clone());
-                    rejected.insert(address.clone());
+                    accounts.reject(&user);
+                    accounts.reject(address);
                 }
             }
         }
         loop {
-            let before = rejected.len();
+            let before = accounts.rejected;
             for (user, alias) in &edges {
-                if staged_rejected(&rejected, user) || staged_rejected(&rejected, alias) {
-                    rejected.extend([user.clone(), alias.clone()]);
+                if staged_rejected(&accounts, user) || staged_rejected(&accounts, alias) {
+                    accounts.reject(user);
+                    accounts.reject(alias);
                 }
             }
-            if rejected.len() == before {
+            if accounts.rejected == before {
                 break;
             }
         }
         anyhow::ensure!(
-            rejected.is_empty() || mode == DeviceListApplyMode::GroupRefresh,
+            accounts.rejected == 0 || mode == DeviceListApplyMode::GroupRefresh,
             "conflicting account identities in ADV response"
         );
         let mut accepted = response.clone();
         accepted
             .device_lists
-            .retain(|list| !staged_rejected(&rejected, &list.user.with_device(0)));
+            .retain(|list| !staged_rejected(&accounts, &list.user.with_device(0)));
         accepted.lid_mappings.retain(|mapping| {
-            !staged_rejected(&rejected, &Jid::pn(mapping.phone_number.as_str()))
-                && !staged_rejected(&rejected, &Jid::lid(mapping.lid.as_str()))
+            [
+                Jid::pn(mapping.phone_number.as_str()),
+                Jid::lid(mapping.lid.as_str()),
+            ]
+            .iter()
+            .all(|user| {
+                !staged_rejected(&accounts, user) && accounts.row(user).is_none_or(|row| !row.empty)
+            })
         });
+        if metadata_only {
+            // Cold mapped contacts can share a response with a different peer
+            // that acquired history while the IQ was in flight. Admission must
+            // cover that whole batch before any mapping reaches its write ACK.
+            if identities.recovered.is_some()
+                || accepted
+                    .device_lists
+                    .iter()
+                    .any(|list| list.devices.iter().any(|device| device.is_hosted))
+            {
+                return Err(DeviceListMaintenanceRequired.into());
+            }
+            if accepted.lid_mappings.len() != response.lid_mappings.len() {
+                // Empty cached projections suppress their own mappings. Replan
+                // against the aliases that will actually be learned, not those
+                // discarded during trust/empty-row filtering.
+                proposed.retain(|user, alias| {
+                    [user, alias].into_iter().all(|user| {
+                        !staged_rejected(&accounts, user)
+                            && accounts.row(user).is_none_or(|row| !row.empty)
+                    })
+                });
+                for row in &mut accounts.rows {
+                    row.requires_maintenance = false;
+                }
+                let records = self
+                    .load_device_records_batch_projected_checked(&projection_users, &proposed)
+                    .await?;
+                for ((list, proof), previous) in
+                    response.device_lists.iter().zip(&proofs).zip(records)
+                {
+                    let user = list.user.with_device(0);
+                    if staged_rejected(&accounts, &user) {
+                        continue;
+                    }
+                    let decoded = proof.as_ref().map(|proof| &proof.decoded);
+                    let raw_changed = previous
+                        .as_ref()
+                        .and_then(|previous| previous.raw_id)
+                        .zip(decoded.map(|decoded| decoded.raw_id))
+                        .is_some_and(|(old, new)| old != new);
+                    let devices = project_adv_devices(
+                        list,
+                        decoded,
+                        if raw_changed { None } else { previous.as_ref() },
+                    );
+                    let index = accounts.track(&user);
+                    accounts.rows[index].requires_maintenance |= projection_requires_maintenance(
+                        previous.as_ref(),
+                        &devices,
+                        decoded,
+                        mode,
+                        &mut retained,
+                    );
+                }
+            }
+            if accounts
+                .rows
+                .iter()
+                .any(|row| !row.rejected && row.requires_maintenance)
+            {
+                return Err(DeviceListMaintenanceRequired.into());
+            }
+        }
         let proofs = response
             .device_lists
             .iter()
             .zip(proofs)
-            .filter(|(list, _)| !staged_rejected(&rejected, &list.user.with_device(0)))
+            .filter(|(list, _)| !staged_rejected(&accounts, &list.user.with_device(0)))
             .map(|(_, proof)| proof)
             .collect();
         Ok(StagedDeviceLists {
@@ -1865,6 +2080,12 @@ impl Client {
         }
         let mut device_records: Vec<wacore::store::traits::DeviceListRecord> =
             Vec::with_capacity(response.device_lists.len());
+        let track_subjects =
+            mode != DeviceListApplyMode::GroupRefresh && response.device_lists.len() > 1;
+        let mut accepted_subjects = Vec::new();
+        if track_subjects {
+            accepted_subjects.reserve(response.device_lists.len());
+        }
         struct PendingIdentityReset<'a> {
             user: &'a Jid,
             previous: wacore::store::traits::DeviceListRecord,
@@ -1887,7 +2108,10 @@ impl Client {
             .iter()
             .map(|user_list| &user_list.user)
             .collect();
-        let mut existing_records = self.load_device_records_batch(&users).await.into_iter();
+        let mut existing_records = self
+            .load_device_records_batch_checked(&users)
+            .await?
+            .into_iter();
 
         for (position, user_list) in response.device_lists.iter().enumerate() {
             // Update device registry (single source of truth for device lists).
@@ -2145,16 +2369,12 @@ impl Client {
                 for device in &previous.devices {
                     // The same response can reuse an ID whose old key index
                     // was revoked. Its replacement must not inherit a warm mark.
-                    if !retained_ids.contains(&device.device_id())
-                        || devices.iter().any(|current| {
-                            current.device_id() == device.device_id()
-                                && current.is_hosted() != device.is_hosted()
-                        })
-                        || (device.device_id() != 0
-                            && decoded_key_index.as_ref().is_some_and(|decoded| {
-                                !wacore::adv::is_key_index_valid(device.key_index(), decoded)
-                            }))
-                    {
+                    if device_requires_cleanup(
+                        device,
+                        &devices,
+                        decoded_key_index.as_ref(),
+                        &retained_ids,
+                    ) {
                         pending_removals.push((&user_list.user, device.device_id()));
                     }
                 }
@@ -2203,6 +2423,34 @@ impl Client {
                 phash: user_list.phash.clone().map(Box::<str>::from),
                 raw_id,
             });
+            if track_subjects {
+                accepted_subjects.push(Some(&user_list.user));
+            }
+        }
+
+        if track_subjects && device_records.len() > 1 {
+            // Storage and cache keep the last row for each canonical account.
+            // Verify every row first, then return exactly that same snapshot.
+            let mut last_by_account =
+                std::collections::HashMap::with_capacity(device_records.len());
+            let mut duplicate = false;
+            for (position, record) in device_records.iter().enumerate() {
+                let key = self.canonical_device_record_key(&record.user).await;
+                if let Some(previous) = last_by_account.insert(key, position) {
+                    accepted_subjects[previous] = None;
+                    duplicate = true;
+                }
+            }
+            if duplicate {
+                fetched_devices.clear();
+                for (subject, record) in accepted_subjects.into_iter().zip(&device_records) {
+                    if let Some(subject) = subject {
+                        fetched_devices.extend(record.devices.iter().map(|device| {
+                            subject.with_device_hosting(device.device_id(), device.is_hosted())
+                        }));
+                    }
+                }
+            }
         }
 
         if maintenance.is_none()

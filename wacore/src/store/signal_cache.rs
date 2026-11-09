@@ -2159,6 +2159,38 @@ impl SignalStoreCache {
         state.delete(address.as_str());
     }
 
+    /// Move an unchanged primary between aliases without retiring its authentication.
+    /// The caller must hold both session guards and prove current reciprocal alias
+    /// ownership under its mapping guard. Cache eviction is not proof of absence.
+    pub async fn move_identity_to_known_alias(
+        &self,
+        from: &ProtocolAddress,
+        to: &ProtocolAddress,
+        expected: &[u8; 32],
+    ) -> bool {
+        let mut state = self.identities.lock().await;
+        if from == to
+            || state.cache.get(from.as_str()).and_then(Option::as_deref)
+                != Some(expected.as_slice())
+            || state.cache.get(to.as_str()).is_none()
+            || state
+                .cache
+                .get(to.as_str())
+                .and_then(Option::as_deref)
+                .is_some_and(|key| key != expected)
+        {
+            return false;
+        }
+        let _change = self.identity_continuity.changing([
+            user_of_protocol_address(from.name()),
+            user_of_protocol_address(to.name()),
+        ]);
+        state.put_dedup(to.as_str(), expected);
+        state.delete(from.as_str());
+        state.evict_if_needed(self.max_entries);
+        true
+    }
+
     fn identity_write_change(
         &self,
         state: &ByteStoreState,
@@ -8649,6 +8681,110 @@ mod durability_chaos_tests;
 #[cfg(test)]
 mod identity_continuity_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn known_alias_transfer_requires_live_cached_anchors() {
+        for case in [
+            "absent",
+            "equal",
+            "conflict_to",
+            "conflict_from",
+            "evicted_from",
+            "evicted_to",
+            "same_address",
+        ] {
+            let cache = SignalStoreCache::new();
+            let backend = crate::store::in_memory::InMemoryBackend::new();
+            let from = ProtocolAddress::new("12025550271@s.whatsapp.net", 0.into());
+            let to = ProtocolAddress::new("100000000000271@lid", 0.into());
+            backend.put_identity(from.as_str(), [1; 32]).await.unwrap();
+            if case == "equal" || case == "conflict_to" {
+                backend
+                    .put_identity(to.as_str(), if case == "equal" { [1; 32] } else { [2; 32] })
+                    .await
+                    .unwrap();
+            }
+            cache.get_identity(&from, &backend).await.unwrap();
+            cache.get_identity(&to, &backend).await.unwrap();
+            if case == "conflict_from" {
+                cache.put_identity(&from, &[2; 32]).await;
+            }
+            if case == "evicted_from" || case == "evicted_to" {
+                let address = if case == "evicted_from" { &from } else { &to };
+                cache.identities.lock().await.cache.remove(address.as_str());
+            }
+            let previous_from = cache.try_get_identity(&from);
+            let previous_to = cache.try_get_identity(&to);
+            let epoch = cache.identity_continuity.snapshot();
+            let destination = if case == "same_address" { &from } else { &to };
+            let moved = cache
+                .move_identity_to_known_alias(&from, destination, &[1; 32])
+                .await;
+            assert_eq!(moved, case == "absent" || case == "equal", "{case}");
+            if moved {
+                assert_eq!(cache.try_get_identity(&from), Some(None));
+                assert_eq!(
+                    cache.try_get_identity(&to).unwrap().unwrap().as_ref(),
+                    &[1; 32]
+                );
+                assert!(
+                    cache
+                        .identity_continuity
+                        .unchanged_primary_for(epoch, ["12025550271", "100000000000271"])
+                );
+                assert!(
+                    !cache
+                        .identity_continuity
+                        .unchanged_for(epoch, ["12025550271", "100000000000271"])
+                );
+                cache.flush(&backend).await.unwrap();
+                assert!(
+                    backend
+                        .load_identity(from.as_str())
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    backend.load_identity(to.as_str()).await.unwrap(),
+                    Some([1; 32])
+                );
+                assert!(
+                    cache
+                        .persist_identity_and_alias_in_epoch(
+                            &to,
+                            Some(&from),
+                            &[1; 32],
+                            &backend,
+                            epoch
+                        )
+                        .await
+                        .unwrap()
+                );
+                cache.delete_identity(&to).await;
+                assert!(
+                    !cache
+                        .persist_identity_and_alias_in_epoch(
+                            &to,
+                            Some(&from),
+                            &[1; 32],
+                            &backend,
+                            epoch
+                        )
+                        .await
+                        .unwrap()
+                );
+            } else {
+                assert_eq!(cache.try_get_identity(&from), previous_from, "{case}");
+                assert_eq!(cache.try_get_identity(&to), previous_to, "{case}");
+                assert!(
+                    cache
+                        .identity_continuity
+                        .unchanged_for(epoch, ["12025550271", "100000000000271"])
+                );
+            }
+        }
+    }
 
     #[test]
     fn primary_epochs_ignore_companion_cleanup_but_not_retirement_or_lost_history() {

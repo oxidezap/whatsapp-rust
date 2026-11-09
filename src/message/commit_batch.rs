@@ -2306,6 +2306,179 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adv_review_round2_peer_reset_preflights_before_learning_other_mapping() {
+        use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq};
+        use std::time::Duration;
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+        use wacore_binary::builder::NodeBuilder;
+
+        struct TwoUserHook(Vec<Jid>);
+        #[async_trait::async_trait]
+        impl InboundDurabilityHook for TwoUserHook {
+            async fn on_messages(
+                &self,
+                client: Arc<Client>,
+                _: &[InboundMessage],
+            ) -> anyhow::Result<()> {
+                let error = client
+                    .refresh_user_devices(self.0.clone())
+                    .await
+                    .unwrap_err();
+                anyhow::ensure!(
+                    error
+                        .to_string()
+                        .contains("cannot run inside an inbound durability hook"),
+                    "{error:#}"
+                );
+                Err(error)
+            }
+        }
+
+        for in_hook in [true, false] {
+            let (client, transport) = create_iq_test_client().await;
+            let phone = Jid::pn("12025550267");
+            let lid = Jid::lid("100000000000267");
+            let peer = Jid::pn("12025550268");
+            let users = vec![phone.clone(), peer.clone()];
+            if in_hook {
+                client
+                    .inbound_durability_hook
+                    .set(Arc::new(TwoUserHook(users.clone())))
+                    .ok()
+                    .unwrap();
+                client.enter_drain_mode_for_tests();
+            }
+            let operation = {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    if in_hook {
+                        let _permit = client.acquire_message_processing_permit().await;
+                        let outcome = client
+                            .commit_pending_batch_result(
+                                vec![PendingDelivery::from(item("ROUND2_PEER_RESET"))].into(),
+                                BatchOrigin::OfflineDrain,
+                                None,
+                                true,
+                            )
+                            .await;
+                        assert!(outcome.persisted);
+                        Ok(outcome.delivered)
+                    } else {
+                        client.refresh_user_devices(users).await.map(|_| true)
+                    }
+                })
+            };
+            let iq = decode_sent_iq(&transport, 0).await;
+            crate::test_utils::seed_adv_primary(&client, &peer).await;
+            client
+                .update_device_list(DeviceListRecord {
+                    user: peer.user.as_str().into(),
+                    devices: [DeviceInfo::new(0, None), DeviceInfo::new(3, Some(1))].into(),
+                    raw_id: Some(1),
+                    timestamp: 1,
+                    phash: None,
+                })
+                .await
+                .unwrap();
+            let mut details = wa::ADVKeyIndexList::default();
+            details.raw_id = Some(2);
+            details.timestamp = Some(100);
+            details.current_index = Some(1);
+            details.valid_indexes = vec![1];
+            let response = NodeBuilder::new("iq")
+                .attr("type", "result")
+                .children([NodeBuilder::new("usync")
+                    .children([NodeBuilder::new("list")
+                        .children([
+                            NodeBuilder::new("user")
+                                .attr("jid", phone.to_string())
+                                .children([
+                                    NodeBuilder::new("lid").attr("val", lid.to_string()).build(),
+                                    NodeBuilder::new("devices")
+                                        .children([NodeBuilder::new("device-list")
+                                            .children([NodeBuilder::new("device")
+                                                .attr("id", "0")
+                                                .build()])
+                                            .build()])
+                                        .build(),
+                                ])
+                                .build(),
+                            NodeBuilder::new("user")
+                                .attr("jid", peer.to_string())
+                                .children([NodeBuilder::new("devices")
+                                    .children([
+                                        NodeBuilder::new("device-list")
+                                            .children([
+                                                NodeBuilder::new("device").attr("id", "0").build(),
+                                                NodeBuilder::new("device")
+                                                    .attr("id", "2")
+                                                    .attr("key-index", "1")
+                                                    .build(),
+                                            ])
+                                            .build(),
+                                        NodeBuilder::new("key-index-list")
+                                            .attr("ts", "100")
+                                            .bytes(crate::test_utils::sign_adv_key_index(
+                                                waproto::codec::adv_key_index_list_to_vec(&details),
+                                            ))
+                                            .build(),
+                                    ])
+                                    .build()])
+                                .build(),
+                        ])
+                        .build()])
+                    .build()])
+                .build();
+            let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+            answer_iq(&client, &id, &response).await;
+            // The concurrent registry publication makes the first response
+            // stale. Answer its legitimate retry with the same full batch.
+            let retry = tokio::time::timeout(Duration::from_secs(5), decode_sent_iq(&transport, 1))
+                .await
+                .unwrap();
+            assert!(client.device_list_identity_alias(&phone).await.is_none());
+            let id = retry
+                .get()
+                .attrs()
+                .optional_string("id")
+                .unwrap()
+                .into_owned();
+            answer_iq(&client, &id, &response).await;
+            let delivered = tokio::time::timeout(Duration::from_secs(5), operation)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(delivered, !in_hook);
+            let backend = client.persistence_manager.backend();
+            assert_eq!(
+                client.device_list_identity_alias(&phone).await.is_some(),
+                !in_hook,
+                "a hook rejected for the independent peer must not publish the other mapping"
+            );
+            assert_eq!(
+                backend.get_lid_mapping(&lid.user).await.unwrap().is_some(),
+                !in_hook
+            );
+            assert_eq!(
+                backend.get_pn_mapping(&phone.user).await.unwrap().is_some(),
+                !in_hook
+            );
+            let record = client.load_device_record_for_jid(&peer).await.unwrap();
+            assert_eq!(record.raw_id, Some(if in_hook { 1 } else { 2 }));
+            assert_eq!(
+                record
+                    .devices
+                    .iter()
+                    .map(|d| d.device_id())
+                    .collect::<Vec<_>>(),
+                if in_hook { vec![0, 3] } else { vec![0, 2] }
+            );
+            client.signal_shutdown_sync();
+        }
+    }
+
+    #[tokio::test]
     async fn offline_durability_hook_can_resolve_an_uncached_ordinary_user() {
         hook_lookup_during_drain(HookDeviceLookup::Metadata).await;
     }

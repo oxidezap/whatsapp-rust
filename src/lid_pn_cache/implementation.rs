@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use wacore_binary::CompactString;
 
+use crate::cache::Cache;
 use crate::cache_config::{CacheConfig, CacheEntryConfig};
 use crate::cache_store::TypedCache;
 #[cfg(test)]
@@ -93,7 +94,7 @@ pub struct LidPnCache {
     /// LID, never a newer un-persisted one. `Arc<str>` value: the hot-path check
     /// clones a refcount and compares in place, no payload copy. In-memory only;
     /// mappings loaded from persistent storage are marked during warm-up.
-    persisted: TypedCache<Arc<str>, Arc<str>>,
+    persisted: Cache<Arc<str>, Arc<str>>,
 }
 
 /// What [`LidPnCache::memory_stats`] reports: one figure per internal map.
@@ -183,7 +184,7 @@ impl LidPnCache {
                 identity_continuity,
                 // Always in-memory: tracks per-process persist state, never the
                 // mapping itself, so it must not go through the shared store.
-                persisted: TypedCache::from_local(config.build_with_tti()),
+                persisted: config.build_with_tti(),
                 contact_hash_to_lid: TypedCache::from_local(config.build_with_tti()),
                 topology: std::sync::OnceLock::new(),
             },
@@ -194,7 +195,7 @@ impl LidPnCache {
                 startup_writes: std::sync::Mutex::new(None),
                 startup_finished: AtomicBool::new(false),
                 identity_continuity,
-                persisted: TypedCache::from_local(config.build_with_tti()),
+                persisted: config.build_with_tti(),
                 contact_hash_to_lid: TypedCache::from_local(config.build_with_tti()),
                 topology: std::sync::OnceLock::new(),
             },
@@ -267,6 +268,12 @@ impl LidPnCache {
     #[cfg(test)]
     pub(crate) fn startup_finished_for_tests(&self) -> bool {
         self.startup_finished.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn evict_reverse_for_tests(&self, lid: &str) {
+        let _guard = self.lock_mutation().await;
+        self.lid_to_entry.invalidate(lid).await;
     }
 
     /// Test-only clones of the backing custom stores, one per direction map.

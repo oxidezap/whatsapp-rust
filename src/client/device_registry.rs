@@ -129,6 +129,13 @@ impl UserLookupKeys {
 }
 
 impl Client {
+    pub(crate) async fn canonical_device_record_key(
+        &self,
+        user: &str,
+    ) -> wacore_binary::CompactString {
+        self.resolve_lookup_keys(user).await.canonical_key().into()
+    }
+
     /// Resolve a user identifier to its canonical storage key (LID preferred).
     ///
     /// This is a convenience wrapper around `resolve_lookup_keys().canonical_key()`.
@@ -1604,24 +1611,30 @@ impl Client {
         &self,
         keys: &[&str],
     ) -> HashMap<Arc<str>, Arc<wacore::store::traits::DeviceListRecord>> {
-        if keys.is_empty() {
-            return HashMap::new();
-        }
-        let rows = match self
-            .persistence_manager
-            .backend()
-            .get_devices_batch(keys)
-            .await
-        {
+        match self.fetch_registry_rows_checked(keys).await {
             Ok(rows) => rows,
             Err(e) => {
                 warn!(
                     "device registry: batched DB lookup failed for {} keys: {e}",
                     keys.len()
                 );
-                return HashMap::new();
+                HashMap::new()
             }
-        };
+        }
+    }
+
+    async fn fetch_registry_rows_checked(
+        &self,
+        keys: &[&str],
+    ) -> Result<HashMap<Arc<str>, Arc<wacore::store::traits::DeviceListRecord>>> {
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = self
+            .persistence_manager
+            .backend()
+            .get_devices_batch(keys)
+            .await?;
         let mut out = HashMap::with_capacity(rows.len());
         for record in rows {
             if record.devices.is_empty() {
@@ -1633,7 +1646,7 @@ impl Client {
                 .await;
             out.insert(Arc::clone(&record.user), record);
         }
-        out
+        Ok(out)
     }
 
     /// Owned registry records for `users`, positionally, from the cache or
@@ -1655,6 +1668,44 @@ impl Client {
         users: &[&Jid],
         proposed: &HashMap<Jid, Jid>,
     ) -> Vec<Option<wacore::store::traits::DeviceListRecord>> {
+        let (records, status) = self
+            .load_device_records_projected_inner(users, proposed)
+            .await;
+        if let Err(e) = status {
+            warn!("device registry: projected DB lookup failed: {e}");
+        }
+        records
+    }
+
+    /// Admission must distinguish an absent record from an unavailable backend.
+    pub(crate) async fn load_device_records_batch_projected_checked(
+        &self,
+        users: &[&Jid],
+        proposed: &HashMap<Jid, Jid>,
+    ) -> Result<Vec<Option<wacore::store::traits::DeviceListRecord>>> {
+        let (records, status) = self
+            .load_device_records_projected_inner(users, proposed)
+            .await;
+        status?;
+        Ok(records)
+    }
+
+    pub(crate) async fn load_device_records_batch_checked(
+        &self,
+        users: &[&Jid],
+    ) -> Result<Vec<Option<wacore::store::traits::DeviceListRecord>>> {
+        self.load_device_records_batch_projected_checked(users, &HashMap::new())
+            .await
+    }
+
+    async fn load_device_records_projected_inner(
+        &self,
+        users: &[&Jid],
+        proposed: &HashMap<Jid, Jid>,
+    ) -> (
+        Vec<Option<wacore::store::traits::DeviceListRecord>>,
+        Result<()>,
+    ) {
         let mut out: Vec<Option<wacore::store::traits::DeviceListRecord>> =
             Vec::with_capacity(users.len());
         let mut pending: Vec<(usize, UserLookupKeys)> = Vec::new();
@@ -1684,19 +1735,22 @@ impl Client {
             out.push(cached);
         }
         if pending.is_empty() {
-            return out;
+            return (out, Ok(()));
         }
         let keys: Vec<&str> = pending
             .iter()
             .flat_map(|(_, lookup)| lookup.all_keys())
             .collect();
-        let rows = self.fetch_registry_rows(&keys).await;
+        let rows = match self.fetch_registry_rows_checked(&keys).await {
+            Ok(rows) => rows,
+            Err(e) => return (out, Err(e)),
+        };
         for (index, lookup) in &pending {
             if let Some(record) = lookup.all_keys().find_map(|key| rows.get(key)) {
                 out[*index] = Some((**record).clone());
             }
         }
-        out
+        (out, Ok(()))
     }
 
     /// Registry devices for many users at once: the cache is probed per

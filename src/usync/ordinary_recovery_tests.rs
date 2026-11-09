@@ -82,6 +82,15 @@ fn primary_response(user: &Jid, account: &KeyPair, valid: bool) -> wacore_binary
 }
 
 /// Sign the shared device-list fixture with a chosen account key.
+fn signed_key_index_for_epoch(valid_indexes: Vec<u32>, current_index: u32, raw_id: u32) -> Vec<u8> {
+    let mut details = waproto::whatsapp::ADVKeyIndexList::default();
+    details.raw_id = Some(raw_id);
+    details.timestamp = Some(1_700_000_000);
+    details.current_index = Some(current_index);
+    details.valid_indexes = valid_indexes;
+    crate::test_utils::sign_adv_key_index(waproto::codec::adv_key_index_list_to_vec(&details))
+}
+
 fn signed_list(account: &KeyPair, embedded_key: bool) -> Vec<u8> {
     let mut signed =
         waproto::codec::adv_signed_key_index_list_decode(&signed_key_index_bytes(vec![1], 1))
@@ -3339,60 +3348,67 @@ async fn adv_review_bootstrap_rechecks_retirement_after_backend_ack() {
 async fn adv_review_staged_proofs_remain_bound_to_duplicate_response_rows() {
     use wacore::usync::{UserDeviceList, UsyncDevice, UsyncLidMapping};
     for group in [false, true] {
-        let (client, _) = create_iq_test_client().await;
-        let phone = Jid::pn("12025550236");
-        let lid = Jid::lid("100000000000236");
-        for user in [&phone, &lid] {
-            crate::test_utils::seed_adv_primary(&client, user).await;
-        }
-        let response = DeviceListResponse {
-            device_lists: [(7, 1), (8, 2)]
-                .into_iter()
-                .map(|(device, index)| UserDeviceList {
-                    user: phone.clone(),
-                    devices: vec![
-                        UsyncDevice::new(0, None),
-                        UsyncDevice::new(device, Some(index)),
-                    ],
-                    phash: None,
-                    key_index_bytes: Some(signed_key_index_bytes(vec![index], index)),
-                })
-                .collect(),
-            lid_mappings: vec![UsyncLidMapping {
-                phone_number: phone.user.clone(),
-                lid: lid.user.clone(),
-            }],
-        };
-        let devices = client
-            .apply_device_list_response(
-                &response,
-                if group {
-                    DeviceListApplyMode::GroupRefresh
-                } else {
-                    DeviceListApplyMode::StrictRefresh
-                },
-                None,
-                group.then_some(std::slice::from_ref(&phone)),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(devices.iter().any(|jid| jid.device == 8));
-        if !group {
-            assert!(devices.iter().any(|jid| jid.device == 7));
-        }
-        for user in [&phone, &lid] {
-            let record = client.load_device_record_for_jid(user).await.unwrap();
+        for (last_device, last_index) in [(8, 2), (7, 1)] {
+            let (client, _) = create_iq_test_client().await;
+            let phone = Jid::pn("12025550236");
+            let lid = Jid::lid("100000000000236");
+            for user in [&phone, &lid] {
+                crate::test_utils::seed_adv_primary(&client, user).await;
+            }
+            let response = DeviceListResponse {
+                device_lists: [(7, 1), (last_device, last_index)]
+                    .into_iter()
+                    .map(|(device, index)| UserDeviceList {
+                        user: phone.clone(),
+                        devices: vec![
+                            UsyncDevice::new(0, None),
+                            UsyncDevice::new(device, Some(index)),
+                        ],
+                        phash: None,
+                        key_index_bytes: Some(signed_key_index_for_epoch(
+                            vec![index],
+                            index,
+                            index,
+                        )),
+                    })
+                    .collect(),
+                lid_mappings: vec![UsyncLidMapping {
+                    phone_number: phone.user.clone(),
+                    lid: lid.user.clone(),
+                }],
+            };
+            let devices = client
+                .apply_device_list_response(
+                    &response,
+                    if group {
+                        DeviceListApplyMode::GroupRefresh
+                    } else {
+                        DeviceListApplyMode::StrictRefresh
+                    },
+                    None,
+                    group.then_some(std::slice::from_ref(&phone)),
+                )
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(
-                record
-                    .devices
-                    .iter()
-                    .map(|device| (device.device_id(), device.key_index()))
-                    .collect::<Vec<_>>(),
-                [(0, None), (8, Some(2))]
+                devices.iter().map(|jid| jid.device).collect::<Vec<_>>(),
+                [0, last_device]
             );
+            for user in [&phone, &lid] {
+                let record = client.load_device_record_for_jid(user).await.unwrap();
+                assert_eq!(
+                    record
+                        .devices
+                        .iter()
+                        .map(|device| (device.device_id(), device.key_index()))
+                        .collect::<Vec<_>>(),
+                    [(0, None), (last_device, Some(last_index))]
+                );
+                assert_eq!(record.raw_id, Some(last_index));
+            }
+            client.signal_shutdown_sync();
         }
-        client.signal_shutdown_sync();
     }
 }
 
@@ -3648,7 +3664,11 @@ async fn adv_review_wire_hosted_subjects_cannot_bypass_the_account_epoch_graph()
             assert!(client.load_device_record_for_jid(&phone).await.is_none());
         } else {
             let devices = result.unwrap().unwrap();
-            assert!(devices.iter().any(|jid| jid.device == 7));
+            assert!(!devices.iter().any(|jid| jid.device == 7));
+            assert_eq!(
+                devices.iter().map(|jid| jid.device).collect::<Vec<_>>(),
+                [0, 99]
+            );
             assert!(
                 devices
                     .iter()
@@ -4244,6 +4264,144 @@ async fn adv_review_primary_iq_before_no_prior_notification_cannot_establish_tru
     client.signal_shutdown_sync();
 }
 
+/// A one-sided cache eviction must not let a resolved alias outlive retirement.
+#[tokio::test]
+async fn adv_review_round2_pn_notification_retires_the_resolved_lid() {
+    for (evict_reverse, explicit_lid) in [(true, false), (false, false), (true, true)] {
+        let (client, transport) = create_iq_test_client().await;
+        let phone = Jid::pn("12025550265");
+        let lid = Jid::lid("100000000000265");
+        client
+            .add_lid_pn_mapping(
+                &lid.user,
+                &phone.user,
+                crate::lid_pn_cache::LearningSource::Usync,
+            )
+            .await
+            .unwrap();
+        if evict_reverse {
+            client.lid_pn_cache.evict_reverse_for_tests(&lid.user).await;
+        }
+        assert_eq!(
+            client.device_list_identity_alias(&phone).await,
+            Some(lid.clone())
+        );
+        assert_eq!(
+            client.device_list_identity_alias(&lid).await.is_none(),
+            evict_reverse
+        );
+        let stale = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let operation = {
+            let client = client.clone();
+            let lid = lid.clone();
+            tokio::spawn(async move { client.ensure_adv_account_identity(&lid).await })
+        };
+        let iq = decode_sent_iq(&transport, 0).await;
+        deliver_identity_reset(&client, &phone, explicit_lid.then_some(&lid)).await;
+        let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+        answer_iq(&client, &id, &primary_response(&lid, &stale, true)).await;
+        let result = tokio::time::timeout(Duration::from_secs(5), operation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "a PN notification must retire its resolved LID IQ"
+        );
+        assert_eq!(
+            client.cached_adv_account_identity(&lid).await.unwrap(),
+            None
+        );
+        assert!(
+            client
+                .persistence_manager
+                .backend()
+                .load_identity(lid.to_protocol_address().as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let fresh = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let retry = {
+            let client = client.clone();
+            let lid = lid.clone();
+            tokio::spawn(async move { client.ensure_adv_account_identity(&lid).await })
+        };
+        let iq = decode_sent_iq(&transport, 1).await;
+        let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+        answer_iq(&client, &id, &primary_response(&lid, &fresh, true)).await;
+        assert_eq!(
+            retry.await.unwrap().unwrap(),
+            *fresh.public_key.public_key_bytes()
+        );
+        client.signal_shutdown_sync();
+    }
+}
+
+#[tokio::test]
+async fn adv_review_round2_known_same_key_migration_preserves_companion_authentication() {
+    for case in ["same", "conflict", "unknown"] {
+        let (client, transport) = create_iq_test_client().await;
+        let phone = Jid::pn("12025550266");
+        let lid = Jid::lid("100000000000266");
+        let key = crate::test_utils::adv_test_account();
+        if case != "unknown" {
+            client
+                .add_lid_pn_mapping(
+                    &lid.user,
+                    &phone.user,
+                    crate::lid_pn_cache::LearningSource::Usync,
+                )
+                .await
+                .unwrap();
+            crate::test_utils::seed_adv_primary(&client, &phone).await;
+        }
+        let primary = if case == "unknown" { &phone } else { &lid };
+        let fetch = {
+            let client = client.clone();
+            let companion = primary.with_device(7);
+            tokio::spawn(async move { client.fetch_pre_keys(&[companion], None).await })
+        };
+        let iq = decode_sent_iq(&transport, 0).await;
+        if case == "unknown" {
+            crate::test_utils::seed_adv_primary(&client, &phone).await;
+        }
+        if case == "conflict" {
+            let changed = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+            client
+                .signal_cache
+                .put_identity(
+                    &lid.to_protocol_address(),
+                    changed.public_key.public_key_bytes(),
+                )
+                .await;
+        }
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client.migrate_signal_sessions_on_lid_discovery(&phone.user, &lid.user),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            client.cached_adv_account_identity(&phone).await.unwrap(),
+            None
+        );
+        let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+        answer_iq(&client, &id, &primary_response(primary, key, true)).await;
+        let result = tokio::time::timeout(Duration::from_secs(5), fetch)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result.is_ok(),
+            case == "same",
+            "migration case {case}: {:?}",
+            result.as_ref().err()
+        );
+        client.signal_shutdown_sync();
+    }
+}
+
 /// Companion-only fetches also need the epoch from before their implicit
 /// primary IQ, not a new epoch captured after the old reply has arrived.
 #[tokio::test]
@@ -4375,6 +4533,216 @@ async fn adv_review_empty_projection_does_not_publish_its_mapping() {
                     .map(|device| device.device_id())
                     .collect::<Vec<_>>(),
                 [0, companion]
+            );
+        }
+        client.signal_shutdown_sync();
+    }
+}
+
+#[tokio::test]
+async fn adv_review_round2_registry_io_does_not_publish_unadmitted_mapping() {
+    use crate::store::release::tests::ProbeBackend;
+    use crate::test_utils::create_iq_test_client_with_backend;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use wacore::usync::{UserDeviceList, UsyncDevice, UsyncLidMapping};
+    let (mut probe, _) = ProbeBackend::new();
+    let raw = probe.backend.clone();
+    let failing = Arc::new(AtomicBool::new(false));
+    let (release, gate) = async_channel::unbounded();
+    let (entered, arrived) = async_channel::unbounded();
+    probe.gate_method = "get_devices_batch";
+    probe.gate = Some(gate);
+    probe.entered = Some(entered);
+    probe.fail_before_method = Some(("get_devices_batch", failing.clone()));
+    let phone = Jid::pn("12025550278");
+    let lid = Jid::lid("100000000000278");
+    let peer = Jid::pn("12025550279");
+    raw.update_device_list(DeviceListRecord {
+        user: peer.user.as_str().into(),
+        devices: [DeviceInfo::new(0, None), DeviceInfo::new(3, Some(1))].into(),
+        raw_id: Some(1),
+        timestamp: 1,
+        phash: None,
+    })
+    .await
+    .unwrap();
+    let (client, _) = create_iq_test_client_with_backend(Arc::new(probe)).await;
+    crate::test_utils::seed_adv_primary(&client, &peer).await;
+    let prepared = vec![(
+        peer.clone(),
+        PreparedAccountIdentity::Trusted(
+            client
+                .cached_adv_account_identity(&peer)
+                .await
+                .unwrap()
+                .unwrap(),
+        ),
+    )];
+    let response = DeviceListResponse {
+        device_lists: vec![
+            UserDeviceList {
+                user: phone.clone(),
+                devices: vec![UsyncDevice::new(0, None)],
+                phash: None,
+                key_index_bytes: None,
+            },
+            UserDeviceList {
+                user: peer.clone(),
+                devices: vec![UsyncDevice::new(0, None), UsyncDevice::new(2, Some(1))],
+                phash: None,
+                key_index_bytes: Some(signed_key_index_for_epoch(vec![1], 1, 2)),
+            },
+        ],
+        lid_mappings: vec![UsyncLidMapping {
+            phone_number: phone.user.clone(),
+            lid: lid.user.clone(),
+        }],
+    };
+    let mut operation = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .apply_device_list_response_inner(
+                    &response,
+                    DeviceListApplyMode::CachePreferred,
+                    None,
+                    None,
+                    DeviceListIdentityContext {
+                        prepared: &prepared,
+                        recovered: None,
+                    },
+                    None,
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    failing.store(true, Ordering::Relaxed);
+    release.send(()).await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            result = &mut operation => result.unwrap(),
+            second = arrived.recv() => {
+                // Drive the old lossy path far enough to expose its partial
+                // mapping: only staging fails, the processor's retry succeeds.
+                second.unwrap();
+                failing.store(false, Ordering::Relaxed);
+                release.send(()).await.unwrap();
+                (&mut operation).await.unwrap()
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let error = result.unwrap_err();
+    assert!(
+        client.device_list_identity_alias(&phone).await.is_none(),
+        "a failed staging read cannot prove that publishing the mapping needs no maintenance"
+    );
+    assert!(raw.get_lid_mapping(&lid.user).await.unwrap().is_none());
+    assert!(raw.get_pn_mapping(&phone.user).await.unwrap().is_none());
+    assert!(format!("{error:#}").contains("synthetic failure before commit"));
+    assert_eq!(
+        raw.get_devices(&peer.user).await.unwrap().unwrap().raw_id,
+        Some(1)
+    );
+    client.signal_shutdown_sync();
+}
+
+#[tokio::test]
+async fn adv_review_round2_cached_empty_projection_is_local_and_keeps_reset_cleanup() {
+    use wacore::usync::{UserDeviceList, UsyncDevice, UsyncLidMapping};
+    for changed_raw_id in [false, true] {
+        let (client, _) = create_iq_test_client().await;
+        let phone = Jid::pn("12025550269");
+        let lid = Jid::lid("100000000000269");
+        let empty = Jid::pn("12025550270");
+        let empty_lid = Jid::lid("100000000000270");
+        crate::test_utils::seed_adv_primary(&client, &empty).await;
+        client
+            .update_device_list(DeviceListRecord {
+                user: empty.user.as_str().into(),
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(3, Some(1))].into(),
+                raw_id: Some(1),
+                timestamp: 1,
+                phash: None,
+            })
+            .await
+            .unwrap();
+        let response = DeviceListResponse {
+            device_lists: vec![
+                UserDeviceList {
+                    user: phone.clone(),
+                    devices: vec![UsyncDevice::new(0, None)],
+                    phash: None,
+                    key_index_bytes: None,
+                },
+                UserDeviceList {
+                    user: empty.clone(),
+                    devices: vec![UsyncDevice::new(7, Some(9))],
+                    phash: None,
+                    key_index_bytes: Some(signed_key_index_for_epoch(
+                        vec![1],
+                        1,
+                        if changed_raw_id { 2 } else { 1 },
+                    )),
+                },
+            ],
+            lid_mappings: [(&phone, &lid), (&empty, &empty_lid)]
+                .into_iter()
+                .map(|(pn, lid)| UsyncLidMapping {
+                    phone_number: pn.user.clone(),
+                    lid: lid.user.clone(),
+                })
+                .collect(),
+        };
+        let devices = client
+            .apply_device_list_response(&response, DeviceListApplyMode::CachePreferred, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(devices, vec![phone.clone()]);
+        assert_eq!(
+            client.device_list_identity_alias(&phone).await,
+            Some(lid.clone())
+        );
+        assert_eq!(
+            client
+                .load_device_record_for_jid(&phone)
+                .await
+                .unwrap()
+                .devices
+                .len(),
+            1
+        );
+        assert!(client.device_list_identity_alias(&empty).await.is_none());
+        assert!(
+            client
+                .persistence_manager
+                .backend()
+                .get_lid_mapping(&empty_lid.user)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let old = client.load_device_record_for_jid(&empty).await;
+        if changed_raw_id {
+            assert!(
+                old.is_none(),
+                "the rejected empty fanout must still retire its old raw-id epoch"
+            );
+        } else {
+            let old = old.unwrap();
+            assert_eq!(old.raw_id, Some(1));
+            assert_eq!(
+                old.devices
+                    .iter()
+                    .map(|d| d.device_id())
+                    .collect::<Vec<_>>(),
+                [0, 3]
             );
         }
         client.signal_shutdown_sync();

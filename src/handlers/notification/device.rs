@@ -218,11 +218,13 @@ pub(crate) async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<
     use wacore::types::jid::JidExt;
 
     let stanza_lid = node.attrs().optional_jid("lid");
+    let resolved = client.resolve_encryption_jid(&from_jid).await;
     // Retire authentication begun before this notification, even when the
     // primary was absent. Keep the marker through local cleanup and its ACK,
     // but release it before any fresh authentication triggered below.
     let retirement = client.signal_cache.identity_continuity.changing_primary(
         std::iter::once(from_jid.user.as_ref())
+            .chain(std::iter::once(resolved.user.as_ref()))
             .chain(stanza_lid.as_ref().map(|jid| jid.user.as_ref())),
     );
 
@@ -253,7 +255,6 @@ pub(crate) async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<
     //   - the LID carried by the stanza itself (the local cache may be cold/evicted
     //     so resolve falls back to PN, yet the state lives under the stanza LID).
     // Reading only the resolved address would false-negative and skip a real reset.
-    let resolved = client.resolve_encryption_jid(&from_jid).await;
     let backend = client.persistence_manager.backend();
 
     let mut reset_addrs = vec![resolved.to_protocol_address()];
