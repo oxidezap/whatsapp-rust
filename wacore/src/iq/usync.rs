@@ -391,12 +391,37 @@ pub(crate) fn project_lid_mapping(user: &UsyncUserResult) -> Option<UsyncLidMapp
 }
 
 #[inline]
+fn device_list_subject_server(server: wacore_binary::Server) -> wacore_binary::Server {
+    use wacore_binary::Server;
+    match server {
+        Server::Hosted => Server::Pn,
+        Server::HostedLid => Server::Lid,
+        server => server,
+    }
+}
+
+/// The typed USync result retains wire namespaces. Device-list accounts use
+/// logical user WIDs (WAWebUsync -> deviceJidToUserWid), while individual
+/// devices retain their separate Hosted addressing through `is_hosted`.
+fn device_list_account_subject(mut jid: Jid) -> Jid {
+    jid.server = device_list_subject_server(jid.server);
+    jid.device = 0;
+    if !jid.server.renders_agent() {
+        jid.agent = 0;
+    }
+    jid
+}
+
+#[inline]
 fn device_list_identity_matches(
     returned: &Jid,
     expected: &Jid,
     mappings: &[UsyncLidMapping],
 ) -> bool {
-    if returned.user == expected.user && returned.server == expected.server {
+    if returned.user == expected.user
+        && device_list_subject_server(returned.server)
+            == device_list_subject_server(expected.server)
+    {
         return true;
     }
 
@@ -921,7 +946,7 @@ pub(crate) fn device_list_query(
         .iter()
         .map(|jid| {
             let bare = jid.to_non_ad();
-            let mut user = UsyncUser::from_jid(bare.clone());
+            let mut user = UsyncUser::from_jid(device_list_account_subject(bare.clone()));
             if let Some((device_hash, timestamp)) = hashes.and_then(|hashes| hashes.get(&bare)) {
                 user = user.with_device_sync(
                     UsyncDeviceSyncHint::new()
@@ -967,7 +992,7 @@ fn project_device_list_response_checked(
         if let Some(mapping) = project_lid_mapping(&user) {
             lid_mappings.push(mapping);
         }
-        let Some(user_jid) = user.id else {
+        let Some(user_jid) = user.id.map(device_list_account_subject) else {
             continue;
         };
 
@@ -2110,6 +2135,84 @@ mod tests {
         assert_eq!(result.lid_mappings.len(), 1);
         assert_eq!(result.lid_mappings[0].phone_number, "9876543210");
         assert_eq!(result.lid_mappings[0].lid, "100000000000987");
+    }
+
+    #[test]
+    fn device_lists_scope_hosted_subjects_to_the_logical_account() {
+        for (raw, logical) in [
+            ("12025550241:99@hosted", Jid::pn("12025550241")),
+            ("100000000000241:99@hosted.lid", Jid::lid("100000000000241")),
+        ] {
+            let raw: Jid = raw.parse().unwrap();
+            let response = usync_result(vec![
+                NodeBuilder::new("user")
+                    .attr("jid", raw.to_string())
+                    .children([NodeBuilder::new("devices")
+                        .children([
+                            build_test_key_index_list_node(&[99]),
+                            NodeBuilder::new("device-list")
+                                .children([
+                                    NodeBuilder::new("device").attr("id", "0").build(),
+                                    NodeBuilder::new("device")
+                                        .attr("id", "99")
+                                        .attr("key-index", "99")
+                                        .attr("is_hosted", "true")
+                                        .build(),
+                                ])
+                                .build(),
+                        ])
+                        .build()])
+                    .build(),
+            ]);
+            let spec = DeviceListSpec::with_hashes(
+                vec![raw.clone()],
+                "logical-account",
+                HashMap::from([(raw.to_non_ad(), ("2:hosted-hint".into(), 42))]),
+            );
+            let parsed = spec.parse_response(&response.as_node_ref()).unwrap();
+            assert_eq!(parsed.device_lists[0].user, logical);
+            assert!(parsed.device_lists[0].devices[1].is_hosted);
+            assert_eq!(parsed.device_lists[0].devices[1].device, 99);
+            spec.clone()
+                .require_complete_response()
+                .parse_response(&response.as_node_ref())
+                .unwrap();
+            DeviceListSpec::new(vec![logical.clone()], "logical-request")
+                .require_complete_response()
+                .parse_response(&response.as_node_ref())
+                .unwrap();
+            assert!(
+                DeviceListSpec::new(
+                    vec![Jid::new(logical.user.as_str(), Server::Bot)],
+                    "other-namespace"
+                )
+                .require_complete_response()
+                .parse_response(&response.as_node_ref())
+                .is_err()
+            );
+            let iq = spec.build_iq();
+            let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+                panic!("expected usync query");
+            };
+            let user = nodes[0]
+                .get_optional_child("list")
+                .unwrap()
+                .get_optional_child("user")
+                .unwrap();
+            assert_eq!(
+                user.attrs.get("jid").unwrap().to_string(),
+                logical.to_string()
+            );
+            assert_eq!(
+                user.get_optional_child("devices")
+                    .unwrap()
+                    .attrs
+                    .get("device_hash")
+                    .unwrap()
+                    .to_string(),
+                "2:hosted-hint"
+            );
+        }
     }
 
     #[test]

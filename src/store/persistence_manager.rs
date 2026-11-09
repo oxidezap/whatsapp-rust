@@ -2,7 +2,7 @@ use super::error::StoreError;
 use super::release::{BackendLease, StoreRelease};
 use crate::store::Device;
 use crate::store::traits::Backend;
-use async_lock::{Mutex, RwLock, RwLockWriteGuard};
+use async_lock::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use event_listener::Event;
 use futures::FutureExt;
 use log::{debug, error};
@@ -65,6 +65,12 @@ pub struct PersistenceManager {
     // Last: mutable/cached Devices and cancellation-retained saves must release
     // their raw backend references before the manager releases its lease.
     backend: BackendLease,
+}
+
+/// Prevent managed paired-account mutations through a trust publication ACK.
+/// No writable Device reference escapes the manager.
+pub(crate) struct DeviceOwnershipGuard<'a> {
+    _device: RwLockReadGuard<'a, Device>,
 }
 
 /// Publish even when an advanced modifier unwinds or its future is cancelled.
@@ -336,6 +342,12 @@ impl PersistenceManager {
             .read()
             .expect("snapshot publication only swaps prepared Arcs")
             .clone()
+    }
+
+    pub(crate) async fn lock_device_ownership(&self) -> DeviceOwnershipGuard<'_> {
+        DeviceOwnershipGuard {
+            _device: self.device.read().await,
+        }
     }
 
     pub(crate) fn backend_ref(&self) -> &dyn Backend {

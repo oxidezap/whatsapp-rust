@@ -1644,11 +1644,32 @@ impl Client {
         &self,
         users: &[&Jid],
     ) -> Vec<Option<wacore::store::traits::DeviceListRecord>> {
+        self.load_device_records_batch_projected(users, &HashMap::new())
+            .await
+    }
+
+    /// Select exactly the cache/backend tiers that would be visible after
+    /// accepting these aliases, without publishing the aliases themselves.
+    pub(crate) async fn load_device_records_batch_projected(
+        &self,
+        users: &[&Jid],
+        proposed: &HashMap<Jid, Jid>,
+    ) -> Vec<Option<wacore::store::traits::DeviceListRecord>> {
         let mut out: Vec<Option<wacore::store::traits::DeviceListRecord>> =
             Vec::with_capacity(users.len());
         let mut pending: Vec<(usize, UserLookupKeys)> = Vec::new();
         for (index, jid) in users.iter().enumerate() {
-            let lookup = self.resolve_lookup_keys_for_jid(jid).await;
+            let lookup = match proposed.get(&jid.with_device(0)) {
+                Some(alias) if jid.server == Server::Pn => UserLookupKeys::PnWithLid {
+                    lid: alias.user.clone(),
+                    pn: jid.user.clone(),
+                },
+                Some(alias) if jid.server == Server::Lid => UserLookupKeys::LidWithPn {
+                    lid: jid.user.clone(),
+                    pn: alias.user.clone(),
+                },
+                _ => self.resolve_lookup_keys_for_jid(jid).await,
+            };
             let mut cached = None;
             for key in lookup.all_keys() {
                 if let Some(record) = self.device_registry_cache.get(key).await {

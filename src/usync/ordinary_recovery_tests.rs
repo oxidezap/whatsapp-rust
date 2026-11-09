@@ -246,7 +246,13 @@ async fn stale_maintenance_permit_cannot_flush_a_new_drain() {
 #[tokio::test]
 async fn ordinary_recovery_rejects_an_alias_restored_after_its_lock_snapshot() {
     use wacore::usync::{UserDeviceList, UsyncDevice, UsyncLidMapping};
-    let (client, transport) = create_iq_test_client().await;
+    // This checkpoint excludes database scheduling as a source of Pending:
+    // the warmed session locks and immediate in-memory reads leave only the
+    // deliberately held candidate lock before authentication can start.
+    let (client, transport) = crate::test_utils::create_iq_test_client_with_backend(Arc::new(
+        wacore::store::in_memory::InMemoryBackend::new(),
+    ))
+    .await;
     let phone = Jid::pn("12025550193");
     let lid = Jid::lid("100000000000193");
     for user in [&phone, &lid] {
@@ -285,8 +291,16 @@ async fn ordinary_recovery_rejects_an_alias_restored_after_its_lock_snapshot() {
         },
         topology_generation: client.device_topology.current(),
     };
+    let primary_lock = client
+        .session_lock_for(phone.to_protocol_address().as_str())
+        .await;
     let mut recovery = client.recover_ordinary_adv_identity(error.into());
     assert!(futures::poll!(recovery.as_mut()).is_pending());
+    assert!(wacore::types::jid::cmp_for_lock_order(&phone, &lid).is_lt());
+    assert!(
+        primary_lock.try_lock().is_none(),
+        "recovery must own the earlier primary lock while waiting for the candidate; a merely queued IQ releases that lock"
+    );
     assert!(
         transport.sent().is_empty(),
         "the missing candidate lock must precede the IQ"
@@ -2281,7 +2295,30 @@ async fn mixed_hosted_and_ordinary_alias_lists_cannot_cross_trust_epochs() {
                         .await
                 };
                 if same_epoch {
-                    assert!(result.unwrap().is_some());
+                    let devices = result.unwrap().unwrap();
+                    assert!(devices.contains(&peer.with_device(7)));
+                    let selected = if hosted_first { 7 } else { 99 };
+                    for user in [&pn, &lid] {
+                        let record = client.load_device_record_for_jid(user).await.unwrap();
+                        assert_eq!(
+                            record
+                                .devices
+                                .iter()
+                                .map(|device| device.device_id())
+                                .collect::<Vec<_>>(),
+                            [0, selected]
+                        );
+                        assert_ne!(record.timestamp, 1);
+                    }
+                    assert!(
+                        devices
+                            .iter()
+                            .any(|jid| (jid.user == pn.user || jid.user == lid.user)
+                                && jid.device == selected)
+                    );
+                    assert!(!devices.iter().any(|jid| (jid.user == pn.user
+                        || jid.user == lid.user)
+                        && jid.device == 3));
                 } else if group {
                     let devices = result.unwrap().unwrap();
                     assert!(devices.contains(&peer.with_device(7)));
@@ -2634,7 +2671,20 @@ async fn rejected_new_mapping_does_not_rebind_the_group_contact() {
                         .is_none()
                 );
             } else {
-                assert!(result.unwrap().is_some());
+                let devices = result.unwrap().unwrap();
+                assert!(devices.iter().any(|jid| (jid.user == pn.user || jid.user == lid.user) && jid.device == 7));
+                for user in [&pn, &lid] {
+                    let record = client.load_device_record_for_jid(user).await.unwrap();
+                    assert_eq!(
+                        record
+                            .devices
+                            .iter()
+                            .map(|device| device.device_id())
+                            .collect::<Vec<_>>(),
+                        [0, 7]
+                    );
+                    assert_ne!(record.timestamp, 1);
+                }
                 assert_eq!(
                     client
                         .lid_pn_cache
@@ -3166,6 +3216,1141 @@ async fn first_mapping_recovery_rejects_ineligible_candidates_before_iq() {
         assert!(has_session(&client, &session).await, "{case}");
         assert!(client.device_list_identity_alias(&phone).await.is_none());
         drop(owner_guard);
+        client.signal_shutdown_sync();
+    }
+}
+
+#[tokio::test]
+async fn adv_review_bootstrap_rechecks_retirement_after_backend_ack() {
+    use crate::store::release::tests::ProbeBackend;
+    use crate::test_utils::create_iq_test_client_with_backend;
+    let key = *crate::test_utils::adv_test_account()
+        .public_key
+        .public_key_bytes();
+    let (mut probe, _) = ProbeBackend::new();
+    let raw = probe.backend.clone();
+    let (release, gate) = async_channel::unbounded();
+    let (entered, arrived) = async_channel::unbounded();
+    probe.detach_identity_writes = true;
+    probe.identity_gate_key = Some(key);
+    probe.gate_method = "put_identity";
+    probe.gate = Some(gate);
+    probe.entered = Some(entered);
+    let (client, _) = create_iq_test_client_with_backend(Arc::new(probe)).await;
+    let primary = Jid::pn("12025550235");
+    let writer = {
+        let client = client.clone();
+        let primary = primary.clone();
+        tokio::spawn(async move { client.persist_adv_bootstrap_identity(&primary, &key).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let retirement = client
+        .signal_cache
+        .identity_continuity
+        .changing_primary([primary.user.as_str()]);
+    release.send(()).await.unwrap();
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+    );
+    // Rejection does not roll back an acknowledged host write. Keep it pinned
+    // until the reset's ordered deletion has reached persistence.
+    assert_eq!(
+        raw.load_identity(primary.to_protocol_address().as_str())
+            .await
+            .unwrap(),
+        Some(key)
+    );
+    client
+        .signal_cache
+        .delete_identity(&primary.to_protocol_address())
+        .await;
+    client
+        .signal_cache
+        .flush(client.persistence_manager.backend().as_ref())
+        .await
+        .unwrap();
+    drop(retirement);
+    assert_eq!(
+        raw.load_identity(primary.to_protocol_address().as_str())
+            .await
+            .unwrap(),
+        None
+    );
+    client.signal_shutdown_sync();
+}
+
+#[tokio::test]
+async fn adv_review_staged_proofs_remain_bound_to_duplicate_response_rows() {
+    use wacore::usync::{UserDeviceList, UsyncDevice, UsyncLidMapping};
+    for group in [false, true] {
+        let (client, _) = create_iq_test_client().await;
+        let phone = Jid::pn("12025550236");
+        let lid = Jid::lid("100000000000236");
+        for user in [&phone, &lid] {
+            crate::test_utils::seed_adv_primary(&client, user).await;
+        }
+        let response = DeviceListResponse {
+            device_lists: [(7, 1), (8, 2)]
+                .into_iter()
+                .map(|(device, index)| UserDeviceList {
+                    user: phone.clone(),
+                    devices: vec![
+                        UsyncDevice::new(0, None),
+                        UsyncDevice::new(device, Some(index)),
+                    ],
+                    phash: None,
+                    key_index_bytes: Some(signed_key_index_bytes(vec![index], index)),
+                })
+                .collect(),
+            lid_mappings: vec![UsyncLidMapping {
+                phone_number: phone.user.clone(),
+                lid: lid.user.clone(),
+            }],
+        };
+        let devices = client
+            .apply_device_list_response(
+                &response,
+                if group {
+                    DeviceListApplyMode::GroupRefresh
+                } else {
+                    DeviceListApplyMode::StrictRefresh
+                },
+                None,
+                group.then_some(std::slice::from_ref(&phone)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(devices.iter().any(|jid| jid.device == 8));
+        if !group {
+            assert!(devices.iter().any(|jid| jid.device == 7));
+        }
+        for user in [&phone, &lid] {
+            let record = client.load_device_record_for_jid(user).await.unwrap();
+            assert_eq!(
+                record
+                    .devices
+                    .iter()
+                    .map(|device| (device.device_id(), device.key_index()))
+                    .collect::<Vec<_>>(),
+                [(0, None), (8, Some(2))]
+            );
+        }
+        client.signal_shutdown_sync();
+    }
+}
+
+#[tokio::test]
+async fn adv_review_recovery_rejects_a_durably_owned_cold_alias() {
+    let (client, transport) = create_iq_test_client().await;
+    let phone = Jid::pn("12025550237");
+    let other = Jid::pn("12025550238");
+    let lid = Jid::lid("100000000000237");
+    crate::test_utils::seed_adv_primary(&client, &phone).await;
+    client
+        .persistence_manager
+        .backend()
+        .put_lid_mapping(&wacore::store::traits::LidPnMappingEntry {
+            lid: lid.user.to_string(),
+            phone_number: other.user.to_string(),
+            created_at: 1,
+            updated_at: 1,
+            learning_source: "usync".into(),
+        })
+        .await
+        .unwrap();
+    assert!(client.device_list_identity_alias(&lid).await.is_none());
+    let failure =
+        first_mapping_failure(&client, &phone, &lid, crate::test_utils::adv_test_account());
+    assert!(
+        client
+            .capture_adv_recovery_snapshot(&phone, &failure.response)
+            .await
+            .is_err(),
+        "a cache miss must not erase durable ownership"
+    );
+    assert!(transport.sent().is_empty());
+    assert_eq!(
+        client
+            .persistence_manager
+            .backend()
+            .get_lid_mapping(&lid.user)
+            .await
+            .unwrap()
+            .unwrap()
+            .phone_number,
+        other.user.as_str()
+    );
+    client.signal_shutdown_sync();
+}
+
+#[tokio::test]
+async fn adv_review_paired_ownership_waits_through_recovery_persistence() {
+    use crate::store::release::tests::ProbeBackend;
+    use crate::test_utils::create_iq_test_client_with_backend;
+    let signer = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+    let key = *signer.public_key.public_key_bytes();
+    let (mut probe, _) = ProbeBackend::new();
+    let (release, gate) = async_channel::unbounded();
+    let (entered, arrived) = async_channel::unbounded();
+    probe.detach_identity_writes = true;
+    probe.identity_gate_key = Some(key);
+    probe.gate_method = "put_identity";
+    probe.gate = Some(gate);
+    probe.entered = Some(entered);
+    let (client, transport) = create_iq_test_client_with_backend(Arc::new(probe)).await;
+    let phone = Jid::pn("12025550239");
+    let lid = Jid::lid("100000000000239");
+    for user in [&phone, &lid] {
+        crate::test_utils::seed_adv_primary(&client, user).await;
+    }
+    let failure = first_mapping_failure(&client, &phone, &lid, &signer);
+    let recovery = {
+        let client = client.clone();
+        tokio::spawn(async move { client.recover_ordinary_adv_identity(failure.into()).await })
+    };
+    let iq = decode_sent_iq(&transport, 0).await;
+    let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+    answer_iq(&client, &id, &primary_response(&phone, &signer, true)).await;
+    tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut paired = Box::pin(client.persistence_manager.process_command(
+        wacore::store::commands::DeviceCommand::SetLid(Some(lid.clone())),
+    ));
+    let blocked = futures::poll!(paired.as_mut()).is_pending();
+    release.send(()).await.unwrap();
+    release.send(()).await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), recovery)
+        .await
+        .unwrap()
+        .unwrap();
+    if blocked {
+        paired.await;
+    }
+    assert!(
+        blocked,
+        "paired-account ownership changed inside recovery persistence"
+    );
+    assert!(result.is_ok());
+    client.signal_shutdown_sync();
+}
+
+#[tokio::test]
+async fn adv_review_late_startup_warmup_invalidates_the_earlier_topology_snapshot() {
+    use crate::store::release::tests::ProbeBackend;
+    use crate::test_utils::create_iq_test_client_with_backend;
+    let (mut probe, _) = ProbeBackend::new();
+    let raw = probe.backend.clone();
+    let (release, gate) = async_channel::unbounded();
+    let (entered, arrived) = async_channel::unbounded();
+    probe.gate_method = "get_all_lid_mappings";
+    probe.gate = Some(gate);
+    probe.entered = Some(entered);
+    let (client, _) = create_iq_test_client_with_backend(Arc::new(probe)).await;
+    tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!client.lid_pn_cache.startup_finished_for_tests());
+    let phone = Jid::pn("12025550240");
+    let lid = Jid::lid("100000000000240");
+    for user in [&phone, &lid] {
+        crate::test_utils::seed_adv_primary(&client, user).await;
+    }
+    raw.put_lid_mapping(&wacore::store::traits::LidPnMappingEntry {
+        lid: lid.user.to_string(),
+        phone_number: phone.user.to_string(),
+        created_at: 1,
+        updated_at: 1,
+        learning_source: "usync".into(),
+    })
+    .await
+    .unwrap();
+    let before_warmup = client.device_topology.current();
+    release.send(()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !client.lid_pn_cache.startup_finished_for_tests() {
+            tokio::task::yield_now().await;
+        }
+        drop(client.lid_pn_cache.lock_mutation().await);
+    })
+    .await
+    .unwrap();
+    let response = migration_response(&phone);
+    assert!(
+        client
+            .try_process_group_device_list_response(
+                &response,
+                std::slice::from_ref(&phone),
+                before_warmup
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "a real startup mutation must retain the stale-response gate"
+    );
+    let devices = client
+        .try_process_group_device_list_response(
+            &response,
+            std::slice::from_ref(&phone),
+            client.device_topology.current(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_migration_publication(&client, &phone, &devices).await;
+    client.signal_shutdown_sync();
+}
+
+#[tokio::test]
+async fn adv_review_wire_hosted_subjects_cannot_bypass_the_account_epoch_graph() {
+    use wacore::iq::spec::IqSpec;
+    for conflicting in [false, true] {
+        let (client, _) = create_iq_test_client().await;
+        let phone = Jid::pn("12025550242");
+        let lid = Jid::lid("100000000000242");
+        for user in [&phone, &lid] {
+            crate::test_utils::seed_adv_primary(&client, user).await;
+        }
+        let old = client.cached_adv_account_identity(&phone).await.unwrap();
+        let other = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let hosted_account = if conflicting {
+            &other
+        } else {
+            crate::test_utils::adv_test_account()
+        };
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("usync")
+                .children([NodeBuilder::new("list")
+                    .children([
+                        NodeBuilder::new("user")
+                            .attr("jid", phone.to_string())
+                            .children([
+                                NodeBuilder::new("lid").attr("val", lid.to_string()).build(),
+                                NodeBuilder::new("devices")
+                                    .children([
+                                        NodeBuilder::new("key-index-list")
+                                            .attr("ts", "1000")
+                                            .bytes(signed_list(
+                                                crate::test_utils::adv_test_account(),
+                                                false,
+                                            ))
+                                            .build(),
+                                        NodeBuilder::new("device-list")
+                                            .children([
+                                                NodeBuilder::new("device").attr("id", "0").build(),
+                                                NodeBuilder::new("device")
+                                                    .attr("id", "7")
+                                                    .attr("key-index", "1")
+                                                    .build(),
+                                            ])
+                                            .build(),
+                                    ])
+                                    .build(),
+                            ])
+                            .build(),
+                        NodeBuilder::new("user")
+                            .attr("jid", format!("{}:99@hosted.lid", lid.user))
+                            .attr("pn_jid", phone.to_string())
+                            .children([NodeBuilder::new("devices")
+                                .children([
+                                    NodeBuilder::new("key-index-list")
+                                        .attr("ts", "1000")
+                                        .bytes(signed_list(hosted_account, true))
+                                        .build(),
+                                    NodeBuilder::new("device-list")
+                                        .children([
+                                            NodeBuilder::new("device").attr("id", "0").build(),
+                                            NodeBuilder::new("device")
+                                                .attr("id", "99")
+                                                .attr("key-index", "1")
+                                                .attr("is_hosted", "true")
+                                                .build(),
+                                        ])
+                                        .build(),
+                                ])
+                                .build()])
+                            .build(),
+                    ])
+                    .build()])
+                .build()])
+            .build();
+        let parsed = DeviceListSpec::new(vec![phone.clone()], "hosted-subject")
+            .require_complete_response()
+            .parse_response(&response.as_node_ref())
+            .unwrap();
+        assert_eq!(parsed.device_lists[1].user, lid);
+        let result = client
+            .apply_device_list_response(&parsed, DeviceListApplyMode::StrictRefresh, None, None)
+            .await;
+        if conflicting {
+            assert!(result.is_err());
+            assert!(client.device_list_identity_alias(&phone).await.is_none());
+            assert!(client.load_device_record_for_jid(&phone).await.is_none());
+        } else {
+            let devices = result.unwrap().unwrap();
+            assert!(devices.iter().any(|jid| jid.device == 7));
+            assert!(
+                devices
+                    .iter()
+                    .any(|jid| jid.device == 99 && jid.server.is_lid_family())
+            );
+            for user in [&phone, &lid] {
+                assert_eq!(
+                    client
+                        .load_device_record_for_jid(user)
+                        .await
+                        .unwrap()
+                        .devices
+                        .iter()
+                        .map(|device| device.device_id())
+                        .collect::<Vec<_>>(),
+                    [0, 99]
+                );
+            }
+        }
+        for user in [&phone, &lid] {
+            assert_eq!(client.cached_adv_account_identity(user).await.unwrap(), old);
+        }
+        assert!(
+            client
+                .cached_adv_account_identity(&Jid::new(
+                    lid.user.as_str(),
+                    wacore_binary::Server::HostedLid
+                ))
+                .await
+                .unwrap()
+                .is_none(),
+            "hosted device addressing is not an account-primary namespace"
+        );
+        client.signal_shutdown_sync();
+    }
+}
+
+#[tokio::test]
+async fn adv_review_pending_mapping_write_fences_cold_alias_recovery() {
+    use crate::store::release::tests::ProbeBackend;
+    use crate::test_utils::create_iq_test_client_with_backend;
+    let (mut probe, _) = ProbeBackend::new();
+    let (release, gate) = async_channel::unbounded();
+    let (entered, arrived) = async_channel::unbounded();
+    probe.gate_method = "put_lid_mapping";
+    probe.gate = Some(gate);
+    probe.entered = Some(entered);
+    let (client, _) = create_iq_test_client_with_backend(Arc::new(probe)).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !client.lid_pn_cache.startup_finished_for_tests() {
+            tokio::task::yield_now().await;
+        }
+        drop(client.lid_pn_cache.lock_mutation().await);
+    })
+    .await
+    .unwrap();
+    let phone = Jid::pn("12025550243");
+    let other = Jid::pn("12025550244");
+    let lid = Jid::lid("100000000000243");
+    crate::test_utils::seed_adv_primary(&client, &phone).await;
+    client.cached_adv_account_identity(&lid).await.unwrap();
+    for user in [&phone, &lid] {
+        client
+            .session_lock_for(user.to_protocol_address().as_str())
+            .await;
+    }
+    let writer = {
+        let client = client.clone();
+        let lid = lid.clone();
+        tokio::spawn(async move {
+            client
+                .add_lid_pn_mapping(
+                    &lid.user,
+                    &other.user,
+                    crate::lid_pn_cache::LearningSource::Usync,
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut clearing = Box::pin(client.lid_pn_cache.clear());
+    let cleared_before_ack = futures::poll!(clearing.as_mut()).is_ready();
+    let failure =
+        first_mapping_failure(&client, &phone, &lid, crate::test_utils::adv_test_account());
+    let mut capture = Box::pin(client.capture_adv_recovery_snapshot(&phone, &failure.response));
+    let first = futures::poll!(capture.as_mut());
+    let admitted_before_ack = matches!(&first, std::task::Poll::Ready(Ok(_)));
+    release.send(()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (written, ()) = futures::join!(writer, async {
+            if !cleared_before_ack {
+                clearing.await;
+            }
+            if first.is_pending() {
+                assert!(capture.await.is_err());
+            }
+        });
+        written.unwrap().unwrap();
+    })
+    .await
+    .unwrap();
+    eprintln!("cleared_before_ack={cleared_before_ack} admitted_before_ack={admitted_before_ack}");
+    assert!(
+        !cleared_before_ack,
+        "mapping mutation must survive through the pending backend ACK"
+    );
+    assert!(
+        !admitted_before_ack,
+        "a detached write must not publish another owner after recovery admission"
+    );
+    client.signal_shutdown_sync();
+}
+
+#[tokio::test]
+async fn adv_review_mapping_workers_keep_ack_order_after_finish_or_cancellation() {
+    use crate::store::release::tests::ProbeBackend;
+    use crate::test_utils::create_iq_test_client_with_backend;
+    for (batch, fast) in [(false, false), (true, false), (false, true), (true, true)] {
+        let (mut probe, _) = ProbeBackend::new();
+        let raw = probe.backend.clone();
+        let (release, gate) = async_channel::unbounded();
+        let (entered, arrived) = async_channel::unbounded();
+        probe.gate_method = if batch {
+            "put_lid_mappings"
+        } else {
+            "put_lid_mapping"
+        };
+        probe.gate = Some(gate);
+        probe.entered = Some(entered);
+        let (client, _) = create_iq_test_client_with_backend(Arc::new(probe)).await;
+        let lid = "100000000000245";
+        let first = "12025550245";
+        let second = "12025550246";
+        let requester = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                match (batch, fast) {
+                    (false, false) => {
+                        client
+                            .add_lid_pn_mapping(
+                                lid,
+                                first,
+                                crate::lid_pn_cache::LearningSource::Usync,
+                            )
+                            .await
+                    }
+                    (true, false) => client
+                        .add_lid_pn_mappings(
+                            vec![(lid.into(), first.into())],
+                            crate::lid_pn_cache::LearningSource::Usync,
+                        )
+                        .await
+                        .map(|_| ()),
+                    (false, true) => {
+                        client
+                            .learn_lid_pn_mapping_fast(
+                                lid,
+                                first,
+                                crate::lid_pn_cache::LearningSource::Usync,
+                                false,
+                            )
+                            .await;
+                        Ok(())
+                    }
+                    (true, true) => {
+                        client
+                            .learn_lid_pn_mappings_batch(
+                                vec![(lid.into(), first.into())],
+                                crate::lid_pn_cache::LearningSource::Usync,
+                                false,
+                            )
+                            .await;
+                        Ok(())
+                    }
+                }
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if fast {
+            tokio::time::timeout(Duration::from_secs(5), requester)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        } else {
+            requester.abort();
+            assert!(requester.await.unwrap_err().is_cancelled());
+        }
+        let mut newer = Box::pin(async {
+            if batch {
+                client
+                    .add_lid_pn_mappings(
+                        vec![(lid.into(), second.into())],
+                        crate::lid_pn_cache::LearningSource::Usync,
+                    )
+                    .await
+                    .map(|_| ())
+            } else {
+                client
+                    .add_lid_pn_mapping(lid, second, crate::lid_pn_cache::LearningSource::Usync)
+                    .await
+            }
+        });
+        assert!(futures::poll!(newer.as_mut()).is_pending());
+        tokio::task::yield_now().await;
+        assert_eq!(
+            client.lid_pn_cache.get_phone_number(lid).await.as_deref(),
+            Some(first)
+        );
+        assert!(raw.get_lid_mapping(lid).await.unwrap().is_none());
+        release.send(()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            raw.get_lid_mapping(lid)
+                .await
+                .unwrap()
+                .unwrap()
+                .phone_number,
+            first
+        );
+        release.send(()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), newer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            raw.get_lid_mapping(lid)
+                .await
+                .unwrap()
+                .unwrap()
+                .phone_number,
+            second
+        );
+        assert_eq!(
+            client.lid_pn_cache.get_phone_number(lid).await.as_deref(),
+            Some(second)
+        );
+        client.signal_shutdown_sync();
+    }
+}
+
+#[tokio::test]
+async fn adv_review_mapped_publication_retains_its_store_write_after_cancellation() {
+    use crate::store::release::tests::ProbeBackend;
+    use crate::test_utils::create_iq_test_client_with_backend;
+    use wacore::usync::UsyncLidMapping;
+    let (mut probe, _) = ProbeBackend::new();
+    let raw = probe.backend.clone();
+    let (release, gate) = async_channel::unbounded();
+    let (entered, arrived) = async_channel::unbounded();
+    probe.gate_method = "put_lid_mappings";
+    probe.gate = Some(gate);
+    probe.entered = Some(entered);
+    let (client, _) = create_iq_test_client_with_backend(Arc::new(probe)).await;
+    let phone = Jid::pn("12025550247");
+    let lid = Jid::lid("100000000000247");
+    for user in [&phone, &lid] {
+        crate::test_utils::seed_adv_primary(&client, user).await;
+    }
+    let mut response = migration_response(&phone);
+    response.lid_mappings.push(UsyncLidMapping {
+        phone_number: phone.user.clone(),
+        lid: lid.user.clone(),
+    });
+    let publication = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .apply_device_list_response(
+                    &response,
+                    DeviceListApplyMode::StrictRefresh,
+                    None,
+                    None,
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    publication.abort();
+    assert!(publication.await.unwrap_err().is_cancelled());
+    let mut mapping = Box::pin(client.lid_pn_cache.lock_mutation());
+    assert!(futures::poll!(mapping.as_mut()).is_pending());
+    drop(mapping);
+    assert!(raw.get_lid_mapping(&lid.user).await.unwrap().is_none());
+    release.send(()).await.unwrap();
+    let registry = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.device_topology.lock_registry(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        raw.get_lid_mapping(&lid.user)
+            .await
+            .unwrap()
+            .unwrap()
+            .phone_number,
+        phone.user.as_str()
+    );
+    for user in [&phone, &lid] {
+        assert_eq!(
+            client
+                .load_device_record_for_jid(user)
+                .await
+                .unwrap()
+                .devices
+                .iter()
+                .map(|device| device.device_id())
+                .collect::<Vec<_>>(),
+            [0, 7]
+        );
+    }
+    drop(registry);
+    client.signal_shutdown_sync();
+}
+
+#[tokio::test]
+async fn adv_review_owned_mapping_batch_persists_entries_without_cache_residency() {
+    use crate::cache_config::{CacheConfig, CacheEntryConfig};
+    use crate::store::persistence_manager::PersistenceManager;
+    use crate::store::release::tests::ProbeBackend;
+    for (capacity, timeout) in [(0, None), (1, None), (4, Some(Duration::ZERO))] {
+        let (mut probe, _) = ProbeBackend::new();
+        let raw = probe.backend.clone();
+        let (release, gate) = async_channel::unbounded();
+        let (entered, arrived) = async_channel::unbounded();
+        probe.gate_method = "put_lid_mappings";
+        probe.gate = Some(gate);
+        probe.entered = Some(entered);
+        let pm = Arc::new(PersistenceManager::new(Arc::new(probe)).await.unwrap());
+        let (client, _) = Client::builder()
+            .with_runtime_arc(Arc::new(crate::TokioRuntime))
+            .with_persistence_manager(pm)
+            .with_transport_factory_arc(Arc::new(
+                crate::transport::mock::MockTransportFactory::new(),
+            ))
+            .with_http_client_arc(Arc::new(crate::test_utils::MockHttpClient))
+            .with_cache_config(
+                CacheConfig::default().with_lid_pn_cache(CacheEntryConfig::new(timeout, capacity)),
+            )
+            .build()
+            .await
+            .unwrap()
+            .into_parts();
+        client.enter_live_mode_for_tests();
+        let rows: Vec<_> = (0..4)
+            .map(|index| {
+                (
+                    format!("10000000000025{index}"),
+                    format!("1202555025{index}"),
+                )
+            })
+            .collect();
+        let writer = {
+            let client = client.clone();
+            let rows = rows.clone();
+            tokio::spawn(async move {
+                client
+                    .add_lid_pn_mappings(rows, crate::lid_pn_cache::LearningSource::Usync)
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut resident = 0;
+        for (lid, _) in &rows {
+            resident += usize::from(client.lid_pn_cache.get_phone_number(lid).await.is_some());
+        }
+        assert!(
+            resident < rows.len(),
+            "the persistence batch must outlive evicted/expired rows"
+        );
+        release.send(()).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), writer)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            rows.len()
+        );
+        for (lid, phone) in &rows {
+            assert_eq!(
+                raw.get_lid_mapping(lid)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .phone_number,
+                *phone
+            );
+        }
+        client.signal_shutdown_sync();
+    }
+}
+
+async fn deliver_identity_reset(client: &Arc<Client>, user: &Jid, lid: Option<&Jid>) {
+    use std::sync::atomic::Ordering;
+    let mut node = NodeBuilder::new("notification")
+        .attr("type", "encrypt")
+        .attr("from", user.to_string())
+        .attr("offline", "1")
+        .children([NodeBuilder::new("identity").build()]);
+    if let Some(lid) = lid {
+        node = node.attr("lid", lid.to_string());
+    }
+    let node = node.build();
+    let previous = client.offline_sync_completed.swap(false, Ordering::Relaxed);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::handlers::notification::handle_identity_change(client, &node.as_node_ref()),
+    )
+    .await
+    .unwrap();
+    client
+        .offline_sync_completed
+        .store(previous, Ordering::Relaxed);
+}
+
+/// Cancellation preserves the worker, not authority to reinstall a key after
+/// an actual notification has retired it while that worker was queued.
+#[tokio::test]
+async fn adv_review_cancelled_bootstrap_cannot_restore_a_reset_primary() {
+    for aliased in [false, true] {
+        for reset in [true, false] {
+            let (client, _) = create_iq_test_client().await;
+            let phone = Jid::pn("12025550230");
+            let lid = Jid::lid("100000000000230");
+            if aliased {
+                client
+                    .add_lid_pn_mapping(
+                        &lid.user,
+                        &phone.user,
+                        crate::lid_pn_cache::LearningSource::Usync,
+                    )
+                    .await
+                    .unwrap();
+            }
+            crate::test_utils::seed_adv_primary(&client, &phone).await;
+            let key = client
+                .cached_adv_account_identity(&phone)
+                .await
+                .unwrap()
+                .unwrap();
+            let primary = if aliased { &lid } else { &phone };
+            let backend = client.persistence_manager.backend();
+            client.signal_cache.flush(backend.as_ref()).await.unwrap();
+            let mapping = client.lid_pn_cache.lock_mutation().await;
+            let mut requester = Box::pin(client.persist_adv_bootstrap_identity(primary, &key));
+            assert!(futures::poll!(requester.as_mut()).is_pending());
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match client.adv_bootstrap_fence.try_write() {
+                        None => break,
+                        Some(guard) => drop(guard),
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            drop(requester);
+            if reset {
+                deliver_identity_reset(&client, &phone, aliased.then_some(&lid)).await;
+                assert_eq!(
+                    client.cached_adv_account_identity(&phone).await.unwrap(),
+                    None
+                );
+                assert_eq!(
+                    backend
+                        .load_identity(phone.to_protocol_address().as_str())
+                        .await
+                        .unwrap(),
+                    None
+                );
+            }
+            drop(mapping);
+            // The old worker already owns the fence, so this waits for its ACK.
+            drop(
+                tokio::time::timeout(Duration::from_secs(5), client.adv_bootstrap_fence.write())
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(
+                client.cached_adv_account_identity(primary).await.unwrap(),
+                (!reset).then_some(key),
+                "aliased={aliased} reset={reset}"
+            );
+            assert_eq!(
+                backend
+                    .load_identity(primary.to_protocol_address().as_str())
+                    .await
+                    .unwrap(),
+                (!reset).then_some(key)
+            );
+            if reset {
+                let fresh = *KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>())
+                    .public_key
+                    .public_key_bytes();
+                assert!(
+                    client
+                        .persist_adv_bootstrap_identity(primary, &fresh)
+                        .await
+                        .unwrap()
+                );
+                assert_eq!(
+                    backend
+                        .load_identity(primary.to_protocol_address().as_str())
+                        .await
+                        .unwrap(),
+                    Some(fresh)
+                );
+            }
+            client.signal_shutdown_sync();
+        }
+    }
+}
+
+/// A reply authenticated after its IQ crossed an identity notification must be
+/// retried, including the no-prior-identity path which skips heavy cleanup.
+#[tokio::test]
+async fn adv_review_primary_iq_before_no_prior_notification_cannot_establish_trust() {
+    let (client, transport) = create_iq_test_client().await;
+    let user = Jid::pn("12025550231");
+    let stale = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+    let operation = {
+        let client = client.clone();
+        let user = user.clone();
+        tokio::spawn(async move { client.ensure_adv_account_identity(&user).await })
+    };
+    let iq = decode_sent_iq(&transport, 0).await;
+    deliver_identity_reset(&client, &user, None).await;
+    let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+    answer_iq(&client, &id, &primary_response(&user, &stale, true)).await;
+    let result = tokio::time::timeout(Duration::from_secs(5), operation)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        client.cached_adv_account_identity(&user).await.unwrap(),
+        None,
+        "a pre-notification reply must not establish new trust"
+    );
+    assert!(result.is_err());
+    let fresh = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+    let retry = {
+        let client = client.clone();
+        let user = user.clone();
+        tokio::spawn(async move { client.ensure_adv_account_identity(&user).await })
+    };
+    let iq = decode_sent_iq(&transport, 1).await;
+    let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+    answer_iq(&client, &id, &primary_response(&user, &fresh, true)).await;
+    assert_eq!(
+        retry.await.unwrap().unwrap(),
+        *fresh.public_key.public_key_bytes()
+    );
+    assert_eq!(transport.sent().len(), 2);
+    client.signal_shutdown_sync();
+}
+
+/// Companion-only fetches also need the epoch from before their implicit
+/// primary IQ, not a new epoch captured after the old reply has arrived.
+#[tokio::test]
+async fn adv_review_companion_primary_reply_cannot_revive_reset_identity() {
+    let (client, transport) = create_iq_test_client().await;
+    let phone = Jid::pn("12025550232");
+    let lid = Jid::lid("100000000000232");
+    client
+        .add_lid_pn_mapping(
+            &lid.user,
+            &phone.user,
+            crate::lid_pn_cache::LearningSource::Usync,
+        )
+        .await
+        .unwrap();
+    crate::test_utils::seed_adv_primary(&client, &phone).await;
+    client
+        .signal_cache
+        .flush(client.persistence_manager.backend().as_ref())
+        .await
+        .unwrap();
+    let stale = crate::test_utils::adv_test_account();
+    let fetch = {
+        let client = client.clone();
+        let companion = lid.with_device(7);
+        tokio::spawn(async move { client.fetch_pre_keys(&[companion], None).await })
+    };
+    let iq = decode_sent_iq(&transport, 0).await;
+    deliver_identity_reset(&client, &phone, Some(&lid)).await;
+    assert_eq!(
+        client.cached_adv_account_identity(&phone).await.unwrap(),
+        None
+    );
+    let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+    answer_iq(&client, &id, &primary_response(&lid, stale, true)).await;
+    let result = tokio::time::timeout(Duration::from_secs(5), fetch)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        client.cached_adv_account_identity(&lid).await.unwrap(),
+        None,
+        "a pre-reset companion fetch must not restore its old primary"
+    );
+    assert!(result.is_err());
+    let fresh = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+    let retry = {
+        let client = client.clone();
+        let companion = lid.with_device(7);
+        tokio::spawn(async move { client.fetch_pre_keys(&[companion], None).await })
+    };
+    let iq = decode_sent_iq(&transport, 1).await;
+    let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+    answer_iq(&client, &id, &primary_response(&lid, &fresh, true)).await;
+    retry.await.unwrap().unwrap();
+    assert_eq!(
+        client.cached_adv_account_identity(&lid).await.unwrap(),
+        Some(*fresh.public_key.public_key_bytes())
+    );
+    assert_eq!(transport.sent().len(), 2);
+    client.signal_shutdown_sync();
+}
+
+/// A valid signature is insufficient when every projected device is revoked.
+/// Learning the mapping first must not redirect a rejected PN's old fanout.
+#[tokio::test]
+async fn adv_review_empty_projection_does_not_publish_its_mapping() {
+    use wacore::usync::{UserDeviceList, UsyncDevice, UsyncLidMapping};
+    for group in [false, true] {
+        let (client, _) = create_iq_test_client().await;
+        let phone = Jid::pn("12025550233");
+        let lid = Jid::lid("100000000000233");
+        for (user, companion) in [(&phone, 3), (&lid, 9)] {
+            crate::test_utils::seed_adv_primary(&client, user).await;
+            client
+                .update_device_list(DeviceListRecord {
+                    user: user.user.as_str().into(),
+                    devices: [
+                        DeviceInfo::new(0, None),
+                        DeviceInfo::new(companion, Some(1)),
+                    ]
+                    .into(),
+                    raw_id: Some(1),
+                    timestamp: 1,
+                    phash: None,
+                })
+                .await
+                .unwrap();
+        }
+        let response = DeviceListResponse {
+            device_lists: vec![UserDeviceList {
+                user: phone.clone(),
+                devices: vec![UsyncDevice::new(7, Some(9))],
+                phash: None,
+                key_index_bytes: Some(signed_key_index_bytes(vec![1], 1)),
+            }],
+            lid_mappings: vec![UsyncLidMapping {
+                phone_number: phone.user.clone(),
+                lid: lid.user.clone(),
+            }],
+        };
+        let result = client
+            .apply_device_list_response(
+                &response,
+                if group {
+                    DeviceListApplyMode::GroupRefresh
+                } else {
+                    DeviceListApplyMode::StrictRefresh
+                },
+                None,
+                group.then_some(std::slice::from_ref(&phone)),
+            )
+            .await;
+        if group {
+            let devices = result.unwrap().unwrap();
+            assert!(devices.contains(&phone.with_device(3)));
+            assert!(!devices.contains(&phone.with_device(9)));
+        } else {
+            assert!(result.is_err());
+        }
+        assert!(client.device_list_identity_alias(&phone).await.is_none());
+        assert!(client.device_list_identity_alias(&lid).await.is_none());
+        for (user, companion) in [(&phone, 3), (&lid, 9)] {
+            let record = client.load_device_record_for_jid(user).await.unwrap();
+            assert_eq!(
+                record
+                    .devices
+                    .iter()
+                    .map(|device| device.device_id())
+                    .collect::<Vec<_>>(),
+                [0, companion]
+            );
+        }
+        client.signal_shutdown_sync();
+    }
+}
+
+#[tokio::test]
+async fn adv_review_mapping_store_failure_leaves_the_pair_retryable() {
+    use crate::lid_pn_cache::LearningSource;
+    use crate::store::release::tests::ProbeBackend;
+    use crate::test_utils::create_iq_test_client_with_backend;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    for single in [false, true] {
+        let (mut probe, _) = ProbeBackend::new();
+        let raw = probe.backend.clone();
+        let failing = Arc::new(AtomicBool::new(true));
+        probe.fail_before_method = Some((
+            if single {
+                "put_lid_mapping"
+            } else {
+                "put_lid_mappings"
+            },
+            failing.clone(),
+        ));
+        let (client, _) = create_iq_test_client_with_backend(Arc::new(probe)).await;
+        let phone = "12025550251";
+        let lid = "100000000000251";
+        for fail in [true, false] {
+            failing.store(fail, Ordering::Relaxed);
+            let result = if single {
+                client
+                    .add_lid_pn_mapping(lid, phone, LearningSource::Usync)
+                    .await
+            } else {
+                client
+                    .add_lid_pn_mappings(
+                        vec![(lid.to_owned(), phone.to_owned())],
+                        LearningSource::Usync,
+                    )
+                    .await
+                    .map(|_| ())
+            };
+            assert_eq!(result.is_err(), fail);
+            assert_eq!(client.lid_pn_cache.is_persisted(phone, lid).await, !fail);
+            assert_eq!(raw.get_lid_mapping(lid).await.unwrap().is_some(), !fail);
+        }
         client.signal_shutdown_sync();
     }
 }

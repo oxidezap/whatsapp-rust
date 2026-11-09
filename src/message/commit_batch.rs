@@ -2046,15 +2046,33 @@ mod tests {
             .build()
     }
 
+    #[derive(Clone, Copy)]
+    enum HookDeviceLookup {
+        Metadata,
+        Rotation,
+        MappedMetadata,
+        MappedReset,
+        StoredMapping,
+    }
+
     /// A metadata-only lookup for a user outside this batch must not try to
     /// acquire the single processing permit already held by the hook's caller.
-    async fn hook_lookup_during_drain(recovery: bool) {
+    async fn hook_lookup_during_drain(case: HookDeviceLookup) {
         use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq};
         use std::time::Duration;
         use wacore_binary::builder::NodeBuilder;
+        let recovery = matches!(case, HookDeviceLookup::Rotation);
+        let mapping = matches!(
+            case,
+            HookDeviceLookup::MappedMetadata | HookDeviceLookup::MappedReset
+        );
+        let reset = matches!(case, HookDeviceLookup::MappedReset);
+        let stored_mapping = matches!(case, HookDeviceLookup::StoredMapping);
         struct LookupHook {
             user: Jid,
-            recovery: bool,
+            expect_error: bool,
+            force_refresh: bool,
+            stored_mapping: bool,
         }
         #[async_trait::async_trait]
         impl InboundDurabilityHook for LookupHook {
@@ -2068,11 +2086,26 @@ mod tests {
                         .iter()
                         .all(|message| message.info.source.sender != self.user)
                 );
-                let result = client
-                    .signal()
-                    .get_user_devices(std::slice::from_ref(&self.user))
-                    .await;
-                if self.recovery {
+                if self.stored_mapping {
+                    client
+                        .add_lid_pn_mapping(
+                            "100000000000195",
+                            &self.user.user,
+                            crate::lid_pn_cache::LearningSource::Usync,
+                        )
+                        .await?;
+                    return Ok(());
+                }
+                let result: anyhow::Result<Vec<Jid>> = if self.force_refresh {
+                    client.refresh_user_devices(vec![self.user.clone()]).await
+                } else {
+                    client
+                        .signal()
+                        .get_user_devices(std::slice::from_ref(&self.user))
+                        .await
+                        .map_err(Into::into)
+                };
+                if self.expect_error {
                     let error = result.unwrap_err();
                     assert!(
                         error
@@ -2080,7 +2113,7 @@ mod tests {
                             .contains("cannot run inside an inbound durability hook"),
                         "{error:#}"
                     );
-                    return Err(error.into());
+                    return Err(error);
                 }
                 let devices = result?;
                 assert_eq!(devices, vec![self.user.clone()]);
@@ -2093,14 +2126,16 @@ mod tests {
             .inbound_durability_hook
             .set(Arc::new(LookupHook {
                 user: user.clone(),
-                recovery,
+                expect_error: recovery || reset,
+                force_refresh: reset,
+                stored_mapping,
             }))
             .ok()
             .unwrap();
         let old = wacore::libsignal::protocol::KeyPair::generate(&mut rand::make_rng::<
             rand::rngs::StdRng,
         >());
-        if recovery {
+        if recovery || stored_mapping {
             client
                 .signal_cache
                 .put_identity(
@@ -2109,6 +2144,24 @@ mod tests {
                 )
                 .await;
         }
+        if reset {
+            crate::test_utils::seed_adv_primary(&client, &user).await;
+            client
+                .update_device_list(wacore::store::traits::DeviceListRecord {
+                    user: user.user.as_str().into(),
+                    devices: [
+                        wacore::store::traits::DeviceInfo::new(0, None),
+                        wacore::store::traits::DeviceInfo::new(3, Some(1)),
+                    ]
+                    .into(),
+                    raw_id: Some(1),
+                    timestamp: wacore::time::now_secs(),
+                    phash: None,
+                })
+                .await
+                .unwrap();
+        }
+        let before_anchor = client.cached_adv_account_identity(&user).await.unwrap();
         client.enter_drain_mode_for_tests();
         let commit = {
             let client = client.clone();
@@ -2124,10 +2177,40 @@ mod tests {
                     .await
             })
         };
+        if stored_mapping {
+            let outcome = tokio::time::timeout(Duration::from_secs(5), commit)
+                .await
+                .expect("public mapping must finish while the hook owns the drain permit")
+                .unwrap();
+            assert!(outcome.persisted && outcome.delivered);
+            assert!(
+                client
+                    .lid_pn_cache
+                    .is_persisted(&user.user, "100000000000195")
+                    .await
+            );
+            // Alias migration uses the ordinary per-address session guards;
+            // unlike key recovery it does not acquire the processing permit.
+            assert!(
+                client
+                    .cached_adv_account_identity(&user)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                client
+                    .cached_adv_account_identity(&Jid::lid("100000000000195"))
+                    .await
+                    .unwrap(),
+                before_anchor
+            );
+            return;
+        }
         let iq = decode_sent_iq(&transport, 0).await;
         let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
         let mut devices = vec![NodeBuilder::new("device").attr("id", "0").build()];
-        if recovery {
+        if recovery || reset {
             devices.push(
                 NodeBuilder::new("device")
                     .attr("id", "2")
@@ -2136,9 +2219,10 @@ mod tests {
             );
         }
         let mut children = vec![NodeBuilder::new("device-list").children(devices).build()];
-        if recovery {
+        if recovery || reset {
             let mut details = wa::ADVKeyIndexList::default();
-            details.raw_id = Some(1);
+            details.raw_id = Some(if reset { 2 } else { 1 });
+            details.timestamp = Some(100);
             details.current_index = Some(1);
             details.valid_indexes = vec![1];
             children.push(
@@ -2150,13 +2234,18 @@ mod tests {
                     .build(),
             );
         }
+        let lid = Jid::lid("100000000000195");
+        let mut user_children = vec![NodeBuilder::new("devices").children(children).build()];
+        if mapping {
+            user_children.push(NodeBuilder::new("lid").attr("val", lid.to_string()).build());
+        }
         let response = NodeBuilder::new("iq")
             .attr("type", "result")
             .children([NodeBuilder::new("usync")
                 .children([NodeBuilder::new("list")
                     .children([NodeBuilder::new("user")
                         .attr("jid", user.to_string())
-                        .children([NodeBuilder::new("devices").children(children).build()])
+                        .children(user_children)
                         .build()])
                     .build()])
                 .build()])
@@ -2172,19 +2261,45 @@ mod tests {
             .expect("hook lookup must finish while it owns the drain permit")
             .unwrap();
         assert!(outcome.persisted);
-        assert_eq!(outcome.delivered, !recovery);
-        if recovery {
+        assert_eq!(outcome.delivered, !(recovery || reset));
+        if recovery || reset {
             assert_eq!(
                 client.cached_adv_account_identity(&user).await.unwrap(),
-                Some(*old.public_key.public_key_bytes())
+                before_anchor
             );
             assert_eq!(
                 transport.sent().len(),
-                2,
+                if recovery { 2 } else { 1 },
                 "hook must not start a detached key-recovery worker"
+            );
+            assert!(
+                client
+                    .lid_pn_cache
+                    .get_current_lid(&user.user)
+                    .await
+                    .is_none()
             );
         } else {
             assert!(client.load_device_record(&user.user).await.is_some());
+            if mapping {
+                assert_eq!(
+                    client
+                        .lid_pn_cache
+                        .get_current_lid(&user.user)
+                        .await
+                        .as_deref(),
+                    Some(lid.user.as_str())
+                );
+                assert!(
+                    client
+                        .persistence_manager
+                        .backend()
+                        .get_lid_mapping(&lid.user)
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+            }
         }
         client.ensure_signal_maintenance_context().unwrap();
         client.signal_shutdown_sync();
@@ -2192,12 +2307,27 @@ mod tests {
 
     #[tokio::test]
     async fn offline_durability_hook_can_resolve_an_uncached_ordinary_user() {
-        hook_lookup_during_drain(false).await;
+        hook_lookup_during_drain(HookDeviceLookup::Metadata).await;
     }
 
     #[tokio::test]
     async fn offline_durability_hook_recovery_fails_without_stalling_or_changing_trust() {
-        hook_lookup_during_drain(true).await;
+        hook_lookup_during_drain(HookDeviceLookup::Rotation).await;
+    }
+
+    #[tokio::test]
+    async fn public_mapping_finishes_inside_the_durability_hook() {
+        hook_lookup_during_drain(HookDeviceLookup::StoredMapping).await;
+    }
+
+    #[tokio::test]
+    async fn offline_durability_hook_can_resolve_a_new_mapping_without_reentering_the_permit() {
+        hook_lookup_during_drain(HookDeviceLookup::MappedMetadata).await;
+    }
+
+    #[tokio::test]
+    async fn mapped_reset_cannot_escape_hook_admission_through_an_owned_worker() {
+        hook_lookup_during_drain(HookDeviceLookup::MappedReset).await;
     }
 
     /// Failed drain admission must propagate through the real dispatcher, so

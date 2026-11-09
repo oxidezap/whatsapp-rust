@@ -115,6 +115,19 @@ struct BatchRecordOutcome {
     usync_phones: Vec<String>,
 }
 
+#[derive(Default)]
+struct PersistedMappingBatch {
+    storage: Vec<LidPnMappingEntry>,
+    migration_flags: Vec<bool>,
+    count: usize,
+}
+
+#[derive(Clone, Copy)]
+struct MappingLearningMode {
+    single: bool,
+    migrate_in_worker: bool,
+}
+
 impl Client {
     /// Warm up the LID-PN cache from persistent storage.
     /// This is called during client initialization to populate the in-memory cache
@@ -171,23 +184,16 @@ impl Client {
         phone_number: &str,
         source: LearningSource,
     ) -> Result<()> {
-        match self
-            .record_lid_pn_in_memory(lid, phone_number, source)
-            .await
-        {
-            RecordOutcome::Skipped => Ok(()),
-            RecordOutcome::NeedsUsync => {
-                self.spawn_lid_usync_reconcile(vec![phone_number.to_string()]);
-                Ok(())
-            }
-            RecordOutcome::Written {
-                entry,
-                needs_migration,
-            } => {
-                self.persist_and_migrate_lid_pn(entry, needs_migration)
-                    .await
-            }
-        }
+        let batch = self
+            .learn_lid_pn_mappings_owned(
+                vec![(lid.to_owned(), phone_number.to_owned())],
+                source,
+                true,
+            )
+            .await?;
+        self.migrate_single_lid_pn_batch(batch.storage, batch.migration_flags)
+            .await;
+        Ok(())
     }
 
     /// Durably add a batch of linked-identifier mappings and run the same
@@ -197,18 +203,12 @@ impl Client {
         mappings: Vec<(String, String)>,
         source: LearningSource,
     ) -> Result<usize> {
-        let BatchRecordOutcome {
-            entries,
-            migration_flags,
-            usync_phones,
-        } = self.record_lid_pn_batch_in_memory(mappings, source).await;
-        self.spawn_lid_usync_reconcile(usync_phones);
-
-        let count = entries.len();
-        if !entries.is_empty() {
-            self.persist_and_migrate_lid_pn_batch(entries, migration_flags)
-                .await?;
-        }
+        let batch = self
+            .learn_lid_pn_mappings_owned(mappings, source, false)
+            .await?;
+        let count = batch.count;
+        self.migrate_lid_pn_batch(batch.storage, batch.migration_flags)
+            .await;
         Ok(count)
     }
 
@@ -226,14 +226,9 @@ impl Client {
     /// mid-write), the mapping is only in-memory and will be lost on restart.
     /// Use [`add_lid_pn_mapping`] when the caller needs a durable guarantee.
     ///
-    /// Concurrent calls for the same phone number may both observe
-    /// `needs_migration = true` and each spawn a persist task. The downstream
-    /// work tolerates this:
-    /// - `put_lid_mapping` is an upsert
-    /// - `migrate_device_registry_on_lid_discovery` no-ops after the PN-keyed
-    ///   record is gone
-    /// - `migrate_signal_sessions_on_lid_discovery` no-ops after the sessions
-    ///   are migrated
+    /// The owned worker orders cache mutation and persistence through ACK.
+    /// Migrations follow after releasing that guard, keeping registry and
+    /// Signal lock acquisition outside the mapping mutation scope.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.learn_lid_pn_fast", level = "trace", skip_all, fields(is_offline = is_offline)))]
     pub(crate) async fn learn_lid_pn_mapping_fast(
         self: &Arc<Self>,
@@ -242,34 +237,31 @@ impl Client {
         source: LearningSource,
         is_offline: bool,
     ) {
-        let (entry, needs_migration) = match self
-            .record_lid_pn_in_memory(lid, phone_number, source)
-            .await
-        {
-            RecordOutcome::Skipped => return,
-            RecordOutcome::NeedsUsync => {
-                self.spawn_lid_usync_reconcile(vec![phone_number.to_string()]);
-                return;
-            }
-            RecordOutcome::Written {
-                entry,
-                needs_migration,
-            } => (entry, needs_migration),
-        };
         if is_offline {
+            if matches!(
+                self.record_lid_pn_in_memory(lid, phone_number, source)
+                    .await,
+                RecordOutcome::NeedsUsync
+            ) {
+                self.spawn_lid_usync_reconcile(vec![phone_number.to_owned()]);
+            }
             return;
         }
-        let client = Arc::clone(self);
-        self.runtime
-            .spawn(Box::pin(async move {
-                if let Err(err) = client
-                    .persist_and_migrate_lid_pn(entry, needs_migration)
-                    .await
-                {
-                    log::warn!("Background LID-PN persist failed: {err}");
-                }
-            }))
-            .detach();
+        // Preserve the existing allocation-free steady-state skip.
+        if self.lid_pn_cache.can_skip_relearn(phone_number, lid).await {
+            return;
+        }
+        let (recorded, visible) = futures::channel::oneshot::channel();
+        drop(self.spawn_owned_lid_pn_learning(
+            vec![(lid.to_owned(), phone_number.to_owned())],
+            source,
+            MappingLearningMode {
+                single: true,
+                migrate_in_worker: true,
+            },
+            Some(recorded),
+        ));
+        let _ = visible.await;
     }
 
     /// Batched variant of [`learn_lid_pn_mapping_fast`]. Updates the in-memory
@@ -297,8 +289,22 @@ impl Client {
         source: LearningSource,
         is_offline: bool,
     ) {
-        let outcome = self.record_lid_pn_batch_in_memory(mappings, source).await;
-        self.finish_lid_pn_batch_learning(outcome, is_offline);
+        if is_offline {
+            let outcome = self.record_lid_pn_batch_in_memory(mappings, source).await;
+            self.spawn_lid_usync_reconcile(outcome.usync_phones);
+            return;
+        }
+        let (recorded, visible) = futures::channel::oneshot::channel();
+        drop(self.spawn_owned_lid_pn_learning(
+            mappings,
+            source,
+            MappingLearningMode {
+                single: false,
+                migrate_in_worker: true,
+            },
+            Some(recorded),
+        ));
+        let _ = visible.await;
     }
 
     pub(crate) async fn learn_lid_pn_mappings_batch_guarded(
@@ -307,18 +313,10 @@ impl Client {
         source: LearningSource,
         is_offline: bool,
         guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
-    ) {
+    ) -> Result<()> {
         let outcome = self
             .record_lid_pn_batch_in_memory_guarded(mappings, source, guard)
             .await;
-        self.finish_lid_pn_batch_learning(outcome, is_offline);
-    }
-
-    fn finish_lid_pn_batch_learning(
-        self: &Arc<Self>,
-        outcome: BatchRecordOutcome,
-        is_offline: bool,
-    ) {
         let BatchRecordOutcome {
             entries,
             migration_flags,
@@ -330,22 +328,21 @@ impl Client {
         // flushImmediately).
         self.spawn_lid_usync_reconcile(usync_phones);
 
-        // Nothing written, or an offline replay: skip the persist/migrate task.
         if is_offline || entries.is_empty() {
-            return;
+            return Ok(());
         }
-
+        // The response owner retains this borrowed guard through the ACK.
+        // Never queue already-recorded entries for a later detached write.
+        let storage = self
+            .persist_lid_pn_batch_guarded(entries, false, guard)
+            .await?;
         let client = Arc::clone(self);
         self.runtime
             .spawn(Box::pin(async move {
-                if let Err(err) = client
-                    .persist_and_migrate_lid_pn_batch(entries, migration_flags)
-                    .await
-                {
-                    log::warn!("Background LID-PN batch persist failed: {err}");
-                }
+                client.migrate_lid_pn_batch(storage, migration_flags).await;
             }))
             .detach();
+        Ok(())
     }
 
     /// Fire-and-forget the WA Web `syncContactListJob({mode:"query"})` analog:
@@ -552,76 +549,108 @@ impl Client {
         RecordOutcome::Skipped
     }
 
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(
-            name = "wa.session.persist_migrate_lid_pn",
-            level = "debug",
-            skip_all,
-            fields(needs_migration),
-            err(Debug)
-        )
-    )]
-    async fn persist_and_migrate_lid_pn(
+    async fn learn_lid_pn_mappings_owned(
         &self,
-        entry: LidPnEntry,
-        needs_migration: bool,
-    ) -> Result<()> {
-        use anyhow::anyhow;
-
-        let storage_entry = LidPnMappingEntry {
-            lid: entry.lid.to_string(),
-            phone_number: entry.phone_number.to_string(),
-            created_at: entry.created_at,
-            updated_at: entry.created_at,
-            learning_source: entry.learning_source.as_str().to_string(),
-        };
-
-        // Migration deletes PN-keyed durable state. Keep it intact if the
-        // mapping write fails, so a restarted client can still find that state
-        // by PN; the in-memory pair stays unmarked and a later live learn retries.
-        self.persistence_manager
-            .backend()
-            .put_lid_mapping(&storage_entry)
+        mappings: Vec<(String, String)>,
+        source: LearningSource,
+        single: bool,
+    ) -> Result<PersistedMappingBatch> {
+        // Durable callers must evaluate the skip under the same mutation scope
+        // as record + ACK. Separate cache reads can straddle an ownership change.
+        let client = self
+            .self_weak
+            .get()
+            .and_then(|weak| weak.upgrade())
+            .ok_or_else(|| {
+                anyhow::anyhow!("client ownership unavailable during mapping persistence")
+            })?;
+        client
+            .spawn_owned_lid_pn_learning(
+                mappings,
+                source,
+                MappingLearningMode {
+                    single,
+                    migrate_in_worker: false,
+                },
+                None,
+            )
             .await
-            .map_err(|e| anyhow!("persisting LID-PN mapping: {e}"))?;
-
-        self.lid_pn_cache
-            .mark_persisted(&entry.phone_number, &entry.lid)
-            .await;
-
-        if needs_migration {
-            self.migrate_device_registry_on_lid_discovery(
-                &storage_entry.phone_number,
-                &storage_entry.lid,
-            )
-            .await;
-            self.migrate_signal_sessions_on_lid_discovery(
-                &storage_entry.phone_number,
-                &storage_entry.lid,
-            )
-            .await;
-        }
-
-        Ok(())
+            .map_err(|_| anyhow::anyhow!("owned mapping learning worker stopped"))?
     }
 
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.persist_migrate_lid_pn_batch", level = "debug", skip_all, fields(count = entries.len()), err(Debug)))]
-    async fn persist_and_migrate_lid_pn_batch(
+    /// Receive raw observations, not entries that were registered before the
+    /// worker started. Record + persistence share one owned mutation scope.
+    fn spawn_owned_lid_pn_learning(
+        self: &Arc<Self>,
+        mappings: Vec<(String, String)>,
+        source: LearningSource,
+        mode: MappingLearningMode,
+        recorded: Option<futures::channel::oneshot::Sender<()>>,
+    ) -> futures::channel::oneshot::Receiver<Result<PersistedMappingBatch>> {
+        let client = Arc::clone(self);
+        let (finished, completion) = futures::channel::oneshot::channel();
+        self.runtime.spawn_detached(Box::pin(async move {
+            let result = client
+                .learn_lid_pn_mappings_owned_inner(mappings, source, mode, recorded)
+                .await;
+            if let Err(Err(error)) = finished.send(result) {
+                log::warn!("Background LID-PN learning failed: {error:#}");
+            }
+        }));
+        completion
+    }
+
+    async fn learn_lid_pn_mappings_owned_inner(
         &self,
-        entries: Vec<LidPnEntry>,
-        migration_flags: Vec<bool>,
-    ) -> Result<()> {
-        let storage = self.persist_lid_pn_batch(entries).await?;
-        self.migrate_lid_pn_batch(storage, migration_flags).await;
-        Ok(())
+        mappings: Vec<(String, String)>,
+        source: LearningSource,
+        mode: MappingLearningMode,
+        recorded: Option<futures::channel::oneshot::Sender<()>>,
+    ) -> Result<PersistedMappingBatch> {
+        let guard = self.lid_pn_cache.lock_mutation().await;
+        let BatchRecordOutcome {
+            entries,
+            migration_flags,
+            usync_phones,
+        } = self
+            .record_lid_pn_batch_in_memory_guarded(mappings, source, &guard)
+            .await;
+        let count = entries.len();
+        self.spawn_lid_usync_reconcile(usync_phones);
+        if let Some(recorded) = recorded {
+            let _ = recorded.send(());
+        }
+        let storage = self
+            .persist_lid_pn_batch_guarded(entries, mode.single, &guard)
+            .await?;
+        // Migration takes registry/session locks; it must never retain mapping.
+        drop(guard);
+        if mode.migrate_in_worker {
+            if mode.single {
+                self.migrate_single_lid_pn_batch(storage, migration_flags)
+                    .await;
+            } else {
+                self.migrate_lid_pn_batch(storage, migration_flags).await;
+            }
+            return Ok(PersistedMappingBatch {
+                count,
+                ..Default::default()
+            });
+        }
+        Ok(PersistedMappingBatch {
+            storage,
+            migration_flags,
+            count,
+        })
     }
 
     /// Durable half of the batch learn: one backend transaction plus the
     /// cache persisted-markers, no migrations.
-    async fn persist_lid_pn_batch(
+    async fn persist_lid_pn_batch_guarded(
         &self,
         entries: Vec<LidPnEntry>,
+        single: bool,
+        _guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
     ) -> Result<Vec<LidPnMappingEntry>> {
         use anyhow::anyhow;
 
@@ -639,11 +668,25 @@ impl Client {
             })
             .collect();
 
-        self.persistence_manager
-            .backend()
-            .put_lid_mappings(&storage)
-            .await
-            .map_err(|e| anyhow!("persisting LID-PN mapping batch: {e}"))?;
+        if storage.is_empty() {
+            return Ok(storage);
+        }
+        let backend = self.persistence_manager.backend();
+        if single {
+            anyhow::ensure!(
+                storage.len() == 1,
+                "single mapping persistence received multiple rows"
+            );
+            backend
+                .put_lid_mapping(&storage[0])
+                .await
+                .map_err(|e| anyhow!("persisting LID-PN mapping: {e}"))?;
+        } else {
+            backend
+                .put_lid_mappings(&storage)
+                .await
+                .map_err(|e| anyhow!("persisting LID-PN mapping batch: {e}"))?;
+        }
 
         for entry in &entries {
             self.lid_pn_cache
@@ -651,6 +694,23 @@ impl Client {
                 .await;
         }
         Ok(storage)
+    }
+
+    /// Awaited public APIs retain their original caller's maintenance context;
+    /// fast learning invokes this only in its already-detached worker.
+    async fn migrate_single_lid_pn_batch(
+        &self,
+        storage: Vec<LidPnMappingEntry>,
+        migration_flags: Vec<bool>,
+    ) {
+        for (entry, migrate) in storage.iter().zip(migration_flags) {
+            if migrate {
+                self.migrate_device_registry_on_lid_discovery(&entry.phone_number, &entry.lid)
+                    .await;
+                self.migrate_signal_sessions_on_lid_discovery(&entry.phone_number, &entry.lid)
+                    .await;
+            }
+        }
     }
 
     /// Registry + Signal-session migrations for a persisted batch. Split from
@@ -877,22 +937,21 @@ impl Client {
         // detached task instead: this handler runs under the message
         // pipeline's processing permit, and a large first push walking
         // MIGRATION_DEVICE_RANGE locks per mapping would stall it.
-        let BatchRecordOutcome {
-            entries,
-            migration_flags,
-            usync_phones,
-        } = self
-            .record_lid_pn_batch_in_memory(mappings, LearningSource::MigrationSyncLatest)
-            .await;
-        self.spawn_lid_usync_reconcile(usync_phones);
-        if !entries.is_empty() {
-            match self.persist_lid_pn_batch(entries).await {
-                Ok(storage) => {
-                    // A shutdown can drop this task with the migrations unrun;
-                    // that is accepted, not retried: both halves self-heal
-                    // lazily (decrypt-side session migration via
-                    // try_pn_to_lid_migration_decrypt, and a LID registry miss
-                    // just re-warms over the network on the next send).
+        match self
+            .learn_lid_pn_mappings_owned(mappings, LearningSource::MigrationSyncLatest, false)
+            .await
+        {
+            Ok(PersistedMappingBatch {
+                storage,
+                migration_flags,
+                ..
+            }) => {
+                // A shutdown can drop this task with the migrations unrun;
+                // that is accepted, not retried: both halves self-heal
+                // lazily (decrypt-side session migration via
+                // try_pn_to_lid_migration_decrypt, and a LID registry miss
+                // just re-warms over the network on the next send).
+                if !storage.is_empty() {
                     let client = Arc::clone(self);
                     self.runtime
                         .spawn(Box::pin(async move {
@@ -900,14 +959,14 @@ impl Client {
                         }))
                         .detach();
                 }
-                Err(e) => {
-                    // Do not advance migration state on a failed save (WA
-                    // Web's setLidMigrationMappings rethrows); the primary's
-                    // push is gone, but the ab prop keeps addressing correct
-                    // until re-pair.
-                    log::warn!("Failed to persist migration mappings: {e:?}");
-                    return;
-                }
+            }
+            Err(e) => {
+                // Do not advance migration state on a failed save (WA
+                // Web's setLidMigrationMappings rethrows); the primary's
+                // push is gone, but the ab prop keeps addressing correct
+                // until re-pair.
+                log::warn!("Failed to persist migration mappings: {e:?}");
+                return;
             }
         }
 

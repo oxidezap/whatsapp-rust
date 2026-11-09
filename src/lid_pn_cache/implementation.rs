@@ -257,6 +257,11 @@ impl LidPnCache {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn startup_finished_for_tests(&self) -> bool {
+        self.startup_finished.load(Ordering::Acquire)
+    }
+
     /// Test-only clones of the backing custom stores, one per direction map.
     #[cfg(test)]
     pub(crate) fn custom_stores_for_tests(&self) -> Vec<Arc<dyn wacore::store::CacheStore>> {
@@ -452,14 +457,29 @@ impl LidPnCache {
             }
             None => true,
         };
-        let mapping_changed = (write_lid
+        let reverse_changed = write_lid
             && previous_lid
                 .as_ref()
-                .is_none_or(|existing| existing.phone_number != entry.phone_number))
-            || (should_update_pn
-                && previous_pn
-                    .as_ref()
-                    .is_none_or(|existing| existing.lid != entry.lid));
+                .is_none_or(|existing| existing.phone_number != entry.phone_number);
+        let forward_changed = should_update_pn
+            && previous_pn
+                .as_ref()
+                .is_none_or(|existing| existing.lid != entry.lid);
+        let mapping_changed = reverse_changed || forward_changed;
+        // A durable marker belongs to the current reciprocal pair. Rebinding
+        // either direction must revoke it before publishing the new cache row,
+        // otherwise a concurrent relearn could return before its backend ACK.
+        if forward_changed
+            || (reverse_changed && self.is_persisted(&entry.phone_number, &entry.lid).await)
+        {
+            self.persisted.invalidate(&*entry.phone_number).await;
+        }
+        if reverse_changed
+            && let Some(previous) = &previous_lid
+            && self.is_persisted(&previous.phone_number, &entry.lid).await
+        {
+            self.persisted.invalidate(&*previous.phone_number).await;
+        }
         let _identity_change = mapping_changed.then(|| {
             self.identity_continuity.changing(
                 [
@@ -633,6 +653,7 @@ impl LidPnCache {
                 .get(&*entry.phone_number)
                 .await
                 .is_some_and(|current| current.lid == entry.lid)
+                && self.get_phone_number(&entry.lid).await.as_deref() == Some(&*entry.phone_number)
             {
                 self.mark_persisted(&entry.phone_number, &entry.lid).await;
             }
@@ -1355,6 +1376,32 @@ mod tests {
         // A remap to a new LID is not persisted (even a stale mark of the old
         // LID never satisfies the new pair), so it re-persists.
         assert!(!cache.is_persisted(pn, lid_b).await);
+    }
+
+    #[tokio::test]
+    async fn rebinding_revokes_old_durable_pair_before_reclaim() {
+        let cache = LidPnCache::new();
+        let lid = "100000000000001";
+        let old = "559980000099";
+        let new = "559980000098";
+        for (phone, timestamp) in [(old, 1), (new, 2), (old, 3)] {
+            cache
+                .add(&LidPnEntry::with_timestamp(
+                    lid.to_string(),
+                    phone.to_string(),
+                    timestamp,
+                    LearningSource::Usync,
+                ))
+                .await;
+            assert!(!cache.can_skip_relearn(phone, lid).await);
+            if timestamp < 3 {
+                cache
+                    .mark_persisted(&Arc::from(phone), &Arc::from(lid))
+                    .await;
+            }
+        }
+        assert!(!cache.is_persisted(new, lid).await);
+        assert!(!cache.is_persisted(old, lid).await);
     }
 
     #[tokio::test]

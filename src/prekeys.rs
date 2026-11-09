@@ -229,6 +229,7 @@ impl Client {
         // identity as the fallback in validateADVwithIdentityKey).
         let spec = spec.with_account_identities(account_identities);
 
+        let bootstrap_epoch = self.signal_cache.identity_continuity.snapshot();
         let mut outcome = self.execute(spec).await?;
         // A self-contained companion certificate does not replace the requested
         // primary trust anchor. An omitted primary must not leave a session
@@ -250,7 +251,11 @@ impl Client {
             if let Some(bundle) = outcome.bundles.get(jid) {
                 let identity = authenticated_primary_identity(bundle)?;
                 if !self
-                    .persist_adv_bootstrap_identity(jid, identity.public_key().public_key_bytes())
+                    .persist_adv_bootstrap_identity_in_epoch(
+                        jid,
+                        identity.public_key().public_key_bytes(),
+                        bootstrap_epoch,
+                    )
                     .await?
                 {
                     anyhow::bail!("primary identity changed during companion bootstrap");
@@ -321,8 +326,12 @@ impl Client {
         if let Some(identity) = self.cached_adv_account_identity(jid).await? {
             return Ok(identity);
         }
+        let epoch = self.signal_cache.identity_continuity.snapshot();
         let key = self.query_adv_account_identity(&primary, None).await?;
-        if !self.persist_adv_bootstrap_identity(&primary, &key).await? {
+        if !self
+            .persist_adv_bootstrap_identity_in_epoch(&primary, &key, epoch)
+            .await?
+        {
             anyhow::bail!(crate::usync::DeviceListIdentityConflict::Bootstrap);
         }
         Ok(key)

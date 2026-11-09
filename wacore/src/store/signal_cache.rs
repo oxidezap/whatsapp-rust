@@ -19,6 +19,7 @@ use crate::store::traits::SignalStore;
 type StoreIncarnation = [u8; 16];
 
 const IDENTITY_CHANGE_CAPACITY: usize = 1024;
+const PRIMARY_CHANGE: u64 = 1 << 63;
 
 /// Process-local account changes for historical sends. Fingerprint collisions
 /// only exclude an extra account; pruned history excludes every older token.
@@ -63,6 +64,25 @@ impl IdentityContinuity {
         snapshot: Option<u64>,
         users: impl IntoIterator<Item = &'a str>,
     ) -> bool {
+        self.unchanged_for_inner(snapshot, users, false)
+    }
+
+    /// Bootstrap authentication is revoked by primary retirement, not by
+    /// ordinary companion-session cleanup in the same account.
+    pub fn unchanged_primary_for<'a>(
+        &self,
+        snapshot: Option<u64>,
+        users: impl IntoIterator<Item = &'a str>,
+    ) -> bool {
+        self.unchanged_for_inner(snapshot, users, true)
+    }
+
+    fn unchanged_for_inner<'a>(
+        &self,
+        snapshot: Option<u64>,
+        users: impl IntoIterator<Item = &'a str>,
+        primary_only: bool,
+    ) -> bool {
         let Some(since) = snapshot else {
             return false;
         };
@@ -73,13 +93,16 @@ impl IdentityContinuity {
             return false;
         }
         users.into_iter().all(|user| {
-            let fingerprint = user_fingerprint(user);
+            let fingerprint = user_fingerprint(user) & !PRIMARY_CHANGE;
             state
                 .users
                 .iter()
                 .rev()
                 .take_while(|(generation, _)| *generation > since)
-                .all(|(_, changed)| *changed != fingerprint)
+                .all(|(_, changed)| {
+                    (primary_only && changed & PRIMARY_CHANGE == 0)
+                        || changed & !PRIMARY_CHANGE != fingerprint
+                })
         })
     }
 
@@ -88,6 +111,22 @@ impl IdentityContinuity {
     pub fn changing<'a>(
         &self,
         users: impl IntoIterator<Item = &'a str>,
+    ) -> IdentityContinuityChange<'_> {
+        self.changing_inner(users, false)
+    }
+
+    /// Hold through reset persistence, including notifications with no prior key.
+    pub fn changing_primary<'a>(
+        &self,
+        users: impl IntoIterator<Item = &'a str>,
+    ) -> IdentityContinuityChange<'_> {
+        self.changing_inner(users, true)
+    }
+
+    fn changing_inner<'a>(
+        &self,
+        users: impl IntoIterator<Item = &'a str>,
+        primary: bool,
     ) -> IdentityContinuityChange<'_> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if state.active == 0 {
@@ -111,7 +150,11 @@ impl IdentityContinuity {
                 // untouched.
                 state.floor = evicted.saturating_add(1);
             }
-            state.users.push_back((generation, user_fingerprint(user)));
+            // Keep the shared cache fingerprint unchanged; only this journal
+            // reserves a class bit. Collisions fail closed for extra accounts.
+            let fingerprint = (user_fingerprint(user) & !PRIMARY_CHANGE)
+                | if primary { PRIMARY_CHANGE } else { 0 };
+            state.users.push_back((generation, fingerprint));
         }
         if !scoped {
             state.floor = generation;
@@ -1890,6 +1933,25 @@ impl SignalStoreCache {
         data: &[u8],
         backend: &dyn SignalStore,
     ) -> Result<bool> {
+        self.persist_identity_and_alias_in_epoch(
+            address,
+            alias,
+            data,
+            backend,
+            self.identity_continuity.snapshot(),
+        )
+        .await
+    }
+
+    /// The token must precede authentication, including its network request.
+    pub async fn persist_identity_and_alias_in_epoch(
+        &self,
+        address: &ProtocolAddress,
+        alias: Option<&ProtocolAddress>,
+        data: &[u8],
+        backend: &dyn SignalStore,
+        epoch: Option<u64>,
+    ) -> Result<bool> {
         let key: [u8; 32] = data
             .try_into()
             .map_err(|_| anyhow::anyhow!("invalid bootstrap identity length"))?;
@@ -1899,6 +1961,7 @@ impl SignalStoreCache {
         let _flush = self.flush_lock.lock().await;
         let mut state = self.identities.lock().await;
         let mut matches = true;
+        let mut observed = Vec::with_capacity(2);
         for address in std::iter::once(address).chain(alias) {
             let previous = match state.cache.get(address.as_str()) {
                 Some(cached) => cached.clone(),
@@ -1912,8 +1975,22 @@ impl SignalStoreCache {
                 "invalid stored bootstrap identity length"
             );
             matches &= previous.as_deref().is_none_or(|known| known == data);
+            // Preserve the observed absence/equality for change classification.
+            // An uncached first write must not retire another request's epoch.
+            observed.push((Arc::from(address.as_str()), previous));
         }
-        if !matches {
+        for (address, previous) in observed {
+            state.cache.insert(address, previous);
+        }
+        if !matches
+            || !self.identity_continuity.unchanged_primary_for(
+                epoch,
+                std::iter::once(address)
+                    .chain(alias)
+                    .map(|address| user_of_protocol_address(address.name())),
+            )
+        {
+            state.evict_if_needed(self.max_entries);
             return Ok(false);
         }
         // Pin the authenticated anchor before storage can commit. Dropping its
@@ -1923,6 +2000,14 @@ impl SignalStoreCache {
         let _change = self.identity_write_change(&state, address, data);
         state.put_dedup(address.as_str(), data);
         backend.put_identity(address.as_str(), key).await?;
+        if !self.identity_continuity.unchanged_primary_for(
+            epoch,
+            std::iter::once(address)
+                .chain(alias)
+                .map(|address| user_of_protocol_address(address.name())),
+        ) {
+            return Ok(false);
+        }
         state.dirty.remove(address.as_str());
         state.deleted.remove(address.as_str());
         state.evict_if_needed(self.max_entries);
@@ -2070,9 +2155,7 @@ impl SignalStoreCache {
 
     pub async fn delete_identity(&self, address: &ProtocolAddress) {
         let mut state = self.identities.lock().await;
-        let _change = self
-            .identity_continuity
-            .changing([user_of_protocol_address(address.name())]);
+        let _change = self.identity_address_change(address);
         state.delete(address.as_str());
     }
 
@@ -2087,10 +2170,16 @@ impl SignalStoreCache {
             Some(Some(previous)) if previous.as_ref() == data => None,
             // An uncached write cannot prove this is a first identity. Normal
             // Signal saves load the old row before writing, including absence.
-            _ => Some(
-                self.identity_continuity
-                    .changing([user_of_protocol_address(address.name())]),
-            ),
+            _ => Some(self.identity_address_change(address)),
+        }
+    }
+
+    fn identity_address_change(&self, address: &ProtocolAddress) -> IdentityContinuityChange<'_> {
+        let users = [user_of_protocol_address(address.name())];
+        if u32::from(address.device_id()) == 0 {
+            self.identity_continuity.changing_primary(users)
+        } else {
+            self.identity_continuity.changing(users)
         }
     }
 
@@ -8550,6 +8639,63 @@ mod durability_chaos_tests;
 #[cfg(test)]
 mod identity_continuity_tests {
     use super::*;
+
+    #[test]
+    fn primary_epochs_ignore_companion_cleanup_but_not_retirement_or_lost_history() {
+        let continuity = IdentityContinuity::default();
+        let original = continuity.snapshot();
+        let companion = continuity.changing(["peer"]);
+        assert!(continuity.unchanged_primary_for(original, ["peer"]));
+        assert!(!continuity.unchanged_for(original, ["peer"]));
+        let primary = continuity.changing_primary(["peer", "alias"]);
+        assert!(!continuity.unchanged_primary_for(original, ["peer"]));
+        assert!(!continuity.unchanged_primary_for(original, ["alias"]));
+        assert!(continuity.unchanged_primary_for(original, ["unrelated"]));
+        drop(primary);
+        drop(companion);
+        let current = continuity.snapshot();
+        assert!(continuity.unchanged_primary_for(current, ["peer"]));
+        for _ in 0..IDENTITY_CHANGE_CAPACITY {
+            drop(continuity.changing(["other"]));
+        }
+        assert!(!continuity.unchanged_primary_for(original, ["unrelated"]));
+        drop(continuity.changing_primary([]));
+        assert!(!continuity.unchanged_primary_for(current, ["unrelated"]));
+        assert!(!IdentityContinuity::unavailable().unchanged_primary_for(None, ["peer"]));
+    }
+
+    #[tokio::test]
+    async fn companion_cleanup_does_not_revoke_primary_bootstrap_authentication() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let primary = ProtocolAddress::new("12025550234", 0.into());
+        let companion = ProtocolAddress::new("12025550234", 7.into());
+        let epoch = cache.identity_continuity.snapshot();
+        cache.delete_identity(&companion).await;
+        assert!(
+            cache
+                .persist_identity_and_alias_in_epoch(&primary, None, &[1; 32], &backend, epoch,)
+                .await
+                .unwrap()
+        );
+        // The same pre-IQ token remains valid for equal authentication after
+        // the first cold write; observing absence must not look like retirement.
+        cache.clear_after_flush().await;
+        assert!(
+            cache
+                .persist_identity_and_alias_in_epoch(&primary, None, &[1; 32], &backend, epoch,)
+                .await
+                .unwrap()
+        );
+        let epoch = cache.identity_continuity.snapshot();
+        cache.delete_identity(&primary).await;
+        assert!(
+            !cache
+                .persist_identity_and_alias_in_epoch(&primary, None, &[1; 32], &backend, epoch,)
+                .await
+                .unwrap()
+        );
+    }
 
     #[test]
     fn overlapping_changes_and_cancelled_snapshots_fail_closed() {
