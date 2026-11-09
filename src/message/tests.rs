@@ -8032,6 +8032,73 @@ async fn status_broadcast_decrypt_failure_acks_to_chat() {
     );
 }
 
+/// Regression: a companion pkmsg whose ADV identity cannot be verified was
+/// dropped with no response, so the server kept it queued, redelivered it on
+/// every reconnect and eventually closed the stream with `<stream:error><ack/>`.
+/// WA Web (`WAWebMsgProcessingDecryptApi`) answers with an AdvFailure retry.
+#[tokio::test]
+async fn unverifiable_companion_adv_requests_retry_and_acks() {
+    let (client, transport) = capturing_client("adv_failure_retry").await;
+    let (bundle, receiver) = bobs_prekey_bundle(&client).await;
+    let mut companion = AlicePeer::new("777000000000082:3@lid").await;
+    crate::test_utils::seed_adv_primary(&client, &companion.jid).await;
+    companion
+        .install_bob_session(&receiver.to_protocol_address(), &bundle)
+        .await;
+    let ciphertext = companion
+        .encrypt_text(&receiver.to_protocol_address(), "no certificate")
+        .await;
+    let payload = enc_payload_from_ciphertext(&ciphertext);
+    assert_eq!(payload.enc_type.as_wire_str(), "pkmsg");
+    let info = Arc::new(MessageInfo {
+        id: "ADV-FAIL".into(),
+        source: crate::types::message::MessageSource {
+            sender: companion.jid.clone(),
+            chat: companion.jid.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    client
+        .clone()
+        .process_classified_message(
+            ClassifiedMessage {
+                device_identity: None,
+                info,
+                sender_encryption_jid: companion.jid.clone(),
+                session_payloads: vec![payload],
+                group_payloads: vec![],
+                bot_payloads: vec![],
+                max_sender_retry_count: 0,
+                decrypt_fail_mode: DecryptFailMode::Show,
+                ack_recipient: None,
+            },
+            client.connection_generation.load(Ordering::Acquire),
+        )
+        .await;
+
+    for _ in 0..80 {
+        let sent = transport.sent();
+        if !retry_receipt_key_bundles_for(&sent, "ADV-FAIL").is_empty()
+            && find_message_ack(&sent).is_some()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let sent = transport.sent();
+    assert_eq!(
+        retry_receipt_key_bundles_for(&sent, "ADV-FAIL").len(),
+        1,
+        "an unverifiable ADV identity must request exactly one retry"
+    );
+    assert!(
+        find_message_ack(&sent).is_some(),
+        "the stanza must be acked so the server stops redelivering it"
+    );
+}
+
 /// Run a single session ciphertext through the full classify->process path.
 async fn process_session_ct(
     client: &Arc<Client>,

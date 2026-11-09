@@ -748,9 +748,20 @@ impl Client {
                     .await
                     .is_err()
                 {
+                    // WA Web answers this with a retry receipt (reason
+                    // AdvFailure). A bare return leaves the stanza unacked
+                    // and the server redelivers it every reconnect, then
+                    // closes the stream with `<stream:error><ack/>`.
                     log::warn!(
-                        "Dropping companion prekey message with an unverifiable ADV identity"
+                        "Companion prekey message with an unverifiable ADV identity; requesting retry"
                     );
+                    self.handle_decrypt_failure(
+                        &info,
+                        RetryReason::AdvFailure,
+                        decrypt_fail_mode,
+                        ack_recipient.as_ref(),
+                    )
+                    .await;
                     return;
                 }
             }
