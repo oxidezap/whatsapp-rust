@@ -8181,6 +8181,78 @@ async fn unverifiable_companion_adv_honors_sender_retry_count() {
     );
 }
 
+/// Only the pkmsg whose ADV identity failed was judged; every other `<enc>` in
+/// the stanza, a second pkmsg included, was abandoned without an attempt.
+#[tokio::test]
+async fn unverifiable_companion_adv_reports_only_the_failing_enc() {
+    let (client, _transport) = capturing_client("adv_report_encs").await;
+    let (recorder, _leases) = watch_enc_outcomes(&client);
+    let (bundle, receiver) = bobs_prekey_bundle(&client).await;
+    let mut companion = AlicePeer::new("777000000000084:5@lid").await;
+    crate::test_utils::seed_adv_primary(&client, &companion.jid).await;
+    companion
+        .install_bob_session(&receiver.to_protocol_address(), &bundle)
+        .await;
+    let first = companion
+        .encrypt_text(&receiver.to_protocol_address(), "first")
+        .await;
+    let second = companion
+        .encrypt_text(&receiver.to_protocol_address(), "second")
+        .await;
+    let second = enc_payload_from_ciphertext(&second);
+    assert_eq!(second.enc_type.as_wire_str(), "pkmsg");
+
+    client
+        .clone()
+        .process_classified_message(
+            ClassifiedMessage {
+                device_identity: None,
+                info: dm_info("ADV-ENCS", &companion.jid),
+                sender_encryption_jid: companion.jid.clone(),
+                session_payloads: vec![
+                    enc_payload_from_ciphertext(&first),
+                    enc_payload_at("pkmsg", second.ciphertext.to_vec(), 1),
+                ],
+                group_payloads: vec![enc_payload_at("skmsg", vec![7u8; 16], 2)],
+                bot_payloads: vec![],
+                max_sender_retry_count: 0,
+                decrypt_fail_mode: DecryptFailMode::Show,
+                ack_recipient: None,
+            },
+            client.connection_generation.load(Ordering::Acquire),
+        )
+        .await;
+
+    let mut failures = Vec::new();
+    for _ in 0..40 {
+        failures = recorder.failures();
+        if failures.len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        failures,
+        vec![
+            (
+                0,
+                Some("pkmsg".to_string()),
+                EncDecryptFailureReason::UntrustedIdentity
+            ),
+            (
+                1,
+                Some("pkmsg".to_string()),
+                EncDecryptFailureReason::NotAttempted
+            ),
+            (
+                2,
+                Some("skmsg".to_string()),
+                EncDecryptFailureReason::NotAttempted
+            ),
+        ]
+    );
+}
+
 /// Run a single session ciphertext through the full classify->process path.
 async fn process_session_ct(
     client: &Arc<Client>,

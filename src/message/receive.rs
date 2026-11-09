@@ -775,7 +775,7 @@ impl Client {
                         .chain(&group_payloads)
                         .chain(&bot_payloads)
                     {
-                        let reason = if abandoned.enc_type == EncType::PreKeyMessage {
+                        let reason = if abandoned.enc_index == payload.enc_index {
                             EncDecryptFailureReason::UntrustedIdentity
                         } else {
                             EncDecryptFailureReason::NotAttempted
