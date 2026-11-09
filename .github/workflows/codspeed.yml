@@ -64,7 +64,7 @@ jobs:
       # Both instruments measure immutable base/head workloads under distinct names.
       # No git/CI metadata or baseline is replaced.
       - name: Measure alternating base/head CPU and allocation samples
-        uses: CodSpeedHQ/action@61efe07e57e55bedeab750c434504de272a56e8c # v5.6.1
+        uses: CodSpeedHQ/action@af75f77f17a054769abefaa42fe8dc2975469b5f # v5.6.3
         with:
           mode: simulation,memory
           disable-memory-capture-stack: "false"
@@ -119,7 +119,7 @@ jobs:
           "$RUNNER_TEMP/signal-compare" ci signal-pair-prepare --base-revision "$BASE_REVISION" --head-revision "$HEAD_REVISION"
           lscpu > .signal-pair-out/results/host.txt
       - name: Measure both immutable libraries through CodSpeed
-        uses: CodSpeedHQ/action@61efe07e57e55bedeab750c434504de272a56e8c # v5.6.1
+        uses: CodSpeedHQ/action@af75f77f17a054769abefaa42fe8dc2975469b5f # v5.6.3
         with:
           mode: simulation,memory
           runner-version: "5.4.2"
@@ -327,7 +327,7 @@ jobs:
       # this action, and read the PR right after the bump against the new
       # baseline, not the old one. `cycle-estimation: false` reverts it.
       - name: Run the benchmarks
-        uses: CodSpeedHQ/action@61efe07e57e55bedeab750c434504de272a56e8c # v5.6.1
+        uses: CodSpeedHQ/action@af75f77f17a054769abefaa42fe8dc2975469b5f # v5.6.3
         env:
           SHARD_PACKAGES: ${{ matrix.shard.packages }}
         with:
@@ -460,7 +460,7 @@ jobs:
       # workspace default-member, so a bare `cargo codspeed run` discovers no
       # benchmarks for it ("No benchmarks found for the simulation mode").
       - name: Run the benchmarks
-        uses: CodSpeedHQ/action@61efe07e57e55bedeab750c434504de272a56e8c # v5.6.1
+        uses: CodSpeedHQ/action@af75f77f17a054769abefaa42fe8dc2975469b5f # v5.6.3
         env:
           MOCK_SERVER_URL: "wss://127.0.0.1:8080/ws/chat"
           RUST_LOG: warn
