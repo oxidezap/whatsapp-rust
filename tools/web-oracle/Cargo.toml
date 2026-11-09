@@ -12,11 +12,11 @@ serde_json = { workspace = true, features = ["std", "preserve_order"] }
 sha2.workspace = true
 hex.workspace = true
 boa_engine = { version = "=0.22.0", default-features = false }
-oxc_allocator = "=0.133.0"
-oxc_ast = "=0.133.0"
-oxc_ast_visit = "=0.133.0"
-oxc_parser = "=0.133.0"
-oxc_span = "=0.133.0"
+oxc_allocator = "=0.146.0"
+oxc_ast = "=0.146.0"
+oxc_ast_visit = "=0.146.0"
+oxc_parser = "=0.146.0"
+oxc_span = "=0.146.0"
 clap = { version = "4", features = ["derive"] }
 tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
 
