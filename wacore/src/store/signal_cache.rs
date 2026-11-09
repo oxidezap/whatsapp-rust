@@ -2176,10 +2176,20 @@ impl SignalStoreCache {
 
     fn identity_address_change(&self, address: &ProtocolAddress) -> IdentityContinuityChange<'_> {
         let users = [user_of_protocol_address(address.name())];
-        if u32::from(address.device_id()) == 0 {
-            self.identity_continuity.changing_primary(users)
-        } else {
+        // WhatsApp JIDs encode the device in the name while Signal's device
+        // field remains zero. Unknown names retain conservative retirement.
+        let companion = u32::from(address.device_id()) != 0
+            || address.name().contains('@')
+                && address
+                    .name()
+                    .parse::<wacore_binary::Jid>()
+                    .is_ok_and(|jid| {
+                        (jid.server.is_pn_family() || jid.server.is_lid_family()) && jid.device != 0
+                    });
+        if companion {
             self.identity_continuity.changing(users)
+        } else {
+            self.identity_continuity.changing_primary(users)
         }
     }
 
@@ -8695,6 +8705,64 @@ mod identity_continuity_tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn review_jid_companion_cleanup_keeps_primary_authentication() {
+        use crate::types::jid::JidExt;
+        use wacore_binary::{Jid, Server};
+
+        for server in [Server::Pn, Server::Lid, Server::Hosted, Server::HostedLid] {
+            let cache = SignalStoreCache::new();
+            let backend = crate::store::in_memory::InMemoryBackend::new();
+            let user = "12025550235";
+            let primary = Jid::new(user, server).with_device(0).to_protocol_address();
+            let device = if matches!(server, Server::Hosted | Server::HostedLid) {
+                99
+            } else {
+                7
+            };
+            let companion = Jid::new(user, server)
+                .with_device(device)
+                .to_protocol_address();
+            assert_eq!(u32::from(companion.device_id()), 0);
+            let epoch = cache.identity_continuity.snapshot();
+            cache.delete_identity(&companion).await;
+            assert!(
+                cache
+                    .persist_identity_and_alias_in_epoch(&primary, None, &[1; 32], &backend, epoch,)
+                    .await
+                    .unwrap(),
+                "companion cleanup retired primary authentication for {server:?}"
+            );
+            let epoch = cache.identity_continuity.snapshot();
+            cache.delete_identity(&primary).await;
+            assert!(
+                !cache
+                    .persist_identity_and_alias_in_epoch(&primary, None, &[1; 32], &backend, epoch,)
+                    .await
+                    .unwrap(),
+                "primary retirement must still fence earlier authentication"
+            );
+        }
+        for name in [
+            "12025550235:bad@c.us",
+            "12025550235:7",
+            "12025550235:7@unknown.invalid",
+            "unknown",
+        ] {
+            let cache = SignalStoreCache::new();
+            let epoch = cache.identity_continuity.snapshot();
+            cache
+                .delete_identity(&ProtocolAddress::new(name, 0.into()))
+                .await;
+            assert!(
+                !cache
+                    .identity_continuity
+                    .unchanged_primary_for(epoch, [user_of_protocol_address(name)]),
+                "unknown address formats must retain primary retirement"
+            );
+        }
     }
 
     #[test]
