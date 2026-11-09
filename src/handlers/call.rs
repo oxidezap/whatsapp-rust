@@ -617,14 +617,14 @@ impl StanzaHandler for CallHandler {
                                 } else {
                                     dispatch_call = false;
                                 }
-                            } else if let Some(generation) = group_transition_generation
-                                .or_else(|| client.call_registry().generation_of(call_id))
-                                .filter(|&generation| {
-                                    client
-                                        .call_registry()
-                                        .group_state_if_current(call_id, generation)
-                                        .is_none()
-                                })
+                            } else if let Some((generation, peer)) = direct_screen_share_peer(
+                                &client,
+                                &call,
+                                call_creator,
+                                screen_share.state,
+                                group_transition_generation,
+                            )
+                            .await
                             {
                                 // A 1:1 peer shares its screen as its ordinary video
                                 // plane, announcing it with the same stanza a group
@@ -634,7 +634,7 @@ impl StanzaHandler for CallHandler {
                                     call_id,
                                     generation,
                                     CallEvent::ScreenShareChanged {
-                                        participant: sender.to_non_ad(),
+                                        participant: peer.to_non_ad(),
                                         screen_share: screen_share.clone(),
                                     },
                                 );
@@ -1334,6 +1334,48 @@ fn validate_group_epoch_key(raw_epoch: &[u8]) -> anyhow::Result<()> {
 use crate::voip::direct_ingress::{
     is_call_service_sender, reject_is_device_busy, routed_call_sender,
 };
+
+/// The peer of a current 1:1 video call, when it sent this screen-share
+/// stanza itself about a call it is in; `None` for anything else.
+#[cfg(feature = "voip-control")]
+async fn direct_screen_share_peer(
+    client: &Client,
+    call: &IncomingCall,
+    call_creator: &Jid,
+    state: ScreenShareState,
+    transition: Option<u64>,
+) -> Option<(u64, Jid)> {
+    let call_id = call.action.call_id();
+    let registry = client.call_registry();
+    let generation = transition.or_else(|| registry.generation_of(call_id))?;
+    if registry.is_group_call_if_current(call_id, generation)
+        || registry
+            .group_state_if_current(call_id, generation)
+            .is_some()
+        || is_call_service_sender(&call.from, call_id)
+    {
+        return None;
+    }
+    let session = registry
+        .snapshot(call_id)
+        .filter(|_| registry.is_current(call_id, generation))?;
+    if state == ScreenShareState::Started && !session.is_video {
+        return None;
+    }
+    crate::voip::direct_ingress::canonical_call_identity(
+        client,
+        call_creator,
+        &session.call_creator,
+    )
+    .await?;
+    let peer = crate::voip::direct_ingress::canonical_call_identity(
+        client,
+        &routed_call_sender(call),
+        &session.peer_jid,
+    )
+    .await?;
+    Some((generation, peer))
+}
 
 #[cfg(all(test, feature = "voip-control"))]
 async fn canonical_call_identity(client: &Client, observed: &Jid, expected: &Jid) -> Option<Jid> {
@@ -3822,11 +3864,13 @@ mod tests {
 
         let client = make_sending_client().await;
         let registry = client.call_registry();
-        let generation = registry.insert(wacore::voip_control::CallSession::new_incoming(
+        let mut session = wacore::voip_control::CallSession::new_incoming(
             "CALL-ID-0001",
             fake_caller_lid(),
             fake_caller_lid(),
-        ));
+        );
+        session.is_video = true;
+        let generation = registry.insert(session);
         let (event_tx, event_rx) = async_channel::unbounded::<CallEvent>();
         let (control_tx, _control_rx) = video_control_channel();
         registry.set_video_channels(
@@ -3836,29 +3880,45 @@ mod tests {
             control_tx,
             Box::new(|| {}),
         );
-        let stanza = NodeBuilder::new("call")
-            .attr("from", fake_caller_lid())
-            .attr("id", "STANZA-ID-0003")
-            .attr("t", "1766847151")
-            .children([NodeBuilder::new(CallActionTag::ScreenShare.as_str())
-                .attr("call-id", "CALL-ID-0001")
-                .attr("call-creator", fake_caller_lid())
-                .attr("screenshare_state", "1")
-                .attr("version", "2")
-                .build()])
-            .build();
-        let mut cancelled = false;
+        let share = |from: Jid, id: &str| {
+            NodeBuilder::new("call")
+                .attr("from", from)
+                .attr("id", id.to_string())
+                .attr("t", "1766847151")
+                .children([NodeBuilder::new(CallActionTag::ScreenShare.as_str())
+                    .attr("call-id", "CALL-ID-0001")
+                    .attr("call-creator", fake_caller_lid())
+                    .attr("screenshare_state", "1")
+                    .attr("version", "2")
+                    .build()])
+                .build()
+        };
+        let outsider = Jid::new("333333333333333", Server::Lid);
+        for (from, id) in [
+            (outsider, "STANZA-ID-0003"),
+            (fake_caller_lid(), "STANZA-ID-0004"),
+        ] {
+            let mut cancelled = false;
+            assert!(
+                CallHandler
+                    .handle(
+                        client.clone(),
+                        node_to_owned_ref(&share(from, id)),
+                        &mut cancelled
+                    )
+                    .await
+            );
+        }
         assert!(
-            CallHandler
-                .handle(client, node_to_owned_ref(&stanza), &mut cancelled)
-                .await
+            matches!(
+                event_rx.try_recv(),
+                Ok(CallEvent::ScreenShareChanged { participant, screen_share })
+                    if participant == fake_caller_lid()
+                        && screen_share.state == ScreenShareState::Started
+            ),
+            "only the peer's share comes through"
         );
-        assert!(matches!(
-            event_rx.try_recv(),
-            Ok(CallEvent::ScreenShareChanged { participant, screen_share })
-                if participant == fake_caller_lid()
-                    && screen_share.state == ScreenShareState::Started
-        ));
+        assert!(event_rx.try_recv().is_err());
         registry.remove_if_current("CALL-ID-0001", generation);
     }
 
