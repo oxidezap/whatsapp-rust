@@ -8032,13 +8032,22 @@ async fn status_broadcast_decrypt_failure_acks_to_chat() {
     );
 }
 
-/// Regression: a companion pkmsg whose ADV identity cannot be verified was
-/// dropped with no response, so the server kept it queued, redelivered it on
-/// every reconnect and eventually closed the stream with `<stream:error><ack/>`.
-/// WA Web (`WAWebMsgProcessingDecryptApi`) answers with an AdvFailure retry.
-#[tokio::test]
-async fn unverifiable_companion_adv_requests_retry_and_acks() {
-    let (client, transport) = capturing_client("adv_failure_retry").await;
+/// Runs a companion pkmsg through `process_classified_message` with the given
+/// certificate and sender-echoed retry count, and returns the wire frames once
+/// the stanza has been acked.
+async fn run_unverifiable_companion_adv(
+    test_id: &str,
+    certificate: Option<Vec<u8>>,
+    max_sender_retry_count: u8,
+) -> Vec<bytes::Bytes> {
+    let (client, transport) = capturing_client(test_id).await;
+    // Retries after the first carry `<keys>`, which need our own ADV account.
+    client
+        .persistence_manager
+        .process_command(crate::store::commands::DeviceCommand::SetAccount(Some(
+            wa::ADVSignedDeviceIdentity::default(),
+        )))
+        .await;
     let (bundle, receiver) = bobs_prekey_bundle(&client).await;
     let mut companion = AlicePeer::new("777000000000082:3@lid").await;
     crate::test_utils::seed_adv_primary(&client, &companion.jid).await;
@@ -8046,7 +8055,7 @@ async fn unverifiable_companion_adv_requests_retry_and_acks() {
         .install_bob_session(&receiver.to_protocol_address(), &bundle)
         .await;
     let ciphertext = companion
-        .encrypt_text(&receiver.to_protocol_address(), "no certificate")
+        .encrypt_text(&receiver.to_protocol_address(), "unverifiable")
         .await;
     let payload = enc_payload_from_ciphertext(&ciphertext);
     assert_eq!(payload.enc_type.as_wire_str(), "pkmsg");
@@ -8064,13 +8073,13 @@ async fn unverifiable_companion_adv_requests_retry_and_acks() {
         .clone()
         .process_classified_message(
             ClassifiedMessage {
-                device_identity: None,
+                device_identity: certificate.map(bytes::Bytes::from),
                 info,
                 sender_encryption_jid: companion.jid.clone(),
                 session_payloads: vec![payload],
                 group_payloads: vec![],
                 bot_payloads: vec![],
-                max_sender_retry_count: 0,
+                max_sender_retry_count,
                 decrypt_fail_mode: DecryptFailMode::Show,
                 ack_recipient: None,
             },
@@ -8079,23 +8088,96 @@ async fn unverifiable_companion_adv_requests_retry_and_acks() {
         .await;
 
     for _ in 0..80 {
-        let sent = transport.sent();
-        if !retry_receipt_key_bundles_for(&sent, "ADV-FAIL").is_empty()
-            && find_message_ack(&sent).is_some()
-        {
+        if find_message_ack(&transport.sent()).is_some() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    let sent = transport.sent();
+    transport.sent()
+}
+
+/// `(count, error)` of each `<retry>` in the retry receipts for `id`.
+fn retry_counts_for(frames: &[bytes::Bytes], id: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (i, frame) in frames.iter().enumerate() {
+        let Some(buf) = decode_frame(i, frame) else {
+            continue;
+        };
+        let Ok(node) = wacore_binary::marshal::unmarshal_packed_ref(&buf) else {
+            continue;
+        };
+        if node.tag.as_ref() == "receipt"
+            && node.get_attr("id").is_some_and(|v| v.as_str() == id)
+            && node.get_attr("type").is_some_and(|v| v.as_str() == "retry")
+            && let Some(retry) = node.get_optional_child("retry")
+        {
+            let attr = |name| {
+                retry
+                    .get_attr(name)
+                    .map(|v| v.as_str().to_string())
+                    .unwrap_or_default()
+            };
+            out.push((attr("count"), attr("error")));
+        }
+    }
+    out
+}
+
+/// Regression: a companion pkmsg whose ADV identity cannot be verified was
+/// dropped with no response, so the server kept it queued, redelivered it on
+/// every reconnect and eventually closed the stream with `<stream:error><ack/>`.
+/// WA Web (`WAWebMsgProcessingDecryptApi`) answers with an AdvFailure retry.
+#[tokio::test]
+async fn unverifiable_companion_adv_requests_retry_and_acks() {
+    let adv_failure = (RetryReason::AdvFailure as u8).to_string();
+
+    let missing = run_unverifiable_companion_adv("adv_missing", None, 0).await;
     assert_eq!(
-        retry_receipt_key_bundles_for(&sent, "ADV-FAIL").len(),
-        1,
-        "an unverifiable ADV identity must request exactly one retry"
+        retry_counts_for(&missing, "ADV-FAIL"),
+        vec![("1".to_string(), adv_failure.clone())],
+        "a missing certificate must request one AdvFailure retry"
     );
     assert!(
-        find_message_ack(&sent).is_some(),
-        "the stanza must be acked so the server stops redelivering it"
+        find_message_ack(&missing).is_some(),
+        "the stanza must be acked"
+    );
+
+    // Signed by the test account, but for another device's identity key.
+    let other = AlicePeer::new("777000000000083:4@lid").await;
+    let invalid =
+        run_unverifiable_companion_adv("adv_invalid", Some(other.adv_certificate()), 0).await;
+    assert_eq!(
+        retry_counts_for(&invalid, "ADV-FAIL"),
+        vec![("1".to_string(), adv_failure.clone())],
+        "a certificate for another identity must request one AdvFailure retry"
+    );
+    assert!(
+        find_message_ack(&invalid).is_some(),
+        "the stanza must be acked"
+    );
+}
+
+/// The sender-echoed `<enc count>` must reach the retry cache before the ADV
+/// retry, or an empty cache (restart, eviction) restarts the cap at 1.
+#[tokio::test]
+async fn unverifiable_companion_adv_honors_sender_retry_count() {
+    let continued = run_unverifiable_companion_adv("adv_count_3", None, 3).await;
+    assert_eq!(
+        retry_counts_for(&continued, "ADV-FAIL"),
+        vec![("4".to_string(), (RetryReason::AdvFailure as u8).to_string())],
+        "the retry must continue from the sender's count"
+    );
+    assert!(find_message_ack(&continued).is_some());
+
+    let exhausted =
+        run_unverifiable_companion_adv("adv_count_max", None, MAX_DECRYPT_RETRIES).await;
+    assert!(
+        retry_counts_for(&exhausted, "ADV-FAIL").is_empty(),
+        "an exhausted budget must not request another retry"
+    );
+    assert!(
+        find_message_ack(&exhausted).is_some(),
+        "an exhausted budget must still ack the stanza"
     );
 }
 
