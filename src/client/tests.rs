@@ -3857,6 +3857,9 @@ fn client_size_pins_runtime_cache_config_saving() {
         .unwrap();
 
     // These locks have no independent owner, so they live in Client itself.
+    // Account explicitly for ADV bootstrap/publication ordering (40 B on
+    // x86_64). Keep the fixed base and connected-retention ceilings unchanged.
+    expected += size_of::<RwLock<()>>();
     expected += size_of::<RwLock<Option<crate::mediaconn::MediaConn>>>()
         - size_of::<Arc<RwLock<Option<crate::mediaconn::MediaConn>>>>();
     expected += size_of::<std::sync::Mutex<HashSet<Jid>>>()

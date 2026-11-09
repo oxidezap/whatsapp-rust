@@ -29,6 +29,8 @@ pub(crate) struct ProbeBackend {
     pub(crate) gate_method: &'static str,
     pub(crate) fail_before_method: Option<(&'static str, Arc<AtomicBool>)>,
     pub(crate) fail_after_method: Option<&'static str>,
+    pub(crate) detach_identity_writes: bool,
+    pub(crate) identity_gate_key: Option<[u8; 32]>,
     fail_save: bool,
     pub(crate) fail_maintenance: bool,
 }
@@ -48,6 +50,8 @@ impl ProbeBackend {
                 gate_method: "save",
                 fail_before_method: None,
                 fail_after_method: None,
+                detach_identity_writes: false,
+                identity_gate_key: None,
                 fail_save: false,
                 fail_maintenance: false,
             },

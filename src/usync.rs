@@ -803,6 +803,20 @@ impl Client {
             {
                 return Ok(None);
             }
+            let staged = if response.lid_mappings.is_empty()
+                && !response
+                    .device_lists
+                    .iter()
+                    .any(|list| list.devices.iter().any(|device| device.is_hosted))
+            {
+                std::borrow::Cow::Borrowed(response)
+            } else {
+                std::borrow::Cow::Owned(
+                    self.stage_device_list_identities(response, mode, &identities)
+                        .await?,
+                )
+            };
+            let response = staged.as_ref();
             self.learn_device_list_mappings_guarded(response, &mapping_guard)
                 .await?;
             let mut rejected = Vec::new();
@@ -853,6 +867,212 @@ impl Client {
                 Ok(Some(devices))
             }
         })
+    }
+
+    /// Validate the prospective account graph before publishing mappings or
+    /// scheduling migration. Rejection is monotonic across a batch: removing a
+    /// bad list must also remove the binding that could redirect its old fanout.
+    async fn stage_device_list_identities(
+        &self,
+        response: &DeviceListResponse,
+        mode: DeviceListApplyMode,
+        identities: &DeviceListIdentityContext<'_>,
+    ) -> anyhow::Result<DeviceListResponse> {
+        use std::collections::{HashMap, HashSet};
+        if let Some(recovered) = identities.recovered {
+            for (jid, previous) in &recovered.previous_identities {
+                anyhow::ensure!(
+                    self.cached_adv_account_identity(jid).await? == *previous,
+                    "primary identity changed during ADV recovery"
+                );
+            }
+            let expected = recovered.previous_identities.get(1).map(|(jid, _)| jid);
+            anyhow::ensure!(
+                self.device_list_identity_alias(&recovered.user)
+                    .await
+                    .as_ref()
+                    == expected,
+                "account alias changed during ADV recovery"
+            );
+            for mapping in &response.lid_mappings {
+                let pn = Jid::pn(mapping.phone_number.as_str());
+                let lid = Jid::lid(mapping.lid.as_str());
+                if pn == recovered.user || lid == recovered.user {
+                    let alias = if pn == recovered.user { &lid } else { &pn };
+                    anyhow::ensure!(
+                        Some(alias) == expected,
+                        "account alias changed during ADV recovery"
+                    );
+                }
+            }
+        }
+        let mut users: HashSet<Jid> = response
+            .device_lists
+            .iter()
+            .map(|list| list.user.with_device(0))
+            .collect();
+        let mut proposed = HashMap::new();
+        let mut edges = Vec::new();
+        let mut rejected = HashSet::new();
+        for mapping in &response.lid_mappings {
+            let pn = Jid::pn(mapping.phone_number.as_str());
+            let lid = Jid::lid(mapping.lid.as_str());
+            users.extend([pn.clone(), lid.clone()]);
+            edges.push((pn.clone(), lid.clone()));
+            for (user, alias) in [(pn.clone(), lid.clone()), (lid, pn)] {
+                if let Some(previous) = proposed.insert(user.clone(), alias.clone())
+                    && previous != alias
+                {
+                    rejected.extend([user, alias, previous]);
+                }
+            }
+        }
+        let mut current = HashMap::new();
+        for user in users.clone() {
+            if let Some(alias) = self.device_list_identity_alias(&user).await {
+                if self.device_list_identity_alias(&alias).await.as_ref() == Some(&user) {
+                    edges.push((user.clone(), alias.clone()));
+                    current.insert(alias.clone(), user.clone());
+                }
+                users.insert(alias.clone());
+                current.insert(user, alias);
+            }
+        }
+        let mut keys = HashMap::new();
+        for user in &users {
+            keys.insert(user.clone(), self.cached_adv_account_identity(user).await?);
+        }
+        let alias_for = |user: &Jid| proposed.get(user).or_else(|| current.get(user));
+        for mapping in &response.lid_mappings {
+            let pn = Jid::pn(mapping.phone_number.as_str());
+            let lid = Jid::lid(mapping.lid.as_str());
+            if current.get(&pn) == Some(&lid) && current.get(&lid) == Some(&pn) {
+                // A hosted signature may repair/rotate this already known pair.
+                continue;
+            }
+            let mut anchor = None;
+            for address in [&pn, &lid]
+                .into_iter()
+                .chain(current.get(&pn))
+                .chain(current.get(&lid))
+            {
+                if let Some(key) = keys.get(address).copied().flatten() {
+                    if anchor.is_some_and(|anchor| anchor != key) {
+                        rejected.extend([pn.clone(), lid.clone()]);
+                    }
+                    anchor = Some(key);
+                }
+            }
+        }
+        for (user, prepared) in identities.prepared {
+            let user = user.with_device(0);
+            let PreparedAccountIdentity::Trusted(expected) = prepared else {
+                rejected.insert(user);
+                continue;
+            };
+            let primary = keys.get(&user).copied().flatten();
+            let mut live = primary;
+            if let Some(alias) = alias_for(&user) {
+                if alias_for(alias) != Some(&user) {
+                    rejected.insert(user.clone());
+                }
+                let other = keys.get(alias).copied().flatten();
+                if primary.is_some() && other.is_some() && primary != other {
+                    rejected.insert(user.clone());
+                }
+                live = primary.or(other);
+            }
+            if live != Some(*expected) {
+                rejected.insert(user);
+            }
+        }
+        let mut desired = HashMap::new();
+        for list in &response.device_lists {
+            let Some(bytes) = list.key_index_bytes.as_deref() else {
+                if list.devices.iter().any(|device| device.device != 0) {
+                    anyhow::ensure!(
+                        mode == DeviceListApplyMode::GroupRefresh,
+                        "companion device list omits ADV signature"
+                    );
+                    rejected.insert(list.user.with_device(0));
+                }
+                continue;
+            };
+            let user = list.user.with_device(0);
+            if let Some(alias) = alias_for(&user)
+                && alias_for(alias) != Some(&user)
+            {
+                rejected.insert(user.clone());
+            }
+            let key = if list.devices.iter().any(|device| device.is_hosted) {
+                wacore::adv::verify_hosted_key_index_list(bytes).map(|(_, key)| key)
+            } else {
+                let primary = keys.get(&user).copied().flatten();
+                let other = alias_for(&user).and_then(|alias| keys.get(alias).copied().flatten());
+                if primary.is_some() && other.is_some() && primary != other {
+                    rejected.insert(user.clone());
+                }
+                let key = identities
+                    .recovered
+                    .filter(|recovered| recovered.user == list.user)
+                    .map(|recovered| recovered.identity)
+                    .or_else(|| {
+                        identities.prepared.iter().find_map(|(jid, key)| match key {
+                            PreparedAccountIdentity::Trusted(key) if *jid == list.user => {
+                                Some(*key)
+                            }
+                            _ => None,
+                        })
+                    })
+                    .or(primary.or(other));
+                key.filter(|key| wacore::adv::verify_key_index_list(bytes, key).is_some())
+            };
+            let Some(key) = key else {
+                if mode == DeviceListApplyMode::GroupRefresh {
+                    rejected.insert(user);
+                    continue;
+                }
+                return Err(DeviceListAdvError {
+                    user: list.user.clone(),
+                    hosted: list.devices.iter().any(|device| device.is_hosted),
+                    response: response.clone(),
+                    topology_generation: self.device_topology.current(),
+                }
+                .into());
+            };
+            for address in std::iter::once(&user).chain(alias_for(&user)) {
+                if let Some(previous) = desired.insert(address.clone(), key)
+                    && previous != key
+                {
+                    rejected.insert(user.clone());
+                    rejected.insert(address.clone());
+                }
+            }
+        }
+        loop {
+            let before = rejected.len();
+            for (user, alias) in &edges {
+                if rejected.contains(user) || rejected.contains(alias) {
+                    rejected.extend([user.clone(), alias.clone()]);
+                }
+            }
+            if rejected.len() == before {
+                break;
+            }
+        }
+        anyhow::ensure!(
+            rejected.is_empty() || mode == DeviceListApplyMode::GroupRefresh,
+            "conflicting account identities in ADV response"
+        );
+        let mut accepted = response.clone();
+        accepted
+            .device_lists
+            .retain(|list| !rejected.contains(&list.user.with_device(0)));
+        accepted.lid_mappings.retain(|mapping| {
+            !rejected.contains(&Jid::pn(mapping.phone_number.as_str()))
+                && !rejected.contains(&Jid::lid(mapping.lid.as_str()))
+        });
+        Ok(accepted)
     }
 
     /// Lock every known primary before mappings or registry, matching migration.
@@ -916,9 +1136,37 @@ impl Client {
         primary: &Jid,
         key: &[u8; 32],
     ) -> anyhow::Result<bool> {
+        let client = self
+            .self_weak
+            .get()
+            .and_then(|weak| weak.upgrade())
+            .ok_or_else(|| anyhow::anyhow!("client ownership unavailable during bootstrap"))?;
+        let primary = primary.clone();
+        let key = *key;
+        let (send, receive) = futures::channel::oneshot::channel();
+        self.runtime.spawn_detached(Box::pin(async move {
+            let result = client
+                .persist_adv_bootstrap_identity_inner(&primary, &key)
+                .await;
+            if let Err(Err(error)) = send.send(result) {
+                warn!("Owned ADV bootstrap failed after caller cancellation: {error:#}");
+            }
+        }));
+        receive
+            .await
+            .map_err(|_| anyhow::anyhow!("bootstrap identity worker stopped"))?
+    }
+
+    async fn persist_adv_bootstrap_identity_inner(
+        &self,
+        primary: &Jid,
+        key: &[u8; 32],
+    ) -> anyhow::Result<bool> {
         use wacore::types::jid::JidExt;
         let _bootstrap = self.adv_bootstrap_fence.write().await;
         let _mapping = self.lid_pn_cache.lock_mutation().await;
+        // Retain the paired-account fallback check. The cache transaction below
+        // repeats both live Signal anchors after waiting for durable ordering.
         if self
             .device_list_account_identity(primary)
             .await?
@@ -926,10 +1174,19 @@ impl Client {
         {
             return Ok(false);
         }
+        let alias = self.device_list_identity_alias(primary).await;
+        if let Some(alias) = &alias
+            && self.device_list_identity_alias(alias).await.as_ref()
+                != Some(&primary.with_device(0))
+        {
+            return Err(DeviceListIdentityConflict::Alias.into());
+        }
+        let alias = alias.map(|alias| alias.to_protocol_address());
         let backend = self.persistence_manager.backend();
         self.signal_cache
-            .persist_identity_if_absent_or_equal(
+            .persist_identity_and_alias_if_absent_or_equal(
                 &primary.to_protocol_address(),
+                alias.as_ref(),
                 key,
                 backend.as_ref(),
             )

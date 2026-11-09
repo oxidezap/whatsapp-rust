@@ -1876,6 +1876,20 @@ impl SignalStoreCache {
         data: &[u8],
         backend: &dyn SignalStore,
     ) -> Result<bool> {
+        self.persist_identity_and_alias_if_absent_or_equal(address, None, data, backend)
+            .await
+    }
+
+    /// Check both live account anchors inside the same cache/write transaction.
+    /// An owned caller must keep this future and alias membership alive until
+    /// storage acknowledges, even when its original requester is cancelled.
+    pub async fn persist_identity_and_alias_if_absent_or_equal(
+        &self,
+        address: &ProtocolAddress,
+        alias: Option<&ProtocolAddress>,
+        data: &[u8],
+        backend: &dyn SignalStore,
+    ) -> Result<bool> {
         let key: [u8; 32] = data
             .try_into()
             .map_err(|_| anyhow::anyhow!("invalid bootstrap identity length"))?;
@@ -1884,14 +1898,22 @@ impl SignalStoreCache {
         // to an offline batch whose plaintext is not durable yet.
         let _flush = self.flush_lock.lock().await;
         let mut state = self.identities.lock().await;
-        let previous = match state.cache.get(address.as_str()) {
-            Some(cached) => cached.clone(),
-            None => backend
-                .load_identity(address.as_str())
-                .await?
-                .map(Arc::from),
-        };
-        if previous.as_deref().is_some_and(|known| known != data) {
+        let mut matches = true;
+        for address in std::iter::once(address).chain(alias) {
+            let previous = match state.cache.get(address.as_str()) {
+                Some(cached) => cached.clone(),
+                None => backend
+                    .load_identity(address.as_str())
+                    .await?
+                    .map(Arc::from),
+            };
+            anyhow::ensure!(
+                previous.as_deref().is_none_or(|known| known.len() == 32),
+                "invalid stored bootstrap identity length"
+            );
+            matches &= previous.as_deref().is_none_or(|known| known == data);
+        }
+        if !matches {
             return Ok(false);
         }
         // Pin the authenticated anchor before storage can commit. Dropping its

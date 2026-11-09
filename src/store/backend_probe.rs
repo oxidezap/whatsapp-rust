@@ -37,8 +37,53 @@ macro_rules! forward_methods {
 macro_rules! forward_domains {
     ($owner:ty) => {
         impl SignalStore for $owner {
+            fn put_identity<'s, 'a, 'async_trait>(
+                &'s self,
+                address: &'a str,
+                key: [u8; 32],
+            ) -> BoxFuture<'async_trait, Result<()>>
+            where
+                's: 'async_trait,
+                'a: 'async_trait,
+                Self: 'async_trait,
+            {
+                Box::pin(async move {
+                    let backend = self.backend.clone();
+                    let address = address.to_owned();
+                    let entered = self.entered.clone();
+                    let gate = self.gate.clone();
+                    let gate_method = self.gate_method;
+                    let gated = self.identity_gate_key.is_none_or(|expected| expected == key);
+                    let fail_before = self.fail_before_method.as_ref()
+                        .filter(|(method, _)| *method == "put_identity")
+                        .map(|(_, failing)| failing.clone());
+                    let fail_after = self.fail_after_method == Some("put_identity");
+                    let write = async move {
+                        if gated && gate_method == "put_identity" {
+                            if let Some(entered) = &entered { entered.send(()).await.expect("announce I/O"); }
+                            if let Some(gate) = &gate { gate.recv().await.expect("unpark I/O"); }
+                        }
+                        if fail_before.as_ref().is_some_and(|failing| failing.load(std::sync::atomic::Ordering::Relaxed)) {
+                            return Err(wacore::store::error::StoreError::Io(std::io::Error::other("synthetic failure before commit")));
+                        }
+                        let result = backend.put_identity(&address, key).await;
+                        if gated && gate_method == "after:put_identity" {
+                            if let Some(entered) = &entered { entered.send(()).await.expect("announce I/O"); }
+                            if let Some(gate) = &gate { gate.recv().await.expect("unpark I/O"); }
+                        }
+                        if fail_after {
+                            return Err(wacore::store::error::StoreError::Io(std::io::Error::other("synthetic failure after commit")));
+                        }
+                        result
+                    };
+                    if self.detach_identity_writes {
+                        tokio::spawn(write).await.map_err(|error| wacore::store::error::StoreError::Io(std::io::Error::other(error.to_string())))?
+                    } else {
+                        write.await
+                    }
+                })
+            }
             forward_methods! {
-                fn put_identity<'s, 'a>(this: &'s Self, address: &'a str, key: [u8; 32]) -> Result<()>;
                 fn put_identities_batch<'s, 'a>(this: &'s Self, identities: &'a [(Arc<str>, [u8; 32])]) -> Result<()>;
                 fn load_identity<'s, 'a>(this: &'s Self, address: &'a str) -> Result<Option<[u8; 32]>>;
                 fn delete_identity<'s, 'a>(this: &'s Self, address: &'a str) -> Result<()>;
