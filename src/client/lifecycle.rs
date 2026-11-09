@@ -1322,10 +1322,9 @@ impl Client {
 
     /// Why this connection attempt must not go on, if it must not.
     ///
-    /// Re-asked at every step of the connect graph, because both answers can
-    /// arrive while a version fetch, a transport and a handshake are being
-    /// awaited — a window as wide as the 20s connect timeout. Checked once at
-    /// the start, either one would be published straight over.
+    /// Re-asked at each checkpoint and under the publication lock. Shutdown
+    /// also interrupts network waits, while pause generations must survive a
+    /// pause/resume pair that completes during an attempt.
     fn connect_refusal(&self, attempt_pause_generation: u64) -> Option<ConnectError> {
         if self.shutdown_signal().is_fired() || self.session_state.is_terminal() {
             return Some(ConnectError::Shutdown);
@@ -1585,18 +1584,43 @@ impl Client {
             )
             .await
         });
-        let transport_future = rt_timeout(
-            &*self.runtime,
-            TRANSPORT_CONNECT_TIMEOUT,
-            self.transport_factory.create_transport(),
-        );
+        // Retain a completed transport while the version fetch is pending so
+        // cancellation can explicitly close it before dropping the attempt.
+        let mut opened_transport = None;
+        let transport_future = async {
+            let result = rt_timeout(
+                &*self.runtime,
+                TRANSPORT_CONNECT_TIMEOUT,
+                self.transport_factory.create_transport(),
+            )
+            .await;
+            if let Ok(Ok((transport, _))) = &result {
+                opened_transport = Some(transport.clone());
+            }
+            result
+        };
 
         if self.is_mobile_primary() {
             debug!("Connecting registered mobile transport with explicit application version");
         } else {
             debug!("Connecting WebSocket and fetching latest client version in parallel...");
         }
-        let (version_result, transport_result) = futures::join!(version_future, transport_future);
+        let shutdown = self.shutdown_signal();
+        let connected = {
+            let connecting = async { futures::join!(version_future, transport_future) }.fuse();
+            let stopped = wacore::runtime::wait_for_shutdown(&shutdown).fuse();
+            futures::pin_mut!(connecting, stopped);
+            futures::select_biased! {
+                _ = stopped => None,
+                result = connecting => Some(result),
+            }
+        };
+        let Some((version_result, transport_result)) = connected else {
+            if let Some(transport) = opened_transport {
+                self.close_transport_bounded(&transport).await;
+            }
+            return Err(ConnectError::Shutdown);
+        };
 
         let version_fallback = match version_result {
             Ok(resolved) => resolved.map_err(ConnectError::Version)?,
@@ -1640,46 +1664,58 @@ impl Client {
             return Err(refusal);
         }
 
-        let handshake_result = async {
-            #[cfg(feature = "mobile-core")]
-            if let Some(session) = &self.mobile_session {
-                let attempt = self
-                    .mobile_handshake_attempts
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                        current.checked_add(1)
-                    })
-                    .map_err(|_| {
-                        handshake::HandshakeError::Mobile(
-                            wacore::mobile::MobileSessionError::InvalidProfile(
-                                "mobile_handshake_attempts_exhausted",
-                            ),
-                        )
-                    })?;
-                return handshake::do_mobile_handshake(
+        let handshake_result = {
+            let handshaking = async {
+                #[cfg(feature = "mobile-core")]
+                if let Some(session) = &self.mobile_session {
+                    let attempt = self
+                        .mobile_handshake_attempts
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                            current.checked_add(1)
+                        })
+                        .map_err(|_| {
+                            handshake::HandshakeError::Mobile(
+                                wacore::mobile::MobileSessionError::InvalidProfile(
+                                    "mobile_handshake_attempts_exhausted",
+                                ),
+                            )
+                        })?;
+                    return handshake::do_mobile_handshake(
+                        self.runtime.clone(),
+                        &self.persistence_manager,
+                        transport.clone(),
+                        &mut transport_events,
+                        crate::socket::noise_socket::SendObservers::with_stats(self.stats.clone())
+                            .with_sent_frames(self.sent_frame_tap.clone()),
+                        session,
+                        attempt,
+                    )
+                    .await;
+                }
+                handshake::do_handshake_with_cert_policy(
                     self.runtime.clone(),
                     &self.persistence_manager,
+                    &self.ik_handshake_failures,
                     transport.clone(),
                     &mut transport_events,
                     crate::socket::noise_socket::SendObservers::with_stats(self.stats.clone())
                         .with_sent_frames(self.sent_frame_tap.clone()),
-                    session,
-                    attempt,
+                    self.noise_cert_policy,
                 )
-                .await;
+                .await
             }
-            handshake::do_handshake_with_cert_policy(
-                self.runtime.clone(),
-                &self.persistence_manager,
-                &self.ik_handshake_failures,
-                transport.clone(),
-                &mut transport_events,
-                crate::socket::noise_socket::SendObservers::with_stats(self.stats.clone())
-                    .with_sent_frames(self.sent_frame_tap.clone()),
-                self.noise_cert_policy,
-            )
-            .await
-        }
-        .await;
+            .fuse();
+            let stopped = wacore::runtime::wait_for_shutdown(&shutdown).fuse();
+            futures::pin_mut!(handshaking, stopped);
+            futures::select_biased! {
+                _ = stopped => None,
+                result = handshaking => Some(result),
+            }
+        };
+        let Some(handshake_result) = handshake_result else {
+            self.close_transport_bounded(&transport).await;
+            return Err(ConnectError::Shutdown);
+        };
         let noise_socket = match handshake_result {
             Ok(socket) => socket,
             Err(e) => {
@@ -4009,6 +4045,170 @@ mod tests {
         );
     }
 
+    struct ShutdownConnectHttp(async_channel::Sender<&'static str>);
+
+    #[async_trait::async_trait]
+    impl crate::http::HttpClient for ShutdownConnectHttp {
+        async fn execute(&self, _: crate::http::HttpRequest) -> Result<crate::http::HttpResponse> {
+            self.0.send("version").await.unwrap();
+            std::future::pending().await
+        }
+    }
+
+    struct ShutdownConnectTransport {
+        entered: async_channel::Sender<&'static str>,
+        pending_send: bool,
+        stalled_close: bool,
+        closes: AtomicU32,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::transport::Transport for ShutdownConnectTransport {
+        async fn send(&self, _: bytes::Bytes) -> Result<()> {
+            self.entered.send("handshake").await.unwrap();
+            if self.pending_send {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+
+        async fn disconnect(&self) {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            if self.stalled_close {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    struct ShutdownConnectFactory {
+        transport: Arc<ShutdownConnectTransport>,
+        pending_dial: bool,
+        // Keep the receiver open without supplying a server hello.
+        events: async_channel::Receiver<crate::transport::TransportEvent>,
+        _sender: async_channel::Sender<crate::transport::TransportEvent>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::transport::TransportFactory for ShutdownConnectFactory {
+        async fn create_transport(
+            &self,
+        ) -> Result<(
+            Arc<dyn crate::transport::Transport>,
+            async_channel::Receiver<crate::transport::TransportEvent>,
+        )> {
+            self.transport.entered.send("transport").await.unwrap();
+            if self.pending_dial {
+                std::future::pending::<()>().await;
+            }
+            Ok((self.transport.clone(), self.events.clone()))
+        }
+    }
+
+    async fn shutdown_interrupts_connect(
+        pending_version: bool,
+        pending_dial: bool,
+        pending_send: bool,
+        stalled_close: bool,
+    ) {
+        let (entered, observed) = async_channel::unbounded();
+        let transport = Arc::new(ShutdownConnectTransport {
+            entered: entered.clone(),
+            pending_send,
+            stalled_close,
+            closes: AtomicU32::new(0),
+        });
+        let (sender, events) = async_channel::bounded(1);
+        let factory = Arc::new(ShutdownConnectFactory {
+            transport: transport.clone(),
+            pending_dial,
+            events,
+            _sender: sender,
+        });
+        let persistence = Arc::new(
+            PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                .await
+                .unwrap(),
+        );
+        let builder = Client::builder()
+            .with_runtime(crate::runtime_impl::TokioRuntime)
+            .with_persistence_manager(persistence)
+            .with_transport_factory_arc(factory)
+            .with_http_client(ShutdownConnectHttp(entered));
+        let (client, _) = if pending_version {
+            builder.build().await
+        } else {
+            builder.with_version_override((2, 3000, 1)).build().await
+        }
+        .unwrap()
+        .into_parts();
+        let attempt = tokio::spawn({
+            let client = client.clone();
+            async move { client.connect().await.map(|_| ()) }
+        });
+        // Await actual entry into each pending stage, without advancing time.
+        let expected = if pending_version || pending_dial {
+            "transport"
+        } else {
+            "handshake"
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut version_seen = !pending_version;
+            let mut stage_seen = false;
+            while !version_seen || !stage_seen {
+                let stage = observed.recv().await.unwrap();
+                version_seen |= stage == "version";
+                stage_seen |= stage == expected;
+            }
+        })
+        .await
+        .expect("connect must reach the pending stage");
+        let started = tokio::time::Instant::now();
+        let _report = client.shutdown().await;
+        let result = tokio::time::timeout(Duration::from_secs(3), attempt)
+            .await
+            .expect("shutdown must interrupt connect before its 20s timeout")
+            .unwrap();
+        assert!(matches!(result, Err(ConnectError::Shutdown)));
+        assert_eq!(
+            transport.closes.load(Ordering::SeqCst),
+            u32::from(!pending_dial)
+        );
+        assert_eq!(
+            started.elapsed(),
+            if stalled_close {
+                Client::TRANSPORT_CLOSE_TIMEOUT
+            } else {
+                Duration::ZERO
+            }
+        );
+        assert_abandoned_attempt_cleared(&client).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_interrupts_pending_transport() {
+        shutdown_interrupts_connect(false, true, false, false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_interrupts_pending_version_and_transport() {
+        shutdown_interrupts_connect(true, true, false, false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_interrupts_pending_version_and_closes_open_transport() {
+        shutdown_interrupts_connect(true, false, false, false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_interrupts_pending_handshake_send_with_bounded_close() {
+        shutdown_interrupts_connect(false, false, true, true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_interrupts_pending_handshake_response() {
+        shutdown_interrupts_connect(false, false, false, false).await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn abandoned_dial_stalled_close_preserves_pause_and_resume_generation() {
         for resume_before_dial_returns in [false, true] {
@@ -4044,7 +4244,6 @@ mod tests {
             });
             next_connect_attempt(&entered).await;
             let _ = client.shutdown().await;
-            release.send(()).await.expect("release next dial");
             assert!(matches!(
                 tokio::time::timeout(Duration::from_secs(3), next)
                     .await
@@ -4052,14 +4251,15 @@ mod tests {
                     .expect("next connect task"),
                 Err(ConnectError::Shutdown)
             ));
+            assert_eq!(transport.disconnects_started(), 1, "next dial never opened");
             assert_abandoned_attempt_cleared(&client).await;
         }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn abandoned_dial_stalled_close_preserves_shutdown() {
+    async fn shutdown_cancels_dial_before_transport_opens() {
         let transport = Arc::new(crate::transport::mock::StallingMockTransport::new());
-        let (factory, entered, release) = abandoned_dial(transport.clone(), false);
+        let (factory, entered, _release) = abandoned_dial(transport.clone(), false);
         let client = client_with_abandoned_dial(factory).await;
         let attempt = tokio::spawn({
             let client = client.clone();
@@ -4067,7 +4267,6 @@ mod tests {
         });
         next_connect_attempt(&entered).await;
         let _ = client.shutdown().await;
-        release.send(()).await.expect("release dial");
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(3), attempt)
                 .await
@@ -4075,14 +4274,18 @@ mod tests {
                 .expect("connect task"),
             Err(ConnectError::Shutdown)
         ));
-        assert_eq!(transport.disconnects_started(), 1);
+        assert_eq!(
+            transport.disconnects_started(),
+            0,
+            "dial was cancelled before opening"
+        );
         assert_abandoned_attempt_cleared(&client).await;
     }
 
     #[tokio::test(start_paused = true)]
-    async fn abandoned_dial_stalled_close_allows_bot_shutdown_to_join_owner() {
+    async fn bot_shutdown_joins_pending_dial_without_releasing_it() {
         let transport = Arc::new(crate::transport::mock::StallingMockTransport::new());
-        let (factory, entered, release) = abandoned_dial(transport.clone(), false);
+        let (factory, entered, _release) = abandoned_dial(transport.clone(), false);
         let bot = crate::bot::Bot::builder()
             .with_backend_arc(crate::test_utils::create_test_backend().await)
             .with_transport_factory_arc(factory)
@@ -4097,7 +4300,6 @@ mod tests {
         next_connect_attempt(&entered).await;
         let shutdown = tokio::spawn(handle.shutdown());
         crate::test_utils::poll_until("terminal shutdown requested", || client.is_terminal()).await;
-        release.send(()).await.expect("release dial");
         let report = tokio::time::timeout(Duration::from_secs(3), shutdown)
             .await
             .expect("BotHandle must join the abandoned attempt after bounded close")
@@ -4106,7 +4308,11 @@ mod tests {
             report.run,
             crate::bot::BotRunOutcome::Completed(RunCompletionReason::ShutdownRequested)
         ));
-        assert_eq!(transport.disconnects_started(), 1);
+        assert_eq!(
+            transport.disconnects_started(),
+            0,
+            "dial was cancelled before opening"
+        );
         assert_abandoned_attempt_cleared(&client).await;
     }
 
