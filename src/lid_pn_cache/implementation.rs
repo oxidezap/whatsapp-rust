@@ -660,7 +660,11 @@ impl LidPnCache {
                 .get(&*entry.phone_number)
                 .await
                 .is_some_and(|current| current.lid == entry.lid)
-                && self.get_phone_number(&entry.lid).await.as_deref() == Some(&*entry.phone_number)
+                && self
+                    .lid_to_entry
+                    .get(&*entry.lid)
+                    .await
+                    .is_some_and(|current| current.phone_number == entry.phone_number)
             {
                 self.mark_persisted(&entry.phone_number, &entry.lid).await;
             }
