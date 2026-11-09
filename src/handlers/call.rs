@@ -617,6 +617,27 @@ impl StanzaHandler for CallHandler {
                                 } else {
                                     dispatch_call = false;
                                 }
+                            } else if let Some(generation) = group_transition_generation
+                                .or_else(|| client.call_registry().generation_of(call_id))
+                                .filter(|&generation| {
+                                    client
+                                        .call_registry()
+                                        .group_state_if_current(call_id, generation)
+                                        .is_none()
+                                })
+                            {
+                                // A 1:1 peer shares its screen as its ordinary video
+                                // plane, announcing it with the same stanza a group
+                                // participant sends. Nothing in group state changes;
+                                // the event lets the app show the whole picture.
+                                client.call_registry().send_call_event_if_current(
+                                    call_id,
+                                    generation,
+                                    CallEvent::ScreenShareChanged {
+                                        participant: sender.to_non_ad(),
+                                        screen_share: screen_share.clone(),
+                                    },
+                                );
                             } else {
                                 warn!(
                                     "call: rejected screen-share state from unauthorized sender for {call_id}"
@@ -3792,6 +3813,53 @@ mod tests {
             r.attrs().optional_string("id").as_deref(),
             Some("STANZA-ID-0002")
         );
+    }
+
+    #[cfg(feature = "voip-control")]
+    #[tokio::test]
+    async fn a_one_to_one_peer_screen_share_reaches_the_call_events() {
+        use wacore::voip_control::CallEvent;
+
+        let client = make_sending_client().await;
+        let registry = client.call_registry();
+        let generation = registry.insert(wacore::voip_control::CallSession::new_incoming(
+            "CALL-ID-0001",
+            fake_caller_lid(),
+            fake_caller_lid(),
+        ));
+        let (event_tx, event_rx) = async_channel::unbounded::<CallEvent>();
+        let (control_tx, _control_rx) = video_control_channel();
+        registry.set_video_channels(
+            "CALL-ID-0001",
+            generation,
+            event_tx,
+            control_tx,
+            Box::new(|| {}),
+        );
+        let stanza = NodeBuilder::new("call")
+            .attr("from", fake_caller_lid())
+            .attr("id", "STANZA-ID-0003")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new(CallActionTag::ScreenShare.as_str())
+                .attr("call-id", "CALL-ID-0001")
+                .attr("call-creator", fake_caller_lid())
+                .attr("screenshare_state", "1")
+                .attr("version", "2")
+                .build()])
+            .build();
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(client, node_to_owned_ref(&stanza), &mut cancelled)
+                .await
+        );
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(CallEvent::ScreenShareChanged { participant, screen_share })
+                if participant == fake_caller_lid()
+                    && screen_share.state == ScreenShareState::Started
+        ));
+        registry.remove_if_current("CALL-ID-0001", generation);
     }
 
     #[cfg(feature = "voip-control")]
