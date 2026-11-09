@@ -1,6 +1,7 @@
 //! Core incoming-message pipeline: classify, decrypt and process.
 
 use super::*;
+use crate::client::PermitSuspension;
 use smallvec::SmallVec;
 use wacore::telemetry::LiveAdmissionRefusal;
 use wacore_binary::diagnostics::{ObservedId, ProtocolText};
@@ -669,6 +670,33 @@ impl Client {
         })
     }
 
+    /// Report every payload of an abandoned stanza as not attempted, before
+    /// bailing. Classification already reported any node it set aside: staying
+    /// silent would leave a stanza whose malformed `<enc>` was reported and
+    /// whose decryptable siblings were not, which is the one shape this event
+    /// promises not to produce. The stanza is unacked and will come back, and
+    /// the event repeats with it.
+    fn report_stanza_not_attempted(
+        &self,
+        info: &Arc<MessageInfo>,
+        session_payloads: &[EncPayload],
+        group_payloads: &[EncPayload],
+        bot_payloads: &[EncPayload],
+    ) {
+        for payload in session_payloads
+            .iter()
+            .chain(group_payloads)
+            .chain(bot_payloads)
+        {
+            self.report_enc_decrypt_failure(
+                info,
+                payload.enc_index,
+                payload.enc_type.as_wire_str(),
+                EncDecryptFailureReason::NotAttempted,
+            );
+        }
+    }
+
     /// Phase 2: acquire permit, decrypt payloads, flush. No node borrows.
     #[cfg_attr(
         feature = "tracing",
@@ -697,7 +725,7 @@ impl Client {
         // silently dropped, losing pkmsg messages carrying SKDM (sender key
         // distribution) — and a lost SKDM fails ALL subsequent skmsg from that
         // sender with "No sender key state".
-        let _global_permit = self.acquire_message_processing_permit().await;
+        let mut processing_permit = Some(self.acquire_message_processing_permit().await);
         if self.connection_generation.load(Ordering::Acquire) != lane_generation {
             // Teardown bumped the generation while this stanza waited for the
             // permit; its cache settle must be the LAST Signal-cache activity
@@ -707,25 +735,12 @@ impl Client {
                 "Connection torn down while awaiting the processing permit; leaving message {} for redelivery",
                 ObservedId::new(info.id.as_str())
             );
-            // Every `<enc>` still queued here is abandoned without being tried.
-            // Reported before the bail, because classification already reported
-            // any node it set aside: staying silent would leave a stanza whose
-            // malformed `<enc>` was reported and whose decryptable siblings
-            // were not, which is the one shape this event promises not to
-            // produce. The stanza is unacked and will come back, and the event
-            // repeats with it.
-            for payload in session_payloads
-                .iter()
-                .chain(&group_payloads)
-                .chain(&bot_payloads)
-            {
-                self.report_enc_decrypt_failure(
-                    &info,
-                    payload.enc_index,
-                    payload.enc_type.as_wire_str(),
-                    EncDecryptFailureReason::NotAttempted,
-                );
-            }
+            self.report_stanza_not_attempted(
+                &info,
+                &session_payloads,
+                &group_payloads,
+                &bot_payloads,
+            );
             return;
         }
 
@@ -765,10 +780,29 @@ impl Client {
                 .inbound_commit_batch
                 .live_retention
                 .has_owned_for_message(&info)
-            && !Box::pin(self.flush_inbound_commits_while_processing()).await
         {
-            wacore::telemetry::live_admission_refused(LiveAdmissionRefusal::RetainedWrite);
-            return;
+            // Pre-decrypt: this stanza has no ratchet advances of its own yet,
+            // so releasing its permit for the quiesced flush exposes nothing.
+            let (suspension, durable) = self
+                .with_stanza_permit_suspended(
+                    &mut processing_permit,
+                    lane_generation,
+                    self.commit_inbound_batch_quiesced(Some(lane_generation)),
+                )
+                .await;
+            if suspension == PermitSuspension::Reconnected {
+                self.report_stanza_not_attempted(
+                    &info,
+                    &session_payloads,
+                    &group_payloads,
+                    &bot_payloads,
+                );
+                return;
+            }
+            if !durable {
+                wacore::telemetry::live_admission_refused(LiveAdmissionRefusal::RetainedWrite);
+                return;
+            }
         }
         if self.inbound_journal_enabled()
             && self
@@ -796,12 +830,27 @@ impl Client {
                 wacore::telemetry::live_admission_refused(LiveAdmissionRefusal::RetainedWrite);
                 return;
             }
-            if self.inbound_commit_batch.is_active()
-                && self.inbound_commit_batch.has_entries()
-                && !Box::pin(self.flush_inbound_commits_while_processing()).await
-            {
-                wacore::telemetry::live_admission_refused(LiveAdmissionRefusal::RetainedWrite);
-                return;
+            if self.inbound_commit_batch.is_active() && self.inbound_commit_batch.has_entries() {
+                let (suspension, durable) = self
+                    .with_stanza_permit_suspended(
+                        &mut processing_permit,
+                        lane_generation,
+                        self.commit_inbound_batch_quiesced(Some(lane_generation)),
+                    )
+                    .await;
+                if suspension == PermitSuspension::Reconnected {
+                    self.report_stanza_not_attempted(
+                        &info,
+                        &session_payloads,
+                        &group_payloads,
+                        &bot_payloads,
+                    );
+                    return;
+                }
+                if !durable {
+                    wacore::telemetry::live_admission_refused(LiveAdmissionRefusal::RetainedWrite);
+                    return;
+                }
             }
         }
         // Admission precedes every ratchet mutation. Refusal leaves ciphertext
@@ -834,7 +883,23 @@ impl Client {
                 && self.inbound_commit_batch.is_active()
                 && self.inbound_commit_batch.has_entries()
             {
-                if !Box::pin(self.flush_inbound_commits_while_processing()).await {
+                let (suspension, durable) = self
+                    .with_stanza_permit_suspended(
+                        &mut processing_permit,
+                        lane_generation,
+                        self.commit_inbound_batch_quiesced(Some(lane_generation)),
+                    )
+                    .await;
+                if suspension == PermitSuspension::Reconnected {
+                    self.report_stanza_not_attempted(
+                        &info,
+                        &session_payloads,
+                        &group_payloads,
+                        &bot_payloads,
+                    );
+                    return;
+                }
+                if !durable {
                     wacore::telemetry::live_admission_refused(LiveAdmissionRefusal::RetainedWrite);
                     log::warn!("Live pending batch flush failed before decrypt");
                     return;
@@ -926,6 +991,8 @@ impl Client {
                     decrypt_fail_mode,
                     ack_recipient.as_ref(),
                     (stanza_origin, account_fence),
+                    &mut processing_permit,
+                    lane_generation,
                 )
                 .await
         } else {
@@ -1121,7 +1188,14 @@ impl Client {
         // `signal_flush.rs`). During the offline drain the commit batcher owns
         // the flush instead, so only the batch size/byte triggers run here.
         if self.inbound_commit_batch.is_active() {
-            self.maybe_flush_inbound_commits().await;
+            if self.inbound_commits_over_capacity() {
+                // The stanza's entries are all enqueued, so its permit can
+                // stay released for the quiesced flush — nothing after this
+                // point needs it.
+                drop(processing_permit.take());
+                self.flush_inbound_commits_quiesced(Some(lane_generation))
+                    .await;
+            }
         } else {
             self.schedule_signal_flush(lane_generation);
         }
@@ -1136,6 +1210,10 @@ impl Client {
         sender_encryption_jid: &Jid,
         decrypt_fail_mode: crate::types::events::DecryptFailMode,
     ) -> SessionBatchOutcome {
+        // Test shim: process as if holding a stanza permit so mid-batch
+        // recovery paths can release-and-reacquire like production.
+        let mut permit_slot = Some(self.acquire_message_processing_permit().await);
+        let lane_generation = self.connection_generation.load(Ordering::Acquire);
         self.process_session_enc_batch_with_origin(
             payloads,
             info,
@@ -1146,6 +1224,8 @@ impl Client {
                 raw_pending::StanzaOrigin::new(),
                 IncomingAccountFence::default(),
             ),
+            &mut permit_slot,
+            lane_generation,
         )
         .await
     }
@@ -1162,6 +1242,8 @@ impl Client {
             .lock_incoming_companion_account(sender, None, &payloads)
             .await
             .unwrap();
+        let mut permit_slot = Some(self.acquire_message_processing_permit().await);
+        let lane_generation = self.connection_generation.load(Ordering::Acquire);
         self.process_session_enc_batch_with_origin(
             payloads,
             info,
@@ -1169,10 +1251,13 @@ impl Client {
             crate::types::events::DecryptFailMode::Show,
             None,
             (raw_pending::StanzaOrigin::new(), fence),
+            &mut permit_slot,
+            lane_generation,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn process_session_enc_batch_with_origin(
         self: Arc<Self>,
         payloads: Vec<EncPayload>,
@@ -1181,6 +1266,8 @@ impl Client {
         decrypt_fail_mode: crate::types::events::DecryptFailMode,
         ack_recipient: Option<&Jid>,
         scope: (raw_pending::StanzaOrigin, IncomingAccountFence),
+        permit_slot: &mut Option<async_lock::SemaphoreGuardArc>,
+        lane_generation: u64,
     ) -> SessionBatchOutcome {
         let stanza_origin = scope.0;
         // Decrypt and projection are sequential phases. Keeping their state in
@@ -1193,6 +1280,8 @@ impl Client {
                 decrypt_fail_mode,
                 ack_recipient,
                 scope,
+                permit_slot,
+                lane_generation,
             ));
             std::future::poll_fn(|cx| poll_inbound_phase(future.as_mut(), cx)).await
         };
@@ -1255,6 +1344,7 @@ impl Client {
         outcome
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn decrypt_session_enc_batch_with_origin(
         self: Arc<Self>,
         payloads: Vec<EncPayload>,
@@ -1263,6 +1353,8 @@ impl Client {
         decrypt_fail_mode: crate::types::events::DecryptFailMode,
         ack_recipient: Option<&Jid>,
         scope: (raw_pending::StanzaOrigin, IncomingAccountFence),
+        permit_slot: &mut Option<async_lock::SemaphoreGuardArc>,
+        lane_generation: u64,
     ) -> (
         SessionBatchOutcome,
         Vec<DeferredPlaintext>,
@@ -1300,7 +1392,10 @@ impl Client {
         // saves the new key (ReplacedExisting); the rest are NewOrUnchanged.
         let mut local_identity_reacted = false;
 
-        for payload in payloads {
+        // Iterator, not `for payload in payloads`: the identity-recovery bail
+        // reports every remaining payload as unattempted.
+        let mut payloads_iter = payloads.into_iter();
+        while let Some(payload) = payloads_iter.next() {
             if account_fence.retired {
                 outcome.had_failure = true;
                 break;
@@ -1489,32 +1584,72 @@ impl Client {
                         // archived (not deleted) when the new PreKeySignalMessage is processed,
                         // allowing decryption of any in-flight messages encrypted with the old session.
                         self.signal_cache.delete_identity(address).await;
-                        // This stanza's processing permit is held here, and the
-                        // full-cache flush below would otherwise persist ratchet
-                        // advances for accumulated drain entries that have no
-                        // durable row yet — commit them first. A failed commit
-                        // restores the entries, so the flush must be skipped
-                        // too: the retry then fails and the message is
-                        // redelivered, instead of stranding those ratchets.
-                        if self.inbound_commit_batch.is_active()
-                            && !self.commit_inbound_batch_holding_permit().await
-                        {
-                            log::warn!(
-                                "Deferring identity-change flush for {}: the drain batch commit failed and its entries must stay unflushed",
-                                address.observe()
-                            );
-                            outcome.had_failure = true;
-                            self.report_enc_decrypt_failure(
-                                info,
-                                enc_index,
-                                enc_type,
-                                EncDecryptFailureReason::StorageFailure,
-                            );
-                            continue;
-                        }
-                        // Flush immediately so the backend is updated BEFORE the retry decrypt below.
-                        // Device::is_trusted_identity reads from backend, not cache.
-                        if let Err(e) = self.flush_signal_cache().await {
+                        // The full-cache flush below would otherwise persist
+                        // ratchet advances for accumulated drain entries that
+                        // have no durable row yet — commit them first. During
+                        // the drain that requires the whole quiescence, so this
+                        // stanza releases its permit AND its session lock (a
+                        // peer stanza may be waiting on the same sender) and
+                        // runs commit+flush suspended; its own advances are
+                        // already enqueued per-payload, so the release exposes
+                        // nothing. A failed commit restores the entries, so the
+                        // flush must be skipped too: the retry then fails and
+                        // the message is redelivered.
+                        if self.inbound_commit_batch.is_active() {
+                            drop(session_guard.take());
+                            let self_for_work = Arc::clone(&self);
+                            let (suspension, flushed) = self
+                                .with_stanza_permit_suspended(
+                                    permit_slot,
+                                    lane_generation,
+                                    async move {
+                                        if !self_for_work
+                                            .commit_inbound_batch_holding_permit()
+                                            .await
+                                        {
+                                            return false;
+                                        }
+                                        // Flush immediately so the backend is
+                                        // updated BEFORE the retry decrypt:
+                                        // `is_trusted_identity` reads the
+                                        // backend, not the cache.
+                                        self_for_work.flush_signal_cache().await.is_ok()
+                                    },
+                                )
+                                .await;
+                            session_guard = Some(session_mutex.lock_arc().await);
+                            if suspension == PermitSuspension::Reconnected {
+                                self.report_enc_decrypt_failure(
+                                    info,
+                                    enc_index,
+                                    enc_type,
+                                    EncDecryptFailureReason::NotAttempted,
+                                );
+                                for remaining in payloads_iter {
+                                    self.report_enc_decrypt_failure(
+                                        info,
+                                        remaining.enc_index,
+                                        remaining.enc_type.as_wire_str(),
+                                        EncDecryptFailureReason::NotAttempted,
+                                    );
+                                }
+                                return (outcome, deferred, Some(timer));
+                            }
+                            if !flushed {
+                                log::warn!(
+                                    "Deferring identity-change flush for {}: the drain batch commit or cache flush failed and its entries must stay unflushed",
+                                    address.observe()
+                                );
+                                outcome.had_failure = true;
+                                self.report_enc_decrypt_failure(
+                                    info,
+                                    enc_index,
+                                    enc_type,
+                                    EncDecryptFailureReason::StorageFailure,
+                                );
+                                continue;
+                            }
+                        } else if let Err(e) = self.flush_signal_cache().await {
                             log::warn!(
                                 "Failed to flush identity deletion for {}: {e:?}",
                                 address.observe()
@@ -3252,6 +3387,8 @@ mod adv_tests {
                     },
                     ..Default::default()
                 });
+                let mut permit_slot = Some(client.acquire_message_processing_permit().await);
+                let lane_generation = client.connection_generation.load(Ordering::Acquire);
                 client
                     .decrypt_session_enc_batch_with_origin(
                         payloads,
@@ -3260,6 +3397,8 @@ mod adv_tests {
                         crate::types::events::DecryptFailMode::Show,
                         None,
                         (raw_pending::StanzaOrigin::new(), fence),
+                        &mut permit_slot,
+                        lane_generation,
                     )
                     .await
             })

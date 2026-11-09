@@ -537,7 +537,9 @@ impl Client {
             additional_static_media_hosts,
             history_sync_admission,
             connect_admission,
+            offline_drain_permits,
         } = extensions;
+        let offline_drain_permits = resolve_offline_drain_permits(offline_drain_permits);
         let mut unique_id_bytes = [0u8; 2];
         rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut unique_id_bytes);
 
@@ -612,10 +614,11 @@ impl Client {
             unified_session: crate::unified_session::UnifiedSessionManager::new(),
 
             signal_cache: Arc::new(crate::store::signal_cache::SignalStoreCache::new()),
-            message_processing_semaphore: std::sync::Mutex::new(Arc::new(
-                async_lock::Semaphore::new(1),
+            message_processing_semaphore: std::sync::Mutex::new(MessagePermitSemaphore::drain(
+                offline_drain_permits,
             )),
             message_semaphore_generation: AtomicU64::new(0),
+            offline_drain_permits,
             // Coordination caches: capacity-only eviction, no TTL/TTI.
             // These hold live mutexes and channel senders; time-based eviction
             // while tasks hold references would silently break serialisation.
@@ -2466,8 +2469,8 @@ impl Client {
         self.offline_terminal_gate_reached
             .store(true, Ordering::Release);
         let terminal_gate = self.offline_terminal_lock.lock().await;
-        // Reset semaphore to 1 permit for next offline sync.
-        self.swap_message_semaphore(1);
+        // Reset to the drain pool for the next offline sync.
+        self.swap_to_drain_semaphore();
         // Reset dead-socket timestamps so stale values from the previous
         // connection don't trigger an immediate reconnect on the next one.
         self.stats.reset_connection_activity();

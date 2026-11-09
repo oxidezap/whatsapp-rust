@@ -3900,6 +3900,10 @@ fn client_size_pins_runtime_cache_config_saving() {
     assert_eq!(retry_slot, 2 * size_of::<usize>());
     assert_eq!(decrypt_slot, 2 * size_of::<usize>());
     assert!(slots < legacy_slots);
+    // The drain permit pool made the semaphore struct carry its quiescence
+    // width beside the Arc (+8 B over a bare Mutex<Arc<Semaphore>>), and the
+    // resolved width is stored on the client (+8 B).
+    expected += 2 * size_of::<usize>();
     eprintln!(
         "Client={} B; retry/decrypt/handler slots={retry_slot}/{decrypt_slot}/{handler_slot} B; previous slots={legacy_slots} B; current slots={slots} B",
         size_of::<Client>()
@@ -9316,23 +9320,25 @@ async fn wait_for_startup_sync_reports_a_teardown_without_waiting_out_its_timeou
     );
 }
 
-/// `async_lock::Semaphore` does not report its count, so ask it the question
-/// the drain actually asks: can two stanzas be in flight at once?
-fn concurrent_permits(client: &Arc<Client>) -> bool {
+/// `async_lock::Semaphore` does not report its count, so count how many
+/// permits the current pool will give out at once.
+fn available_permit_count(client: &Arc<Client>) -> usize {
     let semaphore = client.read_message_semaphore().1;
-    let first = semaphore.try_acquire_arc();
-    let second = semaphore.try_acquire_arc();
-    first.is_some() && second.is_some()
+    let mut guards = Vec::new();
+    while let Some(guard) = semaphore.try_acquire_arc() {
+        guards.push(guard);
+    }
+    guards.len()
 }
 
-/// Exactly one, not merely "not two": a drain that could acquire nothing at
-/// all would satisfy the negation of [`concurrent_permits`] while being just
-/// as broken.
-fn exactly_one_permit(client: &Arc<Client>) -> bool {
-    let semaphore = client.read_message_semaphore().1;
-    let first = semaphore.try_acquire_arc();
-    let second = semaphore.try_acquire_arc();
-    first.is_some() && second.is_none()
+/// The live semaphore is the wide one.
+fn live_sized_permits(client: &Arc<Client>) -> bool {
+    available_permit_count(client) == node_io::MESSAGE_LIVE_PERMITS
+}
+
+/// The drain pool is the client's configured width, not a hard-coded one.
+fn drain_sized_permits(client: &Arc<Client>) -> bool {
+    available_permit_count(client) == client.offline_drain_permits
 }
 
 /// A finisher that arrives after its teardown cannot widen the semaphore the
@@ -9349,7 +9355,7 @@ async fn a_late_finisher_cannot_widen_the_next_drains_semaphore() {
     let stale_generation = client.connection_generation.load(Ordering::Acquire);
     client.enter_live_mode_for_tests();
     assert!(
-        concurrent_permits(&client),
+        live_sized_permits(&client),
         "live mode is the wide semaphore"
     );
 
@@ -9361,8 +9367,8 @@ async fn a_late_finisher_cannot_widen_the_next_drains_semaphore() {
         .await;
 
     assert!(
-        exactly_one_permit(&client),
-        "the next drain starts on exactly one permit, whatever the old finisher does"
+        drain_sized_permits(&client),
+        "the next drain starts on its configured pool, whatever the old finisher does"
     );
 }
 
@@ -9402,15 +9408,15 @@ async fn the_permit_reset_is_inside_the_terminal_lock() {
     .await;
 
     assert!(
-        concurrent_permits(&client),
+        live_sized_permits(&client),
         "the teardown narrowed the semaphore without the lock a finisher publishes under"
     );
 
     drop(terminal_gate);
     teardown.await.expect("teardown must not panic");
     assert!(
-        exactly_one_permit(&client),
-        "and once it has the lock, it does narrow it to exactly one"
+        drain_sized_permits(&client),
+        "and once it has the lock, it does narrow it to the drain pool"
     );
 }
 
