@@ -985,6 +985,37 @@ impl VideoPlaneState {
 /// Add one packet's reassembly counters to the call's totals. Taken per packet rather than read from
 /// the pipeline at report time because the video plane can be rebuilt mid-call, and its counters
 /// with it.
+/// Hand completed pictures to the application, noting a keyframe that ends a loss.
+fn play_out_video(
+    outbox: &mut VecDeque<Output>,
+    v: &mut VideoPlaneState,
+    completed: Vec<(u32, Vec<u8>, Option<u8>)>,
+    peer_orientation: u8,
+) {
+    for (timestamp, au, orientation) in completed {
+        let keyframe = au_is_keyframe(&au);
+        // Parameter sets are sync metadata, not a repaired picture.
+        if keyframe
+            && au_has_idr(&au)
+            && v.inbound_gap_timestamp
+                .is_none_or(|gap| (timestamp.wrapping_sub(gap) as i32) > 0)
+        {
+            v.peer_keyframe_pending = None;
+            v.inbound_gap_timestamp = None;
+        }
+        outbox.push_back(Output::VideoPlayout(VideoFrame {
+            data: au,
+            keyframe,
+            orientation: orientation.unwrap_or(peer_orientation),
+            sender: None,
+            device: None,
+            pid: None,
+            timestamp,
+            generation: 0,
+        }));
+    }
+}
+
 fn fold_video_reassembly(stats: &mut CallMediaStats, r: &VideoReassemblyStats) {
     let d = &r.depacketizer;
     for (total, delta) in [
@@ -1040,6 +1071,24 @@ fn fold_video_reassembly(stats: &mut CallMediaStats, r: &VideoReassemblyStats) {
             &mut stats.video_retired_ssrc_ignored,
             r.retired_ssrc_ignored,
         ),
+        (
+            &mut stats.video_fec_repairs_received,
+            r.fec.repairs_received,
+        ),
+        (&mut stats.video_fec_recovered, r.fec.packets_recovered),
+        (&mut stats.video_fec_parity_matched, r.fec.parity_matched),
+        (
+            &mut stats.video_fec_parity_mismatched,
+            r.fec.parity_mismatched,
+        ),
+        (
+            &mut stats.video_fec_insufficient,
+            r.fec.repairs_insufficient,
+        ),
+        (&mut stats.video_fec_late, r.fec.repairs_late),
+        (&mut stats.video_fec_rejected, r.fec.recovered_rejected),
+        (&mut stats.video_gaps_skipped, r.fec.gaps_skipped),
+        (&mut stats.video_packets_skipped, r.fec.packets_skipped),
     ] {
         *total = total.saturating_add(delta);
     }
@@ -3208,7 +3257,7 @@ impl CallEngine {
                 self.health.on_rtp(now);
             }
             let received = match m.video.as_mut() {
-                Some(v) if v.active => match v.pipe.unprotect_video_packet_split(pkt) {
+                Some(v) if v.active => match v.pipe.unprotect_video_packet_held(pkt, now) {
                     Ok((header, completed, audio, received_payload_len)) => {
                         reassembly = Some(v.pipe.take_reassembly_stats());
                         if v.pipe.inbound_ssrc() == Some(header.ssrc) {
@@ -3225,28 +3274,7 @@ impl CallEngine {
                         if video_lost > 0 {
                             v.inbound_gap_timestamp = Some(header.timestamp);
                         }
-                        for (timestamp, au, orientation) in completed {
-                            let keyframe = au_is_keyframe(&au);
-                            // Parameter sets are sync metadata, not a repaired picture.
-                            if keyframe
-                                && au_has_idr(&au)
-                                && v.inbound_gap_timestamp
-                                    .is_none_or(|gap| (timestamp.wrapping_sub(gap) as i32) > 0)
-                            {
-                                v.peer_keyframe_pending = None;
-                                v.inbound_gap_timestamp = None;
-                            }
-                            self.outbox.push_back(Output::VideoPlayout(VideoFrame {
-                                data: au,
-                                keyframe,
-                                orientation: orientation.unwrap_or(self.peer_video_orientation),
-                                sender: None,
-                                device: None,
-                                pid: None,
-                                timestamp,
-                                generation: 0,
-                            }));
-                        }
+                        play_out_video(&mut self.outbox, v, completed, self.peer_video_orientation);
                         piggybacked = audio;
                         Ok(())
                     }
@@ -3279,6 +3307,10 @@ impl CallEngine {
                         self.media_stats.srtp_unprotect_failed.saturating_add(1);
                 }
             }
+            // A loss the peer's repair packets may still fill is not yet a missing picture: ask for
+            // a keyframe only once a gap is given up on. Asking on every lost packet had the peer
+            // sending keyframes -- its largest pictures -- into the very loss that triggered them.
+            let unrepaired = reassembly.is_some_and(|r| r.fec.gaps_skipped > 0);
             if let Some(reassembly) = reassembly {
                 fold_video_reassembly(&mut self.media_stats, &reassembly);
             }
@@ -3290,6 +3322,8 @@ impl CallEngine {
                     .media_stats
                     .video_rtp_lost
                     .saturating_add(u32::from(video_lost));
+            }
+            if unrepaired {
                 // A missing reference picture can damage later frames without a decoder error.
                 // Recover through the same coalesced path as the application's requests.
                 self.request_peer_keyframe(now, KeyframeUrgency::Coalesced);
@@ -3329,6 +3363,7 @@ impl CallEngine {
             // here too, under the same keys, and in a video call they carry its audio piggybacked
             // just as its video does.
             let mut piggybacked = None;
+            let mut repaired = None;
             match m.pipe.unprotect_auxiliary(pkt) {
                 Ok((_, mut payload)) => {
                     self.media_stats.auxiliary_rtp_authenticated = self
@@ -3336,12 +3371,27 @@ impl CallEngine {
                         .auxiliary_rtp_authenticated
                         .saturating_add(1);
                     piggybacked = split_whatsapp_audio_piggyback(pkt, &mut payload);
+                    // The peer's video FEC: rebuild what its video lost.
+                    if wire_header.payload_type == RTP_PAYLOAD_TYPE_VIDEO_FEC
+                        && let Some(v) = m.video.as_mut().filter(|v| v.active)
+                    {
+                        let completed = v.pipe.repair_video(&payload, now);
+                        play_out_video(&mut self.outbox, v, completed, self.peer_video_orientation);
+                        repaired = Some(v.pipe.take_reassembly_stats());
+                    }
                 }
                 Err(SrtpReceiveError::AuthenticationFailed) if audio_carrier => {
                     self.media_stats.srtp_unprotect_failed =
                         self.media_stats.srtp_unprotect_failed.saturating_add(1);
                 }
                 _ => {}
+            }
+            let unrepaired = repaired.is_some_and(|r| r.fec.gaps_skipped > 0);
+            if let Some(repaired) = repaired {
+                fold_video_reassembly(&mut self.media_stats, &repaired);
+            }
+            if unrepaired {
+                self.request_peer_keyframe(now, KeyframeUrgency::Coalesced);
             }
             if let Some(audio) = piggybacked {
                 // This packet was already counted as an arrival above.

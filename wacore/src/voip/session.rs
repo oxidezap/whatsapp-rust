@@ -8,6 +8,7 @@ use super::e2e_srtp::{
     derive_srtcp_keys_from_raw, protect_srtcp, unprotect_srtcp, verify_warp_mi_tag,
 };
 use super::fec::{RTP_PAYLOAD_TYPE_VIDEO_FEC, VideoFecSender};
+use super::fec_receive::{InboundFec, InboundFecStats};
 use super::h264::{
     H264_MAX_AU_BYTES, H264Depacketizer, H264DepacketizerStats, PacketizedAu, au_has_idr,
     packetize_au,
@@ -771,6 +772,9 @@ pub struct VideoReassemblyStats {
     pub ssrc_switch_partial_dropped: u32,
     /// Packets from a retired SSRC ignored for their picture (their piggybacked audio is kept).
     pub retired_ssrc_ignored: u32,
+    /// What holding and rebuilding did; zero unless [`VideoPipeline::unprotect_video_packet_held`]
+    /// is the receive path.
+    pub fec: InboundFecStats,
 }
 
 pub struct VideoPipeline {
@@ -819,6 +823,9 @@ pub struct VideoPipeline {
     ssrc_switches: u32,
     ssrc_switch_partial_dropped: u32,
     retired_ssrc_ignored: u32,
+    /// Holds packets behind a gap and rebuilds lost ones from the peer's repair packets; used by
+    /// [`Self::unprotect_video_packet_held`] only.
+    inbound_fec: InboundFec,
     pkt_scratch: PacketizedAu,
     srtcp: SrtcpSender,
     /// Forward error correction for our video, once the call turns it on.
@@ -956,6 +963,7 @@ impl VideoPipeline {
             ssrc_switches: 0,
             ssrc_switch_partial_dropped: 0,
             retired_ssrc_ignored: 0,
+            inbound_fec: InboundFec::default(),
             pkt_scratch: PacketizedAu::default(),
             srtcp: SrtcpSender::new(p.call_key, p.self_lid, rtcp_cname, true)?,
             fec: None,
@@ -1134,6 +1142,7 @@ impl VideoPipeline {
     /// packets that arrived before the pause, and a reclaim part-way through one
     /// would otherwise be completed by fewer stragglers than it takes to earn.
     pub(crate) fn reset_reassembly(&mut self) {
+        self.inbound_fec.reset();
         self.depacketizer.reset();
         self.frame_orientation = None;
         self.depacketizer_ssrc = None;
@@ -1143,6 +1152,7 @@ impl VideoPipeline {
     }
 
     pub(crate) fn reset_depacketizer(&mut self) {
+        self.inbound_fec.reset();
         self.depacketizer.reset();
         self.frame_orientation = None;
         self.depacketizer_ssrc = None;
@@ -1160,6 +1170,7 @@ impl VideoPipeline {
             ssrc_switches: std::mem::take(&mut self.ssrc_switches),
             ssrc_switch_partial_dropped: std::mem::take(&mut self.ssrc_switch_partial_dropped),
             retired_ssrc_ignored: std::mem::take(&mut self.retired_ssrc_ignored),
+            fec: self.inbound_fec.take_stats(),
         }
     }
 
@@ -1352,6 +1363,39 @@ impl VideoPipeline {
         &mut self,
         packet: &[u8],
     ) -> Result<VideoPacketSplit, SrtpReceiveError> {
+        self.unprotect_video_packet_inner(packet, None)
+    }
+
+    /// [`Self::unprotect_video_packet_split`] for a 1:1 call, whose peer protects its video with
+    /// repair packets: the packets behind a sequence gap wait, up to a short hold, for the lost one
+    /// to arrive late or be rebuilt by [`Self::repair_video`]. `now_ms` times the hold.
+    pub(crate) fn unprotect_video_packet_held(
+        &mut self,
+        packet: &[u8],
+        now_ms: u64,
+    ) -> Result<VideoPacketSplit, SrtpReceiveError> {
+        self.unprotect_video_packet_inner(packet, Some(now_ms))
+    }
+
+    /// A decrypted repair packet from the peer's video FEC stream. Returns the pictures that the
+    /// packet it rebuilt, and those held behind it, complete.
+    pub(crate) fn repair_video(
+        &mut self,
+        payload: &[u8],
+        now_ms: u64,
+    ) -> Vec<TimestampedAccessUnit> {
+        let Some(ssrc) = self.depacketizer_ssrc else {
+            return Vec::new();
+        };
+        let ready = self.inbound_fec.repair(now_ms, ssrc, payload);
+        self.reassemble(ready)
+    }
+
+    fn unprotect_video_packet_inner(
+        &mut self,
+        packet: &[u8],
+        held_at: Option<u64>,
+    ) -> Result<VideoPacketSplit, SrtpReceiveError> {
         let (header, mut payload) = unprotect_srtp_packet_checked(
             &self.recv_keys,
             &mut self.recv_streams,
@@ -1359,6 +1403,12 @@ impl VideoPipeline {
             packet,
         )?;
         let payload_len = super::rtp::received_payload_len(packet, &payload);
+        // What a repair packet protects: the payload before its audio is split off.
+        let payload_with_audio = if held_at.is_some() {
+            payload.clone()
+        } else {
+            Vec::new()
+        };
         let piggybacked_audio = super::rtp::split_whatsapp_audio_piggyback(packet, &mut payload);
         // Counted BEFORE the grace check, and for every authenticated packet including the ones that
         // check ignores. Counting only the stream that replaced the retired one would never expire
@@ -1411,6 +1461,7 @@ impl VideoPipeline {
                         self.ssrc_switch_partial_dropped.saturating_add(1);
                 }
                 self.depacketizer.reset();
+                self.inbound_fec.reset();
                 self.frame_orientation = None;
             }
             if let Some(left) = self.depacketizer_ssrc {
@@ -1427,11 +1478,57 @@ impl VideoPipeline {
             self.retired_ssrc_run = 0;
             self.contender_ssrc = None;
         }
+        let completed = match held_at {
+            None => {
+                let mut completed = Vec::new();
+                self.depacketize(packet, &header, &payload, &mut completed);
+                completed
+            }
+            Some(now_ms) => {
+                // As the sender protected it: the header as it arrived, then the whole decrypted
+                // payload, any piggybacked audio included.
+                let header_len = rtp_header_byte_length(packet).unwrap_or(RTP_FIXED_HEADER_LEN);
+                let mut plain = Vec::with_capacity(header_len + payload.len() + 64);
+                plain.extend_from_slice(&packet[..header_len]);
+                plain.extend_from_slice(&payload_with_audio);
+                let ready = self
+                    .inbound_fec
+                    .arrive(now_ms, header.sequence_number, plain);
+                self.reassemble(ready)
+            }
+        };
+        Ok((header, completed, piggybacked_audio, payload_len))
+    }
+
+    /// Feed plaintext packets the hold released, in order.
+    fn reassemble(&mut self, packets: Vec<Vec<u8>>) -> Vec<TimestampedAccessUnit> {
+        let mut completed = Vec::new();
+        for plain in packets {
+            let (Some(header), Some(header_len)) =
+                (parse_rtp_header(&plain), rtp_header_byte_length(&plain))
+            else {
+                continue;
+            };
+            let mut payload = plain[header_len..].to_vec();
+            super::rtp::split_whatsapp_audio_piggyback(&plain, &mut payload);
+            self.depacketize(&plain, &header, &payload, &mut completed);
+        }
+        completed
+    }
+
+    /// Push one packet's video payload into reassembly; `packet` is read for its header only.
+    fn depacketize(
+        &mut self,
+        packet: &[u8],
+        header: &RtpHeader,
+        payload: &[u8],
+        completed: &mut Vec<TimestampedAccessUnit>,
+    ) {
         let first = self.depacketizer.push_with_time_offset(
             header.sequence_number,
             header.timestamp,
             super::rtp::parse_whatsapp_media_time_offset(packet),
-            &payload,
+            payload,
             header.marker,
         );
         // Keyed by the timestamp the depacketizer hands the picture out with, which is not the RTP
@@ -1449,7 +1546,6 @@ impl VideoPipeline {
                 _ => self.frame_orientation = Some((picture, rotation)),
             }
         }
-        let mut completed = Vec::with_capacity(if first.is_some() { 2 } else { 0 });
         // Ready AUs are drained after every push, so at most the previous unmarked
         // AU and the current AU complete here. Keep each one's own orientation.
         let mut next = first;
@@ -1462,7 +1558,6 @@ impl VideoPipeline {
             completed.push((timestamp, au, orientation));
             next = self.depacketizer.pop_ready();
         }
-        Ok((header, completed, piggybacked_audio, payload_len))
     }
 }
 
@@ -1968,6 +2063,52 @@ mod tests {
 
     // Our video FEC authenticates under the keys the peer reads all our streams with, on its own
     // stream, and what it carries rebuilds a lost video packet exactly as it was protected.
+    // The receiving half: a packet lost from a picture is rebuilt from the repair packets that
+    // follow it, and the picture comes out exactly as a lossless receiver assembles it.
+    #[test]
+    fn a_held_receiver_rebuilds_a_lost_packet_from_the_peers_repair() {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let me = "111111111111111:0@lid";
+        let peer = "222222222222222:0@lid";
+        let mut tx = VideoPipeline::new(&video_params(&call_key, me, peer)).unwrap();
+        tx.configure_fec(0x0bad_f00d, VideoFecConfig::default());
+        let mut rx_media = MediaPipeline::new(&MediaPipelineParams {
+            call_key: &call_key,
+            self_lid: peer,
+            peer_lid: me,
+            ssrc: 0x0102_0304,
+            samples_per_packet: 960,
+            warp_mi_tag_len: WARP_MI_TAG_LEN,
+        })
+        .unwrap();
+        let mut lossless = VideoPipeline::new(&video_params(&call_key, peer, me)).unwrap();
+        let mut held = VideoPipeline::new(&video_params(&call_key, peer, me)).unwrap();
+
+        let mut packets = tx.protect_video(&video_au(20_000));
+        packets.extend(tx.protect_video(&video_au(20_000)));
+        let mut expected = Vec::new();
+        let mut rebuilt = Vec::new();
+        let mut video_seen = 0;
+        for (now, packet) in (0u64..).zip(&packets) {
+            if packet[1] & 0x7f == RTP_PAYLOAD_TYPE_VIDEO_FEC {
+                let (_, payload) = rx_media.unprotect_auxiliary(packet).unwrap();
+                rebuilt.extend(held.repair_video(&payload, now));
+                continue;
+            }
+            expected.extend(lossless.unprotect_video_packet_split(packet).unwrap().1);
+            video_seen += 1;
+            if video_seen == 3 {
+                continue; // lost on the way
+            }
+            rebuilt.extend(held.unprotect_video_packet_held(packet, now).unwrap().1);
+        }
+        assert!(!expected.is_empty());
+        assert_eq!(rebuilt, expected);
+        let stats = held.take_reassembly_stats().fec;
+        assert_eq!(stats.packets_recovered, 1);
+        assert_eq!(stats.gaps_skipped, 0);
+    }
+
     #[test]
     fn video_fec_authenticates_on_its_own_stream_and_rebuilds_a_lost_packet() {
         use crate::voip::fec::{FecHeader, recover_packet};
