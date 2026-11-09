@@ -241,8 +241,8 @@ async fn stale_maintenance_permit_cannot_flush_a_new_drain() {
     client.signal_shutdown_sync();
 }
 
-/// Response replay may restore a mapping evicted before recovery captured its
-/// session locks. That newly visible alias must not be reset without its lock.
+/// A response candidate is locked before authentication; a different alias
+/// learned after that snapshot must still reject replay without resetting it.
 #[tokio::test]
 async fn ordinary_recovery_rejects_an_alias_restored_after_its_lock_snapshot() {
     use wacore::usync::{UserDeviceList, UsyncDevice, UsyncLidMapping};
@@ -285,18 +285,37 @@ async fn ordinary_recovery_rejects_an_alias_restored_after_its_lock_snapshot() {
         },
         topology_generation: client.device_topology.current(),
     };
-    let recovery = {
-        let client = client.clone();
-        tokio::spawn(async move { client.recover_ordinary_adv_identity(error.into()).await })
+    let mut recovery = client.recover_ordinary_adv_identity(error.into());
+    assert!(futures::poll!(recovery.as_mut()).is_pending());
+    assert!(
+        transport.sent().is_empty(),
+        "the missing candidate lock must precede the IQ"
+    );
+    drop(alias_guard);
+    let changed_alias = Jid::lid("100000000000194");
+    let changed_lock = client
+        .session_lock_for(changed_alias.to_protocol_address().as_str())
+        .await;
+    let changed_guard = changed_lock.lock_arc().await;
+    let reply = async {
+        let iq = decode_sent_iq(&transport, 0).await;
+        client
+            .lid_pn_cache
+            .add(&crate::lid_pn_cache::LidPnEntry::new(
+                changed_alias.user.to_string(),
+                phone.user.to_string(),
+                crate::lid_pn_cache::LearningSource::Usync,
+            ))
+            .await;
+        let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+        answer_iq(&client, &id, &primary_response(&phone, &replacement, true)).await;
     };
-    let iq = decode_sent_iq(&transport, 0).await;
-    let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
-    answer_iq(&client, &id, &primary_response(&phone, &replacement, true)).await;
-    let error = tokio::time::timeout(Duration::from_secs(5), recovery)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap_err();
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(recovery, reply)
+    })
+    .await
+    .unwrap();
+    let error = result.unwrap_err();
     assert!(
         error.to_string().contains("account alias changed"),
         "{error:#}"
@@ -310,7 +329,11 @@ async fn ordinary_recovery_rejects_an_alias_restored_after_its_lock_snapshot() {
                 .public_key_bytes()
         )
     );
-    drop(alias_guard);
+    assert_eq!(
+        client.device_list_identity_alias(&phone).await,
+        Some(changed_alias)
+    );
+    drop(changed_guard);
     client.signal_shutdown_sync();
 }
 
@@ -2735,5 +2758,414 @@ async fn replacement_mapping_preserves_the_previous_account_anchor() {
             );
             client.signal_shutdown_sync();
         }
+    }
+}
+
+/// Authenticate a rotation before publishing the response's first PN/LID
+/// binding. Capturing no current alias must not permanently block that binding.
+#[tokio::test]
+async fn ordinary_rotation_recovers_with_its_first_response_mapping() {
+    for candidate_known in [false, true] {
+        let (client, transport) = create_iq_test_client().await;
+        let phone = Jid::pn("12025550182");
+        let lid = Jid::lid("100000000000182");
+        crate::test_utils::seed_adv_primary(&client, &phone).await;
+        if candidate_known {
+            crate::test_utils::seed_adv_primary(&client, &lid).await;
+        }
+        client
+            .update_device_list(DeviceListRecord {
+                user: phone.user.as_str().into(),
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(3, Some(1))].into(),
+                raw_id: Some(1),
+                timestamp: 1,
+                phash: None,
+            })
+            .await
+            .unwrap();
+        let old = client.cached_adv_account_identity(&phone).await.unwrap();
+        let old_session = seed_fresh_session(&client, &phone.with_device(3)).await;
+        let alias_session = seed_fresh_session(&client, &lid).await;
+        let replacement = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let original = adv_wire_response(&phone, signed_list(&replacement, false));
+        let devices = original
+            .get_optional_child("usync")
+            .unwrap()
+            .get_optional_child("list")
+            .unwrap()
+            .get_optional_child("user")
+            .unwrap()
+            .get_optional_child("devices")
+            .unwrap()
+            .clone();
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("usync")
+                .children([NodeBuilder::new("list")
+                    .children([NodeBuilder::new("user")
+                        .attr("jid", phone.to_string())
+                        .children([
+                            devices,
+                            NodeBuilder::new("lid").attr("val", lid.to_string()).build(),
+                        ])
+                        .build()])
+                    .build()])
+                .build()])
+            .build();
+        let operation = {
+            let client = client.clone();
+            let phone = phone.clone();
+            tokio::spawn(async move {
+                client
+                    .fetch_user_devices_with_freshness(vec![phone], Freshness::Refresh)
+                    .await
+            })
+        };
+        for index in 0..2 {
+            let iq = decode_sent_iq(&transport, index).await;
+            let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+            answer_iq(&client, &id, &response).await;
+        }
+        let iq = decode_sent_iq(&transport, 2).await;
+        assert_eq!(
+            iq.get().attrs().optional_string("xmlns").as_deref(),
+            Some("encrypt")
+        );
+        assert!(client.device_list_identity_alias(&phone).await.is_none());
+        assert_eq!(
+            client.cached_adv_account_identity(&phone).await.unwrap(),
+            old
+        );
+        assert_eq!(
+            client.cached_adv_account_identity(&lid).await.unwrap(),
+            if candidate_known { old } else { None }
+        );
+        let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+        answer_iq(&client, &id, &primary_response(&phone, &replacement, true)).await;
+        let result = tokio::time::timeout(Duration::from_secs(5), operation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.unwrap(), vec![phone.clone(), phone.with_device(2)]);
+        assert_eq!(
+            client.device_list_identity_alias(&phone).await,
+            Some(lid.clone())
+        );
+        for user in [&phone, &lid] {
+            assert_eq!(
+                client.device_list_account_identity(user).await.unwrap(),
+                Some(*replacement.public_key.public_key_bytes())
+            );
+            let record = client.load_device_record_for_jid(user).await.unwrap();
+            assert_eq!(
+                record
+                    .devices
+                    .iter()
+                    .map(|device| device.device_id())
+                    .collect::<Vec<_>>(),
+                [0, 2]
+            );
+        }
+        assert!(!has_session(&client, &old_session).await);
+        assert!(!has_session(&client, &alias_session).await);
+        assert_eq!(transport.sent().len(), 3);
+        client.signal_shutdown_sync();
+    }
+}
+
+fn first_mapping_failure(
+    client: &Client,
+    phone: &Jid,
+    lid: &Jid,
+    signer: &KeyPair,
+) -> DeviceListAdvError {
+    use wacore::usync::{UserDeviceList, UsyncDevice, UsyncLidMapping};
+    DeviceListAdvError {
+        user: phone.clone(),
+        hosted: false,
+        response: DeviceListResponse {
+            device_lists: vec![UserDeviceList {
+                user: phone.clone(),
+                devices: vec![UsyncDevice::new(0, None), UsyncDevice::new(2, Some(1))],
+                phash: None,
+                key_index_bytes: Some(signed_list(signer, false)),
+            }],
+            lid_mappings: vec![UsyncLidMapping {
+                phone_number: phone.user.clone(),
+                lid: lid.user.clone(),
+            }],
+        },
+        topology_generation: client.device_topology.current(),
+    }
+}
+
+/// A first mapping is a captured proposal, never permission to ignore a key,
+/// relationship or paired-account change while the primary IQ is outstanding.
+#[tokio::test]
+async fn first_mapping_recovery_rejects_changes_during_authentication() {
+    for change in [
+        "primary-key",
+        "candidate-key",
+        "source-alias",
+        "candidate-owner",
+        "paired-candidate",
+        "paired-primary",
+        "wrong-primary",
+        "invalid-primary",
+    ] {
+        let (client, transport) = create_iq_test_client().await;
+        let phone = Jid::pn("12025550184");
+        let lid = Jid::lid("100000000000184");
+        crate::test_utils::seed_adv_primary(&client, &phone).await;
+        let old_session = seed_fresh_session(&client, &phone.with_device(3)).await;
+        client
+            .update_device_list(DeviceListRecord {
+                user: phone.user.as_str().into(),
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(3, Some(1))].into(),
+                raw_id: Some(1),
+                timestamp: 1,
+                phash: None,
+            })
+            .await
+            .unwrap();
+        let replacement = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let error = first_mapping_failure(&client, &phone, &lid, &replacement);
+        let recovery = {
+            let client = client.clone();
+            tokio::spawn(async move { client.recover_ordinary_adv_identity(error.into()).await })
+        };
+        let iq = decode_sent_iq(&transport, 0).await;
+        assert!(client.device_list_identity_alias(&phone).await.is_none());
+        assert!(client.device_list_identity_alias(&lid).await.is_none());
+        assert!(
+            client.adv_bootstrap_fence.try_write().is_some(),
+            "snapshot fence must be released before the IQ"
+        );
+        let other_key = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        match change {
+            "primary-key" | "candidate-key" => {
+                let target = if change == "primary-key" {
+                    &phone
+                } else {
+                    &lid
+                };
+                let lock = client
+                    .session_lock_for(target.to_protocol_address().as_str())
+                    .await;
+                let _guard = lock.lock_arc().await;
+                client
+                    .signal_cache
+                    .put_identity(
+                        &target.to_protocol_address(),
+                        other_key.public_key.public_key_bytes(),
+                    )
+                    .await;
+            }
+            "source-alias" | "candidate-owner" => {
+                let (lid, phone) = if change == "source-alias" {
+                    (Jid::lid("100000000000185"), phone.clone())
+                } else {
+                    (lid.clone(), Jid::pn("12025550185"))
+                };
+                client
+                    .lid_pn_cache
+                    .add(&crate::lid_pn_cache::LidPnEntry::new(
+                        lid.user.to_string(),
+                        phone.user.to_string(),
+                        crate::lid_pn_cache::LearningSource::Usync,
+                    ))
+                    .await;
+            }
+            "paired-candidate" | "paired-primary" => {
+                client
+                    .persistence_manager
+                    .process_command(if change == "paired-candidate" {
+                        wacore::store::commands::DeviceCommand::SetLid(Some(lid.clone()))
+                    } else {
+                        wacore::store::commands::DeviceCommand::SetId(Some(phone.clone()))
+                    })
+                    .await;
+            }
+            _ => {}
+        }
+        let expected_phone = client.cached_adv_account_identity(&phone).await.unwrap();
+        let expected_lid = client.cached_adv_account_identity(&lid).await.unwrap();
+        let phone_alias = client.device_list_identity_alias(&phone).await;
+        let lid_alias = client.device_list_identity_alias(&lid).await;
+        let signer = if change == "wrong-primary" {
+            &other_key
+        } else {
+            &replacement
+        };
+        let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+        answer_iq(
+            &client,
+            &id,
+            &primary_response(&phone, signer, change != "invalid-primary"),
+        )
+        .await;
+        let error = tokio::time::timeout(Duration::from_secs(5), recovery)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        if change == "paired-candidate" || change == "paired-primary" {
+            assert!(error.to_string().contains("paired primary"), "{error:#}");
+        }
+        assert_eq!(
+            client.cached_adv_account_identity(&phone).await.unwrap(),
+            expected_phone,
+            "{change}"
+        );
+        assert_eq!(
+            client.cached_adv_account_identity(&lid).await.unwrap(),
+            expected_lid,
+            "{change}"
+        );
+        assert_eq!(
+            client.device_list_identity_alias(&phone).await,
+            phone_alias,
+            "{change}"
+        );
+        assert_eq!(
+            client.device_list_identity_alias(&lid).await,
+            lid_alias,
+            "{change}"
+        );
+        assert!(has_session(&client, &old_session).await, "{change}");
+        let record = client
+            .persistence_manager
+            .backend()
+            .get_devices(&phone.user)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record
+                .devices
+                .iter()
+                .map(|device| device.device_id())
+                .collect::<Vec<_>>(),
+            [0, 3]
+        );
+        assert_eq!(transport.sent().len(), 1);
+        client.signal_shutdown_sync();
+    }
+}
+
+/// An occupied, conflicting, paired or ambiguous destination cannot become a
+/// recovery target merely because it appeared in an uncommitted response.
+#[tokio::test]
+async fn first_mapping_recovery_rejects_ineligible_candidates_before_iq() {
+    use wacore::usync::UsyncLidMapping;
+    for case in [
+        "occupied",
+        "reverse-only",
+        "conflicting-key",
+        "ambiguous-source",
+        "ambiguous-target",
+        "paired",
+    ] {
+        let (client, transport) = create_iq_test_client().await;
+        let phone = Jid::pn("12025550186");
+        let lid = Jid::lid("100000000000186");
+        let other = Jid::pn("12025550187");
+        let other_lid = Jid::lid("100000000000187");
+        crate::test_utils::seed_adv_primary(&client, &phone).await;
+        let old = client.cached_adv_account_identity(&phone).await.unwrap();
+        let session = seed_fresh_session(&client, &phone).await;
+        let signer = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let mut failure = first_mapping_failure(&client, &phone, &lid, &signer);
+        match case {
+            "occupied" | "reverse-only" => {
+                client
+                    .lid_pn_cache
+                    .add(&crate::lid_pn_cache::LidPnEntry::new(
+                        lid.user.to_string(),
+                        other.user.to_string(),
+                        crate::lid_pn_cache::LearningSource::Usync,
+                    ))
+                    .await;
+                if case == "reverse-only" {
+                    client
+                        .lid_pn_cache
+                        .add(&crate::lid_pn_cache::LidPnEntry::new(
+                            other_lid.user.to_string(),
+                            other.user.to_string(),
+                            crate::lid_pn_cache::LearningSource::Usync,
+                        ))
+                        .await;
+                }
+            }
+            "conflicting-key" => {
+                client
+                    .signal_cache
+                    .put_identity(
+                        &lid.to_protocol_address(),
+                        signer.public_key.public_key_bytes(),
+                    )
+                    .await;
+            }
+            "ambiguous-source" => failure.response.lid_mappings.push(UsyncLidMapping {
+                phone_number: phone.user.clone(),
+                lid: other_lid.user.clone(),
+            }),
+            "ambiguous-target" => failure.response.lid_mappings.push(UsyncLidMapping {
+                phone_number: other.user.clone(),
+                lid: lid.user.clone(),
+            }),
+            "paired" => {
+                client
+                    .persistence_manager
+                    .process_command(wacore::store::commands::DeviceCommand::SetLid(Some(
+                        lid.clone(),
+                    )))
+                    .await;
+                crate::test_utils::seed_adv_primary(&client, &lid).await;
+            }
+            _ => unreachable!(),
+        }
+        let candidate_key = client.cached_adv_account_identity(&lid).await.unwrap();
+        let candidate_alias = client.device_list_identity_alias(&lid).await;
+        if case == "occupied" || case == "reverse-only" {
+            assert_eq!(candidate_alias, Some(other.clone()));
+        }
+        if case == "reverse-only" {
+            assert_eq!(
+                client.device_list_identity_alias(&other).await,
+                Some(other_lid.clone())
+            );
+        }
+        let owner_lock = client
+            .session_lock_for(other.to_protocol_address().as_str())
+            .await;
+        let owner_guard = owner_lock.lock_arc().await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client.recover_ordinary_adv_identity(failure.into()),
+        )
+        .await
+        .expect("reject before waiting for an IQ")
+        .unwrap_err();
+        assert!(transport.sent().is_empty(), "{case}");
+        assert_eq!(
+            client.cached_adv_account_identity(&phone).await.unwrap(),
+            old,
+            "{case}"
+        );
+        assert_eq!(
+            client.cached_adv_account_identity(&lid).await.unwrap(),
+            candidate_key,
+            "{case}"
+        );
+        assert_eq!(
+            client.device_list_identity_alias(&lid).await,
+            candidate_alias,
+            "{case}"
+        );
+        assert!(has_session(&client, &session).await, "{case}");
+        assert!(client.device_list_identity_alias(&phone).await.is_none());
+        drop(owner_guard);
+        client.signal_shutdown_sync();
     }
 }
