@@ -133,14 +133,24 @@ pub(crate) async fn handle_privacy_token_notification(client: &Arc<Client>, node
     }
 
     // Re-subscribe presence with the updated token.
-    if token_stored
-        && let Some(from) = &from_jid
-        && let Err(e) = client
+    if token_stored && let Some(from) = &from_jid {
+        // The notification's PN and the active presence key can be different
+        // namespaces. Prefer the tracked LID, retaining legacy PN subscriptions.
+        let lid = sender_lid_jid
+            .clone()
+            .unwrap_or_else(|| wacore_binary::Jid::lid(sender_lid));
+        let target = if !stored_under_pn && client.is_presence_subscription_tracked(&lid) {
+            &lid
+        } else {
+            from
+        };
+        if let Err(e) = client
             .presence()
-            .re_subscribe_when_active(from, sender_lid, stored_under_pn)
+            .re_subscribe_when_active(target, sender_lid, stored_under_pn)
             .await
-    {
-        debug!(target: "Client/TcToken", "Failed to re-subscribe presence for {}: {e}", from.observe());
+        {
+            debug!(target: "Client/TcToken", "Failed to re-subscribe presence for {}: {e}", target.observe());
+        }
     }
 }
 
@@ -323,6 +333,60 @@ mod tests {
             Some(token.as_slice())
         );
         client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn review_pn_token_notification_resubscribes_the_tracked_lid() {
+        use crate::test_utils::{create_iq_test_client, decode_sent_iq};
+        use wacore_binary::Jid;
+
+        for explicit_lid in [true, false] {
+            let (client, transport) = create_iq_test_client().await;
+            let phone = Jid::pn("12025550262");
+            let lid = Jid::lid("100000000000262");
+            if !explicit_lid {
+                client
+                    .learn_lid_pn_mapping_fast(
+                        &lid.user,
+                        &phone.user,
+                        crate::lid_pn_cache::LearningSource::Usync,
+                        true,
+                    )
+                    .await;
+            }
+            client.track_presence_subscription(lid.clone());
+            let token = b"synthetic-tracked-lid-token".to_vec();
+            let mut notification = NodeBuilder::new("notification")
+                .attr("type", "privacy_token")
+                .attr("from", phone.to_string());
+            if explicit_lid {
+                notification = notification.attr("sender_lid", lid.to_string());
+            }
+            let notification = notification
+                .children([NodeBuilder::new("tokens")
+                    .children([NodeBuilder::new("token")
+                        .attr("type", "trusted_contact")
+                        .attr("t", client.runtime.wall_time_secs().to_string())
+                        .bytes(token.clone())
+                        .build()])
+                    .build()])
+                .build();
+            handle_privacy_token_notification(&client, &notification.as_node_ref()).await;
+            let sent = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                decode_sent_iq(&transport, 0),
+            )
+            .await
+            .expect("the active LID subscription must be retried");
+            assert_eq!(sent.get().attrs().optional_jid("to"), Some(lid));
+            assert_eq!(
+                sent.get()
+                    .get_optional_child("tctoken")
+                    .and_then(|child| child.content_bytes()),
+                Some(token.as_slice())
+            );
+            client.signal_shutdown_sync();
+        }
     }
 
     #[tokio::test]

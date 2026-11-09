@@ -156,14 +156,14 @@ impl<'a> Presence<'a> {
             return Ok(());
         }
 
-        let mut token = self.client.lookup_tc_token_for_key(token_key).await;
+        let mut token = self.client.lookup_tc_token_for_key(jid, token_key).await;
         if token.is_none() && stored_under_pn {
             // A legacy PN row can be moved after the notification's write ACK.
             // Only that storage namespace may follow a newly learned mapping;
             // an expired LID token must not fall back to an unrelated PN row.
             let current_key = self.client.resolve_tc_token_key(jid).await;
             if current_key != token_key {
-                token = self.client.lookup_tc_token_for_key(&current_key).await;
+                token = self.client.lookup_tc_token_for_key(jid, &current_key).await;
             }
         }
         let node = Self::subscription_node_with_token(jid, token);
