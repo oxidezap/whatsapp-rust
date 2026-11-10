@@ -175,7 +175,7 @@ pub struct ClientOptions {
     pub background_saver_interval: Option<Duration>,
     /// Stanzas processed concurrently while the offline backlog drains.
     /// `0` auto-detects one per available core, capped at
-    /// [`crate::client::MAX_OFFLINE_DRAIN_PERMITS`]; an explicit value is
+    /// 8; an explicit value is
     /// clamped to the same range. Per-chat ordering is unaffected — the chat
     /// lane owns that regardless of pool width.
     pub offline_drain_permits: usize,
