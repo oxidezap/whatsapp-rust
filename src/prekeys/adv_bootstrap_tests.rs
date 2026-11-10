@@ -14,8 +14,7 @@ use wacore_binary::builder::NodeBuilder;
 fn adv_bootstrap_memory_reports_retained_capacity_after_cancelled_flights() {
     let budgets = crate::inbound_queue::QueueBudgets::default();
     let baseline = budgets.memory_stats().0;
-    assert!(budgets.adv_bootstrap.get().is_none());
-    let registry = budgets.adv_bootstrap.get_or_init(Arc::default);
+    let registry = budgets.adv_bootstrap();
     let initialized = budgets.memory_stats().0;
     assert!(initialized.bytes > baseline.bytes);
     let mut first_peak = None;

@@ -645,7 +645,7 @@ impl Client {
             transport_ack_queue: self
                 .inbound_queues
                 .get()
-                .and_then(|q| q.ack_queue.get())
+                .and_then(|q| q.ack_sender())
                 .map_or(0, |tx| tx.len()),
             delivery_receipt_queue: self.delivery_receipt_queue.get().map_or(0, |tx| tx.len()),
             response_waiters,

@@ -1064,7 +1064,7 @@ impl Client {
         drop(node);
         let tx = self
             .inbound_queues()
-            .ack_queue
+            .ack_queue()
             .get_or_init(|| self.start_transport_ack_worker());
         let mut lease = crate::inbound_queue::reserve(&self.inbound_queues().ack, bytes.capacity());
         for _ in 0..crate::inbound_queue::SATURATION_RETRY_TURNS {
@@ -3372,7 +3372,7 @@ mod tests {
         use wacore_binary::builder::NodeBuilder;
         let (client, _transport) = create_iq_test_client().await;
         let (tx, rx) = async_channel::bounded(1);
-        assert!(client.inbound_queues().ack_queue.set(tx).is_ok());
+        assert!(client.inbound_queues().ack_queue().set(tx).is_ok());
         let receipt = || {
             node_to_owned_ref(
                 &NodeBuilder::new("receipt")
@@ -3463,7 +3463,7 @@ mod tests {
         use wacore_binary::builder::NodeBuilder;
         let (client, _transport) = create_iq_test_client().await;
         let (tx, rx) = async_channel::bounded(1);
-        assert!(client.inbound_queues().ack_queue.set(tx).is_ok());
+        assert!(client.inbound_queues().ack_queue().set(tx).is_ok());
         let old = client.connection_shutdown_signal();
         client.reset_connection_shutdown();
         let receipt = node_to_owned_ref(
@@ -3520,7 +3520,7 @@ mod tests {
         use wacore_binary::builder::NodeBuilder;
         let (client, _transport) = create_iq_test_client().await;
         let (tx, rx) = async_channel::bounded(1);
-        assert!(client.inbound_queues().ack_queue.set(tx).is_ok());
+        assert!(client.inbound_queues().ack_queue().set(tx).is_ok());
         let receipt = || {
             node_to_owned_ref(
                 &NodeBuilder::new("receipt")

@@ -300,9 +300,7 @@ fn authenticated_primary_identity(
 impl Client {
     /// Allocate flight coordination only when an account needs cold ADV discovery.
     fn adv_bootstrap(&self) -> &Arc<AdvBootstrapRegistry> {
-        self.inbound_queues()
-            .adv_bootstrap
-            .get_or_init(Arc::default)
+        self.inbound_queues().adv_bootstrap()
     }
 
     /// Read a fresh, signed primary key without publishing a trust change.

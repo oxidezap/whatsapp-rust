@@ -122,29 +122,53 @@ pub(crate) async fn yield_for_capacity(runtime: &dyn wacore::runtime::Runtime) {
     }
 }
 
+/// ACK delivery and cold ADV discovery are optional on a connected client.
+/// Share their lazy attachment so unused services do not enlarge its controller.
+#[derive(Default)]
+struct QueueTasks {
+    ack_queue: std::sync::OnceLock<async_channel::Sender<Box<QueuedAck>>>,
+    adv_bootstrap: std::sync::OnceLock<Arc<crate::prekeys::AdvBootstrapRegistry>>,
+}
+
 pub(crate) struct QueueBudgets {
-    pub ack_queue: std::sync::OnceLock<async_channel::Sender<Box<QueuedAck>>>,
+    tasks: std::sync::OnceLock<Box<QueueTasks>>,
     pub chat: Arc<ByteBudget>,
     pub ack: Arc<ByteBudget>,
     pub work: Arc<crate::flush_scope::FlushScope>,
-    pub adv_bootstrap: std::sync::OnceLock<Arc<crate::prekeys::AdvBootstrapRegistry>>,
     per_chat: Arc<BudgetRegistry>,
     pub draining: std::sync::atomic::AtomicBool,
 }
 impl Default for QueueBudgets {
     fn default() -> Self {
         Self {
-            ack_queue: std::sync::OnceLock::new(),
+            tasks: std::sync::OnceLock::new(),
             chat: Arc::new(ByteBudget::new(GLOBAL_CHAT_BYTES)),
             ack: Arc::new(ByteBudget::new(ACK_BYTES)),
             work: Arc::default(),
-            adv_bootstrap: std::sync::OnceLock::new(),
             per_chat: Arc::default(),
             draining: false.into(),
         }
     }
 }
 impl QueueBudgets {
+    /// Attach the ACK queue only when a stanza actually needs deferred delivery.
+    pub(crate) fn ack_queue(&self) -> &std::sync::OnceLock<async_channel::Sender<Box<QueuedAck>>> {
+        &self.tasks.get_or_init(Box::default).ack_queue
+    }
+
+    /// Inspect an existing ACK worker without allocating optional task state.
+    pub(crate) fn ack_sender(&self) -> Option<&async_channel::Sender<Box<QueuedAck>>> {
+        self.tasks.get().and_then(|tasks| tasks.ack_queue.get())
+    }
+
+    /// Attach account-flight coordination only when ADV discovery needs it.
+    pub(crate) fn adv_bootstrap(&self) -> &Arc<crate::prekeys::AdvBootstrapRegistry> {
+        self.tasks
+            .get_or_init(Box::default)
+            .adv_bootstrap
+            .get_or_init(Arc::default)
+    }
+
     /// Count queue controllers, live chat budgets and retained ADV flights, including empty map capacity.
     pub(crate) fn memory_stats(&self) -> (wacore::stats::CollectionStats, u64, u64) {
         use wacore::stats::HeapSize;
@@ -166,10 +190,13 @@ impl QueueBudgets {
             + size_of::<Self>()
             + 2 * (size_of::<ByteBudget>() + 2 * size_of::<usize>())
             + size_of::<crate::flush_scope::FlushScope>() + 2 * size_of::<usize>()
-            + self
-                .adv_bootstrap
-                .get()
-                .map_or(0, |registry| registry.retained_bytes());
+            + self.tasks.get().map_or(0, |tasks| {
+                size_of::<QueueTasks>()
+                    + tasks
+                        .adv_bootstrap
+                        .get()
+                        .map_or(0, |registry| registry.retained_bytes())
+            });
         (
             wacore::stats::CollectionStats::new(entries.len() as u64, registry_bytes as u64),
             GLOBAL_CHAT_BYTES.saturating_sub(self.chat.available()) as u64,
@@ -357,6 +384,38 @@ impl crate::client::Client {
 
 #[cfg(test)]
 mod tests {
+    /// Optional workers must not add inline words or allocate during stats reads.
+    #[test]
+    fn cold_queue_controller_keeps_its_pre_adv_footprint() {
+        // The pre-ADV controller had one ACK slot, four Arc pointers and a
+        // draining flag padded to pointer alignment. Keep that representation.
+        let legacy = size_of::<std::sync::OnceLock<async_channel::Sender<Box<QueuedAck>>>>()
+            + 5 * size_of::<usize>();
+        assert_eq!(size_of::<QueueBudgets>(), legacy);
+        let budgets = QueueBudgets::default();
+        let before = budgets.memory_stats().0.bytes;
+        assert!(budgets.ack_sender().is_none());
+        assert_eq!(budgets.memory_stats().0.bytes, before);
+        assert!(budgets.tasks.get().is_none());
+    }
+
+    /// Count the shared sidecar once, then count ADV ownership when it is used.
+    #[test]
+    fn optional_queue_task_allocations_remain_visible() {
+        let budgets = QueueBudgets::default();
+        let cold = budgets.memory_stats().0.bytes;
+        let (tx, _rx) = async_channel::bounded(1);
+        assert!(budgets.ack_queue().set(tx).is_ok());
+        let ack = budgets.memory_stats().0.bytes;
+        assert_eq!(ack - cold, size_of::<QueueTasks>() as u64);
+        let registry = budgets.adv_bootstrap();
+        assert_eq!(
+            budgets.memory_stats().0.bytes - ack,
+            registry.retained_bytes() as u64
+        );
+        assert!(budgets.ack_sender().is_some());
+    }
+
     use super::*;
     use crate::client::{ChatLane, QueuedChatMessage};
     use async_lock::Mutex;
