@@ -687,8 +687,19 @@ impl H264Depacketizer {
         marker: bool,
     ) -> Option<(u32, Vec<u8>)> {
         self.last_packet_picture = None;
+        // The next fragment of the NAL being rebuilt belongs to its picture, whatever its offset
+        // says: a large picture is paced out over more than `SAME_PICTURE_OFFSET_MS`, and a new
+        // picture cannot begin mid-NAL.
+        let continues_fu = self.fu_active
+            && seq == self.fu_next_seq
+            && nal_unit_type(payload) == NAL_TYPE_FU_A
+            && payload.get(1).is_some_and(|header| header & 0x80 == 0);
         if let Some(cur) = self.au_picture.as_mut() {
-            match cur.order(timestamp, offset_ms) {
+            let order = match cur.order(timestamp, offset_ms) {
+                PictureOrder::LaterShared if continues_fu => PictureOrder::Same,
+                order => order,
+            };
+            match order {
                 PictureOrder::Same => {
                     if (seq.wrapping_sub(cur.last_seq) as i16) > 0 {
                         cur.last_seq = seq;
@@ -1576,6 +1587,36 @@ mod tests {
 
     /// One-millisecond offset in RTP ticks.
     const MS: u32 = 90;
+
+    // A shared screen's pictures are large and paced out: the offset on one picture's fragments
+    // grew past `SAME_PICTURE_OFFSET_MS`, and each such fragment cut the NAL off.
+    #[test]
+    fn a_paced_out_picture_stays_one_access_unit() {
+        let mut d = H264Depacketizer::default();
+        let body = |byte: u8| vec![byte; 50];
+        let start = [&[0x7c, 0x85][..], &body(1)].concat();
+        let middle = [&[0x7c, 0x05][..], &body(2)].concat();
+        let end = [&[0x7c, 0x45][..], &body(3)].concat();
+        assert_eq!(
+            d.push_with_time_offset(1, 9000, Some(0), &start, false),
+            None
+        );
+        assert_eq!(
+            d.push_with_time_offset(2, 9000, Some(10), &middle, false),
+            None
+        );
+        let mut nal = vec![0x65];
+        nal.extend(body(1));
+        nal.extend(body(2));
+        nal.extend(body(3));
+        assert_eq!(
+            d.push_with_time_offset(3, 9000, Some(20), &end, true),
+            Some((9000, au_from_nals(&[nal])))
+        );
+        let stats = d.take_stats();
+        assert_eq!(stats.fu_orphan_fragments, 0);
+        assert_eq!(stats.access_units_shared_timestamp, 0);
+    }
 
     // The pattern an iPhone sender produced: a new picture on the previous picture's RTP
     // timestamp, its media time offset one frame interval later, its sequence numbers following.
