@@ -19,9 +19,13 @@ use crate::store::traits::SignalStore;
 type StoreIncarnation = [u8; 16];
 
 const IDENTITY_CHANGE_CAPACITY: usize = 1024;
+const PRIMARY_CHANGE: u64 = 1 << 63;
+// Zero fingerprints are reserved for journal metadata.
+const ACTIVE_PRIMARY: u64 = PRIMARY_CHANGE;
 
 /// Process-local account changes for historical sends. Fingerprint collisions
-/// only exclude an extra account; pruned history excludes every older token.
+/// only exclude an extra account. Historical sends require the full journal;
+/// bootstrap epochs separately retain the floor of lost primary changes.
 #[derive(Default)]
 pub struct IdentityContinuity {
     state: SyncMutex<IdentityChanges>,
@@ -34,6 +38,66 @@ struct IdentityChanges {
     active: usize,
     active_since: u64,
     users: VecDeque<(u64, u64)>,
+}
+
+// Zero tags are journal compaction metadata, never account fingerprints.
+fn continuity_fingerprint(hash: u64) -> u64 {
+    (hash & !PRIMARY_CHANGE).max(1)
+}
+
+impl IdentityChanges {
+    fn primary_floor(&self) -> u64 {
+        match self.users.front() {
+            Some((generation, 0)) => *generation,
+            None => self.floor,
+            _ => 0,
+        }
+    }
+
+    fn record(&mut self, generation: u64, fingerprint: u64) {
+        if fingerprint != ACTIVE_PRIMARY
+            && fingerprint & PRIMARY_CHANGE != 0
+            && self
+                .users
+                .iter()
+                .rev()
+                .take_while(|(at, _)| *at == generation)
+                .any(|(_, tag)| *tag == fingerprint)
+        {
+            return;
+        }
+        if self.users.is_empty() && self.floor != 0 {
+            // Preserve a global reset before adding the next scoped event.
+            self.users.push_front((self.floor, 0));
+        }
+        while self.users.len() >= IDENTITY_CHANGE_CAPACITY {
+            // Active primary guards must survive compaction until their Drop.
+            let Some(index) = self
+                .users
+                .iter()
+                .position(|(_, tag)| *tag != 0 && *tag != ACTIVE_PRIMARY)
+            else {
+                self.generation = u64::MAX;
+                return;
+            };
+            let Some((evicted, tag)) = self.users.remove(index) else {
+                self.generation = u64::MAX;
+                return;
+            };
+            let lost = evicted.saturating_add(1);
+            self.floor = self.floor.max(lost);
+            if tag & PRIMARY_CHANGE != 0 {
+                if let Some((floor, 0)) = self.users.front_mut() {
+                    *floor = (*floor).max(lost);
+                } else {
+                    // The next loop makes room for both metadata and event;
+                    // no insertion exceeds the existing journal bound.
+                    self.users.push_front((lost, 0));
+                }
+            }
+        }
+        self.users.push_back((generation, fingerprint));
+    }
 }
 
 impl IdentityContinuity {
@@ -58,28 +122,81 @@ impl IdentityContinuity {
         })
     }
 
+    /// Primary authentication includes active primary mutations, independently
+    /// of an unrelated companion guard that may have started much earlier.
+    pub fn primary_snapshot(&self) -> Option<u64> {
+        let state = self.state.lock().ok()?;
+        (state.generation != u64::MAX).then(|| {
+            state
+                .users
+                .iter()
+                .find(|(_, tag)| *tag == ACTIVE_PRIMARY)
+                .map_or(state.generation, |(generation, _)| {
+                    generation.saturating_sub(1)
+                })
+        })
+    }
+
     pub fn unchanged_for<'a>(
         &self,
         snapshot: Option<u64>,
         users: impl IntoIterator<Item = &'a str>,
     ) -> bool {
-        let Some(since) = snapshot else {
-            return false;
-        };
+        self.unchanged_for_inner(snapshot, users, false)
+    }
+
+    /// Bootstrap authentication is revoked by primary retirement, not by
+    /// ordinary companion-session cleanup in the same account.
+    pub fn unchanged_primary_for<'a>(
+        &self,
+        snapshot: Option<u64>,
+        users: impl IntoIterator<Item = &'a str>,
+    ) -> bool {
+        self.unchanged_for_inner(snapshot, users, true)
+    }
+
+    fn unchanged_for_inner<'a>(
+        &self,
+        snapshot: Option<u64>,
+        users: impl IntoIterator<Item = &'a str>,
+        primary_only: bool,
+    ) -> bool {
         let Ok(state) = self.state.lock() else {
             return false;
         };
-        if since < state.floor || since > state.generation || state.generation == u64::MAX {
+        Self::unchanged_in(&state, snapshot, users, primary_only)
+    }
+
+    fn unchanged_in<'a>(
+        state: &IdentityChanges,
+        snapshot: Option<u64>,
+        users: impl IntoIterator<Item = &'a str>,
+        primary_only: bool,
+    ) -> bool {
+        let Some(since) = snapshot else {
+            return false;
+        };
+        let floor = if primary_only {
+            state.primary_floor()
+        } else {
+            state.floor
+        };
+        if since < floor || since > state.generation || state.generation == u64::MAX {
             return false;
         }
         users.into_iter().all(|user| {
-            let fingerprint = user_fingerprint(user);
+            let fingerprint = continuity_fingerprint(user_fingerprint(user));
             state
                 .users
                 .iter()
                 .rev()
                 .take_while(|(generation, _)| *generation > since)
-                .all(|(_, changed)| *changed != fingerprint)
+                .all(|(_, changed)| {
+                    *changed == 0
+                        || *changed == ACTIVE_PRIMARY
+                        || (primary_only && changed & PRIMARY_CHANGE == 0)
+                        || changed & !PRIMARY_CHANGE != fingerprint
+                })
         })
     }
 
@@ -89,7 +206,32 @@ impl IdentityContinuity {
         &self,
         users: impl IntoIterator<Item = &'a str>,
     ) -> IdentityContinuityChange<'_> {
+        self.changing_inner(users, false)
+    }
+
+    /// Hold through reset persistence, including notifications with no prior key.
+    pub fn changing_primary<'a>(
+        &self,
+        users: impl IntoIterator<Item = &'a str>,
+    ) -> IdentityContinuityChange<'_> {
+        self.changing_inner(users, true)
+    }
+
+    fn changing_inner<'a>(
+        &self,
+        users: impl IntoIterator<Item = &'a str>,
+        primary: bool,
+    ) -> IdentityContinuityChange<'_> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        self.changing_in(&mut state, users, primary)
+    }
+
+    fn changing_in<'a>(
+        &self,
+        state: &mut IdentityChanges,
+        users: impl IntoIterator<Item = &'a str>,
+        primary: bool,
+    ) -> IdentityContinuityChange<'_> {
         if state.active == 0 {
             state.active_since = state.generation;
         }
@@ -97,27 +239,56 @@ impl IdentityContinuity {
         state.active += 1;
         let generation = state.generation;
         if generation == u64::MAX {
-            return IdentityContinuityChange(self);
+            return IdentityContinuityChange(self, primary.then_some(generation));
+        }
+        if primary {
+            state.record(generation, ACTIVE_PRIMARY);
         }
         let mut scoped = false;
         for user in users {
             scoped = true;
-            if state.users.len() == IDENTITY_CHANGE_CAPACITY
-                && let Some((evicted, _)) = state.users.pop_front()
-            {
-                // The evicted mutation is no longer examined, so the floor
-                // must move past its generation: a snapshot stamped exactly
-                // there can no longer prove that mutation left its accounts
-                // untouched.
-                state.floor = evicted.saturating_add(1);
-            }
-            state.users.push_back((generation, user_fingerprint(user)));
+            // Keep the shared cache fingerprint unchanged; only this journal
+            // reserves a class bit and zero metadata tag. Collisions fail closed.
+            let fingerprint = continuity_fingerprint(user_fingerprint(user))
+                | if primary { PRIMARY_CHANGE } else { 0 };
+            state.record(generation, fingerprint);
         }
         if !scoped {
             state.floor = generation;
-            state.users.clear();
+            state.users.retain(|(_, tag)| *tag == ACTIVE_PRIMARY);
+            if state.users.len() >= IDENTITY_CHANGE_CAPACITY {
+                state.generation = u64::MAX;
+            } else if !state.users.is_empty() {
+                state.users.push_front((generation, 0));
+            }
         }
-        IdentityContinuityChange(self)
+        IdentityContinuityChange(self, primary.then_some(generation))
+    }
+
+    /// Validate external authentication and exclude only this writer's own
+    /// retirement, atomically. A separately captured checkpoint could absorb a
+    /// reset between validation and registering the replacement.
+    fn checked_primary_change<'a>(
+        &'a self,
+        epoch: Option<u64>,
+        subjects: &[&str],
+        changed: &[&str],
+    ) -> Option<(Option<IdentityContinuityChange<'a>>, u64)> {
+        let mut state = self.state.lock().ok()?;
+        if !Self::unchanged_in(&state, epoch, subjects.iter().copied(), true) {
+            return None;
+        }
+        let change = (!changed.is_empty())
+            .then(|| self.changing_in(&mut state, changed.iter().copied(), true));
+        let generation = state.generation;
+        drop(state);
+        // Dropping a guard acquires state again, so do it only after unlocking.
+        if generation == u64::MAX {
+            drop(change);
+            None
+        } else {
+            Some((change, generation))
+        }
     }
 
     pub fn estimated_heap_bytes(&self) -> usize {
@@ -131,11 +302,19 @@ impl IdentityContinuity {
 }
 
 #[must_use]
-pub struct IdentityContinuityChange<'a>(&'a IdentityContinuity);
+pub struct IdentityContinuityChange<'a>(&'a IdentityContinuity, Option<u64>);
 
 impl Drop for IdentityContinuityChange<'_> {
     fn drop(&mut self) {
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(generation) = self.1
+            && let Some(index) = state
+                .users
+                .iter()
+                .position(|(at, tag)| *at == generation && *tag == ACTIVE_PRIMARY)
+        {
+            state.users.remove(index);
+        }
         state.active -= 1;
     }
 }
@@ -374,6 +553,17 @@ fn protocol_address_matches_user(address: &str, user: &str) -> bool {
 
 /// The user half of a protocol address, matching the prefix
 /// [`protocol_address_matches_user`] tests.
+fn is_companion_identity_address(address: &ProtocolAddress) -> bool {
+    u32::from(address.device_id()) != 0
+        || address.name().contains('@')
+            && address
+                .name()
+                .parse::<wacore_binary::Jid>()
+                .is_ok_and(|jid| {
+                    (jid.server.is_pn_family() || jid.server.is_lid_family()) && jid.device != 0
+                })
+}
+
 fn user_of_protocol_address(address: &str) -> &str {
     match address.find(['@', ':']) {
         Some(end) => &address[..end],
@@ -1876,6 +2066,39 @@ impl SignalStoreCache {
         data: &[u8],
         backend: &dyn SignalStore,
     ) -> Result<bool> {
+        self.persist_identity_and_alias_if_absent_or_equal(address, None, data, backend)
+            .await
+    }
+
+    /// Check both live account anchors inside the same cache/write transaction.
+    /// An owned caller must keep this future and alias membership alive until
+    /// storage acknowledges, even when its original requester is cancelled.
+    pub async fn persist_identity_and_alias_if_absent_or_equal(
+        &self,
+        address: &ProtocolAddress,
+        alias: Option<&ProtocolAddress>,
+        data: &[u8],
+        backend: &dyn SignalStore,
+    ) -> Result<bool> {
+        self.persist_identity_and_alias_in_epoch(
+            address,
+            alias,
+            data,
+            backend,
+            self.identity_continuity.primary_snapshot(),
+        )
+        .await
+    }
+
+    /// The token must precede authentication, including its network request.
+    pub async fn persist_identity_and_alias_in_epoch(
+        &self,
+        address: &ProtocolAddress,
+        alias: Option<&ProtocolAddress>,
+        data: &[u8],
+        backend: &dyn SignalStore,
+        epoch: Option<u64>,
+    ) -> Result<bool> {
         let key: [u8; 32] = data
             .try_into()
             .map_err(|_| anyhow::anyhow!("invalid bootstrap identity length"))?;
@@ -1884,14 +2107,37 @@ impl SignalStoreCache {
         // to an offline batch whose plaintext is not durable yet.
         let _flush = self.flush_lock.lock().await;
         let mut state = self.identities.lock().await;
-        let previous = match state.cache.get(address.as_str()) {
-            Some(cached) => cached.clone(),
-            None => backend
-                .load_identity(address.as_str())
-                .await?
-                .map(Arc::from),
-        };
-        if previous.as_deref().is_some_and(|known| known != data) {
+        let mut matches = true;
+        let mut observed = Vec::with_capacity(2);
+        for address in std::iter::once(address).chain(alias) {
+            let previous = match state.cache.get(address.as_str()) {
+                Some(cached) => cached.clone(),
+                None => backend
+                    .load_identity(address.as_str())
+                    .await?
+                    .map(Arc::from),
+            };
+            anyhow::ensure!(
+                previous.as_deref().is_none_or(|known| known.len() == 32),
+                "invalid stored bootstrap identity length"
+            );
+            matches &= previous.as_deref().is_none_or(|known| known == data);
+            // Preserve the observed absence/equality for change classification.
+            // An uncached first write must not retire another request's epoch.
+            observed.push((Arc::from(address.as_str()), previous));
+        }
+        for (address, previous) in observed {
+            state.cache.insert(address, previous);
+        }
+        if !matches
+            || !self.identity_continuity.unchanged_primary_for(
+                epoch,
+                std::iter::once(address)
+                    .chain(alias)
+                    .map(|address| user_of_protocol_address(address.name())),
+            )
+        {
+            state.evict_if_needed(self.max_entries);
             return Ok(false);
         }
         // Pin the authenticated anchor before storage can commit. Dropping its
@@ -1900,7 +2146,29 @@ impl SignalStoreCache {
         // and a later flush can retry persistence. Dirty entries are not evicted.
         let _change = self.identity_write_change(&state, address, data);
         state.put_dedup(address.as_str(), data);
-        backend.put_identity(address.as_str(), key).await?;
+        // A storage error can follow a commit. Retirement must run on either
+        // outcome before an authenticated but revoked anchor can be retried.
+        let write_result = backend.put_identity(address.as_str(), key).await;
+        if !self.identity_continuity.unchanged_primary_for(
+            epoch,
+            std::iter::once(address)
+                .chain(alias)
+                .map(|address| user_of_protocol_address(address.name())),
+        ) {
+            // The host acknowledged this address even if the reset only knew
+            // its alias. Retire our own write before releasing durable ordering;
+            // errors/cancellation retain a deletion intent, never the stale key.
+            let _retirement = self
+                .identity_continuity
+                .changing_primary([user_of_protocol_address(address.name())]);
+            state.delete(address.as_str());
+            backend.delete_identity(address.as_str()).await?;
+            state.deleted.remove(address.as_str());
+            state.evict_if_needed(self.max_entries);
+            write_result?;
+            return Ok(false);
+        }
+        write_result?;
         state.dirty.remove(address.as_str());
         state.deleted.remove(address.as_str());
         state.evict_if_needed(self.max_entries);
@@ -1919,13 +2187,43 @@ impl SignalStoreCache {
         backend: Arc<dyn SignalStore>,
         runtime: &dyn crate::runtime::Runtime,
     ) -> Result<bool> {
+        self.persist_identities_if_equal_owned(identities, data, backend, runtime, None)
+            .await
+    }
+
+    /// Carry authentication's pre-request epoch through the owned storage ACK.
+    pub async fn persist_identities_if_equal_in_epoch(
+        self: &Arc<Self>,
+        identities: &[(ProtocolAddress, Option<[u8; 32]>)],
+        data: &[u8; 32],
+        backend: Arc<dyn SignalStore>,
+        runtime: &dyn crate::runtime::Runtime,
+        epoch: Option<u64>,
+    ) -> Result<bool> {
+        self.persist_identities_if_equal_owned(identities, data, backend, runtime, Some(epoch))
+            .await
+    }
+
+    async fn persist_identities_if_equal_owned(
+        self: &Arc<Self>,
+        identities: &[(ProtocolAddress, Option<[u8; 32]>)],
+        data: &[u8; 32],
+        backend: Arc<dyn SignalStore>,
+        runtime: &dyn crate::runtime::Runtime,
+        authentication_epoch: Option<Option<u64>>,
+    ) -> Result<bool> {
         let cache = Arc::clone(self);
         let identities = identities.to_vec();
         let data = *data;
         let (send, receive) = futures::channel::oneshot::channel();
         runtime.spawn_detached(Box::pin(async move {
             let result = cache
-                .persist_identities_if_equal_inner(&identities, &data, backend.as_ref())
+                .persist_identities_if_equal_inner(
+                    &identities,
+                    &data,
+                    backend.as_ref(),
+                    authentication_epoch,
+                )
                 .await;
             let _ = send.send(result);
         }));
@@ -1940,6 +2238,7 @@ impl SignalStoreCache {
         identities: &[(ProtocolAddress, Option<[u8; 32]>)],
         data: &[u8; 32],
         backend: &dyn SignalStore,
+        authentication_epoch: Option<Option<u64>>,
     ) -> Result<bool> {
         let mut reloads = 0;
         let (_flush, mut state) = loop {
@@ -1983,6 +2282,35 @@ impl SignalStoreCache {
         if !matches_expected(&state) {
             return Ok(false);
         }
+        // Legacy cache CAS callers have no pre-request token and may queue
+        // behind a predecessor whose committed key they explicitly expect.
+        // An explicitly supplied unavailable epoch must never take this path.
+        let epoch =
+            authentication_epoch.unwrap_or_else(|| self.identity_continuity.primary_snapshot());
+        let subjects: Vec<_> = identities
+            .iter()
+            .map(|(address, _)| user_of_protocol_address(address.name()))
+            .collect();
+        let changed_primary: Vec<_> = identities
+            .iter()
+            .filter(|(address, previous)| {
+                previous.is_some_and(|old| old != *data) && !is_companion_identity_address(address)
+            })
+            .map(|(address, _)| user_of_protocol_address(address.name()))
+            .collect();
+        let Some((_primary_change, write_epoch)) =
+            self.identity_continuity
+                .checked_primary_change(epoch, &subjects, &changed_primary)
+        else {
+            return Ok(false);
+        };
+        let _companion_changes: Vec<_> = identities
+            .iter()
+            .filter(|(address, previous)| {
+                previous.is_some_and(|old| old != *data) && is_companion_identity_address(address)
+            })
+            .map(|(address, _)| self.identity_address_change(address))
+            .collect();
         // Pin every old anchor before an adapter can partially commit. A failed
         // write must not make cache eviction turn an unfinished rotation into
         // an unchanged key. A later flush may restore these old anchors safely.
@@ -1993,21 +2321,68 @@ impl SignalStoreCache {
                 state.delete(address.as_str());
             }
         }
-        let _changes: Vec<_> = identities
+        let pinned_versions: Vec<_> = identities
             .iter()
-            .filter_map(|(address, _)| self.identity_write_change(&state, address, data))
+            .map(|(address, _)| {
+                state
+                    .cache
+                    .get(address.as_str())
+                    .and_then(|value| value.as_ref().map(Arc::downgrade))
+            })
             .collect();
         drop(state);
+        let mut write_result = Ok(());
         for (address, _) in identities {
-            backend.put_identity(address.as_str(), *data).await?;
+            if let Err(error) = backend.put_identity(address.as_str(), *data).await {
+                write_result = Err(error);
+                break;
+            }
         }
         let mut state = self.identities.lock().await;
         // Signal saves/deletes may have changed trust while storage was busy.
         // Their dirty cache entries must survive for the next ordered flush;
         // this verified replacement must not publish over the newer anchors.
-        if !matches_expected(&state) {
+        let epoch_current = self
+            .identity_continuity
+            .unchanged_primary_for(Some(write_epoch), subjects.iter().copied());
+        if !matches_expected(&state) || !epoch_current {
+            if !epoch_current {
+                // Retire only anchors still owned by this transaction. An ABA
+                // Signal write has a new allocation and dirty intent; preserve
+                // that newer state rather than restoring captured old bytes.
+                let retire: Vec<_> = identities
+                    .iter()
+                    .zip(&pinned_versions)
+                    .filter(|((address, _), version)| {
+                        match (version, state.cache.get(address.as_str())) {
+                            (Some(version), Some(Some(current))) => {
+                                same_flush_version(current, version)
+                            }
+                            (None, Some(None)) => true,
+                            _ => false,
+                        }
+                    })
+                    .map(|((address, _), _)| address)
+                    .collect();
+                let _retirement = (!retire.is_empty()).then(|| {
+                    self.identity_continuity.changing_primary(
+                        retire
+                            .iter()
+                            .map(|address| user_of_protocol_address(address.name())),
+                    )
+                });
+                for address in &retire {
+                    state.delete(address.as_str());
+                }
+                for address in retire {
+                    backend.delete_identity(address.as_str()).await?;
+                    state.deleted.remove(address.as_str());
+                }
+            }
+            write_result?;
             return Ok(false);
         }
+        write_result?;
         for (address, _) in identities {
             state.put_dedup(address.as_str(), data);
             state.dirty.remove(address.as_str());
@@ -2048,10 +2423,40 @@ impl SignalStoreCache {
 
     pub async fn delete_identity(&self, address: &ProtocolAddress) {
         let mut state = self.identities.lock().await;
-        let _change = self
-            .identity_continuity
-            .changing([user_of_protocol_address(address.name())]);
+        let _change = self.identity_address_change(address);
         state.delete(address.as_str());
+    }
+
+    /// Move an unchanged primary between aliases without retiring its authentication.
+    /// The caller must hold both session guards and prove current reciprocal alias
+    /// ownership under its mapping guard. Cache eviction is not proof of absence.
+    pub async fn move_identity_to_known_alias(
+        &self,
+        from: &ProtocolAddress,
+        to: &ProtocolAddress,
+        expected: &[u8; 32],
+    ) -> bool {
+        let mut state = self.identities.lock().await;
+        if from == to
+            || state.cache.get(from.as_str()).and_then(Option::as_deref)
+                != Some(expected.as_slice())
+            || state.cache.get(to.as_str()).is_none()
+            || state
+                .cache
+                .get(to.as_str())
+                .and_then(Option::as_deref)
+                .is_some_and(|key| key != expected)
+        {
+            return false;
+        }
+        let _change = self.identity_continuity.changing([
+            user_of_protocol_address(from.name()),
+            user_of_protocol_address(to.name()),
+        ]);
+        state.put_dedup(to.as_str(), expected);
+        state.delete(from.as_str());
+        state.evict_if_needed(self.max_entries);
+        true
     }
 
     fn identity_write_change(
@@ -2065,10 +2470,18 @@ impl SignalStoreCache {
             Some(Some(previous)) if previous.as_ref() == data => None,
             // An uncached write cannot prove this is a first identity. Normal
             // Signal saves load the old row before writing, including absence.
-            _ => Some(
-                self.identity_continuity
-                    .changing([user_of_protocol_address(address.name())]),
-            ),
+            _ => Some(self.identity_address_change(address)),
+        }
+    }
+
+    fn identity_address_change(&self, address: &ProtocolAddress) -> IdentityContinuityChange<'_> {
+        let users = [user_of_protocol_address(address.name())];
+        // WhatsApp JIDs encode the device in the name while Signal's device
+        // field remains zero. Unknown names retain conservative retirement.
+        if is_companion_identity_address(address) {
+            self.identity_continuity.changing(users)
+        } else {
+            self.identity_continuity.changing_primary(users)
         }
     }
 
@@ -6643,6 +7056,9 @@ mod cold_read_race_tests {
         pause_identity_write: AtomicBool,
         pending_identity: SyncMutex<Option<[u8; 32]>>,
         identity_write_release: async_lock::Barrier,
+        fail_identity_delete: AtomicBool,
+        pause_identity_delete: AtomicBool,
+        identity_delete_release: async_lock::Barrier,
     }
 
     impl GatedColdRead {
@@ -6658,6 +7074,9 @@ mod cold_read_race_tests {
                 pause_identity_write: AtomicBool::new(false),
                 pending_identity: SyncMutex::new(None),
                 identity_write_release: async_lock::Barrier::new(2),
+                fail_identity_delete: AtomicBool::new(false),
+                pause_identity_delete: AtomicBool::new(false),
+                identity_delete_release: async_lock::Barrier::new(2),
             }
         }
 
@@ -6719,6 +7138,12 @@ mod cold_read_race_tests {
         }
 
         async fn delete_identity(&self, _: &str) -> StoreResult<()> {
+            if self.pause_identity_delete.load(Ordering::Relaxed) {
+                self.identity_delete_release.wait().await;
+            }
+            if self.fail_identity_delete.load(Ordering::Relaxed) {
+                return Err(std::io::Error::other("synthetic identity deletion failure").into());
+            }
             *self.identity.lock().unwrap_or_else(|p| p.into_inner()) = None;
             Ok(())
         }
@@ -6758,6 +7183,319 @@ mod cold_read_race_tests {
         }
         async fn delete_sender_key(&self, _: &str) -> StoreResult<()> {
             unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn adv_review_round4_verified_cas_rechecks_retirement_after_ack() {
+        for mutation in ["none", "unrelated", "aba", "retire"] {
+            let backend = Arc::new(GatedColdRead::new(0));
+            let cache = Arc::new(SignalStoreCache::new());
+            let address = ProtocolAddress::new("12025550111", 0.into());
+            assert!(
+                cache
+                    .persist_identity_if_absent_or_equal(&address, &[1; 32], backend.as_ref())
+                    .await
+                    .unwrap()
+            );
+            let epoch = cache.identity_continuity.primary_snapshot();
+            backend.pause_identity_write.store(true, Ordering::Relaxed);
+            let expected = [(address.clone(), Some([1; 32]))];
+            let mut write = Box::pin(cache.persist_identities_if_equal_in_epoch(
+                &expected,
+                &[2; 32],
+                backend.clone(),
+                &IdentityTestRuntime,
+                epoch,
+            ));
+            assert!(futures::poll!(write.as_mut()).is_pending());
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while backend.pending_identity.lock().unwrap().is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            match mutation {
+                "aba" => {
+                    cache.put_identity(&address, &[3; 32]).await;
+                    cache.put_identity(&address, &[1; 32]).await;
+                }
+                "retire" => drop(cache.identity_continuity.changing_primary(["12025550111"])),
+                "unrelated" => drop(cache.identity_continuity.changing_primary(["12025550112"])),
+                _ => {}
+            }
+            backend.pause_identity_write.store(false, Ordering::Relaxed);
+            backend.identity_write_release.wait().await;
+            let accepted = write.await.unwrap();
+            assert_eq!(
+                accepted,
+                matches!(mutation, "none" | "unrelated"),
+                "{mutation}"
+            );
+            cache.flush(backend.as_ref()).await.unwrap();
+            cache.clear_after_flush().await;
+            let expected = match mutation {
+                "aba" => Some([1; 32]),
+                "retire" => None,
+                _ => Some([2; 32]),
+            };
+            assert_eq!(
+                backend.load_identity(address.as_str()).await.unwrap(),
+                expected,
+                "{mutation}"
+            );
+            assert_eq!(
+                cache
+                    .get_identity(&address, backend.as_ref())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                expected.as_ref().map(|key| key.as_slice()),
+                "{mutation}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn adv_review_round4_explicitly_unavailable_epoch_cannot_use_legacy_cas() {
+        let backend = Arc::new(GatedColdRead::new(0));
+        let cache = Arc::new(SignalStoreCache::new());
+        let address = ProtocolAddress::new("12025550114", 0.into());
+        assert!(
+            cache
+                .persist_identity_if_absent_or_equal(&address, &[1; 32], backend.as_ref())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !cache
+                .persist_identities_if_equal_in_epoch(
+                    &[(address.clone(), Some([1; 32]))],
+                    &[2; 32],
+                    backend.clone(),
+                    &IdentityTestRuntime,
+                    None
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            backend.load_identity(address.as_str()).await.unwrap(),
+            Some([1; 32])
+        );
+        assert_eq!(
+            cache
+                .get_identity(&address, backend.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            &[1; 32]
+        );
+    }
+
+    #[tokio::test]
+    async fn adv_review_round5_retired_bootstrap_is_removed_after_post_commit_error() {
+        for retire in [false, true] {
+            let backend = GatedColdRead::new(0);
+            let cache = SignalStoreCache::new();
+            let address = ProtocolAddress::new("12025550116", 0.into());
+            backend.pause_identity_write.store(true, Ordering::Relaxed);
+            backend
+                .fail_identity_after_write
+                .store(true, Ordering::Relaxed);
+            let mut write =
+                Box::pin(cache.persist_identity_if_absent_or_equal(&address, &[1; 32], &backend));
+            assert!(futures::poll!(write.as_mut()).is_pending());
+            assert_eq!(*backend.pending_identity.lock().unwrap(), Some([1; 32]));
+            if retire {
+                drop(cache.identity_continuity.changing_primary([]));
+            }
+            backend.pause_identity_write.store(false, Ordering::Relaxed);
+            let (result, _) = futures::join!(write, backend.identity_write_release.wait());
+            assert!(
+                result.is_err(),
+                "the original storage error must remain observable"
+            );
+            let expected = (!retire).then_some([1; 32]);
+            assert_eq!(
+                cache
+                    .get_identity(&address, &backend)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                expected.as_ref().map(|key| key.as_slice()),
+                "retired={retire}"
+            );
+            assert_eq!(
+                backend.load_identity(address.as_str()).await.unwrap(),
+                expected
+            );
+            backend
+                .fail_identity_after_write
+                .store(false, Ordering::Relaxed);
+            cache.flush(&backend).await.unwrap();
+            cache.clear_after_flush().await;
+            assert_eq!(
+                cache
+                    .get_identity(&address, &backend)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                expected.as_ref().map(|key| key.as_slice())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn adv_review_round4_verified_cas_rejection_keeps_deletion_owned() {
+        for cancel in [false, true] {
+            let backend = Arc::new(GatedColdRead::new(0));
+            let cache = Arc::new(SignalStoreCache::new());
+            let address = ProtocolAddress::new("12025550113", 0.into());
+            assert!(
+                cache
+                    .persist_identity_if_absent_or_equal(&address, &[1; 32], backend.as_ref())
+                    .await
+                    .unwrap()
+            );
+            let epoch = cache.identity_continuity.primary_snapshot();
+            backend.pause_identity_write.store(true, Ordering::Relaxed);
+            let expected = [(address.clone(), Some([1; 32]))];
+            let mut write = Box::pin(cache.persist_identities_if_equal_in_epoch(
+                &expected,
+                &[2; 32],
+                backend.clone(),
+                &IdentityTestRuntime,
+                epoch,
+            ));
+            assert!(futures::poll!(write.as_mut()).is_pending());
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while backend.pending_identity.lock().unwrap().is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            drop(cache.identity_continuity.changing_primary(["12025550113"]));
+            backend
+                .fail_identity_delete
+                .store(!cancel, Ordering::Relaxed);
+            backend
+                .pause_identity_delete
+                .store(cancel, Ordering::Relaxed);
+            backend.pause_identity_write.store(false, Ordering::Relaxed);
+            backend.identity_write_release.wait().await;
+            if cancel {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while cache.identities.try_lock().is_some() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                drop(write);
+                backend
+                    .pause_identity_delete
+                    .store(false, Ordering::Relaxed);
+                backend.identity_delete_release.wait().await;
+            } else {
+                assert!(write.await.is_err());
+                let state = cache.identities.lock().await;
+                assert!(state.deleted.contains(address.as_str()));
+                assert!(
+                    state
+                        .cache
+                        .get(address.as_str())
+                        .is_some_and(Option::is_none)
+                );
+                drop(state);
+                backend.fail_identity_delete.store(false, Ordering::Relaxed);
+            }
+            cache.flush(backend.as_ref()).await.unwrap();
+            cache.clear_after_flush().await;
+            assert_eq!(backend.load_identity(address.as_str()).await.unwrap(), None);
+            assert!(
+                cache
+                    .get_identity(&address, backend.as_ref())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn adv_review_round5_retired_rotation_is_removed_after_post_commit_error() {
+        for retire in [false, true] {
+            let backend = Arc::new(GatedColdRead::new(0));
+            let cache = Arc::new(SignalStoreCache::new());
+            let address = ProtocolAddress::new("12025550117", 0.into());
+            assert!(
+                cache
+                    .persist_identity_if_absent_or_equal(&address, &[1; 32], backend.as_ref())
+                    .await
+                    .unwrap()
+            );
+            let epoch = cache.identity_continuity.primary_snapshot();
+            backend.pause_identity_write.store(true, Ordering::Relaxed);
+            backend
+                .fail_identity_after_write
+                .store(true, Ordering::Relaxed);
+            let expected = [(address.clone(), Some([1; 32]))];
+            let mut write = Box::pin(cache.persist_identities_if_equal_in_epoch(
+                &expected,
+                &[2; 32],
+                backend.clone(),
+                &IdentityTestRuntime,
+                epoch,
+            ));
+            assert!(futures::poll!(write.as_mut()).is_pending());
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while backend.pending_identity.lock().unwrap().is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if retire {
+                drop(cache.identity_continuity.changing_primary([]));
+            }
+            backend.pause_identity_write.store(false, Ordering::Relaxed);
+            backend.identity_write_release.wait().await;
+            assert!(write.await.is_err());
+            let expected = (!retire).then_some([1; 32]);
+            assert_eq!(
+                cache
+                    .get_identity(&address, backend.as_ref())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                expected.as_ref().map(|key| key.as_slice()),
+                "retired={retire}"
+            );
+            assert_eq!(
+                backend.load_identity(address.as_str()).await.unwrap(),
+                (!retire).then_some([2; 32])
+            );
+            backend
+                .fail_identity_after_write
+                .store(false, Ordering::Relaxed);
+            cache.flush(backend.as_ref()).await.unwrap();
+            cache.clear_after_flush().await;
+            assert_eq!(
+                backend.load_identity(address.as_str()).await.unwrap(),
+                expected
+            );
+            assert_eq!(
+                cache
+                    .get_identity(&address, backend.as_ref())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                expected.as_ref().map(|key| key.as_slice())
+            );
         }
     }
 
@@ -7124,6 +7862,84 @@ mod cold_read_race_tests {
             .get_sender_chain_key()
             .expect("sender chain")
             .index()
+    }
+
+    #[tokio::test]
+    async fn adv_review_round3_rejected_ack_retires_the_written_address() {
+        let cache = SignalStoreCache::new();
+        let backend = GatedColdRead::new(0);
+        backend.pause_identity_write.store(true, Ordering::Relaxed);
+        let primary = ProtocolAddress::new("12025550173@s.whatsapp.net", 0.into());
+        let alias = ProtocolAddress::new("100000000000273@lid", 0.into());
+        let epoch = cache.identity_continuity.snapshot();
+        let mut write = Box::pin(cache.persist_identity_and_alias_in_epoch(
+            &primary,
+            Some(&alias),
+            &[1; 32],
+            &backend,
+            epoch,
+        ));
+        assert!(futures::poll!(write.as_mut()).is_pending());
+        assert_eq!(*backend.pending_identity.lock().unwrap(), Some([1; 32]));
+        drop(
+            cache
+                .identity_continuity
+                .changing_primary(["100000000000273"]),
+        );
+        let (result, _) = futures::join!(write, backend.identity_write_release.wait());
+        assert!(!result.unwrap());
+        assert_eq!(cache.try_get_identity(&primary), Some(None));
+        assert!(backend.identity.lock().unwrap().is_none());
+        backend.pause_identity_write.store(false, Ordering::Relaxed);
+        cache.flush(&backend).await.unwrap();
+        assert!(backend.identity.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn adv_review_round3_rejected_ack_keeps_delete_intent_on_error_or_cancel() {
+        for cancel in [false, true] {
+            let cache = SignalStoreCache::new();
+            let backend = GatedColdRead::new(0);
+            backend.pause_identity_write.store(true, Ordering::Relaxed);
+            backend
+                .fail_identity_delete
+                .store(!cancel, Ordering::Relaxed);
+            backend
+                .pause_identity_delete
+                .store(cancel, Ordering::Relaxed);
+            let primary = ProtocolAddress::new("12025550176@s.whatsapp.net", 0.into());
+            let epoch = cache.identity_continuity.snapshot();
+            let mut write = Box::pin(
+                cache
+                    .persist_identity_and_alias_in_epoch(&primary, None, &[1; 32], &backend, epoch),
+            );
+            assert!(futures::poll!(write.as_mut()).is_pending());
+            drop(cache.identity_continuity.changing_primary(["12025550176"]));
+            backend.identity_write_release.wait().await;
+            if cancel {
+                assert!(futures::poll!(write.as_mut()).is_pending());
+                drop(write);
+            } else {
+                assert!(write.await.is_err());
+            }
+            assert_eq!(cache.try_get_identity(&primary), Some(None));
+            assert_eq!(*backend.identity.lock().unwrap(), Some([1; 32]));
+            assert!(
+                cache
+                    .identities
+                    .lock()
+                    .await
+                    .deleted
+                    .contains(primary.as_str())
+            );
+            backend.fail_identity_delete.store(false, Ordering::Relaxed);
+            backend
+                .pause_identity_delete
+                .store(false, Ordering::Relaxed);
+            backend.pause_identity_write.store(false, Ordering::Relaxed);
+            cache.flush(&backend).await.unwrap();
+            assert!(backend.identity.lock().unwrap().is_none());
+        }
     }
 
     fn signal_address(user: &str) -> ProtocolAddress {
@@ -8528,6 +9344,355 @@ mod durability_chaos_tests;
 #[cfg(test)]
 mod identity_continuity_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn known_alias_transfer_requires_live_cached_anchors() {
+        for case in [
+            "absent",
+            "equal",
+            "conflict_to",
+            "conflict_from",
+            "evicted_from",
+            "evicted_to",
+            "same_address",
+        ] {
+            let cache = SignalStoreCache::new();
+            let backend = crate::store::in_memory::InMemoryBackend::new();
+            let from = ProtocolAddress::new("12025550171@s.whatsapp.net", 0.into());
+            let to = ProtocolAddress::new("100000000000271@lid", 0.into());
+            backend.put_identity(from.as_str(), [1; 32]).await.unwrap();
+            if case == "equal" || case == "conflict_to" {
+                backend
+                    .put_identity(to.as_str(), if case == "equal" { [1; 32] } else { [2; 32] })
+                    .await
+                    .unwrap();
+            }
+            cache.get_identity(&from, &backend).await.unwrap();
+            cache.get_identity(&to, &backend).await.unwrap();
+            if case == "conflict_from" {
+                cache.put_identity(&from, &[2; 32]).await;
+            }
+            if case == "evicted_from" || case == "evicted_to" {
+                let address = if case == "evicted_from" { &from } else { &to };
+                cache.identities.lock().await.cache.remove(address.as_str());
+            }
+            let previous_from = cache.try_get_identity(&from);
+            let previous_to = cache.try_get_identity(&to);
+            let epoch = cache.identity_continuity.snapshot();
+            let destination = if case == "same_address" { &from } else { &to };
+            let moved = cache
+                .move_identity_to_known_alias(&from, destination, &[1; 32])
+                .await;
+            assert_eq!(moved, case == "absent" || case == "equal", "{case}");
+            if moved {
+                assert_eq!(cache.try_get_identity(&from), Some(None));
+                assert_eq!(
+                    cache.try_get_identity(&to).unwrap().unwrap().as_ref(),
+                    &[1; 32]
+                );
+                assert!(
+                    cache
+                        .identity_continuity
+                        .unchanged_primary_for(epoch, ["12025550171", "100000000000271"])
+                );
+                assert!(
+                    !cache
+                        .identity_continuity
+                        .unchanged_for(epoch, ["12025550171", "100000000000271"])
+                );
+                cache.flush(&backend).await.unwrap();
+                assert!(
+                    backend
+                        .load_identity(from.as_str())
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    backend.load_identity(to.as_str()).await.unwrap(),
+                    Some([1; 32])
+                );
+                assert!(
+                    cache
+                        .persist_identity_and_alias_in_epoch(
+                            &to,
+                            Some(&from),
+                            &[1; 32],
+                            &backend,
+                            epoch
+                        )
+                        .await
+                        .unwrap()
+                );
+                cache.delete_identity(&to).await;
+                assert!(
+                    !cache
+                        .persist_identity_and_alias_in_epoch(
+                            &to,
+                            Some(&from),
+                            &[1; 32],
+                            &backend,
+                            epoch
+                        )
+                        .await
+                        .unwrap()
+                );
+            } else {
+                assert_eq!(cache.try_get_identity(&from), previous_from, "{case}");
+                assert_eq!(cache.try_get_identity(&to), previous_to, "{case}");
+                assert!(
+                    cache
+                        .identity_continuity
+                        .unchanged_for(epoch, ["12025550171", "100000000000271"])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn adv_review_round3_companion_overflow_keeps_primary_history_distinct() {
+        let continuity = IdentityContinuity::default();
+        let before = continuity.snapshot();
+        for _ in 0..IDENTITY_CHANGE_CAPACITY + 2 {
+            drop(continuity.changing(["companion_only"]));
+        }
+        assert!(continuity.unchanged_primary_for(before, ["peer"]));
+        assert!(!continuity.unchanged_for(before, ["peer"]));
+        let before_retirement = continuity.snapshot();
+        drop(continuity.changing_primary(["peer"]));
+        for _ in 0..IDENTITY_CHANGE_CAPACITY + 2 {
+            drop(continuity.changing(["companion_only"]));
+        }
+        assert!(!continuity.unchanged_primary_for(before_retirement, ["peer"]));
+        let before_reset = continuity.snapshot();
+        drop(continuity.changing_primary([]));
+        assert!(!continuity.unchanged_primary_for(before_reset, ["unrelated"]));
+        let after_reset = continuity.snapshot();
+        for _ in 0..IDENTITY_CHANGE_CAPACITY + 2 {
+            drop(continuity.changing(["companion_only"]));
+        }
+        assert!(!continuity.unchanged_primary_for(before_reset, ["unrelated"]));
+        assert!(continuity.unchanged_primary_for(after_reset, ["unrelated"]));
+    }
+
+    #[test]
+    fn adv_review_round3_primary_compaction_preserves_bounds_and_active_epochs() {
+        assert_eq!(continuity_fingerprint(0), 1);
+        assert_eq!(continuity_fingerprint(PRIMARY_CHANGE), 1);
+        for primary_position in [0, 1, IDENTITY_CHANGE_CAPACITY - 1] {
+            let mut state = IdentityChanges::default();
+            for position in 0..IDENTITY_CHANGE_CAPACITY * 4 {
+                state.generation = position as u64 + 1;
+                state.record(
+                    state.generation,
+                    if position == primary_position {
+                        PRIMARY_CHANGE | 1
+                    } else {
+                        1
+                    },
+                );
+                assert!(state.users.len() <= IDENTITY_CHANGE_CAPACITY);
+                let markers = state.users.iter().filter(|(_, tag)| *tag == 0).count();
+                assert!(markers <= 1);
+                assert!(markers == 0 || state.users.front().unwrap().1 == 0);
+            }
+            assert_eq!(state.primary_floor(), primary_position as u64 + 2);
+            assert!(state.floor >= state.primary_floor());
+        }
+        for primary in [false, true] {
+            let continuity = IdentityContinuity::default();
+            let active = if primary {
+                continuity.changing_primary(["peer", "alias"])
+            } else {
+                continuity.changing(["peer", "alias"])
+            };
+            let during = continuity.snapshot();
+            for _ in 0..IDENTITY_CHANGE_CAPACITY * 3 {
+                drop(continuity.changing(["other"]));
+            }
+            assert_eq!(
+                continuity.unchanged_primary_for(during, ["peer", "alias"]),
+                !primary
+            );
+            assert!(!continuity.unchanged_for(during, ["peer"]));
+            drop(active);
+            assert_eq!(
+                continuity.unchanged_primary_for(during, ["peer", "alias"]),
+                !primary
+            );
+            assert!(continuity.unchanged_primary_for(continuity.snapshot(), ["peer"]));
+        }
+    }
+
+    #[test]
+    fn primary_epochs_ignore_companion_cleanup_but_not_retirement_or_lost_history() {
+        let continuity = IdentityContinuity::default();
+        let original = continuity.snapshot();
+        let companion = continuity.changing(["peer"]);
+        assert!(continuity.unchanged_primary_for(original, ["peer"]));
+        assert!(!continuity.unchanged_for(original, ["peer"]));
+        let primary = continuity.changing_primary(["peer", "alias"]);
+        assert!(!continuity.unchanged_primary_for(original, ["peer"]));
+        assert!(!continuity.unchanged_primary_for(original, ["alias"]));
+        assert!(continuity.unchanged_primary_for(original, ["unrelated"]));
+        drop(primary);
+        drop(companion);
+        let current = continuity.snapshot();
+        assert!(continuity.unchanged_primary_for(current, ["peer"]));
+        for _ in 0..IDENTITY_CHANGE_CAPACITY {
+            drop(continuity.changing(["other"]));
+        }
+        assert!(!continuity.unchanged_primary_for(original, ["unrelated"]));
+        drop(continuity.changing_primary([]));
+        assert!(!continuity.unchanged_primary_for(current, ["unrelated"]));
+        assert!(!IdentityContinuity::unavailable().unchanged_primary_for(None, ["peer"]));
+    }
+
+    #[tokio::test]
+    async fn adv_review_round4_fresh_bootstrap_ignores_completed_primary_retirement_under_companion()
+     {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let primary = ProtocolAddress::new("12025550106", 0.into());
+        let _companion = cache.identity_continuity.changing(["12025550106"]);
+        drop(cache.identity_continuity.changing_primary(["12025550106"]));
+        assert!(
+            cache
+                .persist_identity_if_absent_or_equal(&primary, &[1; 32], &backend)
+                .await
+                .unwrap(),
+            "a newly authenticated bootstrap must not inherit a completed retirement"
+        );
+        assert_eq!(
+            backend.load_identity(primary.as_str()).await.unwrap(),
+            Some([1; 32])
+        );
+        let earlier = cache.identity_continuity.changing_primary(["12025550106"]);
+        let later = cache.identity_continuity.changing_primary(["12025550106"]);
+        drop(earlier);
+        for _ in 0..IDENTITY_CHANGE_CAPACITY * 2 {
+            drop(cache.identity_continuity.changing(["unrelated"]));
+        }
+        assert!(
+            !cache
+                .persist_identity_if_absent_or_equal(&primary, &[1; 32], &backend)
+                .await
+                .unwrap(),
+            "the remaining active primary guard must revoke authentication after compaction"
+        );
+        drop(later);
+        assert!(
+            cache
+                .persist_identity_if_absent_or_equal(&primary, &[1; 32], &backend)
+                .await
+                .unwrap()
+        );
+        let reset = cache.identity_continuity.changing_primary([]);
+        assert!(
+            !cache
+                .persist_identity_if_absent_or_equal(&primary, &[1; 32], &backend)
+                .await
+                .unwrap()
+        );
+        drop(reset);
+        assert!(
+            cache
+                .persist_identity_if_absent_or_equal(&primary, &[1; 32], &backend)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn companion_cleanup_does_not_revoke_primary_bootstrap_authentication() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let primary = ProtocolAddress::new("12025550134", 0.into());
+        let companion = ProtocolAddress::new("12025550134", 7.into());
+        let epoch = cache.identity_continuity.snapshot();
+        cache.delete_identity(&companion).await;
+        assert!(
+            cache
+                .persist_identity_and_alias_in_epoch(&primary, None, &[1; 32], &backend, epoch,)
+                .await
+                .unwrap()
+        );
+        // The same pre-IQ token remains valid for equal authentication after
+        // the first cold write; observing absence must not look like retirement.
+        cache.clear_after_flush().await;
+        assert!(
+            cache
+                .persist_identity_and_alias_in_epoch(&primary, None, &[1; 32], &backend, epoch,)
+                .await
+                .unwrap()
+        );
+        let epoch = cache.identity_continuity.snapshot();
+        cache.delete_identity(&primary).await;
+        assert!(
+            !cache
+                .persist_identity_and_alias_in_epoch(&primary, None, &[1; 32], &backend, epoch,)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn review_jid_companion_cleanup_keeps_primary_authentication() {
+        use crate::types::jid::JidExt;
+        use wacore_binary::{Jid, Server};
+
+        for server in [Server::Pn, Server::Lid, Server::Hosted, Server::HostedLid] {
+            let cache = SignalStoreCache::new();
+            let backend = crate::store::in_memory::InMemoryBackend::new();
+            let user = "12025550135";
+            let primary = Jid::new(user, server).with_device(0).to_protocol_address();
+            let device = if matches!(server, Server::Hosted | Server::HostedLid) {
+                99
+            } else {
+                7
+            };
+            let companion = Jid::new(user, server)
+                .with_device(device)
+                .to_protocol_address();
+            assert_eq!(u32::from(companion.device_id()), 0);
+            let epoch = cache.identity_continuity.snapshot();
+            cache.delete_identity(&companion).await;
+            assert!(
+                cache
+                    .persist_identity_and_alias_in_epoch(&primary, None, &[1; 32], &backend, epoch,)
+                    .await
+                    .unwrap(),
+                "companion cleanup retired primary authentication for {server:?}"
+            );
+            let epoch = cache.identity_continuity.snapshot();
+            cache.delete_identity(&primary).await;
+            assert!(
+                !cache
+                    .persist_identity_and_alias_in_epoch(&primary, None, &[1; 32], &backend, epoch,)
+                    .await
+                    .unwrap(),
+                "primary retirement must still fence earlier authentication"
+            );
+        }
+        for name in [
+            "12025550135:bad@c.us",
+            "12025550135:7",
+            "12025550135:7@unknown.invalid",
+            "unknown",
+        ] {
+            let cache = SignalStoreCache::new();
+            let epoch = cache.identity_continuity.snapshot();
+            cache
+                .delete_identity(&ProtocolAddress::new(name, 0.into()))
+                .await;
+            assert!(
+                !cache
+                    .identity_continuity
+                    .unchanged_primary_for(epoch, [user_of_protocol_address(name)]),
+                "unknown address formats must retain primary retirement"
+            );
+        }
+    }
 
     #[test]
     fn overlapping_changes_and_cancelled_snapshots_fail_closed() {

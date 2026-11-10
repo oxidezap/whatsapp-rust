@@ -115,6 +115,20 @@ struct BatchRecordOutcome {
     usync_phones: Vec<String>,
 }
 
+#[derive(Default)]
+struct PersistedMappingBatch {
+    storage: Vec<LidPnMappingEntry>,
+    migration_flags: Vec<bool>,
+    count: usize,
+}
+
+#[derive(Clone, Copy)]
+struct MappingLearningMode {
+    single: bool,
+    migrate_in_worker: bool,
+    repair_existing_tokens: bool,
+}
+
 impl Client {
     /// Warm up the LID-PN cache from persistent storage.
     /// This is called during client initialization to populate the in-memory cache
@@ -156,6 +170,12 @@ impl Client {
     /// `@s.whatsapp.net` server, no device suffix). Pick the
     /// [`LearningSource`] that matches where the pair came from;
     /// [`LearningSource::Other`] covers sources without a dedicated variant.
+    ///
+    /// Cache warm-up precedes the storage ACK, as in WhatsApp Web. On error,
+    /// the observation may remain readable, but durability is not confirmed;
+    /// retry this API. The storage operation itself may have committed before
+    /// returning an error. Cancelling the caller does not cancel its owned
+    /// write or migrations. Mutations remain ordered behind pending write ACKs.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(
@@ -171,45 +191,29 @@ impl Client {
         phone_number: &str,
         source: LearningSource,
     ) -> Result<()> {
-        match self
-            .record_lid_pn_in_memory(lid, phone_number, source)
-            .await
-        {
-            RecordOutcome::Skipped => Ok(()),
-            RecordOutcome::NeedsUsync => {
-                self.spawn_lid_usync_reconcile(vec![phone_number.to_string()]);
-                Ok(())
-            }
-            RecordOutcome::Written {
-                entry,
-                needs_migration,
-            } => {
-                self.persist_and_migrate_lid_pn(entry, needs_migration)
-                    .await
-            }
-        }
+        self.learn_lid_pn_mappings_owned(
+            vec![(lid.to_owned(), phone_number.to_owned())],
+            source,
+            true,
+            true,
+        )
+        .await?;
+        Ok(())
     }
 
     /// Durably add a batch of linked-identifier mappings and run the same
     /// registry/session migrations as the single-entry path.
+    /// Error, cancellation and cache-visibility semantics match
+    /// [`Self::add_lid_pn_mapping`].
     pub async fn add_lid_pn_mappings(
         &self,
         mappings: Vec<(String, String)>,
         source: LearningSource,
     ) -> Result<usize> {
-        let BatchRecordOutcome {
-            entries,
-            migration_flags,
-            usync_phones,
-        } = self.record_lid_pn_batch_in_memory(mappings, source).await;
-        self.spawn_lid_usync_reconcile(usync_phones);
-
-        let count = entries.len();
-        if !entries.is_empty() {
-            self.persist_and_migrate_lid_pn_batch(entries, migration_flags)
-                .await?;
-        }
-        Ok(count)
+        let batch = self
+            .learn_lid_pn_mappings_owned(mappings, source, false, true)
+            .await?;
+        Ok(batch.count)
     }
 
     /// Hot-path variant: cache is updated synchronously (so a subsequent
@@ -226,14 +230,9 @@ impl Client {
     /// mid-write), the mapping is only in-memory and will be lost on restart.
     /// Use [`add_lid_pn_mapping`] when the caller needs a durable guarantee.
     ///
-    /// Concurrent calls for the same phone number may both observe
-    /// `needs_migration = true` and each spawn a persist task. The downstream
-    /// work tolerates this:
-    /// - `put_lid_mapping` is an upsert
-    /// - `migrate_device_registry_on_lid_discovery` no-ops after the PN-keyed
-    ///   record is gone
-    /// - `migrate_signal_sessions_on_lid_discovery` no-ops after the sessions
-    ///   are migrated
+    /// The owned worker orders cache mutation and persistence through ACK.
+    /// Migrations follow after releasing that guard, keeping registry and
+    /// Signal lock acquisition outside the mapping mutation scope.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.learn_lid_pn_fast", level = "trace", skip_all, fields(is_offline = is_offline)))]
     pub(crate) async fn learn_lid_pn_mapping_fast(
         self: &Arc<Self>,
@@ -242,34 +241,32 @@ impl Client {
         source: LearningSource,
         is_offline: bool,
     ) {
-        let (entry, needs_migration) = match self
-            .record_lid_pn_in_memory(lid, phone_number, source)
-            .await
-        {
-            RecordOutcome::Skipped => return,
-            RecordOutcome::NeedsUsync => {
-                self.spawn_lid_usync_reconcile(vec![phone_number.to_string()]);
-                return;
-            }
-            RecordOutcome::Written {
-                entry,
-                needs_migration,
-            } => (entry, needs_migration),
-        };
         if is_offline {
+            if matches!(
+                self.record_lid_pn_in_memory(lid, phone_number, source)
+                    .await,
+                RecordOutcome::NeedsUsync
+            ) {
+                self.spawn_lid_usync_reconcile(vec![phone_number.to_owned()]);
+            }
             return;
         }
-        let client = Arc::clone(self);
-        self.runtime
-            .spawn(Box::pin(async move {
-                if let Err(err) = client
-                    .persist_and_migrate_lid_pn(entry, needs_migration)
-                    .await
-                {
-                    log::warn!("Background LID-PN persist failed: {err}");
-                }
-            }))
-            .detach();
+        // Preserve the existing allocation-free steady-state skip.
+        if self.lid_pn_cache.can_skip_relearn(phone_number, lid).await {
+            return;
+        }
+        let (recorded, visible) = futures::channel::oneshot::channel();
+        drop(self.spawn_owned_lid_pn_learning(
+            vec![(lid.to_owned(), phone_number.to_owned())],
+            source,
+            MappingLearningMode {
+                single: true,
+                migrate_in_worker: true,
+                repair_existing_tokens: false,
+            },
+            Some(recorded),
+        ));
+        let _ = visible.await;
     }
 
     /// Batched variant of [`learn_lid_pn_mapping_fast`]. Updates the in-memory
@@ -297,8 +294,23 @@ impl Client {
         source: LearningSource,
         is_offline: bool,
     ) {
-        let outcome = self.record_lid_pn_batch_in_memory(mappings, source).await;
-        self.finish_lid_pn_batch_learning(outcome, is_offline);
+        if is_offline {
+            let outcome = self.record_lid_pn_batch_in_memory(mappings, source).await;
+            self.spawn_lid_usync_reconcile(outcome.usync_phones);
+            return;
+        }
+        let (recorded, visible) = futures::channel::oneshot::channel();
+        drop(self.spawn_owned_lid_pn_learning(
+            mappings,
+            source,
+            MappingLearningMode {
+                single: false,
+                migrate_in_worker: true,
+                repair_existing_tokens: false,
+            },
+            Some(recorded),
+        ));
+        let _ = visible.await;
     }
 
     pub(crate) async fn learn_lid_pn_mappings_batch_guarded(
@@ -307,18 +319,10 @@ impl Client {
         source: LearningSource,
         is_offline: bool,
         guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
-    ) {
+    ) -> Result<()> {
         let outcome = self
             .record_lid_pn_batch_in_memory_guarded(mappings, source, guard)
             .await;
-        self.finish_lid_pn_batch_learning(outcome, is_offline);
-    }
-
-    fn finish_lid_pn_batch_learning(
-        self: &Arc<Self>,
-        outcome: BatchRecordOutcome,
-        is_offline: bool,
-    ) {
         let BatchRecordOutcome {
             entries,
             migration_flags,
@@ -330,22 +334,21 @@ impl Client {
         // flushImmediately).
         self.spawn_lid_usync_reconcile(usync_phones);
 
-        // Nothing written, or an offline replay: skip the persist/migrate task.
         if is_offline || entries.is_empty() {
-            return;
+            return Ok(());
         }
-
+        // The response owner retains this borrowed guard through the ACK.
+        // Never queue already-recorded entries for a later detached write.
+        let storage = self
+            .persist_lid_pn_batch_guarded(entries, false, guard)
+            .await?;
         let client = Arc::clone(self);
         self.runtime
             .spawn(Box::pin(async move {
-                if let Err(err) = client
-                    .persist_and_migrate_lid_pn_batch(entries, migration_flags)
-                    .await
-                {
-                    log::warn!("Background LID-PN batch persist failed: {err}");
-                }
+                client.migrate_lid_pn_batch(storage, migration_flags).await;
             }))
             .detach();
+        Ok(())
     }
 
     /// Fire-and-forget the WA Web `syncContactListJob({mode:"query"})` analog:
@@ -552,76 +555,118 @@ impl Client {
         RecordOutcome::Skipped
     }
 
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(
-            name = "wa.session.persist_migrate_lid_pn",
-            level = "debug",
-            skip_all,
-            fields(needs_migration),
-            err(Debug)
-        )
-    )]
-    async fn persist_and_migrate_lid_pn(
+    async fn learn_lid_pn_mappings_owned(
         &self,
-        entry: LidPnEntry,
-        needs_migration: bool,
-    ) -> Result<()> {
-        use anyhow::anyhow;
-
-        let storage_entry = LidPnMappingEntry {
-            lid: entry.lid.to_string(),
-            phone_number: entry.phone_number.to_string(),
-            created_at: entry.created_at,
-            updated_at: entry.created_at,
-            learning_source: entry.learning_source.as_str().to_string(),
-        };
-
-        // Migration deletes PN-keyed durable state. Keep it intact if the
-        // mapping write fails, so a restarted client can still find that state
-        // by PN; the in-memory pair stays unmarked and a later live learn retries.
-        self.persistence_manager
-            .backend()
-            .put_lid_mapping(&storage_entry)
+        mappings: Vec<(String, String)>,
+        source: LearningSource,
+        single: bool,
+        migrate_in_worker: bool,
+    ) -> Result<PersistedMappingBatch> {
+        // Durable callers must evaluate the skip under the same mutation scope
+        // as record + ACK. Separate cache reads can straddle an ownership change.
+        let client = self
+            .self_weak
+            .get()
+            .and_then(|weak| weak.upgrade())
+            .ok_or_else(|| {
+                anyhow::anyhow!("client ownership unavailable during mapping persistence")
+            })?;
+        client
+            .spawn_owned_lid_pn_learning(
+                mappings,
+                source,
+                MappingLearningMode {
+                    single,
+                    migrate_in_worker,
+                    repair_existing_tokens: migrate_in_worker,
+                },
+                None,
+            )
             .await
-            .map_err(|e| anyhow!("persisting LID-PN mapping: {e}"))?;
-
-        self.lid_pn_cache
-            .mark_persisted(&entry.phone_number, &entry.lid)
-            .await;
-
-        if needs_migration {
-            self.migrate_device_registry_on_lid_discovery(
-                &storage_entry.phone_number,
-                &storage_entry.lid,
-            )
-            .await;
-            self.migrate_signal_sessions_on_lid_discovery(
-                &storage_entry.phone_number,
-                &storage_entry.lid,
-            )
-            .await;
-        }
-
-        Ok(())
+            .map_err(|_| anyhow::anyhow!("owned mapping learning worker stopped"))?
     }
 
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.persist_migrate_lid_pn_batch", level = "debug", skip_all, fields(count = entries.len()), err(Debug)))]
-    async fn persist_and_migrate_lid_pn_batch(
+    /// Receive raw observations, not entries that were registered before the
+    /// worker started. Record + persistence share one owned mutation scope.
+    fn spawn_owned_lid_pn_learning(
+        self: &Arc<Self>,
+        mappings: Vec<(String, String)>,
+        source: LearningSource,
+        mode: MappingLearningMode,
+        recorded: Option<futures::channel::oneshot::Sender<()>>,
+    ) -> futures::channel::oneshot::Receiver<Result<PersistedMappingBatch>> {
+        let client = Arc::clone(self);
+        let (finished, completion) = futures::channel::oneshot::channel();
+        self.runtime.spawn_detached(Box::pin(async move {
+            let result = client
+                .learn_lid_pn_mappings_owned_inner(mappings, source, mode, recorded)
+                .await;
+            if let Err(Err(error)) = finished.send(result) {
+                log::warn!("Background LID-PN learning failed: {error:#}");
+            }
+        }));
+        completion
+    }
+
+    async fn learn_lid_pn_mappings_owned_inner(
         &self,
-        entries: Vec<LidPnEntry>,
-        migration_flags: Vec<bool>,
-    ) -> Result<()> {
-        let storage = self.persist_lid_pn_batch(entries).await?;
-        self.migrate_lid_pn_batch(storage, migration_flags).await;
-        Ok(())
+        mappings: Vec<(String, String)>,
+        source: LearningSource,
+        mode: MappingLearningMode,
+        recorded: Option<futures::channel::oneshot::Sender<()>>,
+    ) -> Result<PersistedMappingBatch> {
+        let guard = self.lid_pn_cache.lock_mutation().await;
+        let mut token_repairs = Vec::new();
+        // Explicit durable re-learns repair legacy token rows. Background
+        // observations retain their no-I/O skip for already-persisted pairs.
+        if mode.repair_existing_tokens {
+            for (lid, phone) in &mappings {
+                if self.lid_pn_cache.can_skip_relearn(phone, lid).await {
+                    token_repairs.push((phone.clone(), lid.clone()));
+                }
+            }
+        }
+        let BatchRecordOutcome {
+            entries,
+            migration_flags,
+            usync_phones,
+        } = self
+            .record_lid_pn_batch_in_memory_guarded(mappings, source, &guard)
+            .await;
+        let count = entries.len();
+        self.spawn_lid_usync_reconcile(usync_phones);
+        if let Some(recorded) = recorded {
+            let _ = recorded.send(());
+        }
+        let storage = self
+            .persist_lid_pn_batch_guarded(entries, mode.single, &guard)
+            .await?;
+        // Release mapping before acquiring registry/session migration locks.
+        drop(guard);
+        if mode.migrate_in_worker {
+            self.migrate_lid_pn_batch(storage, migration_flags).await;
+            for (phone, lid) in token_repairs {
+                self.migrate_tc_token_on_lid_discovery(&phone, &lid).await;
+            }
+            return Ok(PersistedMappingBatch {
+                count,
+                ..Default::default()
+            });
+        }
+        Ok(PersistedMappingBatch {
+            storage,
+            migration_flags,
+            count,
+        })
     }
 
     /// Durable half of the batch learn: one backend transaction plus the
     /// cache persisted-markers, no migrations.
-    async fn persist_lid_pn_batch(
+    async fn persist_lid_pn_batch_guarded(
         &self,
         entries: Vec<LidPnEntry>,
+        single: bool,
+        _guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
     ) -> Result<Vec<LidPnMappingEntry>> {
         use anyhow::anyhow;
 
@@ -639,11 +684,25 @@ impl Client {
             })
             .collect();
 
-        self.persistence_manager
-            .backend()
-            .put_lid_mappings(&storage)
-            .await
-            .map_err(|e| anyhow!("persisting LID-PN mapping batch: {e}"))?;
+        if storage.is_empty() {
+            return Ok(storage);
+        }
+        let backend = self.persistence_manager.backend();
+        if single {
+            anyhow::ensure!(
+                storage.len() == 1,
+                "single mapping persistence received multiple rows"
+            );
+            backend
+                .put_lid_mapping(&storage[0])
+                .await
+                .map_err(|e| anyhow!("persisting LID-PN mapping: {e}"))?;
+        } else {
+            backend
+                .put_lid_mappings(&storage)
+                .await
+                .map_err(|e| anyhow!("persisting LID-PN mapping batch: {e}"))?;
+        }
 
         for entry in &entries {
             self.lid_pn_cache
@@ -653,7 +712,9 @@ impl Client {
         Ok(storage)
     }
 
-    /// Registry + Signal-session migrations for a persisted batch. Split from
+    /// Registry, Signal-session and token migrations after releasing mapping.
+    /// They use registry/session guards without acquiring the processing permit.
+    /// Split from
     /// the persist so callers on the message pipeline can await durability but
     /// defer this part — each new mapping walks up to MIGRATION_DEVICE_RANGE
     /// per-address locks, which must not stall the global processing permit.
@@ -683,12 +744,19 @@ impl Client {
     /// migrated here; the token was the one piece keyed the same way that was
     /// left behind.
     ///
-    /// `sender_timestamp` is not carried over: it only gates re-issuing our own
-    /// token, so losing it costs at most one extra issue, whereas the received
-    /// token is what the send path cannot do without.
+    /// Carry the original sender timestamp too, preserving the issuance bucket.
+    /// A sender-only placeholder must never overwrite received token bytes.
     async fn migrate_tc_token_on_lid_discovery(&self, pn: &str, lid: &str) {
         use log::warn;
 
+        // The worker may have waited behind another mapping after its ACK.
+        // Keep current ownership stable through the token move's own ACK.
+        let _mapping = self.lid_pn_cache.lock_mutation().await;
+        if self.lid_pn_cache.get_current_lid(pn).await.as_deref() != Some(lid)
+            || self.lid_pn_cache.get_phone_number(lid).await.as_deref() != Some(pn)
+        {
+            return;
+        }
         let backend = self.persistence_manager.backend();
         let entry = match backend.get_tc_token(pn).await {
             Ok(Some(entry)) => entry,
@@ -701,11 +769,20 @@ impl Client {
 
         // Newer-wins in the store, so a token already filed under the LID by a
         // later arrival is not regressed by the older PN-keyed one.
-        if let Err(e) = backend
-            .store_received_tc_token(lid, &entry.token, entry.token_timestamp)
-            .await
+        if !entry.token.is_empty()
+            && let Err(e) = backend
+                .store_received_tc_token(lid, &entry.token, entry.token_timestamp)
+                .await
         {
             warn!("tc token migration: writing LID-keyed token failed: {e}");
+            return;
+        }
+        if let Some(timestamp) = entry.sender_timestamp
+            && let Err(e) = backend
+                .touch_tc_token_sender_timestamp(lid, timestamp)
+                .await
+        {
+            warn!("tc token migration: writing LID sender timestamp failed: {e}");
             return;
         }
         // Only after the write succeeded: a failure here leaves a stale but
@@ -877,22 +954,26 @@ impl Client {
         // detached task instead: this handler runs under the message
         // pipeline's processing permit, and a large first push walking
         // MIGRATION_DEVICE_RANGE locks per mapping would stall it.
-        let BatchRecordOutcome {
-            entries,
-            migration_flags,
-            usync_phones,
-        } = self
-            .record_lid_pn_batch_in_memory(mappings, LearningSource::MigrationSyncLatest)
-            .await;
-        self.spawn_lid_usync_reconcile(usync_phones);
-        if !entries.is_empty() {
-            match self.persist_lid_pn_batch(entries).await {
-                Ok(storage) => {
-                    // A shutdown can drop this task with the migrations unrun;
-                    // that is accepted, not retried: both halves self-heal
-                    // lazily (decrypt-side session migration via
-                    // try_pn_to_lid_migration_decrypt, and a LID registry miss
-                    // just re-warms over the network on the next send).
+        match self
+            .learn_lid_pn_mappings_owned(
+                mappings,
+                LearningSource::MigrationSyncLatest,
+                false,
+                false,
+            )
+            .await
+        {
+            Ok(PersistedMappingBatch {
+                storage,
+                migration_flags,
+                ..
+            }) => {
+                // A shutdown can drop this task with the migrations unrun;
+                // that is accepted, not retried: both halves self-heal
+                // lazily (decrypt-side session migration via
+                // try_pn_to_lid_migration_decrypt, and a LID registry miss
+                // just re-warms over the network on the next send).
+                if !storage.is_empty() {
                     let client = Arc::clone(self);
                     self.runtime
                         .spawn(Box::pin(async move {
@@ -900,14 +981,14 @@ impl Client {
                         }))
                         .detach();
                 }
-                Err(e) => {
-                    // Do not advance migration state on a failed save (WA
-                    // Web's setLidMigrationMappings rethrows); the primary's
-                    // push is gone, but the ab prop keeps addressing correct
-                    // until re-pair.
-                    log::warn!("Failed to persist migration mappings: {e:?}");
-                    return;
-                }
+            }
+            Err(e) => {
+                // Do not advance migration state on a failed save (WA
+                // Web's setLidMigrationMappings rethrows); the primary's
+                // push is gone, but the ab prop keeps addressing correct
+                // until re-pair.
+                log::warn!("Failed to persist migration mappings: {e:?}");
+                return;
             }
         }
 
@@ -1097,6 +1178,30 @@ impl Client {
                 }
             }
 
+            // Match publication's session -> mapping order. Primary bootstrap
+            // does not hold session locks, so exclude its CAS across both reads
+            // and this transfer, releasing mapping before the next iteration.
+            let _mapping = if device_id == 0 {
+                Some(self.lid_pn_cache.lock_mutation().await)
+            } else {
+                None
+            };
+            let known_primary_alias = device_id == 0
+                && from.server.is_pn_family()
+                && to.server.is_lid_family()
+                && self
+                    .lid_pn_cache
+                    .get_current_lid(&from.user)
+                    .await
+                    .as_deref()
+                    == Some(to.user.as_str())
+                && self
+                    .lid_pn_cache
+                    .get_phone_number(&to.user)
+                    .await
+                    .as_deref()
+                    == Some(from.user.as_str());
+
             // Identity uses LID-wins (the inverse of session). For the same
             // physical device the identity_key is stable across PN/LID, so
             // either policy yields the same bytes in the steady state. The
@@ -1111,22 +1216,42 @@ impl Client {
             match self.signal_cache.get_identity(&pn_proto, backend).await {
                 Ok(Some(identity_data)) => {
                     match self.signal_cache.get_identity(&lid_proto, backend).await {
-                        Ok(None) => {
-                            self.signal_cache
-                                .put_identity(&lid_proto, &identity_data)
-                                .await;
-                            self.signal_cache.delete_identity(&pn_proto).await;
-                            outcome.migrated_identities += 1;
-                            info!(
-                                "Migrated identity {} -> {}",
-                                pn_jid.observe(),
-                                lid_jid.observe()
-                            );
-                        }
-                        Ok(Some(_)) => {
-                            // LID-wins: existing LID identity preserved; drop the PN copy.
-                            self.signal_cache.delete_identity(&pn_proto).await;
-                            outcome.discarded_identities += 1;
+                        Ok(destination) => {
+                            let expected: Option<&[u8; 32]> =
+                                identity_data.as_ref().try_into().ok();
+                            if known_primary_alias
+                                && destination
+                                    .as_deref()
+                                    .is_none_or(|key| key == identity_data.as_ref())
+                                && let Some(expected) = expected
+                            {
+                                if !self
+                                    .signal_cache
+                                    .move_identity_to_known_alias(&pn_proto, &lid_proto, expected)
+                                    .await
+                                {
+                                    outcome.skipped_identities += 1;
+                                    continue;
+                                }
+                            } else {
+                                if destination.is_none() {
+                                    self.signal_cache
+                                        .put_identity(&lid_proto, &identity_data)
+                                        .await;
+                                }
+                                // Divergent or unproven aliases retain primary retirement.
+                                self.signal_cache.delete_identity(&pn_proto).await;
+                            }
+                            if destination.is_none() {
+                                outcome.migrated_identities += 1;
+                                info!(
+                                    "Migrated identity {} -> {}",
+                                    pn_jid.observe(),
+                                    lid_jid.observe()
+                                );
+                            } else {
+                                outcome.discarded_identities += 1;
+                            }
                         }
                         Err(e) => {
                             outcome.skipped_identities += 1;
@@ -1373,6 +1498,335 @@ mod tests {
     use wacore::store::in_memory::InMemoryBackend;
     use wacore::store::traits::SignalStore;
     use wacore_binary::Server;
+
+    #[tokio::test]
+    async fn adv_review_round2_mapping_ack_orders_mutation_without_blocking_cached_lookup() {
+        use crate::store::release::tests::ProbeBackend;
+        use crate::test_utils::create_iq_test_client_with_backend;
+        use std::time::Duration;
+        for fail_after_ack in [false, true] {
+            let (mut probe, _) = ProbeBackend::new();
+            let raw = probe.backend.clone();
+            let (release, gate) = async_channel::unbounded();
+            let (entered, arrived) = async_channel::unbounded();
+            probe.gate_method = "after:put_lid_mappings";
+            probe.gate = Some(gate);
+            probe.entered = Some(entered);
+            if fail_after_ack {
+                probe.fail_after_method = Some("put_lid_mappings");
+            }
+            let (client, _) = create_iq_test_client_with_backend(Arc::new(probe)).await;
+            let phone = "12025550174";
+            let lid = "100000000000274";
+            client
+                .learn_lid_pn_mapping_fast(
+                    "100000000000275",
+                    "12025550175",
+                    LearningSource::Other,
+                    true,
+                )
+                .await;
+            raw.store_received_tc_token(
+                phone,
+                b"synthetic-ack-token",
+                client.runtime.wall_time_secs(),
+            )
+            .await
+            .unwrap();
+            let write = {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    client
+                        .add_lid_pn_mappings(
+                            vec![(lid.into(), phone.into())],
+                            LearningSource::Usync,
+                        )
+                        .await
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut mutation = Box::pin(client.lid_pn_cache.lock_mutation());
+            assert!(futures::poll!(mutation.as_mut()).is_pending());
+            assert_eq!(
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    client.lid_pn_cache.get_current_lid("12025550175")
+                )
+                .await
+                .unwrap()
+                .as_deref(),
+                Some("100000000000275")
+            );
+            assert!(!client.lid_pn_cache.is_persisted(phone, lid).await);
+            release.send(()).await.unwrap();
+            let guard = tokio::time::timeout(Duration::from_secs(5), mutation)
+                .await
+                .unwrap();
+            drop(guard);
+            let result = tokio::time::timeout(Duration::from_secs(5), write)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.is_err(), fail_after_ack);
+            assert_eq!(
+                client.lid_pn_cache.is_persisted(phone, lid).await,
+                !fail_after_ack
+            );
+            assert_eq!(
+                client.lid_pn_cache.get_current_lid(phone).await.as_deref(),
+                Some(lid)
+            );
+            assert!(raw.get_lid_mapping(lid).await.unwrap().is_some());
+            assert_eq!(
+                raw.get_tc_token(phone).await.unwrap().is_some(),
+                fail_after_ack
+            );
+            client.signal_shutdown_sync();
+        }
+    }
+
+    #[tokio::test]
+    async fn adv_review_round2_cancelled_public_batch_still_migrates_the_received_token() {
+        use crate::store::release::tests::ProbeBackend;
+        use crate::test_utils::create_iq_test_client_with_backend;
+        use std::time::Duration;
+        let (mut probe, _) = ProbeBackend::new();
+        let raw = probe.backend.clone();
+        let (release, gate) = async_channel::unbounded();
+        let (entered, arrived) = async_channel::unbounded();
+        probe.gate_method = "after:put_lid_mappings";
+        probe.gate = Some(gate);
+        probe.entered = Some(entered);
+        let (client, _) = create_iq_test_client_with_backend(Arc::new(probe)).await;
+        let phone = "12025550163";
+        let lid = "100000000000263";
+        let token = b"synthetic-cancelled-migration";
+        raw.store_received_tc_token(phone, token, client.runtime.wall_time_secs())
+            .await
+            .unwrap();
+        let caller = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .add_lid_pn_mappings(vec![(lid.into(), phone.into())], LearningSource::Usync)
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        release.send(()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(entry) = raw.get_tc_token(lid).await.unwrap() {
+                    assert_eq!(entry.token, token);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelling a durable caller must not discard its migration batch");
+        assert!(raw.get_tc_token(phone).await.unwrap().is_none());
+        client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn adv_review_round2_single_public_mapping_migrates_the_received_token() {
+        let client = create_test_client().await;
+        let phone = "12025550164";
+        let lid = "100000000000264";
+        let token = b"synthetic-single-migration";
+        client
+            .persistence_manager
+            .backend()
+            .store_received_tc_token(phone, token, client.runtime.wall_time_secs())
+            .await
+            .unwrap();
+        client
+            .add_lid_pn_mapping(lid, phone, LearningSource::Usync)
+            .await
+            .unwrap();
+        assert_eq!(
+            client.lookup_tc_token_for_jid(&Jid::lid(lid)).await,
+            Some(token.to_vec())
+        );
+        client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn adv_review_round2_token_repair_write_failure_retains_the_pn_row() {
+        use crate::store::release::tests::ProbeBackend;
+        use crate::test_utils::create_iq_test_client_with_backend;
+        use std::sync::atomic::AtomicBool;
+        let (mut probe, _) = ProbeBackend::new();
+        let raw = probe.backend.clone();
+        let failing = Arc::new(AtomicBool::new(true));
+        probe.fail_before_method = Some(("store_received_tc_token", failing.clone()));
+        let (client, _) = create_iq_test_client_with_backend(Arc::new(probe)).await;
+        let phone = "12025550176";
+        let lid = "100000000000276";
+        client
+            .add_lid_pn_mapping(lid, phone, LearningSource::Usync)
+            .await
+            .unwrap();
+        raw.store_received_tc_token(
+            phone,
+            b"synthetic-repair-error",
+            client.runtime.wall_time_secs(),
+        )
+        .await
+        .unwrap();
+        client
+            .add_lid_pn_mapping(lid, phone, LearningSource::Usync)
+            .await
+            .unwrap();
+        assert!(raw.get_tc_token(phone).await.unwrap().is_some());
+        assert!(raw.get_tc_token(lid).await.unwrap().is_none());
+        failing.store(false, Ordering::Relaxed);
+        client
+            .add_lid_pn_mapping(lid, phone, LearningSource::Usync)
+            .await
+            .unwrap();
+        assert!(raw.get_tc_token(phone).await.unwrap().is_none());
+        assert_eq!(
+            raw.get_tc_token(lid).await.unwrap().unwrap().token,
+            b"synthetic-repair-error"
+        );
+        client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn adv_review_round2_cancelled_token_repair_keeps_ownership_through_ack() {
+        use crate::store::release::tests::ProbeBackend;
+        use crate::test_utils::create_iq_test_client_with_backend;
+        use std::time::Duration;
+        let (mut probe, _) = ProbeBackend::new();
+        let raw = probe.backend.clone();
+        let (release, gate) = async_channel::unbounded();
+        let (entered, arrived) = async_channel::unbounded();
+        probe.gate_method = "after:store_received_tc_token";
+        probe.gate = Some(gate);
+        probe.entered = Some(entered);
+        let (client, _) = create_iq_test_client_with_backend(Arc::new(probe)).await;
+        let phone = "12025550177";
+        let lid = "100000000000277";
+        client
+            .add_lid_pn_mapping(lid, phone, LearningSource::Usync)
+            .await
+            .unwrap();
+        raw.store_received_tc_token(
+            phone,
+            b"synthetic-repair-cancel",
+            client.runtime.wall_time_secs(),
+        )
+        .await
+        .unwrap();
+        let repair = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .add_lid_pn_mapping(lid, phone, LearningSource::Usync)
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        repair.abort();
+        assert!(repair.await.unwrap_err().is_cancelled());
+        assert!(raw.get_tc_token(lid).await.unwrap().is_some());
+        assert!(raw.get_tc_token(phone).await.unwrap().is_some());
+        assert!(client.lid_pn_cache.try_lock_mutation().is_none());
+        release.send(()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while raw.get_tc_token(phone).await.unwrap().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            raw.get_tc_token(lid).await.unwrap().unwrap().token,
+            b"synthetic-repair-cancel"
+        );
+        client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn adv_review_round2_durable_pair_repairs_only_its_current_token() {
+        for single in [true, false] {
+            for case in ["missing", "newer_lid", "expired_pn", "different_owner"] {
+                let client = create_test_client().await;
+                let phone = "12025550172";
+                let lid = "100000000000272";
+                client
+                    .add_lid_pn_mapping(lid, phone, LearningSource::Usync)
+                    .await
+                    .unwrap();
+                let backend = client.persistence_manager.backend();
+                let now = client.runtime.wall_time_secs();
+                backend
+                    .store_received_tc_token(
+                        phone,
+                        b"synthetic-legacy-pn",
+                        if case == "expired_pn" { 1 } else { now - 30 },
+                    )
+                    .await
+                    .unwrap();
+                if case == "newer_lid" {
+                    backend
+                        .store_received_tc_token(lid, b"synthetic-newer-lid", now)
+                        .await
+                        .unwrap();
+                }
+                if case == "different_owner" {
+                    client
+                        .learn_lid_pn_mapping_fast(lid, "12025550173", LearningSource::Usync, true)
+                        .await;
+                    client.migrate_tc_token_on_lid_discovery(phone, lid).await;
+                    assert!(backend.get_tc_token(lid).await.unwrap().is_none());
+                    assert!(backend.get_tc_token(phone).await.unwrap().is_some());
+                } else {
+                    if single {
+                        client
+                            .add_lid_pn_mapping(lid, phone, LearningSource::Usync)
+                            .await
+                            .unwrap();
+                    } else {
+                        assert_eq!(
+                            client
+                                .add_lid_pn_mappings(
+                                    vec![(lid.into(), phone.into())],
+                                    LearningSource::Usync
+                                )
+                                .await
+                                .unwrap(),
+                            0
+                        );
+                    }
+                    let expected = match case {
+                        "expired_pn" => None,
+                        "newer_lid" => Some(b"synthetic-newer-lid".to_vec()),
+                        _ => Some(b"synthetic-legacy-pn".to_vec()),
+                    };
+                    assert_eq!(
+                        client.lookup_tc_token_for_jid(&Jid::lid(lid)).await,
+                        expected
+                    );
+                    assert!(backend.get_tc_token(phone).await.unwrap().is_none());
+                }
+                client.signal_shutdown_sync();
+            }
+        }
+    }
 
     #[cfg(feature = "bench-harness")]
     async fn startup_snapshot_preserves_usync(delayed: bool) {
@@ -3101,6 +3555,9 @@ mod tests {
         let pn = "5500000002222";
         let lid = "133333333333333";
         let token = b"tc-token-bytes".to_vec();
+        client
+            .learn_lid_pn_mapping_fast(lid, pn, LearningSource::Other, true)
+            .await;
 
         let backend = client.persistence_manager.backend();
         backend
@@ -3126,6 +3583,9 @@ mod tests {
         let client: Arc<Client> = create_test_client().await;
         let pn = "5500000003333";
         let lid = "144444444444444";
+        client
+            .learn_lid_pn_mapping_fast(lid, pn, LearningSource::Other, true)
+            .await;
 
         let backend = client.persistence_manager.backend();
         backend
@@ -3150,6 +3610,9 @@ mod tests {
         let client: Arc<Client> = create_test_client().await;
         let pn = "5500000004444";
         let lid = "155555555555555";
+        client
+            .learn_lid_pn_mapping_fast(lid, pn, LearningSource::Other, true)
+            .await;
 
         client.migrate_tc_token_on_lid_discovery(pn, lid).await;
 

@@ -35,36 +35,9 @@ pub(crate) async fn handle_privacy_token_notification(client: &Arc<Client>, node
         .optional_jid("sender_lid")
         .filter(|j| !j.user.is_empty());
 
-    // Resolve to a LID key. We borrow from Jid.user (CompactString) or from
-    // get_current_lid (CompactString), then pass as &str to the storage layer.
-    let resolved_lid: Option<wacore_binary::CompactString>;
-    let sender_lid: &str = if let Some(ref lid_jid) = sender_lid_jid {
-        &lid_jid.user
-    } else {
-        let from = match &from_jid {
-            Some(jid) => jid,
-            None => {
-                warn!(target: "Client/TcToken", "privacy_token notification missing 'from' attribute");
-                return;
-            }
-        };
-
-        if from.is_lid() {
-            &from.user
-        } else {
-            resolved_lid = client.lid_pn_cache.get_current_lid(&from.user).await;
-            match &resolved_lid {
-                Some(lid) => lid.as_str(),
-                None => {
-                    debug!(
-                        target: "Client/TcToken",
-                        "Cannot resolve LID for privacy_token sender {}, storing under PN",
-                        from.observe()
-                    );
-                    &from.user
-                }
-            }
-        }
+    let Some(source) = sender_lid_jid.clone().or_else(|| from_jid.clone()) else {
+        warn!(target: "Client/TcToken", "privacy_token notification missing 'from' attribute");
+        return;
     };
 
     // Parse the token data from the notification
@@ -81,63 +54,55 @@ pub(crate) async fn handle_privacy_token_notification(client: &Arc<Client>, node
         return;
     }
 
-    let backend = client.persistence_manager.backend();
     let mut token_stored = false;
+    let mut storage_key = source.clone();
 
-    for received in &received_tokens {
-        let existing = match backend.get_tc_token(sender_lid).await {
-            Ok(entry) => entry,
-            Err(e) => {
-                warn!(target: "Client/TcToken", "Failed to read tc_token for {}: {e}, skipping", sender_lid);
-                continue;
-            }
-        };
-
-        if let Some(existing) = &existing {
-            // Same bytes: only advance the timestamp forward.
-            if existing.token == received.token {
-                if received.timestamp > existing.token_timestamp
-                    && let Err(e) = backend
-                        .store_received_tc_token(sender_lid, &received.token, received.timestamp)
-                        .await
-                {
-                    warn!(target: "Client/TcToken", "Failed to refresh tc_token timestamp for {}: {e}", sender_lid);
-                }
-                continue;
-            }
-
-            // Don't replace a real token with an older one. A byte-less
-            // placeholder (written by sender-side issuance) has no real token
-            // yet, so always accept the contact's first real token.
-            if !existing.token.is_empty() && received.timestamp < existing.token_timestamp {
-                debug!(
-                    target: "Client/TcToken",
-                    "Skipping older token for {} (incoming={}, existing={})",
-                    sender_lid, received.timestamp, existing.token_timestamp
-                );
-                continue;
-            }
-        }
-
-        // store_received_tc_token preserves any sender_timestamp written
-        // concurrently by the issuance path.
-        if let Err(e) = backend
-            .store_received_tc_token(sender_lid, &received.token, received.timestamp)
+    for received in received_tokens {
+        match client
+            .persist_tc_token_owned(
+                source.clone(),
+                Some((received.token, received.timestamp)),
+                None,
+                true,
+            )
             .await
         {
-            warn!(target: "Client/TcToken", "Failed to store tc_token for {}: {e}", sender_lid);
-        } else {
-            debug!(target: "Client/TcToken", "Stored tc_token for {} (t={})", sender_lid, received.timestamp);
-            token_stored = true;
+            Ok(outcome) => {
+                storage_key = outcome.key;
+                token_stored |= outcome.changed;
+            }
+            Err(e) => {
+                warn!(target: "Client/TcToken", "Failed to store tc_token for {}: {e}", source.observe());
+            }
         }
     }
 
     // Re-subscribe presence with the updated token.
-    if token_stored
-        && let Some(from) = &from_jid
-        && let Err(e) = client.presence().re_subscribe_when_active(from).await
-    {
-        debug!(target: "Client/TcToken", "Failed to re-subscribe presence for {}: {e}", from.observe());
+    if token_stored && let Some(from) = &from_jid {
+        // The notification's PN and the active presence key can be different
+        // namespaces. Prefer the tracked LID, retaining legacy PN subscriptions.
+        let lid = if let Some(lid) = sender_lid_jid {
+            Some(lid)
+        } else if storage_key.is_lid() {
+            Some(storage_key.clone())
+        } else {
+            client
+                .lid_pn_cache
+                .get_current_lid(&from.user)
+                .await
+                .map(wacore_binary::Jid::lid)
+        };
+        let target = lid
+            .as_ref()
+            .filter(|lid| client.is_presence_subscription_tracked(lid))
+            .unwrap_or(from);
+        if let Err(e) = client
+            .presence()
+            .re_subscribe_when_active(target, &storage_key.user, !storage_key.is_lid())
+            .await
+        {
+            debug!(target: "Client/TcToken", "Failed to re-subscribe presence for {}: {e}", target.observe());
+        }
     }
 }
 
@@ -244,6 +209,329 @@ mod tests {
                     .build()])
                 .build()])
             .build()
+    }
+
+    async fn assert_legacy_token_retry_during_mapping_change(after_store: bool) {
+        use crate::lid_pn_cache::LearningSource;
+        use crate::store::release::tests::ProbeBackend;
+        use crate::test_utils::{create_iq_test_client_with_backend, decode_sent_iq};
+        use std::time::Duration;
+        use wacore_binary::Jid;
+
+        let (mut probe, _) = ProbeBackend::new();
+        let raw = probe.backend.clone();
+        let (release, gate) = async_channel::unbounded();
+        let (entered, arrived) = async_channel::unbounded();
+        probe.gate_method = if after_store {
+            "after:store_received_tc_token"
+        } else {
+            "store_received_tc_token"
+        };
+        probe.gate = Some(gate);
+        probe.entered = Some(entered);
+        probe.gate_once = true;
+        let (client, transport) = create_iq_test_client_with_backend(Arc::new(probe)).await;
+        let phone = Jid::pn("12025550160");
+        let lid = Jid::lid("100000000000260");
+        client.track_presence_subscription(phone.clone());
+        let token = b"synthetic-legacy-token".to_vec();
+        let timestamp = client.runtime.wall_time_secs();
+        let notification = privacy_token_notification(&phone.to_string(), timestamp, token.clone());
+        let handler = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                handle_privacy_token_notification(&client, &notification.as_node_ref()).await;
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut ownership = Box::pin(client.lid_pn_cache.lock_mutation());
+        assert!(futures::poll!(ownership.as_mut()).is_pending());
+        drop(ownership);
+        let mapping = {
+            let client = client.clone();
+            let phone = phone.clone();
+            let lid = lid.clone();
+            tokio::spawn(async move {
+                client
+                    .add_lid_pn_mapping(&lid.user, &phone.user, LearningSource::Usync)
+                    .await
+            })
+        };
+        assert!(
+            client
+                .lid_pn_cache
+                .get_current_lid(&phone.user)
+                .await
+                .is_none()
+        );
+        if after_store {
+            assert_eq!(
+                raw.get_tc_token(&phone.user).await.unwrap().unwrap().token,
+                token
+            );
+        } else {
+            assert!(raw.get_tc_token(&phone.user).await.unwrap().is_none());
+        }
+        release.send(()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), mapping)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handler)
+            .await
+            .unwrap()
+            .unwrap();
+        let sent = decode_sent_iq(&transport, 0).await;
+        assert_eq!(sent.get().tag, "presence");
+        assert_eq!(sent.get().attrs().optional_jid("to"), Some(phone.clone()));
+        assert_eq!(
+            sent.get().attrs().optional_string("type").as_deref(),
+            Some("subscribe")
+        );
+        assert_eq!(
+            sent.get()
+                .get_optional_child("tctoken")
+                .and_then(|child| child.content_bytes()),
+            Some(token.as_slice())
+        );
+        assert!(raw.get_tc_token(&phone.user).await.unwrap().is_none());
+        assert_eq!(
+            raw.get_tc_token(&lid.user).await.unwrap().unwrap().token,
+            token
+        );
+        client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn adv_review_round3_new_notification_token_survives_mapping() {
+        use crate::lid_pn_cache::LearningSource;
+        use crate::store::release::tests::ProbeBackend;
+        use crate::test_utils::create_iq_test_client_with_backend;
+        use std::time::Duration;
+        use wacore_binary::Jid;
+        for write_after_delete in [false, true] {
+            let (mut deleting, _) = ProbeBackend::new();
+            let raw = deleting.backend.clone();
+            let (release_delete, gate) = async_channel::unbounded();
+            let (deleting_tx, deleting_rx) = async_channel::unbounded();
+            deleting.gate_method = "delete_tc_token";
+            deleting.gate = Some(gate);
+            deleting.entered = Some(deleting_tx);
+            let (mut writing, _) = ProbeBackend::new();
+            writing.backend = Arc::new(deleting);
+            let (release_write, gate) = async_channel::unbounded();
+            let (writing_tx, writing_rx) = async_channel::unbounded();
+            writing.gate_method = "store_received_tc_token";
+            writing.gate_once = true;
+            writing.gate = Some(gate);
+            writing.entered = Some(writing_tx);
+            let (client, _) = create_iq_test_client_with_backend(Arc::new(writing)).await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !client.lid_pn_cache.startup_finished_for_tests() {
+                    tokio::task::yield_now().await;
+                }
+                drop(client.lid_pn_cache.lock_mutation().await);
+            })
+            .await
+            .unwrap();
+            let phone = Jid::pn("12025550177");
+            let lid = Jid::lid("100000000000277");
+            let now = client.runtime.wall_time_secs();
+            raw.store_received_tc_token(&phone.user, b"synthetic-old", now - 1)
+                .await
+                .unwrap();
+            let notification =
+                privacy_token_notification(&phone.to_string(), now, b"synthetic-new".to_vec());
+            let handler = {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    handle_privacy_token_notification(&client, &notification.as_node_ref()).await
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(5), writing_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut check = Box::pin(client.lid_pn_cache.lock_mutation());
+            let serialized = match futures::poll!(check.as_mut()) {
+                std::task::Poll::Pending => true,
+                std::task::Poll::Ready(guard) => {
+                    drop(guard);
+                    false
+                }
+            };
+            drop(check);
+            let mapping = {
+                let client = client.clone();
+                let phone = phone.clone();
+                let lid = lid.clone();
+                tokio::spawn(async move {
+                    client
+                        .add_lid_pn_mapping(&lid.user, &phone.user, LearningSource::Usync)
+                        .await
+                })
+            };
+            if serialized {
+                // A correct writer fences migration until its chosen key/write
+                // reaches ACK. Drive that admitted ordering, with the same data
+                // assertions as the formerly possible lost/orphan interleavings.
+                release_write.send(()).await.unwrap();
+                tokio::time::timeout(Duration::from_secs(5), handler)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(5), deleting_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                release_delete.send(()).await.unwrap();
+                tokio::time::timeout(Duration::from_secs(5), mapping)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            } else {
+                tokio::time::timeout(Duration::from_secs(5), deleting_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if write_after_delete {
+                    release_delete.send(()).await.unwrap();
+                    tokio::time::timeout(Duration::from_secs(5), mapping)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap();
+                    release_write.send(()).await.unwrap();
+                    tokio::time::timeout(Duration::from_secs(5), handler)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                } else {
+                    release_write.send(()).await.unwrap();
+                    tokio::time::timeout(Duration::from_secs(5), handler)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    release_delete.send(()).await.unwrap();
+                    tokio::time::timeout(Duration::from_secs(5), mapping)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap();
+                }
+            }
+            assert_eq!(
+                raw.get_tc_token(&lid.user).await.unwrap().unwrap().token,
+                b"synthetic-new"
+            );
+            assert!(raw.get_tc_token(&phone.user).await.unwrap().is_none());
+            client.signal_shutdown_sync();
+        }
+    }
+
+    #[tokio::test]
+    async fn review_pn_token_notification_resubscribes_the_tracked_lid() {
+        use crate::test_utils::{create_iq_test_client, decode_sent_iq};
+        use wacore_binary::Jid;
+
+        for explicit_lid in [true, false] {
+            let (client, transport) = create_iq_test_client().await;
+            let phone = Jid::pn("12025550162");
+            let lid = Jid::lid("100000000000262");
+            if !explicit_lid {
+                client
+                    .learn_lid_pn_mapping_fast(
+                        &lid.user,
+                        &phone.user,
+                        crate::lid_pn_cache::LearningSource::Usync,
+                        true,
+                    )
+                    .await;
+            }
+            client.track_presence_subscription(lid.clone());
+            let token = b"synthetic-tracked-lid-token".to_vec();
+            let mut notification = NodeBuilder::new("notification")
+                .attr("type", "privacy_token")
+                .attr("from", phone.to_string());
+            if explicit_lid {
+                notification = notification.attr("sender_lid", lid.to_string());
+            }
+            let notification = notification
+                .children([NodeBuilder::new("tokens")
+                    .children([NodeBuilder::new("token")
+                        .attr("type", "trusted_contact")
+                        .attr("t", client.runtime.wall_time_secs().to_string())
+                        .bytes(token.clone())
+                        .build()])
+                    .build()])
+                .build();
+            handle_privacy_token_notification(&client, &notification.as_node_ref()).await;
+            let sent = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                decode_sent_iq(&transport, 0),
+            )
+            .await
+            .expect("the active LID subscription must be retried");
+            assert_eq!(sent.get().attrs().optional_jid("to"), Some(lid));
+            assert_eq!(
+                sent.get()
+                    .get_optional_child("tctoken")
+                    .and_then(|child| child.content_bytes()),
+                Some(token.as_slice())
+            );
+            client.signal_shutdown_sync();
+        }
+    }
+
+    #[tokio::test]
+    async fn review_token_retry_keeps_pn_key_when_mapping_appears_during_save() {
+        assert_legacy_token_retry_during_mapping_change(false).await;
+    }
+
+    #[tokio::test]
+    async fn review_token_retry_finds_a_pn_token_moved_before_retry() {
+        assert_legacy_token_retry_during_mapping_change(true).await;
+    }
+
+    #[tokio::test]
+    async fn review_token_retry_does_not_replace_expired_explicit_lid_with_pn_token() {
+        use crate::test_utils::{create_iq_test_client, decode_sent_iq};
+        use wacore_binary::Jid;
+        let (client, transport) = create_iq_test_client().await;
+        let phone = Jid::pn("12025550161");
+        let lid = Jid::lid("100000000000261");
+        client.track_presence_subscription(phone.clone());
+        client
+            .persistence_manager
+            .backend()
+            .store_received_tc_token(
+                &phone.user,
+                b"synthetic-current-pn",
+                client.runtime.wall_time_secs(),
+            )
+            .await
+            .unwrap();
+        let notification = NodeBuilder::new("notification")
+            .attr("type", "privacy_token")
+            .attr("from", phone.to_string())
+            .attr("sender_lid", lid.to_string())
+            .children([NodeBuilder::new("tokens")
+                .children([NodeBuilder::new("token")
+                    .attr("type", "trusted_contact")
+                    .attr("t", "1")
+                    .bytes(b"synthetic-expired-lid".to_vec())
+                    .build()])
+                .build()])
+            .build();
+        handle_privacy_token_notification(&client, &notification.as_node_ref()).await;
+        let sent = decode_sent_iq(&transport, 0).await;
+        assert!(sent.get().get_optional_child("tctoken").is_none());
+        client.signal_shutdown_sync();
     }
 
     #[tokio::test]

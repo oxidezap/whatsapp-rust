@@ -216,6 +216,7 @@ impl Client {
         sender: &Jid,
         certificate: Option<&[u8]>,
         payloads: &[EncPayload],
+        account_locked: bool,
     ) -> Option<usize> {
         if sender.device == 0 {
             return None;
@@ -229,11 +230,19 @@ impl Client {
             };
             let identity = *message.identity_key().public_key().public_key_bytes();
             drop(message);
-            if self
-                .validate_incoming_companion_identity(sender, certificate, &identity)
+            let validation = if account_locked {
+                self.validate_incoming_companion_identity_inner(
+                    sender,
+                    certificate,
+                    &identity,
+                    true,
+                )
                 .await
-                .is_err()
-            {
+            } else {
+                self.validate_incoming_companion_identity(sender, certificate, &identity)
+                    .await
+            };
+            if validation.is_err() {
                 return Some(payload.enc_index);
             }
         }
@@ -745,6 +754,7 @@ impl Client {
                     &sender_encryption_jid,
                     device_identity.as_deref(),
                     &session_payloads,
+                    false,
                 )
                 .await
             } else {
@@ -788,6 +798,22 @@ impl Client {
             }
             return;
         }
+
+        // A recovery may publish while the offline permit is unavailable.
+        // Recheck negative preflight results under the account fence, using
+        // cached trust only so no network wait enters processing admission.
+        let invalid_companion_enc = if invalid_companion_enc.is_some() {
+            let _account = self.lock_companion_account(&sender_encryption_jid).await;
+            self.preflight_incoming_companion_identity(
+                &sender_encryption_jid,
+                device_identity.as_deref(),
+                &session_payloads,
+                true,
+            )
+            .await
+        } else {
+            None
+        };
 
         if let Some(invalid_companion_enc) = invalid_companion_enc {
             // WA Web answers this with a retry receipt (reason
@@ -3312,6 +3338,44 @@ mod adv_tests {
         incoming.abort();
         assert!(incoming.await.unwrap_err().is_cancelled());
         assert!(client.response_waiters_guard().is_empty());
+        client.signal_shutdown_sync();
+    }
+
+    /// A negative preflight can become valid before offline admission opens.
+    #[tokio::test]
+    async fn negative_adv_preflight_uses_recovered_trust_after_admission() {
+        use wacore::libsignal::protocol::KeyPair;
+        let client = crate::test_utils::create_test_client().await;
+        client.enter_drain_mode_for_tests();
+        let sender = Jid::pn_device("12025550129", 7);
+        let (payloads, certificate, _) = companion_payload_fixture();
+        let stale = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        client
+            .signal_cache
+            .put_identity(
+                &sender.with_device(0).to_protocol_address(),
+                stale.public_key.public_key_bytes(),
+            )
+            .await;
+        let permit = client.acquire_message_processing_permit().await;
+        assert_eq!(
+            client
+                .preflight_incoming_companion_identity(
+                    &sender,
+                    Some(&certificate),
+                    &payloads,
+                    false,
+                )
+                .await,
+            Some(0)
+        );
+        crate::test_utils::seed_adv_primary(&client, &sender).await;
+        drop(permit);
+        let _permit = client.acquire_message_processing_permit().await;
+        let _account = client.lock_companion_account(&sender).await;
+        assert_eq!(client.preflight_incoming_companion_identity(
+            &sender, Some(&certificate), &payloads, true,
+        ).await, None);
         client.signal_shutdown_sync();
     }
 

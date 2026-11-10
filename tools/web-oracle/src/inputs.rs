@@ -117,7 +117,7 @@ pub fn modules(paths: &[Bundle], names: &[&str]) -> Result<BTreeMap<String, Vec<
         let allocator = oxc_allocator::Allocator::default();
         let parsed = oxc_parser::Parser::new(&allocator, text, SourceType::default()).parse();
         ensure!(
-            parsed.errors.is_empty(),
+            parsed.diagnostics.is_empty(),
             "original bundle AST parse failed: {}",
             bundle.path.display()
         );
@@ -146,6 +146,25 @@ pub fn modules(paths: &[Bundle], names: &[&str]) -> Result<BTreeMap<String, Vec<
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn modules_rejects_parser_diagnostics_before_extracting_calls() {
+        let valid = br#"__d("Fixture", [], function() {});"#;
+        let bundle = |bytes: &[u8]| Bundle {
+            path: PathBuf::from("fixture.js"),
+            bytes: bytes.to_vec(),
+        };
+        let extracted = modules(&[bundle(valid)], &["Fixture"]).unwrap();
+        assert_eq!(extracted["Fixture"], &valid[..valid.len() - 1]);
+
+        let invalid = br#"__d("Fixture", [], function() {}); let = ;"#;
+        let error = modules(&[bundle(invalid)], &["Fixture"]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("original bundle AST parse failed")
+        );
+    }
+
     #[test]
     fn changed_missing_extra_and_repeated_inputs_fail_before_execution() {
         let temp = tempfile::tempdir().unwrap();

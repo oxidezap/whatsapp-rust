@@ -326,6 +326,7 @@ impl Client {
         jids: &[Jid],
         reason: Option<PreKeyFetchReason>,
     ) -> Result<wacore::prekeys::PreKeyFetchOutcome, anyhow::Error> {
+        let bootstrap_epoch = self.signal_cache.identity_continuity.primary_snapshot();
         let account_identities = self.collect_account_identities(jids).await?;
         let mut primary_snapshots = Vec::new();
         for jid in jids.iter().filter(|jid| jid.device == 0) {
@@ -375,18 +376,16 @@ impl Client {
         // Remember every cold account anchor before returning companions, even
         // when device 0 was explicitly requested: fanout validates bundles
         // before installing any primary session. The caller may already own
-        // session locks, so compare/insert atomically instead of reacquiring them.
-        let backend = self.persistence_manager.backend();
+        // session locks: the bootstrap fence excludes ADV publication without
+        // reacquiring sessions, and checks known reciprocal account aliases.
         for jid in &bootstrap_primaries {
             if let Some(bundle) = outcome.bundles.get(jid) {
-                use wacore::types::jid::JidExt;
                 let identity = authenticated_primary_identity(bundle)?;
                 if !self
-                    .signal_cache
-                    .persist_identity_if_absent_or_equal(
-                        &jid.to_protocol_address(),
+                    .persist_adv_bootstrap_identity_in_epoch(
+                        jid,
                         identity.public_key().public_key_bytes(),
-                        &*backend,
+                        bootstrap_epoch,
                     )
                     .await?
                 {
@@ -469,31 +468,45 @@ impl Client {
                     return Ok(identity);
                 }
             }
-            match self.adv_bootstrap().claim(generation, &primary) {
-                Ok(lease) => {
-                    let result = self
-                        .bootstrap_adv_account_identity(&primary, generation, &shutdown)
-                        .await
-                        .map_err(Arc::new);
-                    ensure_adv_bootstrap_scope(&self.connection_generation, generation, &shutdown)?;
-                    *lease
-                        .flight
-                        .result
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner()) = Some(result.clone());
-                    result.map_err(|error| anyhow::Error::new(SharedAdvBootstrapError(error)))
-                }
-                Err(flight) => {
-                    let _ = flight.released.recv().await;
-                    ensure_adv_bootstrap_scope(&self.connection_generation, generation, &shutdown)?;
-                    let result = flight
-                        .result
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .clone();
-                    result
-                        .ok_or_else(|| anyhow::anyhow!("ADV bootstrap cancelled"))?
-                        .map_err(|error| anyhow::Error::new(SharedAdvBootstrapError(error)))
+            loop {
+                match self.adv_bootstrap().claim(generation, &primary) {
+                    Ok(lease) => {
+                        let result = self
+                            .bootstrap_adv_account_identity(&primary, generation, &shutdown)
+                            .await
+                            .map_err(Arc::new);
+                        ensure_adv_bootstrap_scope(
+                            &self.connection_generation,
+                            generation,
+                            &shutdown,
+                        )?;
+                        *lease
+                            .flight
+                            .result
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner()) = Some(result.clone());
+                        return result
+                            .map_err(|error| anyhow::Error::new(SharedAdvBootstrapError(error)));
+                    }
+                    Err(flight) => {
+                        let _ = flight.released.recv().await;
+                        ensure_adv_bootstrap_scope(
+                            &self.connection_generation,
+                            generation,
+                            &shutdown,
+                        )?;
+                        let result = flight
+                            .result
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .clone();
+                        if let Some(result) = result {
+                            return result.map_err(|error| {
+                                anyhow::Error::new(SharedAdvBootstrapError(error))
+                            });
+                        }
+                        // Cancellation belongs to the leader, not its valid joiners.
+                    }
                 }
             }
         };
@@ -521,6 +534,7 @@ impl Client {
         if let Some(identity) = cached {
             return Ok(identity);
         }
+        let epoch = self.signal_cache.identity_continuity.primary_snapshot();
         let key = self.query_adv_account_identity(primary, None).await?;
         drop(query);
         let address = primary.to_protocol_address();
@@ -540,10 +554,14 @@ impl Client {
             .work
             .try_track()
             .ok_or_else(|| anyhow::anyhow!("ADV persistence admission closed"))?;
-        let backend = self.persistence_manager.backend();
-        let cache = self.signal_cache.clone();
+        let client = self
+            .self_weak
+            .get()
+            .and_then(|weak| weak.upgrade())
+            .ok_or_else(|| anyhow::anyhow!("client ownership unavailable during bootstrap"))?;
         let current_generation = self.connection_generation.clone();
         let shutdown = shutdown.clone();
+        let primary_owned = primary.clone();
         let (send, receive) = futures::channel::oneshot::channel();
         // Once storage is admitted, its writer owns the primary fence and the
         // drain tracking until the backend finishes. Cancelling an IQ caller
@@ -553,8 +571,8 @@ impl Client {
             let _work = work;
             let result = async {
                 ensure_adv_bootstrap_scope(&current_generation, generation, &shutdown)?;
-                let accepted = cache
-                    .persist_identity_if_absent_or_equal(&address, &key, &*backend)
+                let accepted = client
+                    .persist_adv_bootstrap_identity_inner(&primary_owned, &key, epoch)
                     .await?;
                 ensure_adv_bootstrap_scope(&current_generation, generation, &shutdown)?;
                 anyhow::ensure!(accepted, "primary identity changed during ADV bootstrap");

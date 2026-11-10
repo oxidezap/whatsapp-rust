@@ -372,7 +372,7 @@ async fn adv_bootstrap_caps_queries_and_cancellation_releases_slots() {
 }
 
 #[tokio::test]
-async fn adv_bootstrap_cancelled_leader_releases_joiner_and_allows_a_new_flight() {
+async fn adv_bootstrap_cancelled_leader_allows_valid_joiner_to_take_over() {
     let (client, transport) = create_iq_test_client().await;
     let primary = Jid::pn("12025550172");
     let leader = request(&client, primary.with_device(7));
@@ -381,14 +381,16 @@ async fn adv_bootstrap_cancelled_leader_releases_joiner_and_allows_a_new_flight(
     wait_for_joiner(&client).await;
     leader.abort();
     assert!(leader.await.unwrap_err().is_cancelled());
-    assert!(joined.await.unwrap().is_err());
-    assert!(client.adv_bootstrap().flights.lock().unwrap().is_empty());
-    let retry = request(&client, primary.with_device(7));
+
     let iq = decode_sent_iq(&transport, 1).await;
     let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
     let account = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
     answer(&client, &id, &primary, &account, true).await;
-    assert!(retry.await.unwrap().is_ok());
+    assert_eq!(
+        joined.await.unwrap().unwrap(),
+        *account.public_key.public_key_bytes()
+    );
+    assert!(client.adv_bootstrap().flights.lock().unwrap().is_empty());
     client.signal_shutdown_sync();
 }
 
@@ -493,4 +495,41 @@ async fn adv_bootstrap_owned_writer_keeps_primary_fence_after_caller_cancellatio
         );
         client.signal_shutdown_sync();
     }
+}
+
+/// Dropping all callers cannot release storage while the admitted write owns it.
+#[tokio::test]
+async fn adv_bootstrap_writer_delays_store_release_after_client_drop() {
+    use crate::store::release::tests::ProbeBackend;
+    use crate::test_utils::create_iq_test_client_with_backend;
+    let (mut probe, dropped) = ProbeBackend::new();
+    let (release, gate) = async_channel::unbounded();
+    let (entered, arrived) = async_channel::unbounded();
+    probe.gate = Some(gate);
+    probe.entered = Some(entered);
+    probe.gate_method = "put_identity";
+    let (client, transport) = create_iq_test_client_with_backend(Arc::new(probe)).await;
+    let released = client.store_release();
+    let primary = Jid::pn("12025550179");
+    let bootstrap = request(&client, primary.with_device(7));
+    let iq = decode_sent_iq(&transport, 0).await;
+    let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+    let account = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+    answer(&client, &id, &primary, &account, true).await;
+    tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    bootstrap.abort();
+    assert!(bootstrap.await.unwrap_err().is_cancelled());
+    client.signal_shutdown_sync();
+    drop(client);
+    let mut wait = Box::pin(released.wait());
+    assert!(futures::poll!(&mut wait).is_pending());
+    assert!(!dropped.load(Ordering::SeqCst));
+    release.send(()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), wait)
+        .await
+        .unwrap();
+    assert!(dropped.load(Ordering::SeqCst));
 }
