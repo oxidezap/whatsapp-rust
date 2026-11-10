@@ -20,6 +20,7 @@ pub mod driver;
 pub mod e2e_srtp;
 pub mod engine;
 pub mod fec;
+pub mod fec_receive;
 pub mod group_audio;
 pub mod group_media;
 // The group-call membership/control state moved to the neutral contract so the registry names it

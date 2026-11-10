@@ -432,6 +432,34 @@ fn window_delta(now: &CallMediaStats, then: &CallMediaStats) -> CallMediaStats {
         video_retired_ssrc_ignored: now
             .video_retired_ssrc_ignored
             .saturating_sub(then.video_retired_ssrc_ignored),
+        video_fec_repairs_received: now
+            .video_fec_repairs_received
+            .saturating_sub(then.video_fec_repairs_received),
+        video_fec_recovered: now
+            .video_fec_recovered
+            .saturating_sub(then.video_fec_recovered),
+        video_fec_parity_matched: now
+            .video_fec_parity_matched
+            .saturating_sub(then.video_fec_parity_matched),
+        video_fec_parity_mismatched: now
+            .video_fec_parity_mismatched
+            .saturating_sub(then.video_fec_parity_mismatched),
+        video_fec_insufficient: now
+            .video_fec_insufficient
+            .saturating_sub(then.video_fec_insufficient),
+        video_fec_late: now.video_fec_late.saturating_sub(then.video_fec_late),
+        video_fec_rejected: now
+            .video_fec_rejected
+            .saturating_sub(then.video_fec_rejected),
+        video_gaps_skipped: now
+            .video_gaps_skipped
+            .saturating_sub(then.video_gaps_skipped),
+        video_packets_skipped: now
+            .video_packets_skipped
+            .saturating_sub(then.video_packets_skipped),
+        video_packets_late: now
+            .video_packets_late
+            .saturating_sub(then.video_packets_late),
         video_fec_sent: now.video_fec_sent.saturating_sub(then.video_fec_sent),
         video_fec_bytes_sent: now
             .video_fec_bytes_sent

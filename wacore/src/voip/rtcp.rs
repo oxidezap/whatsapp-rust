@@ -385,6 +385,15 @@ impl RtpReceptionStats {
         self.ssrc
     }
 
+    /// Whether recovered audio is too old for the sequential decode path. Compare only within
+    /// the same stream and use RTP's wrapping timestamp order.
+    pub(crate) fn is_at_or_before_latest_timestamp(&self, ssrc: u32, timestamp: u32) -> bool {
+        self.ssrc == Some(ssrc)
+            && self
+                .last_rtp_timestamp
+                .is_some_and(|latest| timestamp.wrapping_sub(latest) as i32 <= 0)
+    }
+
     /// Samples between the last two packets of this stream, per the peer's own RTP timestamps.
     ///
     /// `None` until two consecutive in-order packets have been seen, cleared again by a newest
@@ -742,6 +751,24 @@ mod frame_span_tests {
 
     fn observe(stats: &mut RtpReceptionStats, seq: u16, timestamp: u32, ssrc: u32) {
         stats.observe(ssrc, seq, timestamp, u64::from(seq) * 60, CLOCK);
+    }
+
+    #[test]
+    fn recovered_audio_cannot_go_back_before_the_latest_timestamp() {
+        let mut stats = RtpReceptionStats::default();
+        assert!(!stats.is_at_or_before_latest_timestamp(SSRC, 0));
+        observe(&mut stats, 65535, u32::MAX - 959, SSRC);
+        assert!(!stats.is_at_or_before_latest_timestamp(SSRC, 0));
+        observe(&mut stats, 0, 0, SSRC);
+        assert!(stats.is_at_or_before_latest_timestamp(SSRC, u32::MAX - 1919));
+        assert!(stats.is_at_or_before_latest_timestamp(SSRC, 0));
+        assert!(!stats.is_at_or_before_latest_timestamp(SSRC, 960));
+        assert!(!stats.is_at_or_before_latest_timestamp(SSRC + 1, u32::MAX - 1919));
+        // A reordered original must not move the timestamp watermark backwards.
+        observe(&mut stats, 65534, u32::MAX - 1919, SSRC);
+        assert!(stats.is_at_or_before_latest_timestamp(SSRC, u32::MAX - 959));
+        observe(&mut stats, 1, 100, SSRC + 1);
+        assert!(stats.is_at_or_before_latest_timestamp(SSRC + 1, 99));
     }
 
     // The number the whole codec decision rests on. `codec_probe` compares the duration a packet's
