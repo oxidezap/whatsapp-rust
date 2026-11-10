@@ -2122,10 +2122,10 @@ impl Client {
                     wacore::send::retain_skdm_distribution_targets(&mut devices, own_sending_jid);
                 } else if let Some(cached_map) = cached_map {
                     devices.retain(|device| {
-                        !device.is_hosted()
-                            && !(device.user == own_sending_jid.user
+                        !(device.is_hosted()
+                            || (device.user == own_sending_jid.user
                                 && device.device == own_sending_jid.device)
-                            && !cached_map.device_and_primary_warm(&device.user, device.device)
+                            || cached_map.device_and_primary_warm(&device.user, device.device))
                     });
                 }
                 log::debug!(

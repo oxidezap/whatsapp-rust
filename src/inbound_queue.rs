@@ -127,6 +127,7 @@ pub(crate) struct QueueBudgets {
     pub chat: Arc<ByteBudget>,
     pub ack: Arc<ByteBudget>,
     pub work: Arc<crate::flush_scope::FlushScope>,
+    pub adv_bootstrap: std::sync::OnceLock<Arc<crate::prekeys::AdvBootstrapRegistry>>,
     per_chat: Arc<BudgetRegistry>,
     pub draining: std::sync::atomic::AtomicBool,
 }
@@ -137,6 +138,7 @@ impl Default for QueueBudgets {
             chat: Arc::new(ByteBudget::new(GLOBAL_CHAT_BYTES)),
             ack: Arc::new(ByteBudget::new(ACK_BYTES)),
             work: Arc::default(),
+            adv_bootstrap: std::sync::OnceLock::new(),
             per_chat: Arc::default(),
             draining: false.into(),
         }
@@ -162,7 +164,11 @@ impl QueueBudgets {
             // Controller, global counters and work scope are counted once.
             + size_of::<Self>()
             + 2 * (size_of::<ByteBudget>() + 2 * size_of::<usize>())
-            + size_of::<crate::flush_scope::FlushScope>() + 2 * size_of::<usize>();
+            + size_of::<crate::flush_scope::FlushScope>() + 2 * size_of::<usize>()
+            + self
+                .adv_bootstrap
+                .get()
+                .map_or(0, |registry| registry.retained_bytes());
         (
             wacore::stats::CollectionStats::new(entries.len() as u64, registry_bytes as u64),
             GLOBAL_CHAT_BYTES.saturating_sub(self.chat.available()) as u64,

@@ -6551,9 +6551,9 @@ async fn explicit_retry_sends_only_the_retry_receipt() {
             continue;
         };
         if receipt.tag.as_ref() != "receipt"
-            || !receipt
+            || receipt
                 .get_attr("id")
-                .is_some_and(|value| value.as_str() == "EXPLICIT-RETRY")
+                .is_none_or(|value| value.as_str() != "EXPLICIT-RETRY")
         {
             continue;
         }
@@ -7467,16 +7467,14 @@ async fn decrypt_peer_message_after(
                 let buf = decode_frame(index, frame)?;
                 let node = wacore_binary::marshal::unmarshal_packed_ref(&buf).ok()?;
                 if node.tag.as_ref() != "message"
-                    || !node
-                        .get_attr("to")
-                        .is_some_and(|value| value.as_str() == to)
+                    || node.get_attr("to").is_none_or(|value| value.as_str() != to)
                 {
                     return None;
                 }
                 let enc = node.get_optional_child_by_tag(&["enc"])?;
-                if !enc
+                if enc
                     .get_attr("type")
-                    .is_some_and(|value| value.as_str() == "msg")
+                    .is_none_or(|value| value.as_str() != "msg")
                 {
                     return None;
                 }
