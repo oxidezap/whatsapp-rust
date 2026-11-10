@@ -21,6 +21,7 @@ struct OwnershipCallbackCache {
         std::sync::Mutex<std::sync::Weak<crate::store::persistence_manager::PersistenceManager>>,
     enabled: std::sync::atomic::AtomicBool,
     delete_enabled: std::sync::atomic::AtomicBool,
+    read_error: std::sync::atomic::AtomicBool,
     delete_hook: std::sync::Mutex<Option<DeleteHook>>,
     taken: std::sync::atomic::AtomicBool,
     sets: std::sync::atomic::AtomicUsize,
@@ -32,6 +33,10 @@ struct OwnershipCallbackCache {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl wacore::store::CacheStore for OwnershipCallbackCache {
     async fn get(&self, namespace: &str, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        anyhow::ensure!(
+            !self.read_error.load(std::sync::atomic::Ordering::Acquire),
+            "synthetic cache read failure"
+        );
         Ok(self
             .rows
             .lock()
@@ -118,6 +123,7 @@ async fn check_hosted_cache_callback_ownership(cold_fill: bool, callback_enabled
         manager: std::sync::Mutex::new(Default::default()),
         enabled: AtomicBool::new(false),
         delete_enabled: AtomicBool::new(false),
+        read_error: AtomicBool::new(false),
         delete_hook: std::sync::Mutex::new(None),
         taken: AtomicBool::new(false),
         sets: AtomicUsize::new(0),
@@ -269,6 +275,7 @@ async fn adv_review_round9_hosted_rotation_cache_delete_can_modify_device() {
             manager: std::sync::Mutex::new(Default::default()),
             enabled: AtomicBool::new(false),
             delete_enabled: AtomicBool::new(callback_enabled),
+            read_error: AtomicBool::new(false),
             delete_hook: std::sync::Mutex::new(None),
             taken: AtomicBool::new(false),
             sets: AtomicUsize::new(0),
@@ -384,9 +391,11 @@ async fn adv_review_round9_hosted_rotation_cache_delete_can_modify_device() {
 enum EvictionCase {
     MappingFromModifier,
     RefilledCache,
+    MalformedCache,
     RetiredPrimary,
     ConnectionChanged,
     DeleteError,
+    ReadError,
     CancelledCaller,
     CacheAheadOfDatabase,
 }
@@ -400,6 +409,7 @@ async fn check_hosted_rotation_eviction(case: EvictionCase) {
         manager: std::sync::Mutex::new(Default::default()),
         enabled: AtomicBool::new(false),
         delete_enabled: AtomicBool::new(false),
+        read_error: AtomicBool::new(false),
         delete_hook: std::sync::Mutex::new(None),
         taken: AtomicBool::new(false),
         sets: AtomicUsize::new(0),
@@ -465,6 +475,7 @@ async fn check_hosted_rotation_eviction(case: EvictionCase) {
     let (blocked, arrived) = async_channel::bounded(1);
     let (release, gate) = async_channel::bounded(1);
     let weak = Arc::downgrade(&client);
+    let hook_store = Arc::downgrade(&store);
     let hook_user = user.clone();
     *store.delete_hook.lock().unwrap() = Some(Box::new(move || {
         Box::pin(async move {
@@ -492,6 +503,12 @@ async fn check_hosted_rotation_eviction(case: EvictionCase) {
                 EvictionCase::RefilledCache => {
                     assert!(client.load_device_record(&hook_user.user).await.is_some());
                 }
+                EvictionCase::MalformedCache => {
+                    hook_store.upgrade().unwrap().rows.lock().unwrap().insert(
+                        ("device_registry".into(), hook_user.user.to_string()),
+                        vec![0xff],
+                    );
+                }
                 EvictionCase::RetiredPrimary => {
                     deliver_identity_reset(&client, &hook_user, None).await
                 }
@@ -503,6 +520,13 @@ async fn check_hosted_rotation_eviction(case: EvictionCase) {
                     );
                 }
                 EvictionCase::DeleteError => anyhow::bail!("synthetic cache delete failure"),
+                EvictionCase::ReadError => {
+                    hook_store
+                        .upgrade()
+                        .unwrap()
+                        .read_error
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
                 EvictionCase::CancelledCaller => {
                     blocked.send(()).await.unwrap();
                     gate.recv().await.unwrap();
@@ -570,9 +594,11 @@ async fn check_hosted_rotation_eviction(case: EvictionCase) {
         let rejected = matches!(
             case,
             EvictionCase::RefilledCache
+                | EvictionCase::MalformedCache
                 | EvictionCase::RetiredPrimary
                 | EvictionCase::ConnectionChanged
                 | EvictionCase::DeleteError
+                | EvictionCase::ReadError
         );
         assert_eq!(result.is_err(), rejected, "{case:?}: {result:?}");
         let expected = if matches!(case, EvictionCase::RetiredPrimary) {
@@ -587,10 +613,7 @@ async fn check_hosted_rotation_eviction(case: EvictionCase) {
             expected,
             "{case:?}"
         );
-        if matches!(
-            case,
-            EvictionCase::DeleteError | EvictionCase::RefilledCache
-        ) {
+        if rejected && !matches!(case, EvictionCase::RetiredPrimary) {
             assert!(
                 has_session(&client, &companion).await,
                 "failed eviction must precede destructive cleanup"
@@ -628,6 +651,10 @@ async fn adv_eviction_rejects_a_cache_refill_without_a_topology_change() {
     check_hosted_rotation_eviction(EvictionCase::RefilledCache).await;
 }
 #[tokio::test]
+async fn adv_eviction_malformed_cache_data_does_not_prove_absence() {
+    check_hosted_rotation_eviction(EvictionCase::MalformedCache).await;
+}
+#[tokio::test]
 async fn adv_eviction_rejects_primary_retirement_during_callback() {
     check_hosted_rotation_eviction(EvictionCase::RetiredPrimary).await;
 }
@@ -638,6 +665,10 @@ async fn adv_eviction_rejects_connection_replacement_during_callback() {
 #[tokio::test]
 async fn adv_eviction_delete_error_preserves_trust_and_sessions() {
     check_hosted_rotation_eviction(EvictionCase::DeleteError).await;
+}
+#[tokio::test]
+async fn adv_eviction_read_error_does_not_prove_cache_absence() {
+    check_hosted_rotation_eviction(EvictionCase::ReadError).await;
 }
 #[tokio::test]
 async fn adv_eviction_survives_caller_cancellation() {

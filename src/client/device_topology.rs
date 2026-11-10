@@ -237,6 +237,10 @@ impl DeviceRegistryCache {
         self.cache.try_invalidate(key).await
     }
 
+    pub(crate) async fn is_absent_after_eviction(&self, key: &str) -> anyhow::Result<bool> {
+        Ok(!self.cache.contains_key_checked(key).await?)
+    }
+
     /// Cache-fill from the DB row the fallback path would have returned: the
     /// answer is unchanged, so no topology change is recorded.
     pub(crate) async fn promote_guarded(

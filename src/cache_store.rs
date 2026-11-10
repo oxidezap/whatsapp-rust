@@ -128,6 +128,21 @@ where
         }
     }
 
+    /// Publication must distinguish confirmed absence from an unavailable host
+    /// cache. Any stored bytes count as present, including malformed values.
+    pub(crate) async fn contains_key_checked<Q>(&self, key: &Q) -> anyhow::Result<bool>
+    where
+        K: Borrow<Q>,
+        Q: std::hash::Hash + Eq + Display + ?Sized,
+    {
+        match &self.inner {
+            Inner::Local(cache) => Ok(cache.get(key).await.is_some()),
+            Inner::Custom {
+                store, namespace, ..
+            } => Ok(store.get(namespace, &key.to_string()).await?.is_some()),
+        }
+    }
+
     /// Insert or update a value (takes ownership of key and value).
     pub async fn insert(&self, key: K, value: V) {
         match &self.inner {

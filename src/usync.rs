@@ -1653,7 +1653,10 @@ impl Client {
                     unchanged &= self.device_list_identity_alias(user).await == *alias;
                 }
                 for key in &eviction_keys {
-                    unchanged &= self.device_registry_cache.get(key).await.is_none();
+                    unchanged &= self
+                        .device_registry_cache
+                        .is_absent_after_eviction(key)
+                        .await?;
                 }
                 for update in &plan.identity_updates {
                     for (address, expected) in &update.identities {
