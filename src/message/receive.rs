@@ -216,6 +216,16 @@ impl Client {
         sender: &Jid,
         certificate: Option<&[u8]>,
         payloads: &[EncPayload],
+    ) -> Option<usize> {
+        self.preflight_incoming_companion_identity_inner(sender, certificate, payloads, false)
+            .await
+    }
+
+    async fn preflight_incoming_companion_identity_inner(
+        &self,
+        sender: &Jid,
+        certificate: Option<&[u8]>,
+        payloads: &[EncPayload],
         account_locked: bool,
     ) -> Option<usize> {
         if sender.device == 0 {
@@ -754,7 +764,6 @@ impl Client {
                     &sender_encryption_jid,
                     device_identity.as_deref(),
                     &session_payloads,
-                    false,
                 )
                 .await
             } else {
@@ -804,7 +813,7 @@ impl Client {
         // cached trust only so no network wait enters processing admission.
         let invalid_companion_enc = if invalid_companion_enc.is_some() {
             let _account = self.lock_companion_account(&sender_encryption_jid).await;
-            self.preflight_incoming_companion_identity(
+            self.preflight_incoming_companion_identity_inner(
                 &sender_encryption_jid,
                 device_identity.as_deref(),
                 &session_payloads,
@@ -3360,12 +3369,7 @@ mod adv_tests {
         let permit = client.acquire_message_processing_permit().await;
         assert_eq!(
             client
-                .preflight_incoming_companion_identity(
-                    &sender,
-                    Some(&certificate),
-                    &payloads,
-                    false,
-                )
+                .preflight_incoming_companion_identity(&sender, Some(&certificate), &payloads,)
                 .await,
             Some(0)
         );
@@ -3373,9 +3377,17 @@ mod adv_tests {
         drop(permit);
         let _permit = client.acquire_message_processing_permit().await;
         let _account = client.lock_companion_account(&sender).await;
-        assert_eq!(client.preflight_incoming_companion_identity(
-            &sender, Some(&certificate), &payloads, true,
-        ).await, None);
+        assert_eq!(
+            client
+                .preflight_incoming_companion_identity_inner(
+                    &sender,
+                    Some(&certificate),
+                    &payloads,
+                    true,
+                )
+                .await,
+            None
+        );
         client.signal_shutdown_sync();
     }
 
