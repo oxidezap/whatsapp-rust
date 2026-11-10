@@ -2397,7 +2397,7 @@ impl Client {
     #[inline(never)]
     async fn apply_adv_identity_update(
         &self,
-        update: AdvIdentityUpdate<'_>,
+        mut update: AdvIdentityUpdate<'_>,
         guard: &crate::client::device_topology::DeviceRegistryMutationGuard<'_>,
         maintenance: &SignalMaintenance<'_>,
         _ownership: DeviceListOwnershipProof<'_>,
@@ -2418,6 +2418,26 @@ impl Client {
         let alias = self.device_list_identity_alias(update.user).await;
         self.validate_adv_recovery_ownership(update.user, alias.as_ref())?;
         let changed = update.changes_trust();
+        if changed {
+            // Installers can add old-primary companions while cache callbacks
+            // run without account locks. Refresh live cleanup under those locks
+            // and ownership, preserving the L1 history retained before eviction.
+            let current = self.recover_device_cleanup_record(update.user).await?;
+            if let Some(previous) = &mut update.previous_record {
+                previous.edit_devices(|devices| {
+                    for device in current.devices {
+                        if !devices
+                            .iter()
+                            .any(|old| old.device_id() == device.device_id())
+                        {
+                            devices.push(device);
+                        }
+                    }
+                });
+            } else {
+                update.previous_record = Some(current);
+            }
+        }
         if changed {
             // Re-adding primary membership requires a fresh SKDM. Ordinary
             // prekey recovery must also retire the session tied to the old key.

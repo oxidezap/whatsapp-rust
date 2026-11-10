@@ -390,6 +390,8 @@ async fn adv_review_round9_hosted_rotation_cache_delete_can_modify_device() {
 #[derive(Clone, Copy, Debug)]
 enum EvictionCase {
     MappingFromModifier,
+    InstalledCompanion,
+    InstalledCompanionIdentityOnly,
     RefilledCache,
     MalformedCache,
     RetiredPrimary,
@@ -499,6 +501,45 @@ async fn check_hosted_rotation_eviction(case: EvictionCase) {
                             })
                         })
                         .await;
+                }
+                EvictionCase::InstalledCompanion | EvictionCase::InstalledCompanionIdentityOnly => {
+                    let topology = client.device_topology.current();
+                    let epoch = client.signal_cache.identity_continuity.primary_snapshot();
+                    let companion = hook_user.with_device(9);
+                    let key = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+                    let bundle =
+                        session_bundle(&key, 9, Some(crate::test_utils::adv_test_account()));
+                    client
+                        .install_prekey_bundle_cached(
+                            &companion,
+                            &bundle,
+                            &mut client.signal_adapter(),
+                            &mut rand::make_rng::<rand::rngs::StdRng>(),
+                        )
+                        .await
+                        .unwrap();
+                    let address = companion.to_protocol_address();
+                    assert!(has_session(&client, &address).await);
+                    if matches!(case, EvictionCase::InstalledCompanionIdentityOnly) {
+                        client.signal_cache.delete_session(&address).await;
+                    }
+                    client.flush_signal_cache_batch_safe().await.unwrap();
+                    assert!(
+                        client
+                            .persistence_manager
+                            .backend_ref()
+                            .load_identity(address.as_str())
+                            .await
+                            .unwrap()
+                            .is_some()
+                    );
+                    assert_eq!(client.device_topology.current(), topology);
+                    assert!(
+                        client
+                            .signal_cache
+                            .identity_continuity
+                            .unchanged_primary_for(epoch, [hook_user.user.as_str()])
+                    );
                 }
                 EvictionCase::RefilledCache => {
                     assert!(client.load_device_record(&hook_user.user).await.is_some());
@@ -634,6 +675,38 @@ async fn check_hosted_rotation_eviction(case: EvictionCase) {
                 "L1-only companions must be retired"
             );
         }
+        if matches!(
+            case,
+            EvictionCase::InstalledCompanion | EvictionCase::InstalledCompanionIdentityOnly
+        ) {
+            let address = user.with_device(9).to_protocol_address();
+            assert!(
+                !has_session(&client, &address).await,
+                "a companion installed during eviction must retire with its old primary"
+            );
+            assert!(
+                client
+                    .signal_cache
+                    .get_identity(&address, backend.as_ref())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                backend
+                    .load_session(address.as_str())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                backend
+                    .load_identity(address.as_str())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
     assert!(!client.device_topology.unchanged_for(
         generation,
@@ -645,6 +718,14 @@ async fn check_hosted_rotation_eviction(case: EvictionCase) {
 #[tokio::test]
 async fn adv_eviction_delete_callback_can_await_mapping_from_device_modifier() {
     check_hosted_rotation_eviction(EvictionCase::MappingFromModifier).await;
+}
+#[tokio::test]
+async fn adv_eviction_retires_companions_installed_during_delete_callback() {
+    check_hosted_rotation_eviction(EvictionCase::InstalledCompanion).await;
+}
+#[tokio::test]
+async fn adv_eviction_retires_identity_only_companions_created_during_callback() {
+    check_hosted_rotation_eviction(EvictionCase::InstalledCompanionIdentityOnly).await;
 }
 #[tokio::test]
 async fn adv_eviction_rejects_a_cache_refill_without_a_topology_change() {
