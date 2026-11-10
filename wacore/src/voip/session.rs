@@ -1067,6 +1067,12 @@ impl VideoPipeline {
         Some(self.srtcp.picture_loss_indication(ours, media_ssrc))
     }
 
+    /// A PLI naming `media_ssrc`: in a group call, one participant's stream.
+    pub(crate) fn picture_loss_indication_for(&mut self, media_ssrc: u32) -> Vec<u8> {
+        let ours = self.rtp.ssrc;
+        self.srtcp.picture_loss_indication(ours, media_ssrc)
+    }
+
     pub(crate) fn set_send_ssrc(&mut self, ssrc: u32) {
         self.rtp.ssrc = ssrc;
     }

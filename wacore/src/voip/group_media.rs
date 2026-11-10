@@ -459,6 +459,18 @@ impl GroupMediaRegistry {
         })
     }
 
+    /// The SSRCs whose video is being received, for asking their senders for a keyframe.
+    pub fn video_ssrcs(&self) -> Vec<u32> {
+        let mut ssrcs: Vec<u32> = self
+            .video_routes
+            .iter()
+            .filter(|(_, id)| self.receivers.get(*id).is_some_and(|r| r.video_enabled))
+            .map(|(ssrc, _)| *ssrc)
+            .collect();
+        ssrcs.sort_unstable();
+        ssrcs
+    }
+
     pub fn unprotect_video(&mut self, packet: &[u8]) -> Option<ParticipantVideo> {
         let ssrc = parse_rtp_header(packet)?.ssrc;
         let participant_id = self.video_routes.get(&ssrc)?.clone();
