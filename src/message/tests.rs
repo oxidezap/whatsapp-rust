@@ -24139,3 +24139,327 @@ async fn offline_receive_flushes_at_message_capacity_before_timer() {
         "drain has not completed"
     );
 }
+
+fn identity_recovery_payload(message: &CiphertextMessage, index: usize) -> EncPayload {
+    let (kind, bytes) = match message {
+        CiphertextMessage::SignalMessage(message) => ("msg", message.serialized()),
+        CiphertextMessage::PreKeySignalMessage(message) => ("pkmsg", message.serialized()),
+        _ => panic!("session ciphertext expected"),
+    };
+    let node = NodeBuilder::new("enc")
+        .attr("type", kind)
+        .bytes(bytes.to_vec())
+        .build();
+    EncPayload::from_node_ref(&node.as_node_ref(), index).unwrap()
+}
+
+async fn identity_recovery_peer(client: &Arc<Client>) -> (AlicePeer, ProtocolAddress) {
+    let sender = Jid::pn_device("12025550191", 7);
+    crate::test_utils::seed_adv_primary(client, &sender).await;
+    let (bundle, bob) = bobs_prekey_bundle(client).await;
+    let bob = bob.to_protocol_address();
+    let mut alice = AlicePeer::new(&sender.to_string()).await;
+    alice.install_bob_session(&bob, &bundle).await;
+    let first = alice.encrypt_text(&bob, "establish recovery fixture").await;
+    assert!(submit_and_check_session(client, &sender, &first).await.0);
+    alice
+        .sessions
+        .0
+        .get_mut(&bob)
+        .unwrap()
+        .session_state_mut()
+        .unwrap()
+        .clear_unacknowledged_pre_key_message();
+    client.enter_drain_mode_for_tests();
+    *client.message_processing_semaphore.lock().unwrap() =
+        crate::client::MessagePermitSemaphore::drain(2);
+    (alice, bob)
+}
+
+#[tokio::test]
+async fn untrusted_identity_recovery_releases_account_and_device_locks() {
+    use crate::store::signal_adapter::strict_identity_fixture::Rejection;
+    use futures::FutureExt;
+    let client = crate::test_utils::create_test_client().await;
+    let (mut alice, bob) = identity_recovery_peer(&client).await;
+    let encrypted = alice
+        .encrypt_text(&bob, "recovered under unchanged account")
+        .await;
+    let payloads = vec![identity_recovery_payload(&encrypted, 0)];
+    let info = group_message_info(
+        "IDENTITY_LOCK_RELEASE",
+        &alice.jid.to_non_ad(),
+        &alice.jid,
+        false,
+    );
+    let rejection = Rejection::after_checks(alice.address.clone(), 0);
+    let blocker = client.acquire_message_processing_permit().await;
+    let mut processing = Box::pin(
+        client
+            .clone()
+            .process_session_enc_batch_account_fenced(payloads, &info, &alice.jid),
+    );
+    for _ in 0..1024 {
+        assert!(futures::poll!(processing.as_mut()).is_pending());
+        if rejection.happened() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        rejection.happened(),
+        "libsignal must reject the real encrypted payload"
+    );
+    let account = client
+        .lock_companion_account(&alice.jid)
+        .now_or_never()
+        .expect("account fence must be released before quiescence")
+        .unwrap();
+    let mutex = client.session_lock_for(alice.address.as_str()).await;
+    let device = mutex
+        .lock_arc()
+        .now_or_never()
+        .expect("device lock must be released before quiescence");
+    drop((account, device, blocker));
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), processing)
+        .await
+        .unwrap();
+    assert!(outcome.decrypted);
+    assert!(outcome.dispatched);
+    assert!(!outcome.interrupted);
+}
+
+#[tokio::test]
+async fn untrusted_identity_recovery_revalidates_rotated_account() {
+    use crate::store::signal_adapter::strict_identity_fixture::Rejection;
+    use futures::FutureExt;
+    let client = crate::test_utils::create_test_client().await;
+    let (mut alice, bob) = identity_recovery_peer(&client).await;
+    let encrypted = alice.encrypt_text(&bob, "retired account payload").await;
+    let info = group_message_info(
+        "IDENTITY_ACCOUNT_ROTATION",
+        &alice.jid.to_non_ad(),
+        &alice.jid,
+        false,
+    );
+    let rejection = Rejection::after_checks(alice.address.clone(), 0);
+    let blocker = client.acquire_message_processing_permit().await;
+    let mut processing = Box::pin(client.clone().process_session_enc_batch_account_fenced(
+        vec![identity_recovery_payload(&encrypted, 0)],
+        &info,
+        &alice.jid,
+    ));
+    for _ in 0..1024 {
+        assert!(futures::poll!(processing.as_mut()).is_pending());
+        if rejection.happened() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(rejection.happened());
+    let account = client
+        .lock_companion_account(&alice.jid)
+        .now_or_never()
+        .unwrap()
+        .unwrap();
+    client
+        .signal_cache
+        .put_identity(&alice.jid.with_device(0).to_protocol_address(), &[43; 32])
+        .await;
+    drop((account, blocker));
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), processing)
+        .await
+        .unwrap();
+    assert!(
+        outcome.interrupted,
+        "account must be revalidated after reacquiring the fence"
+    );
+    assert!(!outcome.decrypted);
+    assert!(!outcome.dispatched);
+}
+
+#[tokio::test]
+async fn untrusted_identity_reconnect_abandons_group_bot_and_receipts() {
+    use crate::store::signal_adapter::strict_identity_fixture::Rejection;
+    let client = crate::test_utils::create_test_client().await;
+    let (mut alice, bob) = identity_recovery_peer(&client).await;
+    let encrypted = alice.encrypt_text(&bob, "stale session plaintext").await;
+    let info = group_message_info(
+        "IDENTITY_RECONNECT",
+        &Jid::group("120363000000000191"),
+        &alice.jid,
+        false,
+    );
+    let (recorder, _leases) = watch_enc_outcomes(&client);
+    let rejection = Rejection::after_checks(alice.address.clone(), 0);
+    let blocker = client.acquire_message_processing_permit().await;
+    let mut group = skmsg_payload_from_bytes(vec![1, 2, 3]);
+    group.enc_index = 1;
+    let mut bot = msmsg_payload_from_bytes(vec![1, 2, 3]);
+    bot.enc_index = 2;
+    let mut processing = Box::pin(process_group_classified_with_payloads(
+        &client,
+        info,
+        &alice.jid,
+        vec![identity_recovery_payload(&encrypted, 0)],
+        vec![group],
+        vec![bot],
+    ));
+    for _ in 0..1024 {
+        assert!(futures::poll!(processing.as_mut()).is_pending());
+        if rejection.happened() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(rejection.happened());
+    client.connection_generation.fetch_add(1, Ordering::AcqRel);
+    client.swap_to_drain_semaphore();
+    drop(blocker);
+    tokio::time::timeout(std::time::Duration::from_secs(5), processing)
+        .await
+        .unwrap();
+    assert!(recorder.decrypted.lock().unwrap().is_empty());
+    assert_eq!(
+        recorder.failures(),
+        vec![
+            (0, Some("msg".into()), EncDecryptFailureReason::NotAttempted),
+            (
+                1,
+                Some("skmsg".into()),
+                EncDecryptFailureReason::NotAttempted
+            ),
+            (
+                2,
+                Some("msmsg".into()),
+                EncDecryptFailureReason::NotAttempted
+            ),
+        ]
+    );
+    assert!(client.offline_receipt_buffer.lock().unwrap().is_empty());
+}
+
+async fn assert_untrusted_identity_prefix_without_hooks(offline: bool) {
+    use crate::store::signal_adapter::strict_identity_fixture::Rejection;
+    let (client, transport) = capturing_client("untrusted_prefix_receipts").await;
+    let (mut alice, bob) = identity_recovery_peer(&client).await;
+    if !offline {
+        let generation = client.connection_generation.load(Ordering::Acquire);
+        assert!(client.finish_inbound_commit_drain(generation).await);
+    }
+    assert!(!client.inbound_journal_enabled());
+    let first = alice.encrypt_text(&bob, "visible successful prefix").await;
+    let rejected = alice.encrypt_text(&bob, "retry this payload").await;
+    let remaining = alice
+        .encrypt_text(&bob, "do not attempt this payload")
+        .await;
+    let mut info = group_message_info(
+        "IDENTITY_PREFIX",
+        &Jid::group("120363000000000192"),
+        &alice.jid,
+        false,
+    );
+    Arc::get_mut(&mut info).unwrap().is_offline = offline;
+    let (recorder, _leases) = watch_enc_outcomes(&client);
+    let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+    let _message_subscription = client.subscribe_handler(collector.clone());
+    let rejection = Rejection::after_checks(alice.address.clone(), 1);
+    process_group_classified_with_payloads(
+        &client,
+        info.clone(),
+        &alice.jid,
+        vec![
+            identity_recovery_payload(&first, 0),
+            identity_recovery_payload(&rejected, 1),
+            identity_recovery_payload(&remaining, 2),
+        ],
+        vec![],
+        vec![],
+    )
+    .await;
+    assert!(rejection.happened());
+    if offline {
+        let generation = client.connection_generation.load(Ordering::Acquire);
+        assert!(
+            client
+                .flush_inbound_commits_quiesced(Some(generation))
+                .await
+        );
+    }
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        delivery_receipts_for(&transport.sent(), "IDENTITY_PREFIX"),
+        0,
+        "committing a successful prefix must not acknowledge unprocessed payloads"
+    );
+    assert_eq!(*recorder.decrypted.lock().unwrap(), vec![(0, "msg")]);
+    let events = collector.events();
+    let texts: Vec<_> = events
+        .iter()
+        .flat_map(|event| event.messages())
+        .filter_map(|message| message.message.conversation.as_deref())
+        .collect();
+    assert_eq!(texts, vec!["visible successful prefix"]);
+    assert_eq!(
+        recorder.failures(),
+        vec![
+            (1, Some("msg".into()), EncDecryptFailureReason::NotAttempted),
+            (2, Some("msg".into()), EncDecryptFailureReason::NotAttempted),
+        ]
+    );
+    assert!(client.offline_receipt_buffer.lock().unwrap().is_empty());
+    process_group_classified_with_payloads(
+        &client,
+        info,
+        &alice.jid,
+        vec![
+            identity_recovery_payload(&first, 0),
+            identity_recovery_payload(&rejected, 1),
+            identity_recovery_payload(&remaining, 2),
+        ],
+        vec![],
+        vec![],
+    )
+    .await;
+    if offline {
+        let generation = client.connection_generation.load(Ordering::Acquire);
+        assert!(
+            client
+                .flush_inbound_commits_quiesced(Some(generation))
+                .await
+        );
+    }
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        delivery_receipts_for(&transport.sent(), "IDENTITY_PREFIX") > 0,
+        "a complete redelivery must authorize the stanza receipt"
+    );
+    let events = collector.events();
+    let texts: Vec<_> = events
+        .iter()
+        .flat_map(|event| event.messages())
+        .filter_map(|message| message.message.conversation.as_deref())
+        .collect();
+    assert_eq!(
+        texts,
+        vec![
+            "visible successful prefix",
+            "retry this payload",
+            "do not attempt this payload"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn untrusted_identity_projects_successful_prefix_without_hooks_offline() {
+    assert_untrusted_identity_prefix_without_hooks(true).await;
+}
+
+#[tokio::test]
+async fn untrusted_identity_projects_successful_prefix_without_hooks_live() {
+    assert_untrusted_identity_prefix_without_hooks(false).await;
+}

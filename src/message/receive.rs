@@ -1294,6 +1294,10 @@ impl Client {
             return outcome;
         }
 
+        let prefix_receipt = outcome
+            .recovery_deferred
+            .then(|| live_retention::ReceiptScope::withheld(info));
+
         for DeferredPlaintext {
             enc_type,
             plaintext,
@@ -1315,7 +1319,7 @@ impl Client {
                             session_type: session_type.as_deref(),
                         },
                         producer: stanza_origin,
-                        receipt: None,
+                        receipt: prefix_receipt.clone(),
                     },
                     info,
                 )
@@ -1343,8 +1347,20 @@ impl Client {
                         enc_type,
                         EncDecryptFailureReason::PlaintextUnusable,
                     );
-                    outcome.undecryptable |=
-                        self.handle_plaintext_failure(info, decrypt_fail_mode).await;
+                    if outcome.recovery_deferred {
+                        // A NACK would also discard the unprocessed suffix.
+                        outcome.undecryptable |= self
+                            .dispatch_undecryptable_event(
+                                Arc::clone(info),
+                                false,
+                                crate::types::events::UnavailableType::Unknown,
+                                decrypt_fail_mode,
+                            )
+                            .await;
+                    } else {
+                        outcome.undecryptable |=
+                            self.handle_plaintext_failure(info, decrypt_fail_mode).await;
+                    }
                 }
             }
         }
@@ -2927,6 +2943,8 @@ impl Client {
                                 )
                                 .await;
                             (matches!(state, InboundCommitState::Durable), Some(state))
+                        } else if receipt.as_ref().is_some_and(|scope| scope.defer()) {
+                            (false, None)
                         } else {
                             (
                                 !info.source.chat.is_status_broadcast()

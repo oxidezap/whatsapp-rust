@@ -223,6 +223,19 @@ pub(super) struct ReceiptScope {
     state: Mutex<ReceiptState>,
 }
 impl ReceiptScope {
+    /// A partial stanza may publish its successful prefix, but that delivery
+    /// must never authorize an ACK for payloads still awaiting redelivery.
+    pub fn withheld(info: &Arc<MessageInfo>) -> Arc<Self> {
+        Arc::new(Self {
+            arrival: Arc::downgrade(info),
+            state: Mutex::new(ReceiptState {
+                closed: true,
+                failed: true,
+                ..Default::default()
+            }),
+        })
+    }
+
     pub fn admission(&self) -> Option<Arc<Charge>> {
         lock(&self.state).charge.upgrade()
     }
