@@ -44,6 +44,14 @@ where
     K: std::hash::Hash + Eq + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
 {
+    #[cfg(test)]
+    pub(crate) fn local_for_tests(&self) -> Option<&Cache<K, V>> {
+        match &self.inner {
+            Inner::Local(cache) => Some(cache),
+            Inner::Custom { .. } => None,
+        }
+    }
+
     pub(crate) fn on_runtime(mut self, runtime: &Arc<dyn wacore::runtime::Runtime>) -> Self {
         self.inner = match self.inner {
             Inner::Local(cache) => Inner::Local(cache.on_runtime(runtime)),

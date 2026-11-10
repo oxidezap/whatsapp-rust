@@ -1031,6 +1031,45 @@ impl Client {
         }
     }
 
+    /// A captured discovery pair is not permission to overwrite a later owner.
+    /// A durable conflict vetoes the current reciprocal live relation. Offline
+    /// replay can learn that relation before its checkpoint persists it; absent
+    /// cache directions instead require an explicit reciprocal durable pair.
+    pub(super) async fn discovery_pair_is_current_guarded(
+        &self,
+        pn: &str,
+        lid: &str,
+        _guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
+    ) -> Result<bool> {
+        let forward = self.lid_pn_cache.get_current_lid(pn).await;
+        let reverse = self.lid_pn_cache.get_phone_number(lid).await;
+        if forward.as_deref().is_some_and(|current| current != lid)
+            || reverse.as_deref().is_some_and(|current| current != pn)
+        {
+            return Ok(false);
+        }
+        let backend = self.persistence_manager.backend();
+        let by_lid = backend.get_lid_mapping(lid).await?;
+        if by_lid
+            .as_ref()
+            .is_some_and(|owner| owner.lid != lid || owner.phone_number != pn)
+        {
+            return Ok(false);
+        }
+        if forward.as_deref() == Some(lid) && reverse.as_deref() == Some(pn) {
+            // Historical LIDs may share the same PN timestamp. The live
+            // reciprocal edge selects its current LID; the PN query alone
+            // does not resolve that tie. A warm-only offline relation is valid
+            // here, but never overrides a conflicting durable LID owner.
+            return Ok(true);
+        }
+        if by_lid.is_none() {
+            return Ok(false);
+        }
+        let by_phone = backend.get_pn_mapping(pn).await?;
+        Ok(by_phone.is_some_and(|by_phone| by_phone.lid == lid && by_phone.phone_number == pn))
+    }
+
     /// Migrate Signal sessions and identity keys from PN to LID address.
     ///
     /// All reads/writes go through `signal_cache` to avoid reading stale data
@@ -1072,13 +1111,19 @@ impl Client {
         }
 
         let standard = self
-            .migrate_signal_sessions_with_backend(&Jid::pn(pn), &Jid::lid(lid), backend.as_ref())
+            .migrate_signal_sessions_with_backend_inner(
+                &Jid::pn(pn),
+                &Jid::lid(lid),
+                backend.as_ref(),
+                true,
+            )
             .await;
         let hosted = self
-            .migrate_signal_sessions_with_backend(
+            .migrate_signal_sessions_with_backend_inner(
                 &Jid::new(pn, wacore_binary::Server::Hosted),
                 &Jid::new(lid, wacore_binary::Server::HostedLid),
                 backend.as_ref(),
+                true,
             )
             .await;
         let migrated_sessions = standard.migrated != 0 || hosted.migrated != 0;
@@ -1128,6 +1173,20 @@ impl Client {
         to: &Jid,
         backend: &dyn SignalStore,
     ) -> crate::features::SignalSessionMigration {
+        self.migrate_signal_sessions_with_backend_inner(from, to, backend, false)
+            .await
+    }
+
+    /// Explicit migrations retain their caller-supplied target contract.
+    /// Discovery additionally proves that the captured relation still owns
+    /// both namespaces before checking out any session, on every iteration.
+    async fn migrate_signal_sessions_with_backend_inner(
+        &self,
+        from: &Jid,
+        to: &Jid,
+        backend: &dyn SignalStore,
+        discovery: bool,
+    ) -> crate::features::SignalSessionMigration {
         use log::{info, warn};
         use wacore::types::jid::JidExt;
 
@@ -1152,6 +1211,44 @@ impl Client {
             keys.sort_unstable_by(wacore::types::jid::cmp_for_lock_order);
             keys.dedup_by(|a, b| wacore::types::jid::cmp_for_lock_order(a, b).is_eq());
             let _guards = self.session_guards_for(&keys).await;
+
+            // Session -> mapping is publication's lock order. Hold ownership
+            // through both the session and identity transfer, not just device0.
+            let mapping_guard = if discovery || device_id == 0 {
+                Some(self.lid_pn_cache.lock_mutation().await)
+            } else {
+                None
+            };
+            if discovery {
+                // Empty source slots cannot transfer state. Probe without a
+                // checkout before paying durable ownership I/O; read errors
+                // fall through to the existing conservative migration path.
+                if matches!(
+                    self.signal_cache.has_session(&pn_proto, backend).await,
+                    Ok(false)
+                ) && matches!(
+                    self.signal_cache.get_identity(&pn_proto, backend).await,
+                    Ok(None)
+                ) {
+                    continue;
+                }
+                let Some(mapping_guard) = mapping_guard.as_ref() else {
+                    return outcome;
+                };
+                let current = self
+                    .discovery_pair_is_current_guarded(&from.user, &to.user, mapping_guard)
+                    .await;
+                match current {
+                    Ok(true) => {}
+                    Ok(false) => return outcome,
+                    Err(error) => {
+                        warn!(
+                            "Skipping discovery migration after ownership lookup failure: {error:#}"
+                        );
+                        return outcome;
+                    }
+                }
+            }
 
             // PN wins on conflict — mirrors whatsmeow's `MigratePNToLID`
             // (`ON CONFLICT DO UPDATE SET session=excluded.session`).
@@ -1178,29 +1275,22 @@ impl Client {
                 }
             }
 
-            // Match publication's session -> mapping order. Primary bootstrap
-            // does not hold session locks, so exclude its CAS across both reads
-            // and this transfer, releasing mapping before the next iteration.
-            let _mapping = if device_id == 0 {
-                Some(self.lid_pn_cache.lock_mutation().await)
-            } else {
-                None
-            };
             let known_primary_alias = device_id == 0
                 && from.server.is_pn_family()
                 && to.server.is_lid_family()
-                && self
-                    .lid_pn_cache
-                    .get_current_lid(&from.user)
-                    .await
-                    .as_deref()
-                    == Some(to.user.as_str())
-                && self
-                    .lid_pn_cache
-                    .get_phone_number(&to.user)
-                    .await
-                    .as_deref()
-                    == Some(from.user.as_str());
+                && (discovery
+                    || (self
+                        .lid_pn_cache
+                        .get_current_lid(&from.user)
+                        .await
+                        .as_deref()
+                        == Some(to.user.as_str())
+                        && self
+                            .lid_pn_cache
+                            .get_phone_number(&to.user)
+                            .await
+                            .as_deref()
+                            == Some(from.user.as_str())));
 
             // Identity uses LID-wins (the inverse of session). For the same
             // physical device the identity_key is stable across PN/LID, so
@@ -3146,6 +3236,569 @@ mod tests {
         crate::test_utils::synthetic_serialized_session(remote_regid, None)
     }
 
+    #[tokio::test]
+    async fn adv_review_round6_discovery_rechecks_owner_before_registry_transfer() {
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+        for rebind in [false, true] {
+            let client: Arc<Client> = create_test_client().await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !client.lid_pn_cache.startup_finished_for_tests() {
+                    tokio::task::yield_now().await;
+                }
+                drop(client.lid_pn_cache.lock_mutation().await);
+            })
+            .await
+            .unwrap();
+            let phone = "12025550193";
+            let other = "12025550194";
+            let lid = "100000000000193";
+            client
+                .add_lid_pn_mapping(lid, phone, LearningSource::Usync)
+                .await
+                .unwrap();
+            let backend = client.persistence_manager.backend();
+            for (user, raw_id, timestamp, companion) in [(phone, 11, 20, 7), (lid, 22, 10, 8)] {
+                backend
+                    .update_device_list(DeviceListRecord {
+                        user: user.into(),
+                        devices: [
+                            DeviceInfo::new(0, None),
+                            DeviceInfo::new(companion, Some(1)),
+                        ]
+                        .into(),
+                        raw_id: Some(raw_id),
+                        timestamp,
+                        phash: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let registry = client.device_topology.lock_registry().await;
+            let mut migration =
+                Box::pin(client.migrate_device_registry_on_lid_discovery(phone, lid));
+            assert!(futures::poll!(migration.as_mut()).is_pending());
+            // Either a correct implementation already owns Map and orders the
+            // migration first, or it must reject a rebind completed before
+            // Registry admission. No sleep or assumed task scheduling.
+            let rebind_before_transfer =
+                rebind && client.lid_pn_cache.try_lock_mutation().is_some();
+            let learning = rebind.then(|| {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    client
+                        .add_lid_pn_mapping(lid, other, LearningSource::RecipientLatestLid)
+                        .await
+                })
+            });
+            if rebind_before_transfer {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        if backend
+                            .get_lid_mapping(lid)
+                            .await
+                            .unwrap()
+                            .is_some_and(|owner| owner.phone_number == other)
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    client.lid_pn_cache.get_phone_number(lid).await.as_deref(),
+                    Some(other)
+                );
+                assert_eq!(
+                    client.lid_pn_cache.get_current_lid(other).await.as_deref(),
+                    Some(lid)
+                );
+                assert_eq!(
+                    backend.get_pn_mapping(other).await.unwrap().unwrap().lid,
+                    lid
+                );
+            }
+            drop(registry);
+            tokio::time::timeout(std::time::Duration::from_secs(5), migration)
+                .await
+                .unwrap();
+            if let Some(learning) = learning {
+                tokio::time::timeout(std::time::Duration::from_secs(5), learning)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            }
+            let source = backend.get_devices(phone).await.unwrap();
+            assert_eq!(
+                source.as_ref().and_then(|row| row.raw_id),
+                rebind_before_transfer.then_some(11),
+                "obsolete discovery must not delete another owner's PN registry"
+            );
+            let target = backend.get_devices(lid).await.unwrap().unwrap();
+            assert_eq!(
+                target.raw_id,
+                Some(if rebind_before_transfer { 22 } else { 11 })
+            );
+            assert_eq!(
+                target
+                    .devices
+                    .iter()
+                    .map(|device| device.device_id())
+                    .collect::<Vec<_>>(),
+                if rebind_before_transfer {
+                    vec![0, 8]
+                } else {
+                    vec![0, 7]
+                }
+            );
+            client.signal_shutdown_sync();
+        }
+    }
+
+    #[tokio::test]
+    async fn adv_review_round6_offline_alias_migrates_without_overriding_durable_conflicts() {
+        use crate::store::release::tests::ProbeBackend;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use wacore::libsignal::protocol::SessionRecord;
+        use wacore::types::jid::JidExt as _;
+        for case in ["warm_only", "foreign", "read_error"] {
+            let (mut probe, _) = ProbeBackend::new();
+            let raw = probe.backend.clone();
+            let fail = Arc::new(AtomicBool::new(false));
+            probe.fail_before_method = Some(("get_lid_mapping", fail.clone()));
+            let (client, _) =
+                crate::test_utils::create_iq_test_client_with_backend(Arc::new(probe)).await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !client.lid_pn_cache.startup_finished_for_tests() {
+                    tokio::task::yield_now().await;
+                }
+                drop(client.lid_pn_cache.lock_mutation().await);
+            })
+            .await
+            .unwrap();
+            let phone = Jid::pn("12025550198");
+            let other = Jid::pn("12025550199");
+            let lid = Jid::lid("100000000000198");
+            // This is the real receive API's offline branch: visible mapping,
+            // with no persistence task before the backlog checkpoint.
+            client
+                .learn_lid_pn_mapping_fast(
+                    &lid.user,
+                    &phone.user,
+                    LearningSource::PeerLidMessage,
+                    true,
+                )
+                .await;
+            assert_eq!(
+                client
+                    .lid_pn_cache
+                    .get_current_lid(&phone.user)
+                    .await
+                    .as_deref(),
+                Some(lid.user.as_str())
+            );
+            assert_eq!(
+                client
+                    .lid_pn_cache
+                    .get_phone_number(&lid.user)
+                    .await
+                    .as_deref(),
+                Some(phone.user.as_str())
+            );
+            assert!(raw.get_lid_mapping(&lid.user).await.unwrap().is_none());
+            let source = phone.to_protocol_address();
+            let target = lid.to_protocol_address();
+            for (address, registration) in [(&source, 101), (&target, 201)] {
+                client
+                    .signal_cache
+                    .put_session(
+                        address,
+                        SessionRecord::deserialize(&tagged_session_blob(registration)).unwrap(),
+                    )
+                    .await;
+            }
+            let backend = client.persistence_manager.backend();
+            client.signal_cache.flush(backend.as_ref()).await.unwrap();
+            if case == "foreign" {
+                raw.put_lid_mapping(&LidPnMappingEntry {
+                    lid: lid.user.to_string(),
+                    phone_number: other.user.to_string(),
+                    created_at: client.runtime.wall_time_secs(),
+                    updated_at: client.runtime.wall_time_secs(),
+                    learning_source: "usync".into(),
+                })
+                .await
+                .unwrap();
+            }
+            fail.store(case == "read_error", Ordering::Release);
+            let moves = case == "warm_only";
+            assert_eq!(
+                client
+                    .migrate_signal_sessions_on_lid_discovery(&phone.user, &lid.user)
+                    .await,
+                moves
+            );
+            assert_eq!(
+                client
+                    .signal_cache
+                    .peek_session(&source, backend.as_ref())
+                    .await
+                    .unwrap()
+                    .is_some(),
+                !moves
+            );
+            assert_eq!(
+                client
+                    .signal_cache
+                    .peek_session(&target, backend.as_ref())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .remote_registration_id()
+                    .unwrap(),
+                if moves { 101 } else { 201 }
+            );
+            assert_eq!(
+                raw.get_session(source.as_str()).await.unwrap().is_some(),
+                !moves
+            );
+            assert_eq!(
+                raw.get_lid_mapping(&lid.user).await.unwrap().is_some(),
+                case == "foreign"
+            );
+            client.signal_shutdown_sync();
+        }
+    }
+
+    #[tokio::test]
+    async fn adv_review_round6_discovery_requires_alias_evidence_but_explicit_target_remains_supported()
+     {
+        use wacore::libsignal::protocol::SessionRecord;
+        use wacore::types::jid::JidExt as _;
+        let client: Arc<Client> = create_test_client().await;
+        let phone = Jid::pn("12025550195");
+        let lid = Jid::lid("100000000000195");
+        let source = phone.to_protocol_address();
+        let target = lid.to_protocol_address();
+        let backend = client.persistence_manager.backend();
+        client
+            .signal_cache
+            .put_session(
+                &source,
+                SessionRecord::deserialize(&tagged_session_blob(71)).unwrap(),
+            )
+            .await;
+        assert!(
+            !client
+                .migrate_signal_sessions_on_lid_discovery(&phone.user, &lid.user)
+                .await
+        );
+        assert_eq!(
+            client
+                .signal_cache
+                .peek_session(&source, backend.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+                .remote_registration_id()
+                .unwrap(),
+            71
+        );
+        assert!(
+            client
+                .signal_cache
+                .peek_session(&target, backend.as_ref())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let explicit = client.migrate_signal_sessions(&phone, &lid).await;
+        assert_eq!(explicit.migrated, 1);
+        client.signal_cache.flush(backend.as_ref()).await.unwrap();
+        assert!(
+            backend
+                .get_session(source.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            client
+                .signal_cache
+                .peek_session(&target, backend.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+                .remote_registration_id()
+                .unwrap(),
+            71
+        );
+        client.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn adv_review_round6_discovery_validates_durable_owner_when_cache_is_cold_or_stale() {
+        use wacore::libsignal::protocol::SessionRecord;
+        use wacore::types::jid::JidExt as _;
+        for foreign_owner in [false, true] {
+            let client: Arc<Client> = create_test_client().await;
+            let phone = Jid::pn("12025550196");
+            let other = Jid::pn("12025550197");
+            let lid = Jid::lid("100000000000196");
+            client
+                .add_lid_pn_mapping(&lid.user, &phone.user, LearningSource::Usync)
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !client.lid_pn_cache.startup_finished_for_tests() {
+                    tokio::task::yield_now().await;
+                }
+                drop(client.lid_pn_cache.lock_mutation().await);
+            })
+            .await
+            .unwrap();
+            let source = phone.to_protocol_address();
+            let target = lid.to_protocol_address();
+            let backend = client.persistence_manager.backend();
+            for (address, registration) in [(&source, 81), (&target, 91)] {
+                client
+                    .signal_cache
+                    .put_session(
+                        address,
+                        SessionRecord::deserialize(&tagged_session_blob(registration)).unwrap(),
+                    )
+                    .await;
+            }
+            client.signal_cache.flush(backend.as_ref()).await.unwrap();
+            if foreign_owner {
+                backend
+                    .put_lid_mapping(&LidPnMappingEntry {
+                        lid: lid.user.to_string(),
+                        phone_number: other.user.to_string(),
+                        created_at: client.runtime.wall_time_secs(),
+                        updated_at: client.runtime.wall_time_secs(),
+                        learning_source: "usync".into(),
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    client
+                        .lid_pn_cache
+                        .get_phone_number(&lid.user)
+                        .await
+                        .as_deref(),
+                    Some(phone.user.as_str())
+                );
+            } else {
+                client.lid_pn_cache.evict_reverse_for_tests(&lid.user).await;
+                assert!(
+                    client
+                        .lid_pn_cache
+                        .get_phone_number(&lid.user)
+                        .await
+                        .is_none()
+                );
+            }
+            assert_eq!(
+                client
+                    .migrate_signal_sessions_on_lid_discovery(&phone.user, &lid.user)
+                    .await,
+                !foreign_owner
+            );
+            assert_eq!(
+                client
+                    .signal_cache
+                    .peek_session(&source, backend.as_ref())
+                    .await
+                    .unwrap()
+                    .is_some(),
+                foreign_owner
+            );
+            assert_eq!(
+                client
+                    .signal_cache
+                    .peek_session(&target, backend.as_ref())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .remote_registration_id()
+                    .unwrap(),
+                if foreign_owner { 91 } else { 81 }
+            );
+            client.signal_cache.flush(backend.as_ref()).await.unwrap();
+            assert_eq!(
+                backend
+                    .get_session(source.as_str())
+                    .await
+                    .unwrap()
+                    .is_some(),
+                foreign_owner
+            );
+            client.signal_shutdown_sync();
+        }
+    }
+
+    #[tokio::test]
+    async fn adv_review_round6_discovery_rechecks_owner_before_companion_transfer() {
+        use wacore::libsignal::protocol::SessionRecord;
+        use wacore::types::jid::JidExt as _;
+
+        for rebind in [false, true] {
+            let client: Arc<Client> = create_test_client().await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !client.lid_pn_cache.startup_finished_for_tests() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let phone = Jid::pn("12025550189");
+            let other = Jid::pn("12025550190");
+            let lid = Jid::lid("100000000000189");
+            client
+                .add_lid_pn_mapping(&lid.user, &phone.user, LearningSource::Usync)
+                .await
+                .unwrap();
+            let source = phone.with_device(7).to_protocol_address();
+            let target = lid.with_device(7).to_protocol_address();
+            let a = tagged_session_blob(8181);
+            let b = tagged_session_blob(9191);
+            client
+                .signal_cache
+                .put_session(&source, SessionRecord::deserialize(&a).unwrap())
+                .await;
+            client
+                .signal_cache
+                .put_session(&target, SessionRecord::deserialize(&b).unwrap())
+                .await;
+            let backend = client.persistence_manager.backend();
+            client.signal_cache.flush(backend.as_ref()).await.unwrap();
+            // Signal serialization materializes an optional default field.
+            // Compare the canonical stored fixtures, not the input encoder's
+            // alternate-but-equivalent representation of that default.
+            let a = backend
+                .get_session(source.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            let b = backend
+                .get_session(target.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .to_vec();
+            assert_ne!(a, b);
+            let mutex = client.session_lock_for(source.as_str()).await;
+            let source_guard = mutex.lock().await;
+            let mut migration =
+                Box::pin(client.migrate_signal_sessions_on_lid_discovery(&phone.user, &lid.user));
+            assert!(futures::poll!(migration.as_mut()).is_pending());
+            if rebind {
+                // The first Pending can be an earlier durable read while
+                // migration owns Map, rather than the held companion mutex.
+                // Keep driving both operations so that read can release Map;
+                // device7 still cannot move until source_guard is released.
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::select! {
+                        result = client.add_lid_pn_mapping(
+                            &lid.user,
+                            &other.user,
+                            LearningSource::RecipientLatestLid,
+                        ) => result,
+                        _ = migration.as_mut() => panic!(
+                            "migration cannot finish while its source companion is locked"
+                        ),
+                    }
+                })
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(
+                    client
+                        .lid_pn_cache
+                        .get_phone_number(&lid.user)
+                        .await
+                        .as_deref(),
+                    Some(other.user.as_str())
+                );
+                assert_eq!(
+                    client
+                        .lid_pn_cache
+                        .get_current_lid(&other.user)
+                        .await
+                        .as_deref(),
+                    Some(lid.user.as_str())
+                );
+                assert_eq!(
+                    backend
+                        .get_lid_mapping(&lid.user)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .phone_number,
+                    other.user.as_str()
+                );
+                assert_eq!(
+                    backend
+                        .get_pn_mapping(&other.user)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .lid,
+                    lid.user.as_str()
+                );
+            }
+            drop(source_guard);
+            tokio::time::timeout(std::time::Duration::from_secs(5), migration)
+                .await
+                .unwrap();
+            let current_source = client
+                .signal_cache
+                .peek_session(&source, backend.as_ref())
+                .await
+                .unwrap();
+            let current_target = client
+                .signal_cache
+                .peek_session(&target, backend.as_ref())
+                .await
+                .unwrap();
+            assert_eq!(
+                current_source
+                    .as_ref()
+                    .map(|record| record.serialize().unwrap()),
+                rebind.then_some(a.clone()),
+                "obsolete discovery must preserve the old owner's companion session"
+            );
+            let expected_target = if rebind { b } else { a.clone() };
+            assert_eq!(
+                current_target.unwrap().serialize().unwrap(),
+                expected_target,
+                "unchanged owner keeps PN-wins; changed owner must preserve destination"
+            );
+            client.signal_cache.flush(backend.as_ref()).await.unwrap();
+            assert_eq!(
+                backend
+                    .get_session(source.as_str())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                rebind.then_some(a.as_slice())
+            );
+            assert_eq!(
+                backend
+                    .get_session(target.as_str())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(expected_target.as_slice())
+            );
+            client.signal_shutdown_sync();
+        }
+    }
+
     /// After device 0 has migrated, a companion's retained old session must
     /// still exclude identity recovery under both primary account locks.
     #[tokio::test]
@@ -3303,6 +3956,10 @@ mod tests {
         let client: Arc<Client> = create_test_client().await;
         let pn = "13135550100";
         let lid = "100000000000100";
+        client
+            .add_lid_pn_mapping(lid, pn, LearningSource::Usync)
+            .await
+            .unwrap();
         let backend = client.persistence_manager.backend();
         let pairs = [
             (Server::Pn, Server::Lid, 11),
@@ -3634,6 +4291,10 @@ mod tests {
         let pn = "19990000004";
         let lid = "100000000000104";
         client
+            .add_lid_pn_mapping(lid, pn, LearningSource::Usync)
+            .await
+            .unwrap();
+        client
             .signal_cache
             .put_identity(&Jid::pn_device(pn, 0).to_protocol_address(), &[7; 32])
             .await;
@@ -3665,6 +4326,10 @@ mod tests {
         let client: Arc<Client> = create_test_client().await;
         let pn = "5500000002222";
         let lid = "133333333333333";
+        client
+            .add_lid_pn_mapping(lid, pn, LearningSource::Usync)
+            .await
+            .unwrap();
         let pn_addr = Jid::pn_device(pn.to_string(), 0).to_protocol_address();
         let lid_addr = Jid::lid_device(lid.to_string(), 0).to_protocol_address();
         let backend = client.persistence_manager.backend();
@@ -3696,6 +4361,10 @@ mod tests {
         let client = create_test_client_with_backend(backend.clone()).await;
         let pn = "5500000003333";
         let lid = "144444444444444";
+        client
+            .add_lid_pn_mapping(lid, pn, LearningSource::Usync)
+            .await
+            .unwrap();
         let pn_addr = Jid::pn_device(pn, 0).to_protocol_address();
         let lid_addr = Jid::lid_device(lid, 0).to_protocol_address();
         client

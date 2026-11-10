@@ -162,14 +162,21 @@ impl DeviceTopology {
 /// The device registry cache plus its topology tracker, fused so every write
 /// records the change. Reads are pass-through; the only write entry points
 /// are [`insert`](Self::insert), [`invalidate`](Self::invalidate) and the
-/// non-recording [`promote`](Self::promote) (whose data is by definition what
-/// the DB fallback already answered).
+/// non-recording [`promote_guarded`](Self::promote_guarded), whose caller
+/// orders the DB fallback under the registry guard.
 pub(crate) struct DeviceRegistryCache {
     cache: crate::cache_store::TypedCache<Arc<str>, Arc<wacore::store::traits::DeviceListRecord>>,
     topology: Arc<DeviceTopology>,
 }
 
 impl DeviceRegistryCache {
+    #[cfg(test)]
+    pub(crate) fn local_for_tests(
+        &self,
+    ) -> Option<&crate::cache::Cache<Arc<str>, Arc<wacore::store::traits::DeviceListRecord>>> {
+        self.cache.local_for_tests()
+    }
+
     pub(crate) fn new(
         cache: crate::cache_store::TypedCache<
             Arc<str>,
@@ -226,12 +233,25 @@ impl DeviceRegistryCache {
 
     /// Cache-fill from the DB row the fallback path would have returned: the
     /// answer is unchanged, so no topology change is recorded.
+    pub(crate) async fn promote_guarded(
+        &self,
+        _guard: &DeviceRegistryMutationGuard<'_>,
+        key: Arc<str>,
+        record: Arc<wacore::store::traits::DeviceListRecord>,
+    ) {
+        self.cache.insert(key, record).await;
+    }
+
+    /// Seed the existing benchmark fixtures without changing their data or
+    /// registration. Production DB fills use the guarded, ordered path.
+    #[cfg(feature = "bench-harness")]
     pub(crate) async fn promote(
         &self,
         key: Arc<str>,
         record: Arc<wacore::store::traits::DeviceListRecord>,
     ) {
-        self.cache.insert(key, record).await;
+        let guard = self.topology.lock_registry().await;
+        self.promote_guarded(&guard, key, record).await;
     }
 
     /// Approximate entry count plus estimated retained bytes. Bytes are `0`

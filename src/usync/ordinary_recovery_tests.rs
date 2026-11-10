@@ -12,6 +12,1202 @@ use wacore::types::events::{Event, EventInterest, EventKind};
 use wacore::types::jid::JidExt as _;
 use wacore_binary::builder::NodeBuilder;
 
+struct OwnershipCallbackCache {
+    rows: std::sync::Mutex<std::collections::HashMap<(String, String), Vec<u8>>>,
+    manager:
+        std::sync::Mutex<std::sync::Weak<crate::store::persistence_manager::PersistenceManager>>,
+    enabled: std::sync::atomic::AtomicBool,
+    taken: std::sync::atomic::AtomicBool,
+    sets: std::sync::atomic::AtomicUsize,
+    cancelled: std::sync::atomic::AtomicBool,
+    entered: async_channel::Sender<(tokio::task::AbortHandle, i64)>,
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl wacore::store::CacheStore for OwnershipCallbackCache {
+    async fn get(&self, namespace: &str, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self
+            .rows
+            .lock()
+            .unwrap()
+            .get(&(namespace.into(), key.into()))
+            .cloned())
+    }
+
+    async fn set(
+        &self,
+        namespace: &str,
+        key: &str,
+        value: &[u8],
+        _: Option<Duration>,
+    ) -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        self.sets.fetch_add(1, Ordering::Relaxed);
+        if self.enabled.load(Ordering::Acquire) && !self.taken.swap(true, Ordering::AcqRel) {
+            let manager = self.manager.lock().unwrap().upgrade().unwrap();
+            let record: DeviceListRecord = serde_json::from_slice(value).unwrap();
+            let callback = tokio::spawn(async move {
+                manager
+                    .modify_device(|device| device.push_name = "registry callback".into())
+                    .await;
+            });
+            self.entered
+                .send((callback.abort_handle(), record.timestamp))
+                .await
+                .unwrap();
+            if callback.await.is_err() {
+                self.cancelled.store(true, Ordering::Release);
+            }
+        }
+        self.rows
+            .lock()
+            .unwrap()
+            .insert((namespace.into(), key.into()), value.to_vec());
+        Ok(())
+    }
+
+    async fn delete(&self, namespace: &str, key: &str) -> anyhow::Result<()> {
+        self.rows
+            .lock()
+            .unwrap()
+            .remove(&(namespace.into(), key.into()));
+        Ok(())
+    }
+
+    async fn clear(&self, namespace: &str) -> anyhow::Result<()> {
+        self.rows
+            .lock()
+            .unwrap()
+            .retain(|(stored, _), _| stored != namespace);
+        Ok(())
+    }
+}
+
+async fn check_hosted_cache_callback_ownership(cold_fill: bool, callback_enabled: bool) {
+    use crate::cache_config::{CacheConfig, CacheStores};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let (entered, arrived) = async_channel::unbounded();
+    let store = Arc::new(OwnershipCallbackCache {
+        rows: std::sync::Mutex::new(Default::default()),
+        manager: std::sync::Mutex::new(Default::default()),
+        enabled: AtomicBool::new(false),
+        taken: AtomicBool::new(false),
+        sets: AtomicUsize::new(0),
+        cancelled: AtomicBool::new(false),
+        entered,
+    });
+    let backend = crate::test_utils::create_test_backend().await;
+    let user = Jid::pn(if cold_fill {
+        "12025550176"
+    } else {
+        "12025550175"
+    });
+    if cold_fill {
+        backend
+            .update_device_list(DeviceListRecord {
+                user: user.user.as_str().into(),
+                devices: [
+                    DeviceInfo::new(0, None),
+                    DeviceInfo::new(2, Some(1)).with_hosting(true),
+                ]
+                .into(),
+                raw_id: Some(1),
+                timestamp: 1,
+                phash: None,
+            })
+            .await
+            .unwrap();
+    }
+    let config = CacheConfig::default().with_cache_stores(CacheStores {
+        device_registry_cache: Some(store.clone()),
+        ..Default::default()
+    });
+    let (client, transport) = crate::test_utils::create_iq_test_client_with_runtime_and_config(
+        backend.clone(),
+        Arc::new(crate::runtime_impl::TokioRuntime),
+        config,
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !client.lid_pn_cache.startup_finished_for_tests() {
+            tokio::task::yield_now().await;
+        }
+        drop(client.lid_pn_cache.lock_mutation().await);
+    })
+    .await
+    .unwrap();
+    crate::test_utils::seed_adv_primary(&client, &user).await;
+    client.flush_signal_cache_batch_safe().await.unwrap();
+    let key = client.cached_adv_account_identity(&user).await.unwrap();
+    *store.manager.lock().unwrap() = Arc::downgrade(&client.persistence_manager);
+    store.rows.lock().unwrap().clear();
+    store.sets.store(0, Ordering::Relaxed);
+    store.enabled.store(callback_enabled, Ordering::Release);
+    let mut lookup = {
+        let client = client.clone();
+        let user = user.clone();
+        tokio::spawn(async move { client.refresh_user_devices(vec![user]).await })
+    };
+    let iq = decode_sent_iq(&transport, 0).await;
+    let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+    let signature = hosted_epoch_response(&user).device_lists[0]
+        .key_index_bytes
+        .clone()
+        .unwrap();
+    answer_iq(
+        &client,
+        &id,
+        &tests::adv_wire_response_with_hosting(&user, signature, 2, true),
+    )
+    .await;
+    let abort = if callback_enabled {
+        let (abort, timestamp) = tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            timestamp == 1,
+            cold_fill,
+            "the callback must occur at the selected read-fill/publication phase"
+        );
+        Some(abort)
+    } else {
+        None
+    };
+    let result = tokio::time::timeout(Duration::from_secs(5), &mut lookup).await;
+    if result.is_err() {
+        if let Some(abort) = abort {
+            abort.abort();
+        }
+        let drained = tokio::time::timeout(Duration::from_secs(5), &mut lookup)
+            .await
+            .is_ok();
+        client.signal_shutdown_sync();
+        panic!(
+            "hosted cache callback waited on its publisher's ownership; cold_fill={cold_fill}, cleanup={drained}"
+        );
+    }
+    let devices = result.unwrap().unwrap().unwrap();
+    assert!(devices.contains(&user));
+    assert!(
+        devices
+            .iter()
+            .any(|device| device.user == user.user && device.device == 2 && device.is_hosted())
+    );
+    assert_eq!(
+        client.cached_adv_account_identity(&user).await.unwrap(),
+        key
+    );
+    assert!(!store.cancelled.load(Ordering::Acquire));
+    assert!(store.sets.load(Ordering::Relaxed) >= if cold_fill { 2 } else { 1 });
+    if callback_enabled {
+        assert_eq!(
+            client.persistence_manager.get_device_snapshot().push_name,
+            "registry callback"
+        );
+    }
+    let record = backend.get_devices(&user.user).await.unwrap().unwrap();
+    assert_eq!(
+        record
+            .devices
+            .iter()
+            .map(|device| device.device_id())
+            .collect::<Vec<_>>(),
+        [0, 2]
+    );
+    client.signal_shutdown_sync();
+}
+
+#[tokio::test]
+async fn adv_review_round8_hosted_publication_cache_callback_can_modify_device() {
+    check_hosted_cache_callback_ownership(false, false).await;
+    check_hosted_cache_callback_ownership(false, true).await;
+}
+
+#[tokio::test]
+async fn adv_review_round8_hosted_cold_fill_cache_callback_can_modify_device() {
+    check_hosted_cache_callback_ownership(true, false).await;
+    check_hosted_cache_callback_ownership(true, true).await;
+}
+
+struct HostedPublicationEventProbe {
+    client: std::sync::Weak<Client>,
+    observations: std::sync::Mutex<Vec<[bool; 3]>>,
+}
+
+#[tokio::test]
+async fn adv_review_round8_busy_after_mapping_ack_keeps_the_original_generation() {
+    use crate::store::release::tests::ProbeBackend;
+    let (mut probe, _) = ProbeBackend::new();
+    let backend = probe.backend.clone();
+    let (entered, arrived) = async_channel::unbounded();
+    let (release, gate) = async_channel::unbounded();
+    probe.gate_method = "after:put_lid_mappings";
+    probe.gate_once = true;
+    probe.entered = Some(entered);
+    probe.gate = Some(gate);
+    let (client, _) = crate::test_utils::create_iq_test_client_with_backend(Arc::new(probe)).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !client.lid_pn_cache.startup_finished_for_tests() {
+            tokio::task::yield_now().await;
+        }
+        drop(client.lid_pn_cache.lock_mutation().await);
+    })
+    .await
+    .unwrap();
+    let phone = Jid::pn("12025550174");
+    let lid = Jid::lid("100000000000174");
+    crate::test_utils::seed_adv_primary(&client, &phone).await;
+    client.flush_signal_cache_batch_safe().await.unwrap();
+    let old = client.cached_adv_account_identity(&phone).await.unwrap();
+    let epoch = client.signal_cache.identity_continuity.primary_snapshot();
+    let generation = client.device_topology.current();
+    let replacement = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+    let mut response = hosted_epoch_response(&phone);
+    response.device_lists[0].key_index_bytes = Some(signed_list(&replacement, true));
+    response.lid_mappings.push(wacore::usync::UsyncLidMapping {
+        phone_number: phone.user.clone(),
+        lid: lid.user.clone(),
+    });
+    let ownership = client.persistence_manager.lock_device_ownership().await;
+    let operation = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .apply_owned_device_list_response(
+                    response,
+                    DeviceListApplyMode::StrictRefresh,
+                    Some(generation),
+                    None,
+                    DeviceListAuthentication {
+                        prepared: Vec::new(),
+                        primary_epoch: epoch,
+                    },
+                    None,
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(backend.get_lid_mapping(&lid.user).await.unwrap().is_some());
+    assert!(client.device_topology.current() > generation);
+    release.send(()).await.unwrap();
+    // These guards must become available while ownership is still unavailable.
+    drop(
+        tokio::time::timeout(Duration::from_secs(5), client.lid_pn_cache.lock_mutation())
+            .await
+            .unwrap(),
+    );
+    drop(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client.device_topology.lock_registry(),
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(!operation.is_finished());
+    drop(ownership);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), operation)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        client.device_list_account_identity(&phone).await.unwrap(),
+        old
+    );
+    assert!(
+        backend.get_lid_mapping(&lid.user).await.unwrap().is_some(),
+        "Busy is not a rollback of the acknowledged mapping"
+    );
+    for user in [&phone, &lid] {
+        assert!(backend.get_devices(&user.user).await.unwrap().is_none());
+        assert!(client.device_registry_cache.get(&user.user).await.is_none());
+    }
+    client.signal_shutdown_sync();
+}
+
+fn hosted_epoch_response(user: &Jid) -> DeviceListResponse {
+    let mut response = migration_response(user);
+    let list = &mut response.device_lists[0];
+    list.devices[1].is_hosted = true;
+    let mut signed =
+        waproto::codec::adv_signed_key_index_list_decode(list.key_index_bytes.as_deref().unwrap())
+            .unwrap();
+    signed.account_signature_key = Some(
+        crate::test_utils::adv_test_account()
+            .public_key
+            .public_key_bytes()
+            .to_vec(),
+    );
+    let bytes = waproto::codec::adv_signed_key_index_list_to_vec(&signed);
+    assert!(wacore::adv::verify_hosted_key_index_list(&bytes).is_some());
+    list.key_index_bytes = Some(bytes);
+    response
+}
+
+#[tokio::test]
+async fn adv_review_round7_unavailable_request_epoch_cannot_publish_a_hosted_list() {
+    for available in [false, true] {
+        let (client, _) = create_iq_test_client().await;
+        let user = Jid::pn("12025550182");
+        crate::test_utils::seed_adv_primary(&client, &user).await;
+        client.flush_signal_cache_batch_safe().await.unwrap();
+        let before = client.cached_adv_account_identity(&user).await.unwrap();
+        let response = hosted_epoch_response(&user);
+        let epoch = available
+            .then(|| client.signal_cache.identity_continuity.primary_snapshot())
+            .flatten();
+        let result = client
+            .apply_device_list_response_in_epoch(
+                &response,
+                DeviceListApplyMode::CachePreferred,
+                None,
+                None,
+                epoch,
+            )
+            .await;
+        assert_eq!(result.is_ok(), available);
+        assert_eq!(
+            client.cached_adv_account_identity(&user).await.unwrap(),
+            before
+        );
+        let backend = client.persistence_manager.backend();
+        assert_eq!(
+            backend.get_devices(&user.user).await.unwrap().is_some(),
+            available
+        );
+        assert_eq!(
+            client.device_registry_cache.get(&user.user).await.is_some(),
+            available
+        );
+        client.signal_shutdown_sync();
+    }
+}
+
+#[tokio::test]
+async fn adv_review_round7_retired_hosted_epoch_does_not_reject_a_valid_group_peer() {
+    for retire in [false, true] {
+        let (client, _) = create_iq_test_client().await;
+        let retired = Jid::pn("12025550181");
+        let valid = Jid::pn("12025550180");
+        for user in [&retired, &valid] {
+            crate::test_utils::seed_adv_primary(&client, user).await;
+        }
+        client.flush_signal_cache_batch_safe().await.unwrap();
+        let epoch = client.signal_cache.identity_continuity.primary_snapshot();
+        if retire {
+            client
+                .signal_cache
+                .delete_identity(&retired.to_protocol_address())
+                .await;
+            client.flush_signal_cache_batch_safe().await.unwrap();
+        }
+        let mut response = hosted_epoch_response(&retired);
+        response
+            .device_lists
+            .extend(hosted_epoch_response(&valid).device_lists);
+        let devices = client
+            .try_process_group_device_list_response_in_epoch(
+                &response,
+                &[retired.clone(), valid.clone()],
+                client.device_topology.current(),
+                epoch,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(devices.contains(&valid));
+        assert!(
+            devices.iter().any(|device| device.user == valid.user
+                && device.device == 7
+                && device.is_hosted())
+        );
+        assert_eq!(
+            devices.iter().any(|device| device.user == retired.user),
+            !retire
+        );
+        let backend = client.persistence_manager.backend();
+        assert_eq!(
+            backend.get_devices(&retired.user).await.unwrap().is_some(),
+            !retire
+        );
+        assert!(backend.get_devices(&valid.user).await.unwrap().is_some());
+        assert_eq!(
+            client
+                .device_registry_cache
+                .get(&retired.user)
+                .await
+                .is_some(),
+            !retire
+        );
+        assert_eq!(
+            client
+                .cached_adv_account_identity(&retired)
+                .await
+                .unwrap()
+                .is_some(),
+            !retire
+        );
+        client.signal_shutdown_sync();
+    }
+}
+
+#[tokio::test]
+async fn adv_review_round7_recovery_cannot_refresh_another_hosted_rows_epoch() {
+    let (client, transport) = create_iq_test_client().await;
+    let ordinary = Jid::pn("12025550179");
+    let hosted = Jid::pn("12025550178");
+    for user in [&ordinary, &hosted] {
+        crate::test_utils::seed_adv_primary(&client, user).await;
+    }
+    client.flush_signal_cache_batch_safe().await.unwrap();
+    let previous = client.cached_adv_account_identity(&ordinary).await.unwrap();
+    let replacement = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+    let ordinary_wire = adv_wire_response(&ordinary, signed_list(&replacement, true));
+    let hosted_wire = tests::adv_wire_response_with_hosting(
+        &hosted,
+        hosted_epoch_response(&hosted).device_lists[0]
+            .key_index_bytes
+            .clone()
+            .unwrap(),
+        2,
+        true,
+    );
+    let users: Vec<_> = [&ordinary_wire, &hosted_wire]
+        .iter()
+        .map(|wire| {
+            wire.get_optional_child("usync")
+                .unwrap()
+                .get_optional_child("list")
+                .unwrap()
+                .children()
+                .unwrap()[0]
+                .clone()
+        })
+        .collect();
+    let response = NodeBuilder::new("iq")
+        .attr("type", "result")
+        .children([NodeBuilder::new("usync")
+            .children([NodeBuilder::new("list").children(users).build()])
+            .build()])
+        .build();
+    let epoch = client.signal_cache.identity_continuity.primary_snapshot();
+    let query = {
+        let client = client.clone();
+        let users = vec![ordinary.clone(), hosted.clone()];
+        tokio::spawn(async move {
+            client
+                .fetch_user_devices_once(users, Freshness::CachePreferred)
+                .await
+        })
+    };
+    let iq = decode_sent_iq(&transport, 0).await;
+    let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+    answer_iq(&client, &id, &response).await;
+    let failure = query
+        .await
+        .unwrap()
+        .unwrap_err()
+        .downcast::<DeviceListAdvError>()
+        .unwrap();
+    assert_eq!(failure.authentication_epoch, epoch);
+    let generation = client.device_topology.current();
+    client
+        .signal_cache
+        .delete_identity(&hosted.to_protocol_address())
+        .await;
+    client.flush_signal_cache_batch_safe().await.unwrap();
+    assert_eq!(client.device_topology.current(), generation);
+    let recovery = {
+        let client = client.clone();
+        tokio::spawn(async move { client.recover_ordinary_adv_identity(failure.into()).await })
+    };
+    let iq = decode_sent_iq(&transport, 1).await;
+    let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+    answer_iq(
+        &client,
+        &id,
+        &primary_response(&ordinary, &replacement, true),
+    )
+    .await;
+    let result = tokio::time::timeout(Duration::from_secs(5), recovery)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(result.is_err());
+    assert_eq!(
+        client.cached_adv_account_identity(&hosted).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        client.cached_adv_account_identity(&ordinary).await.unwrap(),
+        previous
+    );
+    let backend = client.persistence_manager.backend();
+    for user in [&ordinary, &hosted] {
+        assert!(backend.get_devices(&user.user).await.unwrap().is_none());
+        assert!(client.device_registry_cache.get(&user.user).await.is_none());
+    }
+    client.signal_shutdown_sync();
+}
+
+impl wacore::types::events::EventHandler for HostedPublicationEventProbe {
+    fn handle_event(&self, event: Arc<Event>) {
+        if !matches!(event.as_ref(), Event::IdentityChange(_)) {
+            return;
+        }
+        let client = self.client.upgrade().unwrap();
+        let waker = futures::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut ownership = std::pin::pin!(client.persistence_manager.lock_device_ownership());
+        let own_free = ownership.as_mut().poll(&mut context).is_ready();
+        let mut mapping = std::pin::pin!(client.lid_pn_cache.lock_mutation());
+        let map_free = mapping.as_mut().poll(&mut context).is_ready();
+        let mut registry = std::pin::pin!(client.device_topology.lock_registry());
+        let registry_free = registry.as_mut().poll(&mut context).is_ready();
+        self.observations
+            .lock()
+            .unwrap()
+            .push([own_free, map_free, registry_free]);
+    }
+}
+
+/// Exercise the public IQ boundary, not direct response application.
+#[tokio::test]
+async fn adv_review_round7_hosted_cache_preferred_iq_cannot_restore_a_retired_primary() {
+    for reset in [false, true] {
+        let (client, transport) = create_iq_test_client().await;
+        let user = Jid::pn("12025550185");
+        crate::test_utils::seed_adv_primary(&client, &user).await;
+        client.flush_signal_cache_batch_safe().await.unwrap();
+        let key = client
+            .cached_adv_account_identity(&user)
+            .await
+            .unwrap()
+            .unwrap();
+        let backend = client.persistence_manager.backend();
+        let operation = {
+            let client = client.clone();
+            let user = user.clone();
+            tokio::spawn(async move {
+                client
+                    .signal()
+                    .get_user_devices(std::slice::from_ref(&user))
+                    .await
+            })
+        };
+        let iq = decode_sent_iq(&transport, 0).await;
+        if reset {
+            deliver_identity_reset(&client, &user, None).await;
+            assert_eq!(
+                client.cached_adv_account_identity(&user).await.unwrap(),
+                None
+            );
+            assert_eq!(
+                backend
+                    .load_identity(user.to_protocol_address().as_str())
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
+        let mut signed =
+            waproto::codec::adv_signed_key_index_list_decode(&signed_key_index_bytes(vec![1], 1))
+                .unwrap();
+        signed.account_signature_key = Some(key.to_vec());
+        let response = tests::adv_wire_response_with_hosting(
+            &user,
+            waproto::codec::adv_signed_key_index_list_to_vec(&signed),
+            2,
+            true,
+        );
+        let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+        answer_iq(&client, &id, &response).await;
+        let result = tokio::time::timeout(Duration::from_secs(5), operation)
+            .await
+            .unwrap()
+            .unwrap();
+        if reset {
+            assert_eq!(
+                client.cached_adv_account_identity(&user).await.unwrap(),
+                None,
+                "a hosted IQ begun before retirement cannot restore its old primary"
+            );
+            assert_eq!(
+                backend
+                    .load_identity(user.to_protocol_address().as_str())
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert!(result.is_err());
+            assert!(backend.get_devices(&user.user).await.unwrap().is_none());
+            assert!(client.device_registry_cache.get(&user.user).await.is_none());
+        } else {
+            let devices = result.unwrap();
+            assert!(devices.contains(&user));
+            assert!(devices.iter().any(|device| device.user == user.user
+                && device.device == 2
+                && device.is_hosted()));
+            let record = backend.get_devices(&user.user).await.unwrap().unwrap();
+            assert_eq!(
+                record
+                    .devices
+                    .iter()
+                    .map(|device| device.device_id())
+                    .collect::<Vec<_>>(),
+                vec![0, 2]
+            );
+            assert_eq!(
+                client.cached_adv_account_identity(&user).await.unwrap(),
+                Some(key)
+            );
+        }
+        client.signal_shutdown_sync();
+    }
+}
+
+/// A host callback can await a different task without reentering its manager.
+#[tokio::test]
+async fn adv_review_round7_hosted_publication_cannot_deadlock_an_async_device_modifier() {
+    use crate::lid_pn_cache::LearningSource;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    for (hold_modifier, cancel, fail_registry) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (false, false, true),
+    ] {
+        let (pending, waiting) = async_channel::unbounded();
+        let (completed, finished) = async_channel::unbounded();
+        let runtime = Arc::new(BootstrapWorkerRuntime {
+            armed: AtomicBool::new(false),
+            pending,
+            completed,
+        });
+        let backend = crate::test_utils::create_test_backend().await;
+        let backend: Arc<dyn crate::store::traits::Backend> = if fail_registry {
+            let (mut probe, _) = crate::store::release::tests::ProbeBackend::new();
+            probe.backend = backend;
+            probe.fail_before_method =
+                Some(("update_device_lists", Arc::new(AtomicBool::new(true))));
+            Arc::new(probe)
+        } else {
+            backend
+        };
+        let (client, transport) =
+            crate::test_utils::create_iq_test_client_with_runtime(backend, runtime.clone()).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !client.lid_pn_cache.startup_finished_for_tests() {
+                tokio::task::yield_now().await;
+            }
+            drop(client.lid_pn_cache.lock_mutation().await);
+        })
+        .await
+        .unwrap();
+        let user = Jid::pn("12025550184");
+        crate::test_utils::seed_adv_primary(&client, &user).await;
+        client.flush_signal_cache_batch_safe().await.unwrap();
+        let probe = Arc::new(HostedPublicationEventProbe {
+            client: Arc::downgrade(&client),
+            observations: std::sync::Mutex::new(Vec::new()),
+        });
+        let subscription = client.subscribe_handler(probe.clone());
+        assert!(subscription.update_interest(EventInterest::of(&[EventKind::IdentityChange])));
+        subscription.detach();
+        let next_pair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let next = *next_pair.public_key.public_key_bytes();
+        let (release, callback_wait) = async_channel::bounded(1);
+        let (entered, callback_entered) = async_channel::bounded(1);
+        let mut modifier = hold_modifier.then(|| {
+            let manager = client.persistence_manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .modify_device_async(move |_| {
+                        Box::pin(async move {
+                            entered.send(()).await.unwrap();
+                            callback_wait.recv().await.unwrap();
+                        })
+                    })
+                    .await;
+            })
+        });
+        if hold_modifier {
+            tokio::time::timeout(Duration::from_secs(5), callback_entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let mut lookup = {
+            let client = client.clone();
+            let user = user.clone();
+            tokio::spawn(async move {
+                client
+                    .signal()
+                    .get_user_devices(std::slice::from_ref(&user))
+                    .await
+            })
+        };
+        let iq = decode_sent_iq(&transport, 0).await;
+        let mut signed =
+            waproto::codec::adv_signed_key_index_list_decode(&signed_key_index_bytes(vec![1], 1))
+                .unwrap();
+        signed.account_signature_key = Some(next.to_vec());
+        signed.account_signature = Some(
+            next_pair
+                .private_key
+                .calculate_signature(
+                    &[&[6, 2], signed.details.as_ref().unwrap().as_slice()].concat(),
+                    &mut rand::make_rng::<rand::rngs::StdRng>(),
+                )
+                .unwrap()
+                .to_vec(),
+        );
+        let signed = waproto::codec::adv_signed_key_index_list_to_vec(&signed);
+        assert_eq!(
+            wacore::adv::verify_hosted_key_index_list(&signed).map(|(_, key)| key),
+            Some(next)
+        );
+        let response = tests::adv_wire_response_with_hosting(&user, signed, 2, true);
+        let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+        if hold_modifier {
+            runtime.armed.store(true, Ordering::SeqCst);
+        }
+        answer_iq(&client, &id, &response).await;
+        if hold_modifier {
+            tokio::time::timeout(Duration::from_secs(5), waiting.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if cancel {
+                lookup.abort();
+                assert!((&mut lookup).await.unwrap_err().is_cancelled());
+            }
+            let mut host_task = {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    let result = client
+                        .add_lid_pn_mapping("100000000000186", "12025550186", LearningSource::Usync)
+                        .await;
+                    let _ = release.send(()).await;
+                    result
+                })
+            };
+            let outcome = tokio::time::timeout(Duration::from_secs(5), &mut host_task).await;
+            if outcome.is_err() {
+                let modifier = modifier.take().unwrap();
+                modifier.abort();
+                let _ = modifier.await;
+                let host_drained = tokio::time::timeout(Duration::from_secs(5), &mut host_task)
+                    .await
+                    .is_ok();
+                let publication_drained = tokio::time::timeout(Duration::from_secs(5), &mut lookup)
+                    .await
+                    .is_ok();
+                client.signal_shutdown_sync();
+                panic!(
+                    "publication and the async modifier formed an ownership/mapping lock cycle; cleanup host={host_drained}, publication={publication_drained}"
+                );
+            }
+            outcome.unwrap().unwrap().unwrap();
+            tokio::time::timeout(Duration::from_secs(5), modifier.take().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), finished.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        if !cancel {
+            let result = tokio::time::timeout(Duration::from_secs(5), lookup)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.is_err(), fail_registry);
+            if let Ok(devices) = result {
+                assert!(devices.contains(&user));
+                assert!(devices.iter().any(|device| device.user == user.user
+                    && device.device == 2
+                    && device.is_hosted()));
+            }
+        }
+        assert_eq!(
+            client.cached_adv_account_identity(&user).await.unwrap(),
+            Some(next)
+        );
+        let row = client
+            .persistence_manager
+            .backend()
+            .get_devices(&user.user)
+            .await
+            .unwrap();
+        if fail_registry {
+            assert!(row.is_none());
+        } else {
+            assert_eq!(
+                row.unwrap()
+                    .devices
+                    .iter()
+                    .map(|device| device.device_id())
+                    .collect::<Vec<_>>(),
+                vec![0, 2]
+            );
+        }
+        let observations = probe.observations.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        if !hold_modifier {
+            assert_eq!(
+                observations.as_slice(),
+                [[true, true, true]],
+                "host reactions must follow ownership, mapping and registry release, including after a failed registry ACK"
+            );
+        }
+        client.signal_shutdown_sync();
+    }
+}
+
+#[tokio::test]
+async fn adv_review_round6_registry_read_waits_for_the_cache_first_writer_ack() {
+    use crate::store::release::tests::ProbeBackend;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (mut probe, _) = ProbeBackend::new();
+    let raw = probe.backend.clone();
+    let enabled = Arc::new(AtomicBool::new(false));
+    let (release, gate) = async_channel::unbounded();
+    let (entered, arrived) = async_channel::unbounded();
+    probe.gate_method = "update_device_list";
+    probe.gate_once = true;
+    probe.gate_enabled = Some(enabled.clone());
+    probe.gate = Some(gate);
+    probe.entered = Some(entered);
+    let (client, _) = crate::test_utils::create_iq_test_client_with_backend(Arc::new(probe)).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !client.lid_pn_cache.startup_finished_for_tests() {
+            tokio::task::yield_now().await;
+        }
+        drop(client.lid_pn_cache.lock_mutation().await);
+    })
+    .await
+    .unwrap();
+    let peer = Jid::pn("12025550187");
+    let record = |raw_id| DeviceListRecord {
+        user: peer.user.as_str().into(),
+        devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(1))].into(),
+        raw_id: Some(raw_id),
+        timestamp: 1,
+        phash: None,
+    };
+    raw.update_device_list(record(1)).await.unwrap();
+    enabled.store(true, Ordering::Release);
+    let writer = {
+        let client = client.clone();
+        let replacement = record(2);
+        tokio::spawn(async move { client.update_device_list(replacement).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        client
+            .device_registry_cache
+            .get(&peer.user)
+            .await
+            .unwrap()
+            .raw_id,
+        Some(2)
+    );
+    assert_eq!(
+        raw.get_devices(&peer.user).await.unwrap().unwrap().raw_id,
+        Some(1)
+    );
+    let generation = client.device_topology.current();
+    // Model an ordinary L1 eviction after its new generation was published,
+    // while the same writer is still waiting for its durable operation.
+    client
+        .device_registry_cache
+        .raw_invalidate_for_tests(&peer.user)
+        .await;
+    assert_eq!(client.device_topology.current(), generation);
+    let mut reader = Box::pin(client.load_device_record_for_jid(&peer));
+    assert!(futures::poll!(reader.as_mut()).is_pending());
+    release.send(()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), writer)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let loaded = tokio::time::timeout(Duration::from_secs(5), reader)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.raw_id, Some(2));
+    assert_eq!(
+        client
+            .device_registry_cache
+            .get(&peer.user)
+            .await
+            .unwrap()
+            .raw_id,
+        Some(2)
+    );
+    assert_eq!(
+        raw.get_devices(&peer.user).await.unwrap().unwrap().raw_id,
+        Some(2)
+    );
+    client.signal_shutdown_sync();
+}
+
+#[tokio::test]
+async fn adv_review_round6_cancelled_registry_fill_retains_custom_store_ack() {
+    use crate::cache_config::{CacheConfig, CacheStores};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    type SyntheticCacheRows = Arc<std::sync::Mutex<HashMap<(String, String), Vec<u8>>>>;
+
+    struct DelayedStore {
+        rows: SyntheticCacheRows,
+        taken: AtomicBool,
+        entered: async_channel::Sender<()>,
+        release: async_channel::Receiver<()>,
+        fail_after_commit: bool,
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl wacore::store::CacheStore for DelayedStore {
+        async fn get(&self, namespace: &str, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .get(&(namespace.into(), key.into()))
+                .cloned())
+        }
+
+        async fn set(
+            &self,
+            namespace: &str,
+            key: &str,
+            value: &[u8],
+            _: Option<Duration>,
+        ) -> anyhow::Result<()> {
+            let key = (namespace.to_owned(), key.to_owned());
+            if self.taken.swap(true, Ordering::AcqRel) {
+                self.rows.lock().unwrap().insert(key, value.to_vec());
+                return Ok(());
+            }
+            // Model a host operation that continues after its Rust waiter is
+            // dropped. The effect deliberately lands only after release.
+            let rows = Arc::clone(&self.rows);
+            let value = value.to_vec();
+            let entered = self.entered.clone();
+            let release = self.release.clone();
+            let fail = self.fail_after_commit;
+            let (send, receive) = tokio::sync::oneshot::channel();
+            drop(tokio::spawn(async move {
+                entered.send(()).await.unwrap();
+                release.recv().await.unwrap();
+                rows.lock().unwrap().insert(key, value);
+                let result = if fail {
+                    Err(anyhow::anyhow!("synthetic cache error after commit"))
+                } else {
+                    Ok(())
+                };
+                let _ = send.send(result);
+            }));
+            receive
+                .await
+                .map_err(|_| anyhow::anyhow!("synthetic cache worker stopped"))?
+        }
+
+        async fn delete(&self, namespace: &str, key: &str) -> anyhow::Result<()> {
+            self.rows
+                .lock()
+                .unwrap()
+                .remove(&(namespace.into(), key.into()));
+            Ok(())
+        }
+
+        async fn clear(&self, namespace: &str) -> anyhow::Result<()> {
+            self.rows
+                .lock()
+                .unwrap()
+                .retain(|(stored, _), _| stored != namespace);
+            Ok(())
+        }
+    }
+
+    for (fail_after_commit, publication) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let (release, gate) = async_channel::unbounded();
+        let (entered, arrived) = async_channel::unbounded();
+        let store = Arc::new(DelayedStore {
+            rows: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            taken: AtomicBool::new(false),
+            entered,
+            release: gate,
+            fail_after_commit,
+        });
+        let config = CacheConfig::default().with_cache_stores(CacheStores {
+            device_registry_cache: Some(store.clone()),
+            ..Default::default()
+        });
+        let client = crate::test_utils::create_test_client_with_config(
+            "registry_fill_ack",
+            Arc::new(crate::test_utils::MockHttpClient),
+            config,
+        )
+        .await;
+        let peer = Jid::pn("12025550192");
+        if publication {
+            crate::test_utils::seed_adv_primary(&client, &peer).await;
+        }
+        let backend = client.persistence_manager.backend();
+        backend
+            .update_device_list(DeviceListRecord {
+                user: peer.user.as_str().into(),
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(1))].into(),
+                raw_id: Some(1),
+                timestamp: 1,
+                phash: None,
+            })
+            .await
+            .unwrap();
+        let reader = {
+            let client = client.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                if publication {
+                    client
+                        .process_device_list_response(
+                            &migration_response(&peer),
+                            Freshness::Refresh,
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    assert!(client.load_device_record_for_jid(&peer).await.is_some());
+                }
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        reader.abort();
+        assert!(reader.await.unwrap_err().is_cancelled());
+        let mut invalidation = Box::pin(async {
+            let guard = client.device_topology.lock_registry().await;
+            client
+                .try_invalidate_device_cache_guarded(&peer.user, &guard)
+                .await
+        });
+        assert!(
+            futures::poll!(invalidation.as_mut()).is_pending(),
+            "caller cancellation must not release ordering before the cache store ACK"
+        );
+        assert!(backend.get_devices(&peer.user).await.unwrap().is_some());
+        release.send(()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), invalidation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(backend.get_devices(&peer.user).await.unwrap().is_none());
+        assert!(client.device_registry_cache.get(&peer.user).await.is_none());
+        assert!(store.rows.lock().unwrap().is_empty());
+        client.signal_shutdown_sync();
+    }
+}
+
+#[tokio::test]
+async fn adv_review_round6_queued_registry_fill_cannot_restore_a_deleted_row() {
+    use crate::store::release::tests::ProbeBackend;
+    use crate::test_utils::create_iq_test_client_with_backend;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (mut probe, _) = ProbeBackend::new();
+    let backend = probe.backend.clone();
+    let enabled = Arc::new(AtomicBool::new(false));
+    let (release, gate) = async_channel::unbounded();
+    let (entered, arrived) = async_channel::unbounded();
+    probe.gate_enabled = Some(enabled.clone());
+    probe.gate_once = true;
+    probe.gate_method = "after:get_devices";
+    probe.gate = Some(gate);
+    probe.entered = Some(entered);
+    let peer = Jid::pn("12025550188");
+    backend
+        .update_device_list(DeviceListRecord {
+            user: peer.user.as_str().into(),
+            devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(1))].into(),
+            raw_id: Some(1),
+            timestamp: 1,
+            phash: None,
+        })
+        .await
+        .unwrap();
+    let (client, _) = create_iq_test_client_with_backend(Arc::new(probe)).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !client.lid_pn_cache.startup_finished_for_tests() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    enabled.store(true, Ordering::Release);
+    let mut load = Box::pin(client.load_device_record_for_jid(&peer));
+    assert!(futures::poll!(load.as_mut()).is_pending());
+    tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    enabled.store(false, Ordering::Release);
+    let cache = client.device_registry_cache.local_for_tests().unwrap();
+    let writer = cache.hold_write_for_test().await;
+    release.send(()).await.unwrap();
+    assert!(futures::poll!(load.as_mut()).is_pending()); // promotion queued behind writer
+    drop(writer);
+    // Keep the old fill unpolled until invalidation has had its first attempt.
+    let mut invalidation = Box::pin(async {
+        let registry = client.device_topology.lock_registry().await;
+        client
+            .try_invalidate_device_cache_guarded(&peer.user, &registry)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        match futures::poll!(invalidation.as_mut()) {
+            std::task::Poll::Ready(result) => {
+                result.unwrap();
+                let _ = load.await;
+            }
+            std::task::Poll::Pending => {
+                let _ = load.await;
+                invalidation.await.unwrap();
+            }
+        }
+    })
+    .await
+    .expect("both admitted operations must finish");
+    assert!(backend.get_devices(&peer.user).await.unwrap().is_none());
+    assert!(
+        client.device_registry_cache.get(&peer.user).await.is_none(),
+        "a queued pre-delete DB fill must not resurrect the deleted cache row"
+    );
+    client.signal_shutdown_sync();
+}
+
 /// Produce real signed Signal material, retaining the validated certificate anchor.
 fn session_bundle(
     identity: &KeyPair,
@@ -348,6 +1544,7 @@ async fn ordinary_recovery_rejects_an_alias_restored_after_its_lock_snapshot() {
             }],
         },
         topology_generation: client.device_topology.current(),
+        authentication_epoch: client.signal_cache.identity_continuity.primary_snapshot(),
     };
     let primary_lock = client
         .session_lock_for(phone.to_protocol_address().as_str())
@@ -1419,6 +2616,9 @@ async fn prepared_primary_survives_known_namespace_migration() {
                 DeviceListIdentityContext {
                     prepared: &anchors,
                     recovered: None,
+                    publication_started: None,
+                    authentication_epoch: None,
+                    reactions: None,
                 },
                 None,
             )
@@ -1496,7 +2696,10 @@ async fn prepared_primary_rejects_missing_changed_and_conflicting_identity() {
                     None,
                     DeviceListIdentityContext {
                         prepared: &prepared,
-                        recovered: None
+                        recovered: None,
+                        publication_started: None,
+                        authentication_epoch: None,
+                        reactions: None,
                     },
                     None,
                 )
@@ -1557,7 +2760,10 @@ async fn migrated_primary_survives_cache_reload_and_client_reopen() {
 #[tokio::test]
 async fn primary_migration_waits_until_adv_publication_finishes() {
     use crate::lid_pn_cache::{LearningSource, LidPnEntry};
+    use std::task::Poll;
+
     let (client, _) = create_iq_test_client().await;
+    assert!(client.lid_pn_cache.startup_finished_for_tests());
     let pn = Jid::pn("12025550123");
     let lid = Jid::lid("100000000000123");
     client
@@ -1570,16 +2776,50 @@ async fn primary_migration_waits_until_adv_publication_finishes() {
         .await;
     crate::test_utils::seed_adv_primary(&client, &pn).await;
     let response = migration_response(&pn);
+    let mut addresses = [pn.clone(), lid.clone()];
+    addresses.sort_unstable_by(wacore::types::jid::cmp_for_lock_order);
+    let first = client
+        .session_lock_for(addresses[0].to_protocol_address().as_str())
+        .await;
+    let second = client
+        .session_lock_for(addresses[1].to_protocol_address().as_str())
+        .await;
+    // Force an early suspension before the worker owns both primary locks.
+    let blocked = first.lock_arc().await;
     let registry = client.device_topology.lock_registry().await;
     let publication = client.process_device_list_response(&response, Freshness::Refresh);
     futures::pin_mut!(publication);
     assert!(futures::poll!(publication.as_mut()).is_pending());
+    assert!(second.try_lock().is_some());
+    drop(blocked);
+    // Registry keeps this complete guard set stable. The requester's first
+    // Pending can precede its owned worker, so observe the actual boundary.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        futures::future::poll_fn(|cx| {
+            assert!(publication.as_mut().poll(cx).is_pending());
+            if first.try_lock().is_none()
+                && second.try_lock().is_none()
+                && client.lid_pn_cache.try_lock_mutation().is_none()
+            {
+                return Poll::Ready(());
+            }
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }),
+    )
+    .await
+    .expect("publication must own both primary locks and Map before migration");
     let migration = client.migrate_signal_sessions(&pn, &lid);
     futures::pin_mut!(migration);
     assert!(futures::poll!(migration.as_mut()).is_pending());
     drop(registry);
-    assert!(publication.await.is_ok());
-    migration.await;
+    let (publication_result, _) = tokio::time::timeout(Duration::from_secs(5), async {
+        futures::join!(publication, migration)
+    })
+    .await
+    .expect("publication and migration must both finish after Registry is released");
+    assert_migration_publication(&client, &pn, &publication_result.unwrap()).await;
     assert!(
         client
             .cached_adv_account_identity(&pn)
@@ -1753,6 +2993,9 @@ async fn group_identity_conflicts_retain_only_the_affected_contact() {
                         DeviceListIdentityContext {
                             prepared,
                             recovered: None,
+                            publication_started: None,
+                            authentication_epoch: None,
+                            reactions: None,
                         },
                         Some(&maintenance),
                     )
@@ -1867,6 +3110,9 @@ async fn group_identity_storage_failure_is_not_partial_success() {
             DeviceListIdentityContext {
                 prepared: &prepared,
                 recovered: None,
+                publication_started: None,
+                authentication_epoch: None,
+                reactions: None,
             },
             None,
         )
@@ -1894,7 +3140,19 @@ async fn group_identity_storage_failure_is_not_partial_success() {
 #[tokio::test]
 async fn migrated_primary_cancellation_releases_adv_guards() {
     use crate::lid_pn_cache::LearningSource;
-    let (client, _) = create_iq_test_client().await;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (pending, waiting) = async_channel::unbounded();
+    let (completed, finished) = async_channel::unbounded();
+    let runtime = Arc::new(BootstrapWorkerRuntime {
+        armed: AtomicBool::new(false),
+        pending,
+        completed,
+    });
+    let (client, _) = crate::test_utils::create_iq_test_client_with_runtime(
+        crate::test_utils::create_test_backend().await,
+        runtime.clone(),
+    )
+    .await;
     let pn = Jid::pn("12025550123");
     let lid = Jid::lid("100000000000123");
     crate::test_utils::seed_adv_primary(&client, &pn).await;
@@ -1923,12 +3181,23 @@ async fn migrated_primary_cancellation_releases_adv_guards() {
     drop(blocked);
 
     let registry = client.device_topology.lock_registry().await;
+    runtime.armed.store(true, Ordering::SeqCst);
     let mut publication =
         Box::pin(client.process_device_list_response(&response, Freshness::Refresh));
     assert!(futures::poll!(publication.as_mut()).is_pending());
+    tokio::time::timeout(Duration::from_secs(5), waiting.recv())
+        .await
+        .unwrap()
+        .unwrap();
     assert!(first.try_lock().is_none());
     assert!(second.try_lock().is_none());
     drop(publication);
+    // The owned task must observe cancellation and release its partial guard
+    // set BEFORE Registry is released, without publishing a new device list.
+    tokio::time::timeout(Duration::from_secs(5), finished.recv())
+        .await
+        .unwrap()
+        .unwrap();
     assert!(first.try_lock().is_some());
     assert!(second.try_lock().is_some());
     drop(
@@ -1985,7 +3254,10 @@ async fn companion_bootstrap_waits_for_publication_and_checks_the_known_alias() 
         let mut publication =
             Box::pin(client.process_device_list_response(&response, Freshness::Refresh));
         assert!(futures::poll!(publication.as_mut()).is_pending());
-        assert_eq!(arrived.try_recv(), Ok(()));
+        tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+            .await
+            .unwrap()
+            .unwrap();
         let companion = lid.with_device(7);
         let companion_mutex = client
             .session_lock_for(companion.to_protocol_address().as_str())
@@ -3004,6 +4276,7 @@ fn first_mapping_failure(
             }],
         },
         topology_generation: client.device_topology.current(),
+        authentication_epoch: client.signal_cache.identity_continuity.primary_snapshot(),
     }
 }
 
@@ -3358,6 +4631,7 @@ async fn adv_review_round4_retirement_during_preflight_cannot_publish_mapping() 
             identity: authentication.await.unwrap().unwrap(),
             snapshot,
         };
+        let reactions = AdvIdentityReactions::default();
         let maintenance = client.begin_signal_maintenance().await.unwrap();
         let registry = client.device_topology.lock_registry().await;
         // Drive the real publication future manually, so the reset cannot
@@ -3370,6 +4644,9 @@ async fn adv_review_round4_retirement_during_preflight_cannot_publish_mapping() 
             DeviceListIdentityContext {
                 prepared: &[],
                 recovered: Some(&recovered),
+                publication_started: None,
+                authentication_epoch: recovered.snapshot.primary_epoch,
+                reactions: Some(&reactions),
             },
             Some(&maintenance),
         ));
@@ -3392,6 +4669,7 @@ async fn adv_review_round4_retirement_during_preflight_cannot_publish_mapping() 
         drop(registry);
         let result = publication.await;
         drop(maintenance);
+        reactions.dispatch(&client);
         assert_eq!(result.is_err(), retire);
         if !retire {
             assert_round4_publication(&client, &lid, result.as_ref().unwrap().as_ref().unwrap())
@@ -5120,10 +6398,23 @@ async fn adv_review_round2_known_same_key_migration_preserves_companion_authenti
                 )
                 .await;
         }
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            client.migrate_signal_sessions_on_lid_discovery(&phone.user, &lid.user),
-        )
+        tokio::time::timeout(Duration::from_secs(5), async {
+            if case == "unknown" {
+                // This control intentionally has no learned relation.
+                // Exercise the explicit migration contract, which must
+                // retire that authentication rather than invent an alias.
+                client.migrate_signal_sessions(&phone, &lid).await;
+                client
+                    .signal_cache
+                    .flush(client.persistence_manager.backend().as_ref())
+                    .await
+                    .unwrap();
+            } else {
+                client
+                    .migrate_signal_sessions_on_lid_discovery(&phone.user, &lid.user)
+                    .await;
+            }
+        })
         .await
         .unwrap();
         assert_eq!(
@@ -5354,6 +6645,9 @@ async fn adv_review_round2_registry_io_does_not_publish_unadmitted_mapping() {
                     DeviceListIdentityContext {
                         prepared: &prepared,
                         recovered: None,
+                        publication_started: None,
+                        authentication_epoch: None,
+                        reactions: None,
                     },
                     None,
                 )
