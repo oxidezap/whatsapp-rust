@@ -25,6 +25,8 @@ async fn hosted_orphan_recovery_captures_state_flushed_during_enumeration() {
     probe.gate = Some(gate);
     probe.entered = Some(entered);
     probe.gate_method = "after:get_signal_addresses_for_user";
+    // Pause the racing snapshot, not publication's later live-state rescan.
+    probe.gate_once = true;
     let fixture = Rotation::new(probe, Jid::pn("12025550188")).await;
     let orphan = seed_fresh_session(&fixture.client, &fixture.user.with_device(7)).await;
     fixture

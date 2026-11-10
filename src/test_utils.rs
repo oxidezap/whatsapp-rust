@@ -698,6 +698,23 @@ pub(crate) async fn create_iq_test_client_with_runtime(
     Arc<Client>,
     Arc<crate::transport::mock::CapturingMockTransport>,
 ) {
+    create_iq_test_client_with_runtime_and_config(
+        backend,
+        runtime,
+        crate::cache_config::CacheConfig::default(),
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn create_iq_test_client_with_runtime_and_config(
+    backend: Arc<dyn Backend>,
+    runtime: Arc<dyn wacore::runtime::Runtime>,
+    config: crate::cache_config::CacheConfig,
+) -> (
+    Arc<Client>,
+    Arc<crate::transport::mock::CapturingMockTransport>,
+) {
     use crate::transport::mock::CapturingMockTransportFactory;
     use wacore::handshake::NoiseCipher;
 
@@ -710,6 +727,7 @@ pub(crate) async fn create_iq_test_client_with_runtime(
     let transport = factory.transport();
     let (client, _sync_rx) = Client::builder()
         .with_runtime_arc(runtime)
+        .with_cache_config(config)
         .with_persistence_manager(pm)
         .with_transport_factory_arc(Arc::new(factory))
         .with_http_client_arc(Arc::new(MockHttpClient))

@@ -27,6 +27,7 @@ pub(crate) struct ProbeBackend {
     pub(crate) gate: Option<async_channel::Receiver<()>>,
     pub(crate) entered: Option<async_channel::Sender<()>>,
     pub(crate) gate_method: &'static str,
+    pub(crate) gate_enabled: Option<Arc<AtomicBool>>,
     pub(crate) fail_before_method: Option<(&'static str, Arc<AtomicBool>)>,
     pub(crate) fail_after_method: Option<&'static str>,
     pub(crate) detach_identity_writes: bool,
@@ -50,6 +51,7 @@ impl ProbeBackend {
                 gate: None,
                 entered: None,
                 gate_method: "save",
+                gate_enabled: None,
                 fail_before_method: None,
                 fail_after_method: None,
                 detach_identity_writes: false,
@@ -65,6 +67,13 @@ impl ProbeBackend {
 
     pub(crate) async fn before_call(&self, method: &str) {
         if method != self.gate_method {
+            return;
+        }
+        if self
+            .gate_enabled
+            .as_ref()
+            .is_some_and(|enabled| !enabled.load(Ordering::Acquire))
+        {
             return;
         }
         if self.gate_once && self.gate_taken.swap(true, Ordering::SeqCst) {

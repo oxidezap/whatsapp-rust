@@ -44,6 +44,14 @@ where
     K: std::hash::Hash + Eq + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
 {
+    #[cfg(test)]
+    pub(crate) fn local_for_tests(&self) -> Option<&Cache<K, V>> {
+        match &self.inner {
+            Inner::Local(cache) => Some(cache),
+            Inner::Custom { .. } => None,
+        }
+    }
+
     pub(crate) fn on_runtime(mut self, runtime: &Arc<dyn wacore::runtime::Runtime>) -> Self {
         self.inner = match self.inner {
             Inner::Local(cache) => Inner::Local(cache.on_runtime(runtime)),
@@ -56,6 +64,15 @@ where
     pub fn from_local(cache: Cache<K, V>) -> Self {
         Self {
             inner: Inner::Local(cache),
+        }
+    }
+
+    /// Populate the in-process tier without invoking host code. Durable registry
+    /// reads use this while ordered with publication; custom stores are populated
+    /// only by authoritative writes, whose workers retain their ACK ownership.
+    pub(crate) async fn insert_local(&self, key: K, value: V) {
+        if let Inner::Local(cache) = &self.inner {
+            cache.insert(key, value).await;
         }
     }
 }
@@ -120,6 +137,21 @@ where
         }
     }
 
+    /// Publication must distinguish confirmed absence from an unavailable host
+    /// cache. Any stored bytes count as present, including malformed values.
+    pub(crate) async fn contains_key_checked<Q>(&self, key: &Q) -> anyhow::Result<bool>
+    where
+        K: Borrow<Q>,
+        Q: std::hash::Hash + Eq + Display + ?Sized,
+    {
+        match &self.inner {
+            Inner::Local(cache) => Ok(cache.get(key).await.is_some()),
+            Inner::Custom {
+                store, namespace, ..
+            } => Ok(store.get(namespace, &key.to_string()).await?.is_some()),
+        }
+    }
+
     /// Insert or update a value (takes ownership of key and value).
     pub async fn insert(&self, key: K, value: V) {
         match &self.inner {
@@ -153,17 +185,28 @@ where
         K: Borrow<Q>,
         Q: std::hash::Hash + Eq + Display + ?Sized,
     {
+        let _ = self.try_invalidate(key).await;
+    }
+
+    /// Trust replacement must observe a failed host-cache deletion.
+    pub(crate) async fn try_invalidate<Q>(&self, key: &Q) -> anyhow::Result<()>
+    where
+        K: Borrow<Q>,
+        Q: std::hash::Hash + Eq + Display + ?Sized,
+    {
         match &self.inner {
             Inner::Local(cache) => cache.invalidate(key).await,
             Inner::Custom {
                 store, namespace, ..
             } => {
                 let key_str = key.to_string();
-                if let Err(e) = store.delete(namespace, &key_str).await {
-                    log::warn!("TypedCache[{namespace}]: delete({key_str}) error: {e}");
+                if let Err(error) = store.delete(namespace, &key_str).await {
+                    log::warn!("TypedCache[{namespace}]: delete({key_str}) error: {error}");
+                    return Err(error);
                 }
             }
         }
+        Ok(())
     }
 
     /// Remove all entries, awaiting completion for custom backends.

@@ -172,6 +172,8 @@ pub struct CacheStores {
     /// Custom store for group metadata cache.
     pub group_cache: Option<Arc<dyn CacheStore>>,
     /// Custom store for device registry cache.
+    /// Authoritative registry updates populate this store. Durable read misses
+    /// return their rows directly, without calling `set` under publication locks.
     pub device_registry_cache: Option<Arc<dyn CacheStore>>,
     /// Custom store for LID-PN bidirectional mapping cache.
     pub lid_pn_cache: Option<Arc<dyn CacheStore>>,

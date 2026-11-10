@@ -162,14 +162,21 @@ impl DeviceTopology {
 /// The device registry cache plus its topology tracker, fused so every write
 /// records the change. Reads are pass-through; the only write entry points
 /// are [`insert`](Self::insert), [`invalidate`](Self::invalidate) and the
-/// non-recording [`promote`](Self::promote) (whose data is by definition what
-/// the DB fallback already answered).
+/// non-recording [`promote_guarded`](Self::promote_guarded), whose caller
+/// orders the DB fallback under the registry guard.
 pub(crate) struct DeviceRegistryCache {
     cache: crate::cache_store::TypedCache<Arc<str>, Arc<wacore::store::traits::DeviceListRecord>>,
     topology: Arc<DeviceTopology>,
 }
 
 impl DeviceRegistryCache {
+    #[cfg(test)]
+    pub(crate) fn local_for_tests(
+        &self,
+    ) -> Option<&crate::cache::Cache<Arc<str>, Arc<wacore::store::traits::DeviceListRecord>>> {
+        self.cache.local_for_tests()
+    }
+
     pub(crate) fn new(
         cache: crate::cache_store::TypedCache<
             Arc<str>,
@@ -224,8 +231,35 @@ impl DeviceRegistryCache {
         self.topology.record_registry(guard, [key]);
     }
 
-    /// Cache-fill from the DB row the fallback path would have returned: the
-    /// answer is unchanged, so no topology change is recorded.
+    /// The publication worker releases all guards before invoking host code,
+    /// then revalidates cache absence and records the eviction under Registry.
+    pub(crate) async fn evict_before_identity_update(&self, key: &str) -> anyhow::Result<()> {
+        self.cache.try_invalidate(key).await
+    }
+
+    /// Require confirmed raw absence, propagating host failures and counting
+    /// malformed stored bytes as present.
+    pub(crate) async fn is_absent_after_eviction(&self, key: &str) -> anyhow::Result<bool> {
+        Ok(!self.cache.contains_key_checked(key).await?)
+    }
+
+    /// Fill the local tier from the durable row without changing topology.
+    /// Custom stores receive authoritative writes only: invoking their set
+    /// callback here can reenter an uncached read and wait on our Registry guard.
+    pub(crate) async fn promote_guarded(
+        &self,
+        _guard: &DeviceRegistryMutationGuard<'_>,
+        key: Arc<str>,
+        record: Arc<wacore::store::traits::DeviceListRecord>,
+    ) {
+        self.cache.insert_local(key, record).await;
+    }
+
+    /// Preserve the original fixture seed, which bypasses publication admission.
+    /// Taking Registry here initializes a retained lock event absent on the
+    /// baseline, changing the connected-retention fixture by 72 bytes.
+    /// Production DB fills use the guarded, ordered path.
+    #[cfg(feature = "bench-harness")]
     pub(crate) async fn promote(
         &self,
         key: Arc<str>,

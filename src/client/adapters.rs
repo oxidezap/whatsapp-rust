@@ -16,6 +16,12 @@ pub(crate) struct SignalMaintenance<'a> {
 }
 
 impl SignalMaintenance<'_> {
+    /// Retain admission's identity when a publisher releases its permit for
+    /// host code, then enters maintenance again.
+    pub(crate) fn generation(&self) -> (u64, u64) {
+        (self.connection_generation, self.semaphore_generation)
+    }
+
     pub(crate) fn ensure_current(&self) -> Result<()> {
         anyhow::ensure!(
             self.client.connection_generation.load(Ordering::Acquire) == self.connection_generation

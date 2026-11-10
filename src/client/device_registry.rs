@@ -10,9 +10,92 @@ use std::sync::Arc;
 use wacore_binary::{Jid, JidExt as _, Server};
 
 use super::Client;
+use super::device_topology::DeviceRegistryMutationGuard;
 use super::member_index::MemberIndex;
 
 const SIGNAL_NAMESPACE_COUNT: usize = 4;
+
+#[derive(Clone, Copy)]
+enum RegistryReadKind {
+    Single { include_empty: bool },
+    Batch,
+}
+
+impl Client {
+    /// Order the durable read itself with publication, not only its cache fill:
+    /// a cache-first writer can publish topology before its durable write ACK.
+    /// DB fallback fills only the in-process cache, so this read cannot start a
+    /// host write that outlives cancellation or calls back into another read.
+    async fn read_device_registry_rows(
+        &self,
+        keys: &[&str],
+        kind: RegistryReadKind,
+        publication: Option<&DeviceRegistryMutationGuard<'_>>,
+    ) -> Result<Vec<Arc<wacore::store::traits::DeviceListRecord>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(guard) = publication {
+            return self
+                .read_device_registry_rows_guarded(keys, kind, guard, true)
+                .await;
+        }
+        let guard = self.device_topology.lock_registry().await;
+        self.read_device_registry_rows_guarded(keys, kind, &guard, true)
+            .await
+    }
+
+    /// Select durable rows under Registry and optionally promote the local tier.
+    /// Never call a host cache's set callback from a read under this guard.
+    async fn read_device_registry_rows_guarded(
+        &self,
+        keys: &[&str],
+        kind: RegistryReadKind,
+        guard: &DeviceRegistryMutationGuard<'_>,
+        fill: bool,
+    ) -> Result<Vec<Arc<wacore::store::traits::DeviceListRecord>>> {
+        let backend = self.persistence_manager.backend();
+        let rows = match kind {
+            RegistryReadKind::Batch => backend.get_devices_batch(keys).await?,
+            RegistryReadKind::Single { include_empty } => {
+                let mut selected = Vec::new();
+                for key in keys {
+                    match backend.get_devices(key).await {
+                        Ok(Some(record)) if include_empty || !record.devices.is_empty() => {
+                            selected.push(record);
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(error) => warn!(
+                            "device registry DB lookup failed for {}: {error}",
+                            wacore_binary::jid::ObservedJid::from(*key)
+                        ),
+                    }
+                }
+                selected
+            }
+        };
+        let include_empty = matches!(
+            kind,
+            RegistryReadKind::Single {
+                include_empty: true
+            }
+        );
+        let records: Vec<_> = rows
+            .into_iter()
+            .filter(|record| include_empty || !record.devices.is_empty())
+            .map(Arc::new)
+            .collect();
+        if fill {
+            for record in &records {
+                self.device_registry_cache
+                    .promote_guarded(guard, Arc::clone(&record.user), Arc::clone(record))
+                    .await;
+            }
+        }
+        Ok(records)
+    }
+}
 
 /// Per-group device-list snapshot for `resolve_group_devices_memoized`.
 /// Valid while the producing `GroupRoutingInfo` Arc is still the cached one AND the
@@ -602,6 +685,15 @@ impl Client {
         members.build()
     }
 
+    /// Own both alias keys while publication releases its guards for host code.
+    pub(crate) async fn device_registry_lookup_keys(&self, user: &str) -> Vec<String> {
+        self.resolve_lookup_keys(user)
+            .await
+            .all_keys()
+            .map(str::to_owned)
+            .collect()
+    }
+
     /// Resolve a user identifier to its lookup keys with type information.
     ///
     /// Returns a `UserLookupKeys` enum that explicitly represents:
@@ -799,6 +891,7 @@ impl Client {
         self.has_device_in(&lookup, device_id).await
     }
 
+    /// Check every current alias and serialize durable fallback with publication ACKs.
     async fn has_device_in(&self, lookup: &UserLookupKeys, device_id: u16) -> bool {
         for key in lookup.all_keys() {
             if let Some(record) = self.device_registry_cache.get(key).await {
@@ -806,29 +899,28 @@ impl Client {
             }
         }
 
-        let backend = self.persistence_manager.backend();
-        for key in lookup.all_keys() {
-            match backend.get_devices(key).await {
-                Ok(Some(record)) => {
-                    let has_device = record.devices.iter().any(|d| d.device_id() == device_id);
-                    // Cache under the record's actual stored key, not our guessed one,
-                    // to keep the cache and backend consistent.
-                    self.device_registry_cache
-                        .promote(Arc::clone(&record.user), Arc::new(record))
-                        .await;
-                    return has_device;
-                }
-                Ok(None) => continue,
-                Err(e) => {
-                    warn!(
-                        "Failed to check device registry for {}: {e}",
-                        wacore_binary::jid::ObservedJid::from(key)
-                    );
-                }
+        let keys: Vec<_> = lookup.all_keys().collect();
+        match self
+            .read_device_registry_rows(
+                &keys,
+                RegistryReadKind::Single {
+                    include_empty: true,
+                },
+                None,
+            )
+            .await
+        {
+            Ok(records) => records.first().is_some_and(|record| {
+                record
+                    .devices
+                    .iter()
+                    .any(|device| device.device_id() == device_id)
+            }),
+            Err(error) => {
+                warn!("Failed to check device registry: {error}");
+                false
             }
         }
-
-        false
     }
 
     /// Update the device list for a user.
@@ -850,10 +942,11 @@ impl Client {
         self.update_device_list_guarded(record, &guard).await
     }
 
+    /// Publish the canonical cache row and retain Registry through its durable ACK and alias cleanup.
     pub(crate) async fn update_device_list_guarded(
         &self,
         mut record: wacore::store::traits::DeviceListRecord,
-        guard: &crate::client::device_topology::DeviceRegistryMutationGuard<'_>,
+        guard: &DeviceRegistryMutationGuard<'_>,
     ) -> Result<()> {
         use anyhow::Context;
 
@@ -928,10 +1021,11 @@ impl Client {
         self.update_device_lists_guarded(records, &guard).await
     }
 
+    /// Publish an accepted batch under one Registry guard and retain ordering through the storage ACK.
     pub(crate) async fn update_device_lists_guarded(
         &self,
         records: Vec<wacore::store::traits::DeviceListRecord>,
-        guard: &crate::client::device_topology::DeviceRegistryMutationGuard<'_>,
+        guard: &DeviceRegistryMutationGuard<'_>,
     ) -> Result<()> {
         use anyhow::Context;
 
@@ -1063,7 +1157,7 @@ impl Client {
     pub(crate) async fn invalidate_device_cache_guarded(
         &self,
         user: &str,
-        guard: &crate::client::device_topology::DeviceRegistryMutationGuard<'_>,
+        guard: &DeviceRegistryMutationGuard<'_>,
     ) {
         let _ = self.try_invalidate_device_cache_guarded(user, guard).await;
     }
@@ -1072,7 +1166,7 @@ impl Client {
     pub(crate) async fn try_invalidate_device_cache_guarded(
         &self,
         user: &str,
-        guard: &crate::client::device_topology::DeviceRegistryMutationGuard<'_>,
+        guard: &DeviceRegistryMutationGuard<'_>,
     ) -> Result<()> {
         let mut failure = None;
         let lookup = self.resolve_lookup_keys(user).await;
@@ -1132,6 +1226,7 @@ impl Client {
     // Keep the notification dispatcher from embedding the maintenance scope's
     // complete state and cancellation/drop paths in its add/remove branches.
     #[inline(never)]
+    /// Serialize companion admission with account maintenance before modifying durable device topology.
     fn patch_device_add_inner<'a>(
         &'a self,
         user: &'a str,
@@ -1166,7 +1261,7 @@ impl Client {
             };
             let guard = self.device_topology.lock_registry().await;
 
-            let Some(mut record) = self.load_device_record(user).await else {
+            let Some(mut record) = self.load_device_record_guarded(user, &guard).await else {
                 return true;
             };
 
@@ -1384,6 +1479,7 @@ impl Client {
     }
 
     #[inline(never)]
+    /// Retire companion state under maintenance while retaining primary device zero and publication ordering.
     fn patch_device_remove_inner<'a>(
         &'a self,
         user: &'a str,
@@ -1419,7 +1515,7 @@ impl Client {
                 }
             };
             let guard = self.device_topology.lock_registry().await;
-            if let Some(mut record) = self.load_device_record(user).await {
+            if let Some(mut record) = self.load_device_record_guarded(user, &guard).await {
                 let before = record.devices.len();
                 record.edit_devices(|devices| devices.retain(|d| d.device_id() != device_id));
                 if record.devices.len() != before {
@@ -1532,7 +1628,7 @@ impl Client {
             return;
         };
 
-        if let Some(mut record) = self.load_device_record(user).await {
+        if let Some(mut record) = self.load_device_record_guarded(user, &guard).await {
             let mut updated = false;
             record.edit_devices(|devices| {
                 if let Some(d) = devices.iter_mut().find(|d| d.device_id() == device_id) {
@@ -1553,7 +1649,19 @@ impl Client {
         user: &str,
     ) -> Option<wacore::store::traits::DeviceListRecord> {
         let lookup = self.resolve_lookup_keys(user).await;
-        self.load_device_record_in(&lookup).await
+        self.load_device_record_in(&lookup, None).await
+    }
+
+    /// Patch callers already serialize the read and their later authoritative
+    /// write. Do not start a second cache-fill worker or a cancellation-unsafe
+    /// promotion while their borrowed registry guard is held.
+    async fn load_device_record_guarded(
+        &self,
+        user: &str,
+        guard: &DeviceRegistryMutationGuard<'_>,
+    ) -> Option<wacore::store::traits::DeviceListRecord> {
+        let lookup = self.resolve_lookup_keys(user).await;
+        self.load_device_record_in(&lookup, Some(guard)).await
     }
 
     /// `load_device_record` for a caller holding the full `Jid`, so the known
@@ -1564,12 +1672,14 @@ impl Client {
         jid: &Jid,
     ) -> Option<wacore::store::traits::DeviceListRecord> {
         let lookup = self.resolve_lookup_keys_for_jid(jid).await;
-        self.load_device_record_in(&lookup).await
+        self.load_device_record_in(&lookup, None).await
     }
 
+    /// Prefer the current alias cache rows, then load a durable row under the supplied publication scope.
     async fn load_device_record_in(
         &self,
         lookup: &UserLookupKeys,
+        patch: Option<&DeviceRegistryMutationGuard<'_>>,
     ) -> Option<wacore::store::traits::DeviceListRecord> {
         for key in lookup.all_keys() {
             if let Some(record) = self.device_registry_cache.get(key).await {
@@ -1578,26 +1688,23 @@ impl Client {
             }
         }
 
-        let backend = self.persistence_manager.backend();
-        for key in lookup.all_keys() {
-            match backend.get_devices(key).await {
-                Ok(Some(record)) => {
-                    self.device_registry_cache
-                        .promote(record.user.clone(), Arc::new(record.clone()))
-                        .await;
-                    return Some(record);
-                }
-                Ok(None) => continue,
-                Err(e) => {
-                    warn!(
-                        "load_device_record: DB lookup failed for {}: {e}",
-                        wacore_binary::jid::ObservedJid::from(key)
-                    );
-                }
+        let keys: Vec<_> = lookup.all_keys().collect();
+        let kind = RegistryReadKind::Single {
+            include_empty: true,
+        };
+        let result = if let Some(guard) = patch {
+            self.read_device_registry_rows_guarded(&keys, kind, guard, false)
+                .await
+        } else {
+            self.read_device_registry_rows(&keys, kind, None).await
+        };
+        match result {
+            Ok(records) => records.first().map(|record| (**record).clone()),
+            Err(error) => {
+                warn!("load_device_record: DB lookup failed: {error}");
+                None
             }
         }
-
-        None
     }
 
     /// Backend rows for `keys`, each promoted into the registry cache and
@@ -1610,8 +1717,9 @@ impl Client {
     async fn fetch_registry_rows(
         &self,
         keys: &[&str],
+        publication: Option<&DeviceRegistryMutationGuard<'_>>,
     ) -> HashMap<Arc<str>, Arc<wacore::store::traits::DeviceListRecord>> {
-        match self.fetch_registry_rows_checked(keys).await {
+        match self.fetch_registry_rows_checked(keys, publication).await {
             Ok(rows) => rows,
             Err(e) => {
                 warn!(
@@ -1623,30 +1731,22 @@ impl Client {
         }
     }
 
+    /// Batch durable registry misses without hiding storage failures from authoritative publication.
     async fn fetch_registry_rows_checked(
         &self,
         keys: &[&str],
+        publication: Option<&DeviceRegistryMutationGuard<'_>>,
     ) -> Result<HashMap<Arc<str>, Arc<wacore::store::traits::DeviceListRecord>>> {
         if keys.is_empty() {
             return Ok(HashMap::new());
         }
         let rows = self
-            .persistence_manager
-            .backend()
-            .get_devices_batch(keys)
+            .read_device_registry_rows(keys, RegistryReadKind::Batch, publication)
             .await?;
-        let mut out = HashMap::with_capacity(rows.len());
-        for record in rows {
-            if record.devices.is_empty() {
-                continue;
-            }
-            let record = Arc::new(record);
-            self.device_registry_cache
-                .promote(Arc::clone(&record.user), Arc::clone(&record))
-                .await;
-            out.insert(Arc::clone(&record.user), record);
-        }
-        Ok(out)
+        Ok(rows
+            .into_iter()
+            .map(|record| (Arc::clone(&record.user), record))
+            .collect())
     }
 
     /// Owned registry records for `users`, positionally, from the cache or
@@ -1669,7 +1769,7 @@ impl Client {
         proposed: &HashMap<Jid, Jid>,
     ) -> Vec<Option<wacore::store::traits::DeviceListRecord>> {
         let (records, status) = self
-            .load_device_records_projected_inner(users, proposed)
+            .load_device_records_projected_inner(users, proposed, None)
             .await;
         if let Err(e) = status {
             warn!("device registry: projected DB lookup failed: {e}");
@@ -1682,26 +1782,31 @@ impl Client {
         &self,
         users: &[&Jid],
         proposed: &HashMap<Jid, Jid>,
+        publication: &DeviceRegistryMutationGuard<'_>,
     ) -> Result<Vec<Option<wacore::store::traits::DeviceListRecord>>> {
         let (records, status) = self
-            .load_device_records_projected_inner(users, proposed)
+            .load_device_records_projected_inner(users, proposed, Some(publication))
             .await;
         status?;
         Ok(records)
     }
 
+    /// Load positional records under an existing publication guard and preserve backend errors.
     pub(crate) async fn load_device_records_batch_checked(
         &self,
         users: &[&Jid],
+        publication: &DeviceRegistryMutationGuard<'_>,
     ) -> Result<Vec<Option<wacore::store::traits::DeviceListRecord>>> {
-        self.load_device_records_batch_projected_checked(users, &HashMap::new())
+        self.load_device_records_batch_projected_checked(users, &HashMap::new(), publication)
             .await
     }
 
+    /// Resolve prospective aliases without publishing them, retaining per-user cache preference and batch errors.
     async fn load_device_records_projected_inner(
         &self,
         users: &[&Jid],
         proposed: &HashMap<Jid, Jid>,
+        publication: Option<&DeviceRegistryMutationGuard<'_>>,
     ) -> (
         Vec<Option<wacore::store::traits::DeviceListRecord>>,
         Result<()>,
@@ -1741,7 +1846,7 @@ impl Client {
             .iter()
             .flat_map(|(_, lookup)| lookup.all_keys())
             .collect();
-        let rows = match self.fetch_registry_rows_checked(&keys).await {
+        let rows = match self.fetch_registry_rows_checked(&keys, publication).await {
             Ok(rows) => rows,
             Err(e) => return (out, Err(e)),
         };
@@ -1762,6 +1867,24 @@ impl Client {
     pub(crate) async fn get_devices_from_registry_batch(
         &self,
         jids: Vec<Jid>,
+    ) -> (Vec<Jid>, Vec<Jid>) {
+        self.get_devices_from_registry_batch_inner(jids, None).await
+    }
+
+    pub(crate) async fn get_devices_from_registry_batch_guarded(
+        &self,
+        jids: Vec<Jid>,
+        publication: &DeviceRegistryMutationGuard<'_>,
+    ) -> (Vec<Jid>, Vec<Jid>) {
+        self.get_devices_from_registry_batch_inner(jids, Some(publication))
+            .await
+    }
+
+    /// Resolve cached device sets first and batch the remaining durable lookups under publication ordering.
+    async fn get_devices_from_registry_batch_inner(
+        &self,
+        jids: Vec<Jid>,
+        publication: Option<&DeviceRegistryMutationGuard<'_>>,
     ) -> (Vec<Jid>, Vec<Jid>) {
         let mut devices = Vec::with_capacity(jids.len() * 2);
         let mut pending: Vec<(Jid, UserLookupKeys)> = Vec::new();
@@ -1787,7 +1910,7 @@ impl Client {
             .iter()
             .flat_map(|(_, lookup)| lookup.all_keys())
             .collect();
-        let rows = self.fetch_registry_rows(&keys).await;
+        let rows = self.fetch_registry_rows(&keys, publication).await;
         let mut missing = Vec::new();
         for (jid, lookup) in pending {
             let found = lookup
@@ -1834,31 +1957,25 @@ impl Client {
         }
 
         // L2: backend DB
-        let backend = self.persistence_manager.backend();
-        for key in lookup.all_keys() {
-            match backend.get_devices(key).await {
-                Ok(Some(record)) => {
-                    let devices = Self::reconstruct_device_jids(jid, &record);
-                    // Same invariant as L1: an empty row is corruption, treat as a miss.
-                    if devices.is_empty() {
-                        continue;
-                    }
-                    self.device_registry_cache
-                        .promote(Arc::clone(&record.user), Arc::new(record))
-                        .await;
-                    return Some(devices);
-                }
-                Ok(None) => continue,
-                Err(e) => {
-                    warn!(
-                        "get_devices_from_registry: DB lookup failed for {}: {e}",
-                        wacore_binary::jid::ObservedJid::from(key)
-                    );
-                }
+        let keys: Vec<_> = lookup.all_keys().collect();
+        match self
+            .read_device_registry_rows(
+                &keys,
+                RegistryReadKind::Single {
+                    include_empty: false,
+                },
+                None,
+            )
+            .await
+        {
+            Ok(records) => records
+                .first()
+                .map(|record| Self::reconstruct_device_jids(jid, record)),
+            Err(error) => {
+                warn!("get_devices_from_registry: DB lookup failed: {error}");
+                None
             }
         }
-
-        None
     }
 
     /// Reconstruct `Vec<Jid>` from a `DeviceListRecord`, using the query JID's
@@ -1888,7 +2005,21 @@ impl Client {
         )
     )]
     pub(crate) async fn migrate_device_registry_on_lid_discovery(&self, pn: &str, lid: &str) {
+        let mapping_guard = self.lid_pn_cache.lock_mutation().await;
         let guard = self.device_topology.lock_registry().await;
+        match self
+            .discovery_pair_is_current_guarded(pn, lid, &mapping_guard)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                warn!(
+                    "Skipping registry discovery migration after ownership lookup failure: {error:#}"
+                );
+                return;
+            }
+        }
         let backend = self.persistence_manager.backend();
 
         match backend.get_devices(pn).await {
@@ -2392,9 +2523,15 @@ mod tests {
             "add_lid_pn_mapping must bump"
         );
 
-        // Fresh pair: the record must live under its PN key (no mapping yet)
-        // for the migration to find and move it.
+        // Learn the real pair first, then seed a legacy PN row directly:
+        // canonicalized update_device_list would already store it under LID.
         client
+            .add_lid_pn_mapping("100000000000043", "5511999990005", LearningSource::Usync)
+            .await
+            .unwrap();
+        client
+            .persistence_manager
+            .backend()
             .update_device_list(wacore::store::traits::DeviceListRecord {
                 user: "5511999990005".into(),
                 devices: [wacore::store::traits::DeviceInfo::new(0, None)].into(),
