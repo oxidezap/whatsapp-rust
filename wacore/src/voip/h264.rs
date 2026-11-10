@@ -461,7 +461,8 @@ pub struct H264DepacketizerStats {
 /// boundary while the picture goes out), and a picture sent on its
 /// predecessor's RTP timestamp by a whole frame interval (about 67 ms at
 /// 15 fps). 8 ms sits below the 16.7 ms interval of 60 fps video, with room
-/// above the observed 1 ms.
+/// above the observed 1 ms. Expected FU fragments and proven paced slices
+/// override this heuristic while an AU is open.
 const SAME_PICTURE_OFFSET_MS: i32 = 8;
 
 /// H.264's RTP clock, in ticks per millisecond (RFC 6184 §5.1: 90 kHz).
@@ -477,6 +478,8 @@ struct PictureKey {
     /// The offset of the first picture on this RTP timestamp, which the
     /// output timestamp is measured from.
     base_offset: Option<i16>,
+    /// An expected FU fragment proved that this picture's offset varies with pacing.
+    paced: bool,
     /// The sequence number of the picture's latest packet.
     last_seq: u16,
 }
@@ -497,6 +500,7 @@ impl PictureKey {
             timestamp,
             offset,
             base_offset: offset,
+            paced: false,
             last_seq: seq,
         }
     }
@@ -694,11 +698,29 @@ impl H264Depacketizer {
             && seq == self.fu_next_seq
             && nal_unit_type(payload) == NAL_TYPE_FU_A
             && payload.get(1).is_some_and(|header| header & 0x80 == 0);
+        // Once pacing is observed, later slices still belong to this AU after a FU ends.
+        // Require a non-first slice rather than suppressing all offset boundaries: first
+        // slices and parameter sets must still recover a lost marker on a shared timestamp.
+        let later_slice = match nal_unit_type(payload) {
+            1 | 2 | NAL_TYPE_IDR => first_mb_in_slice(payload).is_some_and(|mb| mb > 0),
+            NAL_TYPE_FU_A if payload.get(1).is_some_and(|h| h & 0x80 != 0) => {
+                matches!(payload[1] & 0x1f, 1 | 2 | NAL_TYPE_IDR)
+                    && first_mb_in_slice(&payload[1..]).is_some_and(|mb| mb > 0)
+            }
+            _ => false,
+        };
         if let Some(cur) = self.au_picture.as_mut() {
-            let order = match cur.order(timestamp, offset_ms) {
-                PictureOrder::LaterShared if continues_fu => PictureOrder::Same,
-                order => order,
-            };
+            let mut order = cur.order(timestamp, offset_ms);
+            if timestamp == cur.timestamp && continues_fu {
+                cur.paced |= order != PictureOrder::Same;
+                order = PictureOrder::Same;
+            } else if timestamp == cur.timestamp
+                && cur.paced
+                && seq == cur.last_seq.wrapping_add(1)
+                && later_slice
+            {
+                order = PictureOrder::Same;
+            }
             match order {
                 PictureOrder::Same => {
                     if (seq.wrapping_sub(cur.last_seq) as i16) > 0 {
@@ -720,6 +742,7 @@ impl H264Depacketizer {
                         PictureKey {
                             offset: offset_ms,
                             last_seq: seq,
+                            paced: false,
                             ..cur
                         }
                     };
@@ -762,6 +785,7 @@ impl H264Depacketizer {
                         PictureKey {
                             offset: offset_ms,
                             last_seq: seq,
+                            paced: false,
                             ..completed
                         }
                     }
@@ -1616,6 +1640,127 @@ mod tests {
         let stats = d.take_stats();
         assert_eq!(stats.fu_orphan_fragments, 0);
         assert_eq!(stats.access_units_shared_timestamp, 0);
+    }
+
+    #[test]
+    fn paced_multislice_picture_waits_for_marker() {
+        let nals = [
+            vec![0x67, 1],
+            vec![0x68, 1],
+            [vec![0x65, 0x80], vec![1; 2000]].concat(),
+            vec![0x65, 0x40, 2],
+            [vec![0x65, 0x60], vec![3; 2000]].concat(),
+        ];
+        let au = au_from_nals(&nals);
+        let mut packets = PacketizedAu::default();
+        packetize_au(&au, &mut packets);
+        let mut d = H264Depacketizer::default();
+        for (i, packet) in packets.iter().enumerate() {
+            let last = i + 1 == packets.len();
+            assert_eq!(
+                d.push_with_time_offset(
+                    i as u16,
+                    9000,
+                    Some(i.saturating_sub(1) as i16 * 10),
+                    packet,
+                    last
+                ),
+                last.then(|| (9000, au.clone())),
+                "packet {i} must stay in the marked picture"
+            );
+        }
+        assert_eq!(d.take_stats().access_units_shared_timestamp, 0);
+    }
+
+    #[test]
+    fn paced_fu_accepts_decreasing_offsets() {
+        let mut d = H264Depacketizer::default();
+        assert_eq!(
+            d.push_with_time_offset(1, 9000, Some(20), &[0x7c, 0x85, 0x80], false),
+            None
+        );
+        assert_eq!(
+            d.push_with_time_offset(2, 9000, Some(0), &[0x7c, 0x05, 2], false),
+            None
+        );
+        assert_eq!(
+            d.push_with_time_offset(3, 9000, Some(-20), &[0x7c, 0x45, 3], true),
+            Some((9000, au_from_nals(&[vec![0x65, 0x80, 2, 3]])))
+        );
+        assert_eq!(d.take_stats().packets_stale_timestamp, 0);
+    }
+
+    #[test]
+    fn paced_picture_keeps_real_boundaries_after_a_lost_marker() {
+        for next in [
+            vec![0x41, 0x80, 4],
+            vec![0x7c, 0x81, 0x80, 4],
+            vec![0x67, 4],
+        ] {
+            let mut d = H264Depacketizer::default();
+            assert_eq!(
+                d.push_with_time_offset(1, 9000, Some(0), &[0x7c, 0x85, 0x80], false),
+                None
+            );
+            assert_eq!(
+                d.push_with_time_offset(2, 9000, Some(20), &[0x7c, 0x45, 3], false),
+                None
+            );
+            assert_eq!(
+                d.push_with_time_offset(3, 9000, Some(67), &next, false),
+                Some((9000, au_from_nals(&[vec![0x65, 0x80, 3]])))
+            );
+            assert_eq!(d.last_packet_timestamp(), Some(9000 + 67 * MS));
+            let stats = d.take_stats();
+            assert_eq!(stats.access_units_without_marker, 1);
+            assert_eq!(stats.access_units_shared_timestamp, 1);
+        }
+    }
+
+    #[test]
+    fn paced_fu_still_drops_timestamp_boundaries_and_sequence_gaps() {
+        for (seq, timestamp) in [(3, 10_000), (4, 9000)] {
+            let mut d = H264Depacketizer::default();
+            d.push_with_time_offset(1, 9000, Some(20), &[0x7c, 0x85, 0x80], false);
+            d.push_with_time_offset(2, 9000, Some(0), &[0x7c, 0x05, 2], false);
+            assert_eq!(
+                d.push_with_time_offset(seq, timestamp, Some(20), &[0x7c, 0x45, 3], true),
+                None
+            );
+            let stats = d.take_stats();
+            assert_eq!(
+                stats.fu_dropped_timestamp_boundary,
+                u32::from(timestamp != 9000)
+            );
+            assert_eq!(stats.fu_dropped_sequence_gap, u32::from(seq != 3));
+            assert_eq!(stats.fu_orphan_fragments, 1);
+        }
+    }
+
+    #[test]
+    fn paced_picture_state_ends_at_marker_and_reset() {
+        for reset in [false, true] {
+            let mut d = H264Depacketizer::default();
+            d.push_with_time_offset(1, 9000, Some(0), &[0x7c, 0x85, 0x80], false);
+            assert!(
+                d.push_with_time_offset(2, 9000, Some(20), &[0x7c, 0x45, 3], true)
+                    .is_some()
+            );
+            if reset {
+                d.reset();
+            }
+            let first_offset = if reset { 0 } else { 67 };
+            assert_eq!(
+                d.push_with_time_offset(3, 9000, Some(first_offset), &[0x41, 0x80], false),
+                None
+            );
+            // No FU has demonstrated pacing in this new picture. Keep the offset boundary.
+            let output = 9000 + first_offset as u32 * MS;
+            assert_eq!(
+                d.push_with_time_offset(4, 9000, Some(first_offset + 20), &[0x41, 0x40], true),
+                Some((output, au_from_nals(&[vec![0x41, 0x80]])))
+            );
+        }
     }
 
     // The pattern an iPhone sender produced: a new picture on the previous picture's RTP
