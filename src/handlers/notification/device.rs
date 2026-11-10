@@ -217,6 +217,38 @@ pub(crate) async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<
     use wacore::libsignal::store::sender_key_name::SenderKeyName;
     use wacore::types::jid::JidExt;
 
+    let stanza_lid = node.attrs().optional_jid("lid");
+    let resolved = client.resolve_encryption_jid(&from_jid).await;
+    let alias = client.device_list_identity_alias(&from_jid).await;
+    let reciprocal = if let Some(alias) = &alias {
+        client.device_list_identity_alias(alias).await.as_ref() == Some(&from_jid.with_device(0))
+    } else {
+        false
+    };
+    let counterpart_known = reciprocal
+        || (from_jid.server.is_pn_family()
+            && stanza_lid
+                .as_ref()
+                .is_some_and(|jid| jid.server.is_lid_family()));
+    // Retire authentication begun before this notification, even when the
+    // primary was absent. Keep the marker through local cleanup and its ACK,
+    // but release it before any fresh authentication triggered below.
+    let users = std::iter::once(from_jid.user.as_ref())
+        .chain(std::iter::once(resolved.user.as_ref()))
+        .chain(stanza_lid.as_ref().map(|jid| jid.user.as_ref()))
+        .chain(alias.as_ref().map(|jid| jid.user.as_ref()));
+    // Without the counterpart we cannot safely scope a pending authentication
+    // in its other namespace. Reject pre-reset epochs globally, without
+    // inventing an alias or accepting any response key as current trust.
+    let retirement = if counterpart_known {
+        client
+            .signal_cache
+            .identity_continuity
+            .changing_primary(users)
+    } else {
+        client.signal_cache.identity_continuity.changing_primary([])
+    };
+
     // Always run the device-list cleanup, matching WA Web's
     // clearDeviceRecordForIdentityChange (which runs BEFORE the had-prior-identity
     // gate): drop companion device sessions + force a fresh usync of the peer's
@@ -244,14 +276,16 @@ pub(crate) async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<
     //   - the LID carried by the stanza itself (the local cache may be cold/evicted
     //     so resolve falls back to PN, yet the state lives under the stanza LID).
     // Reading only the resolved address would false-negative and skip a real reset.
-    let resolved = client.resolve_encryption_jid(&from_jid).await;
-    let stanza_lid = node.attrs().optional_jid("lid");
     let backend = client.persistence_manager.backend();
 
     let mut reset_addrs = vec![resolved.to_protocol_address()];
-    for candidate in [Some(from_jid.clone()), stanza_lid.clone()]
-        .into_iter()
-        .flatten()
+    for candidate in [
+        Some(from_jid.clone()),
+        stanza_lid.clone(),
+        alias.clone().filter(|_| reciprocal),
+    ]
+    .into_iter()
+    .flatten()
     {
         let cand_addr = candidate.to_protocol_address();
         if !reset_addrs.contains(&cand_addr) {
@@ -335,6 +369,8 @@ pub(crate) async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<
             .flush_signal_cache_batch_safe_logged("identity change", None)
             .await;
     }
+
+    drop(retirement);
 
     // Re-issue an active trusted-contact token, matching WA Web
     // handleE2eIdentityChange -> sendTcTokenWhenDeviceIdentityChange. Spawned so

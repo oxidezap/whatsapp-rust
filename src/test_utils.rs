@@ -661,7 +661,21 @@ pub(crate) async fn create_iq_test_client() -> (
     Arc<Client>,
     Arc<crate::transport::mock::CapturingMockTransport>,
 ) {
-    create_iq_test_client_with_backend(create_test_backend().await).await
+    let fixture = create_iq_test_client_with_backend(create_test_backend().await).await;
+    // Default fixtures model a settled client. A delayed SQLite warmup can
+    // otherwise publish a topology change after a test captures its generation.
+    // Custom backend/runtime fixtures remain available for startup races/gates.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !fixture.0.lid_pn_cache.startup_finished_for_tests() {
+            tokio::task::yield_now().await;
+        }
+        // Provenance freezes under mutation before publishing loaded rows.
+        // Join that scope as well, rather than mistaking its flag for an ACK.
+        drop(fixture.0.lid_pn_cache.lock_mutation().await);
+    })
+    .await
+    .expect("default fixture mapping warmup must finish");
+    fixture
 }
 
 /// The same connected, Noise-framed fixture with a caller-owned backend for

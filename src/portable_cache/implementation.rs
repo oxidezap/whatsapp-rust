@@ -1692,7 +1692,12 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let mut guard = self.inner.write().await;
+        // Match insert: avoid an allocated listener when uncontended, but
+        // await the same exclusive lock before removing a contended entry.
+        let mut guard = match self.inner.try_write() {
+            Some(guard) => guard,
+            None => self.inner.write().await,
+        };
         match &mut *guard {
             Storage::Plain(inner) => {
                 inner.remove_key(key);
@@ -2040,6 +2045,46 @@ impl<K, V, S> Clone for PortableCache<K, V, S> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn invalidation_waits_for_readers_and_cancellation_keeps_the_entry() {
+        for capacity in [u64::MAX, 2] {
+            let cache = PortableCache::builder().max_capacity(capacity).build();
+            cache.insert(1, 10).await;
+            let reader = cache.inner.read().await;
+            {
+                let mut cancelled = std::pin::pin!(cache.invalidate(&1));
+                assert!(futures::poll!(&mut cancelled).is_pending());
+            }
+            drop(reader);
+            assert_eq!(cache.get(&1).await, Some(10));
+
+            let reader = cache.inner.read().await;
+            let mut waiting = std::pin::pin!(cache.invalidate(&1));
+            assert!(futures::poll!(&mut waiting).is_pending());
+            drop(reader);
+            waiting.await;
+            assert_eq!(cache.get(&1).await, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalidation_cannot_bypass_a_writer_waiting_for_readers() {
+        for capacity in [u64::MAX, 2] {
+            let cache = PortableCache::builder().max_capacity(capacity).build();
+            cache.insert(1, 0).await;
+            let reader = cache.inner.read().await;
+            let mut writer = std::pin::pin!(cache.insert(1, 10));
+            assert!(futures::poll!(&mut writer).is_pending());
+            let mut invalidation = std::pin::pin!(cache.invalidate(&1));
+            assert!(futures::poll!(&mut invalidation).is_pending());
+            drop(reader);
+            assert!(futures::poll!(&mut invalidation).is_pending());
+            writer.await;
+            invalidation.await;
+            assert_eq!(cache.get(&1).await, None);
+        }
+    }
 
     #[tokio::test]
     async fn insert_waits_for_readers_and_cancelled_wait_does_not_publish() {

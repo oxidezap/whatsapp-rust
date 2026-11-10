@@ -32,6 +32,7 @@ mod requests;
 pub use requests::{EditRequest, SendRequest};
 pub(crate) mod group_repair;
 mod tctoken_lifecycle;
+mod tctoken_storage;
 pub(crate) use tctoken_lifecycle::is_own_identity;
 
 /// Error returned by the message send path ([`Client::send_message`],

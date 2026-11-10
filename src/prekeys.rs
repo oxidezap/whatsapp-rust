@@ -195,6 +195,7 @@ impl Client {
         jids: &[Jid],
         reason: Option<PreKeyFetchReason>,
     ) -> Result<wacore::prekeys::PreKeyFetchOutcome, anyhow::Error> {
+        let bootstrap_epoch = self.signal_cache.identity_continuity.primary_snapshot();
         let account_identities = self.collect_account_identities(jids).await?;
         let mut primary_snapshots = Vec::new();
         for jid in jids.iter().filter(|jid| jid.device == 0) {
@@ -244,18 +245,16 @@ impl Client {
         // Remember every cold account anchor before returning companions, even
         // when device 0 was explicitly requested: fanout validates bundles
         // before installing any primary session. The caller may already own
-        // session locks, so compare/insert atomically instead of reacquiring them.
-        let backend = self.persistence_manager.backend();
+        // session locks: the bootstrap fence excludes ADV publication without
+        // reacquiring sessions, and checks known reciprocal account aliases.
         for jid in &bootstrap_primaries {
             if let Some(bundle) = outcome.bundles.get(jid) {
-                use wacore::types::jid::JidExt;
                 let identity = authenticated_primary_identity(bundle)?;
                 if !self
-                    .signal_cache
-                    .persist_identity_if_absent_or_equal(
-                        &jid.to_protocol_address(),
+                    .persist_adv_bootstrap_identity_in_epoch(
+                        jid,
                         identity.public_key().public_key_bytes(),
-                        &*backend,
+                        bootstrap_epoch,
                     )
                     .await?
                 {
@@ -327,14 +326,13 @@ impl Client {
         if let Some(identity) = self.cached_adv_account_identity(jid).await? {
             return Ok(identity);
         }
+        let epoch = self.signal_cache.identity_continuity.primary_snapshot();
         let key = self.query_adv_account_identity(&primary, None).await?;
-        let backend = self.persistence_manager.backend();
         if !self
-            .signal_cache
-            .persist_identity_if_absent_or_equal(&address, &key, &*backend)
+            .persist_adv_bootstrap_identity_in_epoch(&primary, &key, epoch)
             .await?
         {
-            anyhow::bail!("primary identity changed during ADV bootstrap");
+            anyhow::bail!(crate::usync::DeviceListIdentityConflict::Bootstrap);
         }
         Ok(key)
     }

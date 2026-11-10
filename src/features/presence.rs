@@ -146,12 +146,27 @@ impl<'a> Presence<'a> {
     ///
     /// The check is re-read per JID rather than taken from the resubscribe
     /// snapshot: an `unsubscribe` landing mid-resubscribe must not be undone.
-    pub(crate) async fn re_subscribe_when_active(&self, jid: &Jid) -> Result<(), PresenceError> {
+    pub(crate) async fn re_subscribe_when_active(
+        &self,
+        jid: &Jid,
+        token_key: &str,
+        stored_under_pn: bool,
+    ) -> Result<(), PresenceError> {
         if !self.client.is_presence_subscription_tracked(jid) {
             return Ok(());
         }
 
-        let node = self.build_subscription_node(jid).await;
+        let mut token = self.client.lookup_tc_token_for_key(jid, token_key).await;
+        if token.is_none() && stored_under_pn {
+            // A legacy PN row can be moved after the notification's write ACK.
+            // Only that storage namespace may follow a newly learned mapping;
+            // an expired LID token must not fall back to an unrelated PN row.
+            let current_key = self.client.resolve_tc_token_key(jid).await;
+            if current_key != token_key {
+                token = self.client.lookup_tc_token_for_key(jid, &current_key).await;
+            }
+        }
+        let node = Self::subscription_node_with_token(jid, token);
         // Re-read after the token lookup, which awaits. An `unsubscribe` landing
         // in that window has already sent its own stanza, so subscribing now
         // would leave the peer subscribed while we no longer track it. This

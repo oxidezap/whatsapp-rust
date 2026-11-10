@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use wacore_binary::CompactString;
 
+use crate::cache::Cache;
 use crate::cache_config::{CacheConfig, CacheEntryConfig};
 use crate::cache_store::TypedCache;
 #[cfg(test)]
@@ -93,7 +94,7 @@ pub struct LidPnCache {
     /// LID, never a newer un-persisted one. `Arc<str>` value: the hot-path check
     /// clones a refcount and compares in place, no payload copy. In-memory only;
     /// mappings loaded from persistent storage are marked during warm-up.
-    persisted: TypedCache<Arc<str>, Arc<str>>,
+    persisted: Cache<Arc<str>, Arc<str>>,
 }
 
 /// What [`LidPnCache::memory_stats`] reports: one figure per internal map.
@@ -183,7 +184,7 @@ impl LidPnCache {
                 identity_continuity,
                 // Always in-memory: tracks per-process persist state, never the
                 // mapping itself, so it must not go through the shared store.
-                persisted: TypedCache::from_local(config.build_with_tti()),
+                persisted: config.build_with_tti(),
                 contact_hash_to_lid: TypedCache::from_local(config.build_with_tti()),
                 topology: std::sync::OnceLock::new(),
             },
@@ -194,7 +195,7 @@ impl LidPnCache {
                 startup_writes: std::sync::Mutex::new(None),
                 startup_finished: AtomicBool::new(false),
                 identity_continuity,
-                persisted: TypedCache::from_local(config.build_with_tti()),
+                persisted: config.build_with_tti(),
                 contact_hash_to_lid: TypedCache::from_local(config.build_with_tti()),
                 topology: std::sync::OnceLock::new(),
             },
@@ -255,6 +256,24 @@ impl LidPnCache {
         LidPnMutationGuard {
             _guard: self.mutation.lock().await,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_lock_mutation(&self) -> Option<LidPnMutationGuard<'_>> {
+        self.mutation
+            .try_lock()
+            .map(|guard| LidPnMutationGuard { _guard: guard })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn startup_finished_for_tests(&self) -> bool {
+        self.startup_finished.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn evict_reverse_for_tests(&self, lid: &str) {
+        let _guard = self.lock_mutation().await;
+        self.lid_to_entry.invalidate(lid).await;
     }
 
     /// Test-only clones of the backing custom stores, one per direction map.
@@ -452,14 +471,29 @@ impl LidPnCache {
             }
             None => true,
         };
-        let mapping_changed = (write_lid
+        let reverse_changed = write_lid
             && previous_lid
                 .as_ref()
-                .is_none_or(|existing| existing.phone_number != entry.phone_number))
-            || (should_update_pn
-                && previous_pn
-                    .as_ref()
-                    .is_none_or(|existing| existing.lid != entry.lid));
+                .is_none_or(|existing| existing.phone_number != entry.phone_number);
+        let forward_changed = should_update_pn
+            && previous_pn
+                .as_ref()
+                .is_none_or(|existing| existing.lid != entry.lid);
+        let mapping_changed = reverse_changed || forward_changed;
+        // A durable marker belongs to the current reciprocal pair. Rebinding
+        // either direction must revoke it before publishing the new cache row,
+        // otherwise a concurrent relearn could return before its backend ACK.
+        if forward_changed
+            || (reverse_changed && self.is_persisted(&entry.phone_number, &entry.lid).await)
+        {
+            self.persisted.invalidate(&*entry.phone_number).await;
+        }
+        if reverse_changed
+            && let Some(previous) = &previous_lid
+            && self.is_persisted(&previous.phone_number, &entry.lid).await
+        {
+            self.persisted.invalidate(&*previous.phone_number).await;
+        }
         let _identity_change = mapping_changed.then(|| {
             self.identity_continuity.changing(
                 [
@@ -633,6 +667,11 @@ impl LidPnCache {
                 .get(&*entry.phone_number)
                 .await
                 .is_some_and(|current| current.lid == entry.lid)
+                && self
+                    .lid_to_entry
+                    .get(&*entry.lid)
+                    .await
+                    .is_some_and(|current| current.phone_number == entry.phone_number)
             {
                 self.mark_persisted(&entry.phone_number, &entry.lid).await;
             }
@@ -920,6 +959,8 @@ mod tests {
                 cache.can_skip_relearn("pn1", "lid1").await,
                 stored_lid == "lid1" && stored_pn == "pn1"
             );
+            assert!(!cache.is_persisted("old_pn", "lid1").await);
+            assert!(!cache.can_skip_relearn("old_pn", "lid1").await);
             if stored_lid != "lid1" {
                 assert_eq!(
                     cache.get_phone_number(stored_lid).await.as_deref(),
@@ -1355,6 +1396,32 @@ mod tests {
         // A remap to a new LID is not persisted (even a stale mark of the old
         // LID never satisfies the new pair), so it re-persists.
         assert!(!cache.is_persisted(pn, lid_b).await);
+    }
+
+    #[tokio::test]
+    async fn rebinding_revokes_old_durable_pair_before_reclaim() {
+        let cache = LidPnCache::new();
+        let lid = "100000000000001";
+        let old = "559980000099";
+        let new = "559980000098";
+        for (phone, timestamp) in [(old, 1), (new, 2), (old, 3)] {
+            cache
+                .add(&LidPnEntry::with_timestamp(
+                    lid.to_string(),
+                    phone.to_string(),
+                    timestamp,
+                    LearningSource::Usync,
+                ))
+                .await;
+            assert!(!cache.can_skip_relearn(phone, lid).await);
+            if timestamp < 3 {
+                cache
+                    .mark_persisted(&Arc::from(phone), &Arc::from(lid))
+                    .await;
+            }
+        }
+        assert!(!cache.is_persisted(new, lid).await);
+        assert!(!cache.is_persisted(old, lid).await);
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@ const ADDRESS_ATTRIBUTE: &str = "#[divan::bench(args = USER_COUNTS)]";
 const DM_BENCH: &str = "benches/client_dm_send.rs";
 const GROUP_BENCH: &str = "benches/client_group_send.rs";
 const SDK_FIXTURE: &str = "src/bench_support.rs";
+const IDENTITY_BENCH: &str = "benches/client_identity_cache.rs";
 const ATTRIBUTE: &str =
     "#[divan::bench(args = [65536, 1048576], sample_count = 1000, sample_size = 1)]";
 // Each role/repetition has a distinct benchmark URI. No sample overwrites another.
@@ -45,6 +46,7 @@ struct Manifest {
     address_benchmark_sha256: String,
     sdk_benchmark_sha256: [String; 2],
     sdk_fixture_sha256: String,
+    identity_benchmark_sha256: String,
     instruments: [String; 2],
     expected_results: usize,
     order: Vec<(String, usize)>,
@@ -154,6 +156,20 @@ fn sdk_workload(source: &str, group: bool) -> Result<String> {
         ],
     )
 }
+fn identity_workload(source: &str) -> Result<String> {
+    let lookups = "#[divan::bench(args = ENTRY_COUNTS)]";
+    ensure!(
+        source.matches(lookups).count() == 4,
+        "identity lookup registration changed; review the paired workload"
+    );
+    forward_workload(
+        &source.replace(lookups, ""),
+        "#[divan::bench(args = [64usize, 512, 3443, 4096])]",
+        1,
+        &["lid_pn_warm_up"],
+    )
+}
+
 fn forward_workload(
     source: &str,
     attribute: &str,
@@ -228,6 +244,9 @@ mod dm;
 #[path = "sdk_group_pair_workload/mod.rs"]
 #[allow(dead_code, unused_imports)]
 mod group;
+#[path = "sdk_identity_pair_workload/mod.rs"]
+#[allow(dead_code, unused_imports)]
+mod identity;
 fn main() { divan::main(); }
 const DM_CASES: &[&str] = &[
     "1_round0", "2_round0", "5_round0", "1_round1", "2_round1", "5_round1",
@@ -239,6 +258,12 @@ const GROUP_CASES: &[&str] = &[
     "8_round2", "32_round2", "128_round2", "512_round2",
     "8_round3", "32_round3", "128_round3", "512_round3",
 ];
+const WARM_UP_CASES: &[&str] = &[
+    "64_round0", "512_round0", "3443_round0", "4096_round0",
+    "64_round1", "512_round1", "3443_round1", "4096_round1",
+    "64_round2", "512_round2", "3443_round2", "4096_round2",
+    "64_round3", "512_round3", "3443_round3", "4096_round3",
+];
 fn width(case: &str) -> usize {
     case.split_once('_').expect("fixed sample label").0.parse().expect("fixed width")
 }
@@ -249,6 +274,10 @@ fn warm_dm_send_lid(bencher: divan::Bencher, case: &str) {
 #[divan::bench(args = GROUP_CASES, sample_count = 20, sample_size = 20)]
 fn warm_group_send(bencher: divan::Bencher, case: &str) {
     group::warm_group_send(bencher, width(case));
+}
+#[divan::bench(args = WARM_UP_CASES)]
+fn lid_pn_warm_up(bencher: divan::Bencher, case: &str) {
+    identity::lid_pn_warm_up(bencher, width(case));
 }
 "#
 }
@@ -285,6 +314,7 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
             std::fs::read(checkout.join(DM_BENCH))?,
             std::fs::read(checkout.join(GROUP_BENCH))?,
             std::fs::read(checkout.join(SDK_FIXTURE))?,
+            std::fs::read(checkout.join(IDENTITY_BENCH))?,
         ));
         revisions.push(Revision {
             role: role.to_owned(),
@@ -305,6 +335,7 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
     let addresses = address_workload(std::str::from_utf8(&inputs[0].2)?)?;
     let sdk_dm = sdk_workload(std::str::from_utf8(&inputs[0].3)?, false)?;
     let sdk_group = sdk_workload(std::str::from_utf8(&inputs[0].4)?, true)?;
+    let identity = identity_workload(std::str::from_utf8(&inputs[0].6)?)?;
     ensure!(
         std::str::from_utf8(&inputs[0].5)?
             .contains("pub const GROUP_SIZES: &[usize] = &[8, 32, 128, 512];"),
@@ -316,6 +347,8 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
         ("original_sdk_fixture.rs", inputs[0].5.as_slice()),
         ("forwarded_sdk_dm.rs", sdk_dm.as_bytes()),
         ("forwarded_sdk_group.rs", sdk_group.as_bytes()),
+        ("original_identity_benchmark.rs", inputs[0].6.as_slice()),
+        ("forwarded_identity_benchmark.rs", identity.as_bytes()),
     ] {
         write(&output.join("results").join(name), source)?;
     }
@@ -349,6 +382,12 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
         wrapper().as_bytes(),
     )?;
     for item in &revisions {
+        write(
+            &item
+                .checkout
+                .join("benches/sdk_identity_pair_workload/mod.rs"),
+            identity.as_bytes(),
+        )?;
         write(
             &item.checkout.join("benches/sdk_dm_pair_workload/mod.rs"),
             sdk_dm.as_bytes(),
@@ -430,15 +469,16 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
     write_json(
         &output.join("results/manifest.json"),
         &Manifest {
-            schema_version: 4,
+            schema_version: 7,
             measured_driver_revision: head.to_owned(),
             benchmark_sha256: sha256(&inputs[0].0),
             fixture_sha256: sha256(&inputs[0].1),
             address_benchmark_sha256: sha256(&inputs[0].2),
             sdk_benchmark_sha256: [sha256(&inputs[0].3), sha256(&inputs[0].4)],
             sdk_fixture_sha256: sha256(&inputs[0].5),
+            identity_benchmark_sha256: sha256(&inputs[0].6),
             instruments: ["Simulation".to_owned(), "Memory".to_owned()],
-            expected_results: 224,
+            expected_results: 288,
             order: ORDER
                 .iter()
                 .map(|(role, round)| ((*role).to_owned(), *round))
@@ -455,11 +495,11 @@ pub fn measure(root: &Path, output: &Path) -> Result<()> {
     let manifest: Manifest =
         serde_json::from_slice(&std::fs::read(output.join("results/manifest.json"))?)?;
     ensure!(
-        manifest.schema_version == 4 && revision(root)? == manifest.measured_driver_revision,
+        manifest.schema_version == 7 && revision(root)? == manifest.measured_driver_revision,
         "measurement driver changed after preparation"
     );
     ensure!(
-        manifest.instruments == ["Simulation", "Memory"] && manifest.expected_results == 224,
+        manifest.instruments == ["Simulation", "Memory"] && manifest.expected_results == 288,
         "paired CPU/allocation measurement contract changed"
     );
     ensure!(
@@ -498,6 +538,7 @@ pub fn measure(root: &Path, output: &Path) -> Result<()> {
             (DM_BENCH, &manifest.sdk_benchmark_sha256[0]),
             (GROUP_BENCH, &manifest.sdk_benchmark_sha256[1]),
             (SDK_FIXTURE, &manifest.sdk_fixture_sha256),
+            (IDENTITY_BENCH, &manifest.identity_benchmark_sha256),
         ] {
             ensure!(
                 sha256(&std::fs::read(item.checkout.join(path))?) == *hash,
@@ -525,6 +566,63 @@ pub fn measure(root: &Path, output: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn identity_pair_keeps_the_original_timed_body_and_rejects_changed_registration() {
+        let source = include_str!("../../../benches/client_identity_cache.rs");
+        let forwarded = identity_workload(source).unwrap();
+        assert!(!forwarded.contains("#[divan::bench"));
+        assert_eq!(
+            source.split_once("fn lid_pn_warm_up(").unwrap().1,
+            forwarded
+                .split_once("pub(super) fn lid_pn_warm_up(")
+                .unwrap()
+                .1,
+        );
+        assert!(
+            identity_workload(
+                &source.replace("[64usize, 512, 3443, 4096]", "[65usize, 512, 3443, 4096]",)
+            )
+            .is_err()
+        );
+        assert!(
+            identity_workload(&source.replacen(
+                "#[divan::bench(args = ENTRY_COUNTS)]",
+                "#[divan::bench(args = [64usize])]",
+                1,
+            ))
+            .is_err()
+        );
+        for round in 0..4 {
+            assert_eq!(
+                sdk_wrapper().matches(&format!("_round{round}\"")).count(),
+                11
+            );
+        }
+        let wrapper = sdk_wrapper();
+        for (name, widths) in [
+            ("DM_CASES", &[1, 2, 5][..]),
+            ("GROUP_CASES", &[8, 32, 128, 512][..]),
+            ("WARM_UP_CASES", &[64, 512, 3443, 4096][..]),
+        ] {
+            let cases = wrapper
+                .split_once(&format!("const {name}: &[&str] = &["))
+                .unwrap()
+                .1
+                .split_once("];")
+                .unwrap()
+                .0;
+            let actual: Vec<_> = cases.split('"').skip(1).step_by(2).collect();
+            let expected: Vec<_> = (0..4)
+                .flat_map(|round| {
+                    widths
+                        .iter()
+                        .map(move |width| format!("{width}_round{round}"))
+                })
+                .collect();
+            assert_eq!(actual, expected, "wrapper widths must match {name}");
+        }
+    }
+
     #[test]
     fn paired_dependencies_reject_both_unstaged_and_staged_lock_changes() {
         let checkout = tempfile::tempdir().unwrap();
