@@ -1013,6 +1013,10 @@ impl Client {
             }
             SessionBatchOutcome::default()
         };
+        if session_outcome.interrupted {
+            self.report_stanza_not_attempted(&info, &[], &group_payloads, &bot_payloads);
+            return;
+        }
         if session_outcome.had_failure && self.inbound_journal_enabled() {
             self.inbound_commit_batch.live_retention.fail_receipt(&info);
         }
@@ -1285,6 +1289,10 @@ impl Client {
             ));
             std::future::poll_fn(|cx| poll_inbound_phase(future.as_mut(), cx)).await
         };
+
+        if outcome.interrupted {
+            return outcome;
+        }
 
         for DeferredPlaintext {
             enc_type,
@@ -1596,7 +1604,21 @@ impl Client {
                         // flush must be skipped too: the retry then fails and
                         // the message is redelivered.
                         if self.inbound_commit_batch.is_active() {
+                            // A companion in another lane can hold a permit
+                            // while waiting on this account lock. Release both
+                            // locks before waiting for the full permit pool.
+                            let account_identity = if account_fence.guard.is_some() {
+                                Some(
+                                    self.cached_adv_account_identity(sender_encryption_jid)
+                                        .await
+                                        .ok()
+                                        .flatten(),
+                                )
+                            } else {
+                                None
+                            };
                             drop(session_guard.take());
+                            account_fence.guard = None;
                             let self_for_work = Arc::clone(&self);
                             let (suspension, flushed) = self
                                 .with_stanza_permit_suspended(
@@ -1613,12 +1635,53 @@ impl Client {
                                         // updated BEFORE the retry decrypt:
                                         // `is_trusted_identity` reads the
                                         // backend, not the cache.
+                                        if self_for_work
+                                            .connection_generation
+                                            .load(Ordering::Acquire)
+                                            != lane_generation
+                                        {
+                                            return false;
+                                        }
                                         self_for_work.flush_signal_cache().await.is_ok()
                                     },
                                 )
                                 .await;
-                            session_guard = Some(session_mutex.lock_arc().await);
                             if suspension == PermitSuspension::Reconnected {
+                                outcome.interrupted = true;
+                                self.report_enc_decrypt_failure(
+                                    info,
+                                    enc_index,
+                                    enc_type,
+                                    EncDecryptFailureReason::NotAttempted,
+                                );
+                                for remaining in payloads_iter {
+                                    self.report_enc_decrypt_failure(
+                                        info,
+                                        remaining.enc_index,
+                                        remaining.enc_type.as_wire_str(),
+                                        EncDecryptFailureReason::NotAttempted,
+                                    );
+                                }
+                                return (outcome, deferred, Some(timer));
+                            }
+                            let mut account_valid = true;
+                            if let Some(previous) = account_identity {
+                                account_fence.guard =
+                                    self.lock_companion_account(sender_encryption_jid).await;
+                                let current = self
+                                    .cached_adv_account_identity(sender_encryption_jid)
+                                    .await;
+                                if previous.is_none() || current.ok().flatten() != previous {
+                                    account_valid = false;
+                                }
+                            }
+                            session_guard = Some(session_mutex.lock_arc().await);
+                            if !account_valid
+                                || self.connection_generation.load(Ordering::Acquire)
+                                    != lane_generation
+                            {
+                                outcome.interrupted = true;
+                                outcome.had_failure = true;
                                 self.report_enc_decrypt_failure(
                                     info,
                                     enc_index,

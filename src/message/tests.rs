@@ -24084,3 +24084,58 @@ async fn retry_admission_panic_is_not_a_fallback_verdict() {
         .build();
     client.handle_retry_receipt(&receipt, &node).await.unwrap();
 }
+
+/// Drive the count threshold through decrypt and stanza completion, before the timer.
+#[tokio::test(start_paused = true)]
+async fn offline_receive_flushes_at_message_capacity_before_timer() {
+    struct Hook(std::sync::Mutex<Vec<String>>);
+    #[async_trait::async_trait]
+    impl crate::InboundDurabilityHook for Hook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            items: &[wacore::types::events::InboundMessage],
+        ) -> anyhow::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .extend(items.iter().map(|item| item.info.id.to_string()));
+            Ok(())
+        }
+    }
+    let client = crate::test_utils::create_test_client().await;
+    client.enter_drain_mode_for_tests();
+    let hook = Arc::new(Hook(Default::default()));
+    client
+        .inbound_durability_hook
+        .set(hook.clone())
+        .ok()
+        .unwrap();
+    let group: Jid = "120363000000000094@g.us".parse().unwrap();
+    let mut sender = joined_group_sender(&client, "100000000000012@lid", &group).await;
+    let start = tokio::time::Instant::now();
+    for index in 0..400 {
+        let ciphertext = encrypt_group_text(&mut sender, &group, "capacity receive fixture").await;
+        let info = group_message_info(&format!("CAPACITY_{index}"), &group, &sender.jid, false);
+        process_group_classified_with_sessions(
+            &client,
+            info,
+            &sender.jid,
+            vec![],
+            vec![skmsg_payload_from_bytes(ciphertext)],
+        )
+        .await;
+        if index < 399 {
+            assert!(hook.0.lock().unwrap().is_empty(), "no early snapshot");
+        }
+    }
+    assert!(start.elapsed() < std::time::Duration::from_secs(3));
+    let committed = hook.0.lock().unwrap();
+    assert_eq!(committed.len(), 400);
+    assert_eq!(committed.first().unwrap(), "CAPACITY_0");
+    assert_eq!(committed.last().unwrap(), "CAPACITY_399");
+    assert!(
+        client.inbound_commit_batch.is_active(),
+        "drain has not completed"
+    );
+}

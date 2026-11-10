@@ -265,12 +265,15 @@ impl Client {
     /// Acquire every permit the current pool's quiescence requires — all of
     /// them on the drain pool (so no stanza is mid-decrypt while a batch flush
     /// or mode transition persists the whole Signal cache), one on the live
-    /// pool. The semaphore is fair, so a quiescence waiter cannot starve
-    /// behind later stanza acquisitions; a generation swap mid-acquire drops
-    /// the partial hold and retries on the new pool.
+    /// pool. A pool-local mutex serializes collectors so they cannot retain
+    /// disjoint subsets forever. A generation swap mid-acquire drops the
+    /// partial hold and retries on the new pool.
     pub(crate) async fn acquire_message_quiescence(&self) -> Vec<async_lock::SemaphoreGuardArc> {
         loop {
             let (generation, pool) = self.read_message_semaphore();
+            // Fairness of individual acquires cannot prevent two collectors
+            // from each retaining half the pool. Only one may collect at a time.
+            let _collector = pool.quiesce_lock.lock().await;
             let mut permits = Vec::with_capacity(pool.quiesce_permits);
             for _ in 0..pool.quiesce_permits {
                 permits.push(self.acquire_arc_with_warn(&pool.semaphore).await);
@@ -295,16 +298,22 @@ impl Client {
     /// Returns [`PermitSuspension::Reconnected`] when the connection was
     /// replaced while suspended: the caller must abandon its remaining
     /// payloads unacked so the server redelivers them.
-    pub(crate) async fn with_stanza_permit_suspended<R>(
+    pub(crate) async fn with_stanza_permit_suspended(
         &self,
         slot: &mut Option<async_lock::SemaphoreGuardArc>,
         lane_generation: u64,
-        work: impl Future<Output = R>,
-    ) -> (PermitSuspension, R) {
+        work: impl Future<Output = bool>,
+    ) -> (PermitSuspension, bool) {
         drop(slot.take());
-        let _quiescence = self.acquire_message_quiescence().await;
+        let quiescence = self.acquire_message_quiescence().await;
+        if self.connection_generation.load(Ordering::Acquire) != lane_generation {
+            return (PermitSuspension::Reconnected, false);
+        }
         let result = work.await;
-        drop(_quiescence);
+        drop(quiescence);
+        if self.connection_generation.load(Ordering::Acquire) != lane_generation {
+            return (PermitSuspension::Reconnected, result);
+        }
         *slot = Some(self.acquire_message_processing_permit().await);
         let suspension = if self.connection_generation.load(Ordering::Acquire) == lane_generation {
             PermitSuspension::Resumed

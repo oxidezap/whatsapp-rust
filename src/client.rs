@@ -501,28 +501,42 @@ pub(crate) fn resolve_offline_drain_permits(requested: usize) -> usize {
 /// semaphore it is one, because coalesced live flushes have no whole-cache
 /// invariant to guard.
 #[derive(Clone)]
-pub(crate) struct MessagePermitSemaphore {
+pub(crate) struct MessagePermitSemaphore(Arc<MessagePermitPool>);
+
+impl std::ops::Deref for MessagePermitSemaphore {
+    type Target = MessagePermitPool;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+pub(crate) struct MessagePermitPool {
     pub(crate) semaphore: Arc<async_lock::Semaphore>,
     pub(crate) quiesce_permits: usize,
+    /// Serialize partial acquisitions within this semaphore generation.
+    pub(crate) quiesce_lock: async_lock::Mutex<()>,
 }
 
 impl MessagePermitSemaphore {
     /// Semaphore for the offline drain: `permits` stanzas process concurrently
     /// and a quiescence acquire takes all of them.
     pub(crate) fn drain(permits: usize) -> Self {
-        Self {
+        Self(Arc::new(MessagePermitPool {
             semaphore: Arc::new(async_lock::Semaphore::new(permits.max(1))),
             quiesce_permits: permits.max(1),
-        }
+            quiesce_lock: async_lock::Mutex::new(()),
+        }))
     }
 
     /// Live-mode semaphore: `permits` concurrent stanzas, but a quiescence
     /// acquire takes just one — there is no whole-cache drain flush to guard.
     pub(crate) fn live(permits: usize) -> Self {
-        Self {
+        Self(Arc::new(MessagePermitPool {
             semaphore: Arc::new(async_lock::Semaphore::new(permits.max(1))),
             quiesce_permits: 1,
-        }
+            quiesce_lock: async_lock::Mutex::new(()),
+        }))
     }
 
     #[cfg(test)]

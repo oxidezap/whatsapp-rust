@@ -3900,10 +3900,9 @@ fn client_size_pins_runtime_cache_config_saving() {
     assert_eq!(retry_slot, 2 * size_of::<usize>());
     assert_eq!(decrypt_slot, 2 * size_of::<usize>());
     assert!(slots < legacy_slots);
-    // The drain permit pool made the semaphore struct carry its quiescence
-    // width beside the Arc (+8 B over a bare Mutex<Arc<Semaphore>>), and the
-    // resolved width is stored on the client (+8 B).
-    expected += 2 * size_of::<usize>();
+    // Pool coordination lives behind an Arc; only the resolved width adds
+    // a word to Client compared with the original single-permit design.
+    expected += size_of::<usize>();
     eprintln!(
         "Client={} B; retry/decrypt/handler slots={retry_slot}/{decrypt_slot}/{handler_slot} B; previous slots={legacy_slots} B; current slots={slots} B",
         size_of::<Client>()
@@ -10281,4 +10280,93 @@ async fn a_released_request_restarts_the_watchdog_window() {
         200,
         "and the response it is waiting for is still owed"
     );
+}
+
+/// Two concurrent flushes must not partition a width-two pool and deadlock.
+#[tokio::test]
+async fn quiescence_collectors_cannot_split_the_drain_pool() {
+    let client = crate::test_utils::create_test_client().await;
+    *client.message_processing_semaphore.lock().unwrap() = MessagePermitSemaphore::drain(2);
+    let first_stanza = client.acquire_message_processing_permit().await;
+    let second_stanza = client.acquire_message_processing_permit().await;
+    let mut first = Box::pin(client.acquire_message_quiescence());
+    let mut second = Box::pin(client.acquire_message_quiescence());
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    drop(first_stanza);
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    drop(second_stanza);
+    let first_guards = match futures::poll!(first.as_mut()) {
+        std::task::Poll::Ready(guards) => guards,
+        _ => panic!("first collector must own the complete pool"),
+    };
+    assert_eq!(first_guards.len(), 2);
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    drop(first_guards);
+    let second_guards = match futures::poll!(second.as_mut()) {
+        std::task::Poll::Ready(guards) => guards,
+        _ => panic!("second collector must progress after the first releases"),
+    };
+    assert_eq!(second_guards.len(), 2);
+}
+
+/// Cancelling a partial collector releases both its permit and coordination.
+#[tokio::test]
+async fn cancelled_quiescence_releases_partial_hold() {
+    let client = crate::test_utils::create_test_client().await;
+    *client.message_processing_semaphore.lock().unwrap() = MessagePermitSemaphore::drain(2);
+    let stanza = client.acquire_message_processing_permit().await;
+    let mut collector = Box::pin(client.acquire_message_quiescence());
+    assert!(futures::poll!(collector.as_mut()).is_pending());
+    drop(collector);
+    drop(stanza);
+    let guards = client.acquire_message_quiescence().await;
+    assert_eq!(guards.len(), 2);
+}
+
+#[tokio::test]
+async fn quiescence_retries_after_pool_replacement_during_collection() {
+    let client = crate::test_utils::create_test_client().await;
+    *client.message_processing_semaphore.lock().unwrap() = MessagePermitSemaphore::drain(2);
+    let (_, old_pool) = client.read_message_semaphore();
+    let stanza = client.acquire_message_processing_permit().await;
+    let mut collector = Box::pin(client.acquire_message_quiescence());
+    assert!(futures::poll!(collector.as_mut()).is_pending());
+    client.swap_to_drain_semaphore();
+    drop(stanza);
+    let guards = collector.await;
+    let (_, new_pool) = client.read_message_semaphore();
+    assert_eq!(guards.len(), new_pool.quiesce_permits);
+    let old_first = old_pool.semaphore.try_acquire_arc().unwrap();
+    let old_second = old_pool.semaphore.try_acquire_arc().unwrap();
+    assert!(old_pool.semaphore.try_acquire_arc().is_none());
+    assert!(new_pool.semaphore.try_acquire_arc().is_none());
+    drop((old_first, old_second));
+}
+
+/// A stale suspended stanza must not execute maintenance against a new drain.
+#[tokio::test]
+async fn stale_stanza_suspension_skips_work_on_the_replacement_pool() {
+    let client = crate::test_utils::create_test_client().await;
+    *client.message_processing_semaphore.lock().unwrap() = MessagePermitSemaphore::drain(2);
+    let mut slot = Some(client.acquire_message_processing_permit().await);
+    let other_stanza = client.acquire_message_processing_permit().await;
+    let generation = client.connection_generation.load(Ordering::Acquire);
+    let ran = std::sync::atomic::AtomicBool::new(false);
+    let mut suspended =
+        Box::pin(
+            client.with_stanza_permit_suspended(&mut slot, generation, async {
+                ran.store(true, Ordering::Release);
+                true
+            }),
+        );
+    assert!(futures::poll!(suspended.as_mut()).is_pending());
+    client.connection_generation.fetch_add(1, Ordering::AcqRel);
+    client.swap_to_drain_semaphore();
+    drop(other_stanza);
+    let (suspension, _) = suspended.await;
+    assert_eq!(suspension, node_io::PermitSuspension::Reconnected);
+    assert!(!ran.load(Ordering::Acquire));
+    assert!(slot.is_none());
 }

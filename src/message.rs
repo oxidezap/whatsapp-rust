@@ -185,6 +185,8 @@ pub(crate) struct SessionBatchOutcome {
     skdm_only: bool,
     plaintext_failed: bool,
     had_failure: bool,
+    /// Suspension invalidated the connection or account; abandon the whole stanza.
+    interrupted: bool,
 }
 
 /// Outcome of a PN→LID migration retry decrypt. On `Decrypted` the plaintext

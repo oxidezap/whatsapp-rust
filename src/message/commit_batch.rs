@@ -1189,9 +1189,14 @@ impl Client {
             entries,
             commit_ticket,
         } = self.inbound_commit_batch.take();
-        let durable = self
-            .commit_pending_batch(entries.into(), BatchOrigin::OfflineDrain, commit_ticket)
-            .await;
+        let durable = if entries.is_empty() {
+            // An empty deferred tail may still contain dirty SKDM state. Its
+            // receipts must wait for persistence, just as in the drain finisher.
+            self.drain_signal_flush_reporting().await
+        } else {
+            self.commit_pending_batch(entries.into(), BatchOrigin::OfflineDrain, commit_ticket)
+                .await
+        };
         if durable && self.inbound_commit_batch.live_transition_pending() {
             self.complete_deferred_live_transition();
         }
@@ -1371,7 +1376,8 @@ impl Client {
         limit: std::time::Duration,
     ) -> DrainOutcome {
         let settle = async {
-            let _permits = self.acquire_message_quiescence().await;
+            // Keep the cold reconnect acquisition out of the keepalive frame.
+            let _permits = Box::pin(self.acquire_message_quiescence()).await;
             let batch = self.inbound_commit_batch.take();
             let durable = if batch.is_empty() {
                 true
@@ -3823,6 +3829,41 @@ mod tests {
                 .await,
             "with the flush succeeding the empty commit reports durable"
         );
+    }
+
+    /// A failed SKDM-only tail must keep receipts and drain mode through maintenance retries.
+    #[tokio::test]
+    async fn empty_deferred_maintenance_waits_for_signal_durability() {
+        let client = create_test_client_with_failing_http("empty_deferred_maintenance").await;
+        client.enter_drain_mode_for_tests();
+        assert!(client.try_buffer_offline_receipt(&item("SKDM").info));
+        client
+            .inbound_commit_batch
+            .fail_flushes
+            .store(true, Ordering::Release);
+        let generation = client.connection_generation.load(Ordering::Acquire);
+        assert!(!client.finish_inbound_commit_drain(generation).await);
+        assert!(client.inbound_commit_batch.live_transition_pending());
+        assert!(
+            !client
+                .flush_inbound_commits_quiesced(Some(generation))
+                .await
+        );
+        assert!(client.inbound_commit_batch.live_transition_pending());
+        assert!(client.inbound_commit_batch.is_active());
+        assert_eq!(client.offline_receipt_buffer.lock().unwrap().len(), 1);
+        client
+            .inbound_commit_batch
+            .fail_flushes
+            .store(false, Ordering::Release);
+        assert!(
+            client
+                .flush_inbound_commits_quiesced(Some(generation))
+                .await
+        );
+        assert!(!client.inbound_commit_batch.live_transition_pending());
+        assert!(!client.inbound_commit_batch.is_active());
+        assert!(client.offline_receipt_buffer.lock().unwrap().is_empty());
     }
 
     // WA Web createSnapshot flushes aggregate offline receipts per snapshot;
