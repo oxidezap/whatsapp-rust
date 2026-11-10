@@ -145,6 +145,7 @@ impl Default for QueueBudgets {
     }
 }
 impl QueueBudgets {
+    /// Count queue controllers, live chat budgets and retained ADV flights, including empty map capacity.
     pub(crate) fn memory_stats(&self) -> (wacore::stats::CollectionStats, u64, u64) {
         use wacore::stats::HeapSize;
         let entries = self.per_chat.lock().unwrap_or_else(|p| p.into_inner());

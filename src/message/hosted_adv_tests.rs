@@ -4,6 +4,7 @@ use wacore::libsignal::protocol::{IdentityKey, KeyPair};
 use wacore::store::commands::DeviceCommand;
 use wacore::types::jid::adv_account_jid;
 
+/// Build signed companion prekey material with independently selectable hosting and signature prefixes.
 fn fixture(
     account: &KeyPair,
     hosted: bool,
@@ -60,6 +61,7 @@ fn fixture(
     )
 }
 
+/// Publish a paired own-account anchor through device commands for PN or LID tests.
 async fn pair(client: &Client, own: &Jid) {
     let command = if own.server == wacore_binary::Server::Lid {
         DeviceCommand::SetLid(Some(own.with_device(1)))
@@ -80,6 +82,7 @@ async fn pair(client: &Client, own: &Jid) {
         .await;
 }
 
+/// Paired hosted devices reuse ordinary account trust while retaining their hosted Signal addresses.
 #[tokio::test]
 async fn hosted_own_adv_uses_paired_anchor_without_iq_or_signal_namespace_changes() {
     for own in [Jid::pn("12025550181"), Jid::lid("100000000000181")] {
@@ -150,6 +153,7 @@ async fn hosted_own_adv_uses_paired_anchor_without_iq_or_signal_namespace_change
     }
 }
 
+/// Reject mismatched anchors and signature domains for both ordinary and hosted companions.
 #[tokio::test]
 async fn hosted_and_ordinary_adv_reject_wrong_keys_signatures_and_prefixes() {
     for own in [Jid::pn("12025550182"), Jid::lid("100000000000182")] {
@@ -218,6 +222,7 @@ async fn hosted_and_ordinary_adv_reject_wrong_keys_signatures_and_prefixes() {
     }
 }
 
+/// Matching user text must not let PN and LID devices borrow each other's paired trust.
 #[tokio::test]
 async fn hosted_adv_does_not_borrow_paired_trust_from_the_other_addressing_family() {
     for own in [Jid::pn("12025550183"), Jid::lid("12025550183")] {
@@ -275,6 +280,7 @@ async fn hosted_adv_does_not_borrow_paired_trust_from_the_other_addressing_famil
     }
 }
 
+/// Queued hosted receives must validate against a rotated ordinary anchor after acquiring its fence.
 #[tokio::test]
 async fn hosted_receive_rechecks_the_ordinary_anchor_after_rotation() {
     for own in [Jid::pn("12025550184"), Jid::lid("100000000000184")] {
@@ -339,6 +345,7 @@ async fn hosted_receive_rechecks_the_ordinary_anchor_after_rotation() {
     }
 }
 
+/// Concurrent hosted LID send/receive paths must agree on account-before-device lock ordering.
 #[tokio::test]
 async fn hosted_lid_participant_send_and_receive_use_one_account_before_device_lock_order() {
     use crate::store::release::tests::ProbeBackend;

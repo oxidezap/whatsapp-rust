@@ -60,6 +60,7 @@ struct AdvBootstrapLease {
 }
 
 impl Drop for AdvBootstrapLease {
+    /// Remove only this lease's flight so cancellation wakes joiners without erasing a replacement.
     fn drop(&mut self) {
         let mut flights = self
             .registry
@@ -99,6 +100,7 @@ impl AdvBootstrapRegistry {
                 .sum::<usize>()
     }
 
+    /// Join an account/generation flight, or become its leader until the returned lease drops.
     fn claim(
         self: &Arc<Self>,
         generation: u64,
@@ -127,6 +129,7 @@ impl AdvBootstrapRegistry {
 #[derive(Debug)]
 struct SharedAdvBootstrapError(Arc<anyhow::Error>);
 
+/// Keep trust conflicts downcastable for per-contact group rejection; share other error sources.
 fn shared_adv_bootstrap_error(error: Arc<anyhow::Error>) -> anyhow::Error {
     use crate::usync::DeviceListIdentityConflict;
     match error.downcast_ref::<DeviceListIdentityConflict>() {
@@ -149,6 +152,7 @@ impl std::error::Error for SharedAdvBootstrapError {
     }
 }
 
+/// Reject work after shutdown or a connection-generation change, including delayed IQ replies.
 fn ensure_adv_bootstrap_scope(
     generation: &portable_atomic::AtomicU64,
     expected: u64,
@@ -294,6 +298,7 @@ fn authenticated_primary_identity(
 }
 
 impl Client {
+    /// Allocate flight coordination only when an account needs cold ADV discovery.
     fn adv_bootstrap(&self) -> &Arc<AdvBootstrapRegistry> {
         self.inbound_queues()
             .adv_bootstrap
@@ -525,6 +530,8 @@ impl Client {
         }
     }
 
+    /// Bound cold IQ concurrency, then recheck trust under the account fence before owned persistence.
+    /// Cancelling the caller cannot release the admitted writer's fence or storage ownership.
     async fn bootstrap_adv_account_identity(
         &self,
         primary: &Jid,

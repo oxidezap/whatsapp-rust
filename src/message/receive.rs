@@ -211,6 +211,7 @@ impl Client {
             .await
     }
 
+    /// Find the first unverifiable companion prekey before acquiring a processing permit.
     async fn preflight_incoming_companion_identity(
         &self,
         sender: &Jid,
@@ -221,6 +222,7 @@ impl Client {
             .await
     }
 
+    /// Validate prekey certificates without advancing sessions; account-locked callers use cached trust only.
     async fn preflight_incoming_companion_identity_inner(
         &self,
         sender: &Jid,
@@ -3261,6 +3263,7 @@ mod adv_tests {
         )
     }
 
+    /// An unanswered cold IQ must leave offline admission available to a warm companion.
     #[tokio::test]
     async fn cold_adv_preflight_leaves_drain_and_warm_companion_unblocked() {
         let (client, transport) = crate::test_utils::create_iq_test_client().await;

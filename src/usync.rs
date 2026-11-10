@@ -1908,6 +1908,7 @@ impl Client {
             .map_err(|_| anyhow::anyhow!("bootstrap identity worker stopped"))?
     }
 
+    /// Persist a first-contact anchor only while reciprocal aliases and the captured identity epoch remain valid.
     pub(crate) async fn persist_adv_bootstrap_identity_inner(
         &self,
         primary: &Jid,
@@ -3386,6 +3387,7 @@ mod tests {
         client.signal_shutdown_sync();
     }
 
+    /// Hosted-addressed refreshes must wait on the same ordinary account lock as sends and receives.
     #[tokio::test]
     async fn hosted_refresh_waits_for_the_ordinary_account_fence() {
         use std::sync::Arc;

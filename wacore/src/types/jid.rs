@@ -126,6 +126,7 @@ pub fn adv_account_jid(jid: &Jid) -> Jid {
     jid.with_device_hosting(0, false)
 }
 
+/// Group hosted namespaces with their account family solely for lock ordering.
 fn account_server(server: Server) -> Server {
     match server {
         Server::Hosted => Server::Pn,
@@ -267,6 +268,7 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
+    /// ADV anchors collapse hosting, but Signal namespaces remain distinct and account locks sort first.
     #[test]
     fn adv_accounts_share_anchors_without_merging_signal_namespaces() {
         for user in [Jid::pn("12025550180"), Jid::lid("100000000000180")] {

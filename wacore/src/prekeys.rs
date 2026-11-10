@@ -779,6 +779,7 @@ mod tests {
             .bundles
     }
 
+    /// Hosted companion bundles require an authenticated ordinary primary from the same response.
     #[test]
     fn hosted_prekey_bootstrap_uses_the_ordinary_primary_in_the_same_response() {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();

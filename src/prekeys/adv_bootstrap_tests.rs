@@ -9,6 +9,7 @@ use wacore::protocol::ProtocolNode;
 use wacore::types::jid::JidExt;
 use wacore_binary::builder::NodeBuilder;
 
+/// Repeated cancelled bursts release flight allocations without accumulating retained map capacity.
 #[test]
 fn adv_bootstrap_memory_reports_retained_capacity_after_cancelled_flights() {
     let budgets = crate::inbound_queue::QueueBudgets::default();
@@ -50,6 +51,7 @@ fn adv_bootstrap_memory_reports_retained_capacity_after_cancelled_flights() {
     }
 }
 
+/// Spawn a caller whose cancellation can be controlled independently of the shared flight.
 fn request(
     client: &Arc<Client>,
     companion: Jid,
@@ -58,6 +60,7 @@ fn request(
     tokio::spawn(async move { client.ensure_adv_account_identity(&companion).await })
 }
 
+/// Hosted and ordinary devices share one IQ and persist only their ordinary account anchor.
 #[tokio::test]
 async fn hosted_and_ordinary_companions_share_one_canonical_cold_bootstrap() {
     for primary in [Jid::pn("12025550185"), Jid::lid("100000000000185")] {
@@ -109,6 +112,7 @@ async fn hosted_and_ordinary_companions_share_one_canonical_cold_bootstrap() {
     }
 }
 
+/// A mixed prekey response authenticates hosted devices against its ordinary primary bundle.
 #[tokio::test]
 async fn cold_hosted_prekey_fetch_authenticates_and_persists_only_the_ordinary_anchor() {
     for primary in [Jid::pn("12025550189"), Jid::lid("100000000000189")] {
@@ -230,6 +234,7 @@ async fn cold_hosted_prekey_fetch_authenticates_and_persists_only_the_ordinary_a
     }
 }
 
+/// Wait for a second owner of the registered flight before exercising cancellation or shared results.
 async fn wait_for_joiner(client: &Client) {
     poll_until("another caller to join the ADV flight", || {
         client
@@ -243,6 +248,7 @@ async fn wait_for_joiner(client: &Client) {
     .await;
 }
 
+/// Trust conflicts stay downcastable through sharing; storage errors retain their original source chain.
 #[test]
 fn shared_adv_bootstrap_preserves_typed_conflicts_and_other_error_sources() {
     use crate::usync::DeviceListIdentityConflict as Conflict;
@@ -266,6 +272,7 @@ fn shared_adv_bootstrap_preserves_typed_conflicts_and_other_error_sources() {
     assert!(error.chain().any(|source| source.is::<std::io::Error>()));
 }
 
+/// An alias losing reciprocity during an IQ must produce the same typed rejection for both callers.
 #[tokio::test]
 async fn adv_bootstrap_alias_conflict_remains_typed_for_leader_and_joiner() {
     let (client, transport) = create_iq_test_client().await;
@@ -305,6 +312,7 @@ async fn adv_bootstrap_alias_conflict_remains_typed_for_leader_and_joiner() {
     client.signal_shutdown_sync();
 }
 
+/// Deliver a signed primary bundle through the IQ correlator, optionally corrupting its signature.
 async fn answer(client: &Arc<Client>, id: &str, primary: &Jid, account: &KeyPair, valid: bool) {
     let mut rng = rand::make_rng::<rand::rngs::StdRng>();
     let signed = KeyPair::generate(&mut rng);
@@ -341,6 +349,7 @@ async fn answer(client: &Arc<Client>, id: &str, primary: &Jid, account: &KeyPair
         .await;
 }
 
+/// Concurrent callers share both authenticated success and signature failure without a second IQ.
 #[tokio::test]
 async fn adv_bootstrap_shares_success_and_invalid_signature_without_refetching() {
     for valid in [true, false] {
@@ -374,6 +383,7 @@ async fn adv_bootstrap_shares_success_and_invalid_signature_without_refetching()
     }
 }
 
+/// A shared IQ timeout must release the flight and every query admission slot.
 #[tokio::test(start_paused = true)]
 async fn adv_bootstrap_shares_timeout_and_releases_all_admission() {
     let (client, transport) = create_iq_test_client().await;
@@ -398,6 +408,7 @@ async fn adv_bootstrap_shares_timeout_and_releases_all_admission() {
     client.signal_shutdown_sync();
 }
 
+/// At most eight cold IQs may run; cancelling callers releases slots for queued accounts.
 #[tokio::test]
 async fn adv_bootstrap_caps_queries_and_cancellation_releases_slots() {
     let (client, transport) = create_iq_test_client().await;
@@ -433,6 +444,7 @@ async fn adv_bootstrap_caps_queries_and_cancellation_releases_slots() {
     client.signal_shutdown_sync();
 }
 
+/// A surviving joiner reclaims a result-less flight instead of inheriting its leader's cancellation.
 #[tokio::test]
 async fn adv_bootstrap_cancelled_leader_allows_valid_joiner_to_take_over() {
     let (client, transport) = create_iq_test_client().await;
@@ -456,6 +468,7 @@ async fn adv_bootstrap_cancelled_leader_allows_valid_joiner_to_take_over() {
     client.signal_shutdown_sync();
 }
 
+/// Delayed IQ results cannot overwrite newer trust or publish into a retired connection.
 #[tokio::test]
 async fn adv_bootstrap_rechecks_current_trust_and_connection_before_publication() {
     for (retire_connection, fire_shutdown) in [(false, false), (true, false), (false, true)] {
@@ -507,6 +520,7 @@ async fn adv_bootstrap_rechecks_current_trust_and_connection_before_publication(
     }
 }
 
+/// Caller cancellation cannot release the account fence or drain ticket before backend completion.
 #[tokio::test]
 async fn adv_bootstrap_owned_writer_keeps_primary_fence_after_caller_cancellation() {
     use crate::store::release::tests::ProbeBackend;
