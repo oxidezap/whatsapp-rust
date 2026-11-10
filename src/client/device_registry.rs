@@ -701,12 +701,6 @@ impl Client {
         members.build()
     }
 
-    /// Resolve a user identifier to its lookup keys with type information.
-    ///
-    /// Returns a `UserLookupKeys` enum that explicitly represents:
-    /// - `LidWithPn`: User is a LID with known phone number mapping
-    /// - `PnWithLid`: User is a phone number with known LID mapping
-    /// - `Unknown`: No LID-PN mapping exists (could be either type)
     /// Own both alias keys while publication releases its guards for host code.
     pub(crate) async fn device_registry_lookup_keys(&self, user: &str) -> Vec<String> {
         self.resolve_lookup_keys(user)
@@ -716,6 +710,12 @@ impl Client {
             .collect()
     }
 
+    /// Resolve a user identifier to its lookup keys with type information.
+    ///
+    /// Returns a `UserLookupKeys` enum that explicitly represents:
+    /// - `LidWithPn`: User is a LID with known phone number mapping
+    /// - `PnWithLid`: User is a phone number with known LID mapping
+    /// - `Unknown`: No LID-PN mapping exists (could be either type)
     async fn resolve_lookup_keys(&self, user: &str) -> UserLookupKeys {
         // Check if user is a LID (has a phone number mapping). The `user`-derived
         // key is built inline via CompactString (LID/PN are short), avoiding a
