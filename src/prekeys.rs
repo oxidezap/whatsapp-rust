@@ -127,6 +127,16 @@ impl AdvBootstrapRegistry {
 #[derive(Debug)]
 struct SharedAdvBootstrapError(Arc<anyhow::Error>);
 
+fn shared_adv_bootstrap_error(error: Arc<anyhow::Error>) -> anyhow::Error {
+    use crate::usync::DeviceListIdentityConflict;
+    match error.downcast_ref::<DeviceListIdentityConflict>() {
+        Some(DeviceListIdentityConflict::Alias) => DeviceListIdentityConflict::Alias.into(),
+        Some(DeviceListIdentityConflict::Primary) => DeviceListIdentityConflict::Primary.into(),
+        Some(DeviceListIdentityConflict::Bootstrap) => DeviceListIdentityConflict::Bootstrap.into(),
+        None => anyhow::Error::new(SharedAdvBootstrapError(error)),
+    }
+}
+
 impl std::fmt::Display for SharedAdvBootstrapError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(self.0.as_ref(), f)
@@ -485,8 +495,7 @@ impl Client {
                             .result
                             .lock()
                             .unwrap_or_else(|p| p.into_inner()) = Some(result.clone());
-                        return result
-                            .map_err(|error| anyhow::Error::new(SharedAdvBootstrapError(error)));
+                        return result.map_err(shared_adv_bootstrap_error);
                     }
                     Err(flight) => {
                         let _ = flight.released.recv().await;
@@ -501,9 +510,7 @@ impl Client {
                             .unwrap_or_else(|p| p.into_inner())
                             .clone();
                         if let Some(result) = result {
-                            return result.map_err(|error| {
-                                anyhow::Error::new(SharedAdvBootstrapError(error))
-                            });
+                            return result.map_err(shared_adv_bootstrap_error);
                         }
                         // Cancellation belongs to the leader, not its valid joiners.
                     }

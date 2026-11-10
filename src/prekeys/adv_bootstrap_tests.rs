@@ -22,7 +22,7 @@ fn adv_bootstrap_memory_reports_retained_capacity_after_cancelled_flights() {
         let leases: Vec<_> = (0..8)
             .map(|index| {
                 registry
-                    .claim(0, &Jid::pn(format!("12025551{index:03}")))
+                    .claim(0, &Jid::pn(format!("1202555{:04}", 100 + index)))
                     .ok()
                     .expect("independent account flight")
             })
@@ -243,6 +243,68 @@ async fn wait_for_joiner(client: &Client) {
     .await;
 }
 
+#[test]
+fn shared_adv_bootstrap_preserves_typed_conflicts_and_other_error_sources() {
+    use crate::usync::DeviceListIdentityConflict as Conflict;
+    for conflict in [Conflict::Alias, Conflict::Primary, Conflict::Bootstrap] {
+        let message = conflict.to_string();
+        let shared = Arc::new(anyhow::Error::new(conflict).context("bootstrap transaction"));
+        for _ in 0..2 {
+            let error = shared_adv_bootstrap_error(shared.clone());
+            assert!(error.is::<Conflict>());
+            assert_eq!(
+                error.downcast_ref::<Conflict>().unwrap().to_string(),
+                message
+            );
+        }
+    }
+    let shared = Arc::new(anyhow::Error::new(std::io::Error::other(
+        "storage unavailable",
+    )));
+    let error = shared_adv_bootstrap_error(shared);
+    assert!(!error.is::<Conflict>());
+    assert!(error.chain().any(|source| source.is::<std::io::Error>()));
+}
+
+#[tokio::test]
+async fn adv_bootstrap_alias_conflict_remains_typed_for_leader_and_joiner() {
+    let (client, transport) = create_iq_test_client().await;
+    let primary = Jid::pn("12025550191");
+    let lid = Jid::lid("100000000000191");
+    let leader = request(&client, primary.with_device(7));
+    let iq = decode_sent_iq(&transport, 0).await;
+    let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+    let joiner = request(&client, primary.with_device(9));
+    wait_for_joiner(&client).await;
+    client
+        .lid_pn_cache
+        .add(&crate::lid_pn_cache::LidPnEntry::new(
+            lid.user.to_string(),
+            primary.user.to_string(),
+            crate::lid_pn_cache::LearningSource::Usync,
+        ))
+        .await;
+    client.lid_pn_cache.evict_reverse_for_tests(&lid.user).await;
+    let account = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+    answer(&client, &id, &primary, &account, true).await;
+    for caller in [leader, joiner] {
+        let error = caller.await.unwrap().unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<crate::usync::DeviceListIdentityConflict>(),
+            Some(crate::usync::DeviceListIdentityConflict::Alias)
+        ));
+    }
+    assert_eq!(transport.sent_count(), 1);
+    assert!(
+        client
+            .cached_adv_account_identity(&primary)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    client.signal_shutdown_sync();
+}
+
 async fn answer(client: &Arc<Client>, id: &str, primary: &Jid, account: &KeyPair, valid: bool) {
     let mut rng = rand::make_rng::<rand::rngs::StdRng>();
     let signed = KeyPair::generate(&mut rng);
@@ -343,7 +405,7 @@ async fn adv_bootstrap_caps_queries_and_cancellation_releases_slots() {
     for index in 0..10 {
         tasks.push(request(
             &client,
-            Jid::pn_device(format!("12025550{index:03}"), 7),
+            Jid::pn_device(format!("1202555{:04}", 110 + index), 7),
         ));
     }
     poll_until("all cold accounts to enter admission", || {

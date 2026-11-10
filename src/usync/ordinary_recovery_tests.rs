@@ -1813,6 +1813,81 @@ async fn group_identity_conflicts_retain_only_the_affected_contact() {
     }
 }
 
+/// A cold contact's alias conflict must not prevent valid peers from publishing.
+#[tokio::test]
+async fn group_refresh_publishes_peers_after_a_cold_bootstrap_alias_conflict() {
+    let (client, transport) = create_iq_test_client().await;
+    let cold = Jid::pn("12025550195");
+    let good = Jid::pn("12025550196");
+    let lid = Jid::lid("100000000000195");
+    crate::test_utils::seed_adv_primary(&client, &good).await;
+    for user in [&cold, &good] {
+        client
+            .update_device_list(DeviceListRecord {
+                user: user.user.as_str().into(),
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(3, Some(1))].into(),
+                raw_id: Some(1),
+                timestamp: 1,
+                phash: None,
+            })
+            .await
+            .unwrap();
+    }
+    let mut response = migration_response(&cold);
+    response
+        .device_lists
+        .extend(migration_response(&good).device_lists);
+    let users = [cold.clone(), good.clone()];
+    let worker = client.clone();
+    let operation = tokio::spawn(async move {
+        worker
+            .apply_device_list_response(
+                &response,
+                DeviceListApplyMode::GroupRefresh,
+                None,
+                Some(&users),
+            )
+            .await
+    });
+    let iq = decode_sent_iq(&transport, 0).await;
+    let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+    client
+        .lid_pn_cache
+        .add(&crate::lid_pn_cache::LidPnEntry::new(
+            lid.user.to_string(),
+            cold.user.to_string(),
+            crate::lid_pn_cache::LearningSource::Usync,
+        ))
+        .await;
+    client.lid_pn_cache.evict_reverse_for_tests(&lid.user).await;
+    answer_iq(
+        &client,
+        &id,
+        &primary_response(&cold, crate::test_utils::adv_test_account(), true),
+    )
+    .await;
+    let devices = tokio::time::timeout(Duration::from_secs(5), operation)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(devices.contains(&good.with_device(7)), "{devices:?}");
+    assert!(!devices.contains(&cold.with_device(7)));
+    assert!(client.load_device_record_for_jid(&good).await.is_some());
+    assert!(
+        client
+            .load_device_record_for_jid(&cold)
+            .await
+            .unwrap()
+            .devices
+            .iter()
+            .any(|device| device.device_id() == 3)
+    );
+    assert_eq!(transport.sent_count(), 1);
+    client.signal_shutdown_sync();
+}
+
 /// A store fault must not masquerade as a per-contact trust rejection.
 #[tokio::test]
 async fn group_identity_storage_failure_is_not_partial_success() {
