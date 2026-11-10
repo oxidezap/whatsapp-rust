@@ -350,6 +350,12 @@ impl PersistenceManager {
         }
     }
 
+    pub(crate) fn try_lock_device_ownership(&self) -> Option<DeviceOwnershipGuard<'_>> {
+        self.pending_save
+            .try_lock()
+            .map(|_save| DeviceOwnershipGuard { _save })
+    }
+
     pub(crate) fn backend_ref(&self) -> &dyn Backend {
         &*self.backend
     }

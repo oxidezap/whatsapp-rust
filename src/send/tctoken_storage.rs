@@ -95,6 +95,75 @@ mod tests {
     use std::time::Duration;
 
     #[tokio::test]
+    async fn token_writer_resolves_the_original_jid_after_mapping_fence_admission() {
+        for received in [false, true] {
+            let (client, _) = crate::test_utils::create_iq_test_client().await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !client.lid_pn_cache.startup_finished_for_tests() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let phone = Jid::pn("12025550191");
+            let lid = Jid::lid("100000000000191");
+            let now = client.runtime.wall_time_secs();
+            let backend = client.persistence_manager.backend();
+            backend
+                .store_received_tc_token(&lid.user, b"synthetic-existing-token", now - 1)
+                .await
+                .unwrap();
+            let mapping = client.lid_pn_cache.lock_mutation().await;
+            // Drive the same inner future retained by the owned worker. The
+            // pending poll proves it has reached fence admission; changing the
+            // fixture now catches resolving the original PN before that fence.
+            let mut writer = std::pin::pin!(client.persist_tc_token_inner(
+                phone.clone(),
+                received.then(|| (b"synthetic-new-token".to_vec(), now)),
+                Some(now),
+                received,
+            ));
+            assert!(futures::poll!(&mut writer).is_pending());
+            let entry = crate::lid_pn_cache::LidPnEntry::with_timestamp(
+                lid.user.as_str(),
+                phone.user.as_str(),
+                now,
+                LearningSource::Usync,
+            );
+            backend
+                .put_lid_mapping(&wacore::store::traits::LidPnMappingEntry {
+                    lid: lid.user.to_string(),
+                    phone_number: phone.user.to_string(),
+                    created_at: now,
+                    updated_at: now,
+                    learning_source: "usync".into(),
+                })
+                .await
+                .unwrap();
+            client.lid_pn_cache.add_guarded(&entry, &mapping).await;
+            client
+                .lid_pn_cache
+                .mark_persisted(&entry.phone_number, &entry.lid)
+                .await;
+            drop(mapping);
+            let outcome = writer.await.unwrap();
+            assert_eq!(outcome.key, lid);
+            assert!(backend.get_tc_token(&phone.user).await.unwrap().is_none());
+            let saved = backend.get_tc_token(&lid.user).await.unwrap().unwrap();
+            assert_eq!(saved.sender_timestamp, Some(now));
+            assert_eq!(
+                saved.token,
+                if received {
+                    b"synthetic-new-token".as_slice()
+                } else {
+                    b"synthetic-existing-token".as_slice()
+                }
+            );
+            client.signal_shutdown_sync();
+        }
+    }
+
+    #[tokio::test]
     async fn adv_review_round3_token_writer_keeps_ownership_after_cancellation() {
         for (received, existing_lid) in [(false, false), (false, true), (true, false)] {
             let (mut probe, _) = ProbeBackend::new();

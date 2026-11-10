@@ -25,6 +25,10 @@ use std::time::Duration;
 /// Cache operations are best-effort. The client falls back gracefully when
 /// cache reads fail (treats as miss) and logs warnings on write failures.
 /// Implementations should still return errors for observability.
+///
+/// Identity replacement additionally requires confirmation that stale device
+/// registry entries were removed. A deletion or verification-read failure can
+/// reject that operation before new trust or device lists are published.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait CacheStore: Send + Sync + 'static {
