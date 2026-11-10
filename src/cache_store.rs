@@ -161,17 +161,28 @@ where
         K: Borrow<Q>,
         Q: std::hash::Hash + Eq + Display + ?Sized,
     {
+        let _ = self.try_invalidate(key).await;
+    }
+
+    /// Trust replacement must observe a failed host-cache deletion.
+    pub(crate) async fn try_invalidate<Q>(&self, key: &Q) -> anyhow::Result<()>
+    where
+        K: Borrow<Q>,
+        Q: std::hash::Hash + Eq + Display + ?Sized,
+    {
         match &self.inner {
             Inner::Local(cache) => cache.invalidate(key).await,
             Inner::Custom {
                 store, namespace, ..
             } => {
                 let key_str = key.to_string();
-                if let Err(e) = store.delete(namespace, &key_str).await {
-                    log::warn!("TypedCache[{namespace}]: delete({key_str}) error: {e}");
+                if let Err(error) = store.delete(namespace, &key_str).await {
+                    log::warn!("TypedCache[{namespace}]: delete({key_str}) error: {error}");
+                    return Err(error);
                 }
             }
         }
+        Ok(())
     }
 
     /// Remove all entries, awaiting completion for custom backends.

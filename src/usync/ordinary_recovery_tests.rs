@@ -12,11 +12,16 @@ use wacore::types::events::{Event, EventInterest, EventKind};
 use wacore::types::jid::JidExt as _;
 use wacore_binary::builder::NodeBuilder;
 
+type DeleteHook =
+    Box<dyn FnOnce() -> wacore::runtime::BoxFuture<'static, anyhow::Result<()>> + Send>;
+
 struct OwnershipCallbackCache {
     rows: std::sync::Mutex<std::collections::HashMap<(String, String), Vec<u8>>>,
     manager:
         std::sync::Mutex<std::sync::Weak<crate::store::persistence_manager::PersistenceManager>>,
     enabled: std::sync::atomic::AtomicBool,
+    delete_enabled: std::sync::atomic::AtomicBool,
+    delete_hook: std::sync::Mutex<Option<DeleteHook>>,
     taken: std::sync::atomic::AtomicBool,
     sets: std::sync::atomic::AtomicUsize,
     cancelled: std::sync::atomic::AtomicBool,
@@ -68,10 +73,30 @@ impl wacore::store::CacheStore for OwnershipCallbackCache {
     }
 
     async fn delete(&self, namespace: &str, key: &str) -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        if self.delete_enabled.load(Ordering::Acquire) && !self.taken.swap(true, Ordering::AcqRel) {
+            let manager = self.manager.lock().unwrap().upgrade().unwrap();
+            let callback = tokio::spawn(async move {
+                manager
+                    .modify_device(|device| device.push_name = "delete callback".into())
+                    .await;
+            });
+            self.entered
+                .send((callback.abort_handle(), 0))
+                .await
+                .unwrap();
+            if callback.await.is_err() {
+                self.cancelled.store(true, Ordering::Release);
+            }
+        }
         self.rows
             .lock()
             .unwrap()
             .remove(&(namespace.into(), key.into()));
+        let hook = self.delete_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook().await?;
+        }
         Ok(())
     }
 
@@ -92,6 +117,8 @@ async fn check_hosted_cache_callback_ownership(cold_fill: bool, callback_enabled
         rows: std::sync::Mutex::new(Default::default()),
         manager: std::sync::Mutex::new(Default::default()),
         enabled: AtomicBool::new(false),
+        delete_enabled: AtomicBool::new(false),
+        delete_hook: std::sync::Mutex::new(None),
         taken: AtomicBool::new(false),
         sets: AtomicUsize::new(0),
         cancelled: AtomicBool::new(false),
@@ -229,6 +256,381 @@ async fn adv_review_round8_hosted_publication_cache_callback_can_modify_device()
 async fn adv_review_round8_hosted_cold_fill_cache_callback_can_modify_device() {
     check_hosted_cache_callback_ownership(true, false).await;
     check_hosted_cache_callback_ownership(true, true).await;
+}
+
+#[tokio::test]
+async fn adv_review_round9_hosted_rotation_cache_delete_can_modify_device() {
+    use crate::cache_config::{CacheConfig, CacheStores};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    for callback_enabled in [false, true] {
+        let (entered, arrived) = async_channel::unbounded();
+        let store = Arc::new(OwnershipCallbackCache {
+            rows: std::sync::Mutex::new(Default::default()),
+            manager: std::sync::Mutex::new(Default::default()),
+            enabled: AtomicBool::new(false),
+            delete_enabled: AtomicBool::new(callback_enabled),
+            delete_hook: std::sync::Mutex::new(None),
+            taken: AtomicBool::new(false),
+            sets: AtomicUsize::new(0),
+            cancelled: AtomicBool::new(false),
+            entered,
+        });
+        let config = CacheConfig::default().with_cache_stores(CacheStores {
+            device_registry_cache: Some(store.clone()),
+            ..Default::default()
+        });
+        let backend = crate::test_utils::create_test_backend().await;
+        let (client, transport) = crate::test_utils::create_iq_test_client_with_runtime_and_config(
+            backend.clone(),
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            config,
+        )
+        .await;
+        let user = Jid::pn("12025550174");
+        crate::test_utils::seed_adv_primary(&client, &user).await;
+        client.flush_signal_cache_batch_safe().await.unwrap();
+        *store.manager.lock().unwrap() = Arc::downgrade(&client.persistence_manager);
+        let next_pair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let next = *next_pair.public_key.public_key_bytes();
+        let mut lookup = {
+            let client = client.clone();
+            let user = user.clone();
+            tokio::spawn(async move {
+                client
+                    .signal()
+                    .get_user_devices(std::slice::from_ref(&user))
+                    .await
+            })
+        };
+        let iq = decode_sent_iq(&transport, 0).await;
+        let mut signed =
+            waproto::codec::adv_signed_key_index_list_decode(&signed_key_index_bytes(vec![1], 1))
+                .unwrap();
+        signed.account_signature_key = Some(next.to_vec());
+        signed.account_signature = Some(
+            next_pair
+                .private_key
+                .calculate_signature(
+                    &[&[6, 2], signed.details.as_ref().unwrap().as_slice()].concat(),
+                    &mut rand::make_rng::<rand::rngs::StdRng>(),
+                )
+                .unwrap()
+                .to_vec(),
+        );
+        let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+        answer_iq(
+            &client,
+            &id,
+            &tests::adv_wire_response_with_hosting(
+                &user,
+                waproto::codec::adv_signed_key_index_list_to_vec(&signed),
+                2,
+                true,
+            ),
+        )
+        .await;
+        let abort = if callback_enabled {
+            Some(
+                tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .0,
+            )
+        } else {
+            None
+        };
+        let result = tokio::time::timeout(Duration::from_secs(5), &mut lookup).await;
+        if result.is_err() {
+            if let Some(abort) = abort {
+                abort.abort();
+            }
+            let drained = tokio::time::timeout(Duration::from_secs(5), &mut lookup)
+                .await
+                .is_ok();
+            client.signal_shutdown_sync();
+            panic!("cache delete callback deadlocked hosted rotation; cleanup={drained}");
+        }
+        let devices = result.unwrap().unwrap().unwrap();
+        assert!(devices.contains(&user));
+        assert!(
+            devices
+                .iter()
+                .any(|device| device.device == 2 && device.is_hosted())
+        );
+        assert_eq!(
+            client.cached_adv_account_identity(&user).await.unwrap(),
+            Some(next)
+        );
+        assert_eq!(
+            backend
+                .load_identity(user.to_protocol_address().as_str())
+                .await
+                .unwrap(),
+            Some(next)
+        );
+        assert!(!store.cancelled.load(Ordering::Acquire));
+        if callback_enabled {
+            assert_eq!(
+                client.persistence_manager.get_device_snapshot().push_name,
+                "delete callback"
+            );
+        }
+        client.signal_shutdown_sync();
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum EvictionCase {
+    MappingFromModifier,
+    RefilledCache,
+    RetiredPrimary,
+    DeleteError,
+    CancelledCaller,
+    CacheAheadOfDatabase,
+}
+
+async fn check_hosted_rotation_eviction(case: EvictionCase) {
+    use crate::cache_config::{CacheConfig, CacheStores};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    let (entered, _) = async_channel::unbounded();
+    let store = Arc::new(OwnershipCallbackCache {
+        rows: std::sync::Mutex::new(Default::default()),
+        manager: std::sync::Mutex::new(Default::default()),
+        enabled: AtomicBool::new(false),
+        delete_enabled: AtomicBool::new(false),
+        delete_hook: std::sync::Mutex::new(None),
+        taken: AtomicBool::new(false),
+        sets: AtomicUsize::new(0),
+        cancelled: AtomicBool::new(false),
+        entered,
+    });
+    let backend = crate::test_utils::create_test_backend().await;
+    let config = CacheConfig::default().with_cache_stores(CacheStores {
+        device_registry_cache: Some(store.clone()),
+        ..Default::default()
+    });
+    let (client, transport) = crate::test_utils::create_iq_test_client_with_runtime_and_config(
+        backend.clone(),
+        Arc::new(crate::runtime_impl::TokioRuntime),
+        config,
+    )
+    .await;
+    crate::test_utils::poll_until("mapping startup", || {
+        client.lid_pn_cache.startup_finished_for_tests()
+    })
+    .await;
+    let user = Jid::pn("12025550173");
+    crate::test_utils::seed_adv_primary(&client, &user).await;
+    let previous = client
+        .cached_adv_account_identity(&user)
+        .await
+        .unwrap()
+        .unwrap();
+    client.flush_signal_cache_batch_safe().await.unwrap();
+    let mut lookup = {
+        let client = client.clone();
+        let user = user.clone();
+        tokio::spawn(async move {
+            client
+                .signal()
+                .get_user_devices(std::slice::from_ref(&user))
+                .await
+        })
+    };
+    let iq = decode_sent_iq(&transport, 0).await;
+    let old = DeviceListRecord {
+        user: user.user.as_str().into(),
+        devices: [
+            DeviceInfo::new(0, None),
+            DeviceInfo::new(2, Some(1)).with_hosting(true),
+        ]
+        .into(),
+        raw_id: Some(1),
+        timestamp: 1,
+        phash: None,
+    };
+    backend.update_device_list(old.clone()).await.unwrap();
+    let companion = seed_fresh_session(&client, &user.with_device(7)).await;
+    client.flush_signal_cache_batch_safe().await.unwrap();
+    if matches!(case, EvictionCase::CacheAheadOfDatabase) {
+        let mut ahead = old.clone();
+        ahead.edit_devices(|devices| devices.push(DeviceInfo::new(7, Some(2))));
+        client
+            .device_registry_cache
+            .raw_insert_for_tests(ahead.user.clone(), Arc::new(ahead))
+            .await;
+    }
+    let (blocked, arrived) = async_channel::bounded(1);
+    let (release, gate) = async_channel::bounded(1);
+    let weak = Arc::downgrade(&client);
+    let hook_user = user.clone();
+    *store.delete_hook.lock().unwrap() = Some(Box::new(move || {
+        Box::pin(async move {
+            let client = weak.upgrade().unwrap();
+            match case {
+                EvictionCase::MappingFromModifier => {
+                    let manager = client.persistence_manager.clone();
+                    manager
+                        .modify_device_async(move |device| {
+                            Box::pin(async move {
+                                tokio::spawn(async move {
+                                    let address = hook_user.to_protocol_address();
+                                    let lock = client.session_lock_for(address.as_str()).await;
+                                    let _session = lock.lock().await;
+                                    let _mapping = client.lid_pn_cache.lock_mutation().await;
+                                    let _registry = client.device_topology.lock_registry().await;
+                                })
+                                .await
+                                .unwrap();
+                                device.push_name = "mapping callback".into();
+                            })
+                        })
+                        .await;
+                }
+                EvictionCase::RefilledCache => {
+                    assert!(client.load_device_record(&hook_user.user).await.is_some());
+                }
+                EvictionCase::RetiredPrimary => {
+                    deliver_identity_reset(&client, &hook_user, None).await
+                }
+                EvictionCase::DeleteError => anyhow::bail!("synthetic cache delete failure"),
+                EvictionCase::CancelledCaller => {
+                    blocked.send(()).await.unwrap();
+                    gate.recv().await.unwrap();
+                }
+                EvictionCase::CacheAheadOfDatabase => {}
+            }
+            Ok(())
+        })
+    }));
+    let next_pair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+    let next = *next_pair.public_key.public_key_bytes();
+    let mut signed =
+        waproto::codec::adv_signed_key_index_list_decode(&signed_key_index_bytes(vec![1], 1))
+            .unwrap();
+    signed.account_signature_key = Some(next.to_vec());
+    signed.account_signature = Some(
+        next_pair
+            .private_key
+            .calculate_signature(
+                &[&[6, 2], signed.details.as_ref().unwrap().as_slice()].concat(),
+                &mut rand::make_rng::<rand::rngs::StdRng>(),
+            )
+            .unwrap()
+            .to_vec(),
+    );
+    let generation = client.device_topology.current();
+    let id = iq.get().attrs().optional_string("id").unwrap().into_owned();
+    answer_iq(
+        &client,
+        &id,
+        &tests::adv_wire_response_with_hosting(
+            &user,
+            waproto::codec::adv_signed_key_index_list_to_vec(&signed),
+            2,
+            true,
+        ),
+    )
+    .await;
+    if matches!(case, EvictionCase::CancelledCaller) {
+        tokio::time::timeout(Duration::from_secs(5), arrived.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        lookup.abort();
+        assert!(lookup.await.unwrap_err().is_cancelled());
+        release.send(()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while backend
+                .load_identity(user.to_protocol_address().as_str())
+                .await
+                .unwrap()
+                != Some(next)
+                || backend.get_devices(&user.user).await.unwrap().is_none()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    } else {
+        let result = tokio::time::timeout(Duration::from_secs(5), &mut lookup)
+            .await
+            .expect("delete callback and publication must drain")
+            .unwrap();
+        let rejected = matches!(
+            case,
+            EvictionCase::RefilledCache | EvictionCase::RetiredPrimary | EvictionCase::DeleteError
+        );
+        assert_eq!(result.is_err(), rejected, "{case:?}: {result:?}");
+        let expected = if matches!(case, EvictionCase::RetiredPrimary) {
+            None
+        } else if rejected {
+            Some(previous)
+        } else {
+            Some(next)
+        };
+        assert_eq!(
+            client.cached_adv_account_identity(&user).await.unwrap(),
+            expected,
+            "{case:?}"
+        );
+        if matches!(
+            case,
+            EvictionCase::DeleteError | EvictionCase::RefilledCache
+        ) {
+            assert!(
+                has_session(&client, &companion).await,
+                "failed eviction must precede destructive cleanup"
+            );
+            assert_eq!(
+                backend
+                    .get_devices(&user.user)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .timestamp,
+                1
+            );
+        }
+        if matches!(case, EvictionCase::CacheAheadOfDatabase) {
+            assert!(
+                !has_session(&client, &companion).await,
+                "L1-only companions must be retired"
+            );
+        }
+    }
+    assert!(!client.device_topology.unchanged_for(
+        generation,
+        &crate::client::member_index::MemberIndex::from_users([user.user.as_str()])
+    ));
+    client.signal_shutdown_sync();
+}
+
+#[tokio::test]
+async fn adv_eviction_delete_callback_can_await_mapping_from_device_modifier() {
+    check_hosted_rotation_eviction(EvictionCase::MappingFromModifier).await;
+}
+#[tokio::test]
+async fn adv_eviction_rejects_a_cache_refill_without_a_topology_change() {
+    check_hosted_rotation_eviction(EvictionCase::RefilledCache).await;
+}
+#[tokio::test]
+async fn adv_eviction_rejects_primary_retirement_during_callback() {
+    check_hosted_rotation_eviction(EvictionCase::RetiredPrimary).await;
+}
+#[tokio::test]
+async fn adv_eviction_delete_error_preserves_trust_and_sessions() {
+    check_hosted_rotation_eviction(EvictionCase::DeleteError).await;
+}
+#[tokio::test]
+async fn adv_eviction_survives_caller_cancellation() {
+    check_hosted_rotation_eviction(EvictionCase::CancelledCaller).await;
+}
+#[tokio::test]
+async fn adv_eviction_retires_companions_when_cache_is_ahead_of_database() {
+    check_hosted_rotation_eviction(EvictionCase::CacheAheadOfDatabase).await;
 }
 
 struct HostedPublicationEventProbe {

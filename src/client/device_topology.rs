@@ -231,6 +231,12 @@ impl DeviceRegistryCache {
         self.topology.record_registry(guard, [key]);
     }
 
+    /// The publication worker releases all guards before invoking host code,
+    /// then revalidates cache absence and records the eviction under Registry.
+    pub(crate) async fn evict_before_identity_update(&self, key: &str) -> anyhow::Result<()> {
+        self.cache.try_invalidate(key).await
+    }
+
     /// Cache-fill from the DB row the fallback path would have returned: the
     /// answer is unchanged, so no topology change is recorded.
     pub(crate) async fn promote_guarded(
@@ -242,16 +248,17 @@ impl DeviceRegistryCache {
         self.cache.insert(key, record).await;
     }
 
-    /// Seed the existing benchmark fixtures without changing their data or
-    /// registration. Production DB fills use the guarded, ordered path.
+    /// Preserve the original fixture seed, which bypasses publication admission.
+    /// Taking Registry here initializes a retained lock event absent on the
+    /// baseline, changing the connected-retention fixture by 72 bytes.
+    /// Production DB fills use the guarded, ordered path.
     #[cfg(feature = "bench-harness")]
     pub(crate) async fn promote(
         &self,
         key: Arc<str>,
         record: Arc<wacore::store::traits::DeviceListRecord>,
     ) {
-        let guard = self.topology.lock_registry().await;
-        self.promote_guarded(&guard, key, record).await;
+        self.cache.insert(key, record).await;
     }
 
     /// Approximate entry count plus estimated retained bytes. Bytes are `0`
