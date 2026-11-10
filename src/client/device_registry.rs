@@ -707,6 +707,14 @@ impl Client {
     /// - `LidWithPn`: User is a LID with known phone number mapping
     /// - `PnWithLid`: User is a phone number with known LID mapping
     /// - `Unknown`: No LID-PN mapping exists (could be either type)
+    pub(crate) async fn device_registry_lookup_keys(&self, user: &str) -> Vec<String> {
+        self.resolve_lookup_keys(user)
+            .await
+            .all_keys()
+            .map(str::to_owned)
+            .collect()
+    }
+
     async fn resolve_lookup_keys(&self, user: &str) -> UserLookupKeys {
         // Check if user is a LID (has a phone number mapping). The `user`-derived
         // key is built inline via CompactString (LID/PN are short), avoiding a

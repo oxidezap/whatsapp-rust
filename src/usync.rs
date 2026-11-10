@@ -1587,8 +1587,7 @@ impl Client {
                 .iter()
                 .filter(|update| update.changes_trust())
             {
-                let lookup = self.resolve_lookup_keys(&update.user.user).await;
-                eviction_keys.extend(lookup.all_keys().map(str::to_owned));
+                eviction_keys.extend(self.device_registry_lookup_keys(&update.user.user).await);
             }
             eviction_keys.sort_unstable();
             eviction_keys.dedup();
@@ -2418,15 +2417,15 @@ impl Client {
         if changed {
             // Host-cache deletion completed outside every guard. Registry
             // exclusion now keeps it absent through durable retirement and CAS.
-            let lookup = self.resolve_lookup_keys(&update.user.user).await;
-            for key in lookup.all_keys() {
+            let keys = self.device_registry_lookup_keys(&update.user.user).await;
+            for key in &keys {
                 self.persistence_manager
                     .backend_ref()
                     .delete_devices(key)
                     .await?;
             }
             self.device_topology
-                .record_registry(guard, lookup.all_keys());
+                .record_registry(guard, keys.iter().map(String::as_str));
         }
         let backend = self.persistence_manager.backend();
         maintenance.ensure_current()?;
