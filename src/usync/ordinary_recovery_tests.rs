@@ -488,6 +488,7 @@ enum EvictionCase {
     ReadError,
     CancelledCaller,
     CacheAheadOfDatabase,
+    StrictAliasChanged,
 }
 
 async fn check_hosted_rotation_eviction(case: EvictionCase) {
@@ -535,10 +536,14 @@ async fn check_hosted_rotation_eviction(case: EvictionCase) {
         let client = client.clone();
         let user = user.clone();
         tokio::spawn(async move {
+            if matches!(case, EvictionCase::StrictAliasChanged) {
+                return client.refresh_user_devices(vec![user]).await;
+            }
             client
                 .signal()
                 .get_user_devices(std::slice::from_ref(&user))
                 .await
+                .map_err(anyhow::Error::from)
         })
     };
     let iq = decode_sent_iq(&transport, 0).await;
@@ -670,6 +675,17 @@ async fn check_hosted_rotation_eviction(case: EvictionCase) {
                 EvictionCase::RetiredPrimary => {
                     deliver_identity_reset(&client, &hook_user, None).await
                 }
+                EvictionCase::StrictAliasChanged => {
+                    let guard = client.lid_pn_cache.lock_mutation().await;
+                    client
+                        .learn_lid_pn_mappings_batch_guarded(
+                            vec![("100000000000173".into(), hook_user.user.to_string())],
+                            crate::lid_pn_cache::LearningSource::Usync,
+                            true,
+                            &guard,
+                        )
+                        .await?;
+                }
                 EvictionCase::ConnectionChanged => {
                     use std::sync::atomic::Ordering;
                     client.set_generation_for_test(
@@ -723,6 +739,32 @@ async fn check_hosted_rotation_eviction(case: EvictionCase) {
         ),
     )
     .await;
+    if matches!(case, EvictionCase::StrictAliasChanged) {
+        let retry = tokio::time::timeout(Duration::from_secs(5), decode_sent_iq(&transport, 1))
+            .await
+            .expect("a changed alias must trigger a fresh IQ instead of a hard error");
+        assert_eq!(
+            client.device_list_account_identity(&user).await.unwrap(),
+            Some(previous)
+        );
+        let retry_id = retry
+            .get()
+            .attrs()
+            .optional_string("id")
+            .unwrap()
+            .into_owned();
+        answer_iq(
+            &client,
+            &retry_id,
+            &tests::adv_wire_response_with_hosting(
+                &user,
+                waproto::codec::adv_signed_key_index_list_to_vec(&signed),
+                2,
+                true,
+            ),
+        )
+        .await;
+    }
     if matches!(case, EvictionCase::CancelledCaller) {
         tokio::time::timeout(Duration::from_secs(5), arrived.recv())
             .await
@@ -767,7 +809,11 @@ async fn check_hosted_rotation_eviction(case: EvictionCase) {
             Some(next)
         };
         assert_eq!(
-            client.cached_adv_account_identity(&user).await.unwrap(),
+            if matches!(case, EvictionCase::StrictAliasChanged) {
+                client.device_list_account_identity(&user).await.unwrap()
+            } else {
+                client.cached_adv_account_identity(&user).await.unwrap()
+            },
             expected,
             "{case:?}"
         );
@@ -890,6 +936,13 @@ async fn adv_eviction_survives_caller_cancellation() {
 #[tokio::test]
 async fn adv_eviction_retires_companions_when_cache_is_ahead_of_database() {
     check_hosted_rotation_eviction(EvictionCase::CacheAheadOfDatabase).await;
+}
+
+/// Strict refresh must requery after a callback changes aliases, preserving the
+/// previous trust until a reply authenticated under the fresh mapping arrives.
+#[tokio::test]
+async fn adv_eviction_strict_refresh_retries_after_an_alias_change() {
+    check_hosted_rotation_eviction(EvictionCase::StrictAliasChanged).await;
 }
 
 struct HostedPublicationEventProbe {

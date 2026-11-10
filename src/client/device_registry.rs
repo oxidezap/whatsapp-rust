@@ -891,6 +891,7 @@ impl Client {
         self.has_device_in(&lookup, device_id).await
     }
 
+    /// Check every current alias and serialize durable fallback with publication ACKs.
     async fn has_device_in(&self, lookup: &UserLookupKeys, device_id: u16) -> bool {
         for key in lookup.all_keys() {
             if let Some(record) = self.device_registry_cache.get(key).await {
@@ -941,6 +942,7 @@ impl Client {
         self.update_device_list_guarded(record, &guard).await
     }
 
+    /// Publish the canonical cache row and retain Registry through its durable ACK and alias cleanup.
     pub(crate) async fn update_device_list_guarded(
         &self,
         mut record: wacore::store::traits::DeviceListRecord,
@@ -1019,6 +1021,7 @@ impl Client {
         self.update_device_lists_guarded(records, &guard).await
     }
 
+    /// Publish an accepted batch under one Registry guard and retain ordering through the storage ACK.
     pub(crate) async fn update_device_lists_guarded(
         &self,
         records: Vec<wacore::store::traits::DeviceListRecord>,
@@ -1223,6 +1226,7 @@ impl Client {
     // Keep the notification dispatcher from embedding the maintenance scope's
     // complete state and cancellation/drop paths in its add/remove branches.
     #[inline(never)]
+    /// Serialize companion admission with account maintenance before modifying durable device topology.
     fn patch_device_add_inner<'a>(
         &'a self,
         user: &'a str,
@@ -1475,6 +1479,7 @@ impl Client {
     }
 
     #[inline(never)]
+    /// Retire companion state under maintenance while retaining primary device zero and publication ordering.
     fn patch_device_remove_inner<'a>(
         &'a self,
         user: &'a str,
@@ -1670,6 +1675,7 @@ impl Client {
         self.load_device_record_in(&lookup, None).await
     }
 
+    /// Prefer the current alias cache rows, then load a durable row under the supplied publication scope.
     async fn load_device_record_in(
         &self,
         lookup: &UserLookupKeys,
@@ -1725,6 +1731,7 @@ impl Client {
         }
     }
 
+    /// Batch durable registry misses without hiding storage failures from authoritative publication.
     async fn fetch_registry_rows_checked(
         &self,
         keys: &[&str],
@@ -1784,6 +1791,7 @@ impl Client {
         Ok(records)
     }
 
+    /// Load positional records under an existing publication guard and preserve backend errors.
     pub(crate) async fn load_device_records_batch_checked(
         &self,
         users: &[&Jid],
@@ -1793,6 +1801,7 @@ impl Client {
             .await
     }
 
+    /// Resolve prospective aliases without publishing them, retaining per-user cache preference and batch errors.
     async fn load_device_records_projected_inner(
         &self,
         users: &[&Jid],
@@ -1871,6 +1880,7 @@ impl Client {
             .await
     }
 
+    /// Resolve cached device sets first and batch the remaining durable lookups under publication ordering.
     async fn get_devices_from_registry_batch_inner(
         &self,
         jids: Vec<Jid>,

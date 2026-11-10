@@ -392,6 +392,10 @@ struct DeviceListMaintenanceRequired;
 #[error("device ownership is busy during ADV publication")]
 struct DeviceListOwnershipBusy;
 
+#[derive(Debug, thiserror::Error)]
+#[error("account alias changed during ADV cache eviction")]
+struct DeviceListEvictionAliasChanged;
+
 /// A verified account trust change staged until the complete batch is accepted.
 struct AdvIdentityUpdate<'a> {
     authentication_epoch: Option<u64>,
@@ -1648,9 +1652,15 @@ impl Client {
                     drop(eviction_guard);
                     eviction_result?;
                     owned_maintenance = Some(self.begin_signal_maintenance().await?);
-                    (session_guards, mapping_guard) = self
+                    let guards = self
                         .device_list_identity_guards_with_recovery(&users, None, Some(&aliases))
-                        .await?;
+                        .await;
+                    if mode == DeviceListApplyMode::StrictRefresh
+                        && matches!(&guards, Err(error) if error.is::<DeviceListEvictionAliasChanged>())
+                    {
+                        return Ok(None);
+                    }
+                    (session_guards, mapping_guard) = guards?;
                     registry_guard = self.device_topology.lock_registry().await;
                     let mut unchanged = owned_maintenance
                         .as_ref()
@@ -2219,7 +2229,7 @@ impl Client {
                 anyhow::ensure!(
                     publication_aliases
                         .is_none_or(|expected| expected.get(position) == Some(&alias)),
-                    "account alias changed during ADV cache eviction"
+                    DeviceListEvictionAliasChanged
                 );
                 anyhow::ensure!(
                     recovery.is_none_or(|(root, snapshot)| snapshot.matches_observed_alias(
