@@ -3445,8 +3445,21 @@ impl CallEngine {
             .map(|v| v.pipe.take_recovered_audio())
             .unwrap_or_default();
         for audio in recovered {
-            self.on_piggybacked_audio(now, &audio);
+            self.on_recovered_audio(now, &audio);
         }
+    }
+
+    fn on_recovered_audio(&mut self, now: Millis, packet: &[u8]) {
+        // Replay protection accepts unseen older packets. Our decoder and PCM queue cannot
+        // insert them before audio already delivered, so discard a repair that missed that point.
+        if let Some(header) = parse_rtp_header(packet)
+            && let Some(m) = self.media.as_ref()
+            && m.audio_reception
+                .is_at_or_before_latest_timestamp(header.ssrc, header.timestamp)
+        {
+            return;
+        }
+        self.on_piggybacked_audio(now, packet);
     }
 
     /// Give up on held video whose hold ran out though no packet arrived to notice: the peer may
@@ -13087,6 +13100,50 @@ mod tests {
         assert_eq!(stats.rtp_received, 3);
         assert!(stats.audio_frames_decoded > 0);
         assert!(playout_peak(&mut eng, 10, 10) > 0, "the peer is heard");
+    }
+
+    #[test]
+    fn recovered_audio_does_not_rewind_the_decoder() {
+        let mut eng = allocated_video_engine(CallDirection::Incoming);
+        let frames = mlow_tone_frames(3);
+        let audio = |seq, frame: &[u8]| {
+            plain_peer_audio(crate::voip::rtp::RTP_PAYLOAD_TYPE_MLOW_SEPARATE, seq, frame)
+        };
+        eng.on_piggybacked_audio(10, &audio(12, &frames[1]));
+        let decoded = eng.media_stats().audio_frames_decoded;
+        let queued = eng.jitter_len();
+        assert!(decoded > 0);
+        eng.on_recovered_audio(20, &audio(11, &frames[0]));
+        assert_eq!(eng.media_stats().audio_frames_decoded, decoded);
+        assert_eq!(eng.jitter_len(), queued);
+        assert_eq!(eng.media_stats().rtp_received, 1);
+        // A repair that arrives before any newer audio is still useful.
+        eng.on_recovered_audio(30, &audio(13, &frames[2]));
+        assert!(eng.media_stats().audio_frames_decoded > decoded);
+        assert_eq!(eng.media_stats().rtp_received, 2);
+    }
+
+    #[test]
+    fn recovered_audio_timestamp_order_wraps_and_resets_with_ssrc() {
+        let mut eng = allocated_video_engine(CallDirection::Incoming);
+        let frame = &mlow_tone_frames(1)[0];
+        let audio = |seq, timestamp: u32, ssrc: u32| {
+            let mut packet =
+                plain_peer_audio(crate::voip::rtp::RTP_PAYLOAD_TYPE_MLOW_SEPARATE, seq, frame);
+            packet[4..8].copy_from_slice(&timestamp.to_be_bytes());
+            packet[8..12].copy_from_slice(&ssrc.to_be_bytes());
+            packet
+        };
+        eng.on_piggybacked_audio(10, &audio(65535, u32::MAX - 959, peer_audio_ssrc()));
+        eng.on_recovered_audio(20, &audio(0, 0, peer_audio_ssrc()));
+        assert_eq!(eng.media_stats().rtp_received, 2);
+        let decoded = eng.media_stats().audio_frames_decoded;
+        eng.on_recovered_audio(30, &audio(65534, u32::MAX - 1919, peer_audio_ssrc()));
+        eng.on_recovered_audio(31, &audio(1, 0, peer_audio_ssrc()));
+        assert_eq!(eng.media_stats().rtp_received, 2);
+        assert_eq!(eng.media_stats().audio_frames_decoded, decoded);
+        eng.on_recovered_audio(40, &audio(1, u32::MAX - 1919, peer_audio_ssrc() + 1));
+        assert_eq!(eng.media_stats().rtp_received, 3);
     }
 
     #[test]

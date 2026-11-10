@@ -16,10 +16,9 @@ use std::collections::VecDeque;
 use super::fec::{FecHeader, recover_packet};
 use super::rtp::{RTP_PAYLOAD_TYPE_H264, rtp_header_byte_length};
 
-/// How long a packet waits behind a gap for the packet that fills it, counted from its own
-/// arrival. A repair packet follows the span it closes, which for small pictures can be the next
-/// picture's; 100 ms covers that at the frame rates WhatsApp sends, and is only ever spent while a
-/// gap is open.
+/// Maximum wait behind a gap, counted from each packet's arrival. This is a local latency
+/// policy, not a verified WhatsApp Web timeout. It permits reordered originals to fill a gap even
+/// before any FEC repair has been seen. Repair spans can also cross picture boundaries.
 pub(crate) const HOLD_MS: u64 = 100;
 /// Packets held behind gaps at most, so a burst cannot grow the hold without bound.
 const HOLD_MAX: usize = 128;
@@ -567,6 +566,36 @@ mod tests {
         fec.arrive(1, 103, packets[3].clone());
         assert!(fec.repair(2, SSRC, &repair_of(&packets)).is_empty());
         assert_eq!(sequences(&fec.poll(2 + HOLD_MS)), vec![103]);
+        assert_eq!(fec.take_stats().repairs_insufficient, 1);
+    }
+    #[test]
+    fn the_hold_bound_releases_before_the_deadline() {
+        let mut fec = InboundFec::default();
+        fec.arrive(0, 1, packet(1, &[1]));
+        for sequence in 3..3 + HOLD_MAX as u16 {
+            assert!(fec.arrive(1, sequence, packet(sequence, &[1])).is_empty());
+        }
+        assert_eq!(fec.held.len(), HOLD_MAX);
+        let last = 3 + HOLD_MAX as u16;
+        let ready = fec.arrive(1, last, packet(last, &[1]));
+        assert_eq!(sequences(&ready), (3..=last).collect::<Vec<_>>());
+        assert!(fec.held.is_empty());
+        let stats = fec.take_stats();
+        assert_eq!((stats.gaps_skipped, stats.packets_skipped), (1, 1));
+    }
+
+    #[test]
+    fn the_pending_bound_evicts_the_oldest_short_repair() {
+        let mut fec = InboundFec::default();
+        fec.arrive(0, 100, packet(100, &[1]));
+        let repairs: Vec<_> = (0..=PENDING_MAX)
+            .map(|n| repair_of(&[packet(101, &[n as u8]), packet(102, &[2])]))
+            .collect();
+        for repair in &repairs {
+            assert!(fec.repair(1, SSRC, repair).is_empty());
+        }
+        assert_eq!(fec.pending.len(), PENDING_MAX);
+        assert_eq!(fec.pending.front().unwrap().1, repairs[1]);
         assert_eq!(fec.take_stats().repairs_insufficient, 1);
     }
 }

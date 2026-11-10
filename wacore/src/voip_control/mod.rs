@@ -619,8 +619,8 @@ pub struct MediaStats {
     #[builder(default)]
     pub last_unexpected_payload_type: u8,
     /// Forward sequence gaps observed on the peer video stream being reassembled.
-    /// Late arrivals do not subtract from this counter. Gaps request a keyframe through
-    /// the coalesced recovery path.
+    /// Late arrivals and FEC recovery do not subtract from this counter. A keyframe request
+    /// follows only when a gap is abandoned, as counted by `video_gaps_skipped`.
     #[builder(default)]
     pub video_rtp_lost: u32,
     /// Packets of our video the peer asked for again in generic NACKs, counted per packet named.
