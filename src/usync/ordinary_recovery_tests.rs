@@ -326,7 +326,10 @@ async fn adv_registry_cold_read_does_not_invoke_a_reentrant_host_set() {
     *store.set_hook.lock().unwrap() = Some(Box::new(move || {
         Box::pin(async move {
             let client = weak.upgrade().unwrap();
-            let devices = client.signal().get_user_devices(&[nested.clone()]).await?;
+            let devices = client
+                .signal()
+                .get_user_devices(std::slice::from_ref(&nested))
+                .await?;
             assert!(devices.contains(&nested));
             Ok(())
         })

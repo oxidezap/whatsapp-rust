@@ -2200,60 +2200,67 @@ impl Client {
 
     /// Recovery cannot adopt a newly discovered alias while waiting for locks.
     /// Check its observed relations before collecting addresses and once locked.
-    async fn device_list_identity_guards_with_recovery(
-        &self,
-        users: &[Jid],
-        recovery: Option<(&Jid, &AdvRecoverySnapshot)>,
-        publication_aliases: Option<&[Option<Jid>]>,
-    ) -> anyhow::Result<(
-        Vec<async_lock::MutexGuardArc<()>>,
-        crate::lid_pn_cache::LidPnMutationGuard<'_>,
-    )> {
-        for _ in 0..DEVICE_REFRESH_MAX_ATTEMPTS {
-            let mut aliases = Vec::with_capacity(users.len());
-            let mut addresses: Vec<_> = users.iter().map(|user| user.with_device(0)).collect();
-            for (position, user) in users.iter().enumerate() {
-                let alias = self.device_list_identity_alias(user).await;
-                // A continuation has already learned its own accepted mappings.
-                // Reject any later relation before waiting on its session lock.
-                anyhow::ensure!(
-                    publication_aliases
-                        .is_none_or(|expected| expected.get(position) == Some(&alias)),
-                    "account alias changed during ADV cache eviction"
-                );
-                anyhow::ensure!(
-                    recovery.is_none_or(|(root, snapshot)| snapshot.matches_observed_alias(
-                        root,
-                        user,
-                        alias.as_ref()
-                    )),
-                    "account alias changed during ADV recovery"
-                );
-                addresses.extend(alias.iter().map(|alias| alias.with_device(0)));
-                aliases.push(alias);
+    /// Keep this shared state machine out of every publication/recovery caller.
+    #[inline(never)]
+    fn device_list_identity_guards_with_recovery<'a, 'client: 'a>(
+        &'client self,
+        users: &'a [Jid],
+        recovery: Option<(&'a Jid, &'a AdvRecoverySnapshot)>,
+        publication_aliases: Option<&'a [Option<Jid>]>,
+    ) -> wacore::runtime::BoxFuture<
+        'a,
+        anyhow::Result<(
+            Vec<async_lock::MutexGuardArc<()>>,
+            crate::lid_pn_cache::LidPnMutationGuard<'client>,
+        )>,
+    > {
+        Box::pin(async move {
+            for _ in 0..DEVICE_REFRESH_MAX_ATTEMPTS {
+                let mut aliases = Vec::with_capacity(users.len());
+                let mut addresses: Vec<_> = users.iter().map(|user| user.with_device(0)).collect();
+                for (position, user) in users.iter().enumerate() {
+                    let alias = self.device_list_identity_alias(user).await;
+                    // A continuation has already learned its own accepted mappings.
+                    // Reject any later relation before waiting on its session lock.
+                    anyhow::ensure!(
+                        publication_aliases
+                            .is_none_or(|expected| expected.get(position) == Some(&alias)),
+                        "account alias changed during ADV cache eviction"
+                    );
+                    anyhow::ensure!(
+                        recovery.is_none_or(|(root, snapshot)| snapshot.matches_observed_alias(
+                            root,
+                            user,
+                            alias.as_ref()
+                        )),
+                        "account alias changed during ADV recovery"
+                    );
+                    addresses.extend(alias.iter().map(|alias| alias.with_device(0)));
+                    aliases.push(alias);
+                }
+                addresses.sort_unstable_by(wacore::types::jid::cmp_for_lock_order);
+                addresses.dedup_by(|a, b| wacore::types::jid::cmp_for_lock_order(a, b).is_eq());
+                let sessions = self.session_guards_for(&addresses).await;
+                let mapping = self.lid_pn_cache.lock_mutation().await;
+                let mut unchanged = true;
+                for (user, alias) in users.iter().zip(&aliases) {
+                    let current = self.device_list_identity_alias(user).await;
+                    anyhow::ensure!(
+                        recovery.is_none_or(|(root, snapshot)| snapshot.matches_observed_alias(
+                            root,
+                            user,
+                            current.as_ref()
+                        )),
+                        "account alias changed during ADV recovery"
+                    );
+                    unchanged &= current == *alias;
+                }
+                if unchanged {
+                    return Ok((sessions, mapping));
+                }
             }
-            addresses.sort_unstable_by(wacore::types::jid::cmp_for_lock_order);
-            addresses.dedup_by(|a, b| wacore::types::jid::cmp_for_lock_order(a, b).is_eq());
-            let sessions = self.session_guards_for(&addresses).await;
-            let mapping = self.lid_pn_cache.lock_mutation().await;
-            let mut unchanged = true;
-            for (user, alias) in users.iter().zip(&aliases) {
-                let current = self.device_list_identity_alias(user).await;
-                anyhow::ensure!(
-                    recovery.is_none_or(|(root, snapshot)| snapshot.matches_observed_alias(
-                        root,
-                        user,
-                        current.as_ref()
-                    )),
-                    "account alias changed during ADV recovery"
-                );
-                unchanged &= current == *alias;
-            }
-            if unchanged {
-                return Ok((sessions, mapping));
-            }
-        }
-        anyhow::bail!("account aliases changed during ADV lock acquisition")
+            anyhow::bail!("account aliases changed during ADV lock acquisition")
+        })
     }
 
     /// Only a known reciprocal alias can carry the same trusted primary across
@@ -2261,19 +2268,26 @@ impl Client {
     /// Callers hold the mapping mutation guard through the live reads and
     /// publication or cold CAS/ACK. That same guard excludes companion bootstrap
     /// without reacquiring session locks its caller may already own.
-    async fn device_list_account_identity(&self, user: &Jid) -> anyhow::Result<Option<[u8; 32]>> {
-        let primary = self.cached_adv_account_identity(user).await?;
-        let Some(alias) = self.device_list_identity_alias(user).await else {
-            return Ok(primary);
-        };
-        if self.device_list_identity_alias(&alias).await.as_ref() != Some(&user.with_device(0)) {
-            return Err(DeviceListIdentityConflict::Alias.into());
-        }
-        let other = self.cached_adv_account_identity(&alias).await?;
-        if primary.is_some() && other.is_some() && primary != other {
-            return Err(DeviceListIdentityConflict::Primary.into());
-        }
-        Ok(primary.or(other))
+    #[inline(never)]
+    fn device_list_account_identity<'a>(
+        &'a self,
+        user: &'a Jid,
+    ) -> wacore::runtime::BoxFuture<'a, anyhow::Result<Option<[u8; 32]>>> {
+        Box::pin(async move {
+            let primary = self.cached_adv_account_identity(user).await?;
+            let Some(alias) = self.device_list_identity_alias(user).await else {
+                return Ok(primary);
+            };
+            if self.device_list_identity_alias(&alias).await.as_ref() != Some(&user.with_device(0))
+            {
+                return Err(DeviceListIdentityConflict::Alias.into());
+            }
+            let other = self.cached_adv_account_identity(&alias).await?;
+            if primary.is_some() && other.is_some() && primary != other {
+                return Err(DeviceListIdentityConflict::Primary.into());
+            }
+            Ok(primary.or(other))
+        })
     }
 
     /// First-contact writes share publication's fence, but never reacquire
