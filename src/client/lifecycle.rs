@@ -5136,7 +5136,15 @@ mod tests {
             .send(())
             .await
             .expect("the release channel must stay open");
-        crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
+        // Connecting also listens to session hints so shutdown can cancel it.
+        // Wait for this transition's log, rather than a listener that may still
+        // belong to the in-flight connect attempt.
+        crate::test_utils::poll_until("the run loop to announce the pause", || {
+            logs.records_for(RUN_LOOP_LOG)
+                .iter()
+                .any(|(_, message)| message.contains("Session paused"))
+        })
+        .await;
 
         let said = logs.records_for(RUN_LOOP_LOG);
         assert!(
