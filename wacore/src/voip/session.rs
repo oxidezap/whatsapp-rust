@@ -772,8 +772,7 @@ pub struct VideoReassemblyStats {
     pub ssrc_switch_partial_dropped: u32,
     /// Packets from a retired SSRC ignored for their picture (their piggybacked audio is kept).
     pub retired_ssrc_ignored: u32,
-    /// What holding and rebuilding did; zero unless [`VideoPipeline::unprotect_video_packet_held`]
-    /// is the receive path.
+    /// What holding and rebuilding did; zero unless the receive path holds packets behind gaps.
     pub fec: InboundFecStats,
 }
 
