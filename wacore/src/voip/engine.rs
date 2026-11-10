@@ -3325,10 +3325,7 @@ impl CallEngine {
             if let Some(reassembly) = reassembly {
                 fold_video_reassembly(&mut self.media_stats, &reassembly);
             }
-            if let Some(audio) = piggybacked {
-                self.on_piggybacked_audio(now, &audio);
-            }
-            self.play_recovered_audio(now);
+            self.play_recovered_audio(now, piggybacked.as_deref());
             if video_lost > 0 {
                 self.media_stats.video_rtp_lost = self
                     .media_stats
@@ -3405,11 +3402,7 @@ impl CallEngine {
             if unrepaired {
                 self.request_peer_keyframe(now, KeyframeUrgency::Coalesced);
             }
-            self.play_recovered_audio(now);
-            if let Some(audio) = piggybacked {
-                // This packet was already counted as an arrival above.
-                self.on_piggybacked_audio(now, &audio);
-            }
+            self.play_recovered_audio(now, piggybacked.as_deref());
             return;
         }
         match m.pipe.unprotect_audio_checked(pkt) {
@@ -3429,15 +3422,10 @@ impl CallEngine {
         }
     }
 
-    /// One audio RTP packet the peer carried inside another of its packets.
-    ///
-    /// The outer packet authenticated and was decrypted as a whole, which is what protects this
-    /// one: it is plain RTP, header and payload, with no tag of its own. From here it is audio like
-    /// any other and takes the same gate and the same decode. The caller has already counted
-    /// the carrier as an audio arrival, before authentication.
     /// Audio that rode on video packets rebuilt from the peer's repair packets: it was lost with
     /// its carrier and is only recovered now. It passes the same replay check as any carried audio.
-    fn play_recovered_audio(&mut self, now: Millis) {
+    /// Insert the current carrier's audio before any newer recovery from the same audio stream.
+    fn play_recovered_audio(&mut self, now: Millis, mut carrier: Option<&[u8]>) {
         let recovered = self
             .media
             .as_mut()
@@ -3445,10 +3433,25 @@ impl CallEngine {
             .map(|v| v.pipe.take_recovered_audio())
             .unwrap_or_default();
         for audio in recovered {
+            if carrier
+                .and_then(parse_rtp_header)
+                .zip(parse_rtp_header(&audio))
+                .is_some_and(|(current, rebuilt)| {
+                    current.ssrc == rebuilt.ssrc
+                        && current.timestamp.wrapping_sub(rebuilt.timestamp) as i32 <= 0
+                })
+                && let Some(current) = carrier.take()
+            {
+                self.on_piggybacked_audio(now, current);
+            }
             self.on_recovered_audio(now, &audio);
+        }
+        if let Some(current) = carrier {
+            self.on_piggybacked_audio(now, current);
         }
     }
 
+    /// Decode recovered audio only while its timestamp is ahead of the same stream's watermark.
     fn on_recovered_audio(&mut self, now: Millis, packet: &[u8]) {
         // Replay protection accepts unseen older packets. Our decoder and PCM queue cannot
         // insert them before audio already delivered, so discard a repair that missed that point.
@@ -3484,12 +3487,14 @@ impl CallEngine {
         play_out_video(&mut self.outbox, v, completed, self.peer_video_orientation);
         let reassembly = v.pipe.take_reassembly_stats();
         fold_video_reassembly(&mut self.media_stats, &reassembly);
-        self.play_recovered_audio(now);
+        self.play_recovered_audio(now, None);
         if reassembly.fec.gaps_skipped > 0 {
             self.request_peer_keyframe(now, KeyframeUrgency::Coalesced);
         }
     }
 
+    /// Process plain audio RTP protected by its authenticated carrier, using the audio replay gate.
+    /// The caller has already counted the carrier as an audio arrival before authentication.
     fn on_piggybacked_audio(&mut self, now: Millis, packet: &[u8]) {
         let Some(header) = parse_rtp_header(packet) else {
             // What it was carried by authenticated, so this is a sender writing a piggyback this
@@ -13100,6 +13105,84 @@ mod tests {
         assert_eq!(stats.rtp_received, 3);
         assert!(stats.audio_frames_decoded > 0);
         assert!(playout_peak(&mut eng, 10, 10) > 0, "the peer is heard");
+    }
+
+    #[test]
+    fn a_video_arrival_decodes_pending_repair_audio_in_timestamp_order() {
+        use crate::voip::e2e_srtp::{crypt_payload_in_place, derive_e2e_keys};
+        use crate::voip::fec::{RTP_PAYLOAD_TYPE_VIDEO_FEC, encode_fec_payload};
+        use crate::voip::rtp::{RTP_PAYLOAD_TYPE_H264, RTP_PAYLOAD_TYPE_MLOW_SEPARATE};
+
+        let frames = mlow_tone_frames(3);
+        let carriers: Vec<_> = frames
+            .iter()
+            .enumerate()
+            .map(|(n, frame)| {
+                peer_packet_carrying_audio(
+                    RTP_PAYLOAD_TYPE_H264,
+                    peer_video_ssrc(),
+                    100 + n as u16,
+                    &[0x65, 1, 2, 3],
+                    &plain_peer_audio(RTP_PAYLOAD_TYPE_MLOW_SEPARATE, 10 + n as u16, frame),
+                )
+            })
+            .collect();
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let keys =
+            derive_e2e_keys(&call_key, &ssrc::format_e2e_srtp_participant_id(PEER_LID)).unwrap();
+        let plaintexts: Vec<_> = carriers
+            .iter()
+            .map(|packet| {
+                let header = parse_rtp_header(packet).unwrap();
+                let start = crate::voip::rtp::rtp_header_byte_length(packet).unwrap();
+                let mut plain = packet[..packet.len() - WARP_MI_TAG_LEN].to_vec();
+                crypt_payload_in_place(
+                    &keys,
+                    header.ssrc,
+                    header.sequence_number,
+                    0,
+                    &mut plain[start..],
+                );
+                plain
+            })
+            .collect();
+        let repair = encode_fec_payload(&[&plaintexts[1], &plaintexts[2]]).unwrap();
+        let repair_packet =
+            peer_packet_carrying_audio(RTP_PAYLOAD_TYPE_VIDEO_FEC, 0x0bad_f00d, 1, &repair, &[]);
+
+        let mut lossless = allocated_video_engine(CallDirection::Incoming);
+        for (n, frame) in frames.iter().enumerate() {
+            lossless.on_piggybacked_audio(
+                10 + n as u64,
+                &plain_peer_audio(RTP_PAYLOAD_TYPE_MLOW_SEPARATE, 10 + n as u16, frame),
+            );
+        }
+        let expected = &lossless
+            .media
+            .as_ref()
+            .unwrap()
+            .pcm
+            .as_ref()
+            .unwrap()
+            .jitter;
+        for arriving in [1, 2] {
+            let mut eng = allocated_video_engine(CallDirection::Incoming);
+            eng.handle_input(10, Input::RelayPacket(&carriers[0]));
+            eng.handle_input(11, Input::RelayPacket(&repair_packet));
+            let decoded = eng.media_stats().audio_frames_decoded;
+            assert!(decoded > 0);
+            assert_eq!(eng.media_stats().video_fec_recovered, 0);
+            // Either protected packet can arrive late and make the other recoverable.
+            eng.handle_input(12, Input::RelayPacket(&carriers[arriving]));
+            assert_eq!(eng.media_stats().video_fec_recovered, 1);
+            assert_eq!(eng.media_stats().audio_frames_decoded, decoded * 3);
+            assert_eq!(eng.media_stats().piggybacked_audio_received, 3);
+            assert_eq!(
+                &eng.media.as_ref().unwrap().pcm.as_ref().unwrap().jitter,
+                expected,
+                "PCM must match lossless timestamp order for arriving carrier {arriving}",
+            );
+        }
     }
 
     #[test]
