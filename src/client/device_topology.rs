@@ -13,8 +13,8 @@
 //! serving stale data.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Weak};
 
 use portable_atomic::AtomicU64;
 
@@ -49,18 +49,43 @@ struct TopologyLog {
     floor: u64,
 }
 
+type RegistryMutexSlot = std::sync::Mutex<Weak<async_lock::Mutex<()>>>;
+
 /// Shared tracker: a monotonic generation plus the bounded changed-users log.
 pub(crate) struct DeviceTopology {
     generation: AtomicU64,
     log: std::sync::Mutex<TopologyLog>,
-    registry_mutation: async_lock::Mutex<()>,
+    registry_mutation: RegistryMutexSlot,
+}
+
+/// Keep one mutex shared by every holder and queued acquisition, and release
+/// its weak allocation header when the last operation retires. A permanently
+/// stored async mutex retains its 72-byte event after even an uncontended use.
+struct RegistryMutexLease<'a> {
+    slot: &'a RegistryMutexSlot,
+    mutex: Option<Arc<async_lock::Mutex<()>>>,
+}
+
+impl Drop for RegistryMutexLease<'_> {
+    /// Retire idle state under the same admission lock used by new operations.
+    fn drop(&mut self) {
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        // Decrement under admission too: concurrent final cancellations must
+        // not both observe the other's lease and leave a dead weak header.
+        drop(self.mutex.take());
+        if slot.strong_count() == 0 {
+            *slot = Weak::new();
+        }
+    }
 }
 
 /// Proof that a device-registry mutation is serialized with authoritative
 /// refresh publication. The cache write API requires this token so new write
 /// paths cannot accidentally bypass the ordering invariant.
 pub(crate) struct DeviceRegistryMutationGuard<'a> {
-    _guard: async_lock::MutexGuard<'a, ()>,
+    // Release the actual lock before the lease can retire its allocation.
+    _guard: async_lock::MutexGuardArc<()>,
+    _lease: RegistryMutexLease<'a>,
 }
 
 impl DeviceTopology {
@@ -72,7 +97,7 @@ impl DeviceTopology {
                 fingerprints: 0,
                 floor: 0,
             }),
-            registry_mutation: async_lock::Mutex::new(()),
+            registry_mutation: std::sync::Mutex::new(Weak::new()),
         })
     }
 
@@ -80,9 +105,35 @@ impl DeviceTopology {
         self.generation.load(Ordering::Acquire)
     }
 
+    /// Share one mutex across holders and queued acquisitions, retaining
+    /// publication ordering through ACK and retiring its allocation when idle.
     pub(crate) async fn lock_registry(&self) -> DeviceRegistryMutationGuard<'_> {
+        let lease = {
+            let mut slot = self
+                .registry_mutation
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let mutex = slot.upgrade().unwrap_or_else(|| {
+                let mutex = Arc::new(async_lock::Mutex::new(()));
+                *slot = Arc::downgrade(&mutex);
+                mutex
+            });
+            RegistryMutexLease {
+                slot: &self.registry_mutation,
+                mutex: Some(mutex),
+            }
+        };
+        // Cancellation drops the acquisition future before its earlier lease,
+        // so queued users also participate in allocation retirement.
+        let guard = lease
+            .mutex
+            .as_ref()
+            .expect("registry lease owns its mutex until release")
+            .lock_arc()
+            .await;
         DeviceRegistryMutationGuard {
-            _guard: self.registry_mutation.lock().await,
+            _guard: guard,
+            _lease: lease,
         }
     }
 
@@ -256,8 +307,7 @@ impl DeviceRegistryCache {
     }
 
     /// Preserve the original fixture seed, which bypasses publication admission.
-    /// Taking Registry here initializes a retained lock event absent on the
-    /// baseline, changing the connected-retention fixture by 72 bytes.
+    /// Keep benchmark setup independent of registry admission and its allocation.
     /// Production DB fills use the guarded, ordered path.
     #[cfg(feature = "bench-harness")]
     pub(crate) async fn promote(
@@ -314,6 +364,109 @@ impl DeviceRegistryCache {
 #[cfg(test)]
 mod tests {
     use super::{DeviceTopology, MemberIndex, TOPOLOGY_LOG_CAPACITY};
+
+    /// Concurrent cancellation of the final queued users must clear the weak
+    /// header after their strong references disappear under admission.
+    #[test]
+    fn registry_mutex_concurrent_lease_retirement_releases_the_header() {
+        for _ in 0..16 {
+            let slot = super::RegistryMutexSlot::new(std::sync::Weak::new());
+            let mutex = std::sync::Arc::new(async_lock::Mutex::new(()));
+            *slot.lock().unwrap() = std::sync::Arc::downgrade(&mutex);
+            let leases: Vec<_> = (0..8)
+                .map(|_| super::RegistryMutexLease {
+                    slot: &slot,
+                    mutex: Some(mutex.clone()),
+                })
+                .collect();
+            drop(mutex);
+            let start = std::sync::Barrier::new(leases.len());
+            std::thread::scope(|scope| {
+                for lease in leases {
+                    let start = &start;
+                    scope.spawn(move || {
+                        start.wait();
+                        drop(lease);
+                    });
+                }
+            });
+            assert!(std::sync::Weak::ptr_eq(
+                &slot.lock().unwrap(),
+                &std::sync::Weak::new()
+            ));
+        }
+    }
+
+    /// A queued read shares the writer's mutex through its ACK; the final
+    /// release must retire the mutex and event rather than retain their header.
+    #[tokio::test]
+    async fn registry_mutex_retires_after_the_last_queued_operation() {
+        let topology = DeviceTopology::new();
+        let first = topology.lock_registry().await;
+        let mut waiting = Box::pin(topology.lock_registry());
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        drop(first);
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .unwrap();
+        assert!(
+            topology
+                .registry_mutation
+                .lock()
+                .unwrap()
+                .upgrade()
+                .is_some()
+        );
+        drop(second);
+        assert!(std::sync::Weak::ptr_eq(
+            &topology.registry_mutation.lock().unwrap(),
+            &std::sync::Weak::new()
+        ));
+    }
+
+    /// Cancelling the final notified waiter must release its lease and weak
+    /// header even when it never polls again after the writer unlocks.
+    #[tokio::test]
+    async fn registry_mutex_retires_when_a_notified_waiter_is_cancelled() {
+        let topology = DeviceTopology::new();
+        let first = topology.lock_registry().await;
+        let mut waiting = Box::pin(topology.lock_registry());
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        drop(first);
+        drop(waiting);
+        assert!(std::sync::Weak::ptr_eq(
+            &topology.registry_mutation.lock().unwrap(),
+            &std::sync::Weak::new()
+        ));
+        drop(topology.lock_registry().await);
+        assert!(std::sync::Weak::ptr_eq(
+            &topology.registry_mutation.lock().unwrap(),
+            &std::sync::Weak::new()
+        ));
+    }
+
+    /// A cancelled acquisition must neither retire an active mutex nor consume
+    /// the notification needed by another queued operation.
+    #[tokio::test]
+    async fn registry_mutex_cancellation_preserves_the_remaining_waiter() {
+        let topology = DeviceTopology::new();
+        let first = topology.lock_registry().await;
+        let mut cancelled = Box::pin(topology.lock_registry());
+        let mut waiting = Box::pin(topology.lock_registry());
+        assert!(futures::poll!(cancelled.as_mut()).is_pending());
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        drop(cancelled);
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        drop(first);
+        let last = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .unwrap();
+        drop(last);
+        assert!(std::sync::Weak::ptr_eq(
+            &topology.registry_mutation.lock().unwrap(),
+            &std::sync::Weak::new()
+        ));
+    }
 
     fn members(users: &[&str]) -> MemberIndex {
         MemberIndex::from_users(users.iter().copied())
