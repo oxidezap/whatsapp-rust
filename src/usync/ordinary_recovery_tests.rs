@@ -4190,12 +4190,16 @@ async fn adv_review_wire_hosted_subjects_cannot_bypass_the_account_epoch_graph()
             );
             assert_eq!(client.cached_adv_account_identity(&lid).await.unwrap(), old);
         }
+        let hosted = Jid::new(lid.user.as_str(), wacore_binary::Server::HostedLid);
+        assert_eq!(
+            client.cached_adv_account_identity(&hosted).await.unwrap(),
+            old
+        );
         assert!(
             client
-                .cached_adv_account_identity(&Jid::new(
-                    lid.user.as_str(),
-                    wacore_binary::Server::HostedLid
-                ))
+                .persistence_manager
+                .backend()
+                .load_identity(hosted.to_protocol_address().as_str())
                 .await
                 .unwrap()
                 .is_none(),

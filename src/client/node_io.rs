@@ -2828,9 +2828,7 @@ mod tests {
         use std::mem::{size_of, size_of_val};
         let client = crate::test_utils::create_test_client().await;
         let shutdown = client.connection_shutdown_signal();
-        let node = crate::test_utils::node_to_owned_ref(
-            &wacore_binary::builder::NodeBuilder::new("iq").build(),
-        );
+        let node = crate::test_utils::node_to_owned_ref(&NodeBuilder::new("iq").build());
         println!(
             "QueueBudgets: {} bytes",
             size_of::<crate::inbound_queue::QueueBudgets>()
@@ -2855,14 +2853,14 @@ mod tests {
         let reader = async move {
             let connection = reader_client.connect().await?;
             connection.read_until_disconnected().await;
-            Ok::<(), crate::client::ConnectError>(())
+            Ok::<(), ConnectError>(())
         };
         println!(
             "connected fixture reader task: {} bytes",
             size_of_val(&reader)
         );
         drop(reader);
-        let primary = wacore_binary::Jid::pn("12025550189");
+        let primary = Jid::pn("12025550189");
         println!(
             "ensure_adv_account_identity: {} bytes",
             size_of_val(&client.ensure_adv_account_identity(&primary))

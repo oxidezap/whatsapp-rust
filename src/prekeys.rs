@@ -575,7 +575,10 @@ impl Client {
                     .persist_adv_bootstrap_identity_inner(&primary_owned, &key, epoch)
                     .await?;
                 ensure_adv_bootstrap_scope(&current_generation, generation, &shutdown)?;
-                anyhow::ensure!(accepted, "primary identity changed during ADV bootstrap");
+                anyhow::ensure!(
+                    accepted,
+                    crate::usync::DeviceListIdentityConflict::Bootstrap
+                );
                 Ok(key)
             }
             .await;
