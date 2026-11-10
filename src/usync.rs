@@ -1428,7 +1428,7 @@ impl Client {
     /// Share one boxed state machine between ordinary and owned hosted callers.
     #[inline(never)]
     fn apply_device_list_response_inner<'a>(
-        &'a self,
+        self: &'a std::sync::Arc<Self>,
         response: &'a DeviceListResponse,
         mode: DeviceListApplyMode,
         topology_generation: Option<u64>,
@@ -1596,6 +1596,9 @@ impl Client {
                     owned_maintenance.is_some(),
                     "ADV eviction lacks an owned maintenance scope"
                 );
+                let maintenance_generation = maintenance
+                    .ok_or(DeviceListMaintenanceRequired)?
+                    .generation();
                 let mut aliases = Vec::with_capacity(users.len());
                 for user in &users {
                     aliases.push(self.device_list_identity_alias(user).await);
@@ -1639,7 +1642,10 @@ impl Client {
                     )
                     .await?;
                 registry_guard = self.device_topology.lock_registry().await;
-                let mut unchanged = unchanged_during_eviction
+                let mut unchanged = owned_maintenance
+                    .as_ref()
+                    .is_some_and(|scope| scope.generation() == maintenance_generation)
+                    && unchanged_during_eviction
                     && self
                         .device_topology
                         .unchanged_for(generation, &device_response_users(response));

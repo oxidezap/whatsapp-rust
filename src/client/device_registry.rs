@@ -707,6 +707,7 @@ impl Client {
     /// - `LidWithPn`: User is a LID with known phone number mapping
     /// - `PnWithLid`: User is a phone number with known LID mapping
     /// - `Unknown`: No LID-PN mapping exists (could be either type)
+    /// Own both alias keys while publication releases its guards for host code.
     pub(crate) async fn device_registry_lookup_keys(&self, user: &str) -> Vec<String> {
         self.resolve_lookup_keys(user)
             .await

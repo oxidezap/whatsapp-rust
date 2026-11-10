@@ -385,6 +385,7 @@ enum EvictionCase {
     MappingFromModifier,
     RefilledCache,
     RetiredPrimary,
+    ConnectionChanged,
     DeleteError,
     CancelledCaller,
     CacheAheadOfDatabase,
@@ -494,6 +495,13 @@ async fn check_hosted_rotation_eviction(case: EvictionCase) {
                 EvictionCase::RetiredPrimary => {
                     deliver_identity_reset(&client, &hook_user, None).await
                 }
+                EvictionCase::ConnectionChanged => {
+                    use std::sync::atomic::Ordering;
+                    client.set_generation_for_test(
+                        client.connection_generation.load(Ordering::Acquire) + 1,
+                        Ordering::Release,
+                    );
+                }
                 EvictionCase::DeleteError => anyhow::bail!("synthetic cache delete failure"),
                 EvictionCase::CancelledCaller => {
                     blocked.send(()).await.unwrap();
@@ -561,7 +569,10 @@ async fn check_hosted_rotation_eviction(case: EvictionCase) {
             .unwrap();
         let rejected = matches!(
             case,
-            EvictionCase::RefilledCache | EvictionCase::RetiredPrimary | EvictionCase::DeleteError
+            EvictionCase::RefilledCache
+                | EvictionCase::RetiredPrimary
+                | EvictionCase::ConnectionChanged
+                | EvictionCase::DeleteError
         );
         assert_eq!(result.is_err(), rejected, "{case:?}: {result:?}");
         let expected = if matches!(case, EvictionCase::RetiredPrimary) {
@@ -619,6 +630,10 @@ async fn adv_eviction_rejects_a_cache_refill_without_a_topology_change() {
 #[tokio::test]
 async fn adv_eviction_rejects_primary_retirement_during_callback() {
     check_hosted_rotation_eviction(EvictionCase::RetiredPrimary).await;
+}
+#[tokio::test]
+async fn adv_eviction_rejects_connection_replacement_during_callback() {
+    check_hosted_rotation_eviction(EvictionCase::ConnectionChanged).await;
 }
 #[tokio::test]
 async fn adv_eviction_delete_error_preserves_trust_and_sessions() {
