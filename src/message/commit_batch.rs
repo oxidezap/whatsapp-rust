@@ -1376,8 +1376,7 @@ impl Client {
         limit: std::time::Duration,
     ) -> DrainOutcome {
         let settle = async {
-            // Keep the cold reconnect acquisition out of the keepalive frame.
-            let _permits = Box::pin(self.acquire_message_quiescence()).await;
+            let _permits = self.acquire_message_quiescence().await;
             let batch = self.inbound_commit_batch.take();
             let durable = if batch.is_empty() {
                 true
@@ -1421,7 +1420,8 @@ impl Client {
                 DrainOutcome::Failed
             }
         };
-        match wacore::runtime::timeout(&*self.runtime, limit, settle).await {
+        // The cold reconnect settle must not enlarge every keepalive future.
+        match wacore::runtime::timeout(&*self.runtime, limit, Box::pin(settle)).await {
             Ok(outcome) => outcome,
             Err(_) => {
                 // Drop the whole dirty cache — do NOT sample has_entries() (it

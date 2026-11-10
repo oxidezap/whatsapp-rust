@@ -1013,7 +1013,7 @@ impl Client {
             }
             SessionBatchOutcome::default()
         };
-        if session_outcome.interrupted {
+        if session_outcome.interrupted || session_outcome.recovery_deferred {
             self.report_stanza_not_attempted(&info, &[], &group_payloads, &bot_payloads);
             return;
         }
@@ -1586,6 +1586,30 @@ impl Client {
                             ObservedId::new(info.id.as_str()),
                             address.observe()
                         );
+
+                        if !deferred.is_empty() {
+                            // A whole-cache flush could persist these ratchets
+                            // before their plaintexts reach projection. Keep our
+                            // permit, project the successful prefix, and leave
+                            // recovery to redelivery of the remaining payloads.
+                            outcome.recovery_deferred = true;
+                            outcome.had_failure = true;
+                            self.report_enc_decrypt_failure(
+                                info,
+                                enc_index,
+                                enc_type,
+                                EncDecryptFailureReason::NotAttempted,
+                            );
+                            for remaining in payloads_iter {
+                                self.report_enc_decrypt_failure(
+                                    info,
+                                    remaining.enc_index,
+                                    remaining.enc_type.as_wire_str(),
+                                    EncDecryptFailureReason::NotAttempted,
+                                );
+                            }
+                            return (outcome, deferred, Some(timer));
+                        }
 
                         // Delete the old, untrusted identity through the signal cache.
                         // NOTE: We intentionally do NOT delete the session here. The session will be

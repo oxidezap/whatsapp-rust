@@ -187,6 +187,8 @@ pub(crate) struct SessionBatchOutcome {
     had_failure: bool,
     /// Suspension invalidated the connection or account; abandon the whole stanza.
     interrupted: bool,
+    /// Finish projecting earlier plaintexts, then abandon the remaining stanza.
+    recovery_deferred: bool,
 }
 
 /// Outcome of a PN→LID migration retry decrypt. On `Decrypted` the plaintext
