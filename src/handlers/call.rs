@@ -68,6 +68,7 @@ impl StanzaHandler for CallHandler {
         feature = "tracing",
         tracing::instrument(name = "wa.recv.call", level = "debug", skip_all)
     )]
+    /// Parses call signaling, authenticates control updates, and publishes current-call events.
     async fn handle(
         &self,
         client: Arc<Client>,
@@ -617,6 +618,27 @@ impl StanzaHandler for CallHandler {
                                 } else {
                                     dispatch_call = false;
                                 }
+                            } else if let Some((generation, peer)) = direct_screen_share_peer(
+                                &client,
+                                &call,
+                                call_creator,
+                                screen_share.state,
+                                group_transition_generation,
+                            )
+                            .await
+                            {
+                                // A 1:1 peer shares its screen as its ordinary video
+                                // plane, announcing it with the same stanza a group
+                                // participant sends. Nothing in group state changes;
+                                // the event lets the app show the whole picture.
+                                client.call_registry().send_call_event_if_current(
+                                    call_id,
+                                    generation,
+                                    CallEvent::ScreenShareChanged {
+                                        participant: peer.to_non_ad(),
+                                        screen_share: screen_share.clone(),
+                                    },
+                                );
                             } else {
                                 warn!(
                                     "call: rejected screen-share state from unauthorized sender for {call_id}"
@@ -1313,6 +1335,52 @@ fn validate_group_epoch_key(raw_epoch: &[u8]) -> anyhow::Result<()> {
 use crate::voip::direct_ingress::{
     is_call_service_sender, reject_is_device_busy, routed_call_sender,
 };
+
+/// The peer of a current 1:1 video call, when it sent this screen-share
+/// stanza itself about a call it is in; `None` for anything else.
+#[cfg(feature = "voip-control")]
+async fn direct_screen_share_peer(
+    client: &Client,
+    call: &IncomingCall,
+    call_creator: &Jid,
+    state: ScreenShareState,
+    transition: Option<u64>,
+) -> Option<(u64, Jid)> {
+    let call_id = call.action.call_id();
+    let registry = client.call_registry();
+    let generation = transition.or_else(|| registry.generation_of(call_id))?;
+    if registry.is_group_call_if_current(call_id, generation)
+        || registry
+            .group_state_if_current(call_id, generation)
+            .is_some()
+        || is_call_service_sender(&call.from, call_id)
+        // Direct peer envelopes cannot delegate sender identity through participant metadata.
+        || call.participant.is_some()
+    {
+        return None;
+    }
+    let session = registry.snapshot_if_current(call_id, generation)?;
+    // The native screen-share guard accepts an answered call before media connects.
+    if !matches!(
+        session.phase(),
+        wacore::voip_control::CallPhase::Connecting | wacore::voip_control::CallPhase::Active
+    ) {
+        return None;
+    }
+    if state == ScreenShareState::Started && !session.is_video {
+        return None;
+    }
+    crate::voip::direct_ingress::canonical_call_identity(
+        client,
+        call_creator,
+        &session.call_creator,
+    )
+    .await?;
+    let peer =
+        crate::voip::direct_ingress::canonical_call_identity(client, &call.from, &session.peer_jid)
+            .await?;
+    Some((generation, peer))
+}
 
 #[cfg(all(test, feature = "voip-control"))]
 async fn canonical_call_identity(client: &Client, observed: &Jid, expected: &Jid) -> Option<Jid> {
@@ -3792,6 +3860,112 @@ mod tests {
             r.attrs().optional_string("id").as_deref(),
             Some("STANZA-ID-0002")
         );
+    }
+
+    #[cfg(feature = "voip-control")]
+    #[tokio::test]
+    /// Only the authenticated direct peer may announce screen sharing.
+    async fn a_one_to_one_peer_screen_share_reaches_the_call_events() {
+        use wacore::voip_control::CallEvent;
+
+        let client = make_sending_client().await;
+        let registry = client.call_registry();
+        let mut session = wacore::voip_control::CallSession::new_incoming(
+            "CALL-ID-0001",
+            fake_caller_lid(),
+            fake_caller_lid(),
+        );
+        session.is_video = true;
+        let generation = registry.insert(session);
+        let (event_tx, event_rx) = async_channel::unbounded::<CallEvent>();
+        let (control_tx, _control_rx) = video_control_channel();
+        registry.set_video_channels(
+            "CALL-ID-0001",
+            generation,
+            event_tx,
+            control_tx,
+            Box::new(|| {}),
+        );
+        let share = |from: Jid, id: &str| {
+            NodeBuilder::new("call")
+                .attr("from", from)
+                .attr("id", id.to_string())
+                .attr("t", "1766847151")
+                .children([NodeBuilder::new(CallActionTag::ScreenShare.as_str())
+                    .attr("call-id", "CALL-ID-0001")
+                    .attr("call-creator", fake_caller_lid())
+                    .attr("screenshare_state", "1")
+                    .attr("version", "2")
+                    .build()])
+                .build()
+        };
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(
+                    client.clone(),
+                    node_to_owned_ref(&share(fake_caller_lid(), "STANZA-ID-RINGING")),
+                    &mut cancelled,
+                )
+                .await
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "an unanswered call cannot share"
+        );
+        assert!(registry.transition_if_current(
+            "CALL-ID-0001",
+            generation,
+            wacore::voip_control::CallPhase::Connecting,
+        ));
+        let outsider = Jid::new("333333333333333", Server::Lid);
+        for (from, participant, id) in [
+            (outsider.clone(), None, "STANZA-ID-0003"),
+            (outsider, Some(fake_caller_lid()), "STANZA-ID-0005"),
+            (fake_caller_lid(), Some(fake_caller_lid()), "STANZA-ID-0006"),
+            (fake_caller_lid(), None, "STANZA-ID-0004"),
+        ] {
+            let mut node = share(from, id);
+            if let Some(participant) = participant {
+                node.attrs.insert("participant", participant);
+            }
+            let mut cancelled = false;
+            assert!(
+                CallHandler
+                    .handle(client.clone(), node_to_owned_ref(&node), &mut cancelled)
+                    .await
+            );
+        }
+        assert!(
+            matches!(
+                event_rx.try_recv(),
+                Ok(CallEvent::ScreenShareChanged { participant, screen_share })
+                    if participant == fake_caller_lid()
+                        && screen_share.state == ScreenShareState::Started
+            ),
+            "only the peer's share comes through"
+        );
+        assert!(event_rx.try_recv().is_err());
+        assert!(registry.transition_if_current(
+            "CALL-ID-0001",
+            generation,
+            wacore::voip_control::CallPhase::Active,
+        ));
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(
+                    client.clone(),
+                    node_to_owned_ref(&share(fake_caller_lid(), "STANZA-ID-ACTIVE")),
+                    &mut cancelled,
+                )
+                .await
+        );
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(CallEvent::ScreenShareChanged { .. })
+        ));
+        registry.remove_if_current("CALL-ID-0001", generation);
     }
 
     #[cfg(feature = "voip-control")]

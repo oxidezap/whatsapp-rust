@@ -3199,6 +3199,7 @@ impl CallRegistry {
             return false;
         };
         entry.session.answering_device = Some(device);
+        let _ = entry.session.transition_to(CallPhase::Connecting);
         true
     }
 
@@ -5980,7 +5981,12 @@ mod tests {
         let reg = CallRegistry::new();
         let peer = Jid::new("222222222222222", Server::Lid);
         let creator = Jid::new("111111111111111", Server::Lid);
-        let session = || CallSession::new_outgoing("DIRECT-ANSWER", peer.clone(), creator.clone());
+        let session = || {
+            let mut session =
+                CallSession::new_outgoing("DIRECT-ANSWER", peer.clone(), creator.clone());
+            assert!(session.transition_to(CallPhase::Calling));
+            session
+        };
         let stale = reg.insert(session());
         let current = reg.insert(session());
         let rx = reg
@@ -6034,6 +6040,7 @@ mod tests {
             rx.try_recv().is_err(),
             "rejected answers never reach the current media"
         );
+        assert_eq!(reg.phase("DIRECT-ANSWER"), Some(CallPhase::Calling));
         assert!(
             reg.accept_direct_if_current(
                 "DIRECT-ANSWER",
@@ -6049,6 +6056,7 @@ mod tests {
             rx.try_recv().unwrap().answering_lid,
             peer.with_device(2).to_string()
         );
+        assert_eq!(reg.phase("DIRECT-ANSWER"), Some(CallPhase::Connecting));
         let sibling = peer.with_device(3);
         let sibling_answer = crate::voip_control::control::PeerAnswer::builder()
             .answering_lid(sibling.to_string())
