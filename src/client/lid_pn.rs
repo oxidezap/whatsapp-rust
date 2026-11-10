@@ -3236,6 +3236,7 @@ mod tests {
         crate::test_utils::synthetic_serialized_session(remote_regid, None)
     }
 
+    /// Detached discovery must revalidate ownership after waiting for registry publication.
     #[tokio::test]
     async fn adv_review_round6_discovery_rechecks_owner_before_registry_transfer() {
         use wacore::store::traits::{DeviceInfo, DeviceListRecord};
@@ -3357,6 +3358,7 @@ mod tests {
         }
     }
 
+    /// Offline alias evidence permits migration only when durable ownership remains compatible.
     #[tokio::test]
     async fn adv_review_round6_offline_alias_migrates_without_overriding_durable_conflicts() {
         use crate::store::release::tests::ProbeBackend;
@@ -3472,6 +3474,7 @@ mod tests {
         }
     }
 
+    /// Discovery requires reciprocal alias evidence without changing explicit migration semantics.
     #[tokio::test]
     async fn adv_review_round6_discovery_requires_alias_evidence_but_explicit_target_remains_supported()
      {
@@ -3538,6 +3541,7 @@ mod tests {
         client.signal_shutdown_sync();
     }
 
+    /// Cold or stale alias caches must not conceal a conflicting durable owner.
     #[tokio::test]
     async fn adv_review_round6_discovery_validates_durable_owner_when_cache_is_cold_or_stale() {
         use wacore::libsignal::protocol::SessionRecord;
@@ -3640,6 +3644,7 @@ mod tests {
         }
     }
 
+    /// A queued discovery task must not transfer companion trust after its account changes owners.
     #[tokio::test]
     async fn adv_review_round6_discovery_rechecks_owner_before_companion_transfer() {
         use wacore::libsignal::protocol::SessionRecord;

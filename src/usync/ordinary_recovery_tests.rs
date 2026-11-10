@@ -23,6 +23,8 @@ struct OwnershipCallbackCache {
     delete_enabled: std::sync::atomic::AtomicBool,
     read_error: std::sync::atomic::AtomicBool,
     delete_hook: std::sync::Mutex<Option<DeleteHook>>,
+    set_hook: std::sync::Mutex<Option<DeleteHook>>,
+    retain_deleted: std::sync::atomic::AtomicBool,
     taken: std::sync::atomic::AtomicBool,
     sets: std::sync::atomic::AtomicUsize,
     cancelled: std::sync::atomic::AtomicBool,
@@ -54,6 +56,10 @@ impl wacore::store::CacheStore for OwnershipCallbackCache {
     ) -> anyhow::Result<()> {
         use std::sync::atomic::Ordering;
         self.sets.fetch_add(1, Ordering::Relaxed);
+        let hook = self.set_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook().await?;
+        }
         if self.enabled.load(Ordering::Acquire) && !self.taken.swap(true, Ordering::AcqRel) {
             let manager = self.manager.lock().unwrap().upgrade().unwrap();
             let record: DeviceListRecord = serde_json::from_slice(value).unwrap();
@@ -94,10 +100,12 @@ impl wacore::store::CacheStore for OwnershipCallbackCache {
                 self.cancelled.store(true, Ordering::Release);
             }
         }
-        self.rows
-            .lock()
-            .unwrap()
-            .remove(&(namespace.into(), key.into()));
+        if !self.retain_deleted.load(Ordering::Acquire) {
+            self.rows
+                .lock()
+                .unwrap()
+                .remove(&(namespace.into(), key.into()));
+        }
         let hook = self.delete_hook.lock().unwrap().take();
         if let Some(hook) = hook {
             hook().await?;
@@ -125,6 +133,8 @@ async fn check_hosted_cache_callback_ownership(cold_fill: bool, callback_enabled
         delete_enabled: AtomicBool::new(false),
         read_error: AtomicBool::new(false),
         delete_hook: std::sync::Mutex::new(None),
+        set_hook: std::sync::Mutex::new(None),
+        retain_deleted: AtomicBool::new(false),
         taken: AtomicBool::new(false),
         sets: AtomicUsize::new(0),
         cancelled: AtomicBool::new(false),
@@ -199,10 +209,9 @@ async fn check_hosted_cache_callback_ownership(cold_fill: bool, callback_enabled
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            timestamp == 1,
-            cold_fill,
-            "the callback must occur at the selected read-fill/publication phase"
+        assert_ne!(
+            timestamp, 1,
+            "durable reads must not invoke host set callbacks"
         );
         Some(abort)
     } else {
@@ -233,7 +242,7 @@ async fn check_hosted_cache_callback_ownership(cold_fill: bool, callback_enabled
         key
     );
     assert!(!store.cancelled.load(Ordering::Acquire));
-    assert!(store.sets.load(Ordering::Relaxed) >= if cold_fill { 2 } else { 1 });
+    assert_eq!(store.sets.load(Ordering::Relaxed), 1);
     if callback_enabled {
         assert_eq!(
             client.persistence_manager.get_device_snapshot().push_name,
@@ -252,18 +261,90 @@ async fn check_hosted_cache_callback_ownership(cold_fill: bool, callback_enabled
     client.signal_shutdown_sync();
 }
 
+/// Publication must release device ownership before the host cache acknowledges its write.
 #[tokio::test]
 async fn adv_review_round8_hosted_publication_cache_callback_can_modify_device() {
     check_hosted_cache_callback_ownership(false, false).await;
     check_hosted_cache_callback_ownership(false, true).await;
 }
 
+/// A cold durable row must not move a host callback back inside device ownership.
 #[tokio::test]
 async fn adv_review_round8_hosted_cold_fill_cache_callback_can_modify_device() {
     check_hosted_cache_callback_ownership(true, false).await;
     check_hosted_cache_callback_ownership(true, true).await;
 }
 
+/// A read miss must not start a host set callback that recursively reads another
+/// uncached user while the outer read still owns Registry.
+#[tokio::test]
+async fn adv_registry_cold_read_does_not_invoke_a_reentrant_host_set() {
+    use crate::cache_config::{CacheConfig, CacheStores};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let (entered, _) = async_channel::unbounded();
+    let store = Arc::new(OwnershipCallbackCache {
+        rows: std::sync::Mutex::new(Default::default()),
+        manager: std::sync::Mutex::new(Default::default()),
+        enabled: AtomicBool::new(false),
+        delete_enabled: AtomicBool::new(false),
+        read_error: AtomicBool::new(false),
+        delete_hook: std::sync::Mutex::new(None),
+        set_hook: std::sync::Mutex::new(None),
+        retain_deleted: AtomicBool::new(false),
+        taken: AtomicBool::new(false),
+        sets: AtomicUsize::new(0),
+        cancelled: AtomicBool::new(false),
+        entered,
+    });
+    let config = CacheConfig::default().with_cache_stores(CacheStores {
+        device_registry_cache: Some(store.clone()),
+        ..Default::default()
+    });
+    let client = crate::test_utils::create_test_client_with_config(
+        "registry_reentrant_set",
+        Arc::new(crate::test_utils::MockHttpClient),
+        config,
+    )
+    .await;
+    let outer = Jid::pn("12025550183");
+    let nested = Jid::pn("12025550184");
+    for user in [&outer, &nested] {
+        client
+            .persistence_manager
+            .backend()
+            .update_device_list(DeviceListRecord {
+                user: user.user.as_str().into(),
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(1))].into(),
+                raw_id: Some(1),
+                timestamp: 1,
+                phash: None,
+            })
+            .await
+            .unwrap();
+    }
+    let weak = Arc::downgrade(&client);
+    *store.set_hook.lock().unwrap() = Some(Box::new(move || {
+        Box::pin(async move {
+            let client = weak.upgrade().unwrap();
+            let devices = client.signal().get_user_devices(&[nested.clone()]).await?;
+            assert!(devices.contains(&nested));
+            Ok(())
+        })
+    }));
+    let record = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.load_device_record_for_jid(&outer),
+    )
+    .await
+    .expect("a cold read must not deadlock inside the cache host")
+    .unwrap();
+    assert_eq!(record.raw_id, Some(1));
+    assert_eq!(store.sets.load(Ordering::Acquire), 0);
+    assert!(store.set_hook.lock().unwrap().is_some());
+    client.signal_shutdown_sync();
+}
+
+/// Exercise the public IQ path that previously deadlocked delete against modify_device.
 #[tokio::test]
 async fn adv_review_round9_hosted_rotation_cache_delete_can_modify_device() {
     use crate::cache_config::{CacheConfig, CacheStores};
@@ -277,6 +358,8 @@ async fn adv_review_round9_hosted_rotation_cache_delete_can_modify_device() {
             delete_enabled: AtomicBool::new(callback_enabled),
             read_error: AtomicBool::new(false),
             delete_hook: std::sync::Mutex::new(None),
+            set_hook: std::sync::Mutex::new(None),
+            retain_deleted: AtomicBool::new(false),
             taken: AtomicBool::new(false),
             sets: AtomicUsize::new(0),
             cancelled: AtomicBool::new(false),
@@ -393,6 +476,8 @@ enum EvictionCase {
     InstalledCompanion,
     InstalledCompanionIdentityOnly,
     RefilledCache,
+    RefilledOnce,
+    RepeatedRefill,
     MalformedCache,
     RetiredPrimary,
     ConnectionChanged,
@@ -413,6 +498,8 @@ async fn check_hosted_rotation_eviction(case: EvictionCase) {
         delete_enabled: AtomicBool::new(false),
         read_error: AtomicBool::new(false),
         delete_hook: std::sync::Mutex::new(None),
+        set_hook: std::sync::Mutex::new(None),
+        retain_deleted: AtomicBool::new(false),
         taken: AtomicBool::new(false),
         sets: AtomicUsize::new(0),
         cancelled: AtomicBool::new(false),
@@ -543,6 +630,33 @@ async fn check_hosted_rotation_eviction(case: EvictionCase) {
                 }
                 EvictionCase::RefilledCache => {
                     assert!(client.load_device_record(&hook_user.user).await.is_some());
+                    assert!(
+                        client
+                            .device_registry_cache
+                            .get(&hook_user.user)
+                            .await
+                            .is_none()
+                    );
+                }
+                EvictionCase::RefilledOnce | EvictionCase::RepeatedRefill => {
+                    let record = client
+                        .persistence_manager
+                        .backend()
+                        .get_devices(&hook_user.user)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    client
+                        .device_registry_cache
+                        .raw_insert_for_tests(record.user.clone(), Arc::new(record))
+                        .await;
+                    if matches!(case, EvictionCase::RepeatedRefill) {
+                        hook_store
+                            .upgrade()
+                            .unwrap()
+                            .retain_deleted
+                            .store(true, std::sync::atomic::Ordering::Release);
+                    }
                 }
                 EvictionCase::MalformedCache => {
                     hook_store.upgrade().unwrap().rows.lock().unwrap().insert(
@@ -634,7 +748,7 @@ async fn check_hosted_rotation_eviction(case: EvictionCase) {
             .unwrap();
         let rejected = matches!(
             case,
-            EvictionCase::RefilledCache
+            EvictionCase::RepeatedRefill
                 | EvictionCase::MalformedCache
                 | EvictionCase::RetiredPrimary
                 | EvictionCase::ConnectionChanged
@@ -709,46 +823,67 @@ async fn check_hosted_rotation_eviction(case: EvictionCase) {
     client.signal_shutdown_sync();
 }
 
+/// Deleting a cache row must release account locks before a modifier awaits mapping work.
 #[tokio::test]
 async fn adv_eviction_delete_callback_can_await_mapping_from_device_modifier() {
     check_hosted_rotation_eviction(EvictionCase::MappingFromModifier).await;
 }
+/// Reentry must discover sessions installed under the old primary while locks were released.
 #[tokio::test]
 async fn adv_eviction_retires_companions_installed_during_delete_callback() {
     check_hosted_rotation_eviction(EvictionCase::InstalledCompanion).await;
 }
+/// Cleanup must enumerate trusted identities even when their companion session is already gone.
 #[tokio::test]
 async fn adv_eviction_retires_identity_only_companions_created_during_callback() {
     check_hosted_rotation_eviction(EvictionCase::InstalledCompanionIdentityOnly).await;
 }
+/// A read during eviction must not reject an otherwise valid primary rotation.
 #[tokio::test]
-async fn adv_eviction_rejects_a_cache_refill_without_a_topology_change() {
+async fn adv_eviction_allows_a_durable_read_during_the_delete_callback() {
     check_hosted_rotation_eviction(EvictionCase::RefilledCache).await;
 }
+/// A cache-only refill may be evicted again after continuity is revalidated.
+#[tokio::test]
+async fn adv_eviction_retries_a_cache_refill_without_a_topology_change() {
+    check_hosted_rotation_eviction(EvictionCase::RefilledOnce).await;
+}
+/// Persistent cache refills must terminate without publishing trust or destroying old sessions.
+#[tokio::test]
+async fn adv_eviction_bounds_retries_before_trust_or_session_cleanup() {
+    check_hosted_rotation_eviction(EvictionCase::RepeatedRefill).await;
+}
+/// Malformed host bytes cannot establish that the old registry row was removed.
 #[tokio::test]
 async fn adv_eviction_malformed_cache_data_does_not_prove_absence() {
     check_hosted_rotation_eviction(EvictionCase::MalformedCache).await;
 }
+/// A callback cannot retire a primary and then publish the response authenticated before retirement.
 #[tokio::test]
 async fn adv_eviction_rejects_primary_retirement_during_callback() {
     check_hosted_rotation_eviction(EvictionCase::RetiredPrimary).await;
 }
+/// Reacquiring maintenance must preserve the original connection generation.
 #[tokio::test]
 async fn adv_eviction_rejects_connection_replacement_during_callback() {
     check_hosted_rotation_eviction(EvictionCase::ConnectionChanged).await;
 }
+/// Failed host deletion must remain before every destructive identity replacement step.
 #[tokio::test]
 async fn adv_eviction_delete_error_preserves_trust_and_sessions() {
     check_hosted_rotation_eviction(EvictionCase::DeleteError).await;
 }
+/// A failed verification read cannot be treated as confirmed cache absence.
 #[tokio::test]
 async fn adv_eviction_read_error_does_not_prove_cache_absence() {
     check_hosted_rotation_eviction(EvictionCase::ReadError).await;
 }
+/// The owned publisher must complete eviction and publication after its public waiter is cancelled.
 #[tokio::test]
 async fn adv_eviction_survives_caller_cancellation() {
     check_hosted_rotation_eviction(EvictionCase::CancelledCaller).await;
 }
+/// Retain L1-only device history through eviction so its old companion state is also retired.
 #[tokio::test]
 async fn adv_eviction_retires_companions_when_cache_is_ahead_of_database() {
     check_hosted_rotation_eviction(EvictionCase::CacheAheadOfDatabase).await;
@@ -759,6 +894,7 @@ struct HostedPublicationEventProbe {
     observations: std::sync::Mutex<Vec<[bool; 3]>>,
 }
 
+/// Waiting for device ownership must not renew the publication snapshot after a mapping ACK.
 #[tokio::test]
 async fn adv_review_round8_busy_after_mapping_ack_keeps_the_original_generation() {
     use crate::store::release::tests::ProbeBackend;
@@ -877,6 +1013,7 @@ fn hosted_epoch_response(user: &Jid) -> DeviceListResponse {
     response
 }
 
+/// Failure to capture the request epoch must fail before hosted trust publication.
 #[tokio::test]
 async fn adv_review_round7_unavailable_request_epoch_cannot_publish_a_hosted_list() {
     for available in [false, true] {
@@ -916,6 +1053,7 @@ async fn adv_review_round7_unavailable_request_epoch_cannot_publish_a_hosted_lis
     }
 }
 
+/// An invalid hosted member must not suppress independently authenticated group members.
 #[tokio::test]
 async fn adv_review_round7_retired_hosted_epoch_does_not_reject_a_valid_group_peer() {
     for retire in [false, true] {
@@ -984,6 +1122,7 @@ async fn adv_review_round7_retired_hosted_epoch_does_not_reject_a_valid_group_pe
     }
 }
 
+/// Recovering one account must preserve the original authentication epoch of its batch peers.
 #[tokio::test]
 async fn adv_review_round7_recovery_cannot_refresh_another_hosted_rows_epoch() {
     let (client, transport) = create_iq_test_client().await;
@@ -1399,6 +1538,7 @@ async fn adv_review_round7_hosted_publication_cannot_deadlock_an_async_device_mo
     }
 }
 
+/// A cache miss must wait for the writer ACK before reading and promoting durable topology.
 #[tokio::test]
 async fn adv_review_round6_registry_read_waits_for_the_cache_first_writer_ack() {
     use crate::store::release::tests::ProbeBackend;
@@ -1491,8 +1631,9 @@ async fn adv_review_round6_registry_read_waits_for_the_cache_first_writer_ack() 
     client.signal_shutdown_sync();
 }
 
+/// Caller cancellation must not let delayed host writes restore rows after invalidation.
 #[tokio::test]
-async fn adv_review_round6_cancelled_registry_fill_retains_custom_store_ack() {
+async fn adv_review_round6_cancelled_registry_publication_retains_custom_store_ack() {
     use crate::cache_config::{CacheConfig, CacheStores};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1572,9 +1713,7 @@ async fn adv_review_round6_cancelled_registry_fill_retains_custom_store_ack() {
         }
     }
 
-    for (fail_after_commit, publication) in
-        [(false, false), (true, false), (false, true), (true, true)]
-    {
+    for fail_after_commit in [false, true] {
         let (release, gate) = async_channel::unbounded();
         let (entered, arrived) = async_channel::unbounded();
         let store = Arc::new(DelayedStore {
@@ -1595,9 +1734,7 @@ async fn adv_review_round6_cancelled_registry_fill_retains_custom_store_ack() {
         )
         .await;
         let peer = Jid::pn("12025550192");
-        if publication {
-            crate::test_utils::seed_adv_primary(&client, &peer).await;
-        }
+        crate::test_utils::seed_adv_primary(&client, &peer).await;
         let backend = client.persistence_manager.backend();
         backend
             .update_device_list(DeviceListRecord {
@@ -1613,17 +1750,10 @@ async fn adv_review_round6_cancelled_registry_fill_retains_custom_store_ack() {
             let client = client.clone();
             let peer = peer.clone();
             tokio::spawn(async move {
-                if publication {
-                    client
-                        .process_device_list_response(
-                            &migration_response(&peer),
-                            Freshness::Refresh,
-                        )
-                        .await
-                        .unwrap();
-                } else {
-                    assert!(client.load_device_record_for_jid(&peer).await.is_some());
-                }
+                client
+                    .process_device_list_response(&migration_response(&peer), Freshness::Refresh)
+                    .await
+                    .unwrap();
             })
         };
         tokio::time::timeout(Duration::from_secs(5), arrived.recv())
@@ -1655,6 +1785,7 @@ async fn adv_review_round6_cancelled_registry_fill_retains_custom_store_ack() {
     }
 }
 
+/// A queued fallback must finish before invalidation deletes the durable and cached row.
 #[tokio::test]
 async fn adv_review_round6_queued_registry_fill_cannot_restore_a_deleted_row() {
     use crate::store::release::tests::ProbeBackend;
@@ -3177,6 +3308,7 @@ async fn assert_migration_publication(client: &Client, user: &Jid, devices: &[Ji
     assert_eq!(ids, [0, 7]);
 }
 
+/// Prepared trust is usable only while every current primary namespace still agrees.
 #[tokio::test]
 async fn prepared_primary_rejects_missing_changed_and_conflicting_identity() {
     use crate::lid_pn_cache::LearningSource;
@@ -5118,6 +5250,7 @@ async fn adv_review_round4_cold_durable_owner_cannot_be_rebound_by_adv() {
     }
 }
 
+/// Retirement during recovery preflight must reject mappings before their first publication.
 #[tokio::test]
 async fn adv_review_round4_retirement_during_preflight_cannot_publish_mapping() {
     use crate::test_utils::create_iq_test_client_with_backend;
@@ -6881,6 +7014,7 @@ async fn adv_review_round3_alias_reset_retires_the_acknowledged_bootstrap() {
     }
 }
 
+/// Moving a verified same-key account must preserve authenticated companion sessions.
 #[tokio::test]
 async fn adv_review_round2_known_same_key_migration_preserves_companion_authentication() {
     for case in ["same", "conflict", "unknown"] {
@@ -7095,6 +7229,7 @@ async fn adv_review_empty_projection_does_not_publish_its_mapping() {
     }
 }
 
+/// Registry IO must not expose a staged mapping before ownership admission succeeds.
 #[tokio::test]
 async fn adv_review_round2_registry_io_does_not_publish_unadmitted_mapping() {
     use crate::store::release::tests::ProbeBackend;

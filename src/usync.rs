@@ -284,6 +284,7 @@ impl<'a> DeviceListOwnershipProof<'a> {
 }
 
 impl AdvIdentityReactions {
+    /// Deliver host reactions only after publication has released its guards.
     fn dispatch(self, client: &Client) {
         for DeferredAdvIdentityChange {
             user,
@@ -1427,6 +1428,8 @@ impl Client {
     /// Hold mapping and topology guards through CAS, cleanup and publication.
     /// Share one boxed state machine between ordinary and owned hosted callers.
     #[inline(never)]
+    /// Plan under account locks, evict outside them, then revalidate and commit
+    /// in the owned worker so cancellation cannot abandon a host write.
     fn apply_device_list_response_inner<'a>(
         self: &'a std::sync::Arc<Self>,
         response: &'a DeviceListResponse,
@@ -1492,8 +1495,8 @@ impl Client {
             }
             let mut registry_guard = self.device_topology.lock_registry().await;
             if let Some(started) = identities.publication_started {
-                // Reads below can initiate a host cache write. From this point
-                // retain all ordering through every ACK despite cancellation.
+                // Mapping and registry publication can initiate host writes.
+                // Retain ordering through every ACK despite cancellation.
                 started.store(true, std::sync::atomic::Ordering::Release);
             }
             if let Some(generation) = topology_generation
@@ -1608,83 +1611,104 @@ impl Client {
                 for user in &users {
                     aliases.push(self.device_list_identity_alias(user).await);
                 }
-                // Invalidate memos even when the selected L1 row was ahead of
-                // durable storage. Keep that row in the plan for later cleanup.
-                self.device_topology
-                    .record_registry(&registry_guard, eviction_keys.iter().map(String::as_str));
-                let generation = self.device_topology.current();
-                drop(registry_guard);
-                drop(mapping_guard);
-                drop(session_guards);
-                drop(owned_maintenance.take());
-                let mut eviction_result = Ok(());
-                for key in &eviction_keys {
-                    if let Err(error) = self
-                        .device_registry_cache
-                        .evict_before_identity_update(key)
-                        .await
-                    {
-                        eviction_result = Err(error);
-                        break;
+                // A durable fallback can refill the local cache while the host
+                // delete callback runs. Retry only after all continuity checks
+                // pass, with a fixed bound so a persistently refilling store
+                // cannot keep publication alive indefinitely.
+                for eviction_attempt in 0..3 {
+                    // Invalidate memos even when the selected L1 row was ahead of
+                    // durable storage. Keep that row in the plan for later cleanup.
+                    self.device_topology
+                        .record_registry(&registry_guard, eviction_keys.iter().map(String::as_str));
+                    let generation = self.device_topology.current();
+                    drop(registry_guard);
+                    drop(mapping_guard);
+                    drop(session_guards);
+                    drop(owned_maintenance.take());
+                    let mut eviction_result = Ok(());
+                    for key in &eviction_keys {
+                        if let Err(error) = self
+                            .device_registry_cache
+                            .evict_before_identity_update(key)
+                            .await
+                        {
+                            eviction_result = Err(error);
+                            break;
+                        }
                     }
-                }
-                let eviction_guard = self.device_topology.lock_registry().await;
-                let unchanged_during_eviction = self
-                    .device_topology
-                    .unchanged_for(generation, &device_response_users(response));
-                // Record completion even on deletion or maintenance failure.
-                // A memo created during the unlocked callback must recompute.
-                self.device_topology
-                    .record_registry(&eviction_guard, eviction_keys.iter().map(String::as_str));
-                let generation = self.device_topology.current();
-                drop(eviction_guard);
-                eviction_result?;
-                owned_maintenance = Some(self.begin_signal_maintenance().await?);
-                (session_guards, mapping_guard) = self
-                    .device_list_identity_guards_with_recovery(&users, None, Some(&aliases))
-                    .await?;
-                registry_guard = self.device_topology.lock_registry().await;
-                let mut unchanged = owned_maintenance
-                    .as_ref()
-                    .is_some_and(|scope| scope.generation() == maintenance_generation)
-                    && unchanged_during_eviction
-                    && self
+                    let eviction_guard = self.device_topology.lock_registry().await;
+                    let unchanged_during_eviction = self
                         .device_topology
                         .unchanged_for(generation, &device_response_users(response));
-                for (user, alias) in users.iter().zip(&aliases) {
-                    unchanged &= self.device_list_identity_alias(user).await == *alias;
-                }
-                for key in &eviction_keys {
-                    unchanged &= self
-                        .device_registry_cache
-                        .is_absent_after_eviction(key)
+                    // Record completion even on deletion or maintenance failure.
+                    // A memo created during the unlocked callback must recompute.
+                    self.device_topology
+                        .record_registry(&eviction_guard, eviction_keys.iter().map(String::as_str));
+                    let generation = self.device_topology.current();
+                    drop(eviction_guard);
+                    eviction_result?;
+                    owned_maintenance = Some(self.begin_signal_maintenance().await?);
+                    (session_guards, mapping_guard) = self
+                        .device_list_identity_guards_with_recovery(&users, None, Some(&aliases))
                         .await?;
-                }
-                for update in &plan.identity_updates {
-                    for (address, expected) in &update.identities {
-                        unchanged &= self
-                            .signal_cache
-                            .get_identity(address, self.persistence_manager.backend_ref())
+                    registry_guard = self.device_topology.lock_registry().await;
+                    let mut unchanged = owned_maintenance
+                        .as_ref()
+                        .is_some_and(|scope| scope.generation() == maintenance_generation)
+                        && unchanged_during_eviction
+                        && self
+                            .device_topology
+                            .unchanged_for(generation, &device_response_users(response));
+                    for (user, alias) in users.iter().zip(&aliases) {
+                        unchanged &= self.device_list_identity_alias(user).await == *alias;
+                    }
+                    for update in &plan.identity_updates {
+                        for (address, expected) in &update.identities {
+                            unchanged &= self
+                                .signal_cache
+                                .get_identity(address, self.persistence_manager.backend_ref())
+                                .await?
+                                .as_deref()
+                                == expected.as_ref().map(|key| key.as_slice());
+                        }
+                    }
+                    for (user, prepared) in identities.prepared {
+                        if let PreparedAccountIdentity::Trusted(expected) = prepared {
+                            unchanged &=
+                                self.device_list_account_identity(user).await? == Some(*expected);
+                        }
+                    }
+                    if !unchanged {
+                        if mode == DeviceListApplyMode::StrictRefresh {
+                            return Ok(None);
+                        }
+                        anyhow::bail!("device-list state changed during ADV cache eviction");
+                    }
+                    if let Some(recovered) = recovered_identity {
+                        self.validate_adv_recovery_state(recovered, &mapping_guard)
+                            .await?;
+                    }
+                    let mut absent = true;
+                    for key in &eviction_keys {
+                        if !self
+                            .device_registry_cache
+                            .is_absent_after_eviction(key)
                             .await?
-                            .as_deref()
-                            == expected.as_ref().map(|key| key.as_slice());
+                        {
+                            anyhow::ensure!(
+                                self.device_registry_cache.get(key).await.is_some(),
+                                "unreadable device registry entry after ADV cache eviction"
+                            );
+                            absent = false;
+                        }
                     }
-                }
-                for (user, prepared) in identities.prepared {
-                    if let PreparedAccountIdentity::Trusted(expected) = prepared {
-                        unchanged &=
-                            self.device_list_account_identity(user).await? == Some(*expected);
+                    if absent {
+                        break;
                     }
-                }
-                if !unchanged {
-                    if mode == DeviceListApplyMode::StrictRefresh {
-                        return Ok(None);
-                    }
-                    anyhow::bail!("device-list state changed during ADV cache eviction");
-                }
-                if let Some(recovered) = recovered_identity {
-                    self.validate_adv_recovery_state(recovered, &mapping_guard)
-                        .await?;
+                    anyhow::ensure!(
+                        eviction_attempt < 2,
+                        "device registry repeatedly refilled during ADV cache eviction"
+                    );
                 }
             }
             let maintenance = owned_maintenance.as_ref().or(borrowed_maintenance);
@@ -1741,6 +1765,8 @@ impl Client {
         )
     }
 
+    /// Check original primary continuity and current cached/durable ownership
+    /// after an unlocked callback, without replaying pre-learning alias checks.
     async fn validate_adv_recovery_state(
         &self,
         recovered: &RecoveredAccountIdentity,
@@ -2917,6 +2943,8 @@ impl Client {
         })
     }
 
+    /// Apply the accepted plan only after nonblocking device ownership admission;
+    /// eviction callbacks and planning finish before new trust is stored.
     async fn commit_device_list_plan(
         &self,
         plan: DeviceListPlan<'_>,

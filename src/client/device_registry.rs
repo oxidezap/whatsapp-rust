@@ -24,7 +24,8 @@ enum RegistryReadKind {
 impl Client {
     /// Order the durable read itself with publication, not only its cache fill:
     /// a cache-first writer can publish topology before its durable write ACK.
-    /// Borrowed guards belong to an owned device-list publication worker.
+    /// DB fallback fills only the in-process cache, so this read cannot start a
+    /// host write that outlives cancellation or calls back into another read.
     async fn read_device_registry_rows(
         &self,
         keys: &[&str],
@@ -39,30 +40,13 @@ impl Client {
                 .read_device_registry_rows_guarded(keys, kind, guard, true)
                 .await;
         }
-        let client = self
-            .self_weak
-            .get()
-            .and_then(|weak| weak.upgrade())
-            .ok_or_else(|| anyhow::anyhow!("client ownership unavailable during registry read"))?;
-        let keys: Vec<Arc<str>> = keys.iter().map(|key| Arc::from(*key)).collect();
-        let (send, receive) = futures::channel::oneshot::channel();
-        self.runtime.spawn_detached(Box::pin(async move {
-            let guard = client.device_topology.lock_registry().await;
-            let keys: Vec<_> = keys.iter().map(AsRef::as_ref).collect();
-            let result = client
-                .read_device_registry_rows_guarded(&keys, kind, &guard, true)
-                .await;
-            if let Err(Err(error)) = send.send(result) {
-                warn!("Owned registry cache-fill failed after caller cancellation: {error:#}");
-            }
-        }));
-        // Cancellation drops only this waiter. A host cache write may already
-        // be in flight, so its worker retains ordering until the store ACK.
-        receive
+        let guard = self.device_topology.lock_registry().await;
+        self.read_device_registry_rows_guarded(keys, kind, &guard, true)
             .await
-            .map_err(|_| anyhow::anyhow!("registry cache-fill worker stopped"))?
     }
 
+    /// Select durable rows under Registry and optionally promote the local tier.
+    /// Never call a host cache's set callback from a read under this guard.
     async fn read_device_registry_rows_guarded(
         &self,
         keys: &[&str],

@@ -237,19 +237,22 @@ impl DeviceRegistryCache {
         self.cache.try_invalidate(key).await
     }
 
+    /// Require confirmed raw absence, propagating host failures and counting
+    /// malformed stored bytes as present.
     pub(crate) async fn is_absent_after_eviction(&self, key: &str) -> anyhow::Result<bool> {
         Ok(!self.cache.contains_key_checked(key).await?)
     }
 
-    /// Cache-fill from the DB row the fallback path would have returned: the
-    /// answer is unchanged, so no topology change is recorded.
+    /// Fill the local tier from the durable row without changing topology.
+    /// Custom stores receive authoritative writes only: invoking their set
+    /// callback here can reenter an uncached read and wait on our Registry guard.
     pub(crate) async fn promote_guarded(
         &self,
         _guard: &DeviceRegistryMutationGuard<'_>,
         key: Arc<str>,
         record: Arc<wacore::store::traits::DeviceListRecord>,
     ) {
-        self.cache.insert(key, record).await;
+        self.cache.insert_local(key, record).await;
     }
 
     /// Preserve the original fixture seed, which bypasses publication admission.

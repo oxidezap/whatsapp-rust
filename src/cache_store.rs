@@ -66,6 +66,15 @@ where
             inner: Inner::Local(cache),
         }
     }
+
+    /// Populate the in-process tier without invoking host code. Durable registry
+    /// reads use this while ordered with publication; custom stores are populated
+    /// only by authoritative writes, whose workers retain their ACK ownership.
+    pub(crate) async fn insert_local(&self, key: K, value: V) {
+        if let Inner::Local(cache) = &self.inner {
+            cache.insert(key, value).await;
+        }
+    }
 }
 
 impl<K, V> TypedCache<K, V>
