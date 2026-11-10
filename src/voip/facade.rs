@@ -1589,6 +1589,9 @@ async fn send_answer_node(
     node: wacore_binary::Node,
 ) -> Result<(), CallError> {
     registration.ensure_current()?;
+    let accepted = node
+        .get_optional_child(wacore::types::call::CallActionTag::Accept.as_str())
+        .is_some();
     // A failed transport write is delivery-ambiguous. Arm before the await so both an error and
     // cancellation explicitly end this generation; a peer-ended generation fails the guarded claim.
     teardown.arm();
@@ -1597,6 +1600,18 @@ async fn send_answer_node(
         return Err(error);
     }
     registration.ensure_current()?;
+    if accepted
+        && !registration
+            .registry
+            .is_group_call_if_current(&registration.call_id, registration.generation)
+    {
+        // Signaling acceptance precedes media readiness, which advances the call to Active.
+        let _ = registration.registry.transition_if_current(
+            &registration.call_id,
+            registration.generation,
+            CallPhase::Connecting,
+        );
+    }
     Ok(())
 }
 
@@ -7221,6 +7236,10 @@ mod tests {
                     .is_err(),
                 "accept must not be emitted while the preaccept transport write is blocked"
             );
+            assert_eq!(
+                client.call_registry().phase(incoming.action.call_id()),
+                Some(CallPhase::Ringing),
+            );
 
             release_tx.send(()).await.expect("release first send");
             let accept = tokio::time::timeout(Duration::from_secs(2), accept_waiter)
@@ -7237,6 +7256,10 @@ mod tests {
 
         let (result, ()) = tokio::join!(send, observe);
         result.expect("answer signaling");
+        assert_eq!(
+            client.call_registry().phase(incoming.action.call_id()),
+            Some(CallPhase::Connecting),
+        );
         teardown.disarm();
     }
 

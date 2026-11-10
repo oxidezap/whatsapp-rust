@@ -349,7 +349,7 @@ impl Client {
     pub(crate) fn enter_drain_mode_for_tests(&self) {
         self.offline_sync_completed.store(false, Ordering::Release);
         self.offline_sync_finish_started.store(0, Ordering::Release);
-        self.swap_message_semaphore(1);
+        self.swap_to_drain_semaphore();
         self.inbound_commit_batch.reset();
     }
 
@@ -368,7 +368,7 @@ impl Client {
                 .saturating_add(1),
             Ordering::Release,
         );
-        self.swap_message_semaphore(64);
+        self.swap_to_live_semaphore();
         self.inbound_commit_batch.deactivate();
     }
 }
@@ -1145,53 +1145,82 @@ impl Client {
         InboundCommitState::Deferred(ticket)
     }
 
-    /// Size/byte-cap check, run at the end of stanza processing while the
-    /// global processing permit is still held (so the Signal flush inside the
-    /// commit cannot interleave with a half-processed stanza).
-    pub(crate) async fn maybe_flush_inbound_commits(self: &Arc<Self>) {
-        let over = {
-            let state = self.inbound_commit_batch.lock();
-            state.entries.len() >= MAX_BATCH_MESSAGES || state.bytes >= MAX_BATCH_BYTES
-        };
-        if over {
-            self.flush_inbound_commits_while_processing().await;
-        }
+    /// Whether the accumulated drain batch hit a size/byte trigger. Read-only
+    /// split from the flush so a stanza worker can drop its processing permit
+    /// only when the flush is actually needed.
+    pub(crate) fn inbound_commits_over_capacity(&self) -> bool {
+        let state = self.inbound_commit_batch.lock();
+        state.entries.len() >= MAX_BATCH_MESSAGES || state.bytes >= MAX_BATCH_BYTES
     }
 
-    // The receive caller already owns the processing permit. Capacity pressure
-    // must flush queued predecessors without reacquiring that same permit or
-    // advancing the incoming ciphertext before admission succeeds.
-    pub(crate) async fn flush_inbound_commits_while_processing(self: &Arc<Self>) -> bool {
+    /// Commit the accumulated drain batch under a freshly acquired quiescence,
+    /// for callers that hold no processing permit (a stanza worker that just
+    /// released its own, or any out-of-band site).
+    pub(crate) async fn flush_inbound_commits_quiesced(
+        self: &Arc<Self>,
+        expected_generation: Option<u64>,
+    ) -> bool {
+        let _permits = self.acquire_message_quiescence().await;
+        self.commit_inbound_batch_quiesced(expected_generation)
+            .await
+    }
+
+    /// Commit the accumulated drain batch while the caller ALREADY HOLDS the
+    /// drain quiescence — every drain permit, so no stanza is mid-decrypt
+    /// while the commit's Signal flush persists the cache. Stanza workers get
+    /// here via `with_stanza_permit_suspended`: they release their own permit
+    /// first (re-acquiring afterwards); their already-enqueued entry rides
+    /// this batch, so the release does not expose uncommitted advances.
+    ///
+    /// `expected_generation` stands the flush down if a reconnect reset the
+    /// batcher while the caller waited for quiescence: the new connection
+    /// owns the batch then, and taking it here would commit entries ahead of
+    /// their own drain's finisher.
+    pub(crate) async fn commit_inbound_batch_quiesced(
+        self: &Arc<Self>,
+        expected_generation: Option<u64>,
+    ) -> bool {
+        if let Some(generation) = expected_generation
+            && self.connection_generation.load(Ordering::Acquire) != generation
+        {
+            return true;
+        }
         let PendingInboundBatch {
             entries,
             commit_ticket,
         } = self.inbound_commit_batch.take();
-        let durable = self
-            .commit_pending_batch(entries.into(), BatchOrigin::OfflineDrain, commit_ticket)
-            .await;
+        let durable = if entries.is_empty() {
+            // An empty deferred tail may still contain dirty SKDM state. Its
+            // receipts must wait for persistence, just as in the drain finisher.
+            self.drain_signal_flush_reporting().await
+        } else {
+            self.commit_pending_batch(entries.into(), BatchOrigin::OfflineDrain, commit_ticket)
+                .await
+        };
         if durable && self.inbound_commit_batch.live_transition_pending() {
             self.complete_deferred_live_transition();
         }
         durable
     }
 
-    /// Flush after acquiring a global processing permit, so no stanza is
+    /// Flush after acquiring the full drain quiescence, so no stanza is
     /// mid-decrypt when the Signal cache is flushed: a crash could otherwise
     /// persist a ratchet advance for a message no batch has committed, turning
     /// its redelivery into an unrecoverable duplicate. During the drain the
-    /// semaphore holds a single permit, so this fully serializes with stanza
-    /// processing. An empty batch is NOT a no-op: it still flushes the Signal
+    /// quiescence takes every processing permit, so this fully serializes with
+    /// stanza processing. An empty batch is NOT a no-op: it still flushes the Signal
     /// cache under the permit (idempotent when the cache is already clean), so
     /// an out-of-band batch-safe caller that raced the drain finisher still
     /// gets its advance persisted rather than silently skipped.
     ///
     /// With `deactivate`, this is the end-of-drain transition: commit the tail
-    /// batch and switch the batcher to live mode under the same permit hold.
-    /// That is what makes the transition raceless — no stanza is mid-flight
-    /// when the mode flips (a stanza's enqueue and its stanza-end flush always
-    /// agree), and every stanza still queued behind this permit commits as
-    /// Live strictly AFTER the tail batch, preserving arrival order across the
-    /// boundary. Runs before the semaphore widens to the live permit count.
+    /// batch and switch the batcher to live mode under the same quiescence
+    /// hold. That is what makes the transition raceless — no stanza is
+    /// mid-flight when the mode flips (a stanza's enqueue and its stanza-end
+    /// flush always agree), and every stanza still queued behind this
+    /// quiescence commits as Live strictly AFTER the tail batch, preserving
+    /// arrival order across the boundary. Runs before the semaphore widens to
+    /// the live permit count.
     ///
     /// Returns whether the drain state is durable (see
     /// [`commit_inbound_batch`](Self::commit_inbound_batch)); callers gate the
@@ -1202,7 +1231,7 @@ impl Client {
         expected_epoch: Option<u64>,
         expected_generation: Option<u64>,
     ) -> bool {
-        let _permit = self.acquire_message_processing_permit().await;
+        let _permits = self.acquire_message_quiescence().await;
         if let Some(generation) = expected_generation
             && self.connection_generation.load(Ordering::Acquire) != generation
         {
@@ -1267,7 +1296,7 @@ impl Client {
                 self.inbound_commit_batch.defer_live_transition();
                 self.arm_deferred_transition_retry();
                 log::warn!(
-                    "End-of-drain commit failed; staying in drain mode (single permit) until a durable flush completes the live transition"
+                    "End-of-drain commit failed; staying in drain mode until a durable flush completes the live transition"
                 );
             }
         } else if durable && was_draining && self.inbound_commit_batch.live_transition_pending() {
@@ -1278,11 +1307,11 @@ impl Client {
 
     /// Finish a drain→live transition that a failed end-of-drain tail commit
     /// deferred: the finisher already published completion but left the
-    /// batcher in drain mode AND the semaphore at one permit — the flush
+    /// batcher in drain mode AND the semaphore on the drain pool — the flush
     /// invariant (no stanza mid-decrypt while the whole Signal cache is
-    /// persisted) only holds while stanzas are serialized. Called with the
-    /// permit held and a durable commit just done, so the flip is as raceless
-    /// as the normal end-of-drain one.
+    /// persisted) only holds under full drain quiescence. Called with all
+    /// drain permits held and a durable commit just done, so the flip is as
+    /// raceless as the normal end-of-drain one.
     pub(crate) fn complete_deferred_live_transition(&self) {
         // Receipts buffered during the deferred window (SKDM-only stanzas
         // keep buffering while the batcher is active) are safe to send now:
@@ -1290,7 +1319,7 @@ impl Client {
         // Signal state.
         self.flush_offline_receipts();
         self.inbound_commit_batch.deactivate();
-        self.swap_message_semaphore(64);
+        self.swap_to_live_semaphore();
         // Key-share jobs may have observed the earlier failed transition.
         self.offline_sync_notifier.notify(usize::MAX);
         log::info!("Deferred drain-to-live transition completed after a durable flush");
@@ -1347,7 +1376,7 @@ impl Client {
         limit: std::time::Duration,
     ) -> DrainOutcome {
         let settle = async {
-            let _permit = self.acquire_message_processing_permit().await;
+            let _permits = self.acquire_message_quiescence().await;
             let batch = self.inbound_commit_batch.take();
             let durable = if batch.is_empty() {
                 true
@@ -1481,12 +1510,13 @@ impl Client {
         }
     }
 
-    /// Commit any accumulated entries while the caller ALREADY HOLDS the
-    /// processing permit (mid-stanza recovery paths like UntrustedIdentity),
-    /// so a full-cache Signal flush that follows cannot persist ratchet
-    /// advances for entries without a durable buffered row. Returns whether
-    /// that follow-up flush is safe: on a failed commit the entries are back
-    /// in the batcher (unbuffered), and the caller must skip its flush.
+    /// Commit any accumulated entries while the caller ALREADY HOLDS the full
+    /// drain quiescence (mid-stanza recovery paths like UntrustedIdentity,
+    /// via `with_stanza_permit_suspended`), so a full-cache Signal flush that
+    /// follows cannot persist ratchet advances for entries without a durable
+    /// buffered row. Returns whether that follow-up flush is safe: on a
+    /// failed commit the entries are back in the batcher (unbuffered), and
+    /// the caller must skip its flush.
     #[must_use = "a false result means the entries are back in the batcher and the follow-up Signal flush must be skipped"]
     pub(crate) async fn commit_inbound_batch_holding_permit(self: &Arc<Self>) -> bool {
         let batch = self.inbound_commit_batch.take();
@@ -1494,12 +1524,12 @@ impl Client {
             return true;
         }
         // Deliberately NOT completing a pending deferred transition here even
-        // on a durable commit: the caller holds a permit from the old
-        // single-permit semaphore and follows up with a raw whole-cache
-        // flush, which is only safe while that permit excludes every other
-        // stanza — widening to 64 permits first would let new workers be
-        // mid-decrypt under it. The deferred-retry loop completes the
-        // transition moments later, outside any raw-flush window.
+        // on a durable commit: the caller holds the full drain quiescence and
+        // follows up with a raw whole-cache flush, which is only safe while
+        // every other stanza is excluded — widening to the live pool first
+        // would let new workers be mid-decrypt under it. The deferred-retry
+        // loop completes the transition moments later, outside any raw-flush
+        // window.
         self.commit_pending_batch(
             batch.entries.into(),
             BatchOrigin::OfflineDrain,
@@ -3771,7 +3801,9 @@ mod tests {
                 .commit_or_batch_inbound(item(&format!("S{i}")), false)
                 .await;
         }
-        client.maybe_flush_inbound_commits().await;
+        if client.inbound_commit_batch.is_active() && client.inbound_commits_over_capacity() {
+            client.flush_inbound_commits_quiesced(None).await;
+        }
 
         let batches = hook.batches.lock().expect("hook lock").clone();
         assert_eq!(batches.len(), 1, "one commit for the full batch");
@@ -4149,6 +4181,41 @@ mod tests {
                 .await,
             "with the flush succeeding the empty commit reports durable"
         );
+    }
+
+    /// A failed SKDM-only tail must keep receipts and drain mode through maintenance retries.
+    #[tokio::test]
+    async fn empty_deferred_maintenance_waits_for_signal_durability() {
+        let client = create_test_client_with_failing_http("empty_deferred_maintenance").await;
+        client.enter_drain_mode_for_tests();
+        assert!(client.try_buffer_offline_receipt(&item("SKDM").info));
+        client
+            .inbound_commit_batch
+            .fail_flushes
+            .store(true, Ordering::Release);
+        let generation = client.connection_generation.load(Ordering::Acquire);
+        assert!(!client.finish_inbound_commit_drain(generation).await);
+        assert!(client.inbound_commit_batch.live_transition_pending());
+        assert!(
+            !client
+                .flush_inbound_commits_quiesced(Some(generation))
+                .await
+        );
+        assert!(client.inbound_commit_batch.live_transition_pending());
+        assert!(client.inbound_commit_batch.is_active());
+        assert_eq!(client.offline_receipt_buffer.lock().unwrap().len(), 1);
+        client
+            .inbound_commit_batch
+            .fail_flushes
+            .store(false, Ordering::Release);
+        assert!(
+            client
+                .flush_inbound_commits_quiesced(Some(generation))
+                .await
+        );
+        assert!(!client.inbound_commit_batch.live_transition_pending());
+        assert!(!client.inbound_commit_batch.is_active());
+        assert!(client.offline_receipt_buffer.lock().unwrap().is_empty());
     }
 
     // WA Web createSnapshot flushes aggregate offline receipts per snapshot;

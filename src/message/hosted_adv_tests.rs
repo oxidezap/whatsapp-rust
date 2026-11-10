@@ -408,6 +408,8 @@ async fn hosted_lid_participant_send_and_receive_use_one_account_before_device_l
         .validate_incoming_companion_identity(&hosted, Some(&certificate), &identity)
         .await
         .unwrap();
+    let generation = client.connection_generation.load(Ordering::Acquire);
+    let mut processing_permit = Some(client.acquire_message_processing_permit().await);
     let fence = client
         .lock_incoming_companion_account(&hosted, Some(&certificate), &payloads)
         .await
@@ -484,10 +486,13 @@ async fn hosted_lid_participant_send_and_receive_use_one_account_before_device_l
             crate::types::events::DecryptFailMode::Show,
             None,
             (raw_pending::StanzaOrigin::new(), fence),
+            &mut processing_permit,
+            generation,
         ),
     )
     .await
     .unwrap();
+    drop(processing_permit);
     tokio::time::timeout(Duration::from_secs(5), send)
         .await
         .unwrap()

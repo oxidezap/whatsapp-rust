@@ -29,7 +29,7 @@ pub(crate) const DEFAULT_WANTED_PRE_KEY_COUNT: usize = 812;
 const MIN_PRE_KEY_COUNT: usize = 5;
 
 /// Separate from Signal locks: a slow cold lookup must not block a warm
-/// companion that owns the sole offline-processing permit. Only active flights
+/// companion waiting for offline-processing admission. Only active flights
 /// remain registered; a lease releases its joiners even when cancelled.
 pub(crate) struct AdvBootstrapRegistry {
     flights: std::sync::Mutex<std::collections::HashMap<(u64, Jid), Arc<AdvBootstrapFlight>>>,

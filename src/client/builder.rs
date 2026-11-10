@@ -173,6 +173,12 @@ pub struct ClientOptions {
     pub resend_rate_limit: Option<(u32, u32)>,
     /// `None` disables periodic persistence; zero is rejected during build.
     pub background_saver_interval: Option<Duration>,
+    /// Stanzas processed concurrently while the offline backlog drains.
+    /// `0` auto-detects one per available core, capped at
+    /// 8; an explicit value is
+    /// clamped to the same range. Per-chat ordering is unaffected — the chat
+    /// lane owns that regardless of pool width.
+    pub offline_drain_permits: usize,
 }
 
 impl Default for ClientOptions {
@@ -189,6 +195,7 @@ impl Default for ClientOptions {
             wanted_pre_key_count: None,
             resend_rate_limit: None,
             background_saver_interval: None,
+            offline_drain_permits: 0,
         }
     }
 }
@@ -632,6 +639,14 @@ impl ClientBuilder {
         self
     }
 
+    /// Stanzas processed concurrently while the offline backlog drains;
+    /// `0` auto-detects one per available core, capped (see
+    /// [`ClientOptions::offline_drain_permits`]).
+    pub fn with_offline_drain_permits(mut self, permits: usize) -> Self {
+        self.options.offline_drain_permits = permits;
+        self
+    }
+
     /// Install the aggregate lifecycle used by extensions of this client.
     #[cfg(feature = "client-lifecycle")]
     #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
@@ -861,6 +876,7 @@ impl ClientBuilder {
                 additional_static_media_hosts: options
                     .additional_static_media_hosts
                     .into_boxed_slice(),
+                offline_drain_permits: options.offline_drain_permits,
                 ..self
                     .extensions
                     .map(|extensions| *extensions)
@@ -1165,6 +1181,7 @@ pub(super) struct ClientExtensions {
     pub(super) additional_static_media_hosts: Box<[wacore::download::MediaHost]>,
     pub(super) history_sync_admission: Option<Arc<dyn HistorySyncAdmission>>,
     pub(super) connect_admission: Option<Arc<dyn ConnectAdmission>>,
+    pub(super) offline_drain_permits: usize,
 }
 
 impl ClientAssembly {

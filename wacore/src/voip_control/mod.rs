@@ -619,8 +619,8 @@ pub struct MediaStats {
     #[builder(default)]
     pub last_unexpected_payload_type: u8,
     /// Forward sequence gaps observed on the peer video stream being reassembled.
-    /// Late arrivals do not subtract from this counter. Gaps request a keyframe through
-    /// the coalesced recovery path.
+    /// Late arrivals and FEC recovery do not subtract from this counter. A keyframe request
+    /// follows only when a gap is abandoned, as counted by `video_gaps_skipped`.
     #[builder(default)]
     pub video_rtp_lost: u32,
     /// Packets of our video the peer asked for again in generic NACKs, counted per packet named.
@@ -695,6 +695,37 @@ pub struct MediaStats {
     /// while the switch settles. Their piggybacked audio is still played.
     #[builder(default)]
     pub video_retired_ssrc_ignored: u32,
+    /// Video FEC repair packets received for the stream being reassembled.
+    #[builder(default)]
+    pub video_fec_repairs_received: u32,
+    /// Lost video packets rebuilt from the peer's repair packets.
+    #[builder(default)]
+    pub video_fec_recovered: u32,
+    /// Repair packets whose complete group matched their parity: packets are kept as the peer protected them.
+    #[builder(default)]
+    pub video_fec_parity_matched: u32,
+    /// Repair packets whose complete group did not match their parity.
+    #[builder(default)]
+    pub video_fec_parity_mismatched: u32,
+    /// Repair packets with two or more of their group missing.
+    #[builder(default)]
+    pub video_fec_insufficient: u32,
+    /// Repair packets whose one missing packet had already been given up on.
+    #[builder(default)]
+    pub video_fec_late: u32,
+    /// Rebuilt packets that did not look like the video packet they replace.
+    #[builder(default)]
+    pub video_fec_rejected: u32,
+    /// Inbound video gaps given up on after the hold, neither filled late nor rebuilt.
+    #[builder(default)]
+    pub video_gaps_skipped: u32,
+    /// Video packets in those gaps.
+    #[builder(default)]
+    pub video_packets_skipped: u32,
+    /// Video packets that arrived behind what reassembly already took -- a repeat, an original
+    /// already rebuilt from a repair, or one whose gap was skipped -- and were dropped.
+    #[builder(default)]
+    pub video_packets_late: u32,
     /// Video FEC packets we sent (see [`VideoFecConfig`]). Not kept for retransmission.
     #[builder(default)]
     pub video_fec_sent: u32,
