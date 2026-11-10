@@ -10353,7 +10353,7 @@ async fn stale_stanza_suspension_skips_work_on_the_replacement_pool() {
     let mut slot = Some(client.acquire_message_processing_permit().await);
     let other_stanza = client.acquire_message_processing_permit().await;
     let generation = client.connection_generation.load(Ordering::Acquire);
-    let ran = std::sync::atomic::AtomicBool::new(false);
+    let ran = AtomicBool::new(false);
     let mut suspended =
         Box::pin(
             client.with_stanza_permit_suspended(&mut slot, generation, async {
@@ -10366,7 +10366,7 @@ async fn stale_stanza_suspension_skips_work_on_the_replacement_pool() {
     client.swap_to_drain_semaphore();
     drop(other_stanza);
     let (suspension, _) = suspended.await;
-    assert_eq!(suspension, node_io::PermitSuspension::Reconnected);
+    assert_eq!(suspension, PermitSuspension::Reconnected);
     assert!(!ran.load(Ordering::Acquire));
     assert!(slot.is_none());
 }

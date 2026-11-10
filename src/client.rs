@@ -515,7 +515,7 @@ pub(crate) struct MessagePermitPool {
     pub(crate) semaphore: Arc<async_lock::Semaphore>,
     pub(crate) quiesce_permits: usize,
     /// Serialize partial acquisitions within this semaphore generation.
-    pub(crate) quiesce_lock: async_lock::Mutex<()>,
+    pub(crate) quiesce_lock: Mutex<()>,
 }
 
 impl MessagePermitSemaphore {
@@ -525,7 +525,7 @@ impl MessagePermitSemaphore {
         Self(Arc::new(MessagePermitPool {
             semaphore: Arc::new(async_lock::Semaphore::new(permits.max(1))),
             quiesce_permits: permits.max(1),
-            quiesce_lock: async_lock::Mutex::new(()),
+            quiesce_lock: Mutex::new(()),
         }))
     }
 
@@ -535,7 +535,7 @@ impl MessagePermitSemaphore {
         Self(Arc::new(MessagePermitPool {
             semaphore: Arc::new(async_lock::Semaphore::new(permits.max(1))),
             quiesce_permits: 1,
-            quiesce_lock: async_lock::Mutex::new(()),
+            quiesce_lock: Mutex::new(()),
         }))
     }
 
