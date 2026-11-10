@@ -5080,7 +5080,6 @@ async fn adv_review_round4_retirement_during_preflight_cannot_publish_mapping() 
             snapshot,
         };
         let reactions = AdvIdentityReactions::default();
-        let maintenance = client.begin_signal_maintenance().await.unwrap();
         let registry = client.device_topology.lock_registry().await;
         // Drive the real publication future manually, so the reset cannot
         // update topology before publication resumes from this exact wait.
@@ -5096,7 +5095,7 @@ async fn adv_review_round4_retirement_during_preflight_cannot_publish_mapping() 
                 authentication_epoch: recovered.snapshot.primary_epoch,
                 reactions: Some(&reactions),
             },
-            Some(&maintenance),
+            None,
         ));
         assert!(futures::poll!(publication.as_mut()).is_pending());
         let mut mapping = Box::pin(client.lid_pn_cache.lock_mutation());
@@ -5116,7 +5115,6 @@ async fn adv_review_round4_retirement_during_preflight_cannot_publish_mapping() 
         }
         drop(registry);
         let result = publication.await;
-        drop(maintenance);
         reactions.dispatch(&client);
         assert_eq!(result.is_err(), retire);
         if !retire {

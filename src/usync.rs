@@ -889,7 +889,7 @@ impl Client {
             .chain(basis.publication_alias.iter().cloned())
             .collect();
         let (_sessions, _mapping) = self
-            .device_list_identity_guards_with_recovery(&users, Some((user, &basis)))
+            .device_list_identity_guards_with_recovery(&users, Some((user, &basis)), None)
             .await?;
         self.validate_adv_recovery_ownership(user, basis.publication_alias.as_ref())?;
         self.validate_adv_recovery_durable_alias(user, basis.publication_alias.as_ref(), &_mapping)
@@ -1439,6 +1439,10 @@ impl Client {
         Box::pin(async move {
             let recovered_identity = identities.recovered;
             let mut owned_maintenance = if identities.reactions.is_some() {
+                anyhow::ensure!(
+                    borrowed_maintenance.is_none(),
+                    "ADV publication must own its maintenance scope"
+                );
                 Some(self.begin_signal_maintenance().await?)
             } else {
                 None
@@ -1479,6 +1483,7 @@ impl Client {
                 .device_list_identity_guards_with_recovery(
                     &users,
                     recovered_identity.map(|recovered| (&recovered.user, &recovered.snapshot)),
+                    None,
                 )
                 .await?;
             if let Some(recovered) = recovered_identity {
@@ -1636,10 +1641,7 @@ impl Client {
                 eviction_result?;
                 owned_maintenance = Some(self.begin_signal_maintenance().await?);
                 (session_guards, mapping_guard) = self
-                    .device_list_identity_guards_with_recovery(
-                        &users,
-                        recovered_identity.map(|recovered| (&recovered.user, &recovered.snapshot)),
-                    )
+                    .device_list_identity_guards_with_recovery(&users, None, Some(&aliases))
                     .await?;
                 registry_guard = self.device_topology.lock_registry().await;
                 let mut unchanged = owned_maintenance
@@ -1681,7 +1683,7 @@ impl Client {
                     anyhow::bail!("device-list state changed during ADV cache eviction");
                 }
                 if let Some(recovered) = recovered_identity {
-                    self.validate_adv_recovery_publication(response, recovered, &mapping_guard)
+                    self.validate_adv_recovery_state(recovered, &mapping_guard)
                         .await?;
                 }
             }
@@ -1714,25 +1716,8 @@ impl Client {
         recovered: &RecoveredAccountIdentity,
         mapping_guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
     ) -> anyhow::Result<()> {
-        recovered
-            .snapshot
-            .validate_primary_epoch(&self.signal_cache.identity_continuity)?;
-        self.validate_adv_recovery_ownership(
-            &recovered.user,
-            recovered.snapshot.publication_alias.as_ref(),
-        )?;
-        self.validate_adv_recovery_durable_alias(
-            &recovered.user,
-            recovered.snapshot.publication_alias.as_ref(),
-            mapping_guard,
-        )
-        .await?;
-        for (jid, previous) in &recovered.snapshot.identities {
-            anyhow::ensure!(
-                self.cached_adv_account_identity(jid).await? == *previous,
-                "primary identity changed during ADV recovery"
-            );
-        }
+        self.validate_adv_recovery_state(recovered, mapping_guard)
+            .await?;
         let expected = recovered.snapshot.observed_alias.as_ref();
         anyhow::ensure!(
             self.device_list_identity_alias(&recovered.user)
@@ -1754,6 +1739,33 @@ impl Client {
             &recovered.user,
             recovered.snapshot.publication_alias.as_ref(),
         )
+    }
+
+    async fn validate_adv_recovery_state(
+        &self,
+        recovered: &RecoveredAccountIdentity,
+        mapping_guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
+    ) -> anyhow::Result<()> {
+        recovered
+            .snapshot
+            .validate_primary_epoch(&self.signal_cache.identity_continuity)?;
+        self.validate_adv_recovery_ownership(
+            &recovered.user,
+            recovered.snapshot.publication_alias.as_ref(),
+        )?;
+        self.validate_adv_recovery_durable_alias(
+            &recovered.user,
+            recovered.snapshot.publication_alias.as_ref(),
+            mapping_guard,
+        )
+        .await?;
+        for (jid, previous) in &recovered.snapshot.identities {
+            anyhow::ensure!(
+                self.cached_adv_account_identity(jid).await? == *previous,
+                "primary identity changed during ADV recovery"
+            );
+        }
+        Ok(())
     }
 
     /// Validate the prospective account graph before publishing mappings or
@@ -2156,7 +2168,7 @@ impl Client {
         Vec<async_lock::MutexGuardArc<()>>,
         crate::lid_pn_cache::LidPnMutationGuard<'_>,
     )> {
-        self.device_list_identity_guards_with_recovery(users, None)
+        self.device_list_identity_guards_with_recovery(users, None, None)
             .await
     }
 
@@ -2166,6 +2178,7 @@ impl Client {
         &self,
         users: &[Jid],
         recovery: Option<(&Jid, &AdvRecoverySnapshot)>,
+        publication_aliases: Option<&[Option<Jid>]>,
     ) -> anyhow::Result<(
         Vec<async_lock::MutexGuardArc<()>>,
         crate::lid_pn_cache::LidPnMutationGuard<'_>,
@@ -2173,8 +2186,15 @@ impl Client {
         for _ in 0..DEVICE_REFRESH_MAX_ATTEMPTS {
             let mut aliases = Vec::with_capacity(users.len());
             let mut addresses: Vec<_> = users.iter().map(|user| user.with_device(0)).collect();
-            for user in users {
+            for (position, user) in users.iter().enumerate() {
                 let alias = self.device_list_identity_alias(user).await;
+                // A continuation has already learned its own accepted mappings.
+                // Reject any later relation before waiting on its session lock.
+                anyhow::ensure!(
+                    publication_aliases
+                        .is_none_or(|expected| expected.get(position) == Some(&alias)),
+                    "account alias changed during ADV cache eviction"
+                );
                 anyhow::ensure!(
                     recovery.is_none_or(|(root, snapshot)| snapshot.matches_observed_alias(
                         root,
