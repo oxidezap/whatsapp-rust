@@ -7,8 +7,10 @@
 use crate::client::Client;
 use anyhow;
 use anyhow::Context as _;
+use futures::FutureExt as _;
 use log;
 
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use wacore::iq::prekeys::{
     DigestKeyBundleSpec, PreKeyCountSpec, PreKeyFetchReason, PreKeyFetchSpec, PreKeyUploadSpec,
@@ -25,6 +27,143 @@ pub use wacore::prekeys::PreKeyUtils;
 pub(crate) const DEFAULT_WANTED_PRE_KEY_COUNT: usize = 812;
 
 const MIN_PRE_KEY_COUNT: usize = 5;
+
+/// Separate from Signal locks: a slow cold lookup must not block a warm
+/// companion waiting for offline-processing admission. Only active flights
+/// remain registered; a lease releases its joiners even when cancelled.
+pub(crate) struct AdvBootstrapRegistry {
+    flights: std::sync::Mutex<std::collections::HashMap<(u64, Jid), Arc<AdvBootstrapFlight>>>,
+    queries: async_lock::Semaphore,
+}
+
+impl Default for AdvBootstrapRegistry {
+    fn default() -> Self {
+        Self {
+            flights: Default::default(),
+            queries: async_lock::Semaphore::new(8),
+        }
+    }
+}
+
+type AdvBootstrapResult = Result<[u8; 32], Arc<anyhow::Error>>;
+
+struct AdvBootstrapFlight {
+    result: std::sync::Mutex<Option<AdvBootstrapResult>>,
+    released: async_channel::Receiver<std::convert::Infallible>,
+}
+
+struct AdvBootstrapLease {
+    registry: Arc<AdvBootstrapRegistry>,
+    key: (u64, Jid),
+    flight: Arc<AdvBootstrapFlight>,
+    _release: async_channel::Sender<std::convert::Infallible>,
+}
+
+impl Drop for AdvBootstrapLease {
+    /// Remove only this lease's flight so cancellation wakes joiners without erasing a replacement.
+    fn drop(&mut self) {
+        let mut flights = self
+            .registry
+            .flights
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if flights
+            .get(&self.key)
+            .is_some_and(|flight| Arc::ptr_eq(flight, &self.flight))
+        {
+            flights.remove(&self.key);
+        }
+    }
+}
+
+impl AdvBootstrapRegistry {
+    /// Lower bound for owned heap: registry, retained map capacity, keys and
+    /// registered flights. Runtime/channel waiter allocations and the opaque
+    /// allocation behind an anyhow error are deliberately not estimated.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        use wacore::stats::HeapSize;
+        let flights = self.flights.lock().unwrap_or_else(|p| p.into_inner());
+        size_of::<Self>()
+            + 2 * size_of::<usize>()
+            + wacore::stats::hash_table_bytes(
+                flights.capacity(),
+                size_of::<((u64, Jid), Arc<AdvBootstrapFlight>)>(),
+            )
+            + flights
+                .keys()
+                .map(|(_, primary)| {
+                    // The map and leader lease each own the account key.
+                    2 * primary.heap_bytes()
+                        + size_of::<AdvBootstrapFlight>()
+                        + 2 * size_of::<usize>()
+                })
+                .sum::<usize>()
+    }
+
+    /// Join an account/generation flight, or become its leader until the returned lease drops.
+    fn claim(
+        self: &Arc<Self>,
+        generation: u64,
+        primary: &Jid,
+    ) -> Result<AdvBootstrapLease, Arc<AdvBootstrapFlight>> {
+        let key = (generation, primary.clone());
+        let mut flights = self.flights.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(flight) = flights.get(&key) {
+            return Err(flight.clone());
+        }
+        let (release, released) = async_channel::bounded(1);
+        let flight = Arc::new(AdvBootstrapFlight {
+            result: Default::default(),
+            released,
+        });
+        flights.insert(key.clone(), flight.clone());
+        Ok(AdvBootstrapLease {
+            registry: self.clone(),
+            key,
+            flight,
+            _release: release,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct SharedAdvBootstrapError(Arc<anyhow::Error>);
+
+/// Keep trust conflicts downcastable for per-contact group rejection; share other error sources.
+fn shared_adv_bootstrap_error(error: Arc<anyhow::Error>) -> anyhow::Error {
+    use crate::usync::DeviceListIdentityConflict;
+    match error.downcast_ref::<DeviceListIdentityConflict>() {
+        Some(DeviceListIdentityConflict::Alias) => DeviceListIdentityConflict::Alias.into(),
+        Some(DeviceListIdentityConflict::Primary) => DeviceListIdentityConflict::Primary.into(),
+        Some(DeviceListIdentityConflict::Bootstrap) => DeviceListIdentityConflict::Bootstrap.into(),
+        None => anyhow::Error::new(SharedAdvBootstrapError(error)),
+    }
+}
+
+impl std::fmt::Display for SharedAdvBootstrapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.0.as_ref(), f)
+    }
+}
+
+impl std::error::Error for SharedAdvBootstrapError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref().as_ref())
+    }
+}
+
+/// Reject work after shutdown or a connection-generation change, including delayed IQ replies.
+fn ensure_adv_bootstrap_scope(
+    generation: &portable_atomic::AtomicU64,
+    expected: u64,
+    shutdown: &wacore::runtime::ShutdownSignal,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !shutdown.is_fired() && generation.load(Ordering::Acquire) == expected,
+        "connection changed during ADV bootstrap"
+    );
+    Ok(())
+}
 
 /// Whether `upload_pre_keys` should upload, given the `force` flag and the server's
 /// reported pre-key count. The prekey-low path forces, matching WA Web's
@@ -159,9 +298,14 @@ fn authenticated_primary_identity(
 }
 
 impl Client {
+    /// Allocate flight coordination only when an account needs cold ADV discovery.
+    fn adv_bootstrap(&self) -> &Arc<AdvBootstrapRegistry> {
+        self.inbound_queues().adv_bootstrap()
+    }
+
     /// Read a fresh, signed primary key without publishing a trust change.
     pub(crate) async fn fetch_adv_account_identity(&self, jid: &Jid) -> anyhow::Result<[u8; 32]> {
-        let primary = jid.with_device(0);
+        let primary = wacore::types::jid::adv_account_jid(jid);
         self.query_adv_account_identity(&primary, Some(PreKeyFetchReason::Identity))
             .await
     }
@@ -209,7 +353,7 @@ impl Client {
         let mut requested = jids.to_vec();
         let mut bootstrap_primaries = Vec::new();
         for jid in &cold_companions {
-            let primary = jid.with_device(0);
+            let primary = wacore::types::jid::adv_account_jid(jid);
             if !bootstrap_primaries.contains(&primary) {
                 bootstrap_primaries.push(primary.clone());
             }
@@ -235,7 +379,7 @@ impl Client {
         // primary trust anchor. An omitted primary must not leave a session
         // authenticated only by a sender-selected account key.
         for companion in &cold_companions {
-            let primary = companion.with_device(0);
+            let primary = wacore::types::jid::adv_account_jid(companion);
             if let Some(bundle) = outcome.bundles.get(&primary) {
                 authenticated_primary_identity(bundle)?;
             } else {
@@ -285,7 +429,7 @@ impl Client {
         jid: &Jid,
     ) -> anyhow::Result<Option<[u8; 32]>> {
         use wacore::types::jid::JidExt;
-        let primary = jid.with_device(0);
+        let primary = wacore::types::jid::adv_account_jid(jid);
         let backend = self.persistence_manager.backend();
         if let Some(identity) = self
             .signal_cache
@@ -319,22 +463,142 @@ impl Client {
     /// session does. Device-list blobs never rotate an already stored identity.
     pub(crate) async fn ensure_adv_account_identity(&self, jid: &Jid) -> anyhow::Result<[u8; 32]> {
         use wacore::types::jid::JidExt;
-        let primary = jid.with_device(0);
-        let address = primary.to_protocol_address();
-        let lock = self.session_lock_for(address.as_str()).await;
-        let _guard = lock.lock().await;
-        if let Some(identity) = self.cached_adv_account_identity(jid).await? {
+        let generation = self.connection_generation.load(Ordering::Acquire);
+        let shutdown = self.connection_shutdown_signal();
+        let primary = wacore::types::jid::adv_account_jid(jid);
+        let bootstrap = async {
+            ensure_adv_bootstrap_scope(&self.connection_generation, generation, &shutdown)?;
+            {
+                // An existing account operation may be publishing the anchor.
+                // Read behind it, then release the lock before cold admission.
+                let address = primary.to_protocol_address();
+                let lock = self.session_lock_for(address.as_str()).await;
+                let _guard = lock.lock().await;
+                ensure_adv_bootstrap_scope(&self.connection_generation, generation, &shutdown)?;
+                let cached = self.cached_adv_account_identity(&primary).await?;
+                ensure_adv_bootstrap_scope(&self.connection_generation, generation, &shutdown)?;
+                if let Some(identity) = cached {
+                    return Ok(identity);
+                }
+            }
+            loop {
+                match self.adv_bootstrap().claim(generation, &primary) {
+                    Ok(lease) => {
+                        let result = self
+                            .bootstrap_adv_account_identity(&primary, generation, &shutdown)
+                            .await
+                            .map_err(Arc::new);
+                        ensure_adv_bootstrap_scope(
+                            &self.connection_generation,
+                            generation,
+                            &shutdown,
+                        )?;
+                        *lease
+                            .flight
+                            .result
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner()) = Some(result.clone());
+                        return result.map_err(shared_adv_bootstrap_error);
+                    }
+                    Err(flight) => {
+                        let _ = flight.released.recv().await;
+                        ensure_adv_bootstrap_scope(
+                            &self.connection_generation,
+                            generation,
+                            &shutdown,
+                        )?;
+                        let result = flight
+                            .result
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .clone();
+                        if let Some(result) = result {
+                            return result.map_err(shared_adv_bootstrap_error);
+                        }
+                        // Cancellation belongs to the leader, not its valid joiners.
+                    }
+                }
+            }
+        };
+        futures::select_biased! {
+            _ = wacore::runtime::wait_for_shutdown(&shutdown).fuse() => {
+                anyhow::bail!("connection closed during ADV bootstrap")
+            },
+            result = Box::pin(bootstrap).fuse() => result,
+        }
+    }
+
+    /// Bound cold IQ concurrency, then recheck trust under the account fence before owned persistence.
+    /// Cancelling the caller cannot release the admitted writer's fence or storage ownership.
+    async fn bootstrap_adv_account_identity(
+        &self,
+        primary: &Jid,
+        generation: u64,
+        shutdown: &wacore::runtime::ShutdownSignal,
+    ) -> anyhow::Result<[u8; 32]> {
+        use wacore::types::jid::JidExt;
+        let query = self.adv_bootstrap().queries.acquire().await;
+        ensure_adv_bootstrap_scope(&self.connection_generation, generation, shutdown)?;
+        // A previous flight may have published while this caller waited for
+        // admission. No Signal lock is held across either admission or the IQ.
+        let cached = self.cached_adv_account_identity(primary).await?;
+        ensure_adv_bootstrap_scope(&self.connection_generation, generation, shutdown)?;
+        if let Some(identity) = cached {
             return Ok(identity);
         }
         let epoch = self.signal_cache.identity_continuity.primary_snapshot();
-        let key = self.query_adv_account_identity(&primary, None).await?;
-        if !self
-            .persist_adv_bootstrap_identity_in_epoch(&primary, &key, epoch)
-            .await?
-        {
-            anyhow::bail!(crate::usync::DeviceListIdentityConflict::Bootstrap);
+        let key = self.query_adv_account_identity(primary, None).await?;
+        drop(query);
+        let address = primary.to_protocol_address();
+        let lock = self.session_lock_for(address.as_str()).await;
+        let guard = lock.lock_arc().await;
+        ensure_adv_bootstrap_scope(&self.connection_generation, generation, shutdown)?;
+        // Recovery or a primary message may have established a different
+        // anchor during the query. Validate the caller against current trust;
+        // a delayed cold response must never replace it.
+        let cached = self.cached_adv_account_identity(primary).await?;
+        ensure_adv_bootstrap_scope(&self.connection_generation, generation, shutdown)?;
+        if let Some(identity) = cached {
+            return Ok(identity);
         }
-        Ok(key)
+        let work = self
+            .inbound_queues()
+            .work
+            .try_track()
+            .ok_or_else(|| anyhow::anyhow!("ADV persistence admission closed"))?;
+        let client = self
+            .self_weak
+            .get()
+            .and_then(|weak| weak.upgrade())
+            .ok_or_else(|| anyhow::anyhow!("client ownership unavailable during bootstrap"))?;
+        let current_generation = self.connection_generation.clone();
+        let shutdown = shutdown.clone();
+        let primary_owned = primary.clone();
+        let (send, receive) = futures::channel::oneshot::channel();
+        // Once storage is admitted, its writer owns the primary fence and the
+        // drain tracking until the backend finishes. Cancelling an IQ caller
+        // must not let recovery overtake a host write that continues detached.
+        self.runtime.spawn_detached(Box::pin(async move {
+            let _guard = guard;
+            let _work = work;
+            let result = async {
+                ensure_adv_bootstrap_scope(&current_generation, generation, &shutdown)?;
+                let accepted = client
+                    .persist_adv_bootstrap_identity_inner(&primary_owned, &key, epoch)
+                    .await?;
+                ensure_adv_bootstrap_scope(&current_generation, generation, &shutdown)?;
+                anyhow::ensure!(
+                    accepted,
+                    crate::usync::DeviceListIdentityConflict::Bootstrap
+                );
+                Ok(key)
+            }
+            .await;
+            let _ = send.send(result);
+        }));
+        receive
+            .await
+            .map_err(|_| anyhow::anyhow!("ADV persistence worker stopped"))?
     }
 
     /// Load, for each companion JID, its account (device 0) identity key from the
@@ -1127,6 +1391,10 @@ impl Client {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "prekeys/adv_bootstrap_tests.rs"]
+mod adv_bootstrap_tests;
 
 #[cfg(test)]
 mod tests {

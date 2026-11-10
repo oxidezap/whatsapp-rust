@@ -648,7 +648,7 @@ mod tests {
             client
                 .inbound_queues
                 .get()
-                .and_then(|q| q.ack_queue.get())
+                .and_then(|q| q.ack_sender())
                 .is_none(),
             "a successful subset hook must not acknowledge the retained group"
         );
@@ -666,7 +666,7 @@ mod tests {
                 || client
                     .inbound_queues
                     .get()
-                    .and_then(|q| q.ack_queue.get())
+                    .and_then(|q| q.ack_sender())
                     .is_some(),
             "only the complete replay may schedule the stanza acknowledgement"
         );

@@ -76,7 +76,7 @@ impl Client {
         if jid.device == 0 {
             return None;
         }
-        let primary = jid.with_device(0).to_protocol_address();
+        let primary = wacore::types::jid::adv_account_jid(jid).to_protocol_address();
         Some(
             self.session_lock_for(primary.as_str())
                 .await

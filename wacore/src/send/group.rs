@@ -8,8 +8,8 @@ use anyhow::Context as _;
 /// by both normal and targeted sends.
 pub fn retain_skdm_distribution_targets(devices: &mut Vec<Jid>, own_sending_jid: &Jid) {
     devices.retain(|device| {
-        !(device.user == own_sending_jid.user && device.device == own_sending_jid.device)
-            && !device.is_hosted()
+        !((device.user == own_sending_jid.user && device.device == own_sending_jid.device)
+            || device.is_hosted())
     });
 }
 

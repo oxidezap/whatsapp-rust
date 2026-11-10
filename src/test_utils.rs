@@ -99,13 +99,14 @@ pub(crate) fn adv_test_account() -> &'static wacore::libsignal::protocol::KeyPai
     })
 }
 
+/// Seed the shared test account key at the canonical ADV anchor, including for hosted device JIDs.
 #[cfg(test)]
 pub(crate) async fn seed_adv_primary(client: &Client, user: &Jid) {
     use wacore::types::jid::JidExt;
     client
         .signal_cache
         .put_identity(
-            &user.with_device(0).to_protocol_address(),
+            &wacore::types::jid::adv_account_jid(user).to_protocol_address(),
             adv_test_account().public_key.public_key_bytes(),
         )
         .await;

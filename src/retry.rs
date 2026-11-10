@@ -4968,7 +4968,10 @@ mod tests {
                             .await;
                     client
                         .signal_cache
-                        .put_identity(&jid.with_device(0).to_protocol_address(), account_key)
+                        .put_identity(
+                            &wacore::types::jid::adv_account_jid(&jid).to_protocol_address(),
+                            account_key,
+                        )
                         .await;
                     for valid in [false, true] {
                         let dev_prefix: &[u8; 2] = if hosted_device == valid {

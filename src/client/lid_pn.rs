@@ -1203,8 +1203,8 @@ impl Client {
             // must not publish new trust while this iteration retains old
             // session material. Use the send path's order for the whole set.
             let mut keys = vec![
-                from.with_device(0),
-                to.with_device(0),
+                wacore::types::jid::adv_account_jid(from),
+                wacore::types::jid::adv_account_jid(to),
                 pn_jid.clone(),
                 lid_jid.clone(),
             ];

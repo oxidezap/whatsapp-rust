@@ -769,7 +769,7 @@ impl Client {
                 .pn
                 .iter()
                 .chain(snapshot.lid.iter())
-                .any(|own| own.is_same_chat_as(user))
+                .any(|own| own.is_same_chat_as(&wacore::types::jid::adv_account_jid(user)))
             {
                 return Err(error);
             }
@@ -2221,7 +2221,10 @@ impl Client {
     )> {
         for _ in 0..DEVICE_REFRESH_MAX_ATTEMPTS {
             let mut aliases = Vec::with_capacity(users.len());
-            let mut addresses: Vec<_> = users.iter().map(|user| user.with_device(0)).collect();
+            let mut addresses: Vec<_> = users
+                .iter()
+                .map(wacore::types::jid::adv_account_jid)
+                .collect();
             for (position, user) in users.iter().enumerate() {
                 let alias = self.device_list_identity_alias(user).await;
                 // A continuation has already learned its own accepted mappings.
@@ -2239,7 +2242,7 @@ impl Client {
                     )),
                     "account alias changed during ADV recovery"
                 );
-                addresses.extend(alias.iter().map(|alias| alias.with_device(0)));
+                addresses.extend(alias.iter().map(wacore::types::jid::adv_account_jid));
                 aliases.push(alias);
             }
             addresses.sort_unstable_by(wacore::types::jid::cmp_for_lock_order);
@@ -2330,7 +2333,8 @@ impl Client {
             .map_err(|_| anyhow::anyhow!("bootstrap identity worker stopped"))?
     }
 
-    async fn persist_adv_bootstrap_identity_inner(
+    /// Persist a first-contact anchor only while reciprocal aliases and the captured identity epoch remain valid.
+    pub(crate) async fn persist_adv_bootstrap_identity_inner(
         &self,
         primary: &Jid,
         key: &[u8; 32],
@@ -2684,11 +2688,9 @@ impl Client {
             let identity_update = if let Some(identity) = verified_identity {
                 let previous_identity = self.cached_adv_account_identity(&user_list.user).await?;
                 let snapshot = self.persistence_manager.get_device_snapshot();
-                let is_self = snapshot
-                    .pn
-                    .iter()
-                    .chain(snapshot.lid.iter())
-                    .any(|own| own.is_same_chat_as(&user_list.user));
+                let is_self = snapshot.pn.iter().chain(snapshot.lid.iter()).any(|own| {
+                    own.is_same_chat_as(&wacore::types::jid::adv_account_jid(&user_list.user))
+                });
                 if is_self
                     && previous_identity != Some(identity)
                     && mode == DeviceListApplyMode::GroupRefresh
@@ -2702,7 +2704,7 @@ impl Client {
                 let mut identities = Vec::with_capacity(2);
                 use wacore::types::jid::JidExt as _;
                 identities.push((
-                    user_list.user.with_device(0).to_protocol_address(),
+                    wacore::types::jid::adv_account_jid(&user_list.user).to_protocol_address(),
                     previous_identity,
                 ));
                 if !is_self {
@@ -3839,6 +3841,114 @@ mod tests {
         );
         assert!(client.load_device_record_for_jid(&user).await.is_none());
         client.signal_shutdown_sync();
+    }
+
+    /// Hosted-addressed refreshes must wait on the same ordinary account lock as sends and receives.
+    #[tokio::test]
+    async fn hosted_refresh_waits_for_the_ordinary_account_fence() {
+        use std::sync::Arc;
+        use wacore::usync::{UserDeviceList, UsyncDevice};
+        for primary in [Jid::pn("12025550190"), Jid::lid("100000000000190")] {
+            let client = create_test_client().await;
+            let hosted = primary.with_device_hosting(99, true).to_non_ad();
+            let response = authenticated_response_fixture(
+                &client,
+                DeviceListResponse {
+                    device_lists: vec![UserDeviceList {
+                        user: hosted.clone(),
+                        devices: vec![UsyncDevice::new(99, Some(1)).with_hosting(true)],
+                        phash: None,
+                        key_index_bytes: Some(signed_key_index_bytes(vec![1], 1)),
+                    }],
+                    lid_mappings: vec![],
+                },
+            )
+            .await;
+            let lock = client
+                .session_lock_for(primary.to_protocol_address().as_str())
+                .await;
+            let guard = lock.lock().await;
+            let baseline = Arc::strong_count(&lock);
+            let worker = client.clone();
+            let refresh = tokio::spawn(async move {
+                worker
+                    .process_device_list_response(&response, Freshness::Refresh)
+                    .await
+            });
+            crate::test_utils::wait_for_lock_waiter(&lock, baseline).await;
+            assert!(!refresh.is_finished());
+            assert!(client.load_device_record_for_jid(&primary).await.is_none());
+            drop(guard);
+            tokio::time::timeout(std::time::Duration::from_secs(5), refresh)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(client.load_device_record_for_jid(&primary).await.is_some());
+            client.signal_shutdown_sync();
+        }
+    }
+
+    /// The hosted wire family must not hide ownership of our account anchor.
+    #[tokio::test]
+    async fn hosted_addressed_usync_cannot_replace_our_paired_account_anchor() {
+        use wacore::store::commands::DeviceCommand;
+        use wacore::usync::{UserDeviceList, UsyncDevice};
+        for own in [Jid::pn("12025550188"), Jid::lid("100000000000188")] {
+            let client = create_test_client().await;
+            let hosted = own.with_device_hosting(99, true);
+            let response = authenticated_response_fixture(
+                &client,
+                DeviceListResponse {
+                    device_lists: vec![UserDeviceList {
+                        user: hosted.to_non_ad(),
+                        devices: vec![UsyncDevice::new(99, Some(1)).with_hosting(true)],
+                        phash: None,
+                        key_index_bytes: Some(signed_key_index_bytes(vec![1], 1)),
+                    }],
+                    lid_mappings: vec![],
+                },
+            )
+            .await;
+            client
+                .signal_cache
+                .delete_identity(&own.to_protocol_address())
+                .await;
+            let paired = wacore::libsignal::protocol::KeyPair::generate(&mut rand::make_rng::<
+                rand::rngs::StdRng,
+            >());
+            let mut account = waproto::whatsapp::ADVSignedDeviceIdentity::default();
+            account.account_signature_key = Some(paired.public_key.public_key_bytes().to_vec());
+            let command = if own.server == wacore_binary::Server::Lid {
+                DeviceCommand::SetLid(Some(own.with_device(1)))
+            } else {
+                DeviceCommand::SetId(Some(own.with_device(1)))
+            };
+            client.persistence_manager.process_command(command).await;
+            client
+                .persistence_manager
+                .process_command(DeviceCommand::SetAccount(Some(account)))
+                .await;
+            let error = client
+                .process_device_list_response(&response, Freshness::Refresh)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("paired primary identity"));
+            assert_eq!(
+                client.cached_adv_account_identity(&hosted).await.unwrap(),
+                Some(*paired.public_key.public_key_bytes())
+            );
+            assert!(
+                client
+                    .persistence_manager
+                    .backend()
+                    .load_identity(hosted.with_device(0).to_protocol_address().as_str())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            client.signal_shutdown_sync();
+        }
     }
 
     /// A later invalid user must not commit an earlier hosted identity update.

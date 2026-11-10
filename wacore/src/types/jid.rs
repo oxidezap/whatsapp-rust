@@ -117,12 +117,36 @@ pub fn write_protocol_address_to<W: AddressSink + ?Sized>(jid: &Jid, buf: &mut W
     push_protocol_address_to(jid, buf);
 }
 
+/// The account that authenticates a companion's ADV certificate.
+///
+/// WA Web's `asUserWidOrThrow` maps hosted devices back to their PN/LID
+/// account. This is deliberately separate from Signal device addressing:
+/// a hosted device's identity/session must keep its original namespace.
+pub fn adv_account_jid(jid: &Jid) -> Jid {
+    jid.with_device_hosting(0, false)
+}
+
+/// Group hosted namespaces with their account family solely for lock ordering.
+fn account_server(server: Server) -> Server {
+    match server {
+        Server::Hosted => Server::Pn,
+        Server::HostedLid => Server::Lid,
+        server => server,
+    }
+}
+
 /// Consistent ordering for deadlock-free multi-lock acquisition.
+///
+/// Group by account family before ordering devices, so the ordinary account
+/// anchor precedes its hosted companions too (`hosted.lid` sorts before `lid`
+/// lexically). Keep the actual server as a tie-breaker: different Signal
+/// namespaces must never compare equal and disappear during deduplication.
 pub fn cmp_for_lock_order(a: &Jid, b: &Jid) -> std::cmp::Ordering {
-    mapped_server(a.server.as_str())
-        .cmp(mapped_server(b.server.as_str()))
+    mapped_server(account_server(a.server).as_str())
+        .cmp(mapped_server(account_server(b.server).as_str()))
         .then_with(|| a.user.cmp(&b.user))
         .then_with(|| a.device.cmp(&b.device))
+        .then_with(|| mapped_server(a.server.as_str()).cmp(mapped_server(b.server.as_str())))
 }
 
 /// Sort and deduplicate by user identity (user + server).
@@ -243,6 +267,35 @@ pub fn observe_protocol_address(addr: &ProtocolAddress) -> String {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    /// ADV anchors collapse hosting, but Signal namespaces remain distinct and account locks sort first.
+    #[test]
+    fn adv_accounts_share_anchors_without_merging_signal_namespaces() {
+        for user in [Jid::pn("12025550180"), Jid::lid("100000000000180")] {
+            let ordinary = user.with_device(99);
+            let hosted = user.with_device_hosting(99, true);
+            assert_eq!(adv_account_jid(&ordinary), user);
+            assert_eq!(adv_account_jid(&hosted), user);
+            assert_ne!(ordinary.to_protocol_address(), hosted.to_protocol_address());
+            let mut keys = vec![hosted.clone(), ordinary.clone(), user.clone()];
+            keys.sort_unstable_by(cmp_for_lock_order);
+            keys.dedup_by(|a, b| cmp_for_lock_order(a, b).is_eq());
+            assert_eq!(keys.len(), 3, "each Signal namespace keeps its own lock");
+            assert_eq!(keys[0], user, "account anchor precedes every companion");
+            for a in &keys {
+                for b in &keys {
+                    assert_eq!(
+                        cmp_for_lock_order(a, b).is_eq(),
+                        a.to_protocol_address() == b.to_protocol_address()
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            adv_account_jid(&Jid::group("12025550180-1")),
+            Jid::group("12025550180-1")
+        );
+    }
 
     #[test]
     fn test_signal_address_string_lid() {

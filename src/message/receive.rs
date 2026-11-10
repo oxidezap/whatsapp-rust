@@ -212,6 +212,56 @@ impl Client {
             .await
     }
 
+    /// Find the first unverifiable companion prekey before acquiring a processing permit.
+    async fn preflight_incoming_companion_identity(
+        &self,
+        sender: &Jid,
+        certificate: Option<&[u8]>,
+        payloads: &[EncPayload],
+    ) -> Option<usize> {
+        self.preflight_incoming_companion_identity_inner(sender, certificate, payloads, false)
+            .await
+    }
+
+    /// Validate prekey certificates without advancing sessions; account-locked callers use cached trust only.
+    async fn preflight_incoming_companion_identity_inner(
+        &self,
+        sender: &Jid,
+        certificate: Option<&[u8]>,
+        payloads: &[EncPayload],
+        account_locked: bool,
+    ) -> Option<usize> {
+        if sender.device == 0 {
+            return None;
+        }
+        for payload in payloads {
+            if payload.enc_type != EncType::PreKeyMessage {
+                continue;
+            }
+            let Ok(message) = PreKeySignalMessage::try_from(payload.ciphertext.clone()) else {
+                continue;
+            };
+            let identity = *message.identity_key().public_key().public_key_bytes();
+            drop(message);
+            let validation = if account_locked {
+                self.validate_incoming_companion_identity_inner(
+                    sender,
+                    certificate,
+                    &identity,
+                    true,
+                )
+                .await
+            } else {
+                self.validate_incoming_companion_identity(sender, certificate, &identity)
+                    .await
+            };
+            if validation.is_err() {
+                return Some(payload.enc_index);
+            }
+        }
+        None
+    }
+
     async fn validate_incoming_companion_identity_inner(
         &self,
         sender: &Jid,
@@ -712,7 +762,8 @@ impl Client {
         }
     }
 
-    /// Phase 2: acquire permit, decrypt payloads, flush. No node borrows.
+    /// Phase 2: preflight account trust, acquire a processing permit, decrypt,
+    /// then suspend admission for any quiesced flush. No node borrows.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(name = "wa.recv.process", level = "debug", skip_all)
@@ -734,9 +785,25 @@ impl Client {
             ack_recipient,
         } = msg;
 
-        // Acquire the global processing permit (1 during offline sync, N after).
-        // The helper re-acquires across a 1→N semaphore swap (offline→online):
-        // without that, a task waiting on the old 1-permit semaphore would be
+        // Cold ADV may wait for an IQ. Keep that wait outside the drain permit
+        // so one unavailable account cannot stop every chat. This preflight
+        // never advances a ratchet; the account fence rechecks trust under the
+        // primary lock before decrypting. Stale lanes skip even the preflight.
+        let invalid_companion_enc =
+            if self.connection_generation.load(Ordering::Acquire) == lane_generation {
+                self.preflight_incoming_companion_identity(
+                    &sender_encryption_jid,
+                    device_identity.as_deref(),
+                    &session_payloads,
+                )
+                .await
+            } else {
+                None
+            };
+
+        // Acquire one permit from the current bounded processing pool.
+        // The helper re-acquires across a drain→live semaphore swap:
+        // without that, a task waiting on the old processing pool would be
         // silently dropped, losing pkmsg messages carrying SKDM (sender key
         // distribution) — and a lost SKDM fails ALL subsequent skmsg from that
         // sender with "No sender key state".
@@ -759,63 +826,59 @@ impl Client {
             return;
         }
 
-        if sender_encryption_jid.device != 0 {
-            for payload in &session_payloads {
-                if payload.enc_type != EncType::PreKeyMessage {
-                    continue;
-                }
-                let Ok(message) = PreKeySignalMessage::try_from(payload.ciphertext.clone()) else {
-                    continue;
+        // A recovery may publish while the offline permit is unavailable.
+        // Recheck negative preflight results under the account fence, using
+        // cached trust only so no network wait enters processing admission.
+        let invalid_companion_enc = if invalid_companion_enc.is_some() {
+            let _account = self.lock_companion_account(&sender_encryption_jid).await;
+            self.preflight_incoming_companion_identity_inner(
+                &sender_encryption_jid,
+                device_identity.as_deref(),
+                &session_payloads,
+                true,
+            )
+            .await
+        } else {
+            None
+        };
+
+        if let Some(invalid_companion_enc) = invalid_companion_enc {
+            // WA Web answers this with a retry receipt (reason
+            // AdvFailure). A bare return leaves the stanza unacked
+            // and the server redelivers it every reconnect, then
+            // closes the stream with `<stream:error><ack/>`.
+            log::warn!(
+                "Companion prekey message with an unverifiable ADV identity; requesting retry"
+            );
+            for abandoned in session_payloads
+                .iter()
+                .chain(&group_payloads)
+                .chain(&bot_payloads)
+            {
+                let reason = if abandoned.enc_index == invalid_companion_enc {
+                    EncDecryptFailureReason::UntrustedIdentity
+                } else {
+                    EncDecryptFailureReason::NotAttempted
                 };
-                let identity = *message.identity_key().public_key().public_key_bytes();
-                drop(message);
-                if self
-                    .validate_incoming_companion_identity(
-                        &sender_encryption_jid,
-                        device_identity.as_deref(),
-                        &identity,
-                    )
-                    .await
-                    .is_err()
-                {
-                    // WA Web answers this with a retry receipt (reason
-                    // AdvFailure). A bare return leaves the stanza unacked
-                    // and the server redelivers it every reconnect, then
-                    // closes the stream with `<stream:error><ack/>`.
-                    log::warn!(
-                        "Companion prekey message with an unverifiable ADV identity; requesting retry"
-                    );
-                    for abandoned in session_payloads
-                        .iter()
-                        .chain(&group_payloads)
-                        .chain(&bot_payloads)
-                    {
-                        let reason = if abandoned.enc_index == payload.enc_index {
-                            EncDecryptFailureReason::UntrustedIdentity
-                        } else {
-                            EncDecryptFailureReason::NotAttempted
-                        };
-                        self.report_enc_decrypt_failure(
-                            &info,
-                            abandoned.enc_index,
-                            abandoned.enc_type.as_wire_str(),
-                            reason,
-                        );
-                    }
-                    // Otherwise a sender-echoed count is lost after a restart or
-                    // eviction and the retry cap restarts at 1.
-                    self.preseed_sender_retry_count(&info, max_sender_retry_count)
-                        .await;
-                    self.handle_decrypt_failure(
-                        &info,
-                        RetryReason::AdvFailure,
-                        decrypt_fail_mode,
-                        ack_recipient.as_ref(),
-                    )
-                    .await;
-                    return;
-                }
+                self.report_enc_decrypt_failure(
+                    &info,
+                    abandoned.enc_index,
+                    abandoned.enc_type.as_wire_str(),
+                    reason,
+                );
             }
+            // Otherwise a sender-echoed count is lost after a restart or
+            // eviction and the retry cap restarts at 1.
+            self.preseed_sender_retry_count(&info, max_sender_retry_count)
+                .await;
+            self.handle_decrypt_failure(
+                &info,
+                RetryReason::AdvFailure,
+                decrypt_fail_mode,
+                ack_recipient.as_ref(),
+            )
+            .await;
+            return;
         }
 
         let stanza_origin = raw_pending::StanzaOrigin::new();
@@ -3390,6 +3453,10 @@ mod tests {
 }
 
 #[cfg(test)]
+#[path = "hosted_adv_tests.rs"]
+mod hosted_adv_tests;
+
+#[cfg(test)]
 mod adv_tests {
     use super::*;
 
@@ -3435,6 +3502,137 @@ mod adv_tests {
             certificate,
             *device.public_key.public_key_bytes(),
         )
+    }
+
+    /// An unanswered cold IQ must leave offline admission available to a warm companion.
+    #[tokio::test]
+    async fn cold_adv_preflight_leaves_drain_and_warm_companion_unblocked() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        client.enter_drain_mode_for_tests();
+        let cold = Jid::pn_device("12025550126", 7);
+        let warm = cold.with_device(9);
+        let (payloads, certificate, _) = companion_payload_fixture();
+        let (warm_payloads, warm_certificate, warm_identity) = companion_payload_fixture();
+        client
+            .signal_cache
+            .put_identity(&warm.to_protocol_address(), &warm_identity)
+            .await;
+        let generation = client.connection_generation.load(Ordering::Acquire);
+        let incoming = {
+            let client = client.clone();
+            let cold = cold.clone();
+            tokio::spawn(async move {
+                client
+                    .process_classified_message(
+                        ClassifiedMessage {
+                            device_identity: Some(certificate.into()),
+                            info: Arc::new(MessageInfo {
+                                id: "COLD_ADV_PREFLIGHT".into(),
+                                source: crate::types::message::MessageSource {
+                                    chat: cold.to_non_ad(),
+                                    sender: cold.clone(),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            }),
+                            sender_encryption_jid: cold,
+                            session_payloads: payloads,
+                            group_payloads: vec![],
+                            bot_payloads: vec![],
+                            max_sender_retry_count: 0,
+                            decrypt_fail_mode: crate::types::events::DecryptFailMode::Show,
+                            ack_recipient: None,
+                        },
+                        generation,
+                    )
+                    .await;
+            })
+        };
+        // Leave the real IQ unanswered. A warm message in another chat may
+        // now own the drain permits, even if its companion shares this account.
+        let _request = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let permits = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.acquire_message_quiescence(),
+        )
+        .await
+        .expect("cold ADV must leave every offline processing permit available");
+        assert!(
+            client
+                .validate_incoming_companion_identity(
+                    &warm,
+                    Some(&warm_certificate),
+                    &warm_identity,
+                )
+                .await
+                .is_ok()
+        );
+        let fence = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.lock_incoming_companion_account(&warm, Some(&warm_certificate), &warm_payloads),
+        )
+        .await
+        .expect("cold ADV must not own the warm companion's primary lock")
+        .unwrap();
+        assert!(
+            client
+                .cached_adv_account_identity(&cold)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            transport.sent_count(),
+            1,
+            "no ACK before trust/decrypt persistence"
+        );
+        drop(fence);
+        drop(permits);
+        incoming.abort();
+        assert!(incoming.await.unwrap_err().is_cancelled());
+        assert!(client.response_waiters_guard().is_empty());
+        client.signal_shutdown_sync();
+    }
+
+    /// A negative preflight can become valid before offline admission opens.
+    #[tokio::test]
+    async fn negative_adv_preflight_uses_recovered_trust_after_admission() {
+        use wacore::libsignal::protocol::KeyPair;
+        let client = crate::test_utils::create_test_client().await;
+        client.enter_drain_mode_for_tests();
+        let sender = Jid::pn_device("12025550129", 7);
+        let (payloads, certificate, _) = companion_payload_fixture();
+        let stale = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        client
+            .signal_cache
+            .put_identity(
+                &sender.with_device(0).to_protocol_address(),
+                stale.public_key.public_key_bytes(),
+            )
+            .await;
+        let permits = client.acquire_message_quiescence().await;
+        assert_eq!(
+            client
+                .preflight_incoming_companion_identity(&sender, Some(&certificate), &payloads,)
+                .await,
+            Some(0)
+        );
+        crate::test_utils::seed_adv_primary(&client, &sender).await;
+        drop(permits);
+        let _permit = client.acquire_message_processing_permit().await;
+        let _account = client.lock_companion_account(&sender).await;
+        assert_eq!(
+            client
+                .preflight_incoming_companion_identity_inner(
+                    &sender,
+                    Some(&certificate),
+                    &payloads,
+                    true,
+                )
+                .await,
+            None
+        );
+        client.signal_shutdown_sync();
     }
 
     #[tokio::test]

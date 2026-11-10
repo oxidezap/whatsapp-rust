@@ -1168,7 +1168,7 @@ impl Client {
         drop(node);
         let tx = self
             .inbound_queues()
-            .ack_queue
+            .ack_queue()
             .get_or_init(|| self.start_transport_ack_worker());
         let mut lease = crate::inbound_queue::reserve(&self.inbound_queues().ack, bytes.capacity());
         for _ in 0..crate::inbound_queue::SATURATION_RETRY_TURNS {
@@ -2924,6 +2924,54 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    /// Compare this diagnostic on the exact base and head with identical flags.
+    /// It constructs futures without polling them or opening a network session.
+    #[tokio::test]
+    #[ignore = "layout diagnostic: run on base and head with --ignored --nocapture"]
+    async fn audit_connected_retention_future_layouts() {
+        use std::mem::{size_of, size_of_val};
+        let client = crate::test_utils::create_test_client().await;
+        let shutdown = client.connection_shutdown_signal();
+        let node = crate::test_utils::node_to_owned_ref(&NodeBuilder::new("iq").build());
+        println!(
+            "QueueBudgets: {} bytes",
+            size_of::<crate::inbound_queue::QueueBudgets>()
+        );
+        println!(
+            "read_messages_loop: {} bytes",
+            size_of_val(&client.read_messages_loop())
+        );
+        println!(
+            "read_messages_loop_inner: {} bytes",
+            size_of_val(&client.read_messages_loop_inner())
+        );
+        println!(
+            "process_node_scoped: {} bytes",
+            size_of_val(&client.process_node_scoped(node.clone(), &shutdown, false))
+        );
+        println!(
+            "dispatch_node_scoped: {} bytes",
+            size_of_val(&client.dispatch_node_scoped(node, &shutdown, Some(StanzaTag::Iq), 0))
+        );
+        let reader_client = client.clone();
+        let reader = async move {
+            let connection = reader_client.connect().await?;
+            connection.read_until_disconnected().await;
+            Ok::<(), ConnectError>(())
+        };
+        println!(
+            "connected fixture reader task: {} bytes",
+            size_of_val(&reader)
+        );
+        drop(reader);
+        let primary = Jid::pn("12025550189");
+        println!(
+            "ensure_adv_account_identity: {} bytes",
+            size_of_val(&client.ensure_adv_account_identity(&primary))
+        );
+        client.signal_shutdown_sync();
+    }
+
     #[cfg(feature = "mobile-core")]
     use crate::test_utils::primary_startup_client;
 
@@ -3428,7 +3476,7 @@ mod tests {
         use wacore_binary::builder::NodeBuilder;
         let (client, _transport) = create_iq_test_client().await;
         let (tx, rx) = async_channel::bounded(1);
-        assert!(client.inbound_queues().ack_queue.set(tx).is_ok());
+        assert!(client.inbound_queues().ack_queue().set(tx).is_ok());
         let receipt = || {
             node_to_owned_ref(
                 &NodeBuilder::new("receipt")
@@ -3519,7 +3567,7 @@ mod tests {
         use wacore_binary::builder::NodeBuilder;
         let (client, _transport) = create_iq_test_client().await;
         let (tx, rx) = async_channel::bounded(1);
-        assert!(client.inbound_queues().ack_queue.set(tx).is_ok());
+        assert!(client.inbound_queues().ack_queue().set(tx).is_ok());
         let old = client.connection_shutdown_signal();
         client.reset_connection_shutdown();
         let receipt = node_to_owned_ref(
@@ -3576,7 +3624,7 @@ mod tests {
         use wacore_binary::builder::NodeBuilder;
         let (client, _transport) = create_iq_test_client().await;
         let (tx, rx) = async_channel::bounded(1);
-        assert!(client.inbound_queues().ack_queue.set(tx).is_ok());
+        assert!(client.inbound_queues().ack_queue().set(tx).is_ok());
         let receipt = || {
             node_to_owned_ref(
                 &NodeBuilder::new("receipt")
