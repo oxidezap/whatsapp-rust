@@ -47,7 +47,7 @@ struct Manifest {
     sdk_benchmark_sha256: [String; 2],
     sdk_fixture_sha256: String,
     identity_benchmark_sha256: String,
-    instruments: [String; 3],
+    instruments: [String; 2],
     expected_results: usize,
     order: Vec<(String, usize)>,
     revisions: Vec<Revision>,
@@ -465,31 +465,11 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
                 "--locked",
             ]))?;
         ensure_locked_dependencies(&item.checkout)?;
-        // Validate the SDK's modeled CPU/allocation results against real
-        // elapsed time on these same revisions and runner. The other suites
-        // retain their existing instrument set and workloads.
-        run(Command::new("cargo")
-            .current_dir(&item.checkout)
-            .env("CARGO_TARGET_DIR", &item.target)
-            .args([
-                "codspeed",
-                "build",
-                "-m",
-                "walltime",
-                "-p",
-                "whatsapp-rust",
-                "--features",
-                "bench-harness",
-                "--bench",
-                &item.sdk_bench,
-                "--locked",
-            ]))?;
-        ensure_locked_dependencies(&item.checkout)?;
     }
     write_json(
         &output.join("results/manifest.json"),
         &Manifest {
-            schema_version: 6,
+            schema_version: 7,
             measured_driver_revision: head.to_owned(),
             benchmark_sha256: sha256(&inputs[0].0),
             fixture_sha256: sha256(&inputs[0].1),
@@ -497,12 +477,8 @@ pub fn prepare(root: &Path, base: &str, head: &str, output: &Path) -> Result<()>
             sdk_benchmark_sha256: [sha256(&inputs[0].3), sha256(&inputs[0].4)],
             sdk_fixture_sha256: sha256(&inputs[0].5),
             identity_benchmark_sha256: sha256(&inputs[0].6),
-            instruments: [
-                "Simulation".to_owned(),
-                "Memory".to_owned(),
-                "WallTime".to_owned(),
-            ],
-            expected_results: 376,
+            instruments: ["Simulation".to_owned(), "Memory".to_owned()],
+            expected_results: 288,
             order: ORDER
                 .iter()
                 .map(|(role, round)| ((*role).to_owned(), *round))
@@ -519,13 +495,12 @@ pub fn measure(root: &Path, output: &Path) -> Result<()> {
     let manifest: Manifest =
         serde_json::from_slice(&std::fs::read(output.join("results/manifest.json"))?)?;
     ensure!(
-        manifest.schema_version == 6 && revision(root)? == manifest.measured_driver_revision,
+        manifest.schema_version == 7 && revision(root)? == manifest.measured_driver_revision,
         "measurement driver changed after preparation"
     );
     ensure!(
-        manifest.instruments == ["Simulation", "Memory", "WallTime"]
-            && manifest.expected_results == 376,
-        "paired CPU/allocation/walltime measurement contract changed"
+        manifest.instruments == ["Simulation", "Memory"] && manifest.expected_results == 288,
+        "paired CPU/allocation measurement contract changed"
     );
     ensure!(
         manifest.order
