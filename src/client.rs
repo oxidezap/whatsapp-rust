@@ -32,6 +32,7 @@ mod lifecycle;
 pub(crate) mod member_index;
 mod messaging;
 mod node_io;
+pub(crate) use node_io::PermitSuspension;
 mod notification_scope;
 pub(crate) use notification_scope::NotificationScope;
 pub(crate) mod offline_resume;
@@ -475,6 +476,79 @@ use crate::cache_config::RuntimeCacheConfig;
 use crate::socket::{NoiseSocket, SocketError, error::EncryptSendError};
 use crate::sync_task::MajorSyncTask;
 use wacore::runtime::Runtime;
+
+/// Cap on the auto-detected drain permit count: enough to keep several cores
+/// busy on decrypt+commit without letting a many-core host fan the drain out
+/// unboundedly — each in-flight stanza holds decode buffers and a lane slot.
+pub(crate) const MAX_OFFLINE_DRAIN_PERMITS: usize = 8;
+
+/// Resolve `ClientOptions::offline_drain_permits`: `0` picks one worker per
+/// available core, capped.
+pub(crate) fn resolve_offline_drain_permits(requested: usize) -> usize {
+    if requested == 0 {
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+            .clamp(1, MAX_OFFLINE_DRAIN_PERMITS)
+    } else {
+        requested.clamp(1, MAX_OFFLINE_DRAIN_PERMITS)
+    }
+}
+
+/// The message-processing semaphore plus the number of permits a full
+/// quiescence must hold. On the drain pool that is every permit — batch
+/// flushes and mode transitions need all stanzas out of decrypt; on the live
+/// semaphore it is one, because coalesced live flushes have no whole-cache
+/// invariant to guard.
+#[derive(Clone)]
+pub(crate) struct MessagePermitSemaphore(Arc<MessagePermitPool>);
+
+impl std::ops::Deref for MessagePermitSemaphore {
+    type Target = MessagePermitPool;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+pub(crate) struct MessagePermitPool {
+    pub(crate) semaphore: Arc<async_lock::Semaphore>,
+    pub(crate) quiesce_permits: usize,
+    /// Serialize partial acquisitions within this semaphore generation.
+    pub(crate) quiesce_lock: Mutex<()>,
+}
+
+impl MessagePermitSemaphore {
+    /// Semaphore for the offline drain: `permits` stanzas process concurrently
+    /// and a quiescence acquire takes all of them.
+    pub(crate) fn drain(permits: usize) -> Self {
+        Self(Arc::new(MessagePermitPool {
+            semaphore: Arc::new(async_lock::Semaphore::new(permits.max(1))),
+            quiesce_permits: permits.max(1),
+            quiesce_lock: Mutex::new(()),
+        }))
+    }
+
+    /// Live-mode semaphore: `permits` concurrent stanzas, but a quiescence
+    /// acquire takes just one — there is no whole-cache drain flush to guard.
+    pub(crate) fn live(permits: usize) -> Self {
+        Self(Arc::new(MessagePermitPool {
+            semaphore: Arc::new(async_lock::Semaphore::new(permits.max(1))),
+            quiesce_permits: 1,
+            quiesce_lock: Mutex::new(()),
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_acquire(&self) -> Option<async_lock::SemaphoreGuard<'_>> {
+        self.semaphore.try_acquire()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_acquire_arc(&self) -> Option<async_lock::SemaphoreGuardArc> {
+        self.semaphore.try_acquire_arc()
+    }
+}
 
 /// Per-chat lane for sequential message processing. Combines the enqueue lock
 /// and queue sender into a single cached entry (one lookup instead of two).
@@ -2071,11 +2145,18 @@ pub struct Client {
     /// and coalesced on the receive path (see `signal_flush.rs`).
     pub(crate) signal_cache: Arc<crate::store::signal_cache::SignalStoreCache>,
 
-    /// Limits message processing concurrency (1 permit during offline sync, N after).
-    /// Wrapped in Mutex to allow replacing on reconnect.
-    pub(crate) message_processing_semaphore: std::sync::Mutex<Arc<async_lock::Semaphore>>,
+    /// Limits message processing concurrency (`offline_drain_permits` during
+    /// offline sync, `MESSAGE_LIVE_PERMITS` after). The drain pool carries its
+    /// own quiescence width: a batch flush or mode transition must hold every
+    /// drain permit, not just one, so no stanza is mid-decrypt while the whole
+    /// Signal cache is persisted. Wrapped in Mutex to allow replacing on
+    /// reconnect.
+    pub(crate) message_processing_semaphore: std::sync::Mutex<MessagePermitSemaphore>,
     /// Bumped on every semaphore swap so stale Arc clones are rejected.
     pub(crate) message_semaphore_generation: AtomicU64,
+    /// Resolved from `ClientOptions::offline_drain_permits`: how many stanzas
+    /// may be mid-flight while the offline backlog drains.
+    pub(crate) offline_drain_permits: usize,
 
     /// Per-device session locks for Signal protocol operations.
     /// Prevents race conditions when multiple messages from the same sender

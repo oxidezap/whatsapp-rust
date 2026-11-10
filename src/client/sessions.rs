@@ -390,8 +390,8 @@ impl Client {
         // loop on that would starve IQ responses and pongs — a hook awaiting
         // any server round-trip would deadlock, and a merely slow hook would
         // trip the keepalive at the end of every drain. Ordering does not need
-        // the inline await: the single permit already serializes the finisher
-        // against stanza processing, so run it off-loop.
+        // the inline await: the finisher's full-quiescence acquire already
+        // serializes it against stanza processing, so run it off-loop.
         self.runtime
             .spawn(Box::pin(async move {
                 client.finish_offline_sync(count, generation).await;
@@ -406,7 +406,7 @@ impl Client {
     /// flag/semaphore/batcher touched by the old connection's finisher.
     async fn finish_offline_sync(self: &Arc<Self>, count: i32, generation: u64) {
         // Commit the drain tail and flip the batcher to live mode under the
-        // still-single processing permit (see flush_inbound_commits_under_permit
+        // full drain quiescence (see flush_inbound_commits_under_permit
         // for the raceless-transition argument), BEFORE widening the semaphore.
         // Receipts flush after, so every receipt's message is durably committed
         // first (WA Web's createSnapshot ordering).
@@ -448,9 +448,10 @@ impl Client {
     /// are back in the batcher unacked, and receipting SKDM/session state that
     /// never became durable would trade a redeliverable failure for a
     /// crash-permanent one. In that case the batcher stays in drain mode AND
-    /// the semaphore stays at one permit: the whole-cache flush inside a
+    /// the semaphore stays on the drain pool: the whole-cache flush inside a
     /// retry commit is only safe while no other stanza can be mid-decrypt
-    /// with unenqueued ratchet advances. The first durable flush completes
+    /// with unenqueued ratchet advances, which the full-quiescence acquire
+    /// still guarantees. The first durable flush completes
     /// the deferred transition (see `complete_deferred_live_transition`) and
     /// widens the semaphore then. `None` (upgrade-failure fallback) leaves
     /// the buffer alone for the connection-state reset to clear.
@@ -482,7 +483,7 @@ impl Client {
         }
         self.offline_sync_completed.store(true, Ordering::Release);
         if durable != Some(false) {
-            self.swap_message_semaphore(64);
+            self.swap_to_live_semaphore();
         }
         if let Some(false) = durable {
             log::warn!(

@@ -3,6 +3,72 @@ use crate::store::persistence_manager::PersistenceManager;
 use crate::store::signal_cache::SignalStoreCache;
 use async_trait::async_trait;
 use std::sync::Arc;
+
+/// A scoped, thread-local trust policy for current-thread crypto fixtures.
+/// Production deliberately trusts identities, so a real libsignal rejection
+/// otherwise cannot exercise receive-side recovery.
+#[cfg(test)]
+pub(crate) mod strict_identity_fixture {
+    use super::ProtocolAddress;
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+
+    struct Policy {
+        address: ProtocolAddress,
+        skip: usize,
+        rejected: Rc<Cell<bool>>,
+    }
+
+    thread_local! {
+        static POLICY: RefCell<Option<Policy>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct Rejection(Rc<Cell<bool>>);
+
+    impl Rejection {
+        pub(crate) fn after_checks(address: ProtocolAddress, skip: usize) -> Self {
+            let rejected = Rc::new(Cell::new(false));
+            POLICY.with_borrow_mut(|policy| {
+                assert!(policy.is_none());
+                *policy = Some(Policy {
+                    address,
+                    skip,
+                    rejected: rejected.clone(),
+                });
+            });
+            Self(rejected)
+        }
+
+        pub(crate) fn happened(&self) -> bool {
+            self.0.get()
+        }
+    }
+
+    impl Drop for Rejection {
+        fn drop(&mut self) {
+            POLICY.with_borrow_mut(|policy| *policy = None);
+        }
+    }
+
+    pub(super) fn reject(address: &ProtocolAddress) -> bool {
+        POLICY.with_borrow_mut(|policy| {
+            let Some(policy) = policy else {
+                return false;
+            };
+            if policy.address != *address || policy.rejected.get() {
+                return false;
+            }
+            if policy.skip > 0 {
+                policy.skip -= 1;
+                return false;
+            }
+            policy.rejected.set(true);
+            true
+        })
+    }
+}
 use wacore::libsignal::protocol::{
     Direction, IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore, PreKeyId,
     PreKeyRecord, PreKeyStore, ProtocolAddress, SessionCheckoutKey, SessionCheckoutStoreResult,
@@ -345,6 +411,10 @@ impl IdentityKeyStore for IdentityAdapter {
         _identity: &IdentityKey,
         _direction: Direction,
     ) -> Option<Result<bool, SignalProtocolError>> {
+        #[cfg(test)]
+        if strict_identity_fixture::reject(_address) {
+            return Some(Ok(false));
+        }
         Some(Ok(true))
     }
 
@@ -362,6 +432,10 @@ impl IdentityKeyStore for IdentityAdapter {
         _identity: &IdentityKey,
         _direction: Direction,
     ) -> Result<bool, SignalProtocolError> {
+        #[cfg(test)]
+        if strict_identity_fixture::reject(_address) {
+            return Ok(false);
+        }
         // WAWebProtocolStoreUnifiedApi.isTrustedIdentity always returns true;
         // identity changes surface via save_identity. Avoid acquiring the
         // device RwLock just to delegate to a stub — the read is acquired N
