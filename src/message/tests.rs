@@ -24339,15 +24339,33 @@ async fn untrusted_identity_reconnect_abandons_group_bot_and_receipts() {
     assert!(client.offline_receipt_buffer.lock().unwrap().is_empty());
 }
 
-async fn assert_untrusted_identity_prefix_without_hooks(offline: bool) {
+async fn assert_untrusted_identity_prefix(offline: bool, journal: bool) {
     use crate::store::signal_adapter::strict_identity_fixture::Rejection;
+    struct Hook;
+    #[async_trait::async_trait]
+    impl crate::InboundDurabilityHook for Hook {
+        async fn on_messages(
+            &self,
+            _: Arc<Client>,
+            _: &[wacore::types::events::InboundMessage],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
     let (client, transport) = capturing_client("untrusted_prefix_receipts").await;
     let (mut alice, bob) = identity_recovery_peer(&client).await;
+    if journal {
+        client
+            .inbound_durability_hook
+            .set(Arc::new(Hook))
+            .ok()
+            .unwrap();
+    }
     if !offline {
         let generation = client.connection_generation.load(Ordering::Acquire);
         assert!(client.finish_inbound_commit_drain(generation).await);
     }
-    assert!(!client.inbound_journal_enabled());
+    assert_eq!(client.inbound_journal_enabled(), journal);
     let first = alice.encrypt_text(&bob, "visible successful prefix").await;
     let rejected = alice.encrypt_text(&bob, "retry this payload").await;
     let remaining = alice
@@ -24378,6 +24396,40 @@ async fn assert_untrusted_identity_prefix_without_hooks(offline: bool) {
     )
     .await;
     assert!(rejection.happened());
+    let queued_charge = if journal && offline {
+        let retention = &client.inbound_commit_batch.live_retention;
+        let mut retained = retention.for_message(&info).unwrap();
+        assert_eq!(retained.len(), 1, "only the successful prefix is retained");
+        let replay = retained.pop().unwrap();
+        let charge = replay
+            .retention
+            .as_ref()
+            .expect("prefix owns its admission");
+        assert!(Arc::ptr_eq(
+            charge,
+            &retention.charge_for_origin(replay.origin).unwrap()
+        ));
+        let weak = Arc::downgrade(charge);
+        assert!(matches!(
+            client.commit_or_batch_pending(replay, false).await,
+            InboundCommitState::Deferred(_)
+        ));
+        assert!(
+            weak.upgrade().is_some(),
+            "queued replay keeps its admission charged"
+        );
+        let pressure = retention.occupy_remaining_for_tests();
+        assert!(
+            retention
+                .reserve(raw_pending::StanzaOrigin::new(), 1, 1)
+                .is_err(),
+            "the queued prefix charge participates in bounded admission"
+        );
+        drop(pressure);
+        Some(weak)
+    } else {
+        None
+    };
     if offline {
         let generation = client.connection_generation.load(Ordering::Acquire);
         assert!(
@@ -24386,9 +24438,13 @@ async fn assert_untrusted_identity_prefix_without_hooks(offline: bool) {
                 .await
         );
     }
-    for _ in 0..20 {
-        tokio::task::yield_now().await;
-    }
+    assert_eq!(
+        client
+            .outbound_flush
+            .flush(&*client.runtime, std::time::Duration::from_secs(5))
+            .await,
+        crate::flush_scope::DrainOutcome::Completed
+    );
     assert_eq!(
         delivery_receipts_for(&transport.sent(), "IDENTITY_PREFIX"),
         0,
@@ -24402,6 +24458,12 @@ async fn assert_untrusted_identity_prefix_without_hooks(offline: bool) {
         .filter_map(|message| message.message.conversation.as_deref())
         .collect();
     assert_eq!(texts, vec!["visible successful prefix"]);
+    if let Some(charge) = queued_charge {
+        assert!(
+            charge.upgrade().is_none(),
+            "durable prefix commit releases its admission"
+        );
+    }
     assert_eq!(
         recorder.failures(),
         vec![
@@ -24431,11 +24493,16 @@ async fn assert_untrusted_identity_prefix_without_hooks(offline: bool) {
                 .await
         );
     }
-    for _ in 0..20 {
-        tokio::task::yield_now().await;
-    }
-    assert!(
-        delivery_receipts_for(&transport.sent(), "IDENTITY_PREFIX") > 0,
+    assert_eq!(
+        client
+            .outbound_flush
+            .flush(&*client.runtime, std::time::Duration::from_secs(5))
+            .await,
+        crate::flush_scope::DrainOutcome::Completed
+    );
+    assert_eq!(
+        delivery_receipts_for(&transport.sent(), "IDENTITY_PREFIX"),
+        if offline || journal { 1 } else { 2 },
         "a complete redelivery must authorize the stanza receipt"
     );
     let events = collector.events();
@@ -24456,10 +24523,15 @@ async fn assert_untrusted_identity_prefix_without_hooks(offline: bool) {
 
 #[tokio::test]
 async fn untrusted_identity_projects_successful_prefix_without_hooks_offline() {
-    assert_untrusted_identity_prefix_without_hooks(true).await;
+    assert_untrusted_identity_prefix(true, false).await;
 }
 
 #[tokio::test]
 async fn untrusted_identity_projects_successful_prefix_without_hooks_live() {
-    assert_untrusted_identity_prefix_without_hooks(false).await;
+    assert_untrusted_identity_prefix(false, false).await;
+}
+
+#[tokio::test]
+async fn untrusted_identity_journal_prefix_replay_keeps_admission_and_withholds_receipt() {
+    assert_untrusted_identity_prefix(true, true).await;
 }
