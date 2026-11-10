@@ -68,6 +68,7 @@ impl StanzaHandler for CallHandler {
         feature = "tracing",
         tracing::instrument(name = "wa.recv.call", level = "debug", skip_all)
     )]
+    /// Parses call signaling, authenticates control updates, and publishes current-call events.
     async fn handle(
         &self,
         client: Arc<Client>,
@@ -1353,12 +1354,12 @@ async fn direct_screen_share_peer(
             .group_state_if_current(call_id, generation)
             .is_some()
         || is_call_service_sender(&call.from, call_id)
+        // Direct peer envelopes cannot delegate sender identity through participant metadata.
+        || call.participant.is_some()
     {
         return None;
     }
-    let session = registry
-        .snapshot(call_id)
-        .filter(|_| registry.is_current(call_id, generation))?;
+    let session = registry.snapshot_if_current(call_id, generation)?;
     if state == ScreenShareState::Started && !session.is_video {
         return None;
     }
@@ -1368,12 +1369,9 @@ async fn direct_screen_share_peer(
         &session.call_creator,
     )
     .await?;
-    let peer = crate::voip::direct_ingress::canonical_call_identity(
-        client,
-        &routed_call_sender(call),
-        &session.peer_jid,
-    )
-    .await?;
+    let peer =
+        crate::voip::direct_ingress::canonical_call_identity(client, &call.from, &session.peer_jid)
+            .await?;
     Some((generation, peer))
 }
 
@@ -3859,6 +3857,7 @@ mod tests {
 
     #[cfg(feature = "voip-control")]
     #[tokio::test]
+    /// Only the authenticated direct peer may announce screen sharing.
     async fn a_one_to_one_peer_screen_share_reaches_the_call_events() {
         use wacore::voip_control::CallEvent;
 
@@ -3894,18 +3893,20 @@ mod tests {
                 .build()
         };
         let outsider = Jid::new("333333333333333", Server::Lid);
-        for (from, id) in [
-            (outsider, "STANZA-ID-0003"),
-            (fake_caller_lid(), "STANZA-ID-0004"),
+        for (from, participant, id) in [
+            (outsider.clone(), None, "STANZA-ID-0003"),
+            (outsider, Some(fake_caller_lid()), "STANZA-ID-0005"),
+            (fake_caller_lid(), Some(fake_caller_lid()), "STANZA-ID-0006"),
+            (fake_caller_lid(), None, "STANZA-ID-0004"),
         ] {
+            let mut node = share(from, id);
+            if let Some(participant) = participant {
+                node.attrs.insert("participant", participant);
+            }
             let mut cancelled = false;
             assert!(
                 CallHandler
-                    .handle(
-                        client.clone(),
-                        node_to_owned_ref(&share(from, id)),
-                        &mut cancelled
-                    )
+                    .handle(client.clone(), node_to_owned_ref(&node), &mut cancelled)
                     .await
             );
         }
