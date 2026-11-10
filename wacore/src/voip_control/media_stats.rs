@@ -457,6 +457,9 @@ fn window_delta(now: &CallMediaStats, then: &CallMediaStats) -> CallMediaStats {
         video_packets_skipped: now
             .video_packets_skipped
             .saturating_sub(then.video_packets_skipped),
+        video_packets_late: now
+            .video_packets_late
+            .saturating_sub(then.video_packets_late),
         video_fec_sent: now.video_fec_sent.saturating_sub(then.video_fec_sent),
         video_fec_bytes_sent: now
             .video_fec_bytes_sent

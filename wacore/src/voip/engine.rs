@@ -982,9 +982,6 @@ impl VideoPlaneState {
     }
 }
 
-/// Add one packet's reassembly counters to the call's totals. Taken per packet rather than read from
-/// the pipeline at report time because the video plane can be rebuilt mid-call, and its counters
-/// with it.
 /// Hand completed pictures to the application, noting a keyframe that ends a loss.
 fn play_out_video(
     outbox: &mut VecDeque<Output>,
@@ -1016,6 +1013,9 @@ fn play_out_video(
     }
 }
 
+/// Add one packet's reassembly counters to the call's totals. Taken per packet rather than read from
+/// the pipeline at report time because the video plane can be rebuilt mid-call, and its counters
+/// with it.
 fn fold_video_reassembly(stats: &mut CallMediaStats, r: &VideoReassemblyStats) {
     let d = &r.depacketizer;
     for (total, delta) in [
@@ -1089,6 +1089,7 @@ fn fold_video_reassembly(stats: &mut CallMediaStats, r: &VideoReassemblyStats) {
         (&mut stats.video_fec_rejected, r.fec.recovered_rejected),
         (&mut stats.video_gaps_skipped, r.fec.gaps_skipped),
         (&mut stats.video_packets_skipped, r.fec.packets_skipped),
+        (&mut stats.video_packets_late, r.fec.packets_late),
     ] {
         *total = total.saturating_add(delta);
     }
@@ -2514,6 +2515,15 @@ impl CallEngine {
             {
                 next = next.min(deadline);
             }
+            if self.group.is_none()
+                && let Some(deadline) = m
+                    .video
+                    .as_ref()
+                    .filter(|v| v.active)
+                    .and_then(|v| v.pipe.video_hold_deadline())
+            {
+                next = next.min(deadline);
+            }
             // The health watchdog needs its own tick: its whole job is to fire when nothing else
             // is happening, so it cannot ride on a timer that inbound media drives.
             next = next.min(self.health.deadline());
@@ -2608,6 +2618,7 @@ impl CallEngine {
                 self.outbox.push_back(Output::Playout(frame));
             }
         }
+        self.expire_video_hold(now);
         if self.started && self.allocated && self.media.is_some() && now >= self.rtcp_deadline {
             self.emit_sender_reports(now, self.rtcp_wallclock_at(now));
             self.rtcp_deadline = next_tick(self.rtcp_deadline, now, RTCP_MS);
@@ -3317,6 +3328,7 @@ impl CallEngine {
             if let Some(audio) = piggybacked {
                 self.on_piggybacked_audio(now, &audio);
             }
+            self.play_recovered_audio(now);
             if video_lost > 0 {
                 self.media_stats.video_rtp_lost = self
                     .media_stats
@@ -3393,6 +3405,7 @@ impl CallEngine {
             if unrepaired {
                 self.request_peer_keyframe(now, KeyframeUrgency::Coalesced);
             }
+            self.play_recovered_audio(now);
             if let Some(audio) = piggybacked {
                 // This packet was already counted as an arrival above.
                 self.on_piggybacked_audio(now, &audio);
@@ -3422,6 +3435,48 @@ impl CallEngine {
     /// one: it is plain RTP, header and payload, with no tag of its own. From here it is audio like
     /// any other and takes the same gate and the same decode. The caller has already counted
     /// the carrier as an audio arrival, before authentication.
+    /// Audio that rode on video packets rebuilt from the peer's repair packets: it was lost with
+    /// its carrier and is only recovered now. It passes the same replay check as any carried audio.
+    fn play_recovered_audio(&mut self, now: Millis) {
+        let recovered = self
+            .media
+            .as_mut()
+            .and_then(|m| m.video.as_mut())
+            .map(|v| v.pipe.take_recovered_audio())
+            .unwrap_or_default();
+        for audio in recovered {
+            self.on_piggybacked_audio(now, &audio);
+        }
+    }
+
+    /// Give up on held video whose hold ran out though no packet arrived to notice: the peer may
+    /// have paused, and the picture behind the gap must not wait for its next packet.
+    fn expire_video_hold(&mut self, now: Millis) {
+        if self.group.is_some() {
+            return;
+        }
+        let Some(m) = self.media.as_mut() else {
+            return;
+        };
+        let Some(v) = m.video.as_mut().filter(|v| v.active) else {
+            return;
+        };
+        if v.pipe
+            .video_hold_deadline()
+            .is_none_or(|deadline| now < deadline)
+        {
+            return;
+        }
+        let completed = v.pipe.poll_video_hold(now);
+        play_out_video(&mut self.outbox, v, completed, self.peer_video_orientation);
+        let reassembly = v.pipe.take_reassembly_stats();
+        fold_video_reassembly(&mut self.media_stats, &reassembly);
+        self.play_recovered_audio(now);
+        if reassembly.fec.gaps_skipped > 0 {
+            self.request_peer_keyframe(now, KeyframeUrgency::Coalesced);
+        }
+    }
+
     fn on_piggybacked_audio(&mut self, now: Millis, packet: &[u8]) {
         let Some(header) = parse_rtp_header(packet) else {
             // What it was carried by authenticated, so this is a sender writing a piggyback this
@@ -10510,12 +10565,14 @@ mod tests {
         assert_eq!(summary.report_blocks[0].profile_extension, expected);
         assert!(summary.uses_whatsapp_profile_extension);
 
+        // A held video gap the timer gives up on also asks for a keyframe from the same SSRC.
         let check_report = |outputs: &[Output], local_ssrc, bytes: u32, rate: u32| {
             let packet = outputs
                 .iter()
                 .find_map(|output| match output {
                     Output::Transmit(packet)
-                        if parse_rtcp_sender_ssrc(packet) == Some(local_ssrc) =>
+                        if parse_rtcp_sender_ssrc(packet) == Some(local_ssrc)
+                            && packet.get(1) == Some(&RTCP_PT_SR) =>
                     {
                         Some(packet)
                     }
@@ -10841,6 +10898,9 @@ mod tests {
         for (at, packet) in (300..).zip(&next) {
             eng.handle_input(at, Input::RelayPacket(packet));
         }
+        // Not yet: a repair packet may still rebuild them. Asked once the hold gives up.
+        assert!(peer_keyframe_requests(&mut eng, &call_key, local_video_ssrc).is_empty());
+        eng.handle_input(301 + crate::voip::fec_receive::HOLD_MS, Input::Timeout);
         assert_eq!(
             peer_keyframe_requests(&mut eng, &call_key, local_video_ssrc).len(),
             1
@@ -10849,7 +10909,7 @@ mod tests {
 
         // One of them turning up late is not a new loss, and a second gap within
         // the interval is the same burst: counted, but not asked about again.
-        eng.handle_input(400, Input::RelayPacket(&late));
+        eng.handle_input(450, Input::RelayPacket(&late));
         let mut after = packets(2);
         after.remove(0);
         eng.handle_input(500, Input::RelayPacket(&after[0]));
@@ -10868,6 +10928,10 @@ mod tests {
         }
         for packet in peer.protect_video(&video_delta_au(100)) {
             eng.handle_input(now, Input::RelayPacket(&packet));
+        }
+        if gap > 0 {
+            // The packets behind the gap wait for it to be filled; nothing fills it.
+            eng.handle_input(now + crate::voip::fec_receive::HOLD_MS, Input::Timeout);
         }
     }
 
@@ -10907,6 +10971,30 @@ mod tests {
         assert_eq!(stats.video_ssrc_switches, 0);
         let report = format!("{stats:?}");
         assert!(report.contains("video_fu_dropped_sequence_gap: 1"));
+    }
+
+    // The peer's camera may pause right after a gap: the picture held behind it comes out on the
+    // engine's own timer, and the gap is asked about, though no further packet arrives.
+    #[test]
+    fn held_video_is_released_on_the_timer() {
+        use crate::voip::fec_receive::HOLD_MS;
+        let (mut eng, mut peer) = video_engine_with_inbound_stream();
+        let _ = drain(&mut eng);
+        peer.protect_video(&video_delta_au(100));
+        for packet in peer.protect_video(&video_delta_au(100)) {
+            eng.handle_input(300, Input::RelayPacket(&packet));
+        }
+        let (outputs, _) = drain(&mut eng);
+        assert!(!outputs.iter().any(|o| matches!(o, Output::VideoPlayout(_))));
+        assert!(eng.poll_timeout().is_some_and(|at| at <= 300 + HOLD_MS));
+        eng.handle_input(300 + HOLD_MS, Input::Timeout);
+        let (outputs, _) = drain(&mut eng);
+        assert!(outputs.iter().any(|o| matches!(o, Output::VideoPlayout(_))));
+        let stats = eng.media_stats();
+        assert_eq!(
+            (stats.video_gaps_skipped, stats.peer_keyframe_requests),
+            (1, 1)
+        );
     }
 
     #[test]

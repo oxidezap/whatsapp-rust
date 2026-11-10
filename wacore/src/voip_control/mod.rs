@@ -722,6 +722,10 @@ pub struct MediaStats {
     /// Video packets in those gaps.
     #[builder(default)]
     pub video_packets_skipped: u32,
+    /// Video packets that arrived behind what reassembly already took -- a repeat, an original
+    /// already rebuilt from a repair, or one whose gap was skipped -- and were dropped.
+    #[builder(default)]
+    pub video_packets_late: u32,
     /// Video FEC packets we sent (see [`VideoFecConfig`]). Not kept for retransmission.
     #[builder(default)]
     pub video_fec_sent: u32,

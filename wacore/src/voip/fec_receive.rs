@@ -16,14 +16,18 @@ use std::collections::VecDeque;
 use super::fec::{FecHeader, recover_packet};
 use super::rtp::{RTP_PAYLOAD_TYPE_H264, rtp_header_byte_length};
 
-/// How long packets wait behind a gap for the packet that fills it. A repair packet follows the
-/// span it closes, which for small pictures can be the next picture's; 100 ms covers that at the
-/// frame rates WhatsApp sends, and is only ever spent while a gap is open.
-const HOLD_MS: u64 = 100;
-/// Packets held behind one gap at most, so a burst cannot grow the hold without bound.
+/// How long a packet waits behind a gap for the packet that fills it, counted from its own
+/// arrival. A repair packet follows the span it closes, which for small pictures can be the next
+/// picture's; 100 ms covers that at the frame rates WhatsApp sends, and is only ever spent while a
+/// gap is open.
+pub(crate) const HOLD_MS: u64 = 100;
+/// Packets held behind gaps at most, so a burst cannot grow the hold without bound.
 const HOLD_MAX: usize = 128;
 /// Packets kept for rebuilding: well past the widest span a repair packet's mask names.
 const RECENT_MAX: usize = 256;
+/// Repair packets kept while two or more of their packets are still missing, waiting for a late
+/// one to arrive so a single parity can rebuild the other.
+const PENDING_MAX: usize = 32;
 /// A forward jump this far is a restarted stream, not a gap worth waiting on.
 const RESTART_JUMP: i16 = 1000;
 
@@ -39,16 +43,40 @@ pub struct InboundFecStats {
     pub parity_matched: u32,
     /// The same, with parity that did not match. Recovery cannot work while these dominate.
     pub parity_mismatched: u32,
-    /// Repair packets with two or more of their group missing, which one parity cannot rebuild.
+    /// Repair packets given up on with two or more of their group still missing, which one parity
+    /// cannot rebuild.
     pub repairs_insufficient: u32,
     /// Repair packets whose one missing packet was no longer wanted: already skipped.
     pub repairs_late: u32,
     /// Rebuilt packets that did not look like the video packet they replace, and were dropped.
     pub recovered_rejected: u32,
-    /// Gaps given up on: the hold ran out with the packet still missing.
+    /// Gaps given up on: the hold ran out with the packet still missing, or the stream jumped
+    /// past it.
     pub gaps_skipped: u32,
     /// Packets in those gaps.
     pub packets_skipped: u32,
+    /// Packets that arrived behind what was already handed on -- a repeat, an original already
+    /// rebuilt, or one whose gap was skipped -- and were dropped. Reassembly has moved past them,
+    /// and an old fragment fed to it cuts off the NAL it is rebuilding.
+    pub packets_late: u32,
+}
+
+/// A packet handed on to reassembly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Released {
+    /// Plaintext: the header as it arrived, then the whole decrypted payload.
+    pub packet: Vec<u8>,
+    /// Rebuilt from a repair packet rather than received. Its piggybacked audio was never
+    /// delivered, unlike a received packet's, which went on arrival.
+    pub rebuilt: bool,
+}
+
+struct Held {
+    sequence: u16,
+    packet: Vec<u8>,
+    rebuilt: bool,
+    /// When it started waiting.
+    since: u64,
 }
 
 /// Holds inbound video packets behind a sequence gap and rebuilds lost ones from repair packets.
@@ -56,18 +84,26 @@ pub struct InboundFecStats {
 pub struct InboundFec {
     /// The next sequence number reassembly expects, once a packet has arrived.
     expected: Option<u16>,
-    /// Packets after the gap, ordered by sequence number.
-    held: Vec<(u16, Vec<u8>)>,
-    /// When the current gap opened.
-    gap_since: Option<u64>,
+    /// Packets after a gap, ordered by sequence number.
+    held: Vec<Held>,
     /// Recent packets of the stream, newest last, for rebuilding.
     recent: VecDeque<(u16, Vec<u8>)>,
+    /// Repair packets still short of a packet, with when each arrived.
+    pending: VecDeque<(u64, Vec<u8>)>,
     stats: InboundFecStats,
 }
 
 /// Signed distance from `from` to `to`, across the sequence number wrap.
 fn distance(from: u16, to: u16) -> i16 {
     to.wrapping_sub(from) as i16
+}
+
+/// What one attempt to rebuild from a repair packet came to.
+enum Attempt {
+    /// Nothing more it can do: used, checked, or not wanted.
+    Done,
+    /// Still two or more short; worth another try when a packet arrives.
+    Short,
 }
 
 impl InboundFec {
@@ -82,54 +118,129 @@ impl InboundFec {
         std::mem::take(&mut self.stats)
     }
 
-    /// One video packet arrived. Returns the packets reassembly may take now, in order.
-    pub fn arrive(&mut self, now: u64, sequence: u16, packet: Vec<u8>) -> Vec<Vec<u8>> {
-        self.remember(sequence, &packet);
+    /// When the oldest held packet's hold runs out, if one is held: [`Self::poll`] is due then.
+    #[must_use]
+    pub fn deadline(&self) -> Option<u64> {
+        self.held
+            .iter()
+            .map(|held| held.since)
+            .min()
+            .map(|since| since.saturating_add(HOLD_MS))
+    }
+
+    /// Give up on gaps whose hold ran out though nothing arrived since. Returns the packets
+    /// reassembly may take now, in order.
+    pub fn poll(&mut self, now: u64) -> Vec<Released> {
         let mut ready = Vec::new();
-        match self.expected {
-            None => {
-                self.expected = Some(sequence.wrapping_add(1));
-                ready.push(packet);
-            }
-            Some(expected) => {
-                let ahead = distance(expected, sequence);
-                if ahead == 0 {
-                    ready.push(packet);
-                    self.expected = Some(sequence.wrapping_add(1));
-                    self.drain(&mut ready);
-                } else if ahead < 0 {
-                    // Late or repeated: reassembly decides what an old packet is worth.
-                    ready.push(packet);
-                } else if ahead >= RESTART_JUMP {
-                    self.release_all(&mut ready);
-                    ready.push(packet);
-                    self.expected = Some(sequence.wrapping_add(1));
-                } else {
-                    self.hold(now, sequence, packet);
-                }
-            }
-        }
+        self.expire(now, &mut ready);
+        ready
+    }
+
+    /// One video packet arrived. Returns the packets reassembly may take now, in order.
+    pub fn arrive(&mut self, now: u64, sequence: u16, packet: Vec<u8>) -> Vec<Released> {
+        let mut ready = Vec::new();
+        self.place(now, sequence, packet, false, &mut ready);
+        self.retry_pending(now, &mut ready);
         self.expire(now, &mut ready);
         ready
     }
 
     /// One repair packet arrived, already decrypted, for the stream `ssrc`. Returns the packets
     /// reassembly may take now, the rebuilt one among them.
-    pub fn repair(&mut self, now: u64, ssrc: u32, payload: &[u8]) -> Vec<Vec<u8>> {
+    pub fn repair(&mut self, now: u64, ssrc: u32, payload: &[u8]) -> Vec<Released> {
         let mut ready = Vec::new();
         if let Some((header, _)) = FecHeader::parse(payload)
             && header.protected_ssrc == ssrc
         {
             self.stats.repairs_received = self.stats.repairs_received.saturating_add(1);
-            if let Some((sequence, packet)) = self.rebuild(&header, payload) {
-                ready = self.arrive(now, sequence, packet);
+            if let Attempt::Short = self.attempt(now, payload, true, &mut ready) {
+                if self.pending.len() == PENDING_MAX {
+                    self.pending.pop_front();
+                    self.stats.repairs_insufficient =
+                        self.stats.repairs_insufficient.saturating_add(1);
+                }
+                self.pending.push_back((now, payload.to_vec()));
             }
+            self.retry_pending(now, &mut ready);
         }
         self.expire(now, &mut ready);
         ready
     }
 
-    fn rebuild(&mut self, header: &FecHeader, payload: &[u8]) -> Option<(u16, Vec<u8>)> {
+    /// A received or rebuilt packet: handed on if it is next, held behind a gap, or dropped if
+    /// reassembly is already past it.
+    fn place(
+        &mut self,
+        now: u64,
+        sequence: u16,
+        packet: Vec<u8>,
+        rebuilt: bool,
+        ready: &mut Vec<Released>,
+    ) {
+        self.remember(sequence, &packet);
+        let Some(expected) = self.expected else {
+            self.expected = Some(sequence.wrapping_add(1));
+            ready.push(Released { packet, rebuilt });
+            return;
+        };
+        let ahead = distance(expected, sequence);
+        if ahead == 0 {
+            ready.push(Released { packet, rebuilt });
+            self.expected = Some(sequence.wrapping_add(1));
+            self.drain(ready);
+        } else if ahead < 0 {
+            // Kept above for parity checks; reassembly has moved past it.
+            self.stats.packets_late = self.stats.packets_late.saturating_add(1);
+        } else if ahead >= RESTART_JUMP {
+            // The stream restarted rather than paused: nothing is worth waiting for, but the
+            // packets it skipped are as lost as an expired gap's, and are counted as one.
+            self.stats.gaps_skipped = self.stats.gaps_skipped.saturating_add(1);
+            self.stats.packets_skipped = self
+                .stats
+                .packets_skipped
+                .saturating_add((ahead as u32).saturating_sub(self.held.len() as u32));
+            ready.extend(self.held.drain(..).map(|held| Released {
+                packet: held.packet,
+                rebuilt: held.rebuilt,
+            }));
+            ready.push(Released { packet, rebuilt });
+            self.expected = Some(sequence.wrapping_add(1));
+        } else {
+            let at = self
+                .held
+                .partition_point(|held| distance(expected, held.sequence) < ahead);
+            if self
+                .held
+                .get(at)
+                .is_some_and(|held| held.sequence == sequence)
+            {
+                self.stats.packets_late = self.stats.packets_late.saturating_add(1);
+                return;
+            }
+            self.held.insert(
+                at,
+                Held {
+                    sequence,
+                    packet,
+                    rebuilt,
+                    since: now,
+                },
+            );
+        }
+    }
+
+    /// Rebuild from a repair packet if exactly one of its group is missing. `first` is its
+    /// arrival; later attempts are retries of one already counted.
+    fn attempt(
+        &mut self,
+        now: u64,
+        payload: &[u8],
+        first: bool,
+        ready: &mut Vec<Released>,
+    ) -> Attempt {
+        let Some((header, _)) = FecHeader::parse(payload) else {
+            return Attempt::Done;
+        };
         let mut group = Vec::new();
         let mut missing = Vec::new();
         for sequence in header.protected() {
@@ -138,40 +249,70 @@ impl InboundFec {
                 None => missing.push(sequence),
             }
         }
+        let expected = self.expected;
+        let wanted =
+            |sequence: u16| expected.is_some_and(|expected| distance(expected, sequence) >= 0);
         match missing.as_slice() {
             [] => {
-                // Nothing to rebuild: check the parity instead, by rebuilding one we have.
-                let matched = group.split_first().is_some_and(|(first, rest)| {
-                    recover_packet(payload, rest).is_some_and(|rebuilt| rebuilt == *first)
-                });
-                let counter = if matched {
-                    &mut self.stats.parity_matched
-                } else {
-                    &mut self.stats.parity_mismatched
-                };
-                *counter = counter.saturating_add(1);
-                None
+                if first {
+                    // Nothing to rebuild: check the parity instead, by rebuilding one we have.
+                    let matched = group.split_first().is_some_and(|(first, rest)| {
+                        recover_packet(payload, rest).is_some_and(|rebuilt| rebuilt == *first)
+                    });
+                    let counter = if matched {
+                        &mut self.stats.parity_matched
+                    } else {
+                        &mut self.stats.parity_mismatched
+                    };
+                    *counter = counter.saturating_add(1);
+                }
+                Attempt::Done
             }
             [lost] => {
-                let wanted = self
-                    .expected
-                    .is_some_and(|expected| distance(expected, *lost) >= 0);
-                if !wanted {
+                let lost = *lost;
+                if !wanted(lost) {
                     self.stats.repairs_late = self.stats.repairs_late.saturating_add(1);
-                    return None;
+                    return Attempt::Done;
                 }
                 let rebuilt = recover_packet(payload, &group)
-                    .filter(|packet| plausible(packet, *lost, header.protected_ssrc));
-                if rebuilt.is_none() {
-                    self.stats.recovered_rejected = self.stats.recovered_rejected.saturating_add(1);
-                    return None;
+                    .filter(|packet| plausible(packet, lost, header.protected_ssrc));
+                match rebuilt {
+                    Some(packet) => {
+                        self.stats.packets_recovered =
+                            self.stats.packets_recovered.saturating_add(1);
+                        self.place(now, lost, packet, true, ready);
+                    }
+                    None => {
+                        self.stats.recovered_rejected =
+                            self.stats.recovered_rejected.saturating_add(1);
+                    }
                 }
-                self.stats.packets_recovered = self.stats.packets_recovered.saturating_add(1);
-                rebuilt.map(|packet| (*lost, packet))
+                Attempt::Done
             }
+            several if several.iter().any(|sequence| wanted(*sequence)) => Attempt::Short,
             _ => {
-                self.stats.repairs_insufficient = self.stats.repairs_insufficient.saturating_add(1);
-                None
+                self.stats.repairs_late = self.stats.repairs_late.saturating_add(1);
+                Attempt::Done
+            }
+        }
+    }
+
+    /// Try the waiting repair packets again, until none rebuilds anything more.
+    fn retry_pending(&mut self, now: u64, ready: &mut Vec<Released>) {
+        loop {
+            let recovered = self.stats.packets_recovered;
+            let mut index = 0;
+            while index < self.pending.len() {
+                let payload = std::mem::take(&mut self.pending[index].1);
+                if let Attempt::Short = self.attempt(now, &payload, false, ready) {
+                    self.pending[index].1 = payload;
+                    index += 1;
+                } else {
+                    self.pending.remove(index);
+                }
+            }
+            if self.stats.packets_recovered == recovered {
+                break;
             }
         }
     }
@@ -186,58 +327,48 @@ impl InboundFec {
         self.recent.push_back((sequence, packet.to_vec()));
     }
 
-    fn hold(&mut self, now: u64, sequence: u16, packet: Vec<u8>) {
-        let Some(expected) = self.expected else {
-            return;
-        };
-        let ahead = distance(expected, sequence);
-        let at = self
-            .held
-            .partition_point(|(kept, _)| distance(expected, *kept) < ahead);
-        if self.held.get(at).is_some_and(|(kept, _)| *kept == sequence) {
-            return;
-        }
-        self.held.insert(at, (sequence, packet));
-        self.gap_since.get_or_insert(now);
-    }
-
     /// Hand on the held packets that now follow without a gap.
-    fn drain(&mut self, ready: &mut Vec<Vec<u8>>) {
+    fn drain(&mut self, ready: &mut Vec<Released>) {
         while let Some(expected) = self.expected
-            && self.held.first().is_some_and(|(kept, _)| *kept == expected)
+            && self
+                .held
+                .first()
+                .is_some_and(|held| held.sequence == expected)
         {
-            let (_, packet) = self.held.remove(0);
-            ready.push(packet);
+            let held = self.held.remove(0);
+            ready.push(Released {
+                packet: held.packet,
+                rebuilt: held.rebuilt,
+            });
             self.expected = Some(expected.wrapping_add(1));
         }
-        if self.held.is_empty() {
-            self.gap_since = None;
-        }
     }
 
-    /// Give up on gaps that have waited too long, or that hold too much behind them.
-    fn expire(&mut self, now: u64, ready: &mut Vec<Vec<u8>>) {
-        while let (Some(expected), Some(since), Some((first, _))) =
-            (self.expected, self.gap_since, self.held.first())
+    /// Give up on gaps once the oldest packet behind them has waited its hold, or too much is
+    /// held; and on repair packets that waited as long. Each packet waits from its own arrival,
+    /// so several gaps in a row do not add their holds up.
+    fn expire(&mut self, now: u64, ready: &mut Vec<Released>) {
+        while let Some(deadline) = self.deadline()
+            && let Some(expected) = self.expected
+            && let Some(first) = self.held.first().map(|held| held.sequence)
         {
-            if now.saturating_sub(since) < HOLD_MS && self.held.len() <= HOLD_MAX {
+            if now < deadline && self.held.len() <= HOLD_MAX {
                 break;
             }
-            let skipped = distance(expected, *first).max(0) as u32;
+            let skipped = distance(expected, first).max(0) as u32;
             self.stats.gaps_skipped = self.stats.gaps_skipped.saturating_add(1);
             self.stats.packets_skipped = self.stats.packets_skipped.saturating_add(skipped);
-            self.expected = Some(*first);
+            self.expected = Some(first);
             self.drain(ready);
-            if !self.held.is_empty() {
-                // The next gap waits from now: its packets were only held because of this one.
-                self.gap_since = Some(now);
-            }
         }
-    }
-
-    fn release_all(&mut self, ready: &mut Vec<Vec<u8>>) {
-        ready.extend(self.held.drain(..).map(|(_, packet)| packet));
-        self.gap_since = None;
+        while self
+            .pending
+            .front()
+            .is_some_and(|(since, _)| now.saturating_sub(*since) >= HOLD_MS)
+        {
+            self.pending.pop_front();
+            self.stats.repairs_insufficient = self.stats.repairs_insufficient.saturating_add(1);
+        }
     }
 }
 
@@ -268,11 +399,16 @@ mod tests {
         packet
     }
 
-    fn sequences(packets: &[Vec<u8>]) -> Vec<u16> {
-        packets
+    fn sequences(released: &[Released]) -> Vec<u16> {
+        released
             .iter()
-            .map(|p| u16::from_be_bytes([p[2], p[3]]))
+            .map(|r| u16::from_be_bytes([r.packet[2], r.packet[3]]))
             .collect()
+    }
+
+    fn repair_of(packets: &[Vec<u8>]) -> Vec<u8> {
+        let refs: Vec<&[u8]> = packets.iter().map(Vec::as_slice).collect();
+        encode_fec_payload(&refs).unwrap()
     }
 
     #[test]
@@ -301,7 +437,8 @@ mod tests {
         assert!(fec.arrive(10, 103, packets[3].clone()).is_empty());
         let ready = fec.repair(20, SSRC, &repair);
         assert_eq!(sequences(&ready), vec![101, 102, 103]);
-        assert_eq!(ready[0], packets[1]);
+        assert_eq!(ready[0].packet, packets[1]);
+        assert!(ready[0].rebuilt && !ready[1].rebuilt);
         assert_eq!(fec.take_stats().packets_recovered, 1);
     }
 
@@ -339,5 +476,97 @@ mod tests {
             sequences(&fec.arrive(2, 65535, packet(65535, &[2]))),
             vec![65535, 0]
         );
+    }
+
+    // A repair can rebuild a packet that was only delayed. Its original must not reach reassembly
+    // afterwards: an old fragment would cut off the NAL being rebuilt.
+    #[test]
+    fn an_original_arriving_after_its_rebuild_is_dropped() {
+        let packets: Vec<_> = (100..103).map(|s| packet(s, &[s as u8; 4])).collect();
+        let mut fec = InboundFec::default();
+        fec.arrive(0, 100, packets[0].clone());
+        fec.arrive(1, 102, packets[2].clone());
+        assert_eq!(
+            sequences(&fec.repair(2, SSRC, &repair_of(&packets))),
+            vec![101, 102]
+        );
+        assert!(fec.arrive(3, 101, packets[1].clone()).is_empty());
+        assert!(fec.arrive(4, 100, packets[0].clone()).is_empty());
+        assert_eq!(fec.take_stats().packets_late, 2);
+    }
+
+    #[test]
+    fn a_restarted_stream_counts_what_it_skipped() {
+        let mut fec = InboundFec::default();
+        fec.arrive(0, 1, packet(1, &[1]));
+        assert!(fec.arrive(1, 3, packet(3, &[3])).is_empty());
+        let jump = 3 + RESTART_JUMP as u16;
+        assert_eq!(
+            sequences(&fec.arrive(2, jump, packet(jump, &[9]))),
+            vec![3, jump]
+        );
+        let stats = fec.take_stats();
+        assert_eq!(stats.gaps_skipped, 1);
+        assert_eq!(stats.packets_skipped, u32::from(jump) - 2 - 1);
+    }
+
+    // Nothing more may arrive after a gap -- the peer's camera paused -- and the held picture must
+    // still come out when its hold runs out.
+    #[test]
+    fn a_held_packet_is_released_by_the_timer() {
+        let mut fec = InboundFec::default();
+        fec.arrive(0, 1, packet(1, &[1]));
+        assert!(fec.arrive(10, 3, packet(3, &[3])).is_empty());
+        assert_eq!(fec.deadline(), Some(10 + HOLD_MS));
+        assert!(fec.poll(9 + HOLD_MS).is_empty());
+        assert_eq!(sequences(&fec.poll(10 + HOLD_MS)), vec![3]);
+        assert_eq!(fec.deadline(), None);
+        assert_eq!(fec.take_stats().gaps_skipped, 1);
+    }
+
+    // Several gaps in a row: each packet waits from its own arrival, so packets that arrived
+    // together come out together, not one hold per gap later.
+    #[test]
+    fn several_gaps_do_not_add_their_holds_up() {
+        let mut fec = InboundFec::default();
+        fec.arrive(0, 1, packet(1, &[1]));
+        for sequence in [3, 5, 7] {
+            assert!(fec.arrive(10, sequence, packet(sequence, &[1])).is_empty());
+        }
+        assert_eq!(sequences(&fec.poll(10 + HOLD_MS)), vec![3, 5, 7]);
+        let stats = fec.take_stats();
+        assert_eq!((stats.gaps_skipped, stats.packets_skipped), (3, 3));
+    }
+
+    // 101 lost and 102 late when the repair comes: two missing, so it waits. 102 arriving makes
+    // one parity enough, and 101 is rebuilt.
+    #[test]
+    fn a_repair_short_of_two_packets_waits_for_a_late_one() {
+        let packets: Vec<_> = (100..104)
+            .map(|s| packet(s, &[s as u8, 3, s as u8]))
+            .collect();
+        let mut fec = InboundFec::default();
+        fec.arrive(0, 100, packets[0].clone());
+        fec.arrive(1, 103, packets[3].clone());
+        assert!(fec.repair(2, SSRC, &repair_of(&packets)).is_empty());
+        let ready = fec.arrive(3, 102, packets[2].clone());
+        assert_eq!(sequences(&ready), vec![101, 102, 103]);
+        assert_eq!(ready[0].packet, packets[1]);
+        let stats = fec.take_stats();
+        assert_eq!(
+            (stats.packets_recovered, stats.repairs_insufficient),
+            (1, 0)
+        );
+    }
+
+    #[test]
+    fn a_repair_still_short_is_given_up_with_its_gap() {
+        let packets: Vec<_> = (100..104).map(|s| packet(s, &[s as u8])).collect();
+        let mut fec = InboundFec::default();
+        fec.arrive(0, 100, packets[0].clone());
+        fec.arrive(1, 103, packets[3].clone());
+        assert!(fec.repair(2, SSRC, &repair_of(&packets)).is_empty());
+        assert_eq!(sequences(&fec.poll(2 + HOLD_MS)), vec![103]);
+        assert_eq!(fec.take_stats().repairs_insufficient, 1);
     }
 }
