@@ -228,7 +228,7 @@ fn isolated_official_create_helpers_match_rust_projection() {
             "default-and-unconditional-participant-username.memberShareGroupHistoryMode"
         );
         assert!(
-            !(group.ephemerality.is_some()),
+            group.ephemerality.is_none(),
             "default-and-unconditional-participant-username"
         );
         assert_eq!(
@@ -1125,10 +1125,7 @@ fn isolated_official_create_helpers_match_rust_projection() {
             None,
             "parent-mode-flags-and-reason.memberShareGroupHistoryMode"
         );
-        assert!(
-            !(group.ephemerality.is_some()),
-            "parent-mode-flags-and-reason"
-        );
+        assert!(group.ephemerality.is_none(), "parent-mode-flags-and-reason");
         assert_eq!(
             group.ephemerality.as_ref().map(|v| v.duration),
             None,
@@ -1374,7 +1371,7 @@ fn isolated_official_create_helpers_match_rust_projection() {
             "time-cast-wraps-before-normalization.memberShareGroupHistoryMode"
         );
         assert!(
-            !(group.ephemerality.is_some()),
+            group.ephemerality.is_none(),
             "time-cast-wraps-before-normalization"
         );
         assert_eq!(
@@ -1702,7 +1699,7 @@ fn isolated_official_create_helpers_match_rust_projection() {
             "history-share-mode-admin_share.memberShareGroupHistoryMode"
         );
         assert!(
-            !(group.ephemerality.is_some()),
+            group.ephemerality.is_none(),
             "history-share-mode-admin_share"
         );
         assert_eq!(
@@ -1953,7 +1950,7 @@ fn isolated_official_create_helpers_match_rust_projection() {
             "history-share-mode-all_member_share.memberShareGroupHistoryMode"
         );
         assert!(
-            !(group.ephemerality.is_some()),
+            group.ephemerality.is_none(),
             "history-share-mode-all_member_share"
         );
         assert_eq!(
@@ -2183,7 +2180,7 @@ fn isolated_official_create_helpers_match_rust_projection() {
             "history-share-mode-future_mode.memberShareGroupHistoryMode"
         );
         assert!(
-            !(group.ephemerality.is_some()),
+            group.ephemerality.is_none(),
             "history-share-mode-future_mode"
         );
         assert_eq!(
@@ -2436,7 +2433,7 @@ fn isolated_official_create_helpers_match_rust_projection() {
             "history-is-read-without-feature-gate.memberShareGroupHistoryMode"
         );
         assert!(
-            !(group.ephemerality.is_some()),
+            group.ephemerality.is_none(),
             "history-is-read-without-feature-gate"
         );
         assert_eq!(
@@ -2748,7 +2745,7 @@ fn isolated_official_create_helpers_match_rust_projection() {
             "disabled-creator-country-and-username-success.memberShareGroupHistoryMode"
         );
         assert!(
-            !(group.ephemerality.is_some()),
+            group.ephemerality.is_none(),
             "disabled-creator-country-and-username-success"
         );
         assert_eq!(

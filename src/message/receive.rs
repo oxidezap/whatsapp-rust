@@ -3175,6 +3175,10 @@ mod tests {
 }
 
 #[cfg(test)]
+#[path = "hosted_adv_tests.rs"]
+mod hosted_adv_tests;
+
+#[cfg(test)]
 mod adv_tests {
     use super::*;
 

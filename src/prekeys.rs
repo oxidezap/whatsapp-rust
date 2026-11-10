@@ -292,7 +292,7 @@ impl Client {
 
     /// Read a fresh, signed primary key without publishing a trust change.
     pub(crate) async fn fetch_adv_account_identity(&self, jid: &Jid) -> anyhow::Result<[u8; 32]> {
-        let primary = jid.with_device(0);
+        let primary = wacore::types::jid::adv_account_jid(jid);
         self.query_adv_account_identity(&primary, Some(PreKeyFetchReason::Identity))
             .await
     }
@@ -339,7 +339,7 @@ impl Client {
         let mut requested = jids.to_vec();
         let mut bootstrap_primaries = Vec::new();
         for jid in &cold_companions {
-            let primary = jid.with_device(0);
+            let primary = wacore::types::jid::adv_account_jid(jid);
             if !bootstrap_primaries.contains(&primary) {
                 bootstrap_primaries.push(primary.clone());
             }
@@ -365,7 +365,7 @@ impl Client {
         // primary trust anchor. An omitted primary must not leave a session
         // authenticated only by a sender-selected account key.
         for companion in &cold_companions {
-            let primary = companion.with_device(0);
+            let primary = wacore::types::jid::adv_account_jid(companion);
             if let Some(bundle) = outcome.bundles.get(&primary) {
                 authenticated_primary_identity(bundle)?;
             } else {
@@ -417,7 +417,7 @@ impl Client {
         jid: &Jid,
     ) -> anyhow::Result<Option<[u8; 32]>> {
         use wacore::types::jid::JidExt;
-        let primary = jid.with_device(0);
+        let primary = wacore::types::jid::adv_account_jid(jid);
         let backend = self.persistence_manager.backend();
         if let Some(identity) = self
             .signal_cache
@@ -453,7 +453,7 @@ impl Client {
         use wacore::types::jid::JidExt;
         let generation = self.connection_generation.load(Ordering::Acquire);
         let shutdown = self.connection_shutdown_signal();
-        let primary = jid.with_device(0);
+        let primary = wacore::types::jid::adv_account_jid(jid);
         let bootstrap = async {
             ensure_adv_bootstrap_scope(&self.connection_generation, generation, &shutdown)?;
             {

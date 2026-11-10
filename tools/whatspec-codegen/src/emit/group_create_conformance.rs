@@ -92,7 +92,16 @@ fn optional_bool(value: &Value) -> Result<String> {
 fn compare(out: &mut String, actual: &str, expected: &str, label: &str) {
     match expected {
         "true" => out.push_str(&format!("assert!({actual},{});\n", rust_str(label))),
-        "false" => out.push_str(&format!("assert!(!({actual}),{});\n", rust_str(label))),
+        "false" => {
+            if let Some(option) = actual.strip_suffix(".is_some()") {
+                out.push_str(&format!(
+                    "assert!({option}.is_none(),{});\n",
+                    rust_str(label)
+                ));
+            } else {
+                out.push_str(&format!("assert!(!({actual}),{});\n", rust_str(label)));
+            }
+        }
         _ => out.push_str(&format!(
             "assert_eq!({actual},{expected},{});\n",
             rust_str(label)

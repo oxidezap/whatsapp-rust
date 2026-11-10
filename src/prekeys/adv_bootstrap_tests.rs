@@ -58,6 +58,178 @@ fn request(
     tokio::spawn(async move { client.ensure_adv_account_identity(&companion).await })
 }
 
+#[tokio::test]
+async fn hosted_and_ordinary_companions_share_one_canonical_cold_bootstrap() {
+    for primary in [Jid::pn("12025550185"), Jid::lid("100000000000185")] {
+        let (client, transport) = create_iq_test_client().await;
+        let hosted = primary.with_device_hosting(99, true);
+        let leader = request(&client, hosted.clone());
+        let iq = decode_sent_iq(&transport, 0).await;
+        let node = iq.get();
+        let requested = node
+            .get_optional_child("key")
+            .unwrap()
+            .get_optional_child("user")
+            .unwrap()
+            .attrs()
+            .optional_jid("jid")
+            .unwrap();
+        assert_eq!(requested, primary);
+        let id = node.attrs().optional_string("id").unwrap().into_owned();
+        let joined = request(&client, primary.with_device(7));
+        wait_for_joiner(&client).await;
+        let account = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        answer(&client, &id, &primary, &account, true).await;
+        assert_eq!(
+            leader.await.unwrap().unwrap(),
+            *account.public_key.public_key_bytes()
+        );
+        assert_eq!(
+            joined.await.unwrap().unwrap(),
+            *account.public_key.public_key_bytes()
+        );
+        assert_eq!(transport.sent_count(), 1);
+        let backend = client.persistence_manager.backend();
+        assert_eq!(
+            backend
+                .load_identity(primary.to_protocol_address().as_str())
+                .await
+                .unwrap(),
+            Some(*account.public_key.public_key_bytes())
+        );
+        assert!(
+            backend
+                .load_identity(hosted.with_device(0).to_protocol_address().as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(client.adv_bootstrap().flights.lock().unwrap().is_empty());
+        client.signal_shutdown_sync();
+    }
+}
+
+#[tokio::test]
+async fn cold_hosted_prekey_fetch_authenticates_and_persists_only_the_ordinary_anchor() {
+    for primary in [Jid::pn("12025550189"), Jid::lid("100000000000189")] {
+        let (client, transport) = create_iq_test_client().await;
+        let hosted = primary.with_device_hosting(99, true);
+        let ordinary = primary.with_device(7);
+        let requested = vec![hosted.clone(), ordinary.clone()];
+        let fetch = {
+            let client = client.clone();
+            let requested = requested.clone();
+            tokio::spawn(async move { client.fetch_pre_keys(&requested, None).await })
+        };
+        let iq = decode_sent_iq(&transport, 0).await;
+        let node = iq.get();
+        let users: Vec<_> = node
+            .get_optional_child("key")
+            .unwrap()
+            .children()
+            .unwrap()
+            .iter()
+            .map(|user| user.attrs().optional_jid("jid").unwrap())
+            .collect();
+        assert_eq!(
+            users,
+            vec![hosted.clone(), ordinary.clone(), primary.clone()]
+        );
+        let id = node.attrs().optional_string("id").unwrap().into_owned();
+        let account = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let make_bundle = |key: &KeyPair| {
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let signed = KeyPair::generate(&mut rng);
+            PreKeyBundle::new(
+                1,
+                0u32.into(),
+                None,
+                1u32.into(),
+                signed.public_key,
+                key.private_key
+                    .calculate_signature(&signed.public_key.serialize(), &mut rng)
+                    .unwrap()
+                    .to_vec(),
+                IdentityKey::new(key.public_key),
+            )
+            .unwrap()
+        };
+        let mut replies = Vec::new();
+        for jid in &requested {
+            let device = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+            let certificate = waproto::codec::adv_signed_device_identity_to_vec(
+                &wacore::adv::test_util::signed_identity(
+                    &account,
+                    &device,
+                    b"\x18\x07",
+                    &[6, 0],
+                    Some(if jid == &hosted { &[6, 6] } else { &[6, 1] }),
+                    false,
+                ),
+            );
+            replies.push(
+                PreKeyBundleUserNode::from_bundle(
+                    jid.clone(),
+                    &make_bundle(&device),
+                    Some(certificate),
+                )
+                .unwrap()
+                .into_node(),
+            );
+        }
+        replies.push(
+            PreKeyBundleUserNode::from_bundle(primary.clone(), &make_bundle(&account), None)
+                .unwrap()
+                .into_node(),
+        );
+        client
+            .process_node(node_to_owned_ref(
+                &NodeBuilder::new("iq")
+                    .attr("id", id)
+                    .attr("type", "result")
+                    .children([NodeBuilder::new("list").children(replies).build()])
+                    .build(),
+            ))
+            .await;
+        let result = fetch.await.unwrap().unwrap();
+        assert_eq!(
+            result.bundles.len(),
+            2,
+            "bootstrap primary is not an unsolicited result"
+        );
+        for jid in requested {
+            assert_eq!(
+                result
+                    .bundles
+                    .get(&jid)
+                    .unwrap()
+                    .account_identity()
+                    .unwrap()
+                    .public_key()
+                    .public_key_bytes(),
+                account.public_key.public_key_bytes()
+            );
+        }
+        let backend = client.persistence_manager.backend();
+        assert_eq!(
+            backend
+                .load_identity(primary.to_protocol_address().as_str())
+                .await
+                .unwrap(),
+            Some(*account.public_key.public_key_bytes())
+        );
+        assert!(
+            backend
+                .load_identity(hosted.with_device(0).to_protocol_address().as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(transport.sent_count(), 1);
+        client.signal_shutdown_sync();
+    }
+}
+
 async fn wait_for_joiner(client: &Client) {
     poll_until("another caller to join the ADV flight", || {
         client

@@ -370,7 +370,7 @@ fn sort_session_lock_keys(keys: &mut Vec<Jid>) {
     let primaries: Vec<_> = keys
         .iter()
         .filter(|jid| jid.device != 0)
-        .map(|jid| jid.with_device(0))
+        .map(wacore::types::jid::adv_account_jid)
         .collect();
     keys.extend(primaries);
     keys.sort_unstable_by(wacore::types::jid::cmp_for_lock_order);

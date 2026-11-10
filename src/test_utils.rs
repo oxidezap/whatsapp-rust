@@ -105,7 +105,7 @@ pub(crate) async fn seed_adv_primary(client: &Client, user: &Jid) {
     client
         .signal_cache
         .put_identity(
-            &user.with_device(0).to_protocol_address(),
+            &wacore::types::jid::adv_account_jid(user).to_protocol_address(),
             adv_test_account().public_key.public_key_bytes(),
         )
         .await;

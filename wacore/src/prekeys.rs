@@ -291,7 +291,7 @@ impl PreKeyUtils {
             }
             let account_identity = account_identities
                 .get(&jid)
-                .or_else(|| primary_identities.get(&jid.with_device(0)));
+                .or_else(|| primary_identities.get(&crate::types::jid::adv_account_jid(&jid)));
             let bundle =
                 match Self::node_to_pre_key_bundle_ref(&jid, user_node_ref, account_identity) {
                     Ok(b) => b,
@@ -777,6 +777,83 @@ mod tests {
         PreKeyUtils::parse_prekeys_response(&response.as_node_ref(), &HashMap::new())
             .expect("parse bundles")
             .bundles
+    }
+
+    #[test]
+    fn hosted_prekey_bootstrap_uses_the_ordinary_primary_in_the_same_response() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let account = KeyPair::generate(&mut rng);
+        let device = KeyPair::generate(&mut rng);
+        for primary in [Jid::pn("12025550186"), Jid::lid("100000000000186")] {
+            for hosted in [false, true] {
+                let companion = primary.with_device_hosting(if hosted { 99 } else { 7 }, hosted);
+                let make_bundle = |key: &KeyPair| {
+                    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+                    let signed = KeyPair::generate(&mut rng);
+                    PreKeyBundle::new(
+                        1,
+                        0u32.into(),
+                        None,
+                        1u32.into(),
+                        signed.public_key,
+                        key.private_key
+                            .calculate_signature(&signed.public_key.serialize(), &mut rng)
+                            .unwrap()
+                            .to_vec(),
+                        IdentityKey::new(key.public_key),
+                    )
+                    .unwrap()
+                };
+                let certificate = waproto::codec::adv_signed_device_identity_to_vec(
+                    &crate::adv::test_util::signed_identity(
+                        &account,
+                        &device,
+                        b"\x18\x07",
+                        &[6, 0],
+                        Some(if hosted { &[6, 6] } else { &[6, 1] }),
+                        false,
+                    ),
+                );
+                let device_node = PreKeyBundleUserNode::from_bundle(
+                    companion.clone(),
+                    &make_bundle(&device),
+                    Some(certificate),
+                )
+                .unwrap()
+                .into_node();
+                let primary_node = PreKeyBundleUserNode::from_bundle(
+                    primary.clone(),
+                    &make_bundle(&account),
+                    None,
+                )
+                .unwrap()
+                .into_node();
+                let response = NodeBuilder::new("iq")
+                    .children([NodeBuilder::new("list")
+                        .children([device_node, primary_node])
+                        .build()])
+                    .build();
+                let outcome =
+                    PreKeyUtils::parse_prekeys_response(&response.as_node_ref(), &HashMap::new())
+                        .unwrap();
+                let bundle = outcome
+                    .bundles
+                    .get(&companion)
+                    .expect("companion certified by ordinary primary");
+                assert_eq!(
+                    bundle
+                        .account_identity()
+                        .unwrap()
+                        .public_key()
+                        .public_key_bytes(),
+                    account.public_key.public_key_bytes()
+                );
+                assert!(outcome.bundles.contains_key(&primary));
+                if hosted {
+                    assert!(!outcome.bundles.contains_key(&companion.with_device(0)));
+                }
+            }
+        }
     }
 
     #[test]
