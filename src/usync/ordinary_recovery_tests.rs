@@ -692,13 +692,7 @@ async fn check_hosted_rotation_eviction(case: EvictionCase) {
                     .unwrap()
                     .is_none()
             );
-            assert!(
-                backend
-                    .load_session(address.as_str())
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(!backend.has_session(address.as_str()).await.unwrap());
             assert!(
                 backend
                     .load_identity(address.as_str())
