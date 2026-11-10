@@ -1457,6 +1457,20 @@ impl Client {
         Connection { client: self }
     }
 
+    /// Both terminal shutdown publishers also fire the session wake. Share
+    /// that wake with connected work instead of retaining another lazy event
+    /// for a temporary connect wait. Register before the final sticky check;
+    /// pause, readiness and reconnect hints must only cause a re-check.
+    async fn wait_for_connect_shutdown(&self, shutdown: &wacore::runtime::ShutdownSignal) {
+        while !shutdown.is_fired() {
+            let changed = self.session_state_notifier.listen();
+            if shutdown.is_fired() {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     // err(level = "warn", ...): run()'s caller already classifies failures here itself
     // (debug! for a transient HandshakeError worth a quiet retry, error! otherwise — see
     // run()'s connect_err handling) — the default ERROR level on this span ignored that
@@ -1608,7 +1622,7 @@ impl Client {
         let shutdown = self.shutdown_signal();
         let connected = {
             let connecting = async { futures::join!(version_future, transport_future) }.fuse();
-            let stopped = wacore::runtime::wait_for_shutdown(&shutdown).fuse();
+            let stopped = self.wait_for_connect_shutdown(&shutdown).fuse();
             futures::pin_mut!(connecting, stopped);
             futures::select_biased! {
                 _ = stopped => None,
@@ -1705,7 +1719,7 @@ impl Client {
                 .await
             }
             .fuse();
-            let stopped = wacore::runtime::wait_for_shutdown(&shutdown).fuse();
+            let stopped = self.wait_for_connect_shutdown(&shutdown).fuse();
             futures::pin_mut!(handshaking, stopped);
             futures::select_biased! {
                 _ = stopped => None,
@@ -4043,6 +4057,38 @@ mod tests {
                 .unwrap_or_else(|p| p.into_inner())
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn connect_cancellation_does_not_retain_an_additional_event() {
+        let client = crate::test_utils::create_test_client().await;
+        // Model the session event already used by connected work.
+        drop(client.session_state_notifier.listen());
+        let shutdown = client.shutdown_signal();
+        let (sample, ()) = crate::test_alloc::heap_sample(|| {
+            let mut waiter = std::pin::pin!(client.wait_for_connect_shutdown(&shutdown));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(waiter.as_mut().poll(&mut context).is_pending());
+        });
+        assert_eq!(
+            sample.retained, 0,
+            "a transient connect wait retained heap: {sample:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_cancellation_filters_session_hints_and_catches_sticky_shutdown() {
+        let client = crate::test_utils::create_test_client().await;
+        let shutdown = client.shutdown_signal();
+        let mut waiter = std::pin::pin!(client.wait_for_connect_shutdown(&shutdown));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(waiter.as_mut().poll(&mut context).is_pending());
+        client.notify_session_state();
+        assert!(waiter.as_mut().poll(&mut context).is_pending());
+        client.signal_shutdown_sync();
+        assert!(waiter.as_mut().poll(&mut context).is_ready());
+        let mut late = std::pin::pin!(client.wait_for_connect_shutdown(&shutdown));
+        assert!(late.as_mut().poll(&mut context).is_ready());
     }
 
     struct ShutdownConnectHttp(async_channel::Sender<&'static str>);
