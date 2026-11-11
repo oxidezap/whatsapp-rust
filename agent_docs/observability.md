@@ -49,6 +49,14 @@ Use `.github/workflows/codspeed.yml` for CPU/allocation regressions and
 to the measured commit, flags and workload; do not turn it into a permanent
 claim about current memory or performance.
 
+CodSpeed compares benchmark URIs and instruments against the main baseline.
+Keep source paths, names and argument labels stable, and register the same
+workloads on PRs and main. Do not upload generated base/head copies or repeated
+samples as separate benchmark identities. The `classic_benchmark` target uses
+the current Signal public adapter and shares its fixture with functional tests;
+its name does not mean it runs a retired engine. Keep its legacy import cases
+enabled through the proto-signal shard's features.
+
 Logs must never include linking codes, QR payloads or cryptographic key bytes,
 including public identity/ratchet keys and short fingerprints. Use `Jid::observe()`
 for JIDs and borrowed `ObservedJid::from(&text)` for string identifiers; `tracing-pii` deliberately
