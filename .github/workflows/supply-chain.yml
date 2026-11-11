@@ -103,6 +103,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: "true"
+          # MSRV and WASM use the same driver toolchain and otherwise write
+          # one immutable cache key. Keep both lanes' build artifacts.
+          key: compatibility-${{ matrix.lane }}
       - name: Build the qualification driver
         run: cargo +nightly-2026-06-16 build --locked -p whatsapp-xtask
       - name: Validate contracts before release

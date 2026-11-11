@@ -31,108 +31,9 @@ env:
   MALLOC_TOP_PAD_: "131072"
 
 jobs:
-  prefetch-pair:
-    name: Prefetch, addresses and SDK CPU and memory against base
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2026-06-16
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: protoc@${{ env.PROTOC_VERSION }},cargo-codspeed@5.0.2
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: prefetch-pair
-          cache-targets: "false"
-      - name: Build immutable revisions and identical benchmark workloads
-        env:
-          BASE_REVISION: ${{ github.event.pull_request.base.sha }}
-          HEAD_REVISION: ${{ github.event.pull_request.head.sha }}
-        run: |
-          cargo build --locked -p whatsapp-xtask
-          install -m 755 target/debug/whatsapp-xtask "$RUNNER_TEMP/prefetch-compare"
-          "$RUNNER_TEMP/prefetch-compare" ci prefetch-pair-prepare --base-revision "$BASE_REVISION" --head-revision "$HEAD_REVISION"
-          lscpu > .prefetch-pair-out/results/host.txt
-      # Both instruments measure immutable base/head workloads under distinct names.
-      # No git/CI metadata or baseline is replaced.
-      - name: Measure alternating base/head CPU and allocation samples
-        uses: CodSpeedHQ/action@af75f77f17a054769abefaa42fe8dc2975469b5f # v5.6.3
-        with:
-          mode: simulation,memory
-          disable-memory-capture-stack: "false"
-          disable-memory-track-physical: "false"
-          runner-version: "5.4.2"
-          run: '"$RUNNER_TEMP/prefetch-compare" ci prefetch-pair-measure'
-      - name: Preserve exact sources, registration patches and measurement provenance
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: prefetch-pair
-          path: .prefetch-pair-out/results
-  signal-pair:
-    name: Classic Signal CPU and allocations against base on the same host
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2026-06-16
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: protoc@${{ env.PROTOC_VERSION }},cargo-codspeed@5.0.2
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: classic-signal-pair
-          cache-targets: "false"
-      - name: Key the libc6-dbg cache on the installed libc6
-        id: libc6
-        run: cargo xt ci workflow libc-version
-      - uses: actions/cache@v6
-        with:
-          path: ~/.cache/libc6-dbg
-          key: libc6-dbg-${{ runner.arch }}-${{ steps.libc6.outputs.version }}
-      - name: Bound apt and pre-install libc6-dbg
-        env:
-          LIBC6_VERSION: ${{ steps.libc6.outputs.version }}
-        run: cargo xt ci workflow install-libc-debug
-      - name: Build matched classic workloads and preserve the API adapter differences
-        env:
-          BASE_REVISION: ${{ github.event.pull_request.base.sha }}
-          HEAD_REVISION: ${{ github.event.pull_request.head.sha }}
-        run: |
-          cargo build --locked -p whatsapp-xtask
-          install -m 755 target/debug/whatsapp-xtask "$RUNNER_TEMP/signal-compare"
-          "$RUNNER_TEMP/signal-compare" ci signal-pair-prepare --base-revision "$BASE_REVISION" --head-revision "$HEAD_REVISION"
-          lscpu > .signal-pair-out/results/host.txt
-      - name: Measure both immutable libraries through CodSpeed
-        uses: CodSpeedHQ/action@af75f77f17a054769abefaa42fe8dc2975469b5f # v5.6.3
-        with:
-          mode: simulation,memory
-          runner-version: "5.4.2"
-          disable-memory-capture-stack: "false"
-          disable-memory-track-physical: "false"
-          run: '"$RUNNER_TEMP/signal-compare" ci signal-pair-measure'
-      - name: Preserve workload and port sources, hashes, flags and revisions
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: classic-signal-pair
-          path: .signal-pair-out/results
-
+  # The regular shards publish the same source paths, names and instruments on
+  # PRs and main. PR-only generated base/head copies have no main baseline and
+  # appear as new benchmarks on every PR, even when the workload is unchanged.
   connected-retention:
     name: Connected retention against PR base
     if: github.event_name == 'pull_request'
@@ -153,7 +54,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: connected-retention
-          cache-targets: "false"
+          cache-targets: "true"
       - name: Build library revisions with a shared measurement harness
         env:
           BASE_REVISION: ${{ github.event.pull_request.base.sha }}
@@ -244,6 +145,10 @@ jobs:
           - name: client
             packages: -p whatsapp-rust
             features: --features bench-harness
+            # Several SDK benchmark binaries link the full client together.
+            # Bound concurrent compiler/linker processes without changing
+            # codegen or the benchmark workloads.
+            build_flags: --jobs 2
     steps:
       - uses: actions/checkout@v7
         with:
@@ -302,11 +207,13 @@ jobs:
         with:
           tool: protoc@${{ env.PROTOC_VERSION }},cargo-codspeed@5.0.2
 
-      - name: Cache Rust registry
+      - name: Cache instrumented Rust build
         uses: Swatinem/rust-cache@v2
         with:
           prefix-key: ${{ runner.os }}-cargo-codspeed-${{ matrix.shard.name }}
-          cache-targets: "false"
+          # Compilation dominates these jobs. Keep dependencies and build
+          # scripts as well as registry downloads; each shard has its own key.
+          cache-targets: "true"
 
       # simulation and memory share the same instrumented build, so one
       # build covers both instruments.
@@ -314,9 +221,23 @@ jobs:
         env:
           SHARD_PACKAGES: ${{ matrix.shard.packages }}
           SHARD_FEATURES: ${{ matrix.shard.features }}
-        run: >
-          cargo codspeed build -m simulation -m memory
-          $SHARD_PACKAGES $SHARD_FEATURES
+          SHARD_BUILD_FLAGS: ${{ matrix.shard.build_flags }}
+        run: |
+          nproc
+          free -h
+          df -h /
+          /usr/bin/time -v -o "$RUNNER_TEMP/benchmark-build.txt" \
+            cargo codspeed build --locked -m simulation -m memory \
+            $SHARD_PACKAGES $SHARD_FEATURES $SHARD_BUILD_FLAGS
+      - name: Preserve benchmark build resource usage
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-build-${{ matrix.shard.name }}
+          path: ${{ runner.temp }}/benchmark-build.txt
+          retention-days: 14
+          if-no-files-found: warn
+          overwrite: true
 
       # Both instruments run serially in a single invocation so each
       # benchmark uploads as one run carrying CPU and memory metrics.
@@ -436,11 +357,11 @@ jobs:
         with:
           tool: protoc@${{ env.PROTOC_VERSION }},cargo-codspeed@5.0.2
 
-      - name: Cache Rust registry
+      - name: Cache instrumented Rust build
         uses: Swatinem/rust-cache@v2
         with:
           prefix-key: ${{ runner.os }}-cargo-codspeed-integration
-          cache-targets: "false"
+          cache-targets: "true"
 
       - name: Wait for mock server
         run: cargo xt ci workflow wait-for-mock
@@ -454,7 +375,7 @@ jobs:
       # meaningful end-to-end signal; the deterministic memory signal lives in the
       # single-threaded unit benches (other job), which keep the memory instrument.
       - name: Build the benchmark targets
-        run: cargo codspeed build -m simulation -p bench-integration
+        run: cargo codspeed build --locked -m simulation -p bench-integration
 
       # `-p bench-integration` is required: `tests/bench-integration` is not a
       # workspace default-member, so a bare `cargo codspeed run` discovers no
