@@ -145,6 +145,10 @@ jobs:
           - name: client
             packages: -p whatsapp-rust
             features: --features bench-harness
+            # Several SDK benchmark binaries link the full client together.
+            # Bound concurrent compiler/linker processes without changing
+            # codegen or the benchmark workloads.
+            build_flags: --jobs 2
     steps:
       - uses: actions/checkout@v7
         with:
@@ -217,9 +221,23 @@ jobs:
         env:
           SHARD_PACKAGES: ${{ matrix.shard.packages }}
           SHARD_FEATURES: ${{ matrix.shard.features }}
-        run: >
-          cargo codspeed build --locked -m simulation -m memory
-          $SHARD_PACKAGES $SHARD_FEATURES
+          SHARD_BUILD_FLAGS: ${{ matrix.shard.build_flags }}
+        run: |
+          nproc
+          free -h
+          df -h /
+          /usr/bin/time -v -o "$RUNNER_TEMP/benchmark-build.txt" \
+            cargo codspeed build --locked -m simulation -m memory \
+            $SHARD_PACKAGES $SHARD_FEATURES $SHARD_BUILD_FLAGS
+      - name: Preserve benchmark build resource usage
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-build-${{ matrix.shard.name }}
+          path: ${{ runner.temp }}/benchmark-build.txt
+          retention-days: 14
+          if-no-files-found: warn
+          overwrite: true
 
       # Both instruments run serially in a single invocation so each
       # benchmark uploads as one run carrying CPU and memory metrics.
