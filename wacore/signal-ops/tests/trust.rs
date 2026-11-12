@@ -141,6 +141,8 @@ struct Client {
     devices: Vec<Jid>,
     bundles: HashMap<Jid, FetchedBundle>,
     group: Option<Arc<GroupRoutingInfo>>,
+    /// When set, a fetch signals `entered` and waits for `release`.
+    gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 #[async_trait]
@@ -177,6 +179,10 @@ impl SendContextResolver for Client {
 #[async_trait]
 impl SignalResolver for Client {
     async fn fetch_verifiable_prekeys(&self, jids: &[Jid]) -> anyhow::Result<VerifiablePrekeys> {
+        if let Some((entered, release)) = &self.gate {
+            entered.notify_one();
+            release.notified().await;
+        }
         Ok(VerifiablePrekeys {
             bundles: jids
                 .iter()
@@ -365,6 +371,7 @@ async fn a_send_skips_a_companion_whose_bundle_does_not_verify() {
             },
         )]),
         group: None,
+        gate: None,
     };
     // Bob's only device fails verification, so there is nothing to send.
     let sent = alice
@@ -391,6 +398,7 @@ async fn a_send_skips_a_companion_whose_bundle_does_not_verify() {
             },
         )]),
         group: None,
+        gate: None,
     };
     let sent = alice
         .send_direct(&TokioRuntime, &honest, &to, &text("for bob"), "F2")
@@ -453,6 +461,7 @@ async fn a_fresh_account_is_anchored_by_its_primary_in_the_same_fetch() {
             ),
         ]),
         group: None,
+        gate: None,
     };
     let sent = alice
         .send_direct(&TokioRuntime, &mismatched, &primary, &text("hi"), "A1")
@@ -495,6 +504,7 @@ async fn a_companion_is_accepted_when_its_account_primary_is_in_the_same_fetch()
             ),
         ]),
         group: None,
+        gate: None,
     };
     let sent = alice
         .send_direct(&TokioRuntime, &client, &primary, &text("hi"), "A2")
@@ -531,6 +541,7 @@ async fn a_retry_naming_a_recipient_with_another_accounts_keys_is_refused() {
             },
         )]),
         group: None,
+        gate: None,
     };
     alice
         .send_direct(&TokioRuntime, &client, &to, &text("for bob only"), "R1")
@@ -623,6 +634,7 @@ async fn a_refused_group_retry_bundle_leaves_distribution_state_untouched() {
             vec!["111@s.whatsapp.net".parse().unwrap(), bob_jid.to_non_ad()],
             AddressingMode::Pn,
         ))),
+        gate: None,
     };
     let sent = alice
         .send_group(&TokioRuntime, &client, &group, &text("members"), "G1")
@@ -670,5 +682,64 @@ async fn a_refused_group_retry_bundle_leaves_distribution_state_untouched() {
             .await
             .unwrap(),
         "a refused retry must not change the distribution epoch"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn forgetting_a_user_waits_for_a_session_setup_already_in_flight() {
+    let alice = Arc::new(device("alice-forget-race", "111:1@s.whatsapp.net").await);
+    let bob = device("bob-forget-race", "222:1@s.whatsapp.net").await;
+    let paired = common::pair(&bob).await;
+    let bob_jid: Jid = "222:1@s.whatsapp.net".parse().unwrap();
+    alice
+        .trust_account_identity(&bob_jid, paired.account)
+        .await
+        .unwrap();
+    let (entered, release) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let client = Arc::new(Client {
+        devices: vec![bob_jid.clone()],
+        bundles: HashMap::from([(
+            bob_jid.clone(),
+            FetchedBundle {
+                bundle: bundle_for(&bob, 1).await,
+                device_identity: Some(paired.device_identity),
+            },
+        )]),
+        group: None,
+        gate: Some((entered.clone(), release.clone())),
+    });
+
+    // A first send to Bob is setting up his session.
+    let send = {
+        let (alice, client, to) = (alice.clone(), client.clone(), bob_jid.to_non_ad());
+        tokio::spawn(async move {
+            alice
+                .send_direct(&TokioRuntime, &*client, &to, &text("hi"), "S1")
+                .await
+        })
+    };
+    entered.notified().await;
+
+    // An identity reset for Bob must not finish while that setup can still
+    // commit a session it would have deleted.
+    let forget = {
+        let (alice, user) = (alice.clone(), bob_jid.to_non_ad());
+        tokio::spawn(async move { alice.forget_user(&user).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!forget.is_finished(), "the reset must wait for the send");
+
+    release.notify_one();
+    send.await.unwrap().unwrap();
+    forget.await.unwrap().unwrap();
+    assert!(
+        !alice
+            .has_session(&bob_jid.to_protocol_address())
+            .await
+            .unwrap(),
+        "no session may survive the reset"
     );
 }
