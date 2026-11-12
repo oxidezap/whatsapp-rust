@@ -135,9 +135,9 @@ fn main() {
         waproto::whatsapp::session_structure::chain::MessageKeyView,
         {
             let mut input = vec![8, 127];
-            for tag in [18, 26, 34] {
-                input.extend_from_slice(&[tag, 32]);
-                input.extend_from_slice(&[0x42; 32]);
+            for (tag, len) in [(18, 32), (26, 32), (34, 16)] {
+                input.extend_from_slice(&[tag, len]);
+                input.resize(input.len() + usize::from(len), 0x42);
             }
             input.extend_from_slice(&[0xa2, 6, 32]);
             input.extend_from_slice(&[0x77; 32]);
