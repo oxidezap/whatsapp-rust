@@ -268,12 +268,15 @@ fn reopening_a_scope_restores_the_same_device() {
     )))
     .unwrap();
     assert_eq!(block_on(reopened.public_identity()), identity);
-    let again = block_on(SignalOps::create(store_for(
-        &bob.records,
-        bob.scope,
-        "node-a",
-        2,
-    )));
+    // With no live instance under the fence, create reaches the store, whose
+    // exclusive insert must refuse the existing keys.
+    let Node {
+        records,
+        scope,
+        ops,
+    } = bob;
+    drop((ops, reopened));
+    let again = block_on(SignalOps::create(store_for(&records, scope, "node-a", 2)));
     assert!(
         matches!(again, Err(OpsError::InvalidInput(_))),
         "create overwrote existing keys"
@@ -334,6 +337,8 @@ fn forget_user_drops_every_device_of_that_user_only() {
         "123:7@c.us.0",
         "123:12@c.us.0",
         "123:99@hosted.0",
+        // The plain libsignal form, as `establish_session` stores it.
+        "123@s.whatsapp.net.4",
     ];
     let kept = [
         "1234@c.us.0",
@@ -342,6 +347,8 @@ fn forget_user_drops_every_device_of_that_user_only() {
         "123@lid.0",
         "123:7@lid.0",
         "123:99@hosted.lid.0",
+        "1234@s.whatsapp.net.4",
+        "123@lid.4",
     ];
     // Stored addresses use WA Web's `c.us` server for phone-number users.
     for address in forgotten.iter().chain(&kept) {
@@ -391,12 +398,14 @@ fn migrate_pn_to_lid_moves_regular_and_hosted_devices() {
     block_on(store.put_identity("123:7@c.us.0", [3; 32])).unwrap();
     block_on(store.put_session("456:7@lid.0", b"lid-7")).unwrap();
     block_on(store.put_identity("456:7@lid.0", [4; 32])).unwrap();
+    // The plain libsignal form carries the device in its suffix.
+    block_on(store.put_session("123@s.whatsapp.net.5", b"pn-5")).unwrap();
     // Another user sharing the prefix is untouched.
     block_on(store.put_session("1234@c.us.0", b"other")).unwrap();
 
     let pn: wacore_binary::Jid = "123@s.whatsapp.net".parse().unwrap();
     let lid: wacore_binary::Jid = "456@lid".parse().unwrap();
-    assert_eq!(block_on(ops.migrate_pn_to_lid(&pn, &lid)).unwrap(), 3);
+    assert_eq!(block_on(ops.migrate_pn_to_lid(&pn, &lid)).unwrap(), 4);
 
     let session = |a: &str| block_on(store.get_session(a)).unwrap().map(|b| b.to_vec());
     let identity = |a: &str| block_on(store.load_identity(a)).unwrap();
@@ -409,7 +418,14 @@ fn migrate_pn_to_lid_moves_regular_and_hosted_devices() {
     assert_eq!(identity("456:99@hosted.lid.0"), Some([2; 32]));
     assert_eq!(session("456:7@lid.0").as_deref(), Some(&b"pn-7"[..]));
     assert_eq!(identity("456:7@lid.0"), Some([4; 32]));
-    for gone in ["123@c.us.0", "123:7@c.us.0", "123:99@hosted.0"] {
+    assert_eq!(session("456:5@lid.0").as_deref(), Some(&b"pn-5"[..]));
+    assert_eq!(session("456@lid.0").as_deref(), Some(&b"pn-0"[..]));
+    for gone in [
+        "123@c.us.0",
+        "123:7@c.us.0",
+        "123:99@hosted.0",
+        "123@s.whatsapp.net.5",
+    ] {
         assert!(
             session(gone).is_none() && identity(gone).is_none(),
             "{gone}"

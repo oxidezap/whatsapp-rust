@@ -211,29 +211,38 @@ pub(crate) fn session_key(address: &ProtocolAddress) -> String {
     format!("s:{}", address.as_str())
 }
 
-/// Device ID of `address` if it is a stored Signal address of `user` on
-/// `server`: `{user}@{server}.0` or `{user}:{device}@{server}.0`, with WA Web's
-/// `c.us` spelling for phone numbers.
+/// The device of `user`'s address `address` (a stored session or identity
+/// key) on `server`, or `None` when it belongs to someone else. Two forms
+/// are stored: wacore's `{user}[:{device}]@{server}.0`, with WA Web's `c.us`
+/// spelling for phone numbers, and the plain libsignal name
+/// `{user}@{server}.{device}` that callers can pass to `establish_session`
+/// or `decrypt`. A `:device` part wins over the suffix.
 fn device_of(address: &str, user: &str, server: Server) -> Option<u16> {
     let rest = address.strip_prefix(user)?;
-    let (device, rest) = match rest.strip_prefix(':') {
+    let (named, rest) = match rest.strip_prefix(':') {
         Some(tail) => {
             let at = tail.find('@')?;
-            (tail[..at].parse().ok()?, &tail[at..])
+            (Some(tail[..at].parse().ok()?), &tail[at..])
         }
-        None => (0, rest),
+        None => (None, rest),
     };
-    let signal_server = match server {
-        Server::Pn => "c.us",
-        other => other.as_str(),
+    let rest = rest.strip_prefix('@')?;
+    let spellings: &[&str] = match server {
+        Server::Pn => &["c.us", "s.whatsapp.net"],
+        other => &[other.as_str()],
     };
-    // The libsignal device suffix: `.0`. Requiring digits keeps `hosted`
-    // from matching `hosted.lid` addresses.
-    let suffix = rest
-        .strip_prefix('@')?
-        .strip_prefix(signal_server)?
-        .strip_prefix('.')?;
-    (!suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit())).then_some(device)
+    // The libsignal device suffix. Requiring digits keeps `hosted` from
+    // matching `hosted.lid` addresses.
+    let suffix = spellings
+        .iter()
+        .find_map(|spelling| rest.strip_prefix(spelling)?.strip_prefix('.'))?;
+    if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(match named {
+        Some(device) => device,
+        None => suffix.parse().ok()?,
+    })
 }
 
 /// `server` plus its hosted counterpart, if it has one.
