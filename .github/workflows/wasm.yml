@@ -168,22 +168,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: "true"
-      - name: Use Node 24 for JavaScript binding tests
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
-        with:
-          node-version: "24"
-          package-manager-cache: false
-      # The JS bindings are only proven by running them: build, generate the
-      # Node glue, and drive two devices end to end from JavaScript.
-      - name: Test wacore-signal-wasm bindings from Node
-        # Build the native fixture without the WASM-only randomness override.
+      # The bindings are proven by running them: wasm-bindgen-test-runner
+      # (from the CLI above) loads the test module in the runner's Node and
+      # drives two devices end to end through the exported JS surface.
+      - name: Test wacore-signal-wasm bindings
         env:
           RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
-          SIGNAL_WASM_FIXTURE: ${{ github.workspace }}/target/debug/examples/fixture
-        run: |
-          RUSTFLAGS='' cargo build --locked -p wacore-signal-wasm --example fixture
-          cargo build -p wacore-signal-wasm --lib --release --target wasm32-unknown-unknown
-          wasm-bindgen --target nodejs --out-dir target/signal-wasm-node \
-            target/wasm32-unknown-unknown/release/wacore_signal_wasm.wasm
-          node --test wacore/signal-wasm/tests/node.test.mjs
-          npm exec --yes --package=typescript@6.0.3 -- tsc --noEmit --target es2022 --module esnext --moduleResolution bundler --lib esnext,dom --strict wacore/signal-wasm/tests/types.ts
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: >
+          cargo test --locked -p wacore-signal-wasm
+          --target wasm32-unknown-unknown

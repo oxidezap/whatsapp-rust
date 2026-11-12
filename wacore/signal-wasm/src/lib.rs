@@ -259,6 +259,21 @@ impl SignalDevice {
 
     /// Durable public upload batch. Repeated calls/reopening recover the
     /// outstanding live batch; use fresh `generatePrekeys` for retry receipts.
+    ///
+    /// Host call sequence for uploading to the provider. The host initializes
+    /// its own wasm-bindgen module and supplies durable fenced storage plus an
+    /// AAD-authenticating sealer, and keeps one device per held scope. It
+    /// calls `SignalDevice.open` with `create` set, then
+    /// `preparePrekeyUpload(count)` for at most 812 keys, then `publicIdentity()`.
+    /// It passes its upload callback only `registrationId`, `identityKey`,
+    /// `signedPrekey`, the batch's `batchId` and its `preKeys`. The identity
+    /// also carries `advSecret`, which must stay out of that callback. The
+    /// callback owns provider transport, retries and deadlines. When it
+    /// succeeds, the host calls `acknowledgePrekeyUpload` with the `batchId`
+    /// and every key ID. When the response is lost or the callback fails, the
+    /// host skips the acknowledgment; reopening the scope and calling
+    /// `preparePrekeyUpload` again returns the same batch. In every case it
+    /// calls `release()` and then frees the device.
     #[wasm_bindgen(js_name = preparePrekeyUpload, unchecked_return_type = "Promise<PrekeyUploadBatch>")]
     pub fn prepare_prekey_upload(&self, count: f64) -> Promise {
         let inner = self.inner.clone();

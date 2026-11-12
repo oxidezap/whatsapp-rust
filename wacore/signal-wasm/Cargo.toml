@@ -31,12 +31,16 @@ waproto = { workspace = true }
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom = { workspace = true, features = ["wasm_js"] }
 
-[dev-dependencies]
+# The tests drive the exported bindings inside a wasm-bindgen host (Node by
+# default). Keep `wasm-bindgen-test` on the exact release of the locked
+# `wasm-bindgen`; the runner (`wasm-bindgen-cli`) must match it too.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+aes-gcm = { workspace = true }
 buffa = { workspace = true }
 hmac = { workspace = true }
-sha2 = { workspace = true }
 rand = { workspace = true }
-serde_json = { workspace = true }
+sha2 = { workspace = true }
 wacore = { workspace = true, features = ["test-util"] }
 wacore-binary = { workspace = true }
+wasm-bindgen-test = "=0.3.78"
 waproto = { workspace = true }
