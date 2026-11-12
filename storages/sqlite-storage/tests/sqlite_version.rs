@@ -5,8 +5,9 @@
 //! after a WAL database is reopened with a different page size.
 //!
 //! Diesel 2.3 caps `libsqlite3-sys` below 0.39, whose bundled SQLite is still
-//! affected. A build that links its own SQLite (`LIBSQLITE3_SYS_USE_PKG_CONFIG`,
-//! as `cargo xt fixed-sqlite` sets up) must link 3.54 or newer; this test
+//! affected. A build that links an external SQLite, either without the
+//! `bundled-sqlite` feature or with `LIBSQLITE3_SYS_USE_PKG_CONFIG` (as
+//! `cargo xt fixed-sqlite` sets up), must link 3.54 or newer; this test
 //! enforces that. With the bundled copy it reports the version and passes.
 //! The wasm backend links sqlite-wasm-rs 0.6.3, which bundles 3.54.1.
 #![cfg(not(target_family = "wasm"))]
@@ -40,10 +41,11 @@ fn linked_version() -> String {
     row.version
 }
 
-/// Whether this build links a SQLite chosen by the environment rather than
-/// the copy bundled with `libsqlite3-sys`.
+/// Whether this build links an external SQLite rather than the copy bundled
+/// with `libsqlite3-sys`: bundling is off, or the environment overrides it.
 fn links_own_sqlite() -> bool {
-    option_env!("LIBSQLITE3_SYS_USE_PKG_CONFIG").is_some_and(|value| value != "0")
+    !cfg!(feature = "bundled-sqlite")
+        || option_env!("LIBSQLITE3_SYS_USE_PKG_CONFIG").is_some_and(|value| value != "0")
 }
 
 #[test]
