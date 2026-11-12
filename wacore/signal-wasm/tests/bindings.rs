@@ -185,6 +185,9 @@ struct State {
     fail_before: Cell<Option<OpsPredicate>>,
     /// Commit a write, then report it lost, once.
     fail_after: Cell<Option<OpsPredicate>>,
+    /// Delay the response of each `acquire` call in turn (the lease is taken
+    /// at once), then none.
+    acquire_delays: RefCell<Vec<u32>>,
     /// Delay every `get`, so concurrent opens interleave.
     read_delay_ms: Cell<u32>,
 }
@@ -299,10 +302,27 @@ impl MemoryBackend {
         }
         {
             let mut records = state.records.borrow_mut();
-            if ops.iter().any(|op| {
-                op.kind == "insert" && records.contains_key(&slot(&scope, &op.ns, &op.key))
-            }) {
-                return Err(coded_error("record_exists", "record exists"));
+            // Presence moves through the batch: an insert sees what earlier
+            // ops of the same batch created or deleted.
+            let mut present: HashMap<String, bool> = HashMap::new();
+            for op in &ops {
+                let at = slot(&scope, &op.ns, &op.key);
+                let exists = present
+                    .get(&at)
+                    .copied()
+                    .unwrap_or_else(|| records.contains_key(&at));
+                match op.kind.as_str() {
+                    "insert" if exists => {
+                        return Err(coded_error("record_exists", "record exists"));
+                    }
+                    "insert" | "put" => {
+                        present.insert(at, true);
+                    }
+                    "delete" => {
+                        present.insert(at, false);
+                    }
+                    _ => {}
+                }
             }
             for op in &ops {
                 let at = slot(&scope, &op.ns, &op.key);
@@ -331,6 +351,28 @@ impl MemoryBackend {
     }
 
     pub async fn acquire(
+        &self,
+        scope: String,
+        holder: String,
+        now_ms: f64,
+        ttl_ms: f64,
+    ) -> Result<JsValue, JsValue> {
+        let delay = {
+            let mut delays = self.state.acquire_delays.borrow_mut();
+            if delays.is_empty() {
+                0
+            } else {
+                delays.remove(0)
+            }
+        };
+        let out = self.take_lease(scope, holder, now_ms, ttl_ms);
+        if delay > 0 {
+            sleep_ms(delay).await;
+        }
+        out
+    }
+
+    fn take_lease(
         &self,
         scope: String,
         holder: String,
@@ -459,6 +501,9 @@ struct ResolverState {
     /// Bundle by exact device JID, then `fallback` for any other JID.
     bundles: Vec<(String, JsValue)>,
     fallback: Option<JsValue>,
+    /// `(device, code)` the resolver names as rejected. When set, `fetchPrekeys`
+    /// resolves `{ bundles, rejected }` instead of the plain map.
+    rejected: Vec<(String, u16)>,
     /// The group `resolveGroup` expects and its members; none means a
     /// direct-only resolver whose `resolveGroup` fails.
     group: Option<(String, Vec<String>)>,
@@ -492,7 +537,23 @@ impl ResolverState {
                 set(&out, &jid, bundle);
             }
         }
-        Ok(out)
+        if self.rejected.is_empty() {
+            return Ok(out);
+        }
+        let rejected: Array = self
+            .rejected
+            .iter()
+            .map(|(jid, code)| {
+                let item = Object::new();
+                set(&item, "jid", &JsValue::from_str(jid));
+                set(&item, "code", &JsValue::from_f64(f64::from(*code)));
+                JsValue::from(item)
+            })
+            .collect();
+        let wrapped = Object::new();
+        set(&wrapped, "bundles", &out);
+        set(&wrapped, "rejected", &rejected);
+        Ok(wrapped)
     }
 
     fn resolve_group(&self, jid: &str) -> Result<Object, JsValue> {
@@ -2055,7 +2116,12 @@ async fn a_failed_open_keeps_the_lease_that_a_concurrent_open_by_the_same_holder
 async fn a_second_open_with_the_wrong_sealer_does_not_disturb_the_live_device() {
     let bob = device("bob-wrong-key").await;
     let wrong: JsValue = TestSealer::new().into();
-    let _ = open_with(&bob.h.backend, &wrong, "bob-wrong-key", "tab-a", 1.0, false).await;
+    let failed =
+        expect_err(open_with(&bob.h.backend, &wrong, "bob-wrong-key", "tab-a", 1.0, false).await);
+    assert!(
+        !message_of(&failed).is_empty(),
+        "the second open with the wrong sealer is rejected"
+    );
     let refused = expect_err(bob.h.open("bob-wrong-key", "tab-b", 2.0, false).await);
     assert_eq!(code_of(&refused).as_deref(), Some("lease_held"));
     let identity = run(bob.signal.public_identity()).await;
@@ -2323,4 +2389,180 @@ fn collect_to(node: &wacore_binary::Node, out: &mut Vec<String>) {
     for child in node.children().into_iter().flatten() {
         collect_to(child, out);
     }
+}
+
+#[wasm_bindgen_test]
+async fn a_prekey_message_needs_a_device_identity_of_the_senders_pinned_account() {
+    let alice = device("alice-pkmsg-identity").await;
+    let bob = device("bob-pkmsg-identity").await;
+    let other = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+    establish(&alice.signal, BOB, bundle_for(&bob.signal, true).await).await;
+    let (kind, ciphertext) = encrypt(&alice.signal, BOB, b"first").await;
+    assert_eq!(kind, "pkmsg");
+    let foreign = device_identity_under(&alice.signal, &other).await;
+    let decrypt_with = |identity: Option<JsValue>| {
+        bob.signal.decrypt(
+            ALICE.into(),
+            1,
+            kind.clone(),
+            ciphertext.clone(),
+            identity.map(JsCast::unchecked_into),
+        )
+    };
+    rejects_with(decrypt_with(Some(foreign.clone())), "bundle_refused").await;
+    rejects_with(decrypt_with(None), "bundle_refused").await;
+    rejects_with(
+        bob.signal.receive(
+            ALICE.into(),
+            ALICE.into(),
+            1,
+            kind.clone(),
+            ciphertext.clone(),
+            2,
+            false,
+            None,
+            Some(foreign.unchecked_into()),
+        ),
+        "bundle_refused",
+    )
+    .await;
+    assert_eq!(
+        run(bob.signal.has_session(ALICE.into(), 1)).await,
+        JsValue::FALSE,
+        "a refused prekey message starts no session"
+    );
+    let genuine = device_identity_under(&alice.signal, &alice_account()).await;
+    let out = run(decrypt_with(Some(genuine))).await;
+    assert!(!bytes_of(&get(&out, "plaintext")).is_empty());
+}
+
+#[wasm_bindgen_test]
+async fn a_nested_device_sent_wrapper_does_not_surface_app_state_keys() {
+    let share = field(
+        1,
+        &[field(1, &field(1, &[3; 32])), field(2, &field(1, &[4; 32]))].concat(),
+    );
+    let protocol = field(12, &[varint(2 * 8), vec![6], field(7, &share)].concat());
+    let inner = [conversation("nested own-device content"), protocol].concat();
+    // Message.deviceSentMessage is field 31 and holds a Message in field 2.
+    let wrapped = (0..2).fold(inner, |message, _| field(31, &field(2, &message)));
+    let alice = device("alice-nested-dsm").await;
+    let bob = device("bob-nested-dsm").await;
+    establish(&alice.signal, BOB, bundle_for(&bob.signal, true).await).await;
+    let (kind, ciphertext) = encrypt(&alice.signal, BOB, &pad(&wrapped)).await;
+    let received = receive_with(
+        &bob.signal,
+        ALICE,
+        &kind,
+        &ciphertext,
+        2,
+        true,
+        Some(JsValue::TRUE),
+    )
+    .await
+    .ok()
+    .unwrap();
+    let message = bytes_of(&get(&received, "message"));
+    assert!(
+        contains_run(&message, b"nested own-device content"),
+        "the content survives"
+    );
+    assert!(
+        !contains_run(&message, &share),
+        "no wrapper layer may carry key material"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn a_rejected_device_named_by_the_resolver_is_reported_as_a_stale_group_user() {
+    const GONE: &str = "222:2@s.whatsapp.net";
+    let alice = device("alice-stale").await;
+    let bob = device("bob-stale").await;
+    run(alice
+        .signal
+        .set_own_jids("111:1@s.whatsapp.net".into(), Some("900111:1@lid".into())))
+    .await;
+    let resolver = Rc::new(ResolverState {
+        devices: vec![BOB_DEVICE.into(), GONE.into()],
+        bundles: vec![(BOB_DEVICE.into(), bundle_for(&bob.signal, true).await)],
+        rejected: vec![(GONE.into(), 406)],
+        group: Some((GROUP.into(), vec![ALICE.into(), BOB.into()])),
+        ..ResolverState::default()
+    });
+    let sent = run(alice.signal.send_group(
+        plain_resolver(&resolver).unchecked_into(),
+        GROUP.into(),
+        conversation("stale"),
+        "STALE1".into(),
+    ))
+    .await;
+    assert!(strings_of(&get(&sent, "distributionTargets")).contains(&BOB_DEVICE.to_owned()));
+    assert_eq!(strings_of(&get(&sent, "staleDeviceUsers")), ["222"]);
+}
+
+#[wasm_bindgen_test]
+async fn a_failed_open_leaves_the_lease_while_a_same_holder_open_is_still_acquiring() {
+    let h = Harness::new();
+    h.state.read_delay_ms.set(5);
+    let seed = h
+        .open("bob-acquiring", "tab-a", 0.0, true)
+        .await
+        .ok()
+        .unwrap();
+    run(seed.release()).await;
+    drop(seed);
+    // The first open gets its lease at once and fails on the wrong key; the
+    // second is still waiting for its (identical) lease when that happens.
+    h.state.acquire_delays.replace(vec![0, 30]);
+    let wrong: JsValue = TestSealer::new().into();
+    let (failed, started) = join2(
+        open_with(&h.backend, &wrong, "bob-acquiring", "tab-a", 1.0, false),
+        h.open("bob-acquiring", "tab-a", 1.0, false),
+    )
+    .await;
+    assert!(failed.is_err());
+    let bob = started.expect("the concurrent open succeeds");
+    let refused = expect_err(h.open("bob-acquiring", "tab-b", 2.0, false).await);
+    assert_eq!(
+        code_of(&refused).as_deref(),
+        Some("lease_held"),
+        "the failure released a lease the other open still uses"
+    );
+    assert_eq!(run(bob.renew_lease(3.0, TTL)).await, JsValue::TRUE);
+}
+
+#[wasm_bindgen_test]
+async fn the_test_backend_tracks_key_presence_through_a_batch() {
+    let h = Harness::new();
+    let bob = h.open("bob-batch", "tab-a", 0.0, true).await.ok().unwrap();
+    let fence = Object::new();
+    set(&fence, "scope", &"bob-batch".into());
+    set(&fence, "generation", &JsValue::from_f64(1.0));
+    let op = |kind: &str, value: u8| -> JsValue {
+        let op = Object::new();
+        set(&op, "op", &kind.into());
+        set(&op, "ns", &"probe".into());
+        set(&op, "key", &"K".into());
+        if kind != "delete" {
+            set(&op, "value", &Uint8Array::from(&[value][..]));
+        }
+        op.into()
+    };
+    let backend = MemoryBackend {
+        state: h.state.clone(),
+    };
+    let write =
+        |ops: &[JsValue]| backend.write(fence.clone().into(), ops.iter().cloned().collect());
+    // Absent key: two inserts in one batch conflict.
+    let error = write(&[op("insert", 1), op("insert", 2)])
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&error).as_deref(), Some("record_exists"));
+    assert_eq!(h.state.keys_in_namespace("probe"), 0, "the batch is atomic");
+    write(&[op("insert", 1)]).await.unwrap();
+    // Present key: delete then insert succeeds; insert then insert fails.
+    write(&[op("delete", 0), op("insert", 3)]).await.unwrap();
+    let error = write(&[op("insert", 4)]).await.unwrap_err();
+    assert_eq!(code_of(&error).as_deref(), Some("record_exists"));
+    drop(bob);
 }
