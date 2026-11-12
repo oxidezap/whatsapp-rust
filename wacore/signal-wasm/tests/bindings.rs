@@ -25,6 +25,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::rc::Rc;
 use std::task::Poll;
+use wacore::libsignal::protocol::{KeyPair, PublicKey};
 use wacore_signal_wasm::SignalDevice;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -653,10 +654,21 @@ struct Dev {
 async fn device(scope: &str) -> Dev {
     let h = Harness::new();
     let signal = h.open(scope, "tab-a", 0.0, true).await.ok().unwrap();
+    // Every sender knows Bob's account, as after a first contact.
+    run(signal.trust_account_identity(BOB.into(), account_bytes(&bob_account()))).await;
     Dev { signal, h }
 }
 
+/// A companion (device 1) bundle of Bob's account, with its device identity.
 async fn bundle_for(signal: &SignalDevice, with_prekey: bool) -> JsValue {
+    let bundle = unverified_bundle_for(signal, with_prekey).await;
+    let identity = device_identity_under(signal, &bob_account()).await;
+    set(bundle.unchecked_ref(), "deviceIdentity", &identity);
+    bundle
+}
+
+/// The same bundle without a device identity.
+async fn unverified_bundle_for(signal: &SignalDevice, with_prekey: bool) -> JsValue {
     let identity = run(signal.public_identity()).await;
     let signed = get(&identity, "signedPrekey");
     let bundle = Object::new();
@@ -807,13 +819,18 @@ fn contains_run(haystack: &[u8], needle: &[u8]) -> bool {
 // Test-only protos have no pinned codec root, as in the native pairing tests.
 #[allow(clippy::disallowed_methods)]
 fn pairing_container(identity_key: &[u8], adv_secret: &[u8]) -> Vec<u8> {
+    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    pairing_container_for(&KeyPair::generate(&mut rng), identity_key, adv_secret)
+}
+
+/// The same container, signed by a given account key.
+#[allow(clippy::disallowed_methods)]
+fn pairing_container_for(account: &KeyPair, identity_key: &[u8], adv_secret: &[u8]) -> Vec<u8> {
     use buffa::Message as _;
     use hmac::{KeyInit, Mac};
-    use wacore::libsignal::protocol::{KeyPair, PublicKey};
     use waproto::whatsapp as wa;
     let public: [u8; 32] = identity_key.try_into().unwrap();
     let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-    let account = KeyPair::generate(&mut rng);
     let device = KeyPair::new(
         PublicKey::from_djb_public_key_bytes(&public).unwrap(),
         KeyPair::generate(&mut rng).private_key,
@@ -826,7 +843,7 @@ fn pairing_container(identity_key: &[u8], adv_secret: &[u8]) -> Vec<u8> {
     details.device_type = Some(wa::ADVEncryptionType::E2EE);
     let details = details.encode_to_vec();
     let signed = wacore::adv::test_util::signed_identity(
-        &account,
+        account,
         &device,
         &details,
         wacore::adv::test_util::account_prefix(Some(wa::ADVEncryptionType::E2EE)),
@@ -850,6 +867,57 @@ async fn pair(signal: &SignalDevice) {
         &bytes_of(&get(&identity, "advSecret")),
     );
     run(signal.sign_pairing(container)).await;
+}
+
+std::thread_local! {
+    /// The account key Bob's devices are paired under.
+    static BOB_ACCOUNT: KeyPair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+}
+
+fn bob_account() -> KeyPair {
+    BOB_ACCOUNT.with(KeyPair::clone)
+}
+
+fn account_bytes(account: &KeyPair) -> Uint8Array {
+    Uint8Array::from(account.public_key.public_key_bytes().as_slice())
+}
+
+/// The `<device-identity>` a server would send for `signal`, as a companion
+/// of the account that owns `account`.
+async fn device_identity_under(signal: &SignalDevice, account: &KeyPair) -> JsValue {
+    let identity = run(signal.public_identity()).await;
+    let container = pairing_container_for(
+        account,
+        &bytes_of(&get(&identity, "identityKey")),
+        &bytes_of(&get(&identity, "advSecret")),
+    );
+    get(&run(signal.sign_pairing(container)).await, "signedIdentity")
+}
+
+/// A primary-device bundle whose identity key is `account` itself, as for a
+/// real account: the signed prekey is signed by it.
+fn primary_bundle_of(account: &KeyPair) -> JsValue {
+    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    let signed = KeyPair::generate(&mut rng);
+    let prekey = KeyPair::generate(&mut rng);
+    let signature = account
+        .private_key
+        .calculate_signature(&signed.public_key.serialize(), &mut rng)
+        .unwrap();
+    let bundle = Object::new();
+    set(&bundle, "registrationId", &JsValue::from_f64(4242.0));
+    set(&bundle, "deviceId", &JsValue::from_f64(0.0));
+    set(&bundle, "identityKey", &account_bytes(account));
+    set(&bundle, "signedPrekeyId", &JsValue::from_f64(1.0));
+    set(&bundle, "signedPrekey", &account_bytes(&signed));
+    set(
+        &bundle,
+        "signedPrekeySignature",
+        &Uint8Array::from(&signature[..]),
+    );
+    set(&bundle, "prekeyId", &JsValue::from_f64(1.0));
+    set(&bundle, "prekey", &account_bytes(&prekey));
+    bundle.into()
 }
 
 fn stanza(bytes: &[u8]) -> wacore_binary::Node {
@@ -1518,13 +1586,8 @@ async fn a_group_retry_clears_only_the_requester_distribution_acknowledgment() {
         .set_own_jids("111:1@s.whatsapp.net".into(), Some("900111:1@lid".into())))
     .await;
     pair(&alice.signal).await;
-    let primary = device("bob-primary-group-resend").await;
-    let primary_bundle = bundle_for(&primary.signal, true).await;
-    set(
-        primary_bundle.unchecked_ref(),
-        "deviceId",
-        &JsValue::from_f64(0.0),
-    );
+    // Bob's primary device, whose identity key is the account key.
+    let primary_bundle = primary_bundle_of(&bob_account());
     let resolver = Rc::new(ResolverState {
         devices: vec![BOB.into(), BOB_DEVICE.into()],
         bundles: vec![(BOB.into(), primary_bundle)],
