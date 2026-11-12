@@ -519,6 +519,40 @@ async fn concurrent_prepare_is_bounded_and_retry_generation_stays_fresh() {
 }
 
 #[test]
+fn a_prepare_in_progress_holds_back_other_prepares_and_fresh_generation() {
+    block_on(async {
+        let f = Fixture::new().await;
+        let (entered, observed) = oneshot::channel();
+        let (resume, wait) = oneshot::channel();
+        *f.records.pending_read_gate.lock().unwrap() = Some((entered, wait));
+        // The first prepare pauses at its pending-batch read.
+        let first = f.ops.prepare_prekey_upload(&InlineRuntime, 4);
+        futures::pin_mut!(first);
+        assert!(futures::poll!(&mut first).is_pending());
+        observed.await.unwrap();
+        let second = f.ops.prepare_prekey_upload(&InlineRuntime, 4);
+        futures::pin_mut!(second);
+        let fresh = f.ops.generate_prekeys(&InlineRuntime, 2);
+        futures::pin_mut!(fresh);
+        assert!(futures::poll!(&mut second).is_pending());
+        assert!(futures::poll!(&mut fresh).is_pending());
+        assert_eq!(f.counter().await, 1, "nothing allocated while held back");
+        assert!(f.store.load_prekey(1).await.unwrap().is_none());
+        resume.send(()).unwrap();
+        let (first, second, fresh) = futures::join!(first, second, fresh);
+        let (first, second, fresh) = (first.unwrap(), second.unwrap(), fresh.unwrap());
+        assert_eq!(first, second, "the second prepare reuses the batch");
+        assert!(
+            fresh
+                .iter()
+                .all(|key| first.pre_keys.iter().all(|batch| batch.id != key.id)),
+            "fresh keys never reuse batch ids"
+        );
+        assert_eq!(f.counter().await, 7);
+    });
+}
+
+#[test]
 fn wrap_reserves_consumed_pending_ids_and_late_ack_never_marks_retry_keys() {
     block_on(async {
         let f = Fixture::new().await;
@@ -813,15 +847,31 @@ fn corrupted_pending_metadata_or_private_keys_fail_closed_without_replacement() 
                 .await
                 .is_err()
         );
-        for count in [0, 813, u32::MAX] {
+        // Count validation, on a healthy device so no other check can be
+        // what refuses.
+        let f = Fixture::new().await;
+        let count_error = |error: wacore_signal_ops::OpsError| {
             assert!(
+                error.to_string().contains("prekey count must be 1 to 812"),
+                "{error}"
+            )
+        };
+        for count in [0, 813, u32::MAX] {
+            count_error(
                 f.ops
                     .prepare_prekey_upload(&InlineRuntime, count)
                     .await
-                    .is_err()
+                    .unwrap_err(),
             );
-            assert!(f.ops.generate_prekeys(&InlineRuntime, count).await.is_err());
+            count_error(
+                f.ops
+                    .generate_prekeys(&InlineRuntime, count)
+                    .await
+                    .unwrap_err(),
+            );
         }
+        assert_eq!(f.counter().await, 1, "a refused count allocates nothing");
+        assert!(f.store.load_prekey(1).await.unwrap().is_none());
     });
 }
 
@@ -1139,8 +1189,10 @@ fn an_acknowledgment_that_committed_but_lost_its_response_replays_after_reopenin
         );
         assert_eq!(f.uploaded(2).await, Some(true));
 
-        // The process restarts: only the sealed store remains.
-        let Fixture { store, .. } = f;
+        // The process restarts: only the sealed store remains, and no live
+        // instance is left for the reopen to join.
+        let Fixture { store, ops, .. } = f;
+        drop(ops);
         let reopened = SignalOps::open(store).await.unwrap();
         reopened
             .acknowledge_prekey_upload(&batch.batch_id, &[1, 2])
