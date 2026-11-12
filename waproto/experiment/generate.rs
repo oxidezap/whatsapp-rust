@@ -33,13 +33,12 @@ struct Scalar {
 }
 
 fn scalar(kind: Type, bytes: bool) -> Scalar {
-    let (owned, borrowed, wire, read, value, length, write, promote) = match kind {
+    let (owned, borrowed, wire, read, length, write, promote) = match kind {
         Type::TYPE_STRING => (
             "String",
             "&'a str",
             2,
             "r.string()?",
-            "value.as_bytes()",
             "wire::varint_len(value.len() as u64) + value.len()",
             "wire::varint(value.len() as u64, output); output.extend_from_slice(value.as_bytes());",
             "value.to_owned()",
@@ -49,7 +48,6 @@ fn scalar(kind: Type, bytes: bool) -> Scalar {
             "&'a [u8]",
             2,
             "r.bytes()?",
-            "*value",
             "wire::varint_len(value.len() as u64) + value.len()",
             "wire::varint(value.len() as u64, output); output.extend_from_slice(value);",
             if bytes {
@@ -63,7 +61,6 @@ fn scalar(kind: Type, bytes: bool) -> Scalar {
             "bool",
             0,
             "r.varint()? != 0",
-            "u64::from(*value)",
             "1",
             "wire::varint(u64::from(*value), output);",
             "value",
@@ -73,7 +70,6 @@ fn scalar(kind: Type, bytes: bool) -> Scalar {
             "u32",
             0,
             "r.varint()? as u32",
-            "u64::from(*value)",
             "wire::varint_len(u64::from(*value))",
             "wire::varint(u64::from(*value), output);",
             "value",
@@ -83,7 +79,6 @@ fn scalar(kind: Type, bytes: bool) -> Scalar {
             "u64",
             0,
             "r.varint()?",
-            "*value",
             "wire::varint_len(*value)",
             "wire::varint(*value, output);",
             "value",
@@ -93,7 +88,6 @@ fn scalar(kind: Type, bytes: bool) -> Scalar {
             "i32",
             0,
             "r.varint()? as i32",
-            "*value as u64",
             "wire::varint_len(*value as u64)",
             "wire::varint(*value as u64, output);",
             "value",
@@ -103,7 +97,6 @@ fn scalar(kind: Type, bytes: bool) -> Scalar {
             "i64",
             0,
             "r.varint()? as i64",
-            "*value as u64",
             "wire::varint_len(*value as u64)",
             "wire::varint(*value as u64, output);",
             "value",
@@ -113,7 +106,6 @@ fn scalar(kind: Type, bytes: bool) -> Scalar {
             "u32",
             5,
             "r.fixed32()?",
-            "u64::from(*value)",
             "4",
             "output.extend_from_slice(&value.to_le_bytes());",
             "value",
@@ -123,7 +115,6 @@ fn scalar(kind: Type, bytes: bool) -> Scalar {
             "i32",
             5,
             "r.fixed32()? as i32",
-            "*value as u64",
             "4",
             "output.extend_from_slice(&value.to_le_bytes());",
             "value",
@@ -133,7 +124,6 @@ fn scalar(kind: Type, bytes: bool) -> Scalar {
             "i64",
             1,
             "r.fixed64()? as i64",
-            "*value as u64",
             "8",
             "output.extend_from_slice(&value.to_le_bytes());",
             "value",
@@ -143,7 +133,6 @@ fn scalar(kind: Type, bytes: bool) -> Scalar {
             "f64",
             1,
             "f64::from_bits(r.fixed64()?)",
-            "value.to_bits()",
             "8",
             "output.extend_from_slice(&value.to_bits().to_le_bytes());",
             "value",
@@ -153,14 +142,12 @@ fn scalar(kind: Type, bytes: bool) -> Scalar {
             "f32",
             5,
             "f32::from_bits(r.fixed32()?)",
-            "u64::from(value.to_bits())",
             "4",
             "output.extend_from_slice(&value.to_bits().to_le_bytes());",
             "value",
         ),
         other => panic!("unqualified scalar in experiment: {other:?}"),
     };
-    let _ = value;
     Scalar {
         owned,
         borrowed,
@@ -271,11 +258,11 @@ pub fn generate(fds: &FileDescriptorSet, output: &Path) -> std::io::Result<()> {
             ));
         }
         source.push_str("} } }\n");
-        source.push_str(&format!("impl {name} {{ pub fn decode(input: &[u8]) -> Result<Self, wire::Error> {{ Ok({view}::decode(input)?.to_owned_message()) }}\n pub fn encoded_len(&self) -> usize {{ let mut len = 0;\n"));
+        source.push_str(&format!("impl {name} {{ pub fn decode(input: &[u8]) -> Result<Self, wire::Error> {{ Ok({view}::decode(input)?.to_owned_message()) }}\n pub fn encoded_len(&self) -> usize {{ let mut len = 0usize;\n"));
         for field in &fields {
             let scalar = field_scalar(path, field);
             let tag = ((field.number.expect("number") as u64) << 3) | u64::from(scalar.wire);
-            source.push_str(&format!("if let Some(value) = &self.{} {{ let _ = value; len += wire::varint_len({tag}) + {}; }}\n", field.name.as_deref().expect("name").to_snake_case(), scalar.length));
+            source.push_str(&format!("if let Some(value) = &self.{} {{ let _ = value; len = len.saturating_add(wire::varint_len({tag}) + {}); }}\n", field.name.as_deref().expect("name").to_snake_case(), scalar.length));
         }
         source.push_str("assert!(len <= wire::MAX_SIZE, \"protobuf message size limit\"); len }\n pub fn encode_into(&self, output: &mut Vec<u8>) { let _ = self.encoded_len();\n");
         for field in &fields {
