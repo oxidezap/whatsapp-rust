@@ -1213,3 +1213,127 @@ async fn an_acknowledgment_from_before_a_rotation_does_not_mark_the_new_key() {
     );
     assert!(send("warm", "S4").await.distribution_targets.is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retry_for_a_device_outside_the_conversation_is_refused() {
+    use wacore::types::message::AddressingMode;
+    use wacore_signal_ops::{OpsError, RetryRequest, RetryRoute};
+
+    let bob_jid: Jid = "222:1@s.whatsapp.net".parse().unwrap();
+    let eve_jid: Jid = "333:1@s.whatsapp.net".parse().unwrap();
+    let alice = device_with_lid(
+        "alice-retry-check",
+        "111:1@s.whatsapp.net",
+        Some("900111:1@lid"),
+    )
+    .await;
+    common::pair(&alice).await;
+    let bob = device("bob-retry-check", "222:1@s.whatsapp.net").await;
+    let eve = device("eve-retry-check", "333:1@s.whatsapp.net").await;
+    let eve_bundle = remote_bundle_from(&bundle_for(&eve).await);
+    let group: Jid = "120363000000004@g.us".parse().unwrap();
+    let client = FakeClient {
+        devices: vec![bob_jid.clone()],
+        bundles: HashMap::from([(bob_jid.clone(), bundle_for(&bob).await)]),
+        group: Some(Arc::new(GroupRoutingInfo::new(
+            vec!["111@s.whatsapp.net".parse().unwrap(), bob_jid.to_non_ad()],
+            AddressingMode::Pn,
+        ))),
+    };
+    let to = bob_jid.to_non_ad();
+    alice
+        .send_direct(&TokioRuntime, &client, &to, &text("for bob only"), "D1")
+        .await
+        .unwrap();
+    alice
+        .send_group(&TokioRuntime, &client, &group, &text("members only"), "G1")
+        .await
+        .unwrap();
+
+    let refused = |result: Result<Vec<u8>, OpsError>| {
+        assert!(
+            matches!(result, Err(OpsError::InvalidInput(_))),
+            "expected a refused retry, got {result:?}"
+        );
+    };
+    // A stranger asks for the direct message with its own keys.
+    refused(
+        alice
+            .resend(
+                &client,
+                RetryRequest {
+                    chat: &to,
+                    message_id: "D1",
+                    requester: &eve_jid,
+                    encryption_jid: &eve_jid,
+                    route: RetryRoute::Direct { recipient: None },
+                    retry_count: 1,
+                    bundle: Some(&eve_bundle),
+                },
+            )
+            .await,
+    );
+    // The real recipient is named, but the encryption address is someone else's.
+    refused(
+        alice
+            .resend(
+                &client,
+                RetryRequest {
+                    chat: &to,
+                    message_id: "D1",
+                    requester: &bob_jid,
+                    encryption_jid: &eve_jid,
+                    route: RetryRoute::Direct { recipient: None },
+                    retry_count: 1,
+                    bundle: Some(&eve_bundle),
+                },
+            )
+            .await,
+    );
+    // A non-member asks for the group message.
+    refused(
+        alice
+            .resend(
+                &client,
+                RetryRequest {
+                    chat: &group,
+                    message_id: "G1",
+                    requester: &eve_jid,
+                    encryption_jid: &eve_jid,
+                    route: RetryRoute::Group {
+                        addressing_mode: AddressingMode::Pn,
+                    },
+                    retry_count: 1,
+                    bundle: Some(&eve_bundle),
+                },
+            )
+            .await,
+    );
+    // Nothing was written for the stranger.
+    assert!(
+        !alice
+            .has_session(&eve_jid.to_protocol_address())
+            .await
+            .unwrap()
+    );
+
+    // Bob asking from his LID is the same account as the PN chat.
+    let bob_lid: Jid = "900222:1@lid".parse().unwrap();
+    let bob_lid_bundle = remote_bundle_from(&bundle_for(&bob).await);
+    let mapped = MappedClient { inner: client };
+    let retried = alice
+        .resend(
+            &mapped,
+            RetryRequest {
+                chat: &to,
+                message_id: "D1",
+                requester: &bob_lid,
+                encryption_jid: &bob_lid,
+                route: RetryRoute::Direct { recipient: None },
+                retry_count: 1,
+                bundle: Some(&bob_lid_bundle),
+            },
+        )
+        .await;
+    assert!(retried.is_ok(), "the recipient's LID form is accepted");
+}

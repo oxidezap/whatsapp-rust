@@ -15,7 +15,7 @@ use crate::error::OpsError;
 use crate::ops::RemoteBundle;
 use crate::ops::{ServiceStore, SignalOps, chain_key, group_key, session_key};
 use std::collections::HashSet;
-use wacore::client::context::SendContextResolver;
+use wacore::client::context::{GroupRoutingInfo, SendContextResolver};
 use wacore::libsignal::protocol::{UsePQRatchet, process_prekey_bundle};
 use wacore::libsignal::store::sender_key_name::SenderKeyName;
 use wacore::runtime::Runtime;
@@ -186,7 +186,75 @@ fn decode_epoch(bytes: Option<Vec<u8>>) -> u64 {
         .map_or(0, u64::from_be_bytes)
 }
 
+/// Whether `a` and `b` name the same account, across its PN and LID forms.
+async fn same_account(
+    resolver: &dyn SendContextResolver,
+    group: Option<&GroupRoutingInfo>,
+    a: &Jid,
+    b: &Jid,
+) -> bool {
+    if a.is_same_user_as(b) && a.is_pn() == b.is_pn() && a.is_lid() == b.is_lid() {
+        return true;
+    }
+    let (pn, lid) = match (a.is_pn(), b.is_pn(), a.is_lid(), b.is_lid()) {
+        (true, _, _, true) => (a, b),
+        (_, true, true, _) => (b, a),
+        _ => return false,
+    };
+    if let Some(group) = group
+        && group
+            .lid_user_for_phone_user(&pn.user)
+            .is_some_and(|user| *user == lid.user)
+    {
+        return true;
+    }
+    resolver
+        .get_lid_for_phone(&pn.user)
+        .await
+        .is_some_and(|user| user == lid.user)
+}
+
 impl<S: ServiceStore> SignalOps<S> {
+    /// Refuse a retry for a device outside the original conversation before
+    /// any state changes: re-encrypting a stored message to a device the
+    /// caller picks would hand out past plaintext. Membership and PN/LID
+    /// mappings come from `resolver`, the same source a send trusts for its
+    /// device list.
+    async fn check_retry_requester(
+        &self,
+        resolver: &dyn SendContextResolver,
+        request: &RetryRequest<'_>,
+        own: &OwnIdentity,
+    ) -> Result<(), OpsError> {
+        let refuse = || OpsError::InvalidInput("the retry requester was not a recipient".into());
+        let group = match request.route {
+            RetryRoute::Direct { .. } => None,
+            RetryRoute::Group { .. } | RetryRoute::BroadcastList => Some(
+                resolver
+                    .resolve_group_routing_info(request.chat)
+                    .await
+                    .map_err(send_error)?,
+            ),
+        };
+        let group = group.as_deref();
+        // The encryption address must belong to the requester itself.
+        if !same_account(resolver, group, request.requester, request.encryption_jid).await {
+            return Err(refuse());
+        }
+        let mut accounts: Vec<&Jid> = vec![&own.pn];
+        accounts.extend(own.lid.as_ref());
+        match group {
+            None => accounts.push(request.chat),
+            Some(group) => accounts.extend(group.participants.iter()),
+        }
+        for account in accounts {
+            if same_account(resolver, group, account, request.requester).await {
+                return Ok(());
+            }
+        }
+        Err(refuse())
+    }
+
     async fn own_identity(&self) -> Result<OwnIdentity, OpsError> {
         let keys = self.keys().await;
         let pn: Jid = keys
@@ -648,7 +716,9 @@ impl<S: ServiceStore> SignalOps<S> {
             .sent_message(request.chat, request.message_id)
             .await?
             .ok_or_else(|| OpsError::InvalidInput("no record of that sent message".into()))?;
-        let OwnIdentity { account, .. } = self.own_identity().await?;
+        let own = self.own_identity().await?;
+        self.check_retry_requester(resolver, &request, &own).await?;
+        let OwnIdentity { account, .. } = own;
         let address = request.encryption_jid.to_protocol_address();
 
         // A group retry also means the requester may have lost this device's
