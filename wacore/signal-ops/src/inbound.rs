@@ -47,6 +47,10 @@ pub struct ReceiveRequest<'a> {
     pub padding_version: u8,
     /// The sender is one of this account's own devices.
     pub is_from_me: bool,
+    /// The stanza's `<device-identity>`, which a prekey message from a
+    /// companion device carries. A prekey message whose sender does not
+    /// verify against its pinned account is refused before decryption.
+    pub device_identity: Option<&'a [u8]>,
 }
 
 #[derive(Debug)]
@@ -252,7 +256,13 @@ impl<S: ServiceStore> SignalOps<S> {
                         EncKind::Message
                     };
                     let decrypted = self
-                        .decrypt_into(&staged, request.sender, kind, request.ciphertext)
+                        .decrypt_into(
+                            &staged,
+                            request.sender,
+                            kind,
+                            request.ciphertext,
+                            request.device_identity,
+                        )
                         .await?;
                     (decrypted.plaintext, decrypted.identity_changed)
                 }

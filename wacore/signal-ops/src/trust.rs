@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use wacore::adv::{AdvValidation, validate_adv_with_identity_key};
 use wacore::client::context::{GroupRoutingInfo, SendContextResolver, SessionLockGuard};
-use wacore::libsignal::protocol::PreKeyBundle;
+use wacore::libsignal::protocol::{PreKeyBundle, ProtocolAddress};
 use wacore::prekeys::{PreKeyFetchOutcome, RejectedDevice};
 use wacore_binary::{Jid, JidExt as _};
 use wacore_recordstore::Namespace;
@@ -68,6 +68,26 @@ pub enum BundleRejection {
     NoAccountIdentity,
     #[error("the companion's device identity does not verify against the account")]
     InvalidDeviceIdentity,
+}
+
+/// The device a Signal address names. WhatsApp addresses carry the device
+/// in the name (Signal's device id is always 0) and spell the PN server as
+/// legacy `c.us`; a plain libsignal address keeps it in the device id.
+pub(crate) fn device_of(address: &ProtocolAddress) -> Result<Jid, OpsError> {
+    let name = address.name();
+    let name = name
+        .strip_suffix("@c.us")
+        .map_or_else(|| name.to_owned(), |user| format!("{user}@s.whatsapp.net"));
+    let device = name
+        .parse::<Jid>()
+        .map_err(|_| OpsError::InvalidInput(format!("{address} is not a device address")))?;
+    let device_id = u16::try_from(u32::from(address.device_id()))
+        .map_err(|_| OpsError::InvalidInput("device id out of range".into()))?;
+    Ok(if device.device == 0 && device_id != 0 {
+        device.with_device(device_id)
+    } else {
+        device
+    })
 }
 
 fn account_key(device: &Jid) -> String {
@@ -115,10 +135,26 @@ impl<S: ServiceStore> SignalOps<S> {
         ))
     }
 
-    /// Verify `bundle` for `device` and pin a first-seen primary identity in
-    /// `store`, which is the batch the session it allows will commit in.
-    /// `primary_hint` is the identity of the account's primary device fetched
-    /// together with this bundle, used when nothing is pinned yet.
+    /// This device's own account key, from its pairing, when `device` belongs
+    /// to this account. Own devices are anchored to it rather than to a pin.
+    async fn own_account(&self, device: &Jid) -> Option<[u8; 32]> {
+        let keys = self.keys().await;
+        let own = [keys.own_pn.as_deref(), keys.own_lid.as_deref()];
+        let account = device.to_non_ad();
+        if !own
+            .into_iter()
+            .flatten()
+            .filter_map(|jid| jid.parse::<Jid>().ok())
+            .any(|jid| jid.to_non_ad() == account)
+        {
+            return None;
+        }
+        let signed =
+            waproto::codec::adv_signed_device_identity_decode(keys.account.as_deref()?).ok()?;
+        <[u8; 32]>::try_from(signed.account_signature_key?.as_slice()).ok()
+    }
+
+    /// Verify `bundle` for `device`; see [`Self::verify_identity`].
     pub(crate) async fn verify_bundle(
         &self,
         store: &S,
@@ -127,15 +163,42 @@ impl<S: ServiceStore> SignalOps<S> {
         device_identity: Option<&[u8]>,
         primary_hint: Option<[u8; 32]>,
     ) -> Result<Result<(), BundleRejection>, OpsError> {
-        let identity = identity_bytes(bundle)?;
-        let pinned = Self::pinned(store, device).await?;
+        self.verify_identity(
+            store,
+            device,
+            identity_bytes(bundle)?,
+            device_identity,
+            primary_hint,
+        )
+        .await
+    }
+
+    /// Verify that `identity` may start a session with `device`, pinning a
+    /// first-seen account identity in `store`, the batch that session commits
+    /// in. `primary_hint` is the account's primary identity fetched in the
+    /// same batch, used when nothing is pinned yet. A first-use pin is an
+    /// exclusive insert, so a key the application accepted meanwhile is never
+    /// overwritten; that commit fails instead.
+    pub(crate) async fn verify_identity(
+        &self,
+        store: &S,
+        device: &Jid,
+        identity: [u8; 32],
+        device_identity: Option<&[u8]>,
+        primary_hint: Option<[u8; 32]>,
+    ) -> Result<Result<(), BundleRejection>, OpsError> {
+        let own = self.own_account(device).await;
+        let pinned = match own {
+            Some(own) => Some(own),
+            None => Self::pinned(store, device).await?,
+        };
         if is_primary(device) {
             return Ok(match pinned {
                 Some(pinned) if pinned != identity => Err(BundleRejection::IdentityChanged),
                 Some(_) => Ok(()),
                 None => {
                     store
-                        .put_aux(Namespace::AccountIdentity, &account_key(device), &identity)
+                        .insert_aux(Namespace::AccountIdentity, &account_key(device), &identity)
                         .await?;
                     Ok(())
                 }
@@ -154,7 +217,7 @@ impl<S: ServiceStore> SignalOps<S> {
         }
         if pinned.is_none() {
             store
-                .put_aux(Namespace::AccountIdentity, &account_key(device), &account)
+                .insert_aux(Namespace::AccountIdentity, &account_key(device), &account)
                 .await?;
         }
         Ok(Ok(()))

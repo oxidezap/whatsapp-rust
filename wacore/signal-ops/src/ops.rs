@@ -458,9 +458,23 @@ impl<S: ServiceStore> SignalOps<S> {
     /// Record this device's own JIDs once the client knows them (after pair
     /// success). Sends need them to build own-device copies.
     pub async fn set_own_jids(&self, pn: &str, lid: Option<&str>) -> Result<(), OpsError> {
-        for jid in std::iter::once(pn).chain(lid) {
+        let parse = |jid: &str| {
+            // The device-key record stores each JID behind a u16 length.
+            if u16::try_from(jid.len()).is_err() {
+                return Err(OpsError::InvalidInput(format!("{jid} is too long")));
+            }
             jid.parse::<wacore_binary::Jid>()
-                .map_err(|_| OpsError::InvalidInput(format!("{jid} is not a JID")))?;
+                .map_err(|_| OpsError::InvalidInput(format!("{jid} is not a JID")))
+        };
+        if !parse(pn)?.is_pn() {
+            return Err(OpsError::InvalidInput(format!(
+                "{pn} is not a phone-number JID"
+            )));
+        }
+        if let Some(lid) = lid
+            && !parse(lid)?.is_lid()
+        {
+            return Err(OpsError::InvalidInput(format!("{lid} is not a LID")));
         }
         let held = self.lock_device().await?;
         held.run(async {
@@ -665,6 +679,22 @@ impl<S: ServiceStore> SignalOps<S> {
                 }
                 moved += usize::from(changed);
             }
+            // The account's pin moves with it. An existing LID pin wins: it
+            // was pinned or accepted for that address directly.
+            let (pn_account, lid_account) =
+                (pn.to_non_ad().to_string(), lid.to_non_ad().to_string());
+            if let Some(pin) = staged
+                .load_aux(Namespace::AccountIdentity, &pn_account)
+                .await?
+                && staged
+                    .load_aux(Namespace::AccountIdentity, &lid_account)
+                    .await?
+                    .is_none()
+            {
+                staged
+                    .put_aux(Namespace::AccountIdentity, &lid_account, &pin)
+                    .await?;
+            }
             staged.commit().await?;
             Ok(moved)
         })
@@ -700,21 +730,7 @@ impl<S: ServiceStore> SignalOps<S> {
         address: &ProtocolAddress,
         bundle: &RemoteBundle,
     ) -> Result<(), OpsError> {
-        // WhatsApp Signal addresses carry the device in the name (Signal's
-        // device id is always 0) and spell the PN server as legacy `c.us`.
-        let name = address.name();
-        let name = name
-            .strip_suffix("@c.us")
-            .map_or_else(|| name.to_owned(), |user| format!("{user}@s.whatsapp.net"));
-        let mut device = name
-            .parse::<wacore_binary::Jid>()
-            .map_err(|_| OpsError::InvalidInput(format!("{address} is not a device address")))?;
-        // A plain libsignal address keeps the device in its device id instead.
-        let device_id = u16::try_from(u32::from(address.device_id()))
-            .map_err(|_| OpsError::InvalidInput("device id out of range".into()))?;
-        if device.device == 0 && device_id != 0 {
-            device = device.with_device(device_id);
-        }
+        let device = crate::trust::device_of(address)?;
         let device_identity = bundle.device_identity.as_deref();
         let bundle = bundle.to_prekey_bundle()?;
         self.verify_bundle(staged, &device, &bundle, device_identity, None)
@@ -741,11 +757,14 @@ impl<S: ServiceStore> SignalOps<S> {
         sender: &ProtocolAddress,
         kind: EncKind,
         ciphertext: &[u8],
+        device_identity: Option<&[u8]>,
     ) -> Result<Decrypted, OpsError> {
         let held = self.lock_keys(vec![session_key(sender)]).await?;
         held.run(async {
             let staged = Arc::new(self.store.staged());
-            let decrypted = self.decrypt_into(&staged, sender, kind, ciphertext).await?;
+            let decrypted = self
+                .decrypt_into(&staged, sender, kind, ciphertext, device_identity)
+                .await?;
             staged.commit().await?;
             Ok(decrypted)
         })
@@ -754,13 +773,27 @@ impl<S: ServiceStore> SignalOps<S> {
 
     /// Decrypt into a staged view without committing it. The caller holds the
     /// address lock and commits.
+    /// `device_identity` is the `<device-identity>` sent with a prekey message
+    /// from a companion device; a prekey message would start a session, so its
+    /// sender's identity is verified first, as a fetched bundle is.
     pub(crate) async fn decrypt_into(
         &self,
         staged: &Arc<S>,
         sender: &ProtocolAddress,
         kind: EncKind,
         ciphertext: &[u8],
+        device_identity: Option<&[u8]>,
     ) -> Result<Decrypted, OpsError> {
+        if kind == EncKind::PreKey {
+            let identity = *PreKeySignalMessage::try_from(ciphertext)?
+                .identity_key()
+                .public_key()
+                .public_key_bytes();
+            let device = crate::trust::device_of(sender)?;
+            self.verify_identity(staged, &device, identity, device_identity, None)
+                .await?
+                .map_err(OpsError::BundleRefused)?;
+        }
         let mut sessions = self.stores_over(staged.clone()).await;
         let mut identities = sessions.clone();
         // libsignal reports a replaced identity for a prekey message but not

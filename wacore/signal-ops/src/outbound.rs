@@ -262,6 +262,20 @@ impl<S: ServiceStore> SignalOps<S> {
         audience: &[Jid],
     ) -> Result<(), OpsError> {
         let refuse = || OpsError::InvalidInput("the retry requester was not a recipient".into());
+        // The route decides which membership check applies, so it must match
+        // the chat the message was saved under.
+        let route_matches = match request.route {
+            RetryRoute::Direct { .. } => {
+                !request.chat.is_group() && !request.chat.is_broadcast_list()
+            }
+            RetryRoute::Group { .. } => request.chat.is_group(),
+            RetryRoute::BroadcastList => request.chat.is_broadcast_list(),
+        };
+        if !route_matches {
+            return Err(OpsError::InvalidInput(
+                "the retry route does not match the chat".into(),
+            ));
+        }
         let group = match request.route {
             RetryRoute::Direct { .. } => None,
             RetryRoute::Group { .. } | RetryRoute::BroadcastList => Some(
@@ -803,9 +817,7 @@ impl<S: ServiceStore> SignalOps<S> {
             .await?
             .ok_or_else(|| OpsError::InvalidInput("no record of that sent message".into()))?;
         let own = self.own_identity().await?;
-        self.check_retry_requester(resolver, &request, &own, &audience)
-            .await?;
-        let OwnIdentity { account, .. } = own;
+        let account = own.account.clone();
         let address = request.encryption_jid.to_protocol_address();
 
         // A group retry also means the requester may have lost this device's
@@ -817,6 +829,10 @@ impl<S: ServiceStore> SignalOps<S> {
         }
         let held = self.lock_keys(held_keys).await?;
         held.run(async {
+            // Under the group lock that removal and rotation also take, so a
+            // membership answer cannot predate a removal that already ran.
+            self.check_retry_requester(resolver, &request, &own, &audience)
+                .await?;
             if matches!(request.route, RetryRoute::Group { .. }) {
                 let group = request.chat.to_string();
                 let keys: Vec<String> = [request.requester, request.encryption_jid]
