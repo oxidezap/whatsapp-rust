@@ -19,6 +19,8 @@ semver = "1"
 tar = "0.4"
 flate2.workspace = true
 sha2.workspace = true
+sha3 = "0.11"
+cc = "1.4"
 hex.workspace = true
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 url = "2"

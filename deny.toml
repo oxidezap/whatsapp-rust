@@ -24,6 +24,16 @@ ignore = [
     # Compile-time macro dependency of OxiTLS. It contributes no runtime code,
     # and the current provider has no replacement release without it.
     "RUSTSEC-2024-0436",
+    # SQLite < 3.54 (stale page cache across a WAL page-size change). This is
+    # not unreachable: the default `bundled-sqlite` build of
+    # whatsapp-rust-sqlite-storage compiles the affected SQLite that
+    # libsqlite3-sys 0.38.2 bundles. No fixed libsqlite3-sys is usable yet:
+    # Diesel 2.3.14 requires < 0.39 (diesel-rs/diesel#5372 is unreleased).
+    # Native builds link a fixed SQLite with `cargo xt fixed-sqlite`, as
+    # Diesel's maintainer recommends; the "Fixed SQLite" CI job builds that way
+    # and fails if the linked SQLite is older than 3.54. wasm uses
+    # sqlite-wasm-rs 0.6.3 (SQLite 3.54.1). Remove when Diesel accepts 0.39.
+    "RUSTSEC-2026-0459",
 ]
 
 [licenses]
