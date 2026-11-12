@@ -537,7 +537,7 @@ async fn a_group_send_distributes_the_sender_key_once_then_reuses_it() {
     );
 
     // A retry receipt from Bob in the group makes the next send redistribute.
-    common::pair(&alice).await;
+    // Alice keeps the pairing Bob pinned above.
     alice
         .resend(
             &client,
@@ -591,6 +591,11 @@ async fn a_group_send_distributes_the_sender_key_once_then_reuses_it() {
         .await
         .is_err(),
         "the old sender-key chain must not decrypt a message after rotation"
+    );
+    // Bob verifies the identity the stanza actually carries.
+    assert_eq!(
+        stanza_device_identity(&third.stanza).as_deref(),
+        Some(alice_identity.as_slice())
     );
     let (kind, version, carrier) =
         pairwise_enc_for(&third.stanza, &bob_jid).expect("fresh key for bob");
