@@ -23,6 +23,10 @@ pub use buffa;
 #[doc(hidden)]
 pub mod experiment;
 
+#[cfg(feature = "protobuf-experiment")]
+#[doc(hidden)]
+pub mod protobuf;
+
 pub mod whatsapp {
     // disallowed_methods: the generated impls call the buffa trait methods on
     // nested messages; that IS the pinned instantiation.
