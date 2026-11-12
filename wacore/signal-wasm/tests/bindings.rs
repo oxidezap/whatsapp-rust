@@ -2550,6 +2550,12 @@ async fn a_prekey_message_needs_a_device_identity_of_the_senders_pinned_account(
 
 #[wasm_bindgen_test]
 async fn a_nested_device_sent_wrapper_does_not_surface_app_state_keys() {
+    // With app-state sharing consented and not: `message` never carries keys.
+    nested_device_sent_case("on", JsValue::TRUE).await;
+    nested_device_sent_case("off", JsValue::FALSE).await;
+}
+
+async fn nested_device_sent_case(tag: &str, consent: JsValue) {
     let share = field(
         1,
         &[field(1, &field(1, &[3; 32])), field(2, &field(1, &[4; 32]))].concat(),
@@ -2558,8 +2564,8 @@ async fn a_nested_device_sent_wrapper_does_not_surface_app_state_keys() {
     let inner = [conversation("nested own-device content"), protocol].concat();
     // Message.deviceSentMessage is field 31 and holds a Message in field 2.
     let wrapped = (0..2).fold(inner, |message, _| field(31, &field(2, &message)));
-    let bob = device("bob-nested-dsm").await;
-    let alice = own_sibling(&bob, "alice-nested-dsm").await;
+    let bob = device(&format!("bob-nested-dsm-{tag}")).await;
+    let alice = own_sibling(&bob, &format!("alice-nested-dsm-{tag}")).await;
     establish(&alice.signal, BOB, bundle_for(&bob.signal, true).await).await;
     let (kind, ciphertext) = encrypt(&alice.signal, BOB, &pad(&wrapped)).await;
     let received = receive_from(
@@ -2570,7 +2576,7 @@ async fn a_nested_device_sent_wrapper_does_not_surface_app_state_keys() {
         &ciphertext,
         2,
         true,
-        Some(JsValue::TRUE),
+        Some(consent),
     )
     .await
     .ok()
