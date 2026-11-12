@@ -1337,3 +1337,94 @@ async fn a_retry_for_a_device_outside_the_conversation_is_refused() {
         .await;
     assert!(retried.is_ok(), "the recipient's LID form is accepted");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_group_retry_is_answered_only_for_members_the_message_went_to() {
+    use wacore::types::message::AddressingMode;
+    use wacore_signal_ops::{OpsError, RetryRequest, RetryRoute};
+
+    let alice_member: Jid = "111@s.whatsapp.net".parse().unwrap();
+    let bob_jid: Jid = "222:1@s.whatsapp.net".parse().unwrap();
+    let carol_jid: Jid = "444:1@s.whatsapp.net".parse().unwrap();
+    let eve_jid: Jid = "333:1@s.whatsapp.net".parse().unwrap();
+    let alice = device_with_lid(
+        "alice-audience",
+        "111:1@s.whatsapp.net",
+        Some("900111:1@lid"),
+    )
+    .await;
+    common::pair(&alice).await;
+    let bob = device("bob-audience", "222:1@s.whatsapp.net").await;
+    let carol = device("carol-audience", "444:1@s.whatsapp.net").await;
+    let eve = device("eve-audience", "333:1@s.whatsapp.net").await;
+    let group: Jid = "120363000000005@g.us".parse().unwrap();
+    let client_for = |members: Vec<Jid>, bundles: HashMap<Jid, PreKeyBundle>| FakeClient {
+        devices: vec![bob_jid.clone(), carol_jid.clone()],
+        bundles,
+        group: Some(Arc::new(GroupRoutingInfo::new(members, AddressingMode::Pn))),
+    };
+    let bundles = HashMap::from([
+        (bob_jid.clone(), bundle_for(&bob).await),
+        (carol_jid.clone(), bundle_for(&carol).await),
+    ]);
+    let before = client_for(
+        vec![
+            alice_member.clone(),
+            bob_jid.to_non_ad(),
+            carol_jid.to_non_ad(),
+        ],
+        bundles,
+    );
+    alice
+        .send_group(&TokioRuntime, &before, &group, &text("before eve"), "G1")
+        .await
+        .unwrap();
+
+    // Eve joined and Bob left after the send.
+    let after = client_for(
+        vec![alice_member, carol_jid.to_non_ad(), eve_jid.to_non_ad()],
+        HashMap::new(),
+    );
+    fn retry<'a>(
+        group: &'a Jid,
+        requester: &'a Jid,
+        bundle: Option<&'a wacore_signal_ops::RemoteBundle>,
+    ) -> RetryRequest<'a> {
+        RetryRequest {
+            chat: group,
+            message_id: "G1",
+            requester,
+            encryption_jid: requester,
+            route: RetryRoute::Group {
+                addressing_mode: AddressingMode::Pn,
+            },
+            retry_count: 1,
+            bundle,
+        }
+    }
+    let eve_bundle = remote_bundle_from(&bundle_for(&eve).await);
+    let bob_bundle = remote_bundle_from(&bundle_for(&bob).await);
+    assert!(
+        matches!(
+            alice
+                .resend(&after, retry(&group, &eve_jid, Some(&eve_bundle)))
+                .await,
+            Err(OpsError::InvalidInput(_))
+        ),
+        "a member who joined later gets no earlier message"
+    );
+    assert!(
+        matches!(
+            alice
+                .resend(&after, retry(&group, &bob_jid, Some(&bob_bundle)))
+                .await,
+            Err(OpsError::InvalidInput(_))
+        ),
+        "a removed member gets nothing more"
+    );
+    let retried = alice.resend(&after, retry(&group, &carol_jid, None)).await;
+    assert!(
+        retried.is_ok(),
+        "a current recipient is answered: {retried:?}"
+    );
+}

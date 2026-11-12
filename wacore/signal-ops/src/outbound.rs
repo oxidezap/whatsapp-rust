@@ -48,10 +48,16 @@ fn sent_key(chat: &Jid, message_id: &str) -> String {
 }
 
 /// Sent-message record: `[inserted ms, u64 BE][has_secret][secret (32 bytes,
-/// when set)][message]`.
-fn encode_sent(message: &[u8], secret: Option<&[u8; 32]>) -> Vec<u8> {
+/// when set)][audience count, u32 BE]([JID length, u16 BE][JID])*[message]`.
+/// The audience is who the message went to: the chat user for a direct
+/// message, the group's participants at send time otherwise. A retry is only
+/// answered for that audience.
+fn encode_sent(message: &[u8], secret: Option<&[u8; 32]>, audience: &[Jid]) -> Vec<u8> {
     let inserted_ms = u64::try_from(wacore::time::now_utc().timestamp_millis()).unwrap_or(0);
-    let mut out = Vec::with_capacity(8 + 1 + 32 + message.len());
+    let audience: Vec<String> = audience.iter().map(Jid::to_string).collect();
+    let mut out = Vec::with_capacity(
+        8 + 1 + 32 + 4 + audience.iter().map(|jid| 2 + jid.len()).sum::<usize>() + message.len(),
+    );
     out.extend_from_slice(&inserted_ms.to_be_bytes());
     match secret {
         Some(secret) => {
@@ -59,6 +65,19 @@ fn encode_sent(message: &[u8], secret: Option<&[u8; 32]>) -> Vec<u8> {
             out.extend_from_slice(secret);
         }
         None => out.push(0),
+    }
+    let audience: Vec<&String> = audience
+        .iter()
+        .filter(|jid| u16::try_from(jid.len()).is_ok())
+        .collect();
+    out.extend_from_slice(
+        &u32::try_from(audience.len())
+            .unwrap_or(u32::MAX)
+            .to_be_bytes(),
+    );
+    for jid in audience {
+        out.extend_from_slice(&(jid.len() as u16).to_be_bytes());
+        out.extend_from_slice(jid.as_bytes());
     }
     out.extend_from_slice(message);
     out
@@ -68,6 +87,7 @@ fn encode_sent(message: &[u8], secret: Option<&[u8; 32]>) -> Vec<u8> {
 struct SentRecord<'a> {
     inserted_ms: u64,
     secret: Option<&'a [u8]>,
+    audience: Vec<&'a str>,
     body: &'a [u8],
 }
 
@@ -75,15 +95,27 @@ fn decode_sent(record: &[u8]) -> Result<SentRecord<'_>, OpsError> {
     let corrupt = || OpsError::InvalidInput("sent-message record is corrupt".into());
     let (inserted, rest) = record.split_at_checked(8).ok_or_else(corrupt)?;
     let inserted_ms = u64::from_be_bytes(inserted.try_into().map_err(|_| corrupt())?);
-    let (secret, body) = match rest.first() {
+    let (secret, mut rest) = match rest.first() {
         Some(0) => (None, &rest[1..]),
         Some(1) if rest.len() >= 33 => (Some(&rest[1..33]), &rest[33..]),
         _ => return Err(corrupt()),
     };
+    let (count, tail) = rest.split_at_checked(4).ok_or_else(corrupt)?;
+    rest = tail;
+    let count = u32::from_be_bytes(count.try_into().map_err(|_| corrupt())?);
+    let mut audience = Vec::new();
+    for _ in 0..count {
+        let (len, tail) = rest.split_at_checked(2).ok_or_else(corrupt)?;
+        let len = usize::from(u16::from_be_bytes(len.try_into().map_err(|_| corrupt())?));
+        let (jid, tail) = tail.split_at_checked(len).ok_or_else(corrupt)?;
+        audience.push(std::str::from_utf8(jid).map_err(|_| corrupt())?);
+        rest = tail;
+    }
     Ok(SentRecord {
         inserted_ms,
         secret,
-        body,
+        audience,
+        body: rest,
     })
 }
 
@@ -225,6 +257,7 @@ impl<S: ServiceStore> SignalOps<S> {
         resolver: &dyn SendContextResolver,
         request: &RetryRequest<'_>,
         own: &OwnIdentity,
+        audience: &[Jid],
     ) -> Result<(), OpsError> {
         let refuse = || OpsError::InvalidInput("the retry requester was not a recipient".into());
         let group = match request.route {
@@ -241,18 +274,33 @@ impl<S: ServiceStore> SignalOps<S> {
         if !same_account(resolver, group, request.requester, request.encryption_jid).await {
             return Err(refuse());
         }
-        let mut accounts: Vec<&Jid> = vec![&own.pn];
-        accounts.extend(own.lid.as_ref());
-        match group {
-            None => accounts.push(request.chat),
-            Some(group) => accounts.extend(group.participants.iter()),
-        }
-        for account in accounts {
-            if same_account(resolver, group, account, request.requester).await {
+        for own in std::iter::once(&own.pn).chain(own.lid.as_ref()) {
+            if same_account(resolver, group, own, request.requester).await {
                 return Ok(());
             }
         }
-        Err(refuse())
+        // Someone else must have been sent this message, and, for a group,
+        // still be a member: a later joiner gets no earlier messages, and a
+        // removed member gets nothing more.
+        let mut sent_to = false;
+        for account in audience {
+            if same_account(resolver, group, account, request.requester).await {
+                sent_to = true;
+                break;
+            }
+        }
+        if !sent_to {
+            return Err(refuse());
+        }
+        if let Some(group) = group {
+            for member in &group.participants {
+                if same_account(resolver, Some(group), member, request.requester).await {
+                    return Ok(());
+                }
+            }
+            return Err(refuse());
+        }
+        Ok(())
     }
 
     async fn own_identity(&self) -> Result<OwnIdentity, OpsError> {
@@ -364,7 +412,11 @@ impl<S: ServiceStore> SignalOps<S> {
                 .put_aux(
                     Namespace::SentMessage,
                     &sent_key(to, message_id),
-                    &encode_sent(&encoded, prepared.message_secret.as_ref()),
+                    &encode_sent(
+                        &encoded,
+                        prepared.message_secret.as_ref(),
+                        std::slice::from_ref(to),
+                    ),
                 )
                 .await?;
             staged.commit().await?;
@@ -387,6 +439,18 @@ impl<S: ServiceStore> SignalOps<S> {
         chat: &Jid,
         message_id: &str,
     ) -> Result<Option<wa::Message>, OpsError> {
+        Ok(self
+            .sent_record(chat, message_id)
+            .await?
+            .map(|(message, _)| message))
+    }
+
+    /// A sent message and the audience it went to.
+    async fn sent_record(
+        &self,
+        chat: &Jid,
+        message_id: &str,
+    ) -> Result<Option<(wa::Message, Vec<Jid>)>, OpsError> {
         let Some(record) = self
             .store()
             .load_aux(Namespace::SentMessage, &sent_key(chat, message_id))
@@ -406,7 +470,13 @@ impl<S: ServiceStore> SignalOps<S> {
             context.message_secret = Some(secret.to_vec());
             message.message_context_info = Some(context).into();
         }
-        Ok(Some(message))
+        let audience = record
+            .audience
+            .iter()
+            .map(|jid| jid.parse())
+            .collect::<Result<Vec<Jid>, _>>()
+            .map_err(|_| OpsError::InvalidInput("sent-message audience is corrupt".into()))?;
+        Ok(Some((message, audience)))
     }
 
     /// Build a group stanza: a sender-key message for the group plus, for
@@ -584,7 +654,11 @@ impl<S: ServiceStore> SignalOps<S> {
                         .put_aux(
                             Namespace::SentMessage,
                             &sent_key(group, message_id),
-                            &encode_sent(&encoded, prepared.message_secret.as_ref()),
+                            &encode_sent(
+                                &encoded,
+                                prepared.message_secret.as_ref(),
+                                &routing.participants,
+                            ),
                         )
                         .await?;
                     staged.commit().await?;
@@ -712,12 +786,13 @@ impl<S: ServiceStore> SignalOps<S> {
         resolver: &dyn SendContextResolver,
         request: RetryRequest<'_>,
     ) -> Result<Vec<u8>, OpsError> {
-        let message = self
-            .sent_message(request.chat, request.message_id)
+        let (message, audience) = self
+            .sent_record(request.chat, request.message_id)
             .await?
             .ok_or_else(|| OpsError::InvalidInput("no record of that sent message".into()))?;
         let own = self.own_identity().await?;
-        self.check_retry_requester(resolver, &request, &own).await?;
+        self.check_retry_requester(resolver, &request, &own, &audience)
+            .await?;
         let OwnIdentity { account, .. } = own;
         let address = request.encryption_jid.to_protocol_address();
 
