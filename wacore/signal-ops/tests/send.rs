@@ -1692,4 +1692,54 @@ async fn a_retry_whose_route_does_not_match_its_chat_is_refused() {
     // The matching routes still work.
     assert!(retry(&to, "D1", direct()).await.is_ok());
     assert!(retry(&group, "G1", in_group()).await.is_ok());
+
+    // A peer's direct retry names no recipient: the chat is theirs.
+    let result = retry(
+        &to,
+        "D1",
+        RetryRoute::Direct {
+            recipient: Some("333@s.whatsapp.net".parse().unwrap()),
+        },
+    )
+    .await;
+    assert!(
+        matches!(&result, Err(OpsError::InvalidInput(m)) if m.contains("recipient")),
+        "expected a refused recipient, got {result:?}"
+    );
+
+    // An own device's direct retry must name the saved chat's user.
+    let own_device: Jid = "111:2@s.whatsapp.net".parse().unwrap();
+    let own_retry = |recipient: Option<Jid>| {
+        let (alice, client, to, own_device) = (&alice, &client, &to, &own_device);
+        async move {
+            alice
+                .resend(
+                    client,
+                    RetryRequest {
+                        chat: to,
+                        message_id: "D1",
+                        requester: own_device,
+                        encryption_jid: own_device,
+                        route: RetryRoute::Direct { recipient },
+                        retry_count: 1,
+                        bundle: None,
+                    },
+                )
+                .await
+        }
+    };
+    for wrong in [None, Some("333@s.whatsapp.net".parse().unwrap())] {
+        let result = own_retry(wrong).await;
+        assert!(
+            matches!(&result, Err(OpsError::InvalidInput(m)) if m.contains("recipient")),
+            "expected a refused recipient, got {result:?}"
+        );
+    }
+    // The right recipient passes the check; this client has no keys for the
+    // own device, so the retry then stops at the prekey fetch instead.
+    let result = own_retry(Some(to.clone())).await;
+    assert!(
+        !matches!(&result, Err(OpsError::InvalidInput(m)) if m.contains("recipient")),
+        "the saved chat's user is accepted, got {result:?}"
+    );
 }

@@ -202,7 +202,8 @@ pub struct PreparedGroupSend {
 #[derive(Debug, Clone)]
 pub enum RetryRoute {
     /// A direct message; `recipient` is the original chat user when the
-    /// requester is one of this account's own devices.
+    /// requester is one of this account's own devices, and `None` otherwise.
+    /// Any other value is refused.
     Direct {
         recipient: Option<Jid>,
     },
@@ -339,10 +340,32 @@ impl<S: ServiceStore> SignalOps<S> {
         if !same_account(resolver, group, request.requester, request.encryption_jid).await {
             return Err(refuse());
         }
+        let mut from_own = false;
         for own in std::iter::once(&own.pn).chain(own.lid.as_ref()) {
             if same_account(resolver, group, own, request.requester).await {
-                return Ok(());
+                from_own = true;
+                break;
             }
+        }
+        // A direct retry's `recipient` is fixed by the saved chat: the chat
+        // user for one of this account's own devices, none otherwise. A
+        // wrong one would file the message under another conversation.
+        if let RetryRoute::Direct { recipient } = &request.route {
+            let recipient_ok = match (from_own, recipient) {
+                (true, Some(recipient)) => {
+                    same_account(resolver, None, recipient, &request.chat.to_non_ad()).await
+                }
+                (false, None) => true,
+                _ => false,
+            };
+            if !recipient_ok {
+                return Err(OpsError::InvalidInput(
+                    "the retry recipient does not match the saved chat".into(),
+                ));
+            }
+        }
+        if from_own {
+            return Ok(());
         }
         // Someone else must have been sent this message, and, for a group,
         // still be a member: a later joiner gets no earlier messages, and a
