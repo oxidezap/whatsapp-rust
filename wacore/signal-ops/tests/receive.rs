@@ -57,7 +57,32 @@ fn address(user: &str) -> ProtocolAddress {
     ProtocolAddress::new(&format!("{user}@s.whatsapp.net"), DeviceId::from(1))
 }
 
-fn connect(from: &Device, to: &Device, to_addr: &ProtocolAddress) {
+thread_local! {
+    /// The `<device-identity>` each test sender's prekey messages carry, by
+    /// sender address. Leaked so a request can borrow it for any lifetime;
+    /// each test runs on its own thread.
+    static SENDER_IDENTITIES: std::cell::RefCell<std::collections::HashMap<String, &'static [u8]>> =
+        std::cell::RefCell::default();
+}
+
+/// Have `receiver` pin `sender`'s account and remember the identity its
+/// prekey messages must carry (see [`request`]).
+fn accept_sender<R: wacore_signal_ops::ServiceStore>(
+    receiver: &SignalOps<R>,
+    sender: &SignalOps<Store>,
+    sender_addr: &ProtocolAddress,
+) {
+    let identity = block_on(common::vouch(receiver, sender, sender_addr.name()));
+    SENDER_IDENTITIES.with(|map| {
+        map.borrow_mut().insert(
+            sender_addr.name().to_owned(),
+            Box::leak(identity.into_boxed_slice()),
+        );
+    });
+}
+
+fn connect(from: &Device, to: &Device, from_addr: &ProtocolAddress, to_addr: &ProtocolAddress) {
+    accept_sender(&to.ops, &from.ops, from_addr);
     let device_identity = block_on(common::vouch(&from.ops, &to.ops, to_addr.name()));
     let identity = block_on(to.ops.public_identity());
     let prekey = block_on(to.ops.generate_prekeys(&InlineRuntime, 1))
@@ -112,6 +137,10 @@ fn request<'a>(
         ciphertext,
         padding_version: 2,
         is_from_me,
+        // Only a prekey message carries the sender's device identity.
+        device_identity: (kind == ReceiveKind::PreKey)
+            .then(|| SENDER_IDENTITIES.with(|map| map.borrow().get(sender.name()).copied()))
+            .flatten(),
     }
 }
 
@@ -127,7 +156,7 @@ fn redelivery_returns_the_buffered_result_until_delivered() {
     let alice = device("alice-redeliver");
     let bob = device("bob-redeliver");
     let (alice_addr, bob_addr) = (address("111"), address("222"));
-    connect(&alice, &bob, &bob_addr);
+    connect(&alice, &bob, &alice_addr, &bob_addr);
 
     let sent = block_on(alice.ops.encrypt(&bob_addr, &padded(&text("hello")))).unwrap();
     let chat = alice_addr.name().to_owned();
@@ -154,7 +183,7 @@ fn a_fenced_out_receive_leaves_the_ciphertext_decryptable_by_the_successor() {
     let alice = device("alice-atomic");
     let bob = device("bob-atomic");
     let (alice_addr, bob_addr) = (address("111"), address("222"));
-    connect(&alice, &bob, &bob_addr);
+    connect(&alice, &bob, &alice_addr, &bob_addr);
     let chat = alice_addr.name().to_owned();
 
     let first = block_on(alice.ops.encrypt(&bob_addr, &padded(&text("one")))).unwrap();
@@ -198,7 +227,7 @@ fn a_sender_key_carried_in_a_pairwise_message_unlocks_group_traffic() {
     let alice = device("alice-skdm");
     let bob = device("bob-skdm");
     let (alice_addr, bob_addr) = (address("111"), address("222"));
-    connect(&alice, &bob, &bob_addr);
+    connect(&alice, &bob, &alice_addr, &bob_addr);
 
     let skdm = block_on(alice.ops.sender_key_distribution(GROUP, &alice_addr)).unwrap();
     let mut distribution = wa::message::SenderKeyDistributionMessage::default();
@@ -246,7 +275,7 @@ fn only_own_devices_can_hand_over_app_state_keys() {
     let alice = device("alice-keys");
     let bob = device("bob-keys");
     let (alice_addr, bob_addr) = (address("111"), address("222"));
-    connect(&alice, &bob, &bob_addr);
+    connect(&alice, &bob, &alice_addr, &bob_addr);
     let mut protocol = wa::message::ProtocolMessage::default();
     protocol.app_state_sync_key_share = Some(wa::message::AppStateSyncKeyShare::default()).into();
     let mut share = wa::Message::default();
@@ -293,7 +322,7 @@ fn pruning_drops_old_delivered_markers_and_keeps_pending_results() {
     let alice = device("alice-prune");
     let bob = device("bob-prune");
     let (alice_addr, bob_addr) = (address("111"), address("222"));
-    connect(&alice, &bob, &bob_addr);
+    connect(&alice, &bob, &alice_addr, &bob_addr);
     let chat = alice_addr.name().to_owned();
     let sent = block_on(alice.ops.encrypt(&bob_addr, &padded(&text("old")))).unwrap();
     let req = request(&chat, &alice_addr, kind(&sent), &sent.ciphertext, false);
@@ -313,7 +342,7 @@ fn a_bad_sender_key_does_not_block_the_message_carrying_it() {
     let alice = device("alice-bad-skdm");
     let bob = device("bob-bad-skdm");
     let (alice_addr, bob_addr) = (address("111"), address("222"));
-    connect(&alice, &bob, &bob_addr);
+    connect(&alice, &bob, &alice_addr, &bob_addr);
     let mut distribution = wa::message::SenderKeyDistributionMessage::default();
     distribution.group_id = Some(GROUP.to_owned());
     distribution.axolotl_sender_key_distribution_message = Some(vec![0xde, 0xad]);
@@ -411,6 +440,7 @@ fn a_storage_failure_installing_a_sender_key_is_retried_on_redelivery() {
     let (alice_addr, bob_addr) = (address("111"), address("222"));
 
     let device_identity = block_on(common::vouch(&alice.ops, &bob, bob_addr.name()));
+    accept_sender(&bob, &alice.ops, &alice_addr);
     let identity = block_on(bob.public_identity());
     let prekey = block_on(bob.generate_prekeys(&InlineRuntime, 1))
         .unwrap()
@@ -481,7 +511,7 @@ fn a_sender_key_for_another_group_is_not_installed_under_this_chat() {
     let alice = device("alice-other-group");
     let bob = device("bob-other-group");
     let (alice_addr, bob_addr) = (address("111"), address("222"));
-    connect(&alice, &bob, &bob_addr);
+    connect(&alice, &bob, &alice_addr, &bob_addr);
 
     let skdm = block_on(alice.ops.sender_key_distribution(OTHER, &alice_addr)).unwrap();
     let mut distribution = wa::message::SenderKeyDistributionMessage::default();
@@ -527,7 +557,7 @@ fn a_message_that_replaces_the_stored_identity_reports_it() {
     let alice = device("alice-identity-msg");
     let bob = device("bob-identity-msg");
     let (alice_addr, bob_addr) = (address("111"), address("222"));
-    connect(&alice, &bob, &bob_addr);
+    connect(&alice, &bob, &alice_addr, &bob_addr);
     let chat = alice_addr.name().to_owned();
     let bob_chat = bob_addr.name().to_owned();
 

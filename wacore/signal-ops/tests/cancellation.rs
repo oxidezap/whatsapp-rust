@@ -157,6 +157,7 @@ async fn cancellation_case(release_before_takeover: bool) {
         device_identity: Some(device_identity),
     };
     let alice_address = ProtocolAddress::new("111@s.whatsapp.net", DeviceId::from(1));
+    let alice_identity = common::vouch(&bob, &alice, alice_address.name()).await;
     let bob_address = ProtocolAddress::new("222@s.whatsapp.net", DeviceId::from(1));
     alice
         .establish_session(&bob_address, &bundle)
@@ -218,10 +219,15 @@ async fn cancellation_case(release_before_takeover: bool) {
         .await
         .unwrap();
     assert_eq!(
-        bob.decrypt(&alice_address, first.kind, &first.ciphertext)
-            .await
-            .unwrap()
-            .plaintext,
+        bob.decrypt(
+            &alice_address,
+            first.kind,
+            &first.ciphertext,
+            Some(&alice_identity),
+        )
+        .await
+        .unwrap()
+        .plaintext,
         b"published first"
     );
     if !release_before_takeover {
@@ -237,10 +243,15 @@ async fn cancellation_case(release_before_takeover: bool) {
         .await
         .unwrap();
     assert_eq!(
-        bob.decrypt(&alice_address, second.kind, &second.ciphertext)
-            .await
-            .unwrap()
-            .plaintext,
+        bob.decrypt(
+            &alice_address,
+            second.kind,
+            &second.ciphertext,
+            Some(&alice_identity),
+        )
+        .await
+        .unwrap()
+        .plaintext,
         b"published second"
     );
 }

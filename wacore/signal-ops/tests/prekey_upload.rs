@@ -940,6 +940,7 @@ fn actual_signal_consumption_filters_the_recovered_public_batch() {
             .await
             .unwrap();
         let device_identity = common::vouch(&sender.ops, &receiver.ops, "222@s.whatsapp.net").await;
+        let sender_identity = common::vouch(&receiver.ops, &sender.ops, "111@s.whatsapp.net").await;
         let identity = receiver.ops.public_identity().await;
         let sender_address = ProtocolAddress::new("111@s.whatsapp.net", DeviceId::from(1));
         let receiver_address = ProtocolAddress::new("222@s.whatsapp.net", DeviceId::from(1));
@@ -967,7 +968,12 @@ fn actual_signal_consumption_filters_the_recovered_public_batch() {
             .unwrap();
         let received = receiver
             .ops
-            .decrypt(&sender_address, sent.kind, &sent.ciphertext)
+            .decrypt(
+                &sender_address,
+                sent.kind,
+                &sent.ciphertext,
+                Some(&sender_identity),
+            )
             .await
             .unwrap();
         assert_eq!(received.plaintext, b"synthetic-upload-roundtrip");

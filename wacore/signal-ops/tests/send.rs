@@ -284,6 +284,7 @@ async fn receive_group_component(
     ops: &SignalOps<Store>,
     group: &Jid,
     from: &Jid,
+    from_identity: &[u8],
     (kind, version, ciphertext): (String, u8, Vec<u8>),
 ) -> Result<Received, wacore_signal_ops::OpsError> {
     ops.receive(ReceiveRequest {
@@ -293,6 +294,7 @@ async fn receive_group_component(
         ciphertext: &ciphertext,
         padding_version: version,
         is_from_me: false,
+        device_identity: (kind == "pkmsg").then_some(from_identity),
     })
     .await
 }
@@ -352,6 +354,7 @@ async fn a_stanza_built_by_the_service_decrypts_at_the_recipient() {
     let bob_jid: Jid = "222:1@s.whatsapp.net".parse().unwrap();
     let alice = device("alice-send", "111:1@s.whatsapp.net").await;
     let bob = device("bob-send", "222:1@s.whatsapp.net").await;
+    let alice_identity = common::vouch(&bob, &alice, "111:1@s.whatsapp.net").await;
     let client = FakeClient {
         devices: vec![bob_jid.clone()],
         bundles: HashMap::from([(bob_jid.clone(), bundle_for(&bob).await)]),
@@ -385,6 +388,7 @@ async fn a_stanza_built_by_the_service_decrypts_at_the_recipient() {
                 ciphertext: &ciphertext,
                 padding_version: version,
                 is_from_me: false,
+                device_identity: (kind == "pkmsg").then_some(alice_identity.as_slice()),
             })
             .await
             .unwrap();
@@ -446,6 +450,7 @@ async fn a_group_send_distributes_the_sender_key_once_then_reuses_it() {
     )
     .await;
     let bob = device("bob-group-send", "222@s.whatsapp.net").await;
+    let alice_identity = common::vouch(&bob, &alice, "111:1@s.whatsapp.net").await;
     let client = FakeClient {
         devices: vec![alice_jid.clone(), bob_jid.clone()],
         bundles: HashMap::from([(bob_jid.clone(), bundle_for(&bob).await)]),
@@ -462,6 +467,7 @@ async fn a_group_send_distributes_the_sender_key_once_then_reuses_it() {
         let chat = group_str.clone();
         let kind = ReceiveKind::try_from(kind).expect("enc type");
         let bob = &bob;
+        let identity = alice_identity.as_slice();
         async move {
             bob.receive(ReceiveRequest {
                 chat: &chat,
@@ -470,6 +476,7 @@ async fn a_group_send_distributes_the_sender_key_once_then_reuses_it() {
                 ciphertext: &ciphertext,
                 padding_version: version,
                 is_from_me: false,
+                device_identity: (kind == ReceiveKind::PreKey).then_some(identity),
             })
             .await
             .unwrap()
@@ -569,6 +576,7 @@ async fn a_group_send_distributes_the_sender_key_once_then_reuses_it() {
             ciphertext: &ciphertext,
             padding_version: version,
             is_from_me: false,
+            device_identity: None,
         })
         .await
         .is_err(),
@@ -604,7 +612,9 @@ async fn a_send_waiting_on_devices_cannot_give_a_removed_member_the_replacement_
         .await,
     );
     let bob = device("bob-removal-race", &bob_jid.to_string()).await;
+    let alice_identity = common::vouch(&bob, &*alice, "111:1@s.whatsapp.net").await;
     let carol = device("carol-removal-race", &carol_jid.to_string()).await;
+    let alice_identity_carol = common::vouch(&carol, &*alice, "111:1@s.whatsapp.net").await;
     let client = Arc::new(ChangingGroupClient::new(
         FakeClient {
             devices: vec![alice_jid.clone(), bob_jid.clone(), carol_jid.clone()],
@@ -630,12 +640,24 @@ async fn a_send_waiting_on_devices_cannot_give_a_removed_member_the_replacement_
         )
         .await
         .unwrap();
-    receive_group_component(&bob, &group, &alice_jid, enc_for(&first.stanza, &bob_jid))
-        .await
-        .unwrap();
-    receive_group_component(&bob, &group, &alice_jid, skmsg_of(&first.stanza))
-        .await
-        .unwrap();
+    receive_group_component(
+        &bob,
+        &group,
+        &alice_jid,
+        &alice_identity,
+        enc_for(&first.stanza, &bob_jid),
+    )
+    .await
+    .unwrap();
+    receive_group_component(
+        &bob,
+        &group,
+        &alice_jid,
+        &alice_identity,
+        skmsg_of(&first.stanza),
+    )
+    .await
+    .unwrap();
     assert!(
         alice
             .mark_sender_key_distributed(
@@ -687,13 +709,19 @@ async fn a_send_waiting_on_devices_cannot_give_a_removed_member_the_replacement_
         Poll::Pending => rotation.await.unwrap(),
     }
     if let Some(carrier) = pairwise_enc_for(&sent.stanza, &bob_jid) {
-        receive_group_component(&bob, &group, &alice_jid, carrier)
+        receive_group_component(&bob, &group, &alice_jid, &alice_identity, carrier)
             .await
             .unwrap();
     }
-    receive_group_component(&bob, &group, &alice_jid, skmsg_of(&sent.stanza))
-        .await
-        .unwrap();
+    receive_group_component(
+        &bob,
+        &group,
+        &alice_jid,
+        &alice_identity,
+        skmsg_of(&sent.stanza),
+    )
+    .await
+    .unwrap();
     let after = alice
         .send_group(
             &TokioRuntime,
@@ -706,24 +734,35 @@ async fn a_send_waiting_on_devices_cannot_give_a_removed_member_the_replacement_
         .unwrap();
     assert!(pairwise_enc_for(&after.stanza, &bob_jid).is_none());
     assert!(
-        receive_group_component(&bob, &group, &alice_jid, skmsg_of(&after.stanza))
-            .await
-            .is_err(),
+        receive_group_component(
+            &bob,
+            &group,
+            &alice_jid,
+            &alice_identity,
+            skmsg_of(&after.stanza)
+        )
+        .await
+        .is_err(),
         "a removed participant received the replacement sender key from a stale resolution"
     );
     receive_group_component(
         &carol,
         &group,
         &alice_jid,
+        &alice_identity_carol,
         enc_for(&after.stanza, &carol_jid),
     )
     .await
     .unwrap();
-    let Received::Message(message) =
-        receive_group_component(&carol, &group, &alice_jid, skmsg_of(&after.stanza))
-            .await
-            .unwrap()
-    else {
+    let Received::Message(message) = receive_group_component(
+        &carol,
+        &group,
+        &alice_jid,
+        &alice_identity_carol,
+        skmsg_of(&after.stanza),
+    )
+    .await
+    .unwrap() else {
         panic!("retained participant did not receive the message")
     };
     assert_eq!(
@@ -745,6 +784,7 @@ async fn group_encryption_keeps_the_address_selected_before_session_locking() {
     )
     .await;
     let bob = device("bob-mapping-race", &bob_jid.to_string()).await;
+    let alice_identity = common::vouch(&bob, &alice, "111:1@s.whatsapp.net").await;
     let client = ChangingGroupClient::new(
         FakeClient {
             devices: vec![alice_jid.clone(), bob_jid.clone()],
@@ -771,14 +811,18 @@ async fn group_encryption_keeps_the_address_selected_before_session_locking() {
     // no fetched bundle and was never included in the acquired lock set.
     let carrier = pairwise_enc_for(&sent.stanza, &bob_jid)
         .expect("the frozen PN session must deliver the sender key");
-    receive_group_component(&bob, &group, &alice_jid, carrier)
+    receive_group_component(&bob, &group, &alice_jid, &alice_identity, carrier)
         .await
         .unwrap();
-    let Received::Message(received) =
-        receive_group_component(&bob, &group, &alice_jid, skmsg_of(&sent.stanza))
-            .await
-            .unwrap()
-    else {
+    let Received::Message(received) = receive_group_component(
+        &bob,
+        &group,
+        &alice_jid,
+        &alice_identity,
+        skmsg_of(&sent.stanza),
+    )
+    .await
+    .unwrap() else {
         panic!("expected the group payload")
     };
     assert_eq!(
@@ -829,7 +873,12 @@ fn remote_bundle_from(
 }
 
 /// Decrypt the first `<enc>` of a stanza from `from` and return its text.
-async fn deliver_message(ops: &SignalOps<Store>, from: &Jid, stanza: Vec<u8>) -> wa::Message {
+async fn deliver_message(
+    ops: &SignalOps<Store>,
+    from: &Jid,
+    from_identity: &[u8],
+    stanza: Vec<u8>,
+) -> wa::Message {
     let (kind, version, ciphertext) = first_enc(&stanza);
     let sender = from.to_protocol_address();
     let chat = from.to_non_ad().to_string();
@@ -845,6 +894,7 @@ async fn deliver_message(ops: &SignalOps<Store>, from: &Jid, stanza: Vec<u8>) ->
             ciphertext: &ciphertext,
             padding_version: version,
             is_from_me: false,
+            device_identity: (kind == "pkmsg").then_some(from_identity),
         })
         .await
         .unwrap();
@@ -854,8 +904,15 @@ async fn deliver_message(ops: &SignalOps<Store>, from: &Jid, stanza: Vec<u8>) ->
     message.content.message
 }
 
-async fn deliver(ops: &SignalOps<Store>, from: &Jid, stanza: Vec<u8>) -> Option<String> {
-    deliver_message(ops, from, stanza).await.conversation
+async fn deliver(
+    ops: &SignalOps<Store>,
+    from: &Jid,
+    from_identity: &[u8],
+    stanza: Vec<u8>,
+) -> Option<String> {
+    deliver_message(ops, from, from_identity, stanza)
+        .await
+        .conversation
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -873,6 +930,7 @@ async fn a_retry_receipt_gets_the_message_re_encrypted() {
         .trust_account_identity(&bob_jid, bob_paired.account)
         .await
         .unwrap();
+    let alice_identity = common::vouch(&bob, &alice, "111:1@s.whatsapp.net").await;
     let client = FakeClient {
         devices: vec![bob_jid.clone()],
         bundles: HashMap::from([(bob_jid.clone(), bundle_for(&bob).await)]),
@@ -908,7 +966,7 @@ async fn a_retry_receipt_gets_the_message_re_encrypted() {
         .and_then(|context| context.message_secret.as_ref())
         .expect("the original send generated a message secret");
     assert_eq!(secret.len(), 32);
-    let delivered = deliver_message(&bob, &alice_jid, retried).await;
+    let delivered = deliver_message(&bob, &alice_jid, &alice_identity, retried).await;
     assert_eq!(delivered.conversation.as_deref(), Some("lost once"));
     assert_eq!(
         delivered
@@ -921,6 +979,7 @@ async fn a_retry_receipt_gets_the_message_re_encrypted() {
 
     // Bob's device was reset: new keys arrive with the next retry receipt.
     let fresh_bob = device("bob-retry-fresh", "222:1@s.whatsapp.net").await;
+    let alice_identity_fresh = common::vouch(&fresh_bob, &alice, "111:1@s.whatsapp.net").await;
     // A reset device is re-paired by the same primary, under the same account.
     let fresh_identity = common::pair_under(&fresh_bob, &bob_paired.account_keys).await;
     let fresh_bundle = remote_bundle_from(&bundle_for(&fresh_bob).await, Some(fresh_identity));
@@ -940,7 +999,9 @@ async fn a_retry_receipt_gets_the_message_re_encrypted() {
         .await
         .unwrap();
     assert_eq!(
-        deliver(&fresh_bob, &alice_jid, retried).await.as_deref(),
+        deliver(&fresh_bob, &alice_jid, &alice_identity_fresh, retried)
+            .await
+            .as_deref(),
         Some("lost once")
     );
 
@@ -1011,6 +1072,7 @@ async fn a_slow_send_does_not_block_receiving_from_another_peer() {
     let alice = device("alice-slow", "111:1@s.whatsapp.net").await;
     let carol = device("carol-slow", "333:1@s.whatsapp.net").await;
     let dave = Arc::new(device("dave-slow", "444:1@s.whatsapp.net").await);
+    let alice_identity = common::vouch(&dave, &alice, "111:1@s.whatsapp.net").await;
 
     let gate = Arc::new(tokio::sync::Notify::new());
     let slow = Arc::new(SlowClient {
@@ -1051,7 +1113,7 @@ async fn a_slow_send_does_not_block_receiving_from_another_peer() {
         .unwrap();
     let received = tokio::time::timeout(
         Duration::from_secs(5),
-        deliver(&dave, &alice_jid, sent.stanza),
+        deliver(&dave, &alice_jid, &alice_identity, sent.stanza),
     )
     .await
     .expect("receive was blocked by an unrelated send");
@@ -1167,6 +1229,7 @@ async fn a_group_send_reuses_an_older_pn_session_when_the_mapped_lid_has_none() 
     )
     .await;
     let bob = device("bob-pn-fallback", "222@s.whatsapp.net").await;
+    let alice_identity = common::vouch(&bob, &alice, "111:1@s.whatsapp.net").await;
 
     // A PN session from before the LID mapping was known.
     let dm_client = FakeClient {
@@ -1191,6 +1254,7 @@ async fn a_group_send_reuses_an_older_pn_session_when_the_mapped_lid_has_none() 
         &bob,
         &dm_chat.parse().unwrap(),
         &alice_jid,
+        &alice_identity,
         (kind, version, ciphertext),
     )
     .await
@@ -1216,14 +1280,18 @@ async fn a_group_send_reuses_an_older_pn_session_when_the_mapped_lid_has_none() 
         .unwrap();
     assert_eq!(sent.distribution_targets, vec![bob_jid.clone()]);
     let carrier = pairwise_enc_for(&sent.stanza, &bob_jid).expect("the PN session carries the key");
-    receive_group_component(&bob, &group, &alice_jid, carrier)
+    receive_group_component(&bob, &group, &alice_jid, &alice_identity, carrier)
         .await
         .unwrap();
-    let Received::Message(received) =
-        receive_group_component(&bob, &group, &alice_jid, skmsg_of(&sent.stanza))
-            .await
-            .unwrap()
-    else {
+    let Received::Message(received) = receive_group_component(
+        &bob,
+        &group,
+        &alice_jid,
+        &alice_identity,
+        skmsg_of(&sent.stanza),
+    )
+    .await
+    .unwrap() else {
         panic!("expected the group payload")
     };
     assert_eq!(

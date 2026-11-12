@@ -102,13 +102,20 @@ fn a_session_runs_both_ways_and_stays_sealed() {
     let alice = new_device("alice-device");
     let bob = new_device("bob-device");
     let (alice_addr, bob_addr) = (address("111"), address("222"));
+    let alice_identity = block_on(common::vouch(&bob.ops, &alice.ops, alice_addr.name()));
 
     let (bundle, prekey_id) = bundle_for(&alice, &bob, &bob_addr, true);
     block_on(alice.ops.establish_session(&bob_addr, &bundle)).unwrap();
 
     let first = block_on(alice.ops.encrypt(&bob_addr, b"hello bob")).unwrap();
     assert_eq!(first.kind, EncKind::PreKey);
-    let opened = block_on(bob.ops.decrypt(&alice_addr, first.kind, &first.ciphertext)).unwrap();
+    let opened = block_on(bob.ops.decrypt(
+        &alice_addr,
+        first.kind,
+        &first.ciphertext,
+        Some(&alice_identity),
+    ))
+    .unwrap();
     assert_eq!(opened.plaintext, b"hello bob");
 
     // The consumed one-time prekey is gone, after the session became durable.
@@ -120,14 +127,19 @@ fn a_session_runs_both_ways_and_stays_sealed() {
 
     let reply = block_on(bob.ops.encrypt(&alice_addr, b"hi alice")).unwrap();
     assert_eq!(reply.kind, EncKind::Message);
-    let opened = block_on(alice.ops.decrypt(&bob_addr, reply.kind, &reply.ciphertext)).unwrap();
+    let opened = block_on(
+        alice
+            .ops
+            .decrypt(&bob_addr, reply.kind, &reply.ciphertext, None),
+    )
+    .unwrap();
     assert_eq!(opened.plaintext, b"hi alice");
 
     for round in 0..5u8 {
         let to_bob = block_on(alice.ops.encrypt(&bob_addr, &[b'a', round])).unwrap();
         let got = block_on(
             bob.ops
-                .decrypt(&alice_addr, to_bob.kind, &to_bob.ciphertext),
+                .decrypt(&alice_addr, to_bob.kind, &to_bob.ciphertext, None),
         )
         .unwrap();
         assert_eq!(got.plaintext, [b'a', round]);
@@ -135,7 +147,7 @@ fn a_session_runs_both_ways_and_stays_sealed() {
         let got = block_on(
             alice
                 .ops
-                .decrypt(&bob_addr, to_alice.kind, &to_alice.ciphertext),
+                .decrypt(&bob_addr, to_alice.kind, &to_alice.ciphertext, None),
         )
         .unwrap();
         assert_eq!(got.plaintext, [b'b', round]);
@@ -154,21 +166,39 @@ fn a_failed_over_node_keeps_the_session_and_the_old_node_is_fenced_out() {
     let alice = new_device("alice-failover");
     let bob = new_device("bob-failover");
     let (alice_addr, bob_addr) = (address("111"), address("222"));
+    let alice_identity = block_on(common::vouch(&bob.ops, &alice.ops, alice_addr.name()));
     let (bundle, _) = bundle_for(&alice, &bob, &bob_addr, true);
     block_on(alice.ops.establish_session(&bob_addr, &bundle)).unwrap();
     let first = block_on(alice.ops.encrypt(&bob_addr, b"before failover")).unwrap();
-    block_on(bob.ops.decrypt(&alice_addr, first.kind, &first.ciphertext)).unwrap();
+    block_on(bob.ops.decrypt(
+        &alice_addr,
+        first.kind,
+        &first.ciphertext,
+        Some(&alice_identity),
+    ))
+    .unwrap();
 
     // node-a's lease lapses; node-b takes the scope from the same records.
     let takeover = store_for(&bob.records, bob.scope, "node-b", TTL + 1);
     let bob_b = block_on(SignalOps::open(takeover)).unwrap();
 
     let next = block_on(alice.ops.encrypt(&bob_addr, b"after failover")).unwrap();
-    let stale = block_on(bob.ops.decrypt(&alice_addr, next.kind, &next.ciphertext));
+    let stale = block_on(bob.ops.decrypt(
+        &alice_addr,
+        next.kind,
+        &next.ciphertext,
+        Some(&alice_identity),
+    ));
     let err = stale.expect_err("the superseded node must not advance the ratchet");
     assert!(err.is_fence_lost(), "unexpected error: {err:?}");
 
-    let opened = block_on(bob_b.decrypt(&alice_addr, next.kind, &next.ciphertext)).unwrap();
+    let opened = block_on(bob_b.decrypt(
+        &alice_addr,
+        next.kind,
+        &next.ciphertext,
+        Some(&alice_identity),
+    ))
+    .unwrap();
     assert_eq!(opened.plaintext, b"after failover");
 }
 
@@ -177,16 +207,19 @@ fn group_messages_decrypt_with_a_distributed_sender_key() {
     let alice = new_device("alice-group");
     let bob = new_device("bob-group");
     let (alice_addr, bob_addr) = (address("111"), address("222"));
+    let alice_identity = block_on(common::vouch(&bob.ops, &alice.ops, alice_addr.name()));
     let group = "120363000000001@g.us";
     let (bundle, _) = bundle_for(&alice, &bob, &bob_addr, true);
     block_on(alice.ops.establish_session(&bob_addr, &bundle)).unwrap();
 
     let skdm = block_on(alice.ops.sender_key_distribution(group, &alice_addr)).unwrap();
     let carried = block_on(alice.ops.encrypt(&bob_addr, &skdm)).unwrap();
-    let received = block_on(
-        bob.ops
-            .decrypt(&alice_addr, carried.kind, &carried.ciphertext),
-    )
+    let received = block_on(bob.ops.decrypt(
+        &alice_addr,
+        carried.kind,
+        &carried.ciphertext,
+        Some(&alice_identity),
+    ))
     .unwrap();
     block_on(
         bob.ops
@@ -204,6 +237,7 @@ fn a_prekey_message_for_a_rotated_signed_prekey_still_decrypts() {
     let alice = new_device("alice-rotate");
     let bob = new_device("bob-rotate");
     let (alice_addr, bob_addr) = (address("111"), address("222"));
+    let alice_identity = block_on(common::vouch(&bob.ops, &alice.ops, alice_addr.name()));
     let (bundle, _) = bundle_for(&alice, &bob, &bob_addr, false);
     let before = block_on(bob.ops.public_identity()).signed_prekey;
     block_on(alice.ops.establish_session(&bob_addr, &bundle)).unwrap();
@@ -212,7 +246,13 @@ fn a_prekey_message_for_a_rotated_signed_prekey_still_decrypts() {
     assert_ne!(after.id, before.id);
 
     let first = block_on(alice.ops.encrypt(&bob_addr, b"old signed prekey")).unwrap();
-    let opened = block_on(bob.ops.decrypt(&alice_addr, first.kind, &first.ciphertext)).unwrap();
+    let opened = block_on(bob.ops.decrypt(
+        &alice_addr,
+        first.kind,
+        &first.ciphertext,
+        Some(&alice_identity),
+    ))
+    .unwrap();
     assert_eq!(opened.plaintext, b"old signed prekey");
 }
 
