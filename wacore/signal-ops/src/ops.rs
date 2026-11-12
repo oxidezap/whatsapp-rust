@@ -763,6 +763,12 @@ impl<S: ServiceStore> SignalOps<S> {
     ) -> Result<Decrypted, OpsError> {
         let mut sessions = self.stores_over(staged.clone()).await;
         let mut identities = sessions.clone();
+        // libsignal reports a replaced identity for a prekey message but not
+        // for an ordinary `msg` that commits a session with another identity,
+        // so compare the stored identity around the decrypt as well.
+        let before =
+            wacore::libsignal::protocol::IdentityKeyStore::get_identity(&identities, sender)
+                .await?;
         let result = match kind {
             EncKind::PreKey => {
                 let message = PreKeySignalMessage::try_from(ciphertext)?;
@@ -791,12 +797,16 @@ impl<S: ServiceStore> SignalOps<S> {
         if let Some(id) = result.consumed_prekey_id {
             staged.remove_prekey(id.into()).await?;
         }
+        let after =
+            wacore::libsignal::protocol::IdentityKeyStore::get_identity(&identities, sender)
+                .await?;
         Ok(Decrypted {
             plaintext: result.plaintext,
             identity_changed: matches!(
                 result.identity_change,
                 wacore::libsignal::protocol::IdentityChange::ReplacedExisting
-            ),
+            ) || before
+                .is_some_and(|before| after.is_some_and(|after| before != after)),
         })
     }
 

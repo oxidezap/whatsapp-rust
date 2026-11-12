@@ -521,3 +521,62 @@ fn a_sender_key_for_another_group_is_not_installed_under_this_chat() {
         "a key for another group must not decrypt this chat's messages"
     );
 }
+
+#[test]
+fn a_message_that_replaces_the_stored_identity_reports_it() {
+    let alice = device("alice-identity-msg");
+    let bob = device("bob-identity-msg");
+    let (alice_addr, bob_addr) = (address("111"), address("222"));
+    connect(&alice, &bob, &bob_addr);
+    let chat = alice_addr.name().to_owned();
+    let bob_chat = bob_addr.name().to_owned();
+
+    // Establish both directions so Alice's next message is a plain `msg`.
+    let first = block_on(alice.ops.encrypt(&bob_addr, &padded(&text("one")))).unwrap();
+    block_on(bob.ops.receive(request(
+        &chat,
+        &alice_addr,
+        kind(&first),
+        &first.ciphertext,
+        false,
+    )))
+    .unwrap();
+    let reply = block_on(bob.ops.encrypt(&alice_addr, &padded(&text("two")))).unwrap();
+    block_on(alice.ops.receive(request(
+        &bob_chat,
+        &bob_addr,
+        kind(&reply),
+        &reply.ciphertext,
+        false,
+    )))
+    .unwrap();
+
+    // Bob's stored identity for Alice no longer matches the session's.
+    let other = block_on(alice.ops.public_identity())
+        .signed_prekey
+        .public_key;
+    let store = store_for(&bob.records, bob.scope, "node-a", 0);
+    block_on(wacore::store::traits::SignalStore::put_identity(
+        &*store,
+        alice_addr.as_str(),
+        other,
+    ))
+    .unwrap();
+
+    let next = block_on(alice.ops.encrypt(&bob_addr, &padded(&text("three")))).unwrap();
+    assert!(matches!(kind(&next), ReceiveKind::Message));
+    let received = message(
+        block_on(bob.ops.receive(request(
+            &chat,
+            &alice_addr,
+            kind(&next),
+            &next.ciphertext,
+            false,
+        )))
+        .unwrap(),
+    );
+    assert!(
+        received.identity_changed,
+        "a msg that replaces the stored identity must say so"
+    );
+}
