@@ -5845,6 +5845,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "wacore-signal-wasm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "buffa",
+ "getrandom 0.4.3",
+ "hmac 0.13.0",
+ "js-sys",
+ "rand 0.10.3",
+ "send_wrapper",
+ "serde_json",
+ "sha2 0.11.1",
+ "wacore",
+ "wacore-binary",
+ "wacore-recordstore",
+ "wacore-signal-ops",
+ "waproto",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+]
+
+[[package]]
 name = "wait-timeout"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5916,6 +5939,16 @@ dependencies = [
  "rustversion",
  "wasm-bindgen-macro",
  "wasm-bindgen-shared",
+]
+
+[[package]]
+name = "wasm-bindgen-futures"
+version = "0.4.78"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ef4c5d3d2cdf5c54f4231181768f5510842e350db025faf1f7163b1030ed928"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
 ]
 
 [[package]]

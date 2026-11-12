@@ -47,6 +47,7 @@ members = [
     "wacore/noise",
     "wacore/recordstore",
     "wacore/signal-ops",
+    "wacore/signal-wasm",
     "waproto",
 ]
 exclude = ["vendor/wasmtime-internal-cache"]

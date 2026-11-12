@@ -1,0 +1,42 @@
+[package]
+name = "wacore-signal-wasm"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+authors = ["Polymorfa (Softium LLC)"]
+license = "MIT"
+repository = "https://github.com/oxidezap/whatsapp-rust"
+description = "Browser and edge bindings for wacore-signal-ops"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# The bindings exist only on wasm32; on other targets the crate is empty, so a
+# native `cargo check --workspace` stays green without JS types.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+buffa = { workspace = true }
+js-sys = "0.3.105"
+send_wrapper = "0.6"
+wacore = { workspace = true }
+wacore-binary = { workspace = true }
+wacore-recordstore = { path = "../recordstore" }
+wacore-signal-ops = { path = "../signal-ops" }
+wasm-bindgen = "0.2.128"
+wasm-bindgen-futures = "0.4"
+waproto = { workspace = true }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { workspace = true, features = ["wasm_js"] }
+
+[dev-dependencies]
+buffa = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+serde_json = { workspace = true }
+wacore = { workspace = true, features = ["test-util"] }
+wacore-binary = { workspace = true }
+waproto = { workspace = true }

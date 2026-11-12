@@ -137,3 +137,53 @@ jobs:
           cargo build -p whatsapp-rust --lib --release
           --target wasm32-unknown-unknown
           --no-default-features --features voip-mlow,instance-clock
+
+  signal-wasm:
+    name: Signal bindings (wasm32, Node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+          targets: wasm32-unknown-unknown
+      # The CLI must match the wasm-bindgen crate in this workspace's
+      # Cargo.lock, which can differ from the isolated consumers' version the
+      # wasm job installs.
+      - name: Read the locked wasm-bindgen version
+        id: wasm-bindgen
+        run: >
+          awk '/^name = "wasm-bindgen"$/ { getline; split($0, v, "\""); print "version=" v[2]; exit }'
+          Cargo.lock >> "$GITHUB_OUTPUT"
+      - name: Install wasm-bindgen CLI
+        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20
+        with:
+          tool: wasm-bindgen-cli@${{ steps.wasm-bindgen.outputs.version }}
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Cache Rust build (registry + target)
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "true"
+      - name: Use Node 24 for JavaScript binding tests
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      # The JS bindings are only proven by running them: build, generate the
+      # Node glue, and drive two devices end to end from JavaScript.
+      - name: Test wacore-signal-wasm bindings from Node
+        # Build the native fixture without the WASM-only randomness override.
+        env:
+          RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
+          SIGNAL_WASM_FIXTURE: ${{ github.workspace }}/target/debug/examples/fixture
+        run: |
+          RUSTFLAGS='' cargo build --locked -p wacore-signal-wasm --example fixture
+          cargo build -p wacore-signal-wasm --lib --release --target wasm32-unknown-unknown
+          wasm-bindgen --target nodejs --out-dir target/signal-wasm-node \
+            target/wasm32-unknown-unknown/release/wacore_signal_wasm.wasm
+          node --test wacore/signal-wasm/tests/node.test.mjs
+          npm exec --yes --package=typescript@6.0.3 -- tsc --noEmit --target es2022 --module esnext --moduleResolution bundler --lib esnext,dom --strict wacore/signal-wasm/tests/types.ts
