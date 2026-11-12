@@ -188,14 +188,18 @@ impl SignalDevice {
         let lease = match acquired {
             Ok(Some(lease)) => lease,
             Ok(None) => {
-                records.unreserve(&scope, &holder);
+                if let Some(orphan) = records.unreserve(&scope, &holder) {
+                    let _ = records.release(&orphan).await;
+                }
                 return Err(convert::coded_error(
                     "lease_held",
                     "another holder owns this scope",
                 ));
             }
             Err(e) => {
-                records.unreserve(&scope, &holder);
+                if let Some(orphan) = records.unreserve(&scope, &holder) {
+                    let _ = records.release(&orphan).await;
+                }
                 return Err(ops_error(OpsError::Store(e)));
             }
         };

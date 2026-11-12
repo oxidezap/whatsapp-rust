@@ -136,6 +136,9 @@ async fn settle(
 struct HolderOpens {
     acquiring: usize,
     live: HashMap<u64, usize>,
+    /// A lease a failed open left for an open still acquiring. Whoever
+    /// finishes last without a handle on it releases it.
+    deferred: Option<Lease>,
 }
 
 type LiveDevices = Mutex<HashMap<(Arc<str>, Arc<str>), HolderOpens>>;
@@ -184,19 +187,36 @@ impl JsRecords {
         }
     }
 
-    /// Drop a reservation whose acquire returned no lease.
-    pub fn unreserve(&self, scope: &str, holder: &str) {
+    /// Drop a reservation whose acquire returned no lease. Returns a lease
+    /// the caller must now release: one a failed open left for this open,
+    /// when no other open can still take it over.
+    pub fn unreserve(&self, scope: &str, holder: &str) -> Option<Lease> {
+        let mut orphan = None;
         self.update(scope, holder, |opens| {
             opens.acquiring = opens.acquiring.saturating_sub(1);
+            if opens.acquiring == 0
+                && let Some(lease) = opens.deferred.take()
+            {
+                if opens.live.contains_key(&lease.fence.generation) {
+                    return;
+                }
+                orphan = Some(lease);
+            }
         });
+        orphan
     }
 
     /// Turn a reservation into a handle on `lease`'s generation. Each
-    /// `acquired` is paired with one `untrack` of the same lease.
+    /// `acquired` is paired with one `untrack` of the same lease. A deferred
+    /// lease of the same generation is now this handle's; one of another
+    /// generation was already replaced by the store.
     pub fn acquired(&self, lease: &Lease) {
         self.update(&lease.fence.scope, &lease.holder, |opens| {
             opens.acquiring = opens.acquiring.saturating_sub(1);
             *opens.live.entry(lease.fence.generation).or_insert(0) += 1;
+            if opens.acquiring == 0 {
+                opens.deferred = None;
+            }
         });
     }
 
@@ -219,6 +239,11 @@ impl JsRecords {
             };
             if remaining == 0 {
                 opens.live.remove(&generation);
+                if opens.acquiring > 0 {
+                    // An open still acquiring may be handed this lease; if it
+                    // fails instead, it releases it (see `unreserve`).
+                    opens.deferred = Some(lease.clone());
+                }
             }
             last = remaining == 0 && opens.acquiring == 0;
         });
@@ -232,7 +257,7 @@ impl JsRecords {
         let key = Self::live_key(scope, holder);
         let opens = live.entry(key.clone()).or_default();
         change(opens);
-        if opens.acquiring == 0 && opens.live.is_empty() {
+        if opens.acquiring == 0 && opens.live.is_empty() && opens.deferred.is_none() {
             live.remove(&key);
         }
     }

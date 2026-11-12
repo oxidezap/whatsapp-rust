@@ -188,6 +188,9 @@ struct State {
     /// Delay the response of each `acquire` call in turn (the lease is taken
     /// at once), then none.
     acquire_delays: RefCell<Vec<u32>>,
+    /// Make each `acquire` call in turn reject after its delay without taking
+    /// a lease (`true`), then none.
+    acquire_failures: RefCell<Vec<bool>>,
     /// Delay every `get`, so concurrent opens interleave.
     read_delay_ms: Cell<u32>,
 }
@@ -365,6 +368,16 @@ impl MemoryBackend {
                 delays.remove(0)
             }
         };
+        let fails = {
+            let mut failures = self.state.acquire_failures.borrow_mut();
+            !failures.is_empty() && failures.remove(0)
+        };
+        if fails {
+            if delay > 0 {
+                sleep_ms(delay).await;
+            }
+            return Err(JsValue::from_str("lease backend unavailable"));
+        }
         let out = self.take_lease(scope, holder, now_ms, ttl_ms);
         if delay > 0 {
             sleep_ms(delay).await;
@@ -2664,6 +2677,33 @@ async fn a_rejected_device_named_by_the_resolver_is_reported_as_a_stale_group_us
     .await;
     assert!(strings_of(&get(&sent, "distributionTargets")).contains(&BOB_DEVICE.to_owned()));
     assert_eq!(strings_of(&get(&sent, "staleDeviceUsers")), ["222"]);
+}
+
+#[wasm_bindgen_test]
+async fn the_last_acquiring_open_releases_a_lease_a_failed_open_left_behind() {
+    let h = Harness::new();
+    h.state.read_delay_ms.set(5);
+    let seed = h.open("bob-orphan", "tab-a", 0.0, true).await.ok().unwrap();
+    run(seed.release()).await;
+    drop(seed);
+    // The first open takes the lease and fails on the wrong key while the
+    // second is still acquiring, so it leaves the lease to the second. The
+    // second's acquire then fails at the backend.
+    h.state.acquire_delays.replace(vec![0, 30]);
+    h.state.acquire_failures.replace(vec![false, true]);
+    let wrong: JsValue = TestSealer::new().into();
+    let (failed, also_failed) = join2(
+        open_with(&h.backend, &wrong, "bob-orphan", "tab-a", 1.0, false),
+        h.open("bob-orphan", "tab-a", 1.0, false),
+    )
+    .await;
+    assert!(failed.is_err());
+    assert!(also_failed.is_err());
+    let other = h
+        .open("bob-orphan", "tab-b", 2.0, false)
+        .await
+        .expect("no open owns the lease, so another holder takes it at once");
+    run(other.release()).await;
 }
 
 #[wasm_bindgen_test]
