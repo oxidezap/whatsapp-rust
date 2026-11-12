@@ -332,16 +332,30 @@ impl<S: ServiceStore> SignalOps<S> {
     /// locks and retirement state.
     pub async fn open(store: Arc<S>) -> Result<Self, OpsError> {
         let slot = authority_slot(store.authority_key());
+        let loaded = std::sync::atomic::AtomicBool::new(false);
         let authority = slot
             .get_or_try_init(|| async {
-                let blob = store
-                    .load_device_keys()
-                    .await?
-                    .ok_or(OpsError::NotInitialised)?;
-                Ok::<_, OpsError>(new_authority(DeviceKeys::decode(&blob)?))
+                let keys = Self::stored_keys(&store).await?;
+                loaded.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, OpsError>(new_authority(keys))
             })
             .await?
             .clone();
+        if !loaded.load(std::sync::atomic::Ordering::SeqCst) {
+            // Joining a live authority skips its key read. Read through this
+            // store anyway: one with a different sealer must fail here, not
+            // later reseal the shared keys under its own key. The read only
+            // checks; the authority keeps the keys it already holds.
+            let own = Self::stored_keys(&store).await?;
+            let shared = authority.keys.read().await.clone();
+            if own.identity.public_key.public_key_bytes()
+                != shared.identity.public_key.public_key_bytes()
+            {
+                return Err(OpsError::InvalidInput(
+                    "this store's device keys differ from the open instance's".into(),
+                ));
+            }
+        }
         Ok(Self {
             store,
             authority,
@@ -464,19 +478,22 @@ impl<S: ServiceStore> SignalOps<S> {
         Ok(())
     }
 
+    async fn stored_keys(store: &S) -> Result<DeviceKeys, OpsError> {
+        DeviceKeys::decode(
+            &store
+                .load_device_keys()
+                .await?
+                .ok_or(OpsError::NotInitialised)?,
+        )
+    }
+
     /// The device keys as last committed. Read-modify-write starts here, not
     /// from the cache: a write whose response was lost may still have
     /// committed, leaving the cache behind the store, and writing the cached
     /// blob back would rewind it (for example `next_prekey_id`). Call with
     /// the device lock held.
     pub(crate) async fn durable_keys(&self) -> Result<DeviceKeys, OpsError> {
-        DeviceKeys::decode(
-            &self
-                .store
-                .load_device_keys()
-                .await?
-                .ok_or(OpsError::NotInitialised)?,
-        )
+        Self::stored_keys(&self.store).await
     }
 
     /// After a device-key write with an uncertain outcome, bring the cache in

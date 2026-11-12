@@ -347,3 +347,34 @@ async fn an_open_overlapping_a_live_instance_cannot_restore_its_older_keys() {
     let next = second.rotate_signed_prekey().await.unwrap();
     assert_ne!(next.id, rotated.id, "a rotation must not reuse the live ID");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_open_with_a_different_sealer_cannot_join_a_live_instance() {
+    let records = Arc::new(MemoryRecordStore::new());
+    let lease = records
+        .acquire("wrong-sealer", "node-a", 0, TTL)
+        .await
+        .unwrap()
+        .unwrap();
+    let store = |key: &[u8; 32]| {
+        Arc::new(RecordSignalStore::new(
+            records.clone(),
+            Arc::new(AesGcmSealer::new(key)),
+            lease.fence.clone(),
+        ))
+    };
+    let first = SignalOps::create(store(&DATA_KEY)).await.unwrap();
+    let identity = first.public_identity().await.identity_key;
+
+    // Same backend, scope and fence, so it would share the live authority.
+    assert!(
+        SignalOps::open(store(&[7; 32])).await.is_err(),
+        "a store that cannot open the device keys must not join"
+    );
+
+    // Nothing was resealed: the original sealer still opens the device.
+    first.rotate_signed_prekey().await.unwrap();
+    drop(first);
+    let reopened = SignalOps::open(store(&DATA_KEY)).await.unwrap();
+    assert_eq!(reopened.public_identity().await.identity_key, identity);
+}
