@@ -346,6 +346,50 @@ impl FieldElement2625 {
 
     #[allow(clippy::identity_op)]
     pub(super) fn to_bytes(self) -> [u8; 32] {
+        let h = self.canonical_limbs();
+
+        let mut s = [0u8; 32];
+        s[0] = (h[0] >> 0) as u8;
+        s[1] = (h[0] >> 8) as u8;
+        s[2] = (h[0] >> 16) as u8;
+        s[3] = ((h[0] >> 24) | (h[1] << 2)) as u8;
+        s[4] = (h[1] >> 6) as u8;
+        s[5] = (h[1] >> 14) as u8;
+        s[6] = ((h[1] >> 22) | (h[2] << 3)) as u8;
+        s[7] = (h[2] >> 5) as u8;
+        s[8] = (h[2] >> 13) as u8;
+        s[9] = ((h[2] >> 21) | (h[3] << 5)) as u8;
+        s[10] = (h[3] >> 3) as u8;
+        s[11] = (h[3] >> 11) as u8;
+        s[12] = ((h[3] >> 19) | (h[4] << 6)) as u8;
+        s[13] = (h[4] >> 2) as u8;
+        s[14] = (h[4] >> 10) as u8;
+        s[15] = (h[4] >> 18) as u8;
+        s[16] = (h[5] >> 0) as u8;
+        s[17] = (h[5] >> 8) as u8;
+        s[18] = (h[5] >> 16) as u8;
+        s[19] = ((h[5] >> 24) | (h[6] << 1)) as u8;
+        s[20] = (h[6] >> 7) as u8;
+        s[21] = (h[6] >> 15) as u8;
+        s[22] = ((h[6] >> 23) | (h[7] << 3)) as u8;
+        s[23] = (h[7] >> 5) as u8;
+        s[24] = (h[7] >> 13) as u8;
+        s[25] = ((h[7] >> 21) | (h[8] << 4)) as u8;
+        s[26] = (h[8] >> 4) as u8;
+        s[27] = (h[8] >> 12) as u8;
+        s[28] = ((h[8] >> 20) | (h[9] << 6)) as u8;
+        s[29] = (h[9] >> 2) as u8;
+        s[30] = (h[9] >> 10) as u8;
+        s[31] = (h[9] >> 18) as u8;
+
+        // Check that high bit is cleared
+        debug_assert!((s[31] & 0b1000_0000u8) == 0u8);
+
+        s
+    }
+
+    #[rustfmt::skip] // keep alignment of z* calculations
+    pub(super) fn canonical_limbs(self) -> [u32; 10] {
         let inp = &self.0;
         // Reduce the value represented by `in` to the range [0,2*p)
         let mut h: [u32; 10] = FieldElement2625::reduce([
@@ -418,59 +462,21 @@ impl FieldElement2625 {
         debug_assert!((h[9] >> 25) == 0 || (h[9] >> 25) == 1);
         h[9] &= LOW_25_BITS;
 
-        let mut s = [0u8; 32];
-        s[0] = (h[0] >> 0) as u8;
-        s[1] = (h[0] >> 8) as u8;
-        s[2] = (h[0] >> 16) as u8;
-        s[3] = ((h[0] >> 24) | (h[1] << 2)) as u8;
-        s[4] = (h[1] >> 6) as u8;
-        s[5] = (h[1] >> 14) as u8;
-        s[6] = ((h[1] >> 22) | (h[2] << 3)) as u8;
-        s[7] = (h[2] >> 5) as u8;
-        s[8] = (h[2] >> 13) as u8;
-        s[9] = ((h[2] >> 21) | (h[3] << 5)) as u8;
-        s[10] = (h[3] >> 3) as u8;
-        s[11] = (h[3] >> 11) as u8;
-        s[12] = ((h[3] >> 19) | (h[4] << 6)) as u8;
-        s[13] = (h[4] >> 2) as u8;
-        s[14] = (h[4] >> 10) as u8;
-        s[15] = (h[4] >> 18) as u8;
-        s[16] = (h[5] >> 0) as u8;
-        s[17] = (h[5] >> 8) as u8;
-        s[18] = (h[5] >> 16) as u8;
-        s[19] = ((h[5] >> 24) | (h[6] << 1)) as u8;
-        s[20] = (h[6] >> 7) as u8;
-        s[21] = (h[6] >> 15) as u8;
-        s[22] = ((h[6] >> 23) | (h[7] << 3)) as u8;
-        s[23] = (h[7] >> 5) as u8;
-        s[24] = (h[7] >> 13) as u8;
-        s[25] = ((h[7] >> 21) | (h[8] << 4)) as u8;
-        s[26] = (h[8] >> 4) as u8;
-        s[27] = (h[8] >> 12) as u8;
-        s[28] = ((h[8] >> 20) | (h[9] << 6)) as u8;
-        s[29] = (h[9] >> 2) as u8;
-        s[30] = (h[9] >> 10) as u8;
-        s[31] = (h[9] >> 18) as u8;
-
-        // Check that high bit is cleared
-        debug_assert!((s[31] & 0b1000_0000u8) == 0u8);
-
-        s
+        h
     }
 
-    #[rustfmt::skip] // keep alignment of z* calculations
     fn square_inner(&self) -> [u64; 10] {
         // Optimized version of multiplication for the case of squaring.
         // Pre- and post- conditions identical to multiplication function.
         let x = &self.0;
-        let x0_2  =  2 * x[0];
-        let x1_2  =  2 * x[1];
-        let x2_2  =  2 * x[2];
-        let x3_2  =  2 * x[3];
-        let x4_2  =  2 * x[4];
-        let x5_2  =  2 * x[5];
-        let x6_2  =  2 * x[6];
-        let x7_2  =  2 * x[7];
+        let x0_2 = 2 * x[0];
+        let x1_2 = 2 * x[1];
+        let x2_2 = 2 * x[2];
+        let x3_2 = 2 * x[3];
+        let x4_2 = 2 * x[4];
+        let x5_2 = 2 * x[5];
+        let x6_2 = 2 * x[6];
+        let x7_2 = 2 * x[7];
         let x5_19 = 19 * x[5];
         let x6_19 = 19 * x[6];
         let x7_19 = 19 * x[7];
@@ -486,16 +492,39 @@ impl FieldElement2625 {
         // 64-bit multiplication by 2 on the results.  This is because lg(38) is too big: we would
         // have less than 1 bit of headroom left, which is too little.
         let mut z = [0u64; 10];
-        z[0] = m(x[0], x[0]) + m(x2_2, x8_19) + m(x4_2, x6_19) + (m(x1_2, x9_19) +  m(x3_2, x7_19) + m(x[5], x5_19)) * 2;
-        z[1] = m(x0_2, x[1]) + m(x3_2, x8_19) + m(x5_2, x6_19) + (m(x[2], x9_19) +  m(x[4], x7_19)                 ) * 2;
-        z[2] = m(x0_2, x[2]) + m(x1_2,  x[1]) + m(x4_2, x8_19) +  m(x[6], x6_19) + (m(x3_2, x9_19) + m(x5_2, x7_19)) * 2;
-        z[3] = m(x0_2, x[3]) + m(x1_2,  x[2]) + m(x5_2, x8_19) + (m(x[4], x9_19) +  m(x[6], x7_19)                 ) * 2;
-        z[4] = m(x0_2, x[4]) + m(x1_2,  x3_2) + m(x[2],  x[2]) +  m(x6_2, x8_19) + (m(x5_2, x9_19) + m(x[7], x7_19)) * 2;
-        z[5] = m(x0_2, x[5]) + m(x1_2,  x[4]) + m(x2_2,  x[3]) +  m(x7_2, x8_19) +  m(x[6], x9_19)                   * 2;
-        z[6] = m(x0_2, x[6]) + m(x1_2,  x5_2) + m(x2_2,  x[4]) +  m(x3_2,  x[3]) +  m(x[8], x8_19) + m(x7_2, x9_19)  * 2;
-        z[7] = m(x0_2, x[7]) + m(x1_2,  x[6]) + m(x2_2,  x[5]) +  m(x3_2,  x[4]) +  m(x[8], x9_19)                   * 2;
-        z[8] = m(x0_2, x[8]) + m(x1_2,  x7_2) + m(x2_2,  x[6]) +  m(x3_2,  x5_2) +  m(x[4],  x[4]) + m(x[9], x9_19)  * 2;
-        z[9] = m(x0_2, x[9]) + m(x1_2,  x[8]) + m(x2_2,  x[7]) +  m(x3_2,  x[6]) +  m(x4_2,  x[5])                      ;
+        z[0] = m(x[0], x[0])
+            + m(x2_2, x8_19)
+            + m(x4_2, x6_19)
+            + (m(x1_2, x9_19) + m(x3_2, x7_19) + m(x[5], x5_19)) * 2;
+        z[1] =
+            m(x0_2, x[1]) + m(x3_2, x8_19) + m(x5_2, x6_19) + (m(x[2], x9_19) + m(x[4], x7_19)) * 2;
+        z[2] = m(x0_2, x[2])
+            + m(x1_2, x[1])
+            + m(x4_2, x8_19)
+            + m(x[6], x6_19)
+            + (m(x3_2, x9_19) + m(x5_2, x7_19)) * 2;
+        z[3] =
+            m(x0_2, x[3]) + m(x1_2, x[2]) + m(x5_2, x8_19) + (m(x[4], x9_19) + m(x[6], x7_19)) * 2;
+        z[4] = m(x0_2, x[4])
+            + m(x1_2, x3_2)
+            + m(x[2], x[2])
+            + m(x6_2, x8_19)
+            + (m(x5_2, x9_19) + m(x[7], x7_19)) * 2;
+        z[5] = m(x0_2, x[5]) + m(x1_2, x[4]) + m(x2_2, x[3]) + m(x7_2, x8_19) + m(x[6], x9_19) * 2;
+        z[6] = m(x0_2, x[6])
+            + m(x1_2, x5_2)
+            + m(x2_2, x[4])
+            + m(x3_2, x[3])
+            + m(x[8], x8_19)
+            + m(x7_2, x9_19) * 2;
+        z[7] = m(x0_2, x[7]) + m(x1_2, x[6]) + m(x2_2, x[5]) + m(x3_2, x[4]) + m(x[8], x9_19) * 2;
+        z[8] = m(x0_2, x[8])
+            + m(x1_2, x7_2)
+            + m(x2_2, x[6])
+            + m(x3_2, x5_2)
+            + m(x[4], x[4])
+            + m(x[9], x9_19) * 2;
+        z[9] = m(x0_2, x[9]) + m(x1_2, x[8]) + m(x2_2, x[7]) + m(x3_2, x[6]) + m(x4_2, x[5]);
 
         z
     }

@@ -6,6 +6,7 @@
 //! See LICENSE for the retained BSD terms. Secret scalar multiplication uses
 //! fixed loops and subtle selections. Variable-time NAF is only for verification.
 //! Both limb backends share table data, converted during constant evaluation.
+//! XEdDSA parsing and equations are shared by the provider and prepared keys.
 #![deny(dead_code)]
 #![allow(clippy::op_ref, clippy::needless_range_loop)]
 
@@ -29,6 +30,8 @@ mod scalar29;
 #[cfg(target_pointer_width = "64")]
 mod scalar52;
 mod tables;
+mod xeddsa;
+pub(crate) use xeddsa::{ParsedSignature, sign, verify};
 mod vartime;
 mod window;
 mod traits {

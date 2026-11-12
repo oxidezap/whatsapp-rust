@@ -2,7 +2,6 @@
 use super::{
     edwards::EdwardsPoint,
     models::{AffineNielsPoint, ProjectiveNielsPoint},
-    traits::Identity,
 };
 use subtle::{Choice, ConditionallyNegatable, ConditionallySelectable, ConstantTimeEq};
 #[derive(Clone, Copy)]
@@ -12,9 +11,21 @@ impl LookupTable<AffineNielsPoint> {
         debug_assert!((-8..=8).contains(&x));
         let mask = (x as i16) >> 7;
         let abs = ((x as i16) + mask) ^ mask;
-        let mut result = AffineNielsPoint::identity();
-        for j in 1..=8 {
-            result.conditional_assign(&self.0[j - 1], (abs as u16).ct_eq(&(j as u16)));
+        // The choices are one-hot. Build them before keeping the accumulator
+        // live across subtle's optimization barriers, then OR disjoint terms.
+        let choices: [Choice; 9] = core::array::from_fn(|j| (abs as u16).ct_eq(&(j as u16)));
+        use super::field::FieldElement;
+        let identity =
+            FieldElement::conditional_select(&FieldElement::ZERO, &FieldElement::ONE, choices[0]);
+        let mut result = AffineNielsPoint {
+            y_plus_x: identity,
+            y_minus_x: identity,
+            xy2d: FieldElement::ZERO,
+        };
+        for (point, choice) in self.0.iter().zip(&choices[1..]) {
+            result.y_plus_x.or_assign(&point.y_plus_x, *choice);
+            result.y_minus_x.or_assign(&point.y_minus_x, *choice);
+            result.xy2d.or_assign(&point.xy2d, *choice);
         }
         result.conditional_negate(Choice::from((mask & 1) as u8));
         result

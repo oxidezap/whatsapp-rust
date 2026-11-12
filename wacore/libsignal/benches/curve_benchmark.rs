@@ -87,3 +87,55 @@ fn verify_prepared(b: divan::Bencher) {
         .expect("synthetic signing fixture must produce an XEdDSA signature");
     b.bench(|| assert!(prepared.verify_signature(black_box(&[5; 128]), black_box(&signature))));
 }
+
+type VerificationFixture = (
+    wacore_libsignal::core::PreparedVerifyingKey,
+    [u8; 32],
+    Vec<u8>,
+    [u8; 64],
+);
+
+fn verification_fixtures() -> Vec<VerificationFixture> {
+    [0, 1, 7, 31, 127, 128, 254, 255]
+        .into_iter()
+        .flat_map(|seed| {
+            [0, 1024].into_iter().map(move |len| {
+                let public = RustCrypto
+                    .public_key(&[seed; 32])
+                    .expect("synthetic key generation must succeed");
+                let key = wacore_libsignal::core::PublicKey::from_djb_public_key_bytes(&public)
+                    .expect("synthetic public key must be 32 bytes");
+                let prepared = key
+                    .prepare_verifying_key()
+                    .expect("synthetic point must be valid");
+                let message = vec![seed; len];
+                let signature = RustCrypto
+                    .sign(&[seed; 32], &message, &mut Fixed)
+                    .expect("synthetic signing must succeed");
+                (prepared, public, message, signature)
+            })
+        })
+        .collect()
+}
+
+#[divan::bench]
+fn verify_diverse(b: divan::Bencher) {
+    let fixtures = verification_fixtures();
+    b.bench(|| {
+        for (_, public, message, signature) in &fixtures {
+            RustCrypto
+                .verify(black_box(public), black_box(message), black_box(signature))
+                .expect("synthetic signature must verify");
+        }
+    });
+}
+
+#[divan::bench]
+fn verify_prepared_diverse(b: divan::Bencher) {
+    let fixtures = verification_fixtures();
+    b.bench(|| {
+        for (key, _, message, signature) in &fixtures {
+            assert!(key.verify_signature(black_box(message), black_box(signature)));
+        }
+    });
+}

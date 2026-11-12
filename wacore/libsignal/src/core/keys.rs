@@ -311,39 +311,19 @@ impl PreparedVerifyingKey {
         })
     }
     pub fn verify_signature(&self, message: &[u8], signature: &[u8]) -> bool {
-        use crate::curve::{edwards::EdwardsPoint, scalar::Scalar};
-        use sha2::{Digest, Sha512};
-        use subtle::ConstantTimeEq;
-        let Ok(sig) = <&[u8; 64]>::try_from(signature) else {
+        let Some(signature) = crate::curve::ParsedSignature::parse(signature) else {
             return false;
         };
-        let mut s = [0; 32];
-        s.copy_from_slice(&sig[32..]);
-        s[31] &= 127;
-        if s[31] & 224 != 0 {
-            return false;
-        }
         let negative;
-        let point = if sig[63] & 128 != 0 {
+        let point = if signature.sign() != 0 {
             negative = -self.point;
             &negative
         } else {
             &self.point
         };
         let mut encoding = self.encoding;
-        encoding[31] |= sig[63] & 128;
-        let mut h = Sha512::new();
-        h.update(&sig[..32]);
-        h.update(encoding);
-        h.update(message);
-        let h = Scalar::from_bytes_mod_order_wide(&h.finalize().into());
-        let r = EdwardsPoint::vartime_double_scalar_mul_basepoint(
-            &-h,
-            point,
-            &Scalar::from_bytes_mod_order(s),
-        )
-        .compress();
-        bool::from(r.as_bytes().ct_eq(&sig[..32]))
+        encoding[31] |= signature.sign() << 7;
+        crate::curve::verify(point, &encoding, message, &signature)
     }
 }
 /// Keeps the normalized scalar and Edwards encoding for repeated signing.
@@ -393,30 +373,14 @@ impl PreparedSigningKey {
         message: &[u8],
         rng: &mut dyn RandomSource,
     ) -> crate::engine::Result<[u8; 64]> {
-        use crate::curve::{edwards::EdwardsPoint, scalar::Scalar};
-        use sha2::{Digest, Sha512};
         let mut random = zeroize::Zeroizing::new([0; 64]);
         rng.fill(random.as_mut_slice())?;
-        let mut domain = [255; 32];
-        domain[0] = 254;
-        let mut h = Sha512::new();
-        h.update(domain);
-        h.update(self.scalar.as_bytes());
-        h.update(message);
-        h.update(random.as_slice());
-        let digest = zeroize::Zeroizing::new(<[u8; 64]>::from(h.finalize()));
-        let nonce = zeroize::Zeroizing::new(Scalar::from_bytes_mod_order_wide(&digest));
-        let r = EdwardsPoint::mul_base(&nonce).compress();
-        let mut h = Sha512::new();
-        h.update(r.as_bytes());
-        h.update(self.public);
-        h.update(message);
-        let challenge = Scalar::from_bytes_mod_order_wide(&h.finalize().into());
-        let s = *nonce + challenge * self.scalar;
-        let mut signature = [0; 64];
-        signature[..32].copy_from_slice(r.as_bytes());
-        signature[32..].copy_from_slice(s.as_bytes());
-        Ok(signature)
+        Ok(crate::curve::sign(
+            &self.scalar,
+            &self.public,
+            message,
+            &random,
+        ))
     }
 }
 impl PrivateKey {

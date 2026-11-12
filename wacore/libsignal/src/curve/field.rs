@@ -12,19 +12,29 @@ impl PartialEq for FieldElement {
 }
 impl ConstantTimeEq for FieldElement {
     fn ct_eq(&self, other: &Self) -> Choice {
-        self.to_bytes().ct_eq(&other.to_bytes())
+        self.canonical_limbs().ct_eq(&other.canonical_limbs())
     }
 }
 impl FieldElement {
+    pub(super) fn or_assign(&mut self, other: &Self, choice: Choice) {
+        #[cfg(target_pointer_width = "64")]
+        let mask = (choice.unwrap_u8() as u64).wrapping_neg();
+        #[cfg(not(target_pointer_width = "64"))]
+        let mask = (choice.unwrap_u8() as u32).wrapping_neg();
+        for (output, input) in self.0.iter_mut().zip(other.0) {
+            *output |= input & mask;
+        }
+    }
+
     pub(crate) fn is_negative(&self) -> Choice {
-        let bytes = self.to_bytes();
-        (bytes[0] & 1).into()
+        ((self.canonical_limbs()[0] as u8) & 1).into()
     }
     pub(crate) fn is_zero(&self) -> Choice {
-        let zero = [0u8; 32];
-        let bytes = self.to_bytes();
-
-        bytes.ct_eq(&zero)
+        let mut bits = 0;
+        for limb in self.canonical_limbs() {
+            bits |= limb;
+        }
+        bits.ct_eq(&0)
     }
     fn pow22501(&self) -> (FieldElement, FieldElement) {
         // Instead of managing which temporary variables are used
@@ -127,13 +137,19 @@ pub(super) const fn from_radix51(mut limbs: [u64; 5]) -> FieldElement {
         limbs[0] += 19 * carry;
         round += 1;
     }
-    let mut bytes = [0u8; 32];
-    let mut bit = 0;
-    while bit < 255 {
-        bytes[bit / 8] |= (((limbs[bit / 51] >> (bit % 51)) & 1) as u8) << (bit % 8);
-        bit += 1;
-    }
-    FieldElement::from_bytes(&bytes)
+    const LOW_26_BITS: u64 = (1 << 26) - 1;
+    FieldElement::from_limbs([
+        (limbs[0] & LOW_26_BITS) as u32,
+        (limbs[0] >> 26) as u32,
+        (limbs[1] & LOW_26_BITS) as u32,
+        (limbs[1] >> 26) as u32,
+        (limbs[2] & LOW_26_BITS) as u32,
+        (limbs[2] >> 26) as u32,
+        (limbs[3] & LOW_26_BITS) as u32,
+        (limbs[3] >> 26) as u32,
+        (limbs[4] & LOW_26_BITS) as u32,
+        (limbs[4] >> 26) as u32,
+    ])
 }
 
 #[cfg(not(target_pointer_width = "64"))]

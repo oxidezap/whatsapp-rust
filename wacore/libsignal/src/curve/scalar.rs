@@ -27,6 +27,16 @@ impl Scalar {
             bytes: Unpacked::from_bytes_wide(bytes).to_bytes(),
         }
     }
+    pub(super) fn from_signature_bytes(mut bytes: [u8; 32]) -> Option<Self> {
+        bytes[31] &= 127;
+        if bytes[31] & 224 != 0 {
+            return None;
+        }
+        // XEdDSA permits s < 2^253 < 2L, so one conditional subtraction suffices.
+        Some(Self {
+            bytes: Unpacked::sub(&Unpacked::from_bytes(&bytes), &super::constants::L).to_bytes(),
+        })
+    }
     pub(crate) fn as_bytes(&self) -> &[u8; 32] {
         &self.bytes
     }

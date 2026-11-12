@@ -166,7 +166,6 @@ impl Scalar52 {
     }
 
     #[rustfmt::skip] // keep alignment of z[*] calculations
-    #[inline(always)]
     pub(super) fn mul_internal(a: &Scalar52, b: &Scalar52) -> [u128; 9] {
         let mut z = [0u128; 9];
 
@@ -185,7 +184,6 @@ impl Scalar52 {
 
     #[rustfmt::skip] // keep alignment of return calculations
     #[rustfmt::skip] // keep alignment of n* and r* calculations
-    #[inline(always)]
     pub(super) fn montgomery_reduce(limbs: &[u128; 9]) -> Scalar52 {
 
         #[inline(always)]
