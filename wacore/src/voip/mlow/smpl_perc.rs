@@ -648,7 +648,7 @@ pub(crate) fn rfft_forward_ordered_sc(time: &[f32], f: &mut [f32], sc: &mut FftS
     let m = n / 2;
     let sp = sc;
     // z[j] = x[2j] + i*x[2j+1]: even samples into the real part, odd into the imaginary.
-    for (z, pair) in sp.z.iter_mut().zip(time.chunks_exact(2)) {
+    for (z, pair) in sp.z.iter_mut().zip(time.as_chunks::<2>().0.iter()) {
         z.re = pair[0];
         z.im = pair[1];
     }
@@ -722,7 +722,7 @@ pub(crate) fn rfft_backward_ordered_sc(f: &[f32], time: &mut [f32], sc: &mut Fft
     fft_rec(&sp.z, 1, 0, &mut sp.zt, &mut sp.arena, &sp.tw_bwd);
     // The length-m inverse yields m*(x[2j] + i*x[2j+1]); the reference is unnormalized at length
     // n = 2m, so the factor 2 restores its scale.
-    for (pair, z) in time.chunks_exact_mut(2).zip(&sp.zt[..m]) {
+    for (pair, z) in time.as_chunks_mut::<2>().0.iter_mut().zip(&sp.zt[..m]) {
         pair[0] = 2.0 * z.re;
         pair[1] = 2.0 * z.im;
     }

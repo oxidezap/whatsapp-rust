@@ -176,7 +176,7 @@ impl Md5 {
         Self::process_block(&mut self.state, &self.buffer);
 
         let mut out = [0u8; 16];
-        for (chunk, val) in out.chunks_exact_mut(4).zip(self.state) {
+        for (chunk, val) in out.as_chunks_mut::<4>().0.iter_mut().zip(self.state) {
             chunk.copy_from_slice(&val.to_le_bytes());
         }
         out
@@ -184,10 +184,8 @@ impl Md5 {
 
     fn process_block(state: &mut [u32; 4], block: &[u8]) {
         let mut m = [0u32; 16];
-        for (slot, chunk) in m.iter_mut().zip(block.chunks_exact(4)) {
-            if let Ok(b) = <[u8; 4]>::try_from(chunk) {
-                *slot = u32::from_le_bytes(b);
-            }
+        for (slot, chunk) in m.iter_mut().zip(block.as_chunks::<4>().0.iter()) {
+            *slot = u32::from_le_bytes(*chunk);
         }
         let [mut a, mut b, mut c, mut d] = *state;
 

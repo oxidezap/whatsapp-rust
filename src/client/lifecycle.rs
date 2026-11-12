@@ -1687,7 +1687,7 @@ impl Client {
                 if let Some(session) = &self.mobile_session {
                     let attempt = self
                         .mobile_handshake_attempts
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                             current.checked_add(1)
                         })
                         .map_err(|_| {

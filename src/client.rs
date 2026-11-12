@@ -219,7 +219,7 @@ impl SentFrameTap {
     pub(crate) fn acquire(&self) {
         let incremented = self
             .forwarding
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                 count.checked_add(1)
             })
             .is_ok();

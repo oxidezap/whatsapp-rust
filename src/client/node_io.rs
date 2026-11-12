@@ -2909,11 +2909,7 @@ impl Client {
             return true;
         }
 
-        if pair::handle_iq_scoped(self, node, shutdown).await {
-            return true;
-        }
-
-        false
+        pair::handle_iq_scoped(self, node, shutdown).await
     }
 
     pub(crate) fn update_server_time_offset(&self, node: &wacore_binary::NodeRef<'_>) {

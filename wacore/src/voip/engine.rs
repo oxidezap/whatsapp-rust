@@ -888,7 +888,7 @@ fn nacked_video_sequences(feedback: &[RtcpFeedback], video_ssrc: u32) -> Vec<u16
         if item.packet_type != RTCP_PT_RTPFB || item.fmt != 1 || item.media_ssrc != video_ssrc {
             continue;
         }
-        for row in item.fci.chunks_exact(4) {
+        for row in item.fci.as_chunks::<4>().0.iter() {
             let first = u16::from_be_bytes([row[0], row[1]]);
             let following = u16::from_be_bytes([row[2], row[3]]);
             sequences.push(first);
@@ -925,7 +925,9 @@ fn requests_keyframe(feedback: &[RtcpFeedback], video_ssrc: u32) -> bool {
                 item.media_ssrc == video_ssrc
                     || item
                         .fci
-                        .chunks_exact(8)
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
                         .any(|row| row.get(..4) == Some(target.as_slice()))
             }
             _ => false,

@@ -323,7 +323,9 @@ fn envelope(x: &[f32], win: usize) -> Vec<f32> {
 fn speech_energy_contour_tracks_input() {
     let raw = include_bytes!("testdata/synth_mic.raw");
     let pcm: Vec<f32> = raw
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
         .collect();
     let out = round_trip(&pcm);
@@ -835,7 +837,9 @@ fn wasm_derived_frames_decode_to_wasm_reference() {
         serde_json::from_str(include_str!("testdata/wasm_derived_frames.json"))
             .expect("wasm_derived_frames.json");
     let refp: Vec<f32> = include_bytes!("testdata/wasm_derived_ref.raw")
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
         .collect();
     assert_eq!(

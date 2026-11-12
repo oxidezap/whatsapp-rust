@@ -75,11 +75,13 @@ fn perform_pointwise_with_overflow(base: &mut [u8], input: &[u8], subtract: bool
     let (input_words, input_tail) = input.split_at(words * WORD);
 
     for (base_word, input_word) in base_words
-        .chunks_exact_mut(WORD)
-        .zip(input_words.chunks_exact(WORD))
+        .as_chunks_mut::<WORD>()
+        .0
+        .iter_mut()
+        .zip(input_words.as_chunks::<WORD>().0.iter())
     {
-        let x = u64::from_le_bytes(base_word.try_into().expect("word-sized chunk"));
-        let y = u64::from_le_bytes(input_word.try_into().expect("word-sized chunk"));
+        let x = u64::from_le_bytes(*base_word);
+        let y = u64::from_le_bytes(*input_word);
 
         // Add/subtract the low 15 bits of every lane in one word operation,
         // where no carry can escape into the next lane, then restore each
@@ -94,8 +96,10 @@ fn perform_pointwise_with_overflow(base: &mut [u8], input: &[u8], subtract: bool
     }
 
     for (base_pair, input_pair) in base_tail
-        .chunks_exact_mut(2)
-        .zip(input_tail.chunks_exact(2))
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .zip(input_tail.as_chunks::<2>().0.iter())
     {
         let x = u16::from_le_bytes([base_pair[0], base_pair[1]]);
         let y = u16::from_le_bytes([input_pair[0], input_pair[1]]);
