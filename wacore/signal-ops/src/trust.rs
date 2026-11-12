@@ -135,20 +135,25 @@ impl<S: ServiceStore> SignalOps<S> {
         ))
     }
 
-    /// This device's own account key, from its pairing, when `device` belongs
-    /// to this account. Own devices are anchored to it rather than to a pin.
-    async fn own_account(&self, device: &Jid) -> Option<[u8; 32]> {
+    /// Whether `device` is one of this account's devices, by its stored PN
+    /// and LID. Never taken from the client.
+    pub(crate) async fn is_own_account(&self, device: &Jid) -> bool {
         let keys = self.keys().await;
-        let own = [keys.own_pn.as_deref(), keys.own_lid.as_deref()];
         let account = device.to_non_ad();
-        if !own
+        [keys.own_pn.as_deref(), keys.own_lid.as_deref()]
             .into_iter()
             .flatten()
             .filter_map(|jid| jid.parse::<Jid>().ok())
             .any(|jid| jid.to_non_ad() == account)
-        {
+    }
+
+    /// This device's own account key, from its pairing, when `device` belongs
+    /// to this account. Own devices are anchored to it rather than to a pin.
+    async fn own_account(&self, device: &Jid) -> Option<[u8; 32]> {
+        if !self.is_own_account(device).await {
             return None;
         }
+        let keys = self.keys().await;
         let signed =
             waproto::codec::adv_signed_device_identity_decode(keys.account.as_deref()?).ok()?;
         <[u8; 32]>::try_from(signed.account_signature_key?.as_slice()).ok()

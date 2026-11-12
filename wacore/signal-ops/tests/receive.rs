@@ -6,7 +6,7 @@
 
 use futures::executor::block_on;
 use std::sync::Arc;
-use wacore::libsignal::protocol::{DeviceId, ProtocolAddress};
+use wacore::libsignal::protocol::{DeviceId, KeyPair, ProtocolAddress};
 use wacore::messages::MessageUtils;
 use wacore_recordstore::{
     AesGcmSealer, Fence, LeaseStore, MemoryRecordStore, Namespace, RecordSignalStore, RecordStore,
@@ -303,15 +303,57 @@ fn only_own_devices_can_hand_over_app_state_keys() {
         "a peer's key share must not reach the app inside the message"
     );
 
-    let from_self = block_on(alice.ops.encrypt(&bob_addr, &padded(&share))).unwrap();
-    let own = message(
+    // The client claims Alice is one of Bob's own devices: refused, so her
+    // share cannot pass as Bob's own.
+    let claimed = block_on(alice.ops.encrypt(&bob_addr, &padded(&share))).unwrap();
+    assert!(matches!(
         block_on(bob.ops.receive(request(
             &chat,
             &alice_addr,
-            kind(&from_self),
-            &from_self.ciphertext,
+            kind(&claimed),
+            &claimed.ciphertext,
             true,
-        )))
+        ))),
+        Err(wacore_signal_ops::OpsError::InvalidInput(_))
+    ));
+
+    // Bob's own second device, paired under Bob's account, may hand it over.
+    let account = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+    block_on(bob.ops.set_own_jids("222:1@s.whatsapp.net", None)).unwrap();
+    let bob_identity = block_on(common::pair_under(&bob.ops, &account));
+    let second = device("bob-keys-second");
+    block_on(second.ops.set_own_jids("222:2@s.whatsapp.net", None)).unwrap();
+    let second_identity = block_on(common::pair_under(&second.ops, &account));
+    let identity = block_on(bob.ops.public_identity());
+    let prekey = block_on(bob.ops.generate_prekeys(&InlineRuntime, 1))
+        .unwrap()
+        .remove(0);
+    block_on(second.ops.establish_session(
+        &bob_addr,
+        &RemoteBundle {
+            registration_id: identity.registration_id,
+            device_id: 1,
+            identity_key: identity.identity_key,
+            signed_prekey_id: identity.signed_prekey.id,
+            signed_prekey: identity.signed_prekey.public_key,
+            signed_prekey_signature: identity.signed_prekey.signature,
+            prekey: Some((prekey.id, prekey.public_key)),
+            device_identity: Some(bob_identity),
+        },
+    ))
+    .unwrap();
+    let second_addr = ProtocolAddress::new("222@s.whatsapp.net", DeviceId::from(2));
+    let from_self = block_on(second.ops.encrypt(&bob_addr, &padded(&share))).unwrap();
+    let own = message(
+        block_on(bob.ops.receive(ReceiveRequest {
+            chat: &chat,
+            sender: &second_addr,
+            kind: kind(&from_self),
+            ciphertext: &from_self.ciphertext,
+            padding_version: 2,
+            is_from_me: true,
+            device_identity: Some(&second_identity),
+        }))
         .unwrap(),
     );
     assert!(own.app_state_key_share.is_some());

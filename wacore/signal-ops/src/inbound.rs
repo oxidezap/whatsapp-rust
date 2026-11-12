@@ -45,7 +45,9 @@ pub struct ReceiveRequest<'a> {
     pub ciphertext: &'a [u8],
     /// The `<enc v>` padding version.
     pub padding_version: u8,
-    /// The sender is one of this account's own devices.
+    /// The client's claim that the sender is one of this account's devices.
+    /// The service derives this from the sender and the stored own JIDs; a
+    /// claim the sender does not support is refused with `InvalidInput`.
     pub is_from_me: bool,
     /// The stanza's `<device-identity>`, which a prekey message from a
     /// companion device carries. A prekey message whose sender does not
@@ -227,6 +229,17 @@ impl<S: ServiceStore> SignalOps<S> {
                 account_lock(&crate::trust::device_of(request.sender)?.user),
             ],
         };
+        // `is_from_me` gates app-state key shares, so it is derived from the
+        // sender and this account's stored JIDs; a client claim the sender
+        // does not support is refused rather than believed.
+        let from_me = self
+            .is_own_account(&crate::trust::device_of(request.sender)?)
+            .await;
+        if request.is_from_me && !from_me {
+            return Err(OpsError::InvalidInput(
+                "is_from_me is set, but the sender is not one of this account's devices".into(),
+            ));
+        }
         let held = self.lock_keys(keys).await?;
         held.run(async {
             if let Some(bytes) = self
@@ -238,13 +251,9 @@ impl<S: ServiceStore> SignalOps<S> {
                 if entry.state == STATE_DELIVERED {
                     return Ok(Received::AlreadyDelivered { receipt_key });
                 }
-                let content = classify(
-                    &entry.padded_plaintext,
-                    entry.padding_version,
-                    request.is_from_me,
-                )?;
+                let content = classify(&entry.padded_plaintext, entry.padding_version, from_me)?;
                 return Ok(Received::Message(Box::new(ReceivedMessage {
-                    app_state_key_share: key_share(&content, request.is_from_me),
+                    app_state_key_share: key_share(&content, from_me),
                     receipt_key,
                     content,
                     identity_changed: entry.identity_changed,
@@ -285,7 +294,7 @@ impl<S: ServiceStore> SignalOps<S> {
             };
 
             let inserted_ms = now_ms();
-            let content = match classify(&padded, request.padding_version, request.is_from_me) {
+            let content = match classify(&padded, request.padding_version, from_me) {
                 Ok(content) => content,
                 Err(error) => {
                     // The ratchet already advanced; keep that, and record the
@@ -349,7 +358,7 @@ impl<S: ServiceStore> SignalOps<S> {
             staged.commit().await?;
 
             Ok(Received::Message(Box::new(ReceivedMessage {
-                app_state_key_share: key_share(&content, request.is_from_me),
+                app_state_key_share: key_share(&content, from_me),
                 receipt_key,
                 content,
                 identity_changed,
