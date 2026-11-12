@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use wacore::client::context::{GroupRoutingInfo, SendContextResolver, SessionLockGuard};
 use wacore::libsignal::protocol::PreKeyBundle;
-use wacore::prekeys::PreKeyFetchOutcome;
+use wacore::prekeys::{PreKeyFetchOutcome, RejectedDevice};
 use wacore::runtime::{AbortHandle, Runtime};
 use wacore::types::message::AddressingMode;
 use wacore_binary::{CompactString, Jid};
@@ -36,9 +36,14 @@ export interface SendResolver {
   /**
    * Prekey bundles by device JID; omit devices without one. A companion
    * device's bundle must carry the `<device-identity>` the server sent with it
-   * as `deviceIdentity`; a bundle that does not verify is not used.
+   * as `deviceIdentity`; a bundle that does not verify is not used. Resolve
+   * `{ bundles, rejected }` to also name devices the server rejected by code
+   * (406 means unregistered), which a group send reports as stale users.
    */
-  fetchPrekeys(jids: string[]): Promise<Record<string, RemoteBundle>>;
+  fetchPrekeys(jids: string[]): Promise<
+    | Record<string, RemoteBundle>
+    | { bundles: Record<string, RemoteBundle>; rejected?: { jid: string; code: number }[] }
+  >;
   /**
    * Optional. The LID user (no server) that a phone-number user maps to, if
    * known. Lets a send to a phone-number JID reuse a session migrated to the LID.
@@ -160,8 +165,21 @@ impl SignalResolver for JsResolver {
         let object: Object = value
             .dyn_into()
             .map_err(|_| anyhow::anyhow!("fetchPrekeys must resolve to an object"))?;
+        // `{ bundles, rejected }`, or the plain map of bundles by device JID.
+        // No JID is the string "bundles", so the two shapes cannot collide.
+        let wrapped = Reflect::get(&object, &JsValue::from_str("bundles"))
+            .ok()
+            .filter(|value| value.is_object());
+        let (map, rejected) = match wrapped {
+            Some(map) => {
+                let rejected = Reflect::get(&object, &JsValue::from_str("rejected"))
+                    .unwrap_or(JsValue::UNDEFINED);
+                (map.unchecked_into::<Object>(), parse_rejected(&rejected)?)
+            }
+            None => (object, Vec::new()),
+        };
         let mut bundles = HashMap::new();
-        for entry in Object::entries(&object).iter() {
+        for entry in Object::entries(&map).iter() {
             let pair: Array = entry.unchecked_into();
             let jid = parse_jid(&pair.get(0), "fetchPrekeys")?;
             let remote =
@@ -177,11 +195,35 @@ impl SignalResolver for JsResolver {
                 },
             );
         }
-        Ok(VerifiablePrekeys {
-            bundles,
-            rejected: Vec::new(),
-        })
+        Ok(VerifiablePrekeys { bundles, rejected })
     }
+}
+
+fn parse_rejected(value: &JsValue) -> anyhow::Result<Vec<RejectedDevice>> {
+    if value.is_undefined() || value.is_null() {
+        return Ok(Vec::new());
+    }
+    let list: Array = value
+        .clone()
+        .dyn_into()
+        .map_err(|_| anyhow::anyhow!("fetchPrekeys: rejected must be an array"))?;
+    list.iter()
+        .map(|item| {
+            let jid = parse_jid(
+                &Reflect::get(&item, &JsValue::from_str("jid")).unwrap_or(JsValue::UNDEFINED),
+                "fetchPrekeys rejected",
+            )?;
+            let code = Reflect::get(&item, &JsValue::from_str("code"))
+                .ok()
+                .and_then(|code| code.as_f64())
+                .filter(|code| code.fract() == 0.0 && (0.0..=65535.0).contains(code))
+                .ok_or_else(|| anyhow::anyhow!("fetchPrekeys: rejected code must be a number"))?;
+            Ok(RejectedDevice {
+                jid,
+                code: code as u16,
+            })
+        })
+        .collect()
 }
 
 #[async_trait(?Send)]
@@ -216,9 +258,14 @@ impl SendContextResolver for JsResolver {
         &self,
         jids: &[Jid],
     ) -> anyhow::Result<PreKeyFetchOutcome> {
+        let fetched = self.fetch_verifiable_prekeys(jids).await?;
         Ok(PreKeyFetchOutcome {
-            bundles: self.fetch_prekeys(jids).await?,
-            rejected: Vec::new(),
+            bundles: fetched
+                .bundles
+                .into_iter()
+                .map(|(jid, fetched)| (jid, fetched.bundle))
+                .collect(),
+            rejected: fetched.rejected,
         })
     }
 
