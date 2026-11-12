@@ -14,10 +14,13 @@
 //!   authorised it. The adapter applies the batch only while that lease
 //!   generation is still current, in the same transaction. A node that lost
 //!   its lease can never overwrite state written by its successor.
-//! - **Sealing.** Every value is sealed by a [`Sealer`] before it reaches the
-//!   adapter. The authenticated data binds scope, namespace and key, so a
-//!   record cannot be moved to another slot. Record keys (Signal addresses and
-//!   prekey IDs) stay readable so adapters can index and scan them.
+//! - **Sealing.** [`RecordSignalStore`] seals every value with a [`Sealer`]
+//!   before it reaches the adapter. The authenticated data binds scope,
+//!   namespace and key, so a record cannot be moved to another slot. Record
+//!   keys (Signal addresses and prekey IDs) stay readable so adapters can
+//!   index and scan them. [`RecordStore::write`] itself stores bytes as given:
+//!   a caller that bypasses [`RecordSignalStore`] must seal sensitive values
+//!   itself.
 //!
 //! Sealing does not detect rollback: an adapter that serves an older sealed
 //! value for the same slot passes authentication.
