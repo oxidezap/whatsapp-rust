@@ -432,10 +432,16 @@ async fn a_group_send_distributes_the_sender_key_once_then_reuses_it() {
         Some("hello group")
     );
 
-    alice
-        .mark_sender_key_distributed(&group, &first.distribution_targets)
-        .await
-        .unwrap();
+    assert!(
+        alice
+            .mark_sender_key_distributed(
+                &group,
+                &first.distribution_targets,
+                first.distribution_epoch,
+            )
+            .await
+            .unwrap()
+    );
     let second = alice
         .send_group(&TokioRuntime, &client, &group, &text("second"), "G2")
         .await
@@ -475,10 +481,16 @@ async fn a_group_send_distributes_the_sender_key_once_then_reuses_it() {
         .await
         .unwrap();
     assert_eq!(after_retry.distribution_targets, vec![bob_jid.clone()]);
-    alice
-        .mark_sender_key_distributed(&group, &after_retry.distribution_targets)
-        .await
-        .unwrap();
+    assert!(
+        alice
+            .mark_sender_key_distributed(
+                &group,
+                &after_retry.distribution_targets,
+                after_retry.distribution_epoch,
+            )
+            .await
+            .unwrap()
+    );
 
     alice.forget_sender_key_devices(&group).await.unwrap();
     let third = alice
@@ -561,10 +573,16 @@ async fn a_send_waiting_on_devices_cannot_give_a_removed_member_the_replacement_
     receive_group_component(&bob, &group, &alice_jid, skmsg_of(&first.stanza))
         .await
         .unwrap();
-    alice
-        .mark_sender_key_distributed(&group, &first.distribution_targets)
-        .await
-        .unwrap();
+    assert!(
+        alice
+            .mark_sender_key_distributed(
+                &group,
+                &first.distribution_targets,
+                first.distribution_epoch,
+            )
+            .await
+            .unwrap()
+    );
     client
         .pause_devices
         .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1117,4 +1135,74 @@ async fn a_group_send_reuses_an_older_pn_session_when_the_mapped_lid_has_none() 
         received.content.message.conversation.as_deref(),
         Some("after mapping")
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_acknowledgment_from_before_a_rotation_does_not_mark_the_new_key() {
+    use wacore::types::message::AddressingMode;
+
+    let group: Jid = "120363000000003@g.us".parse().unwrap();
+    let alice_jid: Jid = "111:1@s.whatsapp.net".parse().unwrap();
+    let bob_jid: Jid = "222@s.whatsapp.net".parse().unwrap();
+    let alice = device_with_lid(
+        "alice-stale-ack",
+        "111:1@s.whatsapp.net",
+        Some("900111:1@lid"),
+    )
+    .await;
+    let bob = device("bob-stale-ack", "222@s.whatsapp.net").await;
+    let client = FakeClient {
+        devices: vec![alice_jid.clone(), bob_jid.clone()],
+        bundles: HashMap::from([(bob_jid.clone(), bundle_for(&bob).await)]),
+        group: Some(Arc::new(GroupRoutingInfo::new(
+            vec![alice_jid.to_non_ad(), bob_jid.clone()],
+            AddressingMode::Pn,
+        ))),
+    };
+    let send = |text_body: &'static str, id: &'static str| {
+        let (alice, client, group) = (&alice, &client, &group);
+        async move {
+            alice
+                .send_group(&TokioRuntime, client, group, &text(text_body), id)
+                .await
+                .unwrap()
+        }
+    };
+
+    let first = send("before rotation", "S1").await;
+    assert_eq!(first.distribution_targets, vec![bob_jid.clone()]);
+    alice.forget_sender_key_devices(&group).await.unwrap();
+    // The first send with the replacement key is never acknowledged.
+    let lost = send("lost", "S2").await;
+    assert_eq!(lost.distribution_targets, vec![bob_jid.clone()]);
+    assert_ne!(lost.distribution_epoch, first.distribution_epoch);
+
+    // The old send's acknowledgment arrives late and must record nothing.
+    assert!(
+        !alice
+            .mark_sender_key_distributed(
+                &group,
+                &first.distribution_targets,
+                first.distribution_epoch
+            )
+            .await
+            .unwrap()
+    );
+    let next = send("after the late ack", "S3").await;
+    assert_eq!(
+        next.distribution_targets,
+        vec![bob_jid.clone()],
+        "bob never acknowledged the replacement key"
+    );
+    assert!(
+        alice
+            .mark_sender_key_distributed(
+                &group,
+                &next.distribution_targets,
+                next.distribution_epoch
+            )
+            .await
+            .unwrap()
+    );
+    assert!(send("warm", "S4").await.distribution_targets.is_empty());
 }

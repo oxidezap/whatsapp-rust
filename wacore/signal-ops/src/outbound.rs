@@ -105,6 +105,10 @@ pub struct PreparedGroupSend {
     /// Devices this send distributed the sender key to. Once the server acks
     /// the stanza, pass them to [`SignalOps::mark_sender_key_distributed`].
     pub distribution_targets: Vec<Jid>,
+    /// The group's sender-key epoch this send distributed under. Pass it with
+    /// the acknowledgment, so an acknowledgment that arrives after a rotation
+    /// cannot mark devices as holding the replacement key.
+    pub distribution_epoch: u64,
     /// Users whose devices were reported unregistered while fetching bundles;
     /// the client should refresh their device lists.
     pub stale_device_users: Vec<String>,
@@ -161,6 +165,25 @@ async fn encryption_jid(resolver: &dyn SendContextResolver, device: &Jid) -> Jid
 
 fn sender_key_device_key(group: &str, device: &Jid) -> String {
     format!("{group}\u{0}{device}")
+}
+
+/// A group's sender-key epoch. It sits outside the `{group}\0` device
+/// prefix, so clearing the distribution marks on rotation leaves it in place.
+fn distribution_epoch_key(group: &str) -> String {
+    format!("{group}\u{1}epoch")
+}
+
+fn new_epoch() -> [u8; 8] {
+    use rand::Rng;
+    rand::make_rng::<rand::rngs::StdRng>()
+        .next_u64()
+        .to_be_bytes()
+}
+
+fn decode_epoch(bytes: Option<Vec<u8>>) -> u64 {
+    bytes
+        .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_slice()).ok())
+        .map_or(0, u64::from_be_bytes)
 }
 
 impl<S: ServiceStore> SignalOps<S> {
@@ -500,9 +523,19 @@ impl<S: ServiceStore> SignalOps<S> {
 
                     let stanza = wacore_binary::marshal(&prepared.node)
                         .map_err(|e| OpsError::Send(format!("stanza did not marshal: {e}")))?;
+                    // Read under the group lock that rotation also takes.
+                    let distribution_epoch = decode_epoch(
+                        self.store()
+                            .load_aux(
+                                Namespace::SenderKeyDevices,
+                                &distribution_epoch_key(&group_str),
+                            )
+                            .await?,
+                    );
                     Ok(PreparedGroupSend {
                         stanza,
                         distribution_targets: prepared.skdm_devices,
+                        distribution_epoch,
                         stale_device_users: prepared.stale_device_users,
                         phash: prepared.phash.map(|p| p.to_string()),
                     })
@@ -515,15 +548,31 @@ impl<S: ServiceStore> SignalOps<S> {
     /// Record that the server acked a group send whose stanza carried the
     /// sender key to `devices`. This account's own devices are never recorded
     /// (WA Web's `!isMeDevice`), so they get the key on every send.
+    ///
+    /// `distribution_epoch` is the send's [`PreparedGroupSend::distribution_epoch`].
+    /// Returns `false`, recording nothing, when the group's sender key has
+    /// rotated since that send.
     pub async fn mark_sender_key_distributed(
         &self,
         group: &Jid,
         devices: &[Jid],
-    ) -> Result<(), OpsError> {
+        distribution_epoch: u64,
+    ) -> Result<bool, OpsError> {
         let OwnIdentity { pn, lid, .. } = self.own_identity().await?;
         let group_str = group.to_string();
         let held = self.lock_keys(vec![group_key(&group_str)]).await?;
         held.run(async {
+            let current = decode_epoch(
+                self.store()
+                    .load_aux(
+                        Namespace::SenderKeyDevices,
+                        &distribution_epoch_key(&group_str),
+                    )
+                    .await?,
+            );
+            if current != distribution_epoch {
+                return Ok(false);
+            }
             for device in devices {
                 if device.is_same_user_as(&pn)
                     || lid.as_ref().is_some_and(|l| device.is_same_user_as(l))
@@ -538,13 +587,13 @@ impl<S: ServiceStore> SignalOps<S> {
                     )
                     .await?;
             }
-            Ok(())
+            Ok(true)
         })
         .await
     }
 
-    /// Rotate this device's PN and LID sender-key chains and clear distribution
-    /// marks in one fenced batch. Use after membership changes so a removed
+    /// Rotate this device's PN and LID sender-key chains, clear distribution
+    /// marks and start a new distribution epoch in one fenced batch. Use after membership changes so a removed
     /// participant cannot decrypt later messages using the previous chain.
     pub async fn forget_sender_key_devices(&self, group: &Jid) -> Result<(), OpsError> {
         let OwnIdentity { pn, lid, .. } = self.own_identity().await?;
@@ -573,6 +622,13 @@ impl<S: ServiceStore> SignalOps<S> {
             let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
             staged
                 .delete_aux(Namespace::SenderKeyDevices, &refs)
+                .await?;
+            staged
+                .put_aux(
+                    Namespace::SenderKeyDevices,
+                    &distribution_epoch_key(&group_str),
+                    &new_epoch(),
+                )
                 .await?;
             staged.commit().await?;
             Ok(())
@@ -611,6 +667,15 @@ impl<S: ServiceStore> SignalOps<S> {
                     .map(|jid| sender_key_device_key(&group, jid))
                     .collect();
                 let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+                // A new epoch first, so an acknowledgment still in flight from
+                // an earlier send cannot restore the mark deleted here.
+                self.store()
+                    .put_aux(
+                        Namespace::SenderKeyDevices,
+                        &distribution_epoch_key(&group),
+                        &new_epoch(),
+                    )
+                    .await?;
                 self.store()
                     .delete_aux(Namespace::SenderKeyDevices, &refs)
                     .await?;
