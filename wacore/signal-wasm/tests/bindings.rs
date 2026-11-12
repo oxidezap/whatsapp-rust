@@ -2686,6 +2686,73 @@ async fn a_rejected_device_named_by_the_resolver_is_reported_as_a_stale_group_us
 }
 
 #[wasm_bindgen_test]
+async fn releasing_one_device_keeps_the_lease_another_device_of_the_holder_uses() {
+    let h = Harness::new();
+    let first = h
+        .open("bob-shared-release", "tab-a", 0.0, true)
+        .await
+        .ok()
+        .unwrap();
+    let second = h
+        .open("bob-shared-release", "tab-a", 0.0, false)
+        .await
+        .ok()
+        .unwrap();
+    run(first.release()).await;
+    let refused = expect_err(h.open("bob-shared-release", "tab-b", 1.0, false).await);
+    assert_eq!(
+        code_of(&refused).as_deref(),
+        Some("lease_held"),
+        "the second device still uses the lease"
+    );
+    assert_eq!(run(second.renew_lease(2.0, TTL)).await, JsValue::TRUE);
+    // Releasing again changes nothing; the last device's release frees it.
+    run(first.release()).await;
+    run(second.release()).await;
+    let other = h
+        .open("bob-shared-release", "tab-b", 3.0, false)
+        .await
+        .expect("the last release gives the scope up");
+    run(other.release()).await;
+}
+
+#[wasm_bindgen_test]
+async fn dropping_an_old_device_does_not_hide_a_newer_lease_left_for_cleanup() {
+    let h = Harness::new();
+    h.state.read_delay_ms.set(5);
+    let stale = h
+        .open("bob-older-handle", "tab-a", 0.0, true)
+        .await
+        .ok()
+        .unwrap();
+    run(stale.release()).await;
+    // A takes a new generation and fails on the wrong key while B is still
+    // acquiring; the old device is dropped meanwhile; B's acquire fails.
+    h.state.acquire_delays.replace(vec![0, 40]);
+    h.state.acquire_failures.replace(vec![false, true]);
+    let wrong: JsValue = TestSealer::new().into();
+    let dropper = async move {
+        sleep_ms(15).await;
+        drop(stale);
+    };
+    let ((failed, also_failed), ()) = join2(
+        join2(
+            open_with(&h.backend, &wrong, "bob-older-handle", "tab-a", 1.0, false),
+            h.open("bob-older-handle", "tab-a", 1.0, false),
+        ),
+        dropper,
+    )
+    .await;
+    assert!(failed.is_err());
+    assert!(also_failed.is_err());
+    let other = h
+        .open("bob-older-handle", "tab-b", 2.0, false)
+        .await
+        .expect("no device owns the newer lease, so another holder takes it");
+    run(other.release()).await;
+}
+
+#[wasm_bindgen_test]
 async fn the_last_acquiring_open_releases_a_lease_a_failed_open_left_behind() {
     let h = Harness::new();
     h.state.read_delay_ms.set(5);

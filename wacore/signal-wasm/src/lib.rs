@@ -107,13 +107,17 @@ struct Inner {
     lease: RefCell<Lease>,
     store: Arc<Store>,
     /// The lease this device was created on; its open is counted in `records`
-    /// until drop.
+    /// until it is released or dropped.
     tracked: Lease,
+    /// Set by `release`, which already dropped this device's count.
+    released: std::cell::Cell<bool>,
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        self.records.untrack(&self.tracked);
+        if !self.released.get() {
+            self.records.untrack(&self.tracked);
+        }
     }
 }
 
@@ -188,7 +192,7 @@ impl SignalDevice {
         let lease = match acquired {
             Ok(Some(lease)) => lease,
             Ok(None) => {
-                if let Some(orphan) = records.unreserve(&scope, &holder) {
+                for orphan in records.unreserve(&scope, &holder) {
                     let _ = records.release(&orphan).await;
                 }
                 return Err(convert::coded_error(
@@ -197,7 +201,7 @@ impl SignalDevice {
                 ));
             }
             Err(e) => {
-                if let Some(orphan) = records.unreserve(&scope, &holder) {
+                for orphan in records.unreserve(&scope, &holder) {
                     let _ = records.release(&orphan).await;
                 }
                 return Err(ops_error(OpsError::Store(e)));
@@ -233,6 +237,7 @@ impl SignalDevice {
                 ops,
                 records,
                 tracked: lease.clone(),
+                released: std::cell::Cell::new(false),
                 lease: RefCell::new(lease),
                 store,
             }),
@@ -268,16 +273,26 @@ impl SignalDevice {
         })
     }
 
-    /// Give the scope up so another holder can take it at once.
+    /// Give the scope up so another holder can take it at once. When other
+    /// devices opened by the same holder still share this lease, or an open of
+    /// it is still acquiring, the lease stays with them and the last one to
+    /// finish releases it. Calling this again does nothing.
     pub fn release(&self) -> Promise {
         let inner = self.inner.clone();
         promise(async move {
-            let current = inner.lease.borrow().clone();
-            inner
-                .records
-                .release(&current)
-                .await
-                .map_err(|e| ops_error(OpsError::Store(e)))?;
+            if inner.released.replace(true) {
+                return Ok(JsValue::UNDEFINED);
+            }
+            // The count and the decision are one step; the release call is
+            // issued before anything else is awaited.
+            if inner.records.untrack(&inner.tracked) {
+                let current = inner.lease.borrow().clone();
+                inner
+                    .records
+                    .release(&current)
+                    .await
+                    .map_err(|e| ops_error(OpsError::Store(e)))?;
+            }
             Ok(JsValue::UNDEFINED)
         })
     }

@@ -136,9 +136,10 @@ async fn settle(
 struct HolderOpens {
     acquiring: usize,
     live: HashMap<u64, usize>,
-    /// A lease a failed open left for an open still acquiring. Whoever
-    /// finishes last without a handle on it releases it.
-    deferred: Option<Lease>,
+    /// Leases, by generation, that a failed open or a dropped handle left for
+    /// an open still acquiring. The last acquiring open releases those it did
+    /// not take over, so an older generation never hides a newer one.
+    deferred: HashMap<u64, Lease>,
 }
 
 type LiveDevices = Mutex<HashMap<(Arc<str>, Arc<str>), HolderOpens>>;
@@ -187,23 +188,25 @@ impl JsRecords {
         }
     }
 
-    /// Drop a reservation whose acquire returned no lease. Returns a lease
-    /// the caller must now release: one a failed open left for this open,
-    /// when no other open can still take it over.
-    pub fn unreserve(&self, scope: &str, holder: &str) -> Option<Lease> {
-        let mut orphan = None;
+    /// Drop a reservation whose acquire returned no lease. Returns the leases
+    /// the caller must now release: those left for this open, once no other
+    /// open can still take them over and no live handle holds them.
+    pub fn unreserve(&self, scope: &str, holder: &str) -> Vec<Lease> {
+        let mut orphans = Vec::new();
         self.update(scope, holder, |opens| {
             opens.acquiring = opens.acquiring.saturating_sub(1);
-            if opens.acquiring == 0
-                && let Some(lease) = opens.deferred.take()
-            {
-                if opens.live.contains_key(&lease.fence.generation) {
-                    return;
-                }
-                orphan = Some(lease);
+            if opens.acquiring == 0 {
+                let live = &opens.live;
+                orphans.extend(
+                    opens
+                        .deferred
+                        .drain()
+                        .filter(|(generation, _)| !live.contains_key(generation))
+                        .map(|(_, lease)| lease),
+                );
             }
         });
-        orphan
+        orphans
     }
 
     /// Turn a reservation into a handle on `lease`'s generation. Each
@@ -214,8 +217,11 @@ impl JsRecords {
         self.update(&lease.fence.scope, &lease.holder, |opens| {
             opens.acquiring = opens.acquiring.saturating_sub(1);
             *opens.live.entry(lease.fence.generation).or_insert(0) += 1;
+            opens.deferred.remove(&lease.fence.generation);
             if opens.acquiring == 0 {
-                opens.deferred = None;
+                // The store granted a newer generation, so older ones it
+                // still lists were already replaced.
+                opens.deferred.clear();
             }
         });
     }
@@ -242,7 +248,7 @@ impl JsRecords {
                 if opens.acquiring > 0 {
                     // An open still acquiring may be handed this lease; if it
                     // fails instead, it releases it (see `unreserve`).
-                    opens.deferred = Some(lease.clone());
+                    opens.deferred.insert(generation, lease.clone());
                 }
             }
             last = remaining == 0 && opens.acquiring == 0;
@@ -257,7 +263,7 @@ impl JsRecords {
         let key = Self::live_key(scope, holder);
         let opens = live.entry(key.clone()).or_default();
         change(opens);
-        if opens.acquiring == 0 && opens.live.is_empty() && opens.deferred.is_none() {
+        if opens.acquiring == 0 && opens.live.is_empty() && opens.deferred.is_empty() {
             live.remove(&key);
         }
     }
