@@ -1026,6 +1026,8 @@ async fn a_retry_receipt_gets_the_message_re_encrypted() {
 struct SlowClient {
     inner: FakeClient,
     gate: Arc<tokio::sync::Notify>,
+    /// Signalled once a fetch is held at the gate.
+    entered: Arc<tokio::sync::Notify>,
 }
 
 #[async_trait]
@@ -1075,6 +1077,7 @@ async fn a_slow_send_does_not_block_receiving_from_another_peer() {
     let alice_identity = common::vouch(&dave, &alice, "111:1@s.whatsapp.net").await;
 
     let gate = Arc::new(tokio::sync::Notify::new());
+    let entered = Arc::new(tokio::sync::Notify::new());
     let slow = Arc::new(SlowClient {
         inner: FakeClient {
             devices: vec![carol_jid.clone()],
@@ -1083,6 +1086,7 @@ async fn a_slow_send_does_not_block_receiving_from_another_peer() {
             group: None,
         },
         gate: gate.clone(),
+        entered: entered.clone(),
     });
     let send = {
         let dave = dave.clone();
@@ -1093,6 +1097,13 @@ async fn a_slow_send_does_not_block_receiving_from_another_peer() {
                 .await
         })
     };
+
+    // Dave's send is now held inside the fetch, so the receive below only
+    // passes if it really overlaps a blocked send.
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("the send never reached its prekey fetch");
+    assert!(!send.is_finished(), "the send must still be blocked");
 
     // Alice writes to Dave while Dave's send is stuck fetching Carol's keys.
     let to_dave = FakeClient {
@@ -1168,6 +1179,7 @@ async fn a_corrupt_record_is_pruned_instead_of_stopping_the_prune() {
 #[async_trait]
 impl SignalResolver for SlowClient {
     async fn fetch_verifiable_prekeys(&self, jids: &[Jid]) -> anyhow::Result<VerifiablePrekeys> {
+        self.entered.notify_one();
         self.gate.notified().await;
         self.inner.fetch_verifiable_prekeys(jids).await
     }
@@ -1597,4 +1609,87 @@ async fn a_group_retry_is_answered_only_for_members_the_message_went_to() {
         retried.is_ok(),
         "a current recipient is answered: {retried:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retry_whose_route_does_not_match_its_chat_is_refused() {
+    use wacore::types::message::AddressingMode;
+    use wacore_signal_ops::{OpsError, RetryRequest, RetryRoute};
+
+    let bob_jid: Jid = "222:1@s.whatsapp.net".parse().unwrap();
+    let alice = device_with_lid(
+        "alice-route-check",
+        "111:1@s.whatsapp.net",
+        Some("900111:1@lid"),
+    )
+    .await;
+    common::pair(&alice).await;
+    let bob = device("bob-route-check", "222:1@s.whatsapp.net").await;
+    let group: Jid = "120363000000006@g.us".parse().unwrap();
+    let client = FakeClient {
+        devices: vec![bob_jid.clone()],
+        bundles: HashMap::from([(bob_jid.clone(), bundle_for(&bob).await)]),
+        device_identities: HashMap::from([vouch(&alice, &bob, &bob_jid).await]),
+        group: Some(Arc::new(GroupRoutingInfo::new(
+            vec!["111@s.whatsapp.net".parse().unwrap(), bob_jid.to_non_ad()],
+            AddressingMode::Pn,
+        ))),
+    };
+    let to = bob_jid.to_non_ad();
+    alice
+        .send_direct(&TokioRuntime, &client, &to, &text("direct"), "D1")
+        .await
+        .unwrap();
+    alice
+        .send_group(&TokioRuntime, &client, &group, &text("group"), "G1")
+        .await
+        .unwrap();
+
+    let retry = |chat: &Jid, message_id: &'static str, route: RetryRoute| {
+        let (alice, client, bob_jid) = (&alice, &client, &bob_jid);
+        let chat = chat.clone();
+        async move {
+            alice
+                .resend(
+                    client,
+                    RetryRequest {
+                        chat: &chat,
+                        message_id,
+                        requester: bob_jid,
+                        encryption_jid: bob_jid,
+                        route,
+                        retry_count: 1,
+                        bundle: None,
+                    },
+                )
+                .await
+        }
+    };
+    let direct = || RetryRoute::Direct { recipient: None };
+    let in_group = || RetryRoute::Group {
+        addressing_mode: AddressingMode::Pn,
+    };
+
+    // A saved group message cannot be re-sent through the direct route.
+    let result = retry(&group, "G1", direct()).await;
+    assert!(
+        matches!(result, Err(OpsError::InvalidInput(_))),
+        "expected a refused retry, got {result:?}"
+    );
+    // A saved direct message cannot be re-sent through the group route.
+    let result = retry(&to, "D1", in_group()).await;
+    assert!(
+        matches!(result, Err(OpsError::InvalidInput(_))),
+        "expected a refused retry, got {result:?}"
+    );
+    // A broadcast-list route does not fit either chat.
+    let result = retry(&to, "D1", RetryRoute::BroadcastList).await;
+    assert!(
+        matches!(result, Err(OpsError::InvalidInput(_))),
+        "expected a refused retry, got {result:?}"
+    );
+
+    // The matching routes still work.
+    assert!(retry(&to, "D1", direct()).await.is_ok());
+    assert!(retry(&group, "G1", in_group()).await.is_ok());
 }

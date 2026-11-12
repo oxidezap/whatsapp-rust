@@ -122,6 +122,18 @@ impl RecordStore for Records {
                     }
                 )
             });
+        // Mode 7: the acknowledgment commits, but its response is lost.
+        let lose_ack = failure == 7
+            && ops.iter().any(|op| {
+                matches!(
+                    op,
+                    WriteOp::Put {
+                        ns: Namespace::Device,
+                        key,
+                        ..
+                    } if key == "prekey-upload-ack-v1"
+                )
+            });
         let consumed = self.consume.swap(0, Ordering::SeqCst);
         if consumed != 0
             && ops.iter().any(|op| {
@@ -145,7 +157,7 @@ impl RecordStore for Records {
                 .await?;
         }
         self.inner.write(fence, ops).await?;
-        if lose_response {
+        if lose_response || lose_ack {
             return Err(StoreError::Validation("synthetic lost response".into()));
         }
         Ok(())
@@ -1100,5 +1112,56 @@ fn a_lost_prekey_commit_response_cannot_rewind_the_counter() {
             .unwrap();
         f.ops.rotate_signed_prekey().await.unwrap();
         assert_eq!(f.counter().await, committed);
+    });
+}
+
+#[test]
+fn an_acknowledgment_that_committed_but_lost_its_response_replays_after_reopening() {
+    block_on(async {
+        let f = Fixture::new().await;
+        let batch = f
+            .ops
+            .prepare_prekey_upload(&InlineRuntime, 2)
+            .await
+            .unwrap();
+        f.records.fail.store(7, Ordering::SeqCst);
+        assert!(
+            f.ops
+                .acknowledge_prekey_upload(&batch.batch_id, &[1, 2])
+                .await
+                .is_err(),
+            "the caller sees the lost response"
+        );
+        assert_eq!(
+            f.uploaded(1).await,
+            Some(true),
+            "the acknowledgment did commit"
+        );
+        assert_eq!(f.uploaded(2).await, Some(true));
+
+        // The process restarts: only the sealed store remains.
+        let Fixture { store, .. } = f;
+        let reopened = SignalOps::open(store).await.unwrap();
+        reopened
+            .acknowledge_prekey_upload(&batch.batch_id, &[1, 2])
+            .await
+            .expect("the exact acknowledgment replays");
+        let next = reopened
+            .prepare_prekey_upload(&InlineRuntime, 1)
+            .await
+            .unwrap();
+        assert_ne!(next.batch_id, batch.batch_id);
+        reopened
+            .acknowledge_prekey_upload(&batch.batch_id, &[1, 2])
+            .await
+            .expect("a second replay is accepted too");
+        assert_eq!(
+            reopened
+                .prepare_prekey_upload(&InlineRuntime, 1)
+                .await
+                .unwrap(),
+            next,
+            "the replay left the new pending batch unchanged"
+        );
     });
 }
