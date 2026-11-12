@@ -15,6 +15,7 @@ use wacore_recordstore::{
 };
 use wacore_signal_ops::{RemoteBundle, SignalOps};
 
+mod common;
 mod runtime;
 use runtime::InlineRuntime;
 
@@ -138,6 +139,7 @@ async fn cancellation_case(release_before_takeover: bool) {
     )))
     .await
     .unwrap();
+    let device_identity = common::vouch(&alice, &bob, "222@s.whatsapp.net").await;
     let public = bob.public_identity().await;
     let prekey = bob
         .generate_prekeys(&InlineRuntime, 1)
@@ -152,6 +154,7 @@ async fn cancellation_case(release_before_takeover: bool) {
         signed_prekey: public.signed_prekey.public_key,
         signed_prekey_signature: public.signed_prekey.signature,
         prekey: Some((prekey.id, prekey.public_key)),
+        device_identity: Some(device_identity),
     };
     let alice_address = ProtocolAddress::new("111@s.whatsapp.net", DeviceId::from(1));
     let bob_address = ProtocolAddress::new("222@s.whatsapp.net", DeviceId::from(1));

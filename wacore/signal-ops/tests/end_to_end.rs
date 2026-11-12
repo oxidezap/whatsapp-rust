@@ -56,7 +56,15 @@ fn address(user: &str) -> ProtocolAddress {
 }
 
 /// What the WhatsApp client would fetch from the server for `node`.
-fn bundle_for(node: &Node, with_prekey: bool) -> (RemoteBundle, Option<u32>) {
+/// `from` pins the account that signed `node`'s device, as it would after
+/// meeting the peer's primary.
+fn bundle_for(
+    from: &Node,
+    node: &Node,
+    to: &ProtocolAddress,
+    with_prekey: bool,
+) -> (RemoteBundle, Option<u32>) {
+    let device_identity = block_on(common::vouch(&from.ops, &node.ops, to.name()));
     let identity = block_on(node.ops.public_identity());
     let prekey = with_prekey.then(|| {
         let keys = block_on(node.ops.generate_prekeys(&InlineRuntime, 1)).unwrap();
@@ -71,6 +79,7 @@ fn bundle_for(node: &Node, with_prekey: bool) -> (RemoteBundle, Option<u32>) {
             signed_prekey: identity.signed_prekey.public_key,
             signed_prekey_signature: identity.signed_prekey.signature,
             prekey,
+            device_identity: Some(device_identity),
         },
         prekey.map(|(id, _)| id),
     )
@@ -94,7 +103,7 @@ fn a_session_runs_both_ways_and_stays_sealed() {
     let bob = new_device("bob-device");
     let (alice_addr, bob_addr) = (address("111"), address("222"));
 
-    let (bundle, prekey_id) = bundle_for(&bob, true);
+    let (bundle, prekey_id) = bundle_for(&alice, &bob, &bob_addr, true);
     block_on(alice.ops.establish_session(&bob_addr, &bundle)).unwrap();
 
     let first = block_on(alice.ops.encrypt(&bob_addr, b"hello bob")).unwrap();
@@ -145,7 +154,7 @@ fn a_failed_over_node_keeps_the_session_and_the_old_node_is_fenced_out() {
     let alice = new_device("alice-failover");
     let bob = new_device("bob-failover");
     let (alice_addr, bob_addr) = (address("111"), address("222"));
-    let (bundle, _) = bundle_for(&bob, true);
+    let (bundle, _) = bundle_for(&alice, &bob, &bob_addr, true);
     block_on(alice.ops.establish_session(&bob_addr, &bundle)).unwrap();
     let first = block_on(alice.ops.encrypt(&bob_addr, b"before failover")).unwrap();
     block_on(bob.ops.decrypt(&alice_addr, first.kind, &first.ciphertext)).unwrap();
@@ -169,7 +178,7 @@ fn group_messages_decrypt_with_a_distributed_sender_key() {
     let bob = new_device("bob-group");
     let (alice_addr, bob_addr) = (address("111"), address("222"));
     let group = "120363000000001@g.us";
-    let (bundle, _) = bundle_for(&bob, true);
+    let (bundle, _) = bundle_for(&alice, &bob, &bob_addr, true);
     block_on(alice.ops.establish_session(&bob_addr, &bundle)).unwrap();
 
     let skdm = block_on(alice.ops.sender_key_distribution(group, &alice_addr)).unwrap();
@@ -195,7 +204,7 @@ fn a_prekey_message_for_a_rotated_signed_prekey_still_decrypts() {
     let alice = new_device("alice-rotate");
     let bob = new_device("bob-rotate");
     let (alice_addr, bob_addr) = (address("111"), address("222"));
-    let (bundle, _) = bundle_for(&bob, false);
+    let (bundle, _) = bundle_for(&alice, &bob, &bob_addr, false);
     let before = block_on(bob.ops.public_identity()).signed_prekey;
     block_on(alice.ops.establish_session(&bob_addr, &bundle)).unwrap();
 

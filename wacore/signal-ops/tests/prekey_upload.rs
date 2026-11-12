@@ -19,6 +19,7 @@ use wacore_recordstore::{
 };
 use wacore_signal_ops::{DeviceKeys, SignalOps};
 
+mod common;
 mod runtime;
 use runtime::InlineRuntime;
 
@@ -938,6 +939,7 @@ fn actual_signal_consumption_filters_the_recovered_public_batch() {
             .prepare_prekey_upload(&InlineRuntime, 2)
             .await
             .unwrap();
+        let device_identity = common::vouch(&sender.ops, &receiver.ops, "222@s.whatsapp.net").await;
         let identity = receiver.ops.public_identity().await;
         let sender_address = ProtocolAddress::new("111@s.whatsapp.net", DeviceId::from(1));
         let receiver_address = ProtocolAddress::new("222@s.whatsapp.net", DeviceId::from(1));
@@ -953,6 +955,7 @@ fn actual_signal_consumption_filters_the_recovered_public_batch() {
                     signed_prekey: identity.signed_prekey.public_key,
                     signed_prekey_signature: identity.signed_prekey.signature,
                     prekey: Some((batch.pre_keys[0].id, batch.pre_keys[0].public_key)),
+                    device_identity: Some(device_identity),
                 },
             )
             .await

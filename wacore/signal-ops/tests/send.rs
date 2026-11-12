@@ -18,7 +18,10 @@ use wacore::types::jid::JidExt as _;
 use wacore_binary::{Jid, NodeContent};
 use wacore_recordstore::{AesGcmSealer, LeaseStore, MemoryRecordStore, RecordSignalStore};
 mod common;
-use wacore_signal_ops::{ReceiveKind, ReceiveRequest, Received, SignalOps};
+use wacore_signal_ops::{
+    FetchedBundle, ReceiveKind, ReceiveRequest, Received, SignalOps, SignalResolver,
+    VerifiablePrekeys,
+};
 use waproto::whatsapp as wa;
 
 mod runtime;
@@ -77,6 +80,8 @@ struct FakeClient {
     devices: Vec<Jid>,
     bundles: HashMap<Jid, PreKeyBundle>,
     group: Option<Arc<GroupRoutingInfo>>,
+    /// The `<device-identity>` the server sends with each companion's bundle.
+    device_identities: HashMap<Jid, Vec<u8>>,
 }
 
 #[async_trait]
@@ -139,6 +144,46 @@ async fn bundle_for(ops: &SignalOps<Store>) -> PreKeyBundle {
         IdentityKey::new(PublicKey::from_djb_public_key_bytes(&identity.identity_key).unwrap()),
     )
     .unwrap()
+}
+
+/// Pair `peer` under a fresh account and have `sender` pin that account, as it
+/// would after meeting the peer's primary device. Returns the companion's
+/// `<device-identity>` entry for a client's prekey responses.
+async fn vouch(sender: &SignalOps<Store>, peer: &SignalOps<Store>, jid: &Jid) -> (Jid, Vec<u8>) {
+    let paired = common::pair(peer).await;
+    sender
+        .trust_account_identity(jid, paired.account)
+        .await
+        .unwrap();
+    (jid.clone(), paired.device_identity)
+}
+
+/// The bundles `client` holds for `jids`, each with its companion identity.
+fn verifiable(client: &FakeClient, jids: &[Jid]) -> VerifiablePrekeys {
+    VerifiablePrekeys {
+        bundles: jids
+            .iter()
+            .filter_map(|jid| {
+                client.bundles.get(jid).map(|bundle| {
+                    (
+                        jid.clone(),
+                        FetchedBundle {
+                            bundle: bundle.clone(),
+                            device_identity: client.device_identities.get(jid).cloned(),
+                        },
+                    )
+                })
+            })
+            .collect(),
+        rejected: Vec::new(),
+    }
+}
+
+#[async_trait]
+impl SignalResolver for FakeClient {
+    async fn fetch_verifiable_prekeys(&self, jids: &[Jid]) -> anyhow::Result<VerifiablePrekeys> {
+        Ok(verifiable(self, jids))
+    }
 }
 
 struct ChangingGroupClient {
@@ -228,6 +273,13 @@ impl SendContextResolver for ChangingGroupClient {
     }
 }
 
+#[async_trait]
+impl SignalResolver for ChangingGroupClient {
+    async fn fetch_verifiable_prekeys(&self, jids: &[Jid]) -> anyhow::Result<VerifiablePrekeys> {
+        Ok(verifiable(&self.current.read().unwrap(), jids))
+    }
+}
+
 async fn receive_group_component(
     ops: &SignalOps<Store>,
     group: &Jid,
@@ -303,6 +355,7 @@ async fn a_stanza_built_by_the_service_decrypts_at_the_recipient() {
     let client = FakeClient {
         devices: vec![bob_jid.clone()],
         bundles: HashMap::from([(bob_jid.clone(), bundle_for(&bob).await)]),
+        device_identities: HashMap::from([vouch(&alice, &bob, &bob_jid).await]),
         group: None,
     };
     let to = bob_jid.to_non_ad();
@@ -367,6 +420,7 @@ async fn an_unpaired_device_refuses_to_send() {
     let client = FakeClient {
         devices: Vec::new(),
         bundles: HashMap::new(),
+        device_identities: HashMap::new(),
         group: None,
     };
     let to: Jid = "222@s.whatsapp.net".parse().unwrap();
@@ -395,6 +449,7 @@ async fn a_group_send_distributes_the_sender_key_once_then_reuses_it() {
     let client = FakeClient {
         devices: vec![alice_jid.clone(), bob_jid.clone()],
         bundles: HashMap::from([(bob_jid.clone(), bundle_for(&bob).await)]),
+        device_identities: HashMap::new(),
         group: Some(Arc::new(GroupRoutingInfo::new(
             vec![alice_jid.to_non_ad(), bob_jid.clone()],
             AddressingMode::Pn,
@@ -557,6 +612,7 @@ async fn a_send_waiting_on_devices_cannot_give_a_removed_member_the_replacement_
                 (bob_jid.clone(), bundle_for(&bob).await),
                 (carol_jid.clone(), bundle_for(&carol).await),
             ]),
+            device_identities: HashMap::new(),
             group: Some(Arc::new(GroupRoutingInfo::new(
                 vec![alice_jid.to_non_ad(), bob_jid.clone(), carol_jid.clone()],
                 AddressingMode::Pn,
@@ -693,6 +749,7 @@ async fn group_encryption_keeps_the_address_selected_before_session_locking() {
         FakeClient {
             devices: vec![alice_jid.clone(), bob_jid.clone()],
             bundles: HashMap::from([(bob_jid.clone(), bundle_for(&bob).await)]),
+            device_identities: HashMap::new(),
             group: Some(Arc::new(GroupRoutingInfo::new(
                 vec![alice_jid.to_non_ad(), bob_jid.clone()],
                 AddressingMode::Pn,
@@ -747,7 +804,10 @@ fn first_enc(stanza: &[u8]) -> (String, u8, Vec<u8>) {
     enc_parts(find(&parse(stanza)).expect("enc"))
 }
 
-fn remote_bundle_from(bundle: &PreKeyBundle) -> wacore_signal_ops::RemoteBundle {
+fn remote_bundle_from(
+    bundle: &PreKeyBundle,
+    device_identity: Option<Vec<u8>>,
+) -> wacore_signal_ops::RemoteBundle {
     let key = |k: &PublicKey| -> [u8; 32] { *k.public_key_bytes() };
     wacore_signal_ops::RemoteBundle {
         registration_id: bundle.registration_id().unwrap(),
@@ -764,6 +824,7 @@ fn remote_bundle_from(bundle: &PreKeyBundle) -> wacore_signal_ops::RemoteBundle 
             .pre_key_id()
             .unwrap()
             .map(|id| (id.into(), key(bundle.pre_key_public().unwrap().unwrap()))),
+        device_identity,
     }
 }
 
@@ -807,9 +868,15 @@ async fn a_retry_receipt_gets_the_message_re_encrypted() {
     // A retry pkmsg must carry the device identity, which pairing provides.
     common::pair(&alice).await;
     let bob = device("bob-retry", "222:1@s.whatsapp.net").await;
+    let bob_paired = common::pair(&bob).await;
+    alice
+        .trust_account_identity(&bob_jid, bob_paired.account)
+        .await
+        .unwrap();
     let client = FakeClient {
         devices: vec![bob_jid.clone()],
         bundles: HashMap::from([(bob_jid.clone(), bundle_for(&bob).await)]),
+        device_identities: HashMap::from([(bob_jid.clone(), bob_paired.device_identity.clone())]),
         group: None,
     };
     let to = bob_jid.to_non_ad();
@@ -854,7 +921,9 @@ async fn a_retry_receipt_gets_the_message_re_encrypted() {
 
     // Bob's device was reset: new keys arrive with the next retry receipt.
     let fresh_bob = device("bob-retry-fresh", "222:1@s.whatsapp.net").await;
-    let fresh_bundle = remote_bundle_from(&bundle_for(&fresh_bob).await);
+    // A reset device is re-paired by the same primary, under the same account.
+    let fresh_identity = common::pair_under(&fresh_bob, &bob_paired.account_keys).await;
+    let fresh_bundle = remote_bundle_from(&bundle_for(&fresh_bob).await, Some(fresh_identity));
     let retried = alice
         .resend(
             &client,
@@ -948,6 +1017,7 @@ async fn a_slow_send_does_not_block_receiving_from_another_peer() {
         inner: FakeClient {
             devices: vec![carol_jid.clone()],
             bundles: HashMap::from([(carol_jid.clone(), bundle_for(&carol).await)]),
+            device_identities: HashMap::from([vouch(&dave, &carol, &carol_jid).await]),
             group: None,
         },
         gate: gate.clone(),
@@ -966,6 +1036,7 @@ async fn a_slow_send_does_not_block_receiving_from_another_peer() {
     let to_dave = FakeClient {
         devices: vec![dave_jid.clone()],
         bundles: HashMap::from([(dave_jid.clone(), bundle_for(&dave).await)]),
+        device_identities: HashMap::from([vouch(&alice, &dave, &dave_jid).await]),
         group: None,
     };
     let sent = alice
@@ -1032,6 +1103,14 @@ async fn a_corrupt_record_is_pruned_instead_of_stopping_the_prune() {
     );
 }
 
+#[async_trait]
+impl SignalResolver for SlowClient {
+    async fn fetch_verifiable_prekeys(&self, jids: &[Jid]) -> anyhow::Result<VerifiablePrekeys> {
+        self.gate.notified().await;
+        self.inner.fetch_verifiable_prekeys(jids).await
+    }
+}
+
 /// Maps phone user `222` to LID `900222` and holds no prekey bundles, so a
 /// send can only reach that user through a session that already exists.
 struct MappedClient {
@@ -1068,6 +1147,13 @@ impl SendContextResolver for MappedClient {
     }
 }
 
+#[async_trait]
+impl SignalResolver for MappedClient {
+    async fn fetch_verifiable_prekeys(&self, jids: &[Jid]) -> anyhow::Result<VerifiablePrekeys> {
+        self.inner.fetch_verifiable_prekeys(jids).await
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_group_send_reuses_an_older_pn_session_when_the_mapped_lid_has_none() {
     use wacore::types::message::AddressingMode;
@@ -1086,6 +1172,7 @@ async fn a_group_send_reuses_an_older_pn_session_when_the_mapped_lid_has_none() 
     let dm_client = FakeClient {
         devices: vec![bob_jid.clone()],
         bundles: HashMap::from([(bob_jid.clone(), bundle_for(&bob).await)]),
+        device_identities: HashMap::new(),
         group: None,
     };
     let dm = alice
@@ -1116,6 +1203,7 @@ async fn a_group_send_reuses_an_older_pn_session_when_the_mapped_lid_has_none() 
         inner: FakeClient {
             devices: vec![alice_jid.clone(), bob_jid.clone()],
             bundles: HashMap::new(),
+            device_identities: HashMap::new(),
             group: Some(Arc::new(GroupRoutingInfo::new(
                 vec![alice_jid.to_non_ad(), bob_jid.clone()],
                 AddressingMode::Pn,
@@ -1161,6 +1249,7 @@ async fn an_acknowledgment_from_before_a_rotation_does_not_mark_the_new_key() {
     let client = FakeClient {
         devices: vec![alice_jid.clone(), bob_jid.clone()],
         bundles: HashMap::from([(bob_jid.clone(), bundle_for(&bob).await)]),
+        device_identities: HashMap::new(),
         group: Some(Arc::new(GroupRoutingInfo::new(
             vec![alice_jid.to_non_ad(), bob_jid.clone()],
             AddressingMode::Pn,
@@ -1230,11 +1319,12 @@ async fn a_retry_for_a_device_outside_the_conversation_is_refused() {
     common::pair(&alice).await;
     let bob = device("bob-retry-check", "222:1@s.whatsapp.net").await;
     let eve = device("eve-retry-check", "333:1@s.whatsapp.net").await;
-    let eve_bundle = remote_bundle_from(&bundle_for(&eve).await);
+    let eve_bundle = remote_bundle_from(&bundle_for(&eve).await, None);
     let group: Jid = "120363000000004@g.us".parse().unwrap();
     let client = FakeClient {
         devices: vec![bob_jid.clone()],
         bundles: HashMap::from([(bob_jid.clone(), bundle_for(&bob).await)]),
+        device_identities: HashMap::from([vouch(&alice, &bob, &bob_jid).await]),
         group: Some(Arc::new(GroupRoutingInfo::new(
             vec!["111@s.whatsapp.net".parse().unwrap(), bob_jid.to_non_ad()],
             AddressingMode::Pn,
@@ -1319,7 +1409,14 @@ async fn a_retry_for_a_device_outside_the_conversation_is_refused() {
 
     // Bob asking from his LID is the same account as the PN chat.
     let bob_lid: Jid = "900222:1@lid".parse().unwrap();
-    let bob_lid_bundle = remote_bundle_from(&bundle_for(&bob).await);
+    // The LID form of the same account carries Bob's own device identity.
+    let bob_paired = common::pair(&bob).await;
+    alice
+        .trust_account_identity(&bob_lid, bob_paired.account)
+        .await
+        .unwrap();
+    let bob_lid_bundle =
+        remote_bundle_from(&bundle_for(&bob).await, Some(bob_paired.device_identity));
     let mapped = MappedClient { inner: client };
     let retried = alice
         .resend(
@@ -1358,9 +1455,14 @@ async fn a_group_retry_is_answered_only_for_members_the_message_went_to() {
     let carol = device("carol-audience", "444:1@s.whatsapp.net").await;
     let eve = device("eve-audience", "333:1@s.whatsapp.net").await;
     let group: Jid = "120363000000005@g.us".parse().unwrap();
+    let identities = HashMap::from([
+        vouch(&alice, &bob, &bob_jid).await,
+        vouch(&alice, &carol, &carol_jid).await,
+    ]);
     let client_for = |members: Vec<Jid>, bundles: HashMap<Jid, PreKeyBundle>| FakeClient {
         devices: vec![bob_jid.clone(), carol_jid.clone()],
         bundles,
+        device_identities: identities.clone(),
         group: Some(Arc::new(GroupRoutingInfo::new(members, AddressingMode::Pn))),
     };
     let bundles = HashMap::from([
@@ -1402,8 +1504,8 @@ async fn a_group_retry_is_answered_only_for_members_the_message_went_to() {
             bundle,
         }
     }
-    let eve_bundle = remote_bundle_from(&bundle_for(&eve).await);
-    let bob_bundle = remote_bundle_from(&bundle_for(&bob).await);
+    let eve_bundle = remote_bundle_from(&bundle_for(&eve).await, None);
+    let bob_bundle = remote_bundle_from(&bundle_for(&bob).await, None);
     assert!(
         matches!(
             alice

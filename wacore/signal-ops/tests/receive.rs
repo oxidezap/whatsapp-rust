@@ -17,6 +17,7 @@ use wacore_signal_ops::{
 };
 use waproto::whatsapp as wa;
 
+mod common;
 mod runtime;
 use runtime::InlineRuntime;
 
@@ -57,6 +58,7 @@ fn address(user: &str) -> ProtocolAddress {
 }
 
 fn connect(from: &Device, to: &Device, to_addr: &ProtocolAddress) {
+    let device_identity = block_on(common::vouch(&from.ops, &to.ops, to_addr.name()));
     let identity = block_on(to.ops.public_identity());
     let prekey = block_on(to.ops.generate_prekeys(&InlineRuntime, 1))
         .unwrap()
@@ -71,6 +73,7 @@ fn connect(from: &Device, to: &Device, to_addr: &ProtocolAddress) {
             signed_prekey: identity.signed_prekey.public_key,
             signed_prekey_signature: identity.signed_prekey.signature,
             prekey: Some((prekey.id, prekey.public_key)),
+            device_identity: Some(device_identity),
         },
     ))
     .unwrap();
@@ -407,6 +410,7 @@ fn a_storage_failure_installing_a_sender_key_is_retried_on_redelivery() {
     .unwrap();
     let (alice_addr, bob_addr) = (address("111"), address("222"));
 
+    let device_identity = block_on(common::vouch(&alice.ops, &bob, bob_addr.name()));
     let identity = block_on(bob.public_identity());
     let prekey = block_on(bob.generate_prekeys(&InlineRuntime, 1))
         .unwrap()
@@ -421,6 +425,7 @@ fn a_storage_failure_installing_a_sender_key_is_retried_on_redelivery() {
             signed_prekey: identity.signed_prekey.public_key,
             signed_prekey_signature: identity.signed_prekey.signature,
             prekey: Some((prekey.id, prekey.public_key)),
+            device_identity: Some(device_identity),
         },
     ))
     .unwrap();
