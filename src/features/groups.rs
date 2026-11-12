@@ -211,7 +211,7 @@ fn group_history_bundle_message(
 ) -> wa::Message {
     {
         let mut proto_ = wa::Message::default();
-        proto_.message_history_bundle = buffa::MessageField::some({
+        proto_.message_history_bundle = waproto::protobuf::MessageField::some({
             let mut proto_ = wa::message::MessageHistoryBundle::default();
             proto_.mimetype = Some("application/protobuf".into());
             proto_.file_sha256 = Some(upload.file_sha256.to_vec());
@@ -219,7 +219,8 @@ fn group_history_bundle_message(
             proto_.file_enc_sha256 = Some(upload.file_enc_sha256.to_vec());
             proto_.direct_path = Some(upload.direct_path.clone());
             proto_.media_key_timestamp = Some(upload.media_key_timestamp);
-            proto_.message_history_metadata = buffa::MessageField::some(metadata.clone());
+            proto_.message_history_metadata =
+                waproto::protobuf::MessageField::some(metadata.clone());
             proto_
         });
         proto_
@@ -2181,10 +2182,10 @@ impl<'a> Groups<'a> {
         };
         let notice_message = Arc::new({
             let mut proto = wa::Message::default();
-            proto.message_history_notice = buffa::MessageField::some({
+            proto.message_history_notice = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::MessageHistoryNotice::default();
                 proto.message_history_metadata =
-                    buffa::MessageField::some(history_metadata.clone());
+                    waproto::protobuf::MessageField::some(history_metadata.clone());
                 proto
             });
             proto
@@ -3446,13 +3447,13 @@ mod tests {
 
         let source = {
             let mut proto = wa::WebMessageInfo::default();
-            proto.key = buffa::MessageField::some({
+            proto.key = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageKey::default();
                 proto.remote_jid = Some("120363000000000001@g.us".into());
                 proto.id = Some("SYNTHETIC-HISTORY-ID".into());
                 proto
             });
-            proto.message = buffa::MessageField::some({
+            proto.message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::Message::default();
                 proto.conversation = Some("synthetic history payload".into());
                 proto

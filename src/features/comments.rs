@@ -74,7 +74,7 @@ impl<'a> Comments<'a> {
         // WA Web encryptExtendedTextComment: the body is an extendedTextMessage.
         let body = {
             let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
+            proto.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some(text.to_string());
                 proto
@@ -127,14 +127,14 @@ impl<'a> Comments<'a> {
 
         let message = {
             let mut proto = wa::Message::default();
-            proto.enc_comment_message = buffa::MessageField::some({
+            proto.enc_comment_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::EncCommentMessage::default();
-                proto.target_message_key = buffa::MessageField::some(parent_key);
+                proto.target_message_key = waproto::protobuf::MessageField::some(parent_key);
                 proto.enc_payload = Some(enc_payload);
                 proto.enc_iv = Some(iv.to_vec());
                 proto
             });
-            proto.message_context_info = buffa::MessageField::some({
+            proto.message_context_info = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageContextInfo::default();
                 proto.message_secret = Some(comment_secret.to_vec());
                 proto

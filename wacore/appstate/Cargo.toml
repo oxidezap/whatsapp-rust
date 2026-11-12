@@ -13,7 +13,6 @@ crate-type = ["rlib"]
 
 [dependencies]
 anyhow = { workspace = true }
-buffa = { workspace = true }
 hex = { workspace = true }
 hkdf = { workspace = true }
 hmac = { workspace = true }

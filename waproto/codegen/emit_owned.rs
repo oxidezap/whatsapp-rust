@@ -487,8 +487,10 @@ impl Emitter<'_> {
     }
     fn message_source(&self, message: &Message) -> String {
         let name = ident(&message.name);
+        let pinned_clone = message.full_name == ".whatsapp.Message";
+        let clone = if pinned_clone { "" } else { "Clone," };
         let mut out = format!(
-            "#[derive(Clone,Debug,PartialEq,::serde::Serialize)] #[cfg_attr(feature=\"serde-deserialize\",derive(::serde::Deserialize),serde(default))] #[non_exhaustive] pub struct {name}{{\n"
+            "#[derive({clone}Debug,PartialEq,::serde::Serialize)] #[cfg_attr(feature=\"serde-deserialize\",derive(::serde::Deserialize),serde(default))] #[non_exhaustive] pub struct {name}{{\n"
         );
         for id in &message.fields {
             let field = self.schema.field(*id);
@@ -535,6 +537,25 @@ impl Emitter<'_> {
             ));
         }
         out.push_str("}\n");
+        if pinned_clone {
+            out.push_str(&format!("impl ::core::clone::Clone for {name}{{#[inline(never)]fn clone(&self)->Self{{Self{{"));
+            for id in &message.fields {
+                let field = self.schema.field(*id);
+                if !matches!(field.shape, FieldShape::Oneof { .. }) {
+                    let slot = member(&field.name);
+                    out.push_str(&format!(
+                        "{slot}: ::core::clone::Clone::clone(&self.{slot}),"
+                    ));
+                }
+            }
+            for id in &message.oneofs {
+                let slot = member(&self.schema.oneof(*id).name);
+                out.push_str(&format!(
+                    "{slot}: ::core::clone::Clone::clone(&self.{slot}),"
+                ));
+            }
+            out.push_str("}}}\n");
+        }
         let mut initial = String::new();
         for id in &message.fields {
             let field = self.schema.field(*id);
@@ -1542,7 +1563,7 @@ pub fn generate_oracle(schema: &Schema) -> Result<String, syn::Error> {
     };
     let old = Emitter {
         schema,
-        base: "waproto::whatsapp",
+        base: "waproto::reference",
     };
     let mut source = String::new();
     for (index, message) in schema.messages.iter().enumerate() {
@@ -1637,7 +1658,7 @@ fn generate_view_oracle(schema: &Schema) -> String {
     };
     let old = Emitter {
         schema,
-        base: "waproto::whatsapp",
+        base: "waproto::reference",
     };
     let mut out = String::new();
     let value_assert = |value, a: &str, b: &str| {

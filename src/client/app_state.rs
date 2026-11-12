@@ -2839,10 +2839,10 @@ impl Client {
             .collect();
         let msg = {
             let mut proto_ = wa::Message::default();
-            proto_.protocol_message = buffa::MessageField::some({
+            proto_.protocol_message = waproto::protobuf::MessageField::some({
                 let mut proto_ = wa::message::ProtocolMessage::default();
                 proto_.r#type = Some(wa::message::protocol_message::Type::AppStateSyncKeyRequest);
-                proto_.app_state_sync_key_request = buffa::MessageField::some({
+                proto_.app_state_sync_key_request = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::AppStateSyncKeyRequest::default();
                     proto.key_ids = key_ids;
                     proto
@@ -4685,7 +4685,7 @@ mod tests {
         recovery.collection_name = Some(collection.to_string());
         let mut synced = wa::SyncdVersion::default();
         synced.version = Some(version);
-        recovery.version = buffa::MessageField::some(synced);
+        recovery.version = waproto::protobuf::MessageField::some(synced);
         recovery.collection_lthash = Some(vec![0x5A; 128]);
         recovery
     }
@@ -5267,7 +5267,7 @@ mod tests {
         };
         let archived = scalar(&["archive", "120363000000000042@g.us"], {
             let mut proto = wa::SyncActionValue::default();
-            proto.archive_chat_action = buffa::MessageField::some({
+            proto.archive_chat_action = waproto::protobuf::MessageField::some({
                 let mut proto = wa::sync_action_value::ArchiveChatAction::default();
                 proto.archived = Some(true);
                 proto
@@ -5281,7 +5281,7 @@ mod tests {
 
         let muted = scalar(&["mute", "5511999990042@s.whatsapp.net"], {
             let mut proto = wa::SyncActionValue::default();
-            proto.mute_action = buffa::MessageField::some({
+            proto.mute_action = waproto::protobuf::MessageField::some({
                 let mut proto = wa::sync_action_value::MuteAction::default();
                 proto.muted = Some(true);
                 proto.mute_end_timestamp = Some(1_789_834_000_000);
@@ -5313,7 +5313,7 @@ mod tests {
         // redacted target and the event name but no PII.
         let contact = scalar(&["contact", "5511999990042@s.whatsapp.net"], {
             let mut proto = wa::SyncActionValue::default();
-            proto.contact_action = buffa::MessageField::some({
+            proto.contact_action = waproto::protobuf::MessageField::some({
                 let mut proto = wa::sync_action_value::ContactAction::default();
                 proto.full_name = Some("Alex Doe".to_string());
                 proto.first_name = Some("Alex".to_string());
@@ -5358,14 +5358,16 @@ mod tests {
         };
         let delete_chat = || {
             let mut proto = wa::SyncActionValue::default();
-            proto.delete_chat_action =
-                buffa::MessageField::some(wa::sync_action_value::DeleteChatAction::default());
+            proto.delete_chat_action = waproto::protobuf::MessageField::some(
+                wa::sync_action_value::DeleteChatAction::default(),
+            );
             proto
         };
         let clear_chat = || {
             let mut proto = wa::SyncActionValue::default();
-            proto.clear_chat_action =
-                buffa::MessageField::some(wa::sync_action_value::ClearChatAction::default());
+            proto.clear_chat_action = waproto::protobuf::MessageField::some(
+                wa::sync_action_value::ClearChatAction::default(),
+            );
             proto
         };
         assert_eq!(
@@ -5424,7 +5426,7 @@ mod tests {
             operation: wa::syncd_mutation::SyncdOperation::SET,
             action_value: Some({
                 let mut proto = wa::SyncActionValue::default();
-                proto.favorites_action = buffa::MessageField::some({
+                proto.favorites_action = waproto::protobuf::MessageField::some({
                     let mut proto = wa::sync_action_value::FavoritesAction::default();
                     proto.favorites = ids
                         .iter()
@@ -5469,7 +5471,7 @@ mod tests {
             operation: wa::syncd_mutation::SyncdOperation::SET,
             action_value: Some({
                 let mut proto = wa::SyncActionValue::default();
-                proto.delete_message_for_me_action = buffa::MessageField::some({
+                proto.delete_message_for_me_action = waproto::protobuf::MessageField::some({
                     let mut proto = wa::sync_action_value::DeleteMessageForMeAction::default();
                     proto.delete_media = delete_media;
                     proto
@@ -9541,7 +9543,7 @@ mod critical_bootstrap_tests {
                 operation: wa::syncd_mutation::SyncdOperation::Set,
                 action_value: Some({
                     let mut proto = wa::SyncActionValue::default();
-                    proto.status_privacy = buffa::MessageField::some(action);
+                    proto.status_privacy = waproto::protobuf::MessageField::some(action);
                     proto.timestamp = Some(1_700_000_000_000);
                     proto
                 }),
@@ -9675,7 +9677,7 @@ mod critical_bootstrap_tests {
             operation: wa::syncd_mutation::SyncdOperation::SET,
             action_value: Some({
                 let mut proto = wa::SyncActionValue::default();
-                proto.archive_chat_action = buffa::MessageField::some({
+                proto.archive_chat_action = waproto::protobuf::MessageField::some({
                     let mut proto = wa::sync_action_value::ArchiveChatAction::default();
                     proto.archived = Some(true);
                     proto

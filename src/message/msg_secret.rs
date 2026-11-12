@@ -374,7 +374,7 @@ impl Client {
             && let Some(rm) = inner.reaction_message.as_option_mut()
             && rm.key.is_unset()
         {
-            rm.key = buffa::MessageField::some(env.target_message_key.clone());
+            rm.key = waproto::protobuf::MessageField::some(env.target_message_key.clone());
         }
 
         // A comment's own messageSecret rides the OUTER envelope (WA Web puts

@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use buffa::MessageView as _;
 use bytes::Bytes;
-use waproto::whatsapp::{MessageOwnedView, MessageView};
+use waproto::reference::{MessageOwnedView, MessageView};
 
 struct OffsetOwner {
     bytes: Bytes,

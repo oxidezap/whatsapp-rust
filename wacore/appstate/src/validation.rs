@@ -382,7 +382,7 @@ impl<'a> Transforms<'a> for NativeTransforms {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
-    use buffa::Message;
+    use waproto::protobuf::Message;
     fn make<T: Default>(set: impl FnOnce(&mut T)) -> T {
         let mut value = T::default();
         set(&mut value);

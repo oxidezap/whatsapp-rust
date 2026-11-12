@@ -1,5 +1,7 @@
 #![deny(unsafe_code)]
 
+pub use bytes;
+
 mod decode;
 pub mod encoding;
 mod enumeration;
@@ -36,6 +38,7 @@ pub use view::{
     unused_qualifications,
     unused_imports,
     clippy::derivable_impls,
+    clippy::disallowed_methods,
     clippy::let_and_return
 )]
 pub mod generated {

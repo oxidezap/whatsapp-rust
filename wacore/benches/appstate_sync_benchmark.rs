@@ -22,19 +22,19 @@ fn setup_mutations(n: usize) -> Vec<wa::SyncdMutation> {
             {
                 let mut proto = wa::SyncdMutation::default();
                 proto.operation = Some(wa::syncd_mutation::SyncdOperation::Set.into());
-                proto.record = buffa::MessageField::some({
+                proto.record = waproto::protobuf::MessageField::some({
                     let mut proto = wa::SyncdRecord::default();
-                    proto.index = buffa::MessageField::some({
+                    proto.index = waproto::protobuf::MessageField::some({
                         let mut proto = wa::SyncdIndex::default();
                         proto.blob = Some(index_mac);
                         proto
                     });
-                    proto.value = buffa::MessageField::some({
+                    proto.value = waproto::protobuf::MessageField::some({
                         let mut proto = wa::SyncdValue::default();
                         proto.blob = Some(vec![0x5A; 48]);
                         proto
                     });
-                    proto.key_id = buffa::MessageField::some({
+                    proto.key_id = waproto::protobuf::MessageField::some({
                         let mut proto = wa::KeyId::default();
                         proto.id = Some(b"AAAA".to_vec());
                         proto

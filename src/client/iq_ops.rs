@@ -234,12 +234,12 @@ fn build_ephemeral_setting_message(duration: u32, now_secs: i64) -> waproto::wha
     use waproto::whatsapp as wa;
     {
         let mut proto_ = wa::Message::default();
-        proto_.protocol_message = buffa::MessageField::some({
+        proto_.protocol_message = waproto::protobuf::MessageField::some({
             let mut proto_ = wa::message::ProtocolMessage::default();
             proto_.r#type = Some(wa::message::protocol_message::Type::EphemeralSetting);
             proto_.ephemeral_expiration = Some(duration);
             proto_.ephemeral_setting_timestamp = Some(now_secs);
-            proto_.disappearing_mode = buffa::MessageField::some({
+            proto_.disappearing_mode = waproto::protobuf::MessageField::some({
                 let mut proto = wa::DisappearingMode::default();
                 proto.initiator = Some(wa::disappearing_mode::Initiator::ChangedInChat);
                 proto.trigger = Some(wa::disappearing_mode::Trigger::Unknown);

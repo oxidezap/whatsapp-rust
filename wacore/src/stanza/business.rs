@@ -401,8 +401,8 @@ impl BusinessNotification {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
-    use buffa::Message as _;
     use wacore_binary::builder::NodeBuilder;
+    use waproto::protobuf::Message as _;
 
     #[test]
     fn test_parse_remove_jid_notification() {

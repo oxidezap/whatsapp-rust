@@ -520,7 +520,7 @@ mod tests {
 
     #[test]
     fn test_process_decrypted_plaintext_simple() {
-        use buffa::Message as ProtoMessage;
+        use waproto::protobuf::Message as ProtoMessage;
 
         // Create a simple text message
         let msg = {
@@ -541,12 +541,12 @@ mod tests {
 
     #[test]
     fn test_process_decrypted_plaintext_with_skdm() {
-        use buffa::Message as ProtoMessage;
+        use waproto::protobuf::Message as ProtoMessage;
 
         let msg = {
             let mut proto = wa::Message::default();
             proto.conversation = Some("hello".to_string());
-            proto.sender_key_distribution_message = buffa::MessageField::some({
+            proto.sender_key_distribution_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::SenderKeyDistributionMessage::default();
                 proto.group_id = Some("group@g.us".to_string());
                 proto.axolotl_sender_key_distribution_message = Some(vec![1, 2, 3]);
@@ -564,11 +564,11 @@ mod tests {
 
     #[test]
     fn test_process_decrypted_plaintext_skdm_only() {
-        use buffa::Message as ProtoMessage;
+        use waproto::protobuf::Message as ProtoMessage;
 
         let msg = {
             let mut proto = wa::Message::default();
-            proto.sender_key_distribution_message = buffa::MessageField::some({
+            proto.sender_key_distribution_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::SenderKeyDistributionMessage::default();
                 proto.group_id = Some("group@g.us".to_string());
                 proto.axolotl_sender_key_distribution_message = Some(vec![1, 2, 3]);
@@ -586,13 +586,13 @@ mod tests {
 
     #[test]
     fn test_process_decrypted_plaintext_invalid_dsm() {
-        use buffa::Message as ProtoMessage;
+        use waproto::protobuf::Message as ProtoMessage;
 
         let msg = {
             let mut proto = wa::Message::default();
-            proto.device_sent_message = buffa::MessageField::some({
+            proto.device_sent_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::DeviceSentMessage::default();
-                proto.message = buffa::MessageField::some({
+                proto.message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::Message::default();
                     proto.conversation = Some("inner".to_string());
                     proto
@@ -613,13 +613,13 @@ mod tests {
 
     #[test]
     fn test_process_decrypted_plaintext_valid_dsm() {
-        use buffa::Message as ProtoMessage;
+        use waproto::protobuf::Message as ProtoMessage;
 
         let msg = {
             let mut proto = wa::Message::default();
-            proto.device_sent_message = buffa::MessageField::some({
+            proto.device_sent_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::DeviceSentMessage::default();
-                proto.message = buffa::MessageField::some({
+                proto.message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::Message::default();
                     proto.conversation = Some("self-sent".to_string());
                     proto

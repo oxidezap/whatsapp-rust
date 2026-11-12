@@ -8,7 +8,7 @@ use std::time::Instant;
 use waproto::experiment as candidate;
 
 #[cfg(feature = "protobuf-experiment-oracle")]
-use waproto::buffa::{Message as _, MessageView as _};
+use waproto::reference_runtime::{Message as _, MessageView as _};
 
 #[allow(clippy::disallowed_methods)]
 fn measure(name: &str, iterations: u64, mut run: impl FnMut()) {
@@ -122,8 +122,8 @@ fn main() {
         "message-key",
         MessageKey,
         MessageKeyView,
-        waproto::whatsapp::MessageKey,
-        waproto::whatsapp::MessageKeyView,
+        waproto::reference::MessageKey,
+        waproto::reference::MessageKeyView,
         b"\x0a\x1412345@s.whatsapp.net\x10\x01\x1a\x09synthetic".to_vec(),
         id
     );
@@ -131,8 +131,8 @@ fn main() {
         "signal-key",
         SessionStructureChainMessageKey,
         SessionStructureChainMessageKeyView,
-        waproto::whatsapp::session_structure::chain::MessageKey,
-        waproto::whatsapp::session_structure::chain::MessageKeyView,
+        waproto::reference::session_structure::chain::MessageKey,
+        waproto::reference::session_structure::chain::MessageKeyView,
         {
             let mut input = vec![8, 127];
             for (tag, len) in [(18, 32), (26, 32), (34, 16)] {
@@ -149,8 +149,8 @@ fn main() {
         "appstate-small",
         SyncdValue,
         SyncdValueView,
-        waproto::whatsapp::SyncdValue,
-        waproto::whatsapp::SyncdValueView,
+        waproto::reference::SyncdValue,
+        waproto::reference::SyncdValueView,
         {
             let mut input = vec![10, 32];
             input.extend_from_slice(&[0x42; 32]);
@@ -162,8 +162,8 @@ fn main() {
         "appstate-large",
         SyncdValue,
         SyncdValueView,
-        waproto::whatsapp::SyncdValue,
-        waproto::whatsapp::SyncdValueView,
+        waproto::reference::SyncdValue,
+        waproto::reference::SyncdValueView,
         {
             let mut input = vec![10, 128, 128, 4];
             input.resize(65540, 0x42);

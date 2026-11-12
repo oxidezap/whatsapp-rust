@@ -20,13 +20,13 @@
 // Tests/benches exercise the raw buffa API.
 #![allow(clippy::disallowed_methods)]
 
-use buffa::Message;
 use bytes::Bytes;
 use divan::black_box;
 use divan::counter::BytesCount;
 use flate2::{Compression, write::ZlibEncoder};
 use std::io::Write;
 use std::sync::OnceLock;
+use waproto::protobuf::Message;
 use waproto::whatsapp as wa;
 
 /// 1:1 chats, split between PN- and LID-addressed threads.
@@ -92,10 +92,10 @@ fn build_message_body(seed: u64, variant: usize) -> wa::Message {
         // Extended text with context info.
         1 => {
             let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
+            proto.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some(pseudo_text(seed, 64));
-                proto.context_info = buffa::MessageField::some({
+                proto.context_info = waproto::protobuf::MessageField::some({
                     let mut proto = wa::ContextInfo::default();
                     proto.is_forwarded = Some(false);
                     proto.forwarding_score = Some(0);
@@ -104,7 +104,7 @@ fn build_message_body(seed: u64, variant: usize) -> wa::Message {
                 });
                 proto
             });
-            proto.message_context_info = buffa::MessageField::some({
+            proto.message_context_info = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageContextInfo::default();
                 proto.message_secret = Some(vec![(seed & 0xff) as u8; 32]);
                 proto
@@ -115,13 +115,13 @@ fn build_message_body(seed: u64, variant: usize) -> wa::Message {
         // retention policy differently from the text arms.
         2 => {
             let mut proto = wa::Message::default();
-            proto.poll_creation_message = buffa::MessageField::some({
+            proto.poll_creation_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::PollCreationMessage::default();
                 proto.name = Some(pseudo_text(seed, 24));
                 proto.selectable_options_count = Some(1);
                 proto
             });
-            proto.message_context_info = buffa::MessageField::some({
+            proto.message_context_info = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageContextInfo::default();
                 proto.message_secret = Some(vec![(seed & 0xff) as u8; 32]);
                 proto
@@ -132,15 +132,15 @@ fn build_message_body(seed: u64, variant: usize) -> wa::Message {
         // reads, and the one class every retention policy keeps.
         3 => {
             let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
+            proto.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some(pseudo_text(seed, 48));
                 proto
             });
-            proto.message_context_info = buffa::MessageField::some({
+            proto.message_context_info = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageContextInfo::default();
                 proto.message_secret = Some(vec![(seed & 0xff) as u8; 32]);
-                proto.bot_metadata = buffa::MessageField::some({
+                proto.bot_metadata = waproto::protobuf::MessageField::some({
                     let mut proto = wa::BotMetadata::default();
                     proto.persona_id = Some("persona".to_string());
                     proto
@@ -153,10 +153,10 @@ fn build_message_body(seed: u64, variant: usize) -> wa::Message {
         // walk that proves the message is forwarded.
         _ => {
             let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
+            proto.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some(pseudo_text(seed, 90));
-                proto.context_info = buffa::MessageField::some({
+                proto.context_info = waproto::protobuf::MessageField::some({
                     let mut proto = wa::ContextInfo::default();
                     proto.is_forwarded = Some(true);
                     proto.forwarding_score = Some(3);
@@ -164,7 +164,7 @@ fn build_message_body(seed: u64, variant: usize) -> wa::Message {
                 });
                 proto
             });
-            proto.message_context_info = buffa::MessageField::some({
+            proto.message_context_info = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageContextInfo::default();
                 proto.message_secret = Some(vec![(seed & 0xff) as u8; 32]);
                 proto
@@ -184,9 +184,9 @@ fn build_history_msg(
     let seed = (convo * 4099 + index * 31) as u64;
     {
         let mut proto = wa::HistorySyncMsg::default();
-        proto.message = buffa::MessageField::some({
+        proto.message = waproto::protobuf::MessageField::some({
             let mut proto = wa::WebMessageInfo::default();
-            proto.key = buffa::MessageField::some({
+            proto.key = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageKey::default();
                 proto.remote_jid = Some(chat.to_string());
                 proto.from_me = Some(from_me);
@@ -194,7 +194,8 @@ fn build_history_msg(
                 proto.participant = participant.map(str::to_string);
                 proto
             });
-            proto.message = buffa::MessageField::some(build_message_body(seed, index % 5));
+            proto.message =
+                waproto::protobuf::MessageField::some(build_message_body(seed, index % 5));
             proto.message_timestamp =
                 Some(1_700_000_000 + (convo * MESSAGES_PER_CONVERSATION + index) as u64);
             proto

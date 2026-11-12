@@ -604,8 +604,8 @@ mod tests {
     // Primary-side fixture messages have decode-only production codecs.
     #[allow(clippy::disallowed_methods)]
     fn signed_pair_success(client: &Client) -> Node {
-        use buffa::Message;
         use hmac::{KeyInit, Mac};
+        use waproto::protobuf::Message;
         use waproto::whatsapp as wa;
         let device = client.persistence_manager.get_device_snapshot();
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();

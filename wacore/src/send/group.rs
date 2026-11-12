@@ -766,10 +766,10 @@ pub async fn create_sender_key_distribution_message_for_group(
 pub fn build_member_label_message(label: String, ts_secs: i64) -> wa::Message {
     {
         let mut proto_ = wa::Message::default();
-        proto_.protocol_message = buffa::MessageField::some({
+        proto_.protocol_message = waproto::protobuf::MessageField::some({
             let mut proto_ = wa::message::ProtocolMessage::default();
             proto_.r#type = Some(wa::message::protocol_message::Type::GroupMemberLabelChange);
-            proto_.member_label = buffa::MessageField::some({
+            proto_.member_label = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MemberLabel::default();
                 proto.label = Some(label);
                 proto.label_timestamp = Some(ts_secs);

@@ -345,7 +345,7 @@ fn history_sync_on_demand_message(
         let mut proto = wa::message::PeerDataOperationRequestMessage::default();
         proto.peer_data_operation_request_type =
             Some(wa::message::PeerDataOperationRequestType::HISTORY_SYNC_ON_DEMAND);
-        proto.history_sync_on_demand_request = buffa::MessageField::some({
+        proto.history_sync_on_demand_request = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::peer_data_operation_request_message::HistorySyncOnDemandRequest::default();
             proto.chat_jid = Some(chat_jid.to_string());
             proto.oldest_msg_id = Some(oldest_msg_id.to_string());
@@ -359,9 +359,10 @@ fn history_sync_on_demand_message(
     let mut protocol_message = wa::message::ProtocolMessage::default();
     protocol_message.r#type =
         Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_MESSAGE);
-    protocol_message.peer_data_operation_request_message = buffa::MessageField::some(pdo_request);
+    protocol_message.peer_data_operation_request_message =
+        waproto::protobuf::MessageField::some(pdo_request);
     let mut message = wa::Message::default();
-    message.protocol_message = buffa::MessageField::some(protocol_message);
+    message.protocol_message = waproto::protobuf::MessageField::some(protocol_message);
     message
 }
 
@@ -688,7 +689,7 @@ impl Client {
                 Some(wa::message::PeerDataOperationRequestType::PLACEHOLDER_MESSAGE_RESEND);
             proto.placeholder_message_resend_request = vec![{
                 let mut proto = wa::message::peer_data_operation_request_message::PlaceholderMessageResendRequest::default();
-                proto.message_key = buffa::MessageField::some(message_key);
+                proto.message_key = waproto::protobuf::MessageField::some(message_key);
                 proto
             }];
             proto
@@ -699,13 +700,14 @@ impl Client {
             let mut proto_ = wa::message::ProtocolMessage::default();
             proto_.r#type =
                 Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_MESSAGE);
-            proto_.peer_data_operation_request_message = buffa::MessageField::some(pdo_request);
+            proto_.peer_data_operation_request_message =
+                waproto::protobuf::MessageField::some(pdo_request);
             proto_
         };
 
         let msg = {
             let mut proto_ = wa::Message::default();
-            proto_.protocol_message = buffa::MessageField::some(protocol_message);
+            proto_.protocol_message = waproto::protobuf::MessageField::some(protocol_message);
             proto_
         };
 
@@ -920,12 +922,14 @@ impl Client {
             proto.peer_data_operation_request_type = Some(
                 wa::message::PeerDataOperationRequestType::COMPANION_SYNCD_SNAPSHOT_FATAL_RECOVERY,
             );
-            proto.syncd_collection_fatal_recovery_request = buffa::MessageField::some({
-                let mut proto = wa::message::peer_data_operation_request_message::SyncDCollectionFatalRecoveryRequest::default();
-                proto.collection_name = Some(collection.to_string());
-                proto.timestamp = Some(self.runtime.wall_time_secs());
-                proto
-            });
+            proto.syncd_collection_fatal_recovery_request = waproto::protobuf::MessageField::some(
+                {
+                    let mut proto = wa::message::peer_data_operation_request_message::SyncDCollectionFatalRecoveryRequest::default();
+                    proto.collection_name = Some(collection.to_string());
+                    proto.timestamp = Some(self.runtime.wall_time_secs());
+                    proto
+                },
+            );
             proto
         };
 
@@ -933,13 +937,14 @@ impl Client {
             let mut proto_ = wa::message::ProtocolMessage::default();
             proto_.r#type =
                 Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_MESSAGE);
-            proto_.peer_data_operation_request_message = buffa::MessageField::some(pdo_request);
+            proto_.peer_data_operation_request_message =
+                waproto::protobuf::MessageField::some(pdo_request);
             proto_
         };
 
         let msg = Box::new({
             let mut proto_ = wa::Message::default();
-            proto_.protocol_message = buffa::MessageField::some(protocol_message);
+            proto_.protocol_message = waproto::protobuf::MessageField::some(protocol_message);
             proto_
         });
 
@@ -2059,7 +2064,7 @@ mod tests {
         use waproto::whatsapp as wa;
         {
             let mut proto = wa::WebMessageInfo::default();
-            proto.key = buffa::MessageField::some({
+            proto.key = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageKey::default();
                 proto.remote_jid = Some(remote_jid.into());
                 proto.from_me = Some(from_me);
@@ -2078,9 +2083,9 @@ mod tests {
         participant: Option<&str>,
     ) -> waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse
     {
-        use buffa::Message as _;
+        use waproto::protobuf::Message as _;
         let mut web_msg = make_web_msg(remote_jid, from_me, id, participant);
-        web_msg.message = buffa::MessageField::some({
+        web_msg.message = waproto::protobuf::MessageField::some({
             let mut proto_ = waproto::whatsapp::Message::default();
             proto_.conversation = Some("recovered by the phone".to_owned());
             proto_
@@ -2151,7 +2156,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconstruct_from_web_message_info_view() {
-        use buffa::Message as _;
+        use waproto::protobuf::Message as _;
         use waproto::whatsapp as wa;
 
         let client = setup_reconstruct_client().await;
@@ -2427,9 +2432,9 @@ mod tests {
     /// placeholder this change set out to fix.
     #[tokio::test]
     async fn a_response_does_not_adopt_another_senders_pending_entry() {
-        use buffa::Message as _;
         use wacore::types::events::ChannelEventHandler;
         use wacore::types::message::ChatMessageId;
+        use waproto::protobuf::Message as _;
 
         let client = setup_reconstruct_client().await;
         set_own_pn(&client).await;
@@ -2458,7 +2463,7 @@ mod tests {
 
         let web_msg = {
             let mut proto_ = waproto::whatsapp::WebMessageInfo::default();
-            proto_.key = buffa::MessageField::some({
+            proto_.key = waproto::protobuf::MessageField::some({
                 let mut proto_ = waproto::whatsapp::MessageKey::default();
                 proto_.remote_jid = Some(chat.to_owned());
                 proto_.from_me = Some(false);
@@ -2466,7 +2471,7 @@ mod tests {
                 proto_.participant = Some("111222333444555@lid".to_owned());
                 proto_
             });
-            proto_.message = buffa::MessageField::some({
+            proto_.message = waproto::protobuf::MessageField::some({
                 let mut proto_ = waproto::whatsapp::Message::default();
                 proto_.conversation = Some("recovered by the phone".to_owned());
                 proto_
@@ -2513,9 +2518,9 @@ mod tests {
     /// the sender alias and the stanza metadata the original delivery carried.
     #[tokio::test]
     async fn a_pn_response_matches_the_lid_sender_it_was_requested_for() {
-        use buffa::Message as _;
         use wacore::types::events::ChannelEventHandler;
         use wacore::types::message::ChatMessageId;
+        use waproto::protobuf::Message as _;
 
         let client = setup_reconstruct_client().await;
         set_own_pn(&client).await;
@@ -2548,7 +2553,7 @@ mod tests {
 
         let web_msg = {
             let mut proto_ = waproto::whatsapp::WebMessageInfo::default();
-            proto_.key = buffa::MessageField::some({
+            proto_.key = waproto::protobuf::MessageField::some({
                 let mut proto_ = waproto::whatsapp::MessageKey::default();
                 proto_.remote_jid = Some(chat.to_owned());
                 proto_.from_me = Some(false);
@@ -2557,7 +2562,7 @@ mod tests {
                 proto_.participant = Some("15550001234@s.whatsapp.net".to_owned());
                 proto_
             });
-            proto_.message = buffa::MessageField::some({
+            proto_.message = waproto::protobuf::MessageField::some({
                 let mut proto_ = waproto::whatsapp::Message::default();
                 proto_.conversation = Some("recovered by the phone".to_owned());
                 proto_
@@ -2895,9 +2900,9 @@ mod tests {
     /// the participant — so direction is the only thing left to agree on.
     #[tokio::test]
     async fn a_participant_less_response_checks_the_direction() {
-        use buffa::Message as _;
         use wacore::types::events::ChannelEventHandler;
         use wacore::types::message::{ChatMessageId, MessageInfo, MessageSource};
+        use waproto::protobuf::Message as _;
 
         let client = setup_reconstruct_client().await;
         set_own_pn(&client).await;
@@ -2937,7 +2942,7 @@ mod tests {
         // The response answers the incoming one, and omits the participant too.
         let web_msg = {
             let mut proto_ = waproto::whatsapp::WebMessageInfo::default();
-            proto_.key = buffa::MessageField::some({
+            proto_.key = waproto::protobuf::MessageField::some({
                 let mut proto_ = waproto::whatsapp::MessageKey::default();
                 proto_.remote_jid = Some(peer.to_owned());
                 proto_.from_me = Some(false);
@@ -2945,7 +2950,7 @@ mod tests {
                 proto_.participant = None;
                 proto_
             });
-            proto_.message = buffa::MessageField::some({
+            proto_.message = waproto::protobuf::MessageField::some({
                 let mut proto_ = waproto::whatsapp::Message::default();
                 proto_.conversation = Some("recovered by the phone".to_owned());
                 proto_
@@ -3258,14 +3263,14 @@ mod tests {
             chat: &str,
             mark: u8,
         ) -> RecoveryResponse {
-            use buffa::Message as _;
+            use waproto::protobuf::Message as _;
             let mut record = wa::SyncdPlainTextRecord::default();
-            record.value = buffa::MessageField::some({
+            record.value = waproto::protobuf::MessageField::some({
                 let mut data = wa::SyncActionData::default();
                 data.index = Some(format!(r#"["mute","{chat}"]"#).into_bytes());
-                data.value = buffa::MessageField::some({
+                data.value = waproto::protobuf::MessageField::some({
                     let mut value = wa::SyncActionValue::default();
-                    value.mute_action = buffa::MessageField::some({
+                    value.mute_action = waproto::protobuf::MessageField::some({
                         let mut mute = wa::sync_action_value::MuteAction::default();
                         mute.muted = Some(true);
                         mute
@@ -3278,7 +3283,7 @@ mod tests {
             record.mac = Some(vec![mark; 32]);
             let mut recovery = wa::SyncdSnapshotRecovery::default();
             recovery.collection_name = Some(collection.to_string());
-            recovery.version = buffa::MessageField::some({
+            recovery.version = waproto::protobuf::MessageField::some({
                 let mut v = wa::SyncdVersion::default();
                 v.version = Some(version);
                 v
@@ -4092,8 +4097,8 @@ mod tests {
 
         #[tokio::test]
         async fn reviewed_obsolete_manual_replies_never_publish_old_content() {
-            use buffa::Message as _;
             use wacore::types::events::ChannelEventHandler;
+            use waproto::protobuf::Message as _;
             let (client, _, info) = manual_retry_client().await;
             let key = ChatMessageId::new(info.source.chat.clone(), info.id.clone());
             let mut alias_info = (*info).clone();
@@ -4291,7 +4296,7 @@ mod tests {
 
         #[tokio::test]
         async fn manual_pdo_can_ask_again_after_a_contentless_response() {
-            use buffa::Message as _;
+            use waproto::protobuf::Message as _;
             let (client, transport, info) = manual_retry_client().await;
             let first = client
                 .retry_pdo_placeholder_resend_request(&info)
@@ -4515,9 +4520,9 @@ mod tests {
 
         #[tokio::test]
         async fn cancelled_pdo_ownership_preserves_automatic_recovery_and_allows_retry() {
-            use buffa::Message as _;
             use std::time::Duration;
             use wacore::types::{events::ChannelEventHandler, message::SenderMessageId};
+            use waproto::protobuf::Message as _;
             for after_publication in [false, true] {
                 let (client, transport, info) = manual_retry_client().await;
                 let key = ChatMessageId::new(info.source.chat.clone(), info.id.clone());
@@ -4733,8 +4738,8 @@ mod tests {
 
         #[tokio::test]
         async fn a_late_pdo_reply_preserves_the_new_attempt_until_its_matching_reply() {
-            use buffa::Message as _;
             use wacore::types::events::ChannelEventHandler;
+            use waproto::protobuf::Message as _;
             let (client, transport, info) = manual_retry_client().await;
             let key = ChatMessageId::new(info.source.chat.clone(), info.id.clone());
             let first = client
@@ -4801,9 +4806,9 @@ mod tests {
 
         #[tokio::test]
         async fn active_automatic_pdo_rejects_mismatched_ids_and_accepts_matching_or_legacy_ids() {
-            use buffa::Message as _;
             use wacore::types::events::ChannelEventHandler;
             use wacore::types::message::AddressingMode;
+            use waproto::protobuf::Message as _;
             for legacy_id in [false, true] {
                 let (client, transport, info) = manual_retry_client().await;
                 let key = ChatMessageId::new(info.source.chat.clone(), info.id.clone());
@@ -5106,8 +5111,8 @@ mod tests {
     /// re-asking on the next redelivery cannot produce content either.
     #[tokio::test]
     async fn pdo_missing_content_response_clears_pending_but_keeps_memo() {
-        use buffa::Message as _;
         use wacore::types::message::ChatMessageId;
+        use waproto::protobuf::Message as _;
 
         let client = setup_reconstruct_client().await;
         let chat = "5511999998888@s.whatsapp.net";
@@ -5159,7 +5164,7 @@ mod tests {
 
         let web_msg = {
             let mut proto_ = waproto::whatsapp::WebMessageInfo::default();
-            proto_.key = buffa::MessageField::some({
+            proto_.key = waproto::protobuf::MessageField::some({
                 let mut proto_ = waproto::whatsapp::MessageKey::default();
                 proto_.remote_jid = Some(chat.to_owned());
                 proto_.from_me = Some(false);
@@ -5301,13 +5306,13 @@ mod inflate_gzip_tests {
         recovery.collection_name = Some("regular_low".to_string());
         let mut version = super::wa::SyncdVersion::default();
         version.version = Some(7);
-        recovery.version = buffa::MessageField::some(version);
+        recovery.version = waproto::protobuf::MessageField::some(version);
         recovery
     }
 
     #[test]
     fn decodes_compressed_recovery_as_gzip_and_zlib() {
-        use buffa::Message;
+        use waproto::protobuf::Message;
         let expected = recovery();
         let raw = expected.encode_to_vec();
         let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
@@ -5325,7 +5330,7 @@ mod inflate_gzip_tests {
 
     #[test]
     fn decoder_rejects_incomplete_or_appended_recoveries() {
-        use buffa::Message;
+        use waproto::protobuf::Message;
         let raw = recovery().encode_to_vec();
         let payload = gzip(&raw);
         assert!(super::decode_snapshot_recovery(&payload[..payload.len() - 4], true).is_err());

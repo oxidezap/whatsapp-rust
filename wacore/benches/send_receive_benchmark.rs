@@ -4,8 +4,8 @@
 #![allow(clippy::disallowed_methods)]
 
 use async_trait::async_trait;
-use buffa::Message as ProtoMessage;
 use std::collections::HashMap;
+use waproto::protobuf::Message as ProtoMessage;
 
 /// SipHash with fixed keys: the default RandomState seeds per process, so
 /// bucket layout (and thus cache behavior) differed between benchmark runs.

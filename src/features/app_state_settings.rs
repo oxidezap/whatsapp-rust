@@ -128,12 +128,13 @@ impl<'a> AppStateSettings<'a> {
         debug!("Setting disableLinkPreviews -> {disabled}");
         let value = {
             let mut proto = wa::SyncActionValue::default();
-            proto.privacy_setting_disable_link_previews_action = buffa::MessageField::some({
-                let mut proto =
-                    wa::sync_action_value::PrivacySettingDisableLinkPreviewsAction::default();
-                proto.is_previews_disabled = Some(disabled);
-                proto
-            });
+            proto.privacy_setting_disable_link_previews_action =
+                waproto::protobuf::MessageField::some({
+                    let mut proto =
+                        wa::sync_action_value::PrivacySettingDisableLinkPreviewsAction::default();
+                    proto.is_previews_disabled = Some(disabled);
+                    proto
+                });
             proto.timestamp = Some(self.client.runtime.wall_time_millis());
             proto
         };
@@ -252,12 +253,14 @@ mod tests {
         for disabled in [true, false] {
             let m = set_mutation({
                 let mut proto = wa::SyncActionValue::default();
-                proto.privacy_setting_disable_link_previews_action = buffa::MessageField::some({
-                    let mut proto =
-                        wa::sync_action_value::PrivacySettingDisableLinkPreviewsAction::default();
-                    proto.is_previews_disabled = Some(disabled);
-                    proto
-                });
+                proto.privacy_setting_disable_link_previews_action =
+                    waproto::protobuf::MessageField::some({
+                        let mut proto =
+                            wa::sync_action_value::PrivacySettingDisableLinkPreviewsAction::default(
+                            );
+                        proto.is_previews_disabled = Some(disabled);
+                        proto
+                    });
                 proto.timestamp = Some(1000);
                 proto
             });
@@ -280,12 +283,13 @@ mod tests {
         // event with a made-up default would be worse than none.
         let m = set_mutation({
             let mut proto = wa::SyncActionValue::default();
-            proto.privacy_setting_disable_link_previews_action = buffa::MessageField::some({
-                let mut proto =
-                    wa::sync_action_value::PrivacySettingDisableLinkPreviewsAction::default();
-                proto.is_previews_disabled = None;
-                proto
-            });
+            proto.privacy_setting_disable_link_previews_action =
+                waproto::protobuf::MessageField::some({
+                    let mut proto =
+                        wa::sync_action_value::PrivacySettingDisableLinkPreviewsAction::default();
+                    proto.is_previews_disabled = None;
+                    proto
+                });
             proto
         });
         let (outcome, events) = run(&m);
@@ -299,7 +303,7 @@ mod tests {
             operation: wa::syncd_mutation::SyncdOperation::Set,
             action_value: Some({
                 let mut proto = wa::SyncActionValue::default();
-                proto.unarchive_chats_setting = buffa::MessageField::some({
+                proto.unarchive_chats_setting = waproto::protobuf::MessageField::some({
                     let mut proto = wa::sync_action_value::UnarchiveChatsSetting::default();
                     proto.unarchive_chats = unarchive_chats;
                     proto

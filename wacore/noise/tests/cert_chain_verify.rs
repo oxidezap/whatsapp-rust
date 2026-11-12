@@ -6,7 +6,7 @@
 
 #![allow(clippy::disallowed_methods)]
 
-use buffa::Message;
+use waproto::protobuf::Message;
 use waproto::whatsapp::{self as wa, cert_chain::noise_certificate};
 
 use wacore_noise::HandshakeUtils;
@@ -43,13 +43,13 @@ fn build_chain_with_issuer_serial(server_static_pub: &[u8; 32], issuer_serial: u
 
     let chain = {
         let mut proto = wa::CertChain::default();
-        proto.leaf = buffa::MessageField::some({
+        proto.leaf = waproto::protobuf::MessageField::some({
             let mut proto = wa::cert_chain::NoiseCertificate::default();
             proto.details = Some(leaf_details_bytes);
             proto.signature = Some(vec![0u8; 64]);
             proto
         });
-        proto.intermediate = buffa::MessageField::some({
+        proto.intermediate = waproto::protobuf::MessageField::some({
             let mut proto = wa::cert_chain::NoiseCertificate::default();
             proto.details = Some(intermediate_details_bytes);
             proto.signature = Some(vec![0u8; 64]);

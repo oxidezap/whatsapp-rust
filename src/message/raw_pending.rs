@@ -800,8 +800,8 @@ mod tests {
             let mut text = waproto::whatsapp::message::ExtendedTextMessage::default();
             let mut context = waproto::whatsapp::ContextInfo::default();
             context.mentioned_jid = vec![String::new(); 8192];
-            text.context_info = buffa::MessageField::some(context);
-            message.extended_text_message = buffa::MessageField::some(text);
+            text.context_info = waproto::protobuf::MessageField::some(context);
+            message.extended_text_message = waproto::protobuf::MessageField::some(text);
             let graph = current_heap_sample();
             let projection: Bytes = waproto::codec::message_to_vec(&message).into();
             let mut journal = PendingJournal::default();

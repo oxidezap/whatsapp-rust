@@ -1866,7 +1866,6 @@ name = "wacore-appstate"
 version = "0.7.0"
 dependencies = [
  "anyhow",
- "buffa",
  "hex",
  "hkdf",
  "hmac",
@@ -1918,7 +1917,6 @@ dependencies = [
  "arrayvec",
  "async-lock",
  "async-trait",
- "buffa",
  "bytes",
  "cbc",
  "chrono",
@@ -1946,7 +1944,6 @@ name = "wacore-noise"
 version = "0.7.0"
 dependencies = [
  "anyhow",
- "buffa",
  "bytes",
  "hkdf",
  "log",
@@ -2104,7 +2101,6 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "bon",
- "buffa",
  "bytes",
  "chrono",
  "event-listener",

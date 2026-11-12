@@ -584,7 +584,7 @@ pub(crate) fn select_group_history_messages(
                 .as_option()
                 .and_then(|context| {
                     context.message_secret.clone().map(|message_secret| {
-                        buffa::MessageField::some({
+                        waproto::protobuf::MessageField::some({
                             let mut proto_ = waproto::whatsapp::MessageContextInfo::default();
                             proto_.message_secret = Some(message_secret);
                             proto_
@@ -595,7 +595,7 @@ pub(crate) fn select_group_history_messages(
             Some({
                 let mut proto_ = waproto::whatsapp::WebMessageInfo::default();
                 proto_.key = source.key.clone();
-                proto_.message = buffa::MessageField::some({
+                proto_.message = waproto::protobuf::MessageField::some({
                     let mut proto_ = waproto::whatsapp::Message::default();
                     proto_.conversation = content.conversation.clone();
                     proto_.message_context_info = context;
@@ -772,7 +772,7 @@ mod tests {
         let receiver = wacore_binary::Jid::pn("111111111111");
         let bundle_message = Arc::new({
             let mut proto = wa::Message::default();
-            proto.message_history_bundle = buffa::MessageField::some({
+            proto.message_history_bundle = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::MessageHistoryBundle::default();
                 proto.media_key = Some(b"SYNTHETIC-MEDIA-KEY".to_vec());
                 proto
@@ -803,9 +803,9 @@ mod tests {
             b"synthetic-compressed-history".to_vec(),
             Arc::new({
                 let mut proto = wa::Message::default();
-                proto.message_history_notice = buffa::MessageField::some({
+                proto.message_history_notice = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::MessageHistoryNotice::default();
-                    proto.message_history_metadata = buffa::MessageField::some({
+                    proto.message_history_metadata = waproto::protobuf::MessageField::some({
                         let mut proto = wa::message::MessageHistoryMetadata::default();
                         proto.message_count = Some(1);
                         proto.oldest_message_timestamp_in_bundle = Some(900);
@@ -848,9 +848,9 @@ mod tests {
 
         let make_bundle = |count: Option<i64>, oldest: Option<i64>| {
             let mut proto = wa::Message::default();
-            proto.message_history_bundle = buffa::MessageField::some({
+            proto.message_history_bundle = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::MessageHistoryBundle::default();
-                proto.message_history_metadata = buffa::MessageField::some({
+                proto.message_history_metadata = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::MessageHistoryMetadata::default();
                     proto.message_count = count;
                     proto.oldest_message_timestamp_in_bundle = oldest;
@@ -913,13 +913,13 @@ mod tests {
             wacore_binary::Jid::new("120363000000000002", wacore_binary::Server::Group);
         let make_message = |id: &str, remote: &wacore_binary::Jid, timestamp| {
             let mut proto = wa::WebMessageInfo::default();
-            proto.key = buffa::MessageField::some({
+            proto.key = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageKey::default();
                 proto.remote_jid = Some(remote.to_string());
                 proto.id = Some(id.into());
                 proto
             });
-            proto.message = buffa::MessageField::some({
+            proto.message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::Message::default();
                 proto.conversation = Some("synthetic test message".into());
                 proto
@@ -933,7 +933,7 @@ mod tests {
             .message
             .as_option_mut()
             .unwrap()
-            .message_context_info = buffa::MessageField::some({
+            .message_context_info = waproto::protobuf::MessageField::some({
             let mut proto = wa::MessageContextInfo::default();
             proto.message_secret = Some(b"synthetic-secret".to_vec());
             proto.reporting_token_version = Some(1);
@@ -1011,13 +1011,13 @@ mod tests {
         let group = wacore_binary::Jid::new("120363000000000001", wacore_binary::Server::Group);
         let make_message = |id: &str, timestamp| {
             let mut proto = wa::WebMessageInfo::default();
-            proto.key = buffa::MessageField::some({
+            proto.key = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageKey::default();
                 proto.remote_jid = Some(group.to_string());
                 proto.id = Some(id.into());
                 proto
             });
-            proto.message = buffa::MessageField::some({
+            proto.message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::Message::default();
                 proto.conversation = Some("synthetic text".into());
                 proto
@@ -1076,7 +1076,7 @@ mod tests {
             proto.reporting_token_version = Some(1);
             proto
         }] {
-            content.message_context_info = buffa::MessageField::some(context);
+            content.message_context_info = waproto::protobuf::MessageField::some(context);
             assert!(is_shareable_history_text(&content));
         }
         for context in [
@@ -1092,7 +1092,7 @@ mod tests {
             },
             {
                 let mut proto = wa::MessageContextInfo::default();
-                proto.limit_sharing = buffa::MessageField::some(Default::default());
+                proto.limit_sharing = waproto::protobuf::MessageField::some(Default::default());
                 proto
             },
             {
@@ -1102,19 +1102,19 @@ mod tests {
             },
             {
                 let mut proto = wa::MessageContextInfo::default();
-                proto.acp2_setting = buffa::MessageField::some(Default::default());
+                proto.acp2_setting = waproto::protobuf::MessageField::some(Default::default());
                 proto
             },
         ] {
-            content.message_context_info = buffa::MessageField::some(context);
+            content.message_context_info = waproto::protobuf::MessageField::some(context);
             assert!(!is_shareable_history_text(&content));
         }
-        content.message_context_info = buffa::MessageField::none();
-        content.ephemeral_message = buffa::MessageField::some(Default::default());
+        content.message_context_info = waproto::protobuf::MessageField::none();
+        content.ephemeral_message = waproto::protobuf::MessageField::some(Default::default());
         assert!(!is_shareable_history_text(&content));
-        content.ephemeral_message = buffa::MessageField::some({
+        content.ephemeral_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::FutureProofMessage::default();
-            proto.message = buffa::MessageField::some({
+            proto.message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::Message::default();
                 proto.conversation = Some("private nested text".repeat(4096));
                 proto
@@ -1122,7 +1122,7 @@ mod tests {
             proto
         });
         assert!(!is_shareable_history_text(&content));
-        content.ephemeral_message = buffa::MessageField::none();
+        content.ephemeral_message = waproto::protobuf::MessageField::none();
         content.conversation = Some(String::new());
         assert!(!is_shareable_history_text(&content));
     }
@@ -1151,13 +1151,13 @@ mod tests {
         let group = wacore_binary::Jid::new("120363000000000001", wacore_binary::Server::Group);
         let make_message = |id: &str, timestamp| {
             let mut proto = wa::WebMessageInfo::default();
-            proto.key = buffa::MessageField::some({
+            proto.key = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageKey::default();
                 proto.remote_jid = Some(group.to_string());
                 proto.id = Some(id.into());
                 proto
             });
-            proto.message = buffa::MessageField::some({
+            proto.message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::Message::default();
                 proto.conversation = Some(id.into());
                 proto
@@ -1206,14 +1206,14 @@ mod tests {
         let group = wacore_binary::Jid::new("120363000000000001", wacore_binary::Server::Group);
         let make_message = |id: &str| {
             let mut proto = wa::WebMessageInfo::default();
-            proto.key = buffa::MessageField::some({
+            proto.key = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageKey::default();
                 proto.remote_jid = Some(group.to_string());
                 proto.id = Some(id.into());
                 proto.from_me = Some(true);
                 proto
             });
-            proto.message = buffa::MessageField::some({
+            proto.message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::Message::default();
                 proto.conversation = Some("synthetic text".into());
                 proto
@@ -1223,10 +1223,10 @@ mod tests {
             proto
         };
         let mut nested = make_message("nested");
-        nested.message = buffa::MessageField::some({
+        nested.message = waproto::protobuf::MessageField::some({
             let mut proto = wa::Message::default();
             proto.conversation = Some("synthetic text".into());
-            proto.message_history_bundle = buffa::MessageField::some({
+            proto.message_history_bundle = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::MessageHistoryBundle::default();
                 proto.media_key = Some(b"SYNTHETIC-OTHER-KEY".to_vec());
                 proto

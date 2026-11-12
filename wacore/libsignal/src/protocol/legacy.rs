@@ -1829,7 +1829,7 @@ mod tests {
         reason = "Encode a synthetic storage fixture with both historical key representations"
     )]
     fn matching_expanded_message_key_keeps_seed_for_operational_export() {
-        use buffa::Message;
+        use waproto::protobuf::Message;
         let seed = [0x91; 32];
         let mut session = reference_session(72, LegacySessionDispositionV1::Current);
         session.chains[1].message_keys = vec![LegacySessionMessageKeyV1 {

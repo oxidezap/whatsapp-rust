@@ -40,7 +40,7 @@ pub enum PrimaryLinkError {
     #[error("invalid Curve25519 key or signature")]
     Curve(#[from] crate::libsignal::protocol::CurveError),
     #[error("invalid primary linking protobuf")]
-    Protobuf(#[from] buffa::DecodeError),
+    Protobuf(#[from] waproto::protobuf::DecodeError),
     #[error("primary linking AEAD failed")]
     Aead(#[from] crate::libsignal::crypto::CryptoProviderError),
     #[error("primary linking key derivation failed")]

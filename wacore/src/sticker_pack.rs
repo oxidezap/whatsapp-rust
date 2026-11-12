@@ -244,7 +244,7 @@ pub fn build_sticker_pack_message(
 
     Ok({
         let mut proto = wa::Message::default();
-        proto.sticker_pack_message = buffa::MessageField::some(pack_msg);
+        proto.sticker_pack_message = waproto::protobuf::MessageField::some(pack_msg);
         proto
     })
 }

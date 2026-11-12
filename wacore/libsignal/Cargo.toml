@@ -37,7 +37,6 @@ itoa.workspace = true
 wacore-binary.workspace = true
 wacore-derive.workspace = true
 waproto.workspace = true
-buffa.workspace = true
 log.workspace = true
 
 [dev-dependencies]

@@ -714,7 +714,7 @@ mod tests {
     // backend table so delayed prekey messages naming the old id still decrypt.
     #[tokio::test]
     async fn load_signed_prekey_falls_back_to_backend_for_rotated_out_id() {
-        use buffa::Message;
+        use waproto::protobuf::Message;
 
         let backend = crate::test_utils::create_test_backend().await;
         let device = Device::new(backend.clone());

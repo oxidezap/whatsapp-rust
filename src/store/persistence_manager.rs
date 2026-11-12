@@ -1369,7 +1369,7 @@ mod tests {
         let pm = PersistenceManager::new(backend.clone()).await.unwrap();
         let action = {
             let mut proto_ = waproto::whatsapp::sync_action_value::StatusPrivacyAction::default();
-            proto_.mode = Some(buffa::EnumValue::Unknown(99));
+            proto_.mode = Some(waproto::protobuf::EnumValue::Unknown(99));
             proto_.user_jid = vec!["120363000000000042@lid".into()];
             proto_
         };

@@ -276,7 +276,7 @@ pub fn generate(fds: &FileDescriptorSet, output: &Path) -> std::io::Result<()> {
         }
         source.push_str("}\n}\n");
         let parts: Vec<_> = path.split('.').collect();
-        let mut oracle = String::from("waproto::whatsapp::");
+        let mut oracle = String::from("waproto::reference::");
         for part in &parts[..parts.len() - 1] {
             oracle.push_str(&part.to_snake_case());
             oracle.push_str("::");

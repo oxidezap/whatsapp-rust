@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Synthetic persisted receiver records.
 use async_trait::async_trait;
-use buffa::Message as _;
 use futures::executor::block_on;
 use rand::{SeedableRng, rngs::StdRng};
 use wacore_libsignal::protocol::*;
+use waproto::protobuf::Message as _;
 use waproto::whatsapp::SenderKeyRecordStructure;
 type Result<T> = std::result::Result<T, SignalProtocolError>;
 #[derive(Default)]

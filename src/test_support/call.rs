@@ -379,7 +379,7 @@ impl Wire {
                 ))?;
                 let response = waproto::codec::handshake_message_to_vec(&{
                     let mut proto = wa::HandshakeMessage::default();
-                    proto.server_hello = buffa::MessageField::some({
+                    proto.server_hello = waproto::protobuf::MessageField::some({
                         let mut proto = wa::handshake_message::ServerHello::default();
                         proto.ephemeral = Some(ephemeral_pub.to_vec());
                         proto.r#static = Some(encrypted_static);

@@ -216,7 +216,7 @@ fn make_large_msg(round: usize) -> wa::Message {
     let body = format!("large-msg-r{round}-{}", "X".repeat(2000));
     {
         let mut proto_contract_fixture = wa::Message::default();
-        proto_contract_fixture.extended_text_message = buffa::MessageField::some({
+        proto_contract_fixture.extended_text_message = whatsapp_rust::buffa::MessageField::some({
             let mut proto_contract_fixture = wa::message::ExtendedTextMessage::default();
             proto_contract_fixture.text = Some(body);
             proto_contract_fixture

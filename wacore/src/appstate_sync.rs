@@ -319,12 +319,12 @@ fn decode_external_blobs(
             }
             patch.mutations = ext_mutations.mutations;
             // The validated external arm omits exitCode.
-            patch.exit_code = buffa::MessageField::none();
+            patch.exit_code = waproto::protobuf::MessageField::none();
             // Consumed: the reference is what marks a patch as still external,
             // so leaving it would make the next pass (`missing_key_ids_after_inline`
             // runs before `process_one_patch_list`) download and decode the
             // blob — routinely multi-MB — a second time.
-            patch.external_mutations = buffa::MessageField::none();
+            patch.external_mutations = waproto::protobuf::MessageField::none();
         }
     }
     if validate {
@@ -1626,7 +1626,7 @@ impl AppStateProcessor {
         let mut patch = {
             let mut proto = wa::SyncdPatch::default();
             proto.snapshot_mac = Some(snapshot_mac);
-            proto.key_id = buffa::MessageField::some({
+            proto.key_id = waproto::protobuf::MessageField::some({
                 let mut proto = wa::KeyId::default();
                 proto.id = Some(key_id.clone());
                 proto
@@ -1989,9 +1989,9 @@ mod dedup_tests {
     fn mutation(index_mac: &[u8]) -> wa::SyncdMutation {
         {
             let mut proto = wa::SyncdMutation::default();
-            proto.record = buffa::MessageField::some({
+            proto.record = waproto::protobuf::MessageField::some({
                 let mut proto = wa::SyncdRecord::default();
-                proto.index = buffa::MessageField::some({
+                proto.index = waproto::protobuf::MessageField::some({
                     let mut proto = wa::SyncdIndex::default();
                     proto.blob = Some(index_mac.to_vec());
                     proto
@@ -2470,7 +2470,7 @@ mod prepared_validation_tests {
     #[tokio::test(flavor = "current_thread")]
     #[allow(clippy::disallowed_methods)]
     async fn checked_metadata_still_validates_decoded_content_and_then_batch_versions() {
-        use buffa::Message;
+        use waproto::protobuf::Message;
         let processor = processor(Arc::new(AtomicUsize::new(0)));
         let mut external_snapshot = list(snapshot(false));
         external_snapshot.snapshot = None;
@@ -2563,7 +2563,7 @@ mod prepared_validation_tests {
     #[tokio::test(flavor = "current_thread")]
     #[allow(clippy::disallowed_methods)]
     async fn preparation_keeps_distinct_references_with_the_same_path_separate() {
-        use buffa::Message;
+        use waproto::protobuf::Message;
         let processor = processor(Arc::new(AtomicUsize::new(0)));
         let mut pl = PatchList {
             name: WAPatchName::Regular,

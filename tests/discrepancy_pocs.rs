@@ -14,7 +14,7 @@ use waproto::whatsapp as wa;
 fn regression_a1_revoked_reaction_returns_sender_revoke() {
     let msg = {
         let mut proto = wa::Message::default();
-        proto.reaction_message = buffa::MessageField::some({
+        proto.reaction_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::ReactionMessage::default();
             proto.text = Some(String::new());
             proto
@@ -31,9 +31,9 @@ fn regression_a1_revoked_reaction_returns_sender_revoke() {
 fn regression_a1_keep_in_chat_undo_returns_sender_revoke() {
     let msg = {
         let mut proto = wa::Message::default();
-        proto.keep_in_chat_message = buffa::MessageField::some({
+        proto.keep_in_chat_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::KeepInChatMessage::default();
-            proto.key = buffa::MessageField::some({
+            proto.key = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageKey::default();
                 proto.from_me = Some(true);
                 proto
@@ -53,7 +53,7 @@ fn regression_a1_keep_in_chat_undo_returns_sender_revoke() {
 fn regression_a1_secret_encrypted_message_edit_returns_message_edit() {
     let msg = {
         let mut proto = wa::Message::default();
-        proto.secret_encrypted_message = buffa::MessageField::some({
+        proto.secret_encrypted_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::SecretEncryptedMessage::default();
             proto.secret_enc_type =
                 Some(wa::message::secret_encrypted_message::SecretEncType::MESSAGE_EDIT);
@@ -71,7 +71,7 @@ fn regression_a1_secret_encrypted_message_edit_returns_message_edit() {
 fn regression_a1_secret_encrypted_event_edit_returns_message_edit() {
     let msg = {
         let mut proto = wa::Message::default();
-        proto.secret_encrypted_message = buffa::MessageField::some({
+        proto.secret_encrypted_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::SecretEncryptedMessage::default();
             proto.secret_enc_type =
                 Some(wa::message::secret_encrypted_message::SecretEncType::EVENT_EDIT);

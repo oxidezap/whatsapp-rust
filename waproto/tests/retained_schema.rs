@@ -1,7 +1,7 @@
 //! Fixed wire fixtures from the previous schema, independent of regenerated output.
 #![allow(clippy::disallowed_methods)] // Test the generated codec directly.
 
-use buffa::Message as _;
+use waproto::protobuf::Message as _;
 use waproto::whatsapp as wa;
 
 #[test]
@@ -72,10 +72,10 @@ fn message_clone_preserves_retained_and_new_fields_without_aliasing() {
 
 #[test]
 fn wallpaper_string_and_argb_encodings_keep_their_distinct_wire_types() {
-    use buffa::{MessageView as _, ViewEncode as _};
     use wa::message::{
         ChatSolidColorWallpaper, ChatSolidColorWallpaperOwnedView, ChatSolidColorWallpaperView,
     };
+    use waproto::protobuf::{MessageView as _, ViewEncode as _};
     // Historical strings use length-delimited fields 1 and 2. The new source
     // uses fixed32 at the same numbers, without converting old string values.
     let legacy = [0x0a, 3, b'r', b'e', b'd', 0x12, 4, b'b', b'l', b'u', b'e'];

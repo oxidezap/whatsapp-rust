@@ -427,7 +427,7 @@ mod tests {
         }
         for value in values {
             let mut expected = vec![0x51, 0xa2];
-            buffa::encoding::encode_varint(value, &mut expected);
+            waproto::protobuf::encoding::encode_varint(value, &mut expected);
             let mut actual = vec![0x51, 0xa2];
             VecSink(&mut actual).varint(value);
             assert_eq!(actual, expected, "value={value}");
@@ -440,7 +440,7 @@ mod tests {
     #[test]
     #[allow(clippy::disallowed_methods)]
     fn imported_receiver_size_preserves_nested_length_prefix_boundaries() {
-        use buffa::Message as _;
+        use waproto::protobuf::Message as _;
         use waproto::whatsapp::{SessionStructure, session_structure};
         for count in [0, 1, 2, 3, 416, 417, 418, 419] {
             for presence in 0..3 {

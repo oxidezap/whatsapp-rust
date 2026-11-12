@@ -256,7 +256,7 @@ impl<'a> Labels<'a> {
         );
         let value = {
             let mut proto = wa::SyncActionValue::default();
-            proto.label_edit_action = buffa::MessageField::some({
+            proto.label_edit_action = waproto::protobuf::MessageField::some({
                 let mut proto = wa::sync_action_value::LabelEditAction::default();
                 proto.name = Some(name.to_string());
                 proto.color = Some(color);
@@ -282,7 +282,7 @@ impl<'a> Labels<'a> {
         debug!("Deleting label {}", fingerprint_id(label_id));
         let value = {
             let mut proto = wa::SyncActionValue::default();
-            proto.label_edit_action = buffa::MessageField::some({
+            proto.label_edit_action = waproto::protobuf::MessageField::some({
                 let mut proto = wa::sync_action_value::LabelEditAction::default();
                 proto.deleted = Some(true);
                 proto
@@ -414,7 +414,7 @@ impl<'a> Labels<'a> {
 fn association_value(labeled: bool, timestamp_ms: i64) -> wa::SyncActionValue {
     {
         let mut proto = wa::SyncActionValue::default();
-        proto.label_association_action = buffa::MessageField::some({
+        proto.label_association_action = waproto::protobuf::MessageField::some({
             let mut proto = wa::sync_action_value::LabelAssociationAction::default();
             proto.labeled = Some(labeled);
             proto
@@ -668,10 +668,11 @@ mod tests {
                     let value = mutation.action_value.as_mut().unwrap();
                     value.timestamp = raw;
                     if kind == "label_edit" {
-                        value.label_edit_action = buffa::MessageField::some(Default::default());
+                        value.label_edit_action =
+                            waproto::protobuf::MessageField::some(Default::default());
                     } else {
                         value.label_association_action =
-                            buffa::MessageField::some(Default::default());
+                            waproto::protobuf::MessageField::some(Default::default());
                         value
                             .label_association_action
                             .as_option_mut()
@@ -729,7 +730,7 @@ mod tests {
     fn label_edit_dispatches_update() {
         let m = set_mutation(vec!["label_edit", "5"], {
             let mut proto = wa::SyncActionValue::default();
-            proto.label_edit_action = buffa::MessageField::some({
+            proto.label_edit_action = waproto::protobuf::MessageField::some({
                 let mut proto = wa::sync_action_value::LabelEditAction::default();
                 proto.name = Some("Work".into());
                 proto.color = Some(2);
@@ -757,7 +758,7 @@ mod tests {
     fn label_jid_dispatches_association() {
         let m = set_mutation(vec!["label_jid", "5", "12025550111@s.whatsapp.net"], {
             let mut proto = wa::SyncActionValue::default();
-            proto.label_association_action = buffa::MessageField::some({
+            proto.label_association_action = waproto::protobuf::MessageField::some({
                 let mut proto = wa::sync_action_value::LabelAssociationAction::default();
                 proto.labeled = Some(true);
                 proto
@@ -958,7 +959,7 @@ mod tests {
         ] {
             let m = set_mutation(index.clone(), {
                 let mut proto = wa::SyncActionValue::default();
-                proto.label_association_action = buffa::MessageField::some({
+                proto.label_association_action = waproto::protobuf::MessageField::some({
                     let mut proto = wa::sync_action_value::LabelAssociationAction::default();
                     proto.labeled = Some(true);
                     proto
@@ -991,7 +992,7 @@ mod tests {
         // Claimed (a non-`Unclaimed` outcome) so it isn't re-tried, but no event is emitted.
         let m = set_mutation(vec!["label_jid", "5", "not a jid"], {
             let mut proto = wa::SyncActionValue::default();
-            proto.label_association_action = buffa::MessageField::some({
+            proto.label_association_action = waproto::protobuf::MessageField::some({
                 let mut proto = wa::sync_action_value::LabelAssociationAction::default();
                 proto.labeled = Some(true);
                 proto

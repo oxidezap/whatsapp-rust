@@ -21,7 +21,7 @@ fn main() {
 // the current generated owned and borrowed codecs discard unknown fields.
 #[allow(clippy::field_reassign_with_default)] // Also works with non-exhaustive generated messages.
 fn oneof_wire(shape: &str) -> Vec<u8> {
-    use buffa::Message as _;
+    use waproto::protobuf::Message as _;
     let quoted = wa::Message::default().with_conversation("Synthetic quoted text");
     let mut context = wa::ContextInfo::default();
     context.quoted_message = Some(quoted).into();
@@ -45,7 +45,7 @@ fn oneof_wire(shape: &str) -> Vec<u8> {
 
 #[divan::bench]
 fn bench_oneof_owned_encode(bencher: divan::Bencher) {
-    use buffa::Message as _;
+    use waproto::protobuf::Message as _;
     let wire = oneof_wire("known");
     let message = wa::message::interactive_message::Header::decode_from_slice(&wire)
         .expect("valid synthetic oneof fixture");
@@ -55,7 +55,7 @@ fn bench_oneof_owned_encode(bencher: divan::Bencher) {
 
 #[divan::bench]
 fn bench_oneof_view_encode(bencher: divan::Bencher) {
-    use buffa::{MessageView as _, ViewEncode as _};
+    use waproto::protobuf::{MessageView as _, ViewEncode as _};
     let wire = oneof_wire("known");
     let message = wa::message::interactive_message::HeaderView::decode_view(&wire)
         .expect("valid synthetic oneof fixture");
@@ -65,7 +65,7 @@ fn bench_oneof_view_encode(bencher: divan::Bencher) {
 
 #[divan::bench(args = ["known", "future_first", "future_last"])]
 fn bench_oneof_owned_decode(bencher: divan::Bencher, shape: &str) {
-    use buffa::Message as _;
+    use waproto::protobuf::Message as _;
     let wire = oneof_wire(shape);
     bencher.bench(|| {
         black_box(
@@ -77,7 +77,7 @@ fn bench_oneof_owned_decode(bencher: divan::Bencher, shape: &str) {
 
 #[divan::bench(args = ["known", "future_first", "future_last"])]
 fn bench_oneof_view_decode(bencher: divan::Bencher, shape: &str) {
-    use buffa::MessageView as _;
+    use waproto::protobuf::MessageView as _;
     let wire = oneof_wire(shape);
     bencher.bench(|| {
         black_box(
@@ -125,10 +125,10 @@ fn bench_participant_list_hash_8(bencher: divan::Bencher) {
 fn text_message() -> wa::Message {
     {
         let mut proto = wa::Message::default();
-        proto.extended_text_message = buffa::MessageField::some({
+        proto.extended_text_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::ExtendedTextMessage::default();
             proto.text = Some("Benchmark message with a realistic amount of text content.".into());
-            proto.context_info = buffa::MessageField::some({
+            proto.context_info = waproto::protobuf::MessageField::some({
                 let mut proto = wa::ContextInfo::default();
                 proto.stanza_id = Some("3EB0F4E1D2C3B4A59687".into());
                 proto.participant = Some("5511999990000@s.whatsapp.net".into());
@@ -154,7 +154,7 @@ fn bench_encode_and_pad(bencher: divan::Bencher) {
 fn bench_unpad_message_ref(bencher: divan::Bencher) {
     bencher
         .with_inputs(|| {
-            use buffa::Message as _;
+            use waproto::protobuf::Message as _;
             MessageUtils::pad_message_v2(text_message().encode_to_vec())
         })
         .bench_refs(|padded| {
@@ -171,7 +171,7 @@ fn dm_shape(shape: &str) -> wa::Message {
         "text_reply" => text_message(),
         "media_refs" => {
             let mut proto = wa::Message::default();
-            proto.image_message = buffa::MessageField::some({
+            proto.image_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ImageMessage::default();
                 proto.url = Some("https://mmg.whatsapp.net/v/t62.7118-24/abc123".into());
                 proto.direct_path = Some("/v/t62.7118-24/abc123".into());
@@ -203,7 +203,7 @@ fn recv_shape(shape: &str) -> wa::Message {
         // alongside the content.
         "group_skdm_text" => {
             let mut proto = wa::Message::default();
-            proto.sender_key_distribution_message = buffa::MessageField::some({
+            proto.sender_key_distribution_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::SenderKeyDistributionMessage::default();
                 proto.group_id = Some("120363000000000001@g.us".into());
                 proto.axolotl_sender_key_distribution_message = Some(vec![0x33; 350]);
@@ -223,7 +223,7 @@ fn recv_shape(shape: &str) -> wa::Message {
 fn bench_decode_plaintext(bencher: divan::Bencher, shape: &str) {
     bencher
         .with_inputs(|| {
-            use buffa::Message as _;
+            use waproto::protobuf::Message as _;
             MessageUtils::pad_message_v2(recv_shape(shape).encode_to_vec())
         })
         .bench_refs(|padded| {

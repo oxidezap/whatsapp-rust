@@ -755,7 +755,7 @@ impl AlicePeer {
     }
 
     fn adv_certificate(&self) -> Vec<u8> {
-        use buffa::Message;
+        use waproto::protobuf::Message;
         let device = KeyPair::new(
             *self.identity.kp.identity_key().public_key(),
             self.identity.kp.private_key().clone(),
@@ -4638,30 +4638,31 @@ fn test_is_sender_key_distribution_only() {
     // SKDM only → true
     assert!(is_sender_key_distribution_only(&mut {
         let mut proto = wa::Message::default();
-        proto.sender_key_distribution_message = buffa::MessageField::some(skdm.clone());
+        proto.sender_key_distribution_message = waproto::protobuf::MessageField::some(skdm.clone());
         proto
     }));
 
     // SKDM + message_context_info → still true (context_info is metadata)
     assert!(is_sender_key_distribution_only(&mut {
         let mut proto = wa::Message::default();
-        proto.sender_key_distribution_message = buffa::MessageField::some(skdm.clone());
-        proto.message_context_info = buffa::MessageField::some(Default::default());
+        proto.sender_key_distribution_message = waproto::protobuf::MessageField::some(skdm.clone());
+        proto.message_context_info = waproto::protobuf::MessageField::some(Default::default());
         proto
     }));
 
     // SKDM + sticker → false (has user content)
     assert!(!is_sender_key_distribution_only(&mut {
         let mut proto = wa::Message::default();
-        proto.sender_key_distribution_message = buffa::MessageField::some(skdm.clone());
-        proto.sticker_message = buffa::MessageField::some(wa::message::StickerMessage::default());
+        proto.sender_key_distribution_message = waproto::protobuf::MessageField::some(skdm.clone());
+        proto.sticker_message =
+            waproto::protobuf::MessageField::some(wa::message::StickerMessage::default());
         proto
     }));
 
     // SKDM + text → false (has user content)
     assert!(!is_sender_key_distribution_only(&mut {
         let mut proto = wa::Message::default();
-        proto.sender_key_distribution_message = buffa::MessageField::some(skdm.clone());
+        proto.sender_key_distribution_message = waproto::protobuf::MessageField::some(skdm.clone());
         proto.conversation = Some("hello".into());
         proto
     }));
@@ -4670,7 +4671,7 @@ fn test_is_sender_key_distribution_only() {
     assert!(!is_sender_key_distribution_only(&mut {
         let mut proto_ = wa::Message::default();
         proto_.protocol_message =
-            buffa::MessageField::some(wa::message::ProtocolMessage::default());
+            waproto::protobuf::MessageField::some(wa::message::ProtocolMessage::default());
         proto_
     }));
 }
@@ -4681,19 +4682,20 @@ fn skdm_only_detection_restores_carrier_fields() {
     // default; it must restore them so callers still see the original message.
     let mut msg = {
         let mut proto = wa::Message::default();
-        proto.sender_key_distribution_message = buffa::MessageField::some({
+        proto.sender_key_distribution_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::SenderKeyDistributionMessage::default();
             proto.group_id = Some("group".into());
             proto.axolotl_sender_key_distribution_message = Some(vec![1, 2, 3]);
             proto
         });
-        proto.fast_ratchet_key_sender_key_distribution_message = buffa::MessageField::some({
-            let mut proto = wa::message::SenderKeyDistributionMessage::default();
-            proto.group_id = Some("group".into());
-            proto.axolotl_sender_key_distribution_message = Some(vec![4, 5, 6]);
-            proto
-        });
-        proto.message_context_info = buffa::MessageField::some({
+        proto.fast_ratchet_key_sender_key_distribution_message =
+            waproto::protobuf::MessageField::some({
+                let mut proto = wa::message::SenderKeyDistributionMessage::default();
+                proto.group_id = Some("group".into());
+                proto.axolotl_sender_key_distribution_message = Some(vec![4, 5, 6]);
+                proto
+            });
+        proto.message_context_info = waproto::protobuf::MessageField::some({
             let mut proto = wa::MessageContextInfo::default();
             proto.message_secret = Some(vec![9, 8, 7]);
             proto
@@ -4734,12 +4736,12 @@ fn skdm_only_detection_restores_carrier_fields() {
 fn test_unwrap_device_sent_extracts_reaction() {
     let wrapped = {
         let mut proto = wa::Message::default();
-        proto.device_sent_message = buffa::MessageField::some({
+        proto.device_sent_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::DeviceSentMessage::default();
             proto.destination_jid = Some("5511999999999@s.whatsapp.net".to_string());
-            proto.message = buffa::MessageField::some({
+            proto.message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::Message::default();
-                proto.reaction_message = buffa::MessageField::some({
+                proto.reaction_message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::ReactionMessage::default();
                     proto.text = Some("\u{2764}".to_string());
                     proto
@@ -4776,7 +4778,7 @@ fn test_unwrap_device_sent_extracts_reaction() {
 fn test_unwrap_device_sent_preserves_empty_wrapper() {
     let wrapped = {
         let mut proto = wa::Message::default();
-        proto.device_sent_message = buffa::MessageField::some({
+        proto.device_sent_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::DeviceSentMessage::default();
             proto.destination_jid = Some("5511999999999@s.whatsapp.net".to_string());
             proto.message = Default::default();
@@ -4813,20 +4815,21 @@ fn test_unwrap_device_sent_merges_context_info() {
     let wrapped = {
         let mut proto = wa::Message::default(); // Outer message_context_info (from the DSM envelope)
 
-        proto.message_context_info = buffa::MessageField::some({
+        proto.message_context_info = waproto::protobuf::MessageField::some({
             let mut proto = wa::MessageContextInfo::default();
             proto.message_secret = Some(vec![10, 20, 30]);
-            proto.limit_sharing_v2 = buffa::MessageField::some(wa::LimitSharing::default());
+            proto.limit_sharing_v2 =
+                waproto::protobuf::MessageField::some(wa::LimitSharing::default());
             proto
         });
-        proto.device_sent_message = buffa::MessageField::some({
+        proto.device_sent_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::DeviceSentMessage::default();
             proto.destination_jid = Some("5511999999999@s.whatsapp.net".to_string());
-            proto.message = buffa::MessageField::some({
+            proto.message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::Message::default();
                 proto.conversation = Some("hello".to_string()); // Inner has its own message_secret but no limit_sharing_v2
 
-                proto.message_context_info = buffa::MessageField::some({
+                proto.message_context_info = waproto::protobuf::MessageField::some({
                     let mut proto = wa::MessageContextInfo::default();
                     proto.message_secret = Some(vec![1, 2, 3]);
                     proto
@@ -4858,15 +4861,15 @@ fn test_unwrap_device_sent_merges_context_info() {
 fn test_unwrap_device_sent_secret_fallback() {
     let wrapped = {
         let mut proto = wa::Message::default();
-        proto.message_context_info = buffa::MessageField::some({
+        proto.message_context_info = waproto::protobuf::MessageField::some({
             let mut proto = wa::MessageContextInfo::default();
             proto.message_secret = Some(vec![10, 20, 30]);
             proto
         });
-        proto.device_sent_message = buffa::MessageField::some({
+        proto.device_sent_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::DeviceSentMessage::default();
             proto.destination_jid = Some("5511999999999@s.whatsapp.net".to_string());
-            proto.message = buffa::MessageField::some({
+            proto.message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::Message::default();
                 proto.conversation = Some("hello".to_string());
                 proto
@@ -8622,7 +8625,7 @@ async fn skdm_only_group_session_acknowledged_once_without_message_event() {
     let skdm = alice.create_group_skdm(&group).await;
     let plaintext = MessageUtils::encode_and_pad(&{
         let mut proto = wa::Message::default();
-        proto.sender_key_distribution_message = buffa::MessageField::some(skdm);
+        proto.sender_key_distribution_message = waproto::protobuf::MessageField::some(skdm);
         proto
     });
     let session_ct = alice.encrypt(&bob_addr, &plaintext).await;
@@ -8756,7 +8759,7 @@ async fn mixed_skdm_and_bad_plaintext_session_is_nacked_not_positive_acked() {
     let skdm = alice.create_group_skdm(&group).await;
     let skdm_plaintext = MessageUtils::encode_and_pad(&{
         let mut proto = wa::Message::default();
-        proto.sender_key_distribution_message = buffa::MessageField::some(skdm);
+        proto.sender_key_distribution_message = waproto::protobuf::MessageField::some(skdm);
         proto
     });
     let skdm_ct = alice.encrypt(&bob_addr, &skdm_plaintext).await;
@@ -8822,7 +8825,7 @@ async fn bad_session_plaintext_skips_skmsg_sibling_after_nack() {
     let skdm = alice.create_group_skdm(&group).await;
     let skdm_plaintext = MessageUtils::encode_and_pad(&{
         let mut proto = wa::Message::default();
-        proto.sender_key_distribution_message = buffa::MessageField::some(skdm);
+        proto.sender_key_distribution_message = waproto::protobuf::MessageField::some(skdm);
         proto
     });
     let skdm_ct = alice.encrypt(&bob_addr, &skdm_plaintext).await;
@@ -8897,7 +8900,7 @@ async fn group_skmsg_decrypts_under_sender_key_lock() {
     let skdm = alice.create_group_skdm(&group).await;
     let skdm_plaintext = MessageUtils::encode_and_pad(&{
         let mut proto = wa::Message::default();
-        proto.sender_key_distribution_message = buffa::MessageField::some(skdm);
+        proto.sender_key_distribution_message = waproto::protobuf::MessageField::some(skdm);
         proto
     });
     let skdm_ct = alice.encrypt(&bob_addr, &skdm_plaintext).await;
@@ -9148,7 +9151,7 @@ async fn skdm_only_session_with_msmsg_waits_for_bot_payload_response() {
     let skdm = alice.create_group_skdm(&group).await;
     let plaintext = MessageUtils::encode_and_pad(&{
         let mut proto = wa::Message::default();
-        proto.sender_key_distribution_message = buffa::MessageField::some(skdm);
+        proto.sender_key_distribution_message = waproto::protobuf::MessageField::some(skdm);
         proto
     });
     let session_ct = alice.encrypt(&bob_addr, &plaintext).await;
@@ -9251,7 +9254,7 @@ async fn status_skdm_only_session_uses_one_status_receipt() {
     let skdm = alice.create_group_skdm(&status).await;
     let plaintext = MessageUtils::encode_and_pad(&{
         let mut proto = wa::Message::default();
-        proto.sender_key_distribution_message = buffa::MessageField::some(skdm);
+        proto.sender_key_distribution_message = waproto::protobuf::MessageField::some(skdm);
         proto
     });
     let session_ct = alice.encrypt(&bob_addr, &plaintext).await;
@@ -9361,7 +9364,7 @@ async fn skdm_session_with_skmsg_sibling_acknowledged_once() {
     let skdm = alice.create_group_skdm(&group).await;
     let skdm_plaintext = MessageUtils::encode_and_pad(&{
         let mut proto = wa::Message::default();
-        proto.sender_key_distribution_message = buffa::MessageField::some(skdm);
+        proto.sender_key_distribution_message = waproto::protobuf::MessageField::some(skdm);
         proto
     });
     let session_ct = alice.encrypt(&bob_addr, &skdm_plaintext).await;
@@ -9424,7 +9427,7 @@ async fn own_group_skdm_only_session_uses_transport_ack_once() {
     let skdm = alice.create_group_skdm(&group).await;
     let plaintext = MessageUtils::encode_and_pad(&{
         let mut proto = wa::Message::default();
-        proto.sender_key_distribution_message = buffa::MessageField::some(skdm);
+        proto.sender_key_distribution_message = waproto::protobuf::MessageField::some(skdm);
         proto
     });
     let session_ct = alice.encrypt(&bob_addr, &plaintext).await;
@@ -10374,21 +10377,21 @@ async fn app_state_sync_key_share_honored_only_from_self() {
     let key_id = vec![1u8, 2, 3, 4, 5, 6];
     let share = {
         let mut proto_ = wa::Message::default();
-        proto_.protocol_message = buffa::MessageField::some({
+        proto_.protocol_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::ProtocolMessage::default();
-            proto.app_state_sync_key_share = buffa::MessageField::some({
+            proto.app_state_sync_key_share = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::AppStateSyncKeyShare::default();
                 proto.keys = vec![{
                     let mut proto = wa::message::AppStateSyncKey::default();
-                    proto.key_id = buffa::MessageField::some({
+                    proto.key_id = waproto::protobuf::MessageField::some({
                         let mut proto = wa::message::AppStateSyncKeyId::default();
                         proto.key_id = Some(key_id.clone());
                         proto
                     });
-                    proto.key_data = buffa::MessageField::some({
+                    proto.key_data = waproto::protobuf::MessageField::some({
                         let mut proto = wa::message::AppStateSyncKeyData::default();
                         proto.key_data = Some(vec![7u8; 32]);
-                        proto.fingerprint = buffa::MessageField::some({
+                        proto.fingerprint = waproto::protobuf::MessageField::some({
                             let mut proto = wa::message::AppStateSyncKeyFingerprint::default();
                             proto.raw_id = Some(1);
                             proto.current_index = Some(0);
@@ -10469,7 +10472,7 @@ async fn app_state_sync_key_share_honored_only_from_self() {
 
 #[tokio::test]
 async fn app_state_sync_key_request_preserves_known_and_orphan_ids() {
-    use buffa::Message as _;
+    use waproto::protobuf::Message as _;
 
     let client = crate::test_utils::create_test_client().await;
     let backend = client.persistence_manager.backend();
@@ -10571,9 +10574,9 @@ async fn app_state_sync_key_request_preserves_known_and_orphan_ids() {
 
 #[tokio::test]
 async fn app_state_key_share_waits_outside_the_offline_message_lane() {
-    use buffa::Message as _;
     use std::sync::atomic::Ordering;
     use wacore::messages::MessageUtils;
+    use waproto::protobuf::Message as _;
 
     let (client, transport) = capturing_client("appstate_key_share_offline").await;
     let requester_str = "5511000000001:33@s.whatsapp.net";
@@ -10598,10 +10601,10 @@ async fn app_state_key_share_waits_outside_the_offline_message_lane() {
     let requested_key_id = vec![1, 2, 3, 4];
     let request = {
         let mut proto_ = wa::Message::default();
-        proto_.protocol_message = buffa::MessageField::some({
+        proto_.protocol_message = waproto::protobuf::MessageField::some({
             let mut proto_ = wa::message::ProtocolMessage::default();
             proto_.r#type = Some(wa::message::protocol_message::Type::AppStateSyncKeyRequest);
-            proto_.app_state_sync_key_request = buffa::MessageField::some({
+            proto_.app_state_sync_key_request = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::AppStateSyncKeyRequest::default();
                 proto.key_ids = vec![{
                     let mut proto = wa::message::AppStateSyncKeyId::default();
@@ -10937,8 +10940,8 @@ async fn app_state_key_share_survives_a_closed_flush_scope() {
 /// LID-PN cache and flip the account to LID wire addressing.
 #[tokio::test]
 async fn lid_migration_mapping_sync_honored_only_from_self() {
-    use buffa::Message as _;
     use wacore::messages::MessageUtils;
+    use waproto::protobuf::Message as _;
 
     let client = crate::test_utils::create_test_client().await;
     ensure_bob_paired(&client).await;
@@ -10959,9 +10962,9 @@ async fn lid_migration_mapping_sync_honored_only_from_self() {
     };
     let sync = {
         let mut proto_ = wa::Message::default();
-        proto_.protocol_message = buffa::MessageField::some({
+        proto_.protocol_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::ProtocolMessage::default();
-            proto.lid_migration_mapping_sync_message = buffa::MessageField::some({
+            proto.lid_migration_mapping_sync_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::LIDMigrationMappingSyncMessage::default();
                 proto.encoded_mapping_payload = Some(payload.encode_to_vec());
                 proto
@@ -11039,7 +11042,7 @@ fn find_message_nack_error(frames: &[bytes::Bytes], id: &str) -> Option<u32> {
 }
 
 fn encode_message_secret_message(iv: &[u8], payload: &[u8]) -> Vec<u8> {
-    use buffa::Message as _;
+    use waproto::protobuf::Message as _;
     let ms = {
         let mut proto = wa::MessageSecretMessage::default();
         proto.version = Some(1);
@@ -11204,9 +11207,9 @@ fn legacy_edit_text(msg: &wa::Message) -> Option<&str> {
 fn inner_message_edit(text: &str, next_secret: Option<Vec<u8>>) -> wa::Message {
     {
         let mut proto_ = wa::Message::default();
-        proto_.protocol_message = buffa::MessageField::some({
+        proto_.protocol_message = waproto::protobuf::MessageField::some({
             let mut proto_ = wa::message::ProtocolMessage::default();
-            proto_.key = buffa::MessageField::some({
+            proto_.key = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageKey::default();
                 proto.remote_jid = Some("5511777776666@s.whatsapp.net".to_string());
                 proto.from_me = Some(false);
@@ -11215,7 +11218,7 @@ fn inner_message_edit(text: &str, next_secret: Option<Vec<u8>>) -> wa::Message {
                 proto
             });
             proto_.r#type = Some(wa::message::protocol_message::Type::MessageEdit);
-            proto_.edited_message = buffa::MessageField::some({
+            proto_.edited_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::Message::default();
                 proto.conversation = Some(text.to_string());
                 proto
@@ -11257,9 +11260,9 @@ fn encrypted_message_edit(
 
     {
         let mut proto = wa::Message::default();
-        proto.secret_encrypted_message = buffa::MessageField::some({
+        proto.secret_encrypted_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::SecretEncryptedMessage::default();
-            proto.target_message_key = buffa::MessageField::some(target_key);
+            proto.target_message_key = waproto::protobuf::MessageField::some(target_key);
             proto.enc_payload = Some(enc_payload);
             proto.enc_iv = Some(enc_iv.to_vec());
             proto.secret_enc_type =
@@ -12491,7 +12494,7 @@ async fn msmsg_decrypts_when_secret_is_stored() {
         proto
     };
     let pt_bytes = {
-        use buffa::Message as _;
+        use waproto::protobuf::Message as _;
         let mut v = Vec::with_capacity(plaintext_msg.encoded_len() as usize);
         plaintext_msg.encode(&mut v);
         v
@@ -12685,7 +12688,7 @@ async fn msmsg_bot_edit_uses_edit_target_id_for_hkdf() {
         proto
     };
     let pt_bytes = {
-        use buffa::Message as _;
+        use waproto::protobuf::Message as _;
         let mut v = Vec::with_capacity(plaintext_msg.encoded_len() as usize);
         plaintext_msg.encode(&mut v);
         v
@@ -12834,7 +12837,7 @@ async fn msmsg_bot_edit_first_keeps_info_id() {
         proto
     };
     let pt_bytes = {
-        use buffa::Message as _;
+        use waproto::protobuf::Message as _;
         let mut v = Vec::with_capacity(plaintext_msg.encoded_len() as usize);
         plaintext_msg.encode(&mut v);
         v
@@ -12909,7 +12912,7 @@ async fn msmsg_falls_back_to_info_id_when_primary_uses_edit_target() {
         proto
     };
     let pt_bytes = {
-        use buffa::Message as _;
+        use waproto::protobuf::Message as _;
         let mut v = Vec::with_capacity(plaintext_msg.encoded_len() as usize);
         plaintext_msg.encode(&mut v);
         v
@@ -12994,7 +12997,7 @@ async fn msmsg_falls_back_to_edit_target_when_primary_uses_info_id() {
         proto
     };
     let pt_bytes = {
-        use buffa::Message as _;
+        use waproto::protobuf::Message as _;
         let mut v = Vec::with_capacity(plaintext_msg.encoded_len() as usize);
         plaintext_msg.encode(&mut v);
         v
@@ -13143,7 +13146,7 @@ async fn maybe_capture_inbound_msg_secret_persists_for_bot_chats() {
     let msg = {
         let mut proto = wa::Message::default();
         proto.conversation = Some("hi bot".into());
-        proto.message_context_info = buffa::MessageField::some({
+        proto.message_context_info = waproto::protobuf::MessageField::some({
             let mut proto = wa::MessageContextInfo::default();
             proto.message_secret = Some(vec![0xAB; 32]);
             proto
@@ -13185,7 +13188,7 @@ async fn maybe_capture_inbound_msg_secret_persists_for_non_bot_chats() {
     let msg = {
         let mut proto = wa::Message::default();
         proto.conversation = Some("hi".into());
-        proto.message_context_info = buffa::MessageField::some({
+        proto.message_context_info = waproto::protobuf::MessageField::some({
             let mut proto = wa::MessageContextInfo::default();
             proto.message_secret = Some(vec![0xCD; 32]);
             proto
@@ -13236,17 +13239,17 @@ async fn maybe_capture_inbound_msg_secret_persists_for_group_with_bot_mention() 
     });
     let msg = {
         let mut proto = wa::Message::default();
-        proto.extended_text_message = buffa::MessageField::some({
+        proto.extended_text_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::ExtendedTextMessage::default();
             proto.text = Some("hey @MetaAI tell me a joke".into());
-            proto.context_info = buffa::MessageField::some({
+            proto.context_info = waproto::protobuf::MessageField::some({
                 let mut proto = wa::ContextInfo::default();
                 proto.mentioned_jid = vec!["867051314767696@bot".into()];
                 proto
             });
             proto
         });
-        proto.message_context_info = buffa::MessageField::some({
+        proto.message_context_info = waproto::protobuf::MessageField::some({
             let mut proto = wa::MessageContextInfo::default();
             proto.message_secret = Some(vec![0xEE; 32]);
             proto
@@ -13298,17 +13301,17 @@ async fn maybe_capture_inbound_msg_secret_skips_forwarded() {
     });
     let msg = {
         let mut proto = wa::Message::default();
-        proto.extended_text_message = buffa::MessageField::some({
+        proto.extended_text_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::ExtendedTextMessage::default();
             proto.text = Some("forwarded".into());
-            proto.context_info = buffa::MessageField::some({
+            proto.context_info = waproto::protobuf::MessageField::some({
                 let mut proto = wa::ContextInfo::default();
                 proto.is_forwarded = Some(true);
                 proto
             });
             proto
         });
-        proto.message_context_info = buffa::MessageField::some({
+        proto.message_context_info = waproto::protobuf::MessageField::some({
             let mut proto = wa::MessageContextInfo::default();
             proto.message_secret = Some(vec![0xFF; 32]);
             proto
@@ -13360,15 +13363,15 @@ async fn maybe_capture_inbound_msg_secret_via_bot_metadata_without_mention() {
     });
     let msg = {
         let mut proto = wa::Message::default();
-        proto.extended_text_message = buffa::MessageField::some({
+        proto.extended_text_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::ExtendedTextMessage::default();
             proto.text = Some("continue".into());
             proto
         });
-        proto.message_context_info = buffa::MessageField::some({
+        proto.message_context_info = waproto::protobuf::MessageField::some({
             let mut proto = wa::MessageContextInfo::default();
             proto.message_secret = Some(vec![0x7B; 32]);
-            proto.bot_metadata = buffa::MessageField::some({
+            proto.bot_metadata = waproto::protobuf::MessageField::some({
                 let mut proto = wa::BotMetadata::default();
                 proto.persona_id = Some("867051314767696".into());
                 proto
@@ -13430,7 +13433,7 @@ async fn bot_only_captures_group_bot_prompt_skips_plain() {
     let plain_msg = {
         let mut proto = wa::Message::default();
         proto.conversation = Some("hi".into());
-        proto.message_context_info = buffa::MessageField::some({
+        proto.message_context_info = waproto::protobuf::MessageField::some({
             let mut proto = wa::MessageContextInfo::default();
             proto.message_secret = Some(vec![0x01; 32]);
             proto
@@ -13466,15 +13469,15 @@ async fn bot_only_captures_group_bot_prompt_skips_plain() {
     });
     let bot_msg = {
         let mut proto = wa::Message::default();
-        proto.extended_text_message = buffa::MessageField::some({
+        proto.extended_text_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::ExtendedTextMessage::default();
             proto.text = Some("continue".into());
             proto
         });
-        proto.message_context_info = buffa::MessageField::some({
+        proto.message_context_info = waproto::protobuf::MessageField::some({
             let mut proto = wa::MessageContextInfo::default();
             proto.message_secret = Some(vec![0x02; 32]);
-            proto.bot_metadata = buffa::MessageField::some({
+            proto.bot_metadata = waproto::protobuf::MessageField::some({
                 let mut proto = wa::BotMetadata::default();
                 proto.persona_id = Some("867051314767696".into());
                 proto
@@ -13519,17 +13522,17 @@ async fn maybe_capture_inbound_msg_secret_keys_under_other_participant() {
     });
     let msg = {
         let mut proto = wa::Message::default();
-        proto.extended_text_message = buffa::MessageField::some({
+        proto.extended_text_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::ExtendedTextMessage::default();
             proto.text = Some("@MetaAI question".into());
-            proto.context_info = buffa::MessageField::some({
+            proto.context_info = waproto::protobuf::MessageField::some({
                 let mut proto = wa::ContextInfo::default();
                 proto.mentioned_jid = vec!["867051314767696@bot".into()];
                 proto
             });
             proto
         });
-        proto.message_context_info = buffa::MessageField::some({
+        proto.message_context_info = waproto::protobuf::MessageField::some({
             let mut proto = wa::MessageContextInfo::default();
             proto.message_secret = Some(vec![0x5A; 32]);
             proto
@@ -13700,7 +13703,7 @@ async fn mixed_msmsg_and_unknown_enc_still_decrypts_msmsg() {
         proto
     };
     let pt_bytes = {
-        use buffa::Message as _;
+        use waproto::protobuf::Message as _;
         let mut v = Vec::with_capacity(plaintext_msg.encoded_len() as usize);
         plaintext_msg.encode(&mut v);
         v
@@ -13806,7 +13809,7 @@ async fn msmsg_alternate_lookup_resolves_lid_to_stored_pn() {
         proto
     };
     let pt_bytes = {
-        use buffa::Message as _;
+        use waproto::protobuf::Message as _;
         let mut v = Vec::with_capacity(plaintext_msg.encoded_len() as usize);
         plaintext_msg.encode(&mut v);
         v
@@ -13896,7 +13899,7 @@ async fn fanout_capture_lets_subsequent_msmsg_decrypt() {
     let fanout_msg = {
         let mut proto = wa::Message::default();
         proto.conversation = Some("hi bot".into());
-        proto.message_context_info = buffa::MessageField::some({
+        proto.message_context_info = waproto::protobuf::MessageField::some({
             let mut proto = wa::MessageContextInfo::default();
             proto.message_secret = Some(secret.to_vec());
             proto
@@ -13931,7 +13934,7 @@ async fn fanout_capture_lets_subsequent_msmsg_decrypt() {
         proto
     };
     let pt_bytes = {
-        use buffa::Message as _;
+        use waproto::protobuf::Message as _;
         let mut v = Vec::with_capacity(plaintext_msg.encoded_len() as usize);
         plaintext_msg.encode(&mut v);
         v
@@ -14030,7 +14033,7 @@ async fn msmsg_outbound_put_and_inbound_get_match_for_lid_bot() {
         proto
     };
     let pt_bytes = {
-        use buffa::Message as _;
+        use waproto::protobuf::Message as _;
         let mut v = Vec::with_capacity(plaintext_msg.encoded_len() as usize);
         plaintext_msg.encode(&mut v);
         v
@@ -14130,7 +14133,7 @@ async fn a_bot_payload_is_forwarded_like_any_other_plaintext() {
         proto
     };
     let pt_bytes = {
-        use buffa::Message as _;
+        use waproto::protobuf::Message as _;
         let mut v = Vec::with_capacity(plaintext_msg.encoded_len() as usize);
         plaintext_msg.encode(&mut v);
         v
@@ -14215,7 +14218,7 @@ async fn msmsg_with_bot_device_suffix_round_trips() {
         proto
     };
     let pt_bytes = {
-        use buffa::Message as _;
+        use waproto::protobuf::Message as _;
         let mut v = Vec::with_capacity(plaintext_msg.encoded_len() as usize);
         plaintext_msg.encode(&mut v);
         v
@@ -14345,9 +14348,9 @@ async fn enc_reaction_inbound_decrypts_to_plaintext_shape() {
     };
     let msg = {
         let mut proto = wa::Message::default();
-        proto.enc_reaction_message = buffa::MessageField::some({
+        proto.enc_reaction_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::EncReactionMessage::default();
-            proto.target_message_key = buffa::MessageField::some(target_key.clone());
+            proto.target_message_key = waproto::protobuf::MessageField::some(target_key.clone());
             proto.enc_payload = Some(payload);
             proto.enc_iv = Some(iv.to_vec());
             proto
@@ -14424,14 +14427,14 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
 
     let body = {
         let mut proto = wa::Message::default();
-        proto.extended_text_message = buffa::MessageField::some({
+        proto.extended_text_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::ExtendedTextMessage::default();
             proto.text = Some("great post".to_string());
             proto
         }); // Present but secret-less: the outer secret must merge in, not be
         // dropped because a context already exists.
 
-        proto.message_context_info = buffa::MessageField::some(Default::default());
+        proto.message_context_info = waproto::protobuf::MessageField::some(Default::default());
         proto
     };
     let (payload, iv) = wacore::comment::encrypt_comment_with_secret(
@@ -14445,9 +14448,9 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
 
     let msg = {
         let mut proto = wa::Message::default();
-        proto.enc_comment_message = buffa::MessageField::some({
+        proto.enc_comment_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::EncCommentMessage::default();
-            proto.target_message_key = buffa::MessageField::some({
+            proto.target_message_key = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageKey::default();
                 proto.remote_jid = Some(group.to_string());
                 proto.from_me = Some(false);
@@ -14461,7 +14464,7 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
         }); // WA Web ships the comment's own secret on the OUTER envelope (the
         // comment msgData), not inside the encrypted body.
 
-        proto.message_context_info = buffa::MessageField::some({
+        proto.message_context_info = waproto::protobuf::MessageField::some({
             let mut proto = wa::MessageContextInfo::default();
             proto.message_secret = Some(comment_secret.to_vec());
             proto
@@ -14569,7 +14572,7 @@ async fn addon_decrypts_right_after_capture_without_flush() {
     let parent_msg = {
         let mut proto = wa::Message::default();
         proto.conversation = Some("hello".to_string());
-        proto.message_context_info = buffa::MessageField::some({
+        proto.message_context_info = waproto::protobuf::MessageField::some({
             let mut proto = wa::MessageContextInfo::default();
             proto.message_secret = Some(secret.to_vec());
             proto
@@ -16980,9 +16983,9 @@ async fn a_namespace_switch_mid_flight_is_seen_as_a_second_message() {
 
 mod pdo_alias_tests {
     use super::*;
-    use buffa::Message as _;
     use wacore::types::events::ChannelEventHandler;
     use wacore::types::message::MessageSource;
+    use waproto::protobuf::Message as _;
 
     const ID: &str = "SYNTHETIC_PDO_ALIAS";
     const PN: &str = "15550001001@s.whatsapp.net";
@@ -16995,11 +16998,11 @@ mod pdo_alias_tests {
         let mut quoted = wa::Message::default();
         quoted.conversation = Some("q".repeat(2500));
         let mut context = wa::ContextInfo::default();
-        context.quoted_message = buffa::MessageField::some(quoted);
+        context.quoted_message = waproto::protobuf::MessageField::some(quoted);
         let mut text = wa::message::ExtendedTextMessage::default();
         text.text = Some("r".repeat(2000));
-        text.context_info = buffa::MessageField::some(context);
-        message.extended_text_message = buffa::MessageField::some(text);
+        text.context_info = waproto::protobuf::MessageField::some(context);
+        message.extended_text_message = waproto::protobuf::MessageField::some(text);
         let encoded = waproto::codec::message_to_vec(&message);
         let expected = MessageDispatch::fingerprint_encoded(&encoded, false);
         let max = crate::test_alloc::min_max_block(6000, || {
@@ -17088,7 +17091,7 @@ mod pdo_alias_tests {
         for message in [wa::Message::default(), {
             let mut proto = wa::Message::default();
             proto.conversation = Some("synthetic nested message".into());
-            proto.location_message = buffa::MessageField::some({
+            proto.location_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::LocationMessage::default();
                 proto.degrees_latitude = Some(1.5);
                 proto.degrees_longitude = Some(-2.25);
@@ -17128,7 +17131,8 @@ mod pdo_alias_tests {
             proto
         };
         let mut carrier = base.clone();
-        carrier.sender_key_distribution_message = buffa::MessageField::some(skdm.clone());
+        carrier.sender_key_distribution_message =
+            waproto::protobuf::MessageField::some(skdm.clone());
         let expected = MessageDispatch::fingerprint(&base);
         assert_eq!(MessageDispatch::fingerprint(&carrier), expected);
         carrier
@@ -17152,7 +17156,7 @@ mod pdo_alias_tests {
         );
 
         carrier.fast_ratchet_key_sender_key_distribution_message =
-            buffa::MessageField::some(skdm.clone());
+            waproto::protobuf::MessageField::some(skdm.clone());
         assert_ne!(
             MessageDispatch::fingerprint(&carrier),
             expected,
@@ -17162,18 +17166,18 @@ mod pdo_alias_tests {
         inner_without_skdm.sender_key_distribution_message.take();
         let nested_without_skdm = {
             let mut proto = wa::Message::default();
-            proto.ephemeral_message = buffa::MessageField::some({
+            proto.ephemeral_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::FutureProofMessage::default();
-                proto.message = buffa::MessageField::some(inner_without_skdm);
+                proto.message = waproto::protobuf::MessageField::some(inner_without_skdm);
                 proto
             });
             proto
         };
         let nested = {
             let mut proto = wa::Message::default();
-            proto.ephemeral_message = buffa::MessageField::some({
+            proto.ephemeral_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::FutureProofMessage::default();
-                proto.message = buffa::MessageField::some(carrier);
+                proto.message = waproto::protobuf::MessageField::some(carrier);
                 proto
             });
             proto
@@ -17193,7 +17197,7 @@ mod pdo_alias_tests {
         let unknown_expected = MessageDispatch::truncate(Sha256::digest(&wire).into());
         assert_ne!(unknown_expected, expected);
         let mut carrier = base;
-        carrier.sender_key_distribution_message = buffa::MessageField::some(skdm);
+        carrier.sender_key_distribution_message = waproto::protobuf::MessageField::some(skdm);
         let mut encoded = waproto::codec::message_to_vec(&carrier);
         encoded.extend_from_slice(&[0xC0, 0x3E, 0x01]);
         assert_eq!(
@@ -17311,7 +17315,7 @@ mod pdo_alias_tests {
     ) -> wa::message::PeerDataOperationRequestResponseMessage {
         let web = {
             let mut proto = wa::WebMessageInfo::default();
-            proto.key = buffa::MessageField::some({
+            proto.key = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageKey::default();
                 proto.id = Some(info.id.to_string());
                 proto.remote_jid = Some(if info.source.is_group {
@@ -17323,18 +17327,20 @@ mod pdo_alias_tests {
                 proto.from_me = Some(info.source.is_from_me);
                 proto
             });
-            proto.message = buffa::MessageField::some(message);
+            proto.message = waproto::protobuf::MessageField::some(message);
             proto
         };
         {
             let mut proto = wa::message::PeerDataOperationRequestResponseMessage::default();
             proto.peer_data_operation_result = vec![{
                 let mut proto = wa::message::peer_data_operation_request_response_message::PeerDataOperationResult::default();
-                proto.placeholder_message_resend_response = buffa::MessageField::some({
-                    let mut proto = wa::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse::default();
-                    proto.web_message_info_bytes = Some(web.encode_to_vec());
-                    proto
-                });
+                proto.placeholder_message_resend_response = waproto::protobuf::MessageField::some(
+                    {
+                        let mut proto = wa::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse::default();
+                        proto.web_message_info_bytes = Some(web.encode_to_vec());
+                        proto
+                    },
+                );
                 proto
             }];
             proto
@@ -17479,7 +17485,7 @@ mod pdo_alias_tests {
             .await;
         retry_message(&client, &info, &{
             let mut proto = wa::Message::default();
-            proto.enc_reaction_message = buffa::MessageField::some(Default::default());
+            proto.enc_reaction_message = waproto::protobuf::MessageField::some(Default::default());
             proto
         })
         .await;
@@ -18193,9 +18199,9 @@ impl PdoRetryFixture {
     async fn configured(
         configure: impl FnOnce(crate::ClientBuilder) -> crate::ClientBuilder,
     ) -> Self {
-        use buffa::Message as _;
         use wacore::messages::{MessageUtils, wrap_device_sent};
         use wacore::types::events::ChannelEventHandler;
+        use waproto::protobuf::Message as _;
 
         let (client, transport) =
             capturing_client_configured("pdo_pairwise_retry", configure).await;
@@ -18282,7 +18288,7 @@ impl PdoRetryFixture {
             .await;
         let recovered = {
             let mut proto = wa::WebMessageInfo::default();
-            proto.key = buffa::MessageField::some({
+            proto.key = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageKey::default();
                 proto.remote_jid = Some(group.to_string());
                 proto.from_me = Some(true);
@@ -18290,7 +18296,7 @@ impl PdoRetryFixture {
                 proto.participant = Some(device.jid.to_non_ad().to_string());
                 proto
             });
-            proto.message = buffa::MessageField::some(message);
+            proto.message = waproto::protobuf::MessageField::some(message);
             proto
         };
         let response = {
@@ -18298,11 +18304,13 @@ impl PdoRetryFixture {
             proto.stanza_id = Some("SYNTHETIC_PDO_REQUEST".into());
             proto.peer_data_operation_result = vec![{
                 let mut proto = wa::message::peer_data_operation_request_response_message::PeerDataOperationResult::default();
-                proto.placeholder_message_resend_response = buffa::MessageField::some({
-                    let mut proto = wa::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse::default();
-                    proto.web_message_info_bytes = Some(recovered.encode_to_vec());
-                    proto
-                });
+                proto.placeholder_message_resend_response = waproto::protobuf::MessageField::some(
+                    {
+                        let mut proto = wa::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse::default();
+                        proto.web_message_info_bytes = Some(recovered.encode_to_vec());
+                        proto
+                    },
+                );
                 proto
             }];
             proto
@@ -18352,7 +18360,7 @@ impl PdoRetryFixture {
         receiver: &Jid,
         response: &wa::message::PeerDataOperationRequestResponseMessage,
     ) -> Arc<OwnedNodeRef> {
-        let ciphertext = phone.encrypt(&receiver.to_protocol_address(), &MessageUtils::encode_and_pad(&{ let mut proto_ = wa::Message::default(); proto_.protocol_message = buffa::MessageField::some({ let mut proto_ = wa::message::ProtocolMessage::default(); proto_.r#type = Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE); proto_.peer_data_operation_request_response_message = buffa::MessageField::some(response.clone()); proto_ }); proto_ })).await;
+        let ciphertext = phone.encrypt(&receiver.to_protocol_address(), &MessageUtils::encode_and_pad(&{ let mut proto_ = wa::Message::default(); proto_.protocol_message = waproto::protobuf::MessageField::some({ let mut proto_ = wa::message::ProtocolMessage::default(); proto_.r#type = Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE); proto_.peer_data_operation_request_response_message = waproto::protobuf::MessageField::some(response.clone()); proto_ }); proto_ })).await;
         let payload = enc_payload_from_ciphertext(&ciphertext);
         node_to_arc(
             NodeBuilder::new("message")
@@ -18413,8 +18421,8 @@ impl PdoRetryFixture {
 // event publication isolate SKDM from outer reporting and functional context.
 #[tokio::test]
 async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
-    use buffa::Message as _;
     use wacore::types::events::ChannelEventHandler;
+    use waproto::protobuf::Message as _;
 
     #[derive(Default)]
     struct Hook {
@@ -18506,7 +18514,7 @@ async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
             );
             let mut r1 = p.clone();
             if variant != 0 {
-                r1.sender_key_distribution_message = buffa::MessageField::some(skdm);
+                r1.sender_key_distribution_message = waproto::protobuf::MessageField::some(skdm);
             }
             let mut r2 = r1.clone();
             let mut rotated_chain_id = None;
@@ -18542,10 +18550,11 @@ async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
                             .axolotl_sender_key_distribution_message,
                         newer.axolotl_sender_key_distribution_message
                     );
-                    r2.sender_key_distribution_message = buffa::MessageField::some(newer);
+                    r2.sender_key_distribution_message =
+                        waproto::protobuf::MessageField::some(newer);
                 }
                 2 => {
-                    r2.message_context_info = buffa::MessageField::some({
+                    r2.message_context_info = waproto::protobuf::MessageField::some({
                         let mut proto = wa::MessageContextInfo::default();
                         proto.reporting_token_version = Some(2);
                         proto
@@ -18554,9 +18563,9 @@ async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
                 3 => r2.conversation = Some("distinct multipart body".into()),
                 4 => {
                     r2.conversation = None;
-                    r2.reaction_message = buffa::MessageField::some({
+                    r2.reaction_message = waproto::protobuf::MessageField::some({
                         let mut proto = wa::message::ReactionMessage::default();
-                        proto.key = buffa::MessageField::some({
+                        proto.key = waproto::protobuf::MessageField::some({
                             let mut proto = wa::MessageKey::default();
                             proto.remote_jid = Some(group.to_string());
                             proto.id = Some("REACTION_PARENT".into());
@@ -18568,16 +18577,16 @@ async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
                 }
                 5 => {
                     r2.conversation = None;
-                    r2.protocol_message = buffa::MessageField::some({
+                    r2.protocol_message = waproto::protobuf::MessageField::some({
                         let mut proto_ = wa::message::ProtocolMessage::default();
                         proto_.r#type = Some(wa::message::protocol_message::Type::MESSAGE_EDIT);
-                        proto_.key = buffa::MessageField::some({
+                        proto_.key = waproto::protobuf::MessageField::some({
                             let mut proto = wa::MessageKey::default();
                             proto.remote_jid = Some(group.to_string());
                             proto.id = Some("EDIT_PARENT".into());
                             proto
                         });
-                        proto_.edited_message = buffa::MessageField::some({
+                        proto_.edited_message = waproto::protobuf::MessageField::some({
                             let mut proto = wa::Message::default();
                             proto.conversation = Some("edited body".into());
                             proto
@@ -18586,7 +18595,7 @@ async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
                     });
                 }
                 6 => {
-                    r2.message_context_info = buffa::MessageField::some({
+                    r2.message_context_info = waproto::protobuf::MessageField::some({
                         let mut proto = wa::MessageContextInfo::default();
                         proto.message_secret = Some(vec![0xCD; 32]);
                         proto
@@ -18668,7 +18677,7 @@ async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
             );
             let recovered = {
                 let mut proto = wa::WebMessageInfo::default();
-                proto.key = buffa::MessageField::some({
+                proto.key = waproto::protobuf::MessageField::some({
                     let mut proto = wa::MessageKey::default();
                     proto.remote_jid = Some(group.to_string());
                     proto.from_me = Some(false);
@@ -18676,7 +18685,7 @@ async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
                     proto.participant = Some(sender.jid.to_non_ad().to_string());
                     proto
                 });
-                proto.message = buffa::MessageField::some(p);
+                proto.message = waproto::protobuf::MessageField::some(p);
                 proto
             };
             let response = {
@@ -18684,11 +18693,12 @@ async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
                 proto.stanza_id = Some(request_id);
                 proto.peer_data_operation_result = vec![{
                     let mut proto = wa::message::peer_data_operation_request_response_message::PeerDataOperationResult::default();
-                    proto.placeholder_message_resend_response = buffa::MessageField::some({
-                        let mut proto = wa::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse::default();
-                        proto.web_message_info_bytes = Some(recovered.encode_to_vec());
-                        proto
-                    });
+                    proto.placeholder_message_resend_response =
+                        waproto::protobuf::MessageField::some({
+                            let mut proto = wa::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse::default();
+                            proto.web_message_info_bytes = Some(recovered.encode_to_vec());
+                            proto
+                        });
                     proto
                 }];
                 proto
@@ -19078,7 +19088,7 @@ async fn pdo_retry_failed_commit_does_not_claim_recovery() {
 
 #[tokio::test]
 async fn pdo_retry_missing_recovered_content_does_not_claim() {
-    use buffa::Message as _;
+    use waproto::protobuf::Message as _;
     let fixture = PdoRetryFixture::new().await;
     let mut response = fixture.response.clone();
     let recovered = response.peer_data_operation_result[0]
@@ -19590,7 +19600,7 @@ async fn pdo_retry_publication_holds_new_skdm_receipt(teardown: bool) {
             &receiver.to_protocol_address(),
             &MessageUtils::encode_and_pad(&{
                 let mut proto = wa::Message::default();
-                proto.sender_key_distribution_message = buffa::MessageField::some(skdm);
+                proto.sender_key_distribution_message = waproto::protobuf::MessageField::some(skdm);
                 proto
             }),
         )
@@ -19708,7 +19718,7 @@ async fn pdo_retry_teardown_cannot_release_new_skdm_receipt() {
 
 #[tokio::test]
 async fn pdo_retry_unresolved_hook_copy_must_materialize_before_promotion() {
-    use buffa::Message as _;
+    use waproto::protobuf::Message as _;
     struct RecordingHook(std::sync::Mutex<Vec<Arc<wa::Message>>>);
     #[async_trait::async_trait]
     impl crate::types::durability_hook::InboundDurabilityHook for RecordingHook {
@@ -19755,9 +19765,9 @@ async fn pdo_retry_unresolved_hook_copy_must_materialize_before_promotion() {
     };
     let envelope = {
         let mut proto = wa::Message::default();
-        proto.enc_reaction_message = buffa::MessageField::some({
+        proto.enc_reaction_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::EncReactionMessage::default();
-            proto.target_message_key = buffa::MessageField::some(target.clone());
+            proto.target_message_key = waproto::protobuf::MessageField::some(target.clone());
             proto.enc_payload = Some(payload);
             proto.enc_iv = Some(iv.to_vec());
             proto
@@ -19772,11 +19782,11 @@ async fn pdo_retry_unresolved_hook_copy_must_materialize_before_promotion() {
     let mut web =
         waproto::codec::web_message_info_decode(recovered.web_message_info_bytes.as_ref().unwrap())
             .unwrap();
-    web.message = buffa::MessageField::some({
+    web.message = waproto::protobuf::MessageField::some({
         let mut proto = wa::Message::default();
-        proto.reaction_message = buffa::MessageField::some({
+        proto.reaction_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::ReactionMessage::default();
-            proto.key = buffa::MessageField::some(target);
+            proto.key = waproto::protobuf::MessageField::some(target);
             proto.text = Some(text.into());
             proto.sender_timestamp_ms = Some(1_700_000_000_000);
             proto
@@ -20308,7 +20318,7 @@ async fn suppressed_resend_still_installs_the_sender_key_it_carries() {
             &bob_addr,
             &MessageUtils::encode_and_pad(&{
                 let mut proto = wa::Message::default();
-                proto.sender_key_distribution_message = buffa::MessageField::some(skdm);
+                proto.sender_key_distribution_message = waproto::protobuf::MessageField::some(skdm);
                 proto
             }),
         )
@@ -20479,10 +20489,10 @@ async fn suppressed_key_request_resend_still_schedules_the_share() {
 
     let request = {
         let mut proto_ = wa::Message::default();
-        proto_.protocol_message = buffa::MessageField::some({
+        proto_.protocol_message = waproto::protobuf::MessageField::some({
             let mut proto_ = wa::message::ProtocolMessage::default();
             proto_.r#type = Some(wa::message::protocol_message::Type::AppStateSyncKeyRequest);
-            proto_.app_state_sync_key_request = buffa::MessageField::some({
+            proto_.app_state_sync_key_request = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::AppStateSyncKeyRequest::default();
                 proto.key_ids = vec![{
                     let mut proto = wa::message::AppStateSyncKeyId::default();
@@ -20637,9 +20647,9 @@ async fn an_unresolved_secret_envelope_is_not_claimed() {
     // what reaches the consumer is the envelope itself.
     let envelope = {
         let mut proto = wa::Message::default();
-        proto.enc_reaction_message = buffa::MessageField::some({
+        proto.enc_reaction_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::EncReactionMessage::default();
-            proto.target_message_key = buffa::MessageField::some({
+            proto.target_message_key = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageKey::default();
                 proto.id = Some("TARGET".into());
                 proto.remote_jid = Some(peer.to_string());
@@ -20777,9 +20787,9 @@ async fn a_malformed_secret_envelope_is_not_claimed() {
     // extraction rejects it while the consumer still gets only the envelope.
     let malformed = {
         let mut proto = wa::Message::default();
-        proto.enc_reaction_message = buffa::MessageField::some({
+        proto.enc_reaction_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::EncReactionMessage::default();
-            proto.target_message_key = buffa::MessageField::some({
+            proto.target_message_key = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageKey::default();
                 proto.id = Some("TARGET".into());
                 proto.remote_jid = Some(peer.to_string());
@@ -20975,17 +20985,17 @@ async fn a_suppressed_resend_still_captures_the_message_secret() {
 
     let with_secret = |forwarded: bool| {
         let mut proto = wa::Message::default();
-        proto.extended_text_message = buffa::MessageField::some({
+        proto.extended_text_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::ExtendedTextMessage::default();
             proto.text = Some("parent of a later reaction".into());
-            proto.context_info = buffa::MessageField::some({
+            proto.context_info = waproto::protobuf::MessageField::some({
                 let mut proto = wa::ContextInfo::default();
                 proto.is_forwarded = Some(forwarded);
                 proto
             });
             proto
         });
-        proto.message_context_info = buffa::MessageField::some({
+        proto.message_context_info = waproto::protobuf::MessageField::some({
             let mut proto = wa::MessageContextInfo::default();
             proto.message_secret = Some(vec![4; 32]);
             proto
@@ -21050,9 +21060,9 @@ async fn a_batch_keeps_the_resolved_copy_of_an_unresolved_envelope() {
 
     let envelope = {
         let mut proto = wa::Message::default();
-        proto.enc_reaction_message = buffa::MessageField::some({
+        proto.enc_reaction_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::EncReactionMessage::default();
-            proto.target_message_key = buffa::MessageField::some({
+            proto.target_message_key = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageKey::default();
                 proto.id = Some("TARGET".into());
                 proto.remote_jid = Some(peer.to_string());
@@ -21554,7 +21564,7 @@ async fn raw_pending_protocol_only_replay_allows_progress_without_publication() 
     let mut alice = AlicePeer::new("100000000000002@lid").await;
     let mut message = wa::Message::default();
     message.sender_key_distribution_message =
-        buffa::MessageField::some(alice.create_group_skdm(&group).await);
+        waproto::protobuf::MessageField::some(alice.create_group_skdm(&group).await);
     let info = group_message_info("RAW_PROTOCOL_ONLY", &group, &alice.jid, false);
     let producer = raw_pending::StanzaOrigin::new();
     let retention = &client.inbound_commit_batch.live_retention;
@@ -21616,7 +21626,7 @@ async fn raw_pending_protocol_only_backend_failure_keeps_replay_owned() {
     alice.install_bob_session(&address, &bundle).await;
     let mut message = wa::Message::default();
     message.sender_key_distribution_message =
-        buffa::MessageField::some(alice.create_group_skdm(&group).await);
+        waproto::protobuf::MessageField::some(alice.create_group_skdm(&group).await);
     let info = group_message_info("RAW_SKDM_BACKEND_FAILURE", &group, &alice.jid, false);
     let retention = &client.inbound_commit_batch.live_retention;
     let ciphertext = alice
@@ -21692,7 +21702,7 @@ async fn raw_pending_terminal_skdm_rejection_allows_corrected_resend() {
         alice.install_bob_session(&address, &bundle).await;
         let mut valid = wa::Message::default();
         valid.sender_key_distribution_message =
-            buffa::MessageField::some(alice.create_group_skdm(&group).await);
+            waproto::protobuf::MessageField::some(alice.create_group_skdm(&group).await);
         let mut invalid = valid.clone();
         invalid
             .sender_key_distribution_message
@@ -21848,7 +21858,7 @@ async fn raw_pending_mixed_skdm_failure_matrix_preserves_content() {
                 let mut message = wa::Message::default();
                 message.conversation = Some("content survives auxiliary failure".into());
                 message.sender_key_distribution_message =
-                    buffa::MessageField::some(alice.create_group_skdm(&group).await);
+                    waproto::protobuf::MessageField::some(alice.create_group_skdm(&group).await);
                 if terminal {
                     message
                         .sender_key_distribution_message
@@ -22442,7 +22452,7 @@ async fn raw_pending_fresh_drain_protocol_failure_retains_ratchet_advanced_plain
         let group: Jid = "120363000000000091@g.us".parse().unwrap();
         let mut message = wa::Message::default();
         message.sender_key_distribution_message =
-            buffa::MessageField::some(alice.create_group_skdm(&group).await);
+            waproto::protobuf::MessageField::some(alice.create_group_skdm(&group).await);
         let info = group_message_info("FRESH_DRAIN_SKDM_FAILURE", &group, &alice.jid, false);
         let ciphertext = alice
             .encrypt(&address, &MessageUtils::encode_and_pad(&message))
@@ -22590,7 +22600,7 @@ async fn raw_pending_group_plaintext_failure_blocks_shared_receipt_without_forwa
         .await;
     let mut protocol = wa::Message::default();
     protocol.sender_key_distribution_message =
-        buffa::MessageField::some(alice.create_group_skdm(&group).await);
+        waproto::protobuf::MessageField::some(alice.create_group_skdm(&group).await);
     let encrypted_group = alice
         .encrypt_group_message(&group, &MessageUtils::encode_and_pad(&protocol))
         .await;
@@ -22992,8 +23002,8 @@ async fn full_pending_journal_flush_recreation(novel_payload: bool) {
     let mut wrapper = wa::Message::default();
     let mut sent = wa::message::DeviceSentMessage::default();
     sent.destination_jid = Some("15550000001@s.whatsapp.net".into());
-    sent.message = buffa::MessageField::some(plaintext);
-    wrapper.device_sent_message = buffa::MessageField::some(sent);
+    sent.message = waproto::protobuf::MessageField::some(plaintext);
+    wrapper.device_sent_message = waproto::protobuf::MessageField::some(sent);
     let mut original = waproto::codec::message_to_vec(&wrapper);
     // Synthetic future bytes on the outer DSM, retained verbatim while the
     // user projection is its small inner message. No production capture.
@@ -23735,7 +23745,7 @@ fn live_admission_refusal_metrics_regression() {
 #[test]
 #[allow(clippy::disallowed_methods)]
 fn session_store_encoding_does_not_rebuild_skipped_key_arrays() {
-    use buffa::{Message as _, MessageField};
+    use waproto::protobuf::{Message as _, MessageField};
     let mut chain = wa::session_structure::Chain::default();
     let mut ratchet = vec![5];
     ratchet.extend_from_slice(&[0x11; 32]);

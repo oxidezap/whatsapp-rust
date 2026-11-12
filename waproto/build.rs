@@ -43,13 +43,10 @@ mod policy;
 #[path = "experiment/generate.rs"]
 mod experiment;
 
-#[cfg(feature = "protobuf-experiment")]
 #[path = "codegen/emit_owned.rs"]
 pub mod emit_owned;
-#[cfg(feature = "protobuf-experiment")]
 #[path = "codegen/project.rs"]
 pub mod project;
-#[cfg(feature = "protobuf-experiment")]
 #[path = "codegen/schema.rs"]
 pub mod schema;
 
@@ -137,8 +134,8 @@ fn main() -> std::io::Result<()> {
     emission::retain_wallpaper_fields(&mut fds)?;
     signal_storage::check(&names::wire_api(&fds))?;
 
-    #[cfg(feature = "protobuf-experiment")]
     {
+        #[cfg(feature = "protobuf-experiment")]
         experiment::generate(&fds, &out_path)?;
         let projected = project::project(&fds).map_err(std::io::Error::other)?;
         let source = emit_owned::generate(&projected, "crate::protobuf::generated::whatsapp")

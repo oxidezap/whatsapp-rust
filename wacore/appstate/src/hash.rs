@@ -541,27 +541,27 @@ mod tests {
         });
 
         let value = if let Some(b) = value_blob {
-            buffa::MessageField::some({
+            waproto::protobuf::MessageField::some({
                 let mut proto = wa::SyncdValue::default();
                 proto.blob = Some(b);
                 proto
             })
         } else {
-            buffa::MessageField::none()
+            waproto::protobuf::MessageField::none()
         };
 
         {
             let mut proto = wa::SyncdMutation::default();
             proto.operation = Some(operation.into());
-            proto.record = buffa::MessageField::some({
+            proto.record = waproto::protobuf::MessageField::some({
                 let mut proto = wa::SyncdRecord::default();
-                proto.index = buffa::MessageField::some({
+                proto.index = waproto::protobuf::MessageField::some({
                     let mut proto = wa::SyncdIndex::default();
                     proto.blob = Some(index_mac);
                     proto
                 });
                 proto.value = value;
-                proto.key_id = buffa::MessageField::some({
+                proto.key_id = waproto::protobuf::MessageField::some({
                     let mut proto = wa::KeyId::default();
                     proto.id = Some(b"test_key_id".to_vec());
                     proto
@@ -777,19 +777,19 @@ mod tests {
                 .map(|(operation, blob)| {
                     let mut proto = wa::SyncdMutation::default();
                     proto.operation = Some((*operation).into());
-                    proto.record = buffa::MessageField::some({
+                    proto.record = waproto::protobuf::MessageField::some({
                         let mut proto = wa::SyncdRecord::default();
-                        proto.index = buffa::MessageField::some({
+                        proto.index = waproto::protobuf::MessageField::some({
                             let mut proto = wa::SyncdIndex::default();
                             proto.blob = Some(vec![0u8; 32]);
                             proto
                         });
-                        proto.value = buffa::MessageField::some({
+                        proto.value = waproto::protobuf::MessageField::some({
                             let mut proto = wa::SyncdValue::default();
                             proto.blob = Some(hex::decode(blob).expect("vector hex"));
                             proto
                         });
-                        proto.key_id = buffa::MessageField::some({
+                        proto.key_id = waproto::protobuf::MessageField::some({
                             let mut proto = wa::KeyId::default();
                             proto.id = Some(b"test_key_id".to_vec());
                             proto
@@ -1025,7 +1025,7 @@ mod tests {
         blob.extend_from_slice(value_mac);
         {
             let mut proto = wa::SyncdRecord::default();
-            proto.value = buffa::MessageField::some({
+            proto.value = waproto::protobuf::MessageField::some({
                 let mut proto = wa::SyncdValue::default();
                 proto.blob = Some(blob);
                 proto
@@ -1039,17 +1039,17 @@ mod tests {
         blob.extend_from_slice(value_mac);
         {
             let mut proto = wa::SyncdRecord::default();
-            proto.index = buffa::MessageField::some({
+            proto.index = waproto::protobuf::MessageField::some({
                 let mut proto = wa::SyncdIndex::default();
                 proto.blob = Some(index_mac.to_vec());
                 proto
             });
-            proto.value = buffa::MessageField::some({
+            proto.value = waproto::protobuf::MessageField::some({
                 let mut proto = wa::SyncdValue::default();
                 proto.blob = Some(blob);
                 proto
             });
-            proto.key_id = buffa::MessageField::some({
+            proto.key_id = waproto::protobuf::MessageField::some({
                 let mut proto = wa::KeyId::default();
                 proto.id = Some(b"test_key_id".to_vec());
                 proto
@@ -1312,17 +1312,17 @@ mod tests {
     fn vector_record(index: Option<&str>, value: &str) -> wa::SyncdRecord {
         {
             let mut proto = wa::SyncdRecord::default();
-            proto.index = buffa::MessageField::some({
+            proto.index = waproto::protobuf::MessageField::some({
                 let mut proto = wa::SyncdIndex::default();
                 proto.blob = index.map(hex_to_bytes);
                 proto
             });
-            proto.value = buffa::MessageField::some({
+            proto.value = waproto::protobuf::MessageField::some({
                 let mut proto = wa::SyncdValue::default();
                 proto.blob = Some(hex_to_bytes(value));
                 proto
             });
-            proto.key_id = buffa::MessageField::some({
+            proto.key_id = waproto::protobuf::MessageField::some({
                 let mut proto = wa::KeyId::default();
                 proto.id = Some(b"unit-3".to_vec());
                 proto
@@ -1643,19 +1643,19 @@ mod tests {
             proto.mutations = vec![{
                 let mut proto = wa::SyncdMutation::default();
                 proto.operation = Some(wa::syncd_mutation::SyncdOperation::SET.into());
-                proto.record = buffa::MessageField::some({
+                proto.record = waproto::protobuf::MessageField::some({
                     let mut proto = wa::SyncdRecord::default();
-                    proto.index = buffa::MessageField::some({
+                    proto.index = waproto::protobuf::MessageField::some({
                         let mut proto = wa::SyncdIndex::default();
                         proto.blob = Some(vec![0u8; 32]);
                         proto
                     });
-                    proto.value = buffa::MessageField::some({
+                    proto.value = waproto::protobuf::MessageField::some({
                         let mut proto = wa::SyncdValue::default();
                         proto.blob = Some(hex_to_bytes(BLOB));
                         proto
                     });
-                    proto.key_id = buffa::MessageField::some({
+                    proto.key_id = waproto::protobuf::MessageField::some({
                         let mut proto = wa::KeyId::default();
                         proto.id = Some(b"conformance".to_vec());
                         proto

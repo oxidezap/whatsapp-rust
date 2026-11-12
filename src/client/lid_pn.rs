@@ -2669,7 +2669,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_lid_migration_mapping_sync_learns_and_migrates_with_prop() {
-        use buffa::Message as _;
+        use waproto::protobuf::Message as _;
         use waproto::whatsapp as wa;
 
         let client: Arc<Client> = create_test_client().await;
@@ -2789,7 +2789,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_lid_migration_mapping_sync_prefers_latest_lid() {
-        use buffa::Message as _;
+        use waproto::protobuf::Message as _;
         use waproto::whatsapp as wa;
 
         let client: Arc<Client> = create_test_client().await;

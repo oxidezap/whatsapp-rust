@@ -1726,7 +1726,7 @@ async fn fanout_group_epoch_for_generation(
     let raw_epoch = Zeroizing::new(rand::random::<[u8; 32]>().to_vec());
     let mut message = {
         let mut proto = wa::Message::default();
-        proto.call = buffa::MessageField::some({
+        proto.call = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::Call::default();
             proto.call_key = Some(raw_epoch.to_vec());
             proto
@@ -1938,7 +1938,7 @@ fn encode_call_key(call_key: &[u8]) -> Vec<u8> {
     let mut message = wa::Message::default();
     let mut call = wa::message::Call::default();
     call.call_key = Some(call_key.to_vec());
-    message.call = buffa::MessageField::some(call);
+    message.call = waproto::protobuf::MessageField::some(call);
     MessageUtils::encode_and_pad(&message)
 }
 

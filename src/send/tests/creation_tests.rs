@@ -563,7 +563,7 @@ async fn malformed_raw_inputs_fail_before_wire_and_debug_has_negative_controls()
         recipient_fanout: None,
         message: Arc::new({
             let mut proto = wa::Message::default();
-            proto.message_context_info = buffa::MessageField::some({
+            proto.message_context_info = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageContextInfo::default();
                 proto.message_secret = Some(vec![177; 32]);
                 proto

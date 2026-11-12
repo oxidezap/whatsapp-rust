@@ -4939,8 +4939,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::disallowed_methods)]
     async fn retry_key_bundle_validates_hosted_adv_before_installing_session() {
-        use buffa::Message;
         use wacore::adv::test_util;
+        use waproto::protobuf::Message;
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let account = KeyPair::generate(&mut rng);
         let device = KeyPair::generate(&mut rng);
@@ -5766,7 +5766,7 @@ mod tests {
 
         let msg = {
             let mut proto = wa::Message::default();
-            proto.extended_text_message = buffa::MessageField::some({
+            proto.extended_text_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ExtendedTextMessage::default();
                 proto.text = Some("status text".to_string());
                 proto

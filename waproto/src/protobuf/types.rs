@@ -3,6 +3,27 @@
 use super::{DecodeError, EncodeSink, encoding};
 use bytes::Buf;
 
+#[inline]
+pub fn int32_encoded_len(value: i32) -> usize {
+    encoding::varint_len(value as i64 as u64)
+}
+
+#[inline]
+pub fn encode_int32(value: i32, output: &mut impl EncodeSink) {
+    encoding::put_varint(value as i64 as u64, output);
+}
+
+#[inline]
+pub fn bytes_encoded_len(value: &[u8]) -> usize {
+    encoding::varint_len(value.len() as u64) + value.len()
+}
+
+#[inline]
+pub fn encode_bytes(value: &[u8], output: &mut impl EncodeSink) {
+    encoding::put_varint(value.len() as u64, output);
+    output.put_slice(value);
+}
+
 pub fn decode_bytes(input: &mut impl Buf) -> Result<Vec<u8>, DecodeError> {
     let length = usize::try_from(encoding::decode_varint(input)?)
         .map_err(|_| DecodeError::MessageTooLarge)?;

@@ -215,7 +215,7 @@ impl AudioOptions {
 pub fn image_message(upload: UploadResponse, opts: ImageOptions) -> wa::Message {
     {
         let mut proto = wa::Message::default();
-        proto.image_message = buffa::MessageField::some({
+        proto.image_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::ImageMessage::default();
             proto.url = Some(upload.url);
             proto.direct_path = Some(upload.direct_path);
@@ -229,7 +229,7 @@ pub fn image_message(upload: UploadResponse, opts: ImageOptions) -> wa::Message 
             proto.jpeg_thumbnail = opts.jpeg_thumbnail;
             proto.context_info = opts
                 .context_info
-                .map(|ci| buffa::MessageField::some(*ci))
+                .map(|ci| waproto::protobuf::MessageField::some(*ci))
                 .unwrap_or_default();
             proto
         });
@@ -242,7 +242,7 @@ pub fn image_message(upload: UploadResponse, opts: ImageOptions) -> wa::Message 
 pub fn video_message(upload: UploadResponse, opts: VideoOptions) -> wa::Message {
     {
         let mut proto = wa::Message::default();
-        proto.video_message = buffa::MessageField::some({
+        proto.video_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::VideoMessage::default();
             proto.url = Some(upload.url);
             proto.direct_path = Some(upload.direct_path);
@@ -259,7 +259,7 @@ pub fn video_message(upload: UploadResponse, opts: VideoOptions) -> wa::Message 
             proto.gif_playback = opts.gif_playback;
             proto.context_info = opts
                 .context_info
-                .map(|ci| buffa::MessageField::some(*ci))
+                .map(|ci| waproto::protobuf::MessageField::some(*ci))
                 .unwrap_or_default();
             proto
         });
@@ -271,7 +271,7 @@ pub fn video_message(upload: UploadResponse, opts: VideoOptions) -> wa::Message 
 pub fn document_message(upload: UploadResponse, opts: DocumentOptions) -> wa::Message {
     {
         let mut proto = wa::Message::default();
-        proto.document_message = buffa::MessageField::some({
+        proto.document_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::DocumentMessage::default();
             proto.url = Some(upload.url);
             proto.direct_path = Some(upload.direct_path);
@@ -291,7 +291,7 @@ pub fn document_message(upload: UploadResponse, opts: DocumentOptions) -> wa::Me
             proto.jpeg_thumbnail = opts.jpeg_thumbnail;
             proto.context_info = opts
                 .context_info
-                .map(|ci| buffa::MessageField::some(*ci))
+                .map(|ci| waproto::protobuf::MessageField::some(*ci))
                 .unwrap_or_default();
             proto
         });
@@ -304,7 +304,7 @@ pub fn document_message(upload: UploadResponse, opts: DocumentOptions) -> wa::Me
 pub fn audio_message(upload: UploadResponse, opts: AudioOptions) -> wa::Message {
     {
         let mut proto = wa::Message::default();
-        proto.audio_message = buffa::MessageField::some({
+        proto.audio_message = waproto::protobuf::MessageField::some({
             let mut proto = wa::message::AudioMessage::default();
             proto.url = Some(upload.url);
             proto.direct_path = Some(upload.direct_path);
@@ -323,7 +323,7 @@ pub fn audio_message(upload: UploadResponse, opts: AudioOptions) -> wa::Message 
             proto.waveform = opts.waveform;
             proto.context_info = opts
                 .context_info
-                .map(|ci| buffa::MessageField::some(*ci))
+                .map(|ci| waproto::protobuf::MessageField::some(*ci))
                 .unwrap_or_default();
             proto
         });

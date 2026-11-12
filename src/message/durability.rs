@@ -526,8 +526,8 @@ mod tests {
         let mut inner = wa::Message::default();
         inner.conversation = Some("synthetic DSM delivery".into());
         let mut dsm = wa::message::DeviceSentMessage::default();
-        dsm.message = buffa::MessageField::some(inner);
-        message.device_sent_message = buffa::MessageField::some(dsm);
+        dsm.message = waproto::protobuf::MessageField::some(inner);
+        message.device_sent_message = waproto::protobuf::MessageField::some(dsm);
         raw_origin_fixture("raw_dsm", message, true).await;
     }
 
@@ -539,8 +539,8 @@ mod tests {
         protocol.r#type = Some(wa::message::protocol_message::Type::HISTORY_SYNC_NOTIFICATION);
         let mut history = wa::message::HistorySyncNotification::default();
         history.initial_hist_bootstrap_inline_payload = Some(vec![7; 128]);
-        protocol.history_sync_notification = buffa::MessageField::some(history);
-        message.protocol_message = buffa::MessageField::some(protocol);
+        protocol.history_sync_notification = waproto::protobuf::MessageField::some(history);
+        message.protocol_message = waproto::protobuf::MessageField::some(protocol);
         // A peer history notification is detached but rejected by the self-only
         // gate, so this fixture cannot download or acknowledge real history.
         raw_origin_fixture("raw_history", message, false).await;

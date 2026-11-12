@@ -813,22 +813,24 @@ mod group_direct_tests {
         for message in [
             {
                 let mut proto = wa::Message::default();
-                proto.message_history_bundle = buffa::MessageField::some(Default::default());
+                proto.message_history_bundle =
+                    waproto::protobuf::MessageField::some(Default::default());
                 proto
             },
             {
                 let mut proto = wa::Message::default();
-                proto.message_history_notice = buffa::MessageField::some(Default::default());
+                proto.message_history_notice =
+                    waproto::protobuf::MessageField::some(Default::default());
                 proto
             },
             {
                 let mut proto = wa::Message::default();
-                proto.ephemeral_message = buffa::MessageField::some({
+                proto.ephemeral_message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::FutureProofMessage::default();
-                    proto.message = buffa::MessageField::some({
+                    proto.message = waproto::protobuf::MessageField::some({
                         let mut proto = wa::Message::default();
                         proto.message_history_bundle =
-                            buffa::MessageField::some(Default::default());
+                            waproto::protobuf::MessageField::some(Default::default());
                         proto
                     });
                     proto
@@ -837,12 +839,12 @@ mod group_direct_tests {
             },
             {
                 let mut proto = wa::Message::default();
-                proto.edited_message = buffa::MessageField::some({
+                proto.edited_message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::FutureProofMessage::default();
-                    proto.message = buffa::MessageField::some({
+                    proto.message = waproto::protobuf::MessageField::some({
                         let mut proto = wa::Message::default();
                         proto.message_history_bundle =
-                            buffa::MessageField::some(Default::default());
+                            waproto::protobuf::MessageField::some(Default::default());
                         proto
                     });
                     proto
@@ -851,12 +853,12 @@ mod group_direct_tests {
             },
             {
                 let mut proto = wa::Message::default();
-                proto.bot_task_message = buffa::MessageField::some({
+                proto.bot_task_message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::FutureProofMessage::default();
-                    proto.message = buffa::MessageField::some({
+                    proto.message = waproto::protobuf::MessageField::some({
                         let mut proto = wa::Message::default();
                         proto.message_history_bundle =
-                            buffa::MessageField::some(Default::default());
+                            waproto::protobuf::MessageField::some(Default::default());
                         proto
                     });
                     proto
@@ -865,30 +867,32 @@ mod group_direct_tests {
             },
             {
                 let mut proto = wa::Message::default();
-                proto.newsletter_admin_profile_status_message = buffa::MessageField::some({
-                    let mut proto = wa::message::FutureProofMessage::default();
-                    proto.message = buffa::MessageField::some({
-                        let mut proto = wa::Message::default();
-                        proto.message_history_bundle =
-                            buffa::MessageField::some(Default::default());
+                proto.newsletter_admin_profile_status_message =
+                    waproto::protobuf::MessageField::some({
+                        let mut proto = wa::message::FutureProofMessage::default();
+                        proto.message = waproto::protobuf::MessageField::some({
+                            let mut proto = wa::Message::default();
+                            proto.message_history_bundle =
+                                waproto::protobuf::MessageField::some(Default::default());
+                            proto
+                        });
                         proto
                     });
-                    proto
-                });
                 proto
             },
             {
                 let mut proto = wa::Message::default();
-                proto.bot_platform_registration_success_message = buffa::MessageField::some({
-                    let mut proto = wa::message::FutureProofMessage::default();
-                    proto.message = buffa::MessageField::some({
-                        let mut proto = wa::Message::default();
-                        proto.message_history_bundle =
-                            buffa::MessageField::some(Default::default());
+                proto.bot_platform_registration_success_message =
+                    waproto::protobuf::MessageField::some({
+                        let mut proto = wa::message::FutureProofMessage::default();
+                        proto.message = waproto::protobuf::MessageField::some({
+                            let mut proto = wa::Message::default();
+                            proto.message_history_bundle =
+                                waproto::protobuf::MessageField::some(Default::default());
+                            proto
+                        });
                         proto
                     });
-                    proto
-                });
                 proto
             },
         ] {
@@ -1381,9 +1385,9 @@ fn build_revoke_message(
 ) -> wa::Message {
     {
         let mut proto_ = wa::Message::default();
-        proto_.protocol_message = buffa::MessageField::some({
+        proto_.protocol_message = waproto::protobuf::MessageField::some({
             let mut proto_ = wa::message::ProtocolMessage::default();
-            proto_.key = buffa::MessageField::some({
+            proto_.key = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageKey::default();
                 proto.remote_jid = Some(remote_jid.to_string());
                 proto.from_me = Some(from_me);
@@ -1454,9 +1458,9 @@ pub(crate) fn build_edit_message(
 ) -> wa::Message {
     {
         let mut proto_ = wa::Message::default();
-        proto_.protocol_message = buffa::MessageField::some({
+        proto_.protocol_message = waproto::protobuf::MessageField::some({
             let mut proto_ = wa::message::ProtocolMessage::default();
-            proto_.key = buffa::MessageField::some({
+            proto_.key = waproto::protobuf::MessageField::some({
                 let mut proto = wa::MessageKey::default();
                 proto.remote_jid = Some(remote_jid.to_string());
                 proto.from_me = Some(true);
@@ -1465,7 +1469,7 @@ pub(crate) fn build_edit_message(
                 proto
             });
             proto_.r#type = Some(wa::message::protocol_message::Type::MessageEdit);
-            proto_.edited_message = buffa::MessageField::some(new_content);
+            proto_.edited_message = waproto::protobuf::MessageField::some(new_content);
             proto_.timestamp_ms = Some(timestamp_ms);
             proto_
         });
@@ -4286,10 +4290,10 @@ mod tests {
         let target_id = "3EB0REVOKETARGET";
         let revoke = {
             let mut proto_ = wa::Message::default();
-            proto_.protocol_message = buffa::MessageField::some({
+            proto_.protocol_message = waproto::protobuf::MessageField::some({
                 let mut proto_ = wa::message::ProtocolMessage::default();
                 proto_.r#type = Some(wa::message::protocol_message::Type::Revoke);
-                proto_.key = buffa::MessageField::some({
+                proto_.key = waproto::protobuf::MessageField::some({
                     let mut proto = wa::MessageKey::default();
                     proto.id = Some(target_id.into());
                     proto
@@ -4324,10 +4328,10 @@ mod tests {
         let post = wa::Message::default();
         let revoke = {
             let mut proto_ = wa::Message::default();
-            proto_.protocol_message = buffa::MessageField::some({
+            proto_.protocol_message = waproto::protobuf::MessageField::some({
                 let mut proto_ = wa::message::ProtocolMessage::default();
                 proto_.r#type = Some(wa::message::protocol_message::Type::Revoke);
-                proto_.key = buffa::MessageField::some({
+                proto_.key = waproto::protobuf::MessageField::some({
                     let mut proto = wa::MessageKey::default();
                     proto.id = Some("TARGET".into());
                     proto
@@ -4339,7 +4343,7 @@ mod tests {
         let reaction = {
             let mut proto = wa::Message::default();
             proto.reaction_message =
-                buffa::MessageField::some(wa::message::ReactionMessage::default());
+                waproto::protobuf::MessageField::some(wa::message::ReactionMessage::default());
             proto
         };
         let content =
@@ -4677,9 +4681,9 @@ mod tests {
         let err = client
             .send_message(to, {
                 let mut proto = wa::Message::default();
-                proto.reaction_message = buffa::MessageField::some({
+                proto.reaction_message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::ReactionMessage::default();
-                    proto.key = buffa::MessageField::some({
+                    proto.key = waproto::protobuf::MessageField::some({
                         let mut proto = wa::MessageKey::default();
                         proto.remote_jid = Some("status@broadcast".into());
                         proto.from_me = Some(false);
@@ -4708,9 +4712,9 @@ mod tests {
         let err = client
             .send_message(to, {
                 let mut proto = wa::Message::default();
-                proto.reaction_message = buffa::MessageField::some({
+                proto.reaction_message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::ReactionMessage::default();
-                    proto.key = buffa::MessageField::some({
+                    proto.key = waproto::protobuf::MessageField::some({
                         let mut proto = wa::MessageKey::default();
                         proto.remote_jid = Some("status@broadcast".into());
                         proto.from_me = Some(false);
@@ -6186,11 +6190,11 @@ mod tests {
     /// therefore resolves nothing and emits nothing.
     #[tokio::test]
     async fn a_lid_group_repair_finds_a_missed_device_through_the_maps() {
-        use buffa::Message as _;
         use std::collections::HashMap;
         use wacore::client::context::GroupRoutingInfo;
         use wacore::store::traits::{DeviceInfo, DeviceListRecord};
         use wacore_binary::builder::NodeBuilder;
+        use waproto::protobuf::Message as _;
 
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
         client
@@ -7421,7 +7425,8 @@ mod tests {
         fn pin_returns_edit_attribute() {
             let msg = {
                 let mut proto = wa::Message::default();
-                proto.pin_in_chat_message = buffa::MessageField::some(Default::default());
+                proto.pin_in_chat_message =
+                    waproto::protobuf::MessageField::some(Default::default());
                 proto
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -7433,7 +7438,8 @@ mod tests {
         fn poll_creation_v3_returns_meta_node() {
             let msg = {
                 let mut proto = wa::Message::default();
-                proto.poll_creation_message_v3 = buffa::MessageField::some(Default::default());
+                proto.poll_creation_message_v3 =
+                    waproto::protobuf::MessageField::some(Default::default());
                 proto
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -7451,7 +7457,7 @@ mod tests {
         fn event_returns_meta_node() {
             let msg = {
                 let mut proto = wa::Message::default();
-                proto.event_message = buffa::MessageField::some(Default::default());
+                proto.event_message = waproto::protobuf::MessageField::some(Default::default());
                 proto
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -7509,7 +7515,8 @@ mod tests {
         fn poll_creation_v1_returns_meta_node() {
             let msg = {
                 let mut proto = wa::Message::default();
-                proto.poll_creation_message = buffa::MessageField::some(Default::default());
+                proto.poll_creation_message =
+                    waproto::protobuf::MessageField::some(Default::default());
                 proto
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -7527,7 +7534,8 @@ mod tests {
         fn poll_creation_v2_returns_meta_node() {
             let msg = {
                 let mut proto = wa::Message::default();
-                proto.poll_creation_message_v2 = buffa::MessageField::some(Default::default());
+                proto.poll_creation_message_v2 =
+                    waproto::protobuf::MessageField::some(Default::default());
                 proto
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -7545,9 +7553,10 @@ mod tests {
         fn poll_vote_returns_meta_node() {
             let msg = {
                 let mut proto = wa::Message::default();
-                proto.poll_update_message = buffa::MessageField::some({
+                proto.poll_update_message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::PollUpdateMessage::default();
-                    proto.vote = buffa::MessageField::some(wa::message::PollEncValue::default());
+                    proto.vote =
+                        waproto::protobuf::MessageField::some(wa::message::PollEncValue::default());
                     proto
                 });
                 proto
@@ -7564,7 +7573,7 @@ mod tests {
         fn view_once_image_emits_view_once_meta() {
             let msg = {
                 let mut proto = wa::Message::default();
-                proto.image_message = buffa::MessageField::some({
+                proto.image_message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::ImageMessage::default();
                     proto.view_once = Some(true);
                     proto
@@ -7585,7 +7594,7 @@ mod tests {
             let msg = {
                 let mut proto = wa::Message::default();
                 proto.image_message =
-                    buffa::MessageField::some(wa::message::ImageMessage::default());
+                    waproto::protobuf::MessageField::some(wa::message::ImageMessage::default());
                 proto
             };
             assert!(infer_stanza_metadata(&msg).1.is_none());
@@ -7595,7 +7604,8 @@ mod tests {
         fn event_response_returns_meta_node() {
             let msg = {
                 let mut proto = wa::Message::default();
-                proto.enc_event_response_message = buffa::MessageField::some(Default::default());
+                proto.enc_event_response_message =
+                    waproto::protobuf::MessageField::some(Default::default());
                 proto
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -7613,8 +7623,9 @@ mod tests {
         fn poll_update_without_vote_returns_none() {
             let msg = {
                 let mut proto = wa::Message::default();
-                proto.poll_update_message =
-                    buffa::MessageField::some(wa::message::PollUpdateMessage::default());
+                proto.poll_update_message = waproto::protobuf::MessageField::some(
+                    wa::message::PollUpdateMessage::default(),
+                );
                 proto
             };
             let (edit, node) = infer_stanza_metadata(&msg);
@@ -7626,7 +7637,7 @@ mod tests {
         fn revoked_reaction_returns_sender_revoke() {
             let msg = {
                 let mut proto = wa::Message::default();
-                proto.reaction_message = buffa::MessageField::some({
+                proto.reaction_message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::ReactionMessage::default();
                     proto.text = Some(String::new());
                     proto
@@ -7641,9 +7652,9 @@ mod tests {
         fn keep_in_chat_undo_returns_sender_revoke() {
             let msg = {
                 let mut proto = wa::Message::default();
-                proto.keep_in_chat_message = buffa::MessageField::some({
+                proto.keep_in_chat_message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::KeepInChatMessage::default();
-                    proto.key = buffa::MessageField::some({
+                    proto.key = waproto::protobuf::MessageField::some({
                         let mut proto = wa::MessageKey::default();
                         proto.from_me = Some(true);
                         proto
@@ -7661,7 +7672,7 @@ mod tests {
         fn secret_encrypted_message_edit_returns_message_edit() {
             let msg = {
                 let mut proto = wa::Message::default();
-                proto.secret_encrypted_message = buffa::MessageField::some({
+                proto.secret_encrypted_message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::SecretEncryptedMessage::default();
                     proto.secret_enc_type =
                         Some(wa::message::secret_encrypted_message::SecretEncType::MessageEdit);
@@ -7679,7 +7690,7 @@ mod tests {
             // meta node both fire: `event_type=edit` meta + `edit="1"` attr.
             let msg = {
                 let mut proto = wa::Message::default();
-                proto.secret_encrypted_message = buffa::MessageField::some({
+                proto.secret_encrypted_message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::SecretEncryptedMessage::default();
                     proto.secret_enc_type =
                         Some(wa::message::secret_encrypted_message::SecretEncType::EventEdit);
@@ -7700,9 +7711,9 @@ mod tests {
         fn top_level_edited_message_returns_message_edit() {
             let msg = {
                 let mut proto = wa::Message::default();
-                proto.edited_message = buffa::MessageField::some({
+                proto.edited_message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::FutureProofMessage::default();
-                    proto.message = buffa::MessageField::some(wa::Message::default());
+                    proto.message = waproto::protobuf::MessageField::some(wa::Message::default());
                     proto
                 });
                 proto
@@ -7776,7 +7787,7 @@ mod tests {
         fn msg_with_native_flow_button(button_name: &str) -> wa::Message {
             {
                 let mut proto = wa::Message::default();
-                proto.interactive_message = buffa::MessageField::some({
+                proto.interactive_message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::InteractiveMessage::default();
                     proto.interactive_message = Some(
                         interactive_message::InteractiveMessage::NativeFlowMessage(Box::new({
@@ -7945,7 +7956,7 @@ mod tests {
         fn carousel_msg(im: wa::message::InteractiveMessage) -> wa::Message {
             {
                 let mut proto = wa::Message::default();
-                proto.interactive_message = buffa::MessageField::some({
+                proto.interactive_message = waproto::protobuf::MessageField::some({
                     let mut proto = im;
                     proto.interactive_message = Some(
                         interactive_message::InteractiveMessage::CarouselMessage(Default::default()),
@@ -7956,8 +7967,8 @@ mod tests {
             }
         }
 
-        fn body(text: &str) -> buffa::MessageField<interactive_message::Body> {
-            buffa::MessageField::some({
+        fn body(text: &str) -> waproto::protobuf::MessageField<interactive_message::Body> {
+            waproto::protobuf::MessageField::some({
                 let mut proto = interactive_message::Body::default();
                 proto.text = Some(text.to_string());
                 proto
@@ -7984,7 +7995,7 @@ mod tests {
         fn carousel_envelope_variants_emit_mixed_biz() {
             let title = carousel_msg({
                 let mut proto = wa::message::InteractiveMessage::default();
-                proto.header = buffa::MessageField::some({
+                proto.header = waproto::protobuf::MessageField::some({
                     let mut proto = interactive_message::Header::default();
                     proto.title = Some("Our menu".into());
                     proto
@@ -7999,7 +8010,7 @@ mod tests {
 
             let footer = carousel_msg({
                 let mut proto = wa::message::InteractiveMessage::default();
-                proto.footer = buffa::MessageField::some({
+                proto.footer = waproto::protobuf::MessageField::some({
                     let mut proto = interactive_message::Footer::default();
                     proto.text = Some("tap to order".into());
                     proto
@@ -8014,7 +8025,7 @@ mod tests {
 
             let image = carousel_msg({
                 let mut proto = wa::message::InteractiveMessage::default();
-                proto.header = buffa::MessageField::some({
+                proto.header = waproto::protobuf::MessageField::some({
                     let mut proto = interactive_message::Header::default();
                     proto.media = Some(interactive_message::header::Media::ImageMessage(
                         Default::default(),
@@ -8053,7 +8064,7 @@ mod tests {
         fn shop_storefront_returns_none() {
             let msg = {
                 let mut proto = wa::Message::default();
-                proto.interactive_message = buffa::MessageField::some({
+                proto.interactive_message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::InteractiveMessage::default();
                     proto.body = body("visit our shop");
                     proto.interactive_message = Some(
@@ -8073,7 +8084,7 @@ mod tests {
         fn interactive_without_native_flow_returns_none() {
             let msg = {
                 let mut proto = wa::Message::default();
-                proto.interactive_message = buffa::MessageField::some({
+                proto.interactive_message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::InteractiveMessage::default();
                     proto.interactive_message =
                         Some(interactive_message::InteractiveMessage::CollectionMessage(
@@ -8091,7 +8102,7 @@ mod tests {
         fn native_flow_without_buttons_returns_none() {
             let msg = {
                 let mut proto = wa::Message::default();
-                proto.interactive_message = buffa::MessageField::some({
+                proto.interactive_message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::InteractiveMessage::default();
                     proto.interactive_message = Some(
                         interactive_message::InteractiveMessage::NativeFlowMessage(Box::new({
@@ -8114,7 +8125,7 @@ mod tests {
         fn button_without_name_returns_none() {
             let msg = {
                 let mut proto = wa::Message::default();
-                proto.interactive_message = buffa::MessageField::some({
+                proto.interactive_message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::InteractiveMessage::default();
                     proto.interactive_message = Some(
                         interactive_message::InteractiveMessage::NativeFlowMessage(Box::new({
@@ -8143,7 +8154,7 @@ mod tests {
         fn document_with_caption_wrapper() {
             let inner = {
                 let mut proto = wa::Message::default();
-                proto.interactive_message = buffa::MessageField::some({
+                proto.interactive_message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::InteractiveMessage::default();
                     proto.interactive_message = Some(
                         interactive_message::InteractiveMessage::NativeFlowMessage(Box::new({
@@ -8165,9 +8176,9 @@ mod tests {
             };
             let msg = {
                 let mut proto = wa::Message::default();
-                proto.document_with_caption_message = buffa::MessageField::some({
+                proto.document_with_caption_message = waproto::protobuf::MessageField::some({
                     let mut proto = wa::message::FutureProofMessage::default();
-                    proto.message = buffa::MessageField::some(inner);
+                    proto.message = waproto::protobuf::MessageField::some(inner);
                     proto
                 });
                 proto
@@ -8184,10 +8195,10 @@ mod tests {
         fn wrapped_interactive_messages_keep_their_biz_node() {
             fn future_proof(
                 inner: wa::Message,
-            ) -> buffa::MessageField<wa::message::FutureProofMessage> {
+            ) -> waproto::protobuf::MessageField<wa::message::FutureProofMessage> {
                 let mut proto = wa::message::FutureProofMessage::default();
-                proto.message = buffa::MessageField::some(inner);
-                buffa::MessageField::some(proto)
+                proto.message = waproto::protobuf::MessageField::some(inner);
+                waproto::protobuf::MessageField::some(proto)
             }
 
             let inner = || msg_with_native_flow_button("quick_reply");
@@ -8216,10 +8227,10 @@ mod tests {
         fn wrappers_nested_in_either_order_keep_their_biz_node() {
             fn future_proof(
                 inner: wa::Message,
-            ) -> buffa::MessageField<wa::message::FutureProofMessage> {
+            ) -> waproto::protobuf::MessageField<wa::message::FutureProofMessage> {
                 let mut proto = wa::message::FutureProofMessage::default();
-                proto.message = buffa::MessageField::some(inner);
-                buffa::MessageField::some(proto)
+                proto.message = waproto::protobuf::MessageField::some(inner);
+                waproto::protobuf::MessageField::some(proto)
             }
 
             let mut ephemeral = wa::Message::default();
@@ -8972,15 +8983,16 @@ mod tests {
     fn pdo_request_message(request_type: wa::message::PeerDataOperationRequestType) -> wa::Message {
         {
             let mut proto_ = wa::Message::default();
-            proto_.protocol_message = buffa::MessageField::some({
+            proto_.protocol_message = waproto::protobuf::MessageField::some({
                 let mut proto_ = wa::message::ProtocolMessage::default();
                 proto_.r#type =
                     Some(wa::message::protocol_message::Type::PeerDataOperationRequestMessage);
-                proto_.peer_data_operation_request_message = buffa::MessageField::some({
-                    let mut proto = wa::message::PeerDataOperationRequestMessage::default();
-                    proto.peer_data_operation_request_type = Some(request_type);
-                    proto
-                });
+                proto_.peer_data_operation_request_message =
+                    waproto::protobuf::MessageField::some({
+                        let mut proto = wa::message::PeerDataOperationRequestMessage::default();
+                        proto.peer_data_operation_request_type = Some(request_type);
+                        proto
+                    });
                 proto_
             });
             proto_
@@ -9411,7 +9423,7 @@ mod tests {
     /// and a text edit carries no mediatype.
     #[test]
     fn build_newsletter_edit_node_emits_plaintext_edit() {
-        use buffa::Message as _;
+        use waproto::protobuf::Message as _;
         let to: Jid = "120363000000000001@newsletter".parse().unwrap();
         let content = {
             let mut proto = wa::Message::default();
@@ -9447,7 +9459,7 @@ mod tests {
         let to: Jid = "120363000000000001@newsletter".parse().unwrap();
         let content = {
             let mut proto = wa::Message::default();
-            proto.image_message = buffa::MessageField::some({
+            proto.image_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ImageMessage::default();
                 proto.caption = Some("new caption".to_string());
                 proto
@@ -9853,9 +9865,9 @@ mod tests {
 
         let reaction = {
             let mut proto = wa::Message::default();
-            proto.reaction_message = buffa::MessageField::some({
+            proto.reaction_message = waproto::protobuf::MessageField::some({
                 let mut proto = wa::message::ReactionMessage::default();
-                proto.key = buffa::MessageField::some({
+                proto.key = waproto::protobuf::MessageField::some({
                     let mut proto = wa::MessageKey::default();
                     proto.remote_jid = Some(Jid::status_broadcast().to_string());
                     proto.from_me = Some(false);
@@ -9898,7 +9910,7 @@ mod tests {
                 peer_pn.clone(),
                 {
                     let mut proto = wa::Message::default();
-                    proto.extended_text_message = buffa::MessageField::some({
+                    proto.extended_text_message = waproto::protobuf::MessageField::some({
                         let mut proto = wa::message::ExtendedTextMessage::default();
                         proto.text = Some("hi".into());
                         proto
@@ -10444,7 +10456,7 @@ mod tests {
             let expected = {
                 let mut proto = wa::Message::default();
                 proto.conversation = Some(ids[original].into());
-                proto.message_context_info = buffa::MessageField::some({
+                proto.message_context_info = waproto::protobuf::MessageField::some({
                     let mut proto = wa::MessageContextInfo::default();
                     proto.message_secret =
                         Some(snapshots[original].message_secret.unwrap().to_vec());
@@ -10477,8 +10489,8 @@ mod tests {
 
     #[tokio::test]
     async fn forced_refresh_cold_send_uses_one_snapshot_for_skdm_phash_and_waiter() {
-        use buffa::Message;
         use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+        use waproto::protobuf::Message;
         let fixture = GroupSendFixture::with_addressing(AddressingMode::Pn, 1).await;
         let mut refreshed = fixture.member.clone();
         refreshed.device = 2;
@@ -10891,10 +10903,10 @@ mod tests {
 
             let revoke = {
                 let mut proto_ = wa::Message::default();
-                proto_.protocol_message = buffa::MessageField::some({
+                proto_.protocol_message = waproto::protobuf::MessageField::some({
                     let mut proto_ = wa::message::ProtocolMessage::default();
                     proto_.r#type = Some(wa::message::protocol_message::Type::REVOKE);
-                    proto_.key = buffa::MessageField::some({
+                    proto_.key = waproto::protobuf::MessageField::some({
                         let mut proto = wa::MessageKey::default();
                         proto.remote_jid = Some(if wrong_chat {
                             "120363000000000099@g.us".into()
@@ -10913,10 +10925,10 @@ mod tests {
             let incoming = if from_self {
                 {
                     let mut proto = wa::Message::default();
-                    proto.device_sent_message = buffa::MessageField::some({
+                    proto.device_sent_message = waproto::protobuf::MessageField::some({
                         let mut proto = wa::message::DeviceSentMessage::default();
                         proto.destination_jid = Some(fixture.group.to_string());
-                        proto.message = buffa::MessageField::some(revoke);
+                        proto.message = waproto::protobuf::MessageField::some(revoke);
                         proto
                     });
                     proto

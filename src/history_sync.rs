@@ -1222,10 +1222,10 @@ fn push_unique_sender(senders: &mut HistorySecretSenders, sender: Jid) {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
-    use buffa::Message as ProtoMessage;
     use flate2::{Compression, write::ZlibEncoder};
     use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use waproto::protobuf::Message as ProtoMessage;
     use waproto::whatsapp as wa;
     use waproto::whatsapp::message::HistorySyncNotification;
 
@@ -2673,9 +2673,9 @@ mod tests {
                 proto_value.id = chat.into();
                 proto_value.messages = vec![{
                     let mut proto_value = wa::HistorySyncMsg::default();
-                    proto_value.message = buffa::MessageField::some({
+                    proto_value.message = waproto::protobuf::MessageField::some({
                         let mut proto_value = wa::WebMessageInfo::default();
-                        proto_value.key = buffa::MessageField::some({
+                        proto_value.key = waproto::protobuf::MessageField::some({
                             let mut proto_value = wa::MessageKey::default();
                             proto_value.remote_jid = Some(chat.to_string());
                             proto_value.from_me = Some(false);
@@ -2683,7 +2683,7 @@ mod tests {
                             proto_value.participant = None;
                             proto_value
                         });
-                        proto_value.message = buffa::MessageField::some({
+                        proto_value.message = waproto::protobuf::MessageField::some({
                             let mut proto_value = wa::Message::default();
                             proto_value.conversation = Some("historical".to_string());
                             proto_value
@@ -2837,9 +2837,9 @@ mod tests {
                 proto_value.id = chat.into();
                 proto_value.messages = vec![{
                     let mut proto_value = wa::HistorySyncMsg::default();
-                    proto_value.message = buffa::MessageField::some({
+                    proto_value.message = waproto::protobuf::MessageField::some({
                         let mut proto_value = wa::WebMessageInfo::default();
-                        proto_value.key = buffa::MessageField::some({
+                        proto_value.key = waproto::protobuf::MessageField::some({
                             let mut proto_value = wa::MessageKey::default();
                             proto_value.remote_jid = Some(chat.to_string());
                             proto_value.from_me = Some(false);
@@ -2847,7 +2847,7 @@ mod tests {
                             proto_value.participant = None;
                             proto_value
                         });
-                        proto_value.message = buffa::MessageField::some({
+                        proto_value.message = waproto::protobuf::MessageField::some({
                             let mut proto_value = wa::Message::default();
                             proto_value.conversation = Some("bot historical".to_string());
                             proto_value
@@ -2898,8 +2898,9 @@ mod tests {
         let message = if is_poll {
             {
                 let mut proto_value = wa::Message::default();
-                proto_value.poll_creation_message =
-                    buffa::MessageField::some(wa::message::PollCreationMessage::default());
+                proto_value.poll_creation_message = waproto::protobuf::MessageField::some(
+                    wa::message::PollCreationMessage::default(),
+                );
                 proto_value
             }
         } else {
@@ -2911,9 +2912,9 @@ mod tests {
         };
         {
             let mut proto_value = wa::HistorySyncMsg::default();
-            proto_value.message = buffa::MessageField::some({
+            proto_value.message = waproto::protobuf::MessageField::some({
                 let mut proto_value = wa::WebMessageInfo::default();
-                proto_value.key = buffa::MessageField::some({
+                proto_value.key = waproto::protobuf::MessageField::some({
                     let mut proto_value = wa::MessageKey::default();
                     proto_value.remote_jid = Some(chat.to_string());
                     proto_value.from_me = Some(false);
@@ -2921,7 +2922,7 @@ mod tests {
                     proto_value.participant = None;
                     proto_value
                 });
-                proto_value.message = buffa::MessageField::some(message);
+                proto_value.message = waproto::protobuf::MessageField::some(message);
                 proto_value.message_secret = Some(secret.to_vec());
                 proto_value.message_timestamp = Some(ts_secs);
                 proto_value
@@ -3199,7 +3200,7 @@ mod tests {
     ) -> wa::HistorySyncMsg {
         let message_context_info = bot_prompt.then(|| {
             let mut proto_value = wa::MessageContextInfo::default();
-            proto_value.bot_metadata = buffa::MessageField::some({
+            proto_value.bot_metadata = waproto::protobuf::MessageField::some({
                 let mut proto_value = wa::BotMetadata::default();
                 proto_value.persona_id = Some("867051314767696".into());
                 proto_value
@@ -3208,9 +3209,9 @@ mod tests {
         });
         {
             let mut proto_value = wa::HistorySyncMsg::default();
-            proto_value.message = buffa::MessageField::some({
+            proto_value.message = waproto::protobuf::MessageField::some({
                 let mut proto_value = wa::WebMessageInfo::default();
-                proto_value.key = buffa::MessageField::some({
+                proto_value.key = waproto::protobuf::MessageField::some({
                     let mut proto_value = wa::MessageKey::default();
                     proto_value.remote_jid = Some(chat.to_string());
                     proto_value.from_me = Some(false);
@@ -3218,9 +3219,9 @@ mod tests {
                     proto_value.participant = Some(participant.to_string());
                     proto_value
                 });
-                proto_value.message = buffa::MessageField::some({
+                proto_value.message = waproto::protobuf::MessageField::some({
                     let mut proto_value = wa::Message::default();
-                    proto_value.extended_text_message = buffa::MessageField::some({
+                    proto_value.extended_text_message = waproto::protobuf::MessageField::some({
                         let mut proto_value = wa::message::ExtendedTextMessage::default();
                         proto_value.text = Some("hi".into());
                         proto_value

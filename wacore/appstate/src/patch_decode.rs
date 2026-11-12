@@ -318,8 +318,8 @@ fn parse_collection_error_ref(
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
-    use buffa::Message;
     use wacore_binary::builder::NodeBuilder;
+    use waproto::protobuf::Message;
 
     /// Every collection, in an order no caller uses, so the ranks and not the
     /// input decide the result.
@@ -402,7 +402,7 @@ mod tests {
     fn patch_bytes(version: u64) -> Vec<u8> {
         waproto::codec::syncd_patch_to_vec(&{
             let mut proto = wa::SyncdPatch::default();
-            proto.version = buffa::MessageField::some({
+            proto.version = waproto::protobuf::MessageField::some({
                 let mut proto = wa::SyncdVersion::default();
                 proto.version = Some(version);
                 proto

@@ -543,8 +543,8 @@ impl MessageDispatch {
     /// another protobuf sink (the latter costs an entire encode tree).
     #[inline(never)]
     pub(crate) fn fingerprint_encoded(encoded: &[u8], has_skdm: bool) -> DispatchFingerprint {
-        use buffa::encoding::{Tag, WireType, skip_field_depth};
         use sha2::{Digest, Sha256};
+        use waproto::protobuf::encoding::{Tag, WireType, skip_field_depth};
         if !has_skdm {
             return Self::truncate(Sha256::digest(encoded).into());
         }
@@ -555,7 +555,7 @@ impl MessageDispatch {
             let Ok(tag) = Tag::decode(&mut remaining) else {
                 return Self::truncate(Sha256::digest(encoded).into());
             };
-            if skip_field_depth(tag, &mut remaining, buffa::RECURSION_LIMIT).is_err() {
+            if skip_field_depth(tag, &mut remaining, waproto::protobuf::RECURSION_LIMIT).is_err() {
                 // A malformed encoding cannot justify discarding bytes.
                 return Self::truncate(Sha256::digest(encoded).into());
             }

@@ -349,9 +349,9 @@ impl Session {
                         .step_by(LANES)
                         .map(|i| {
                             let mut proto_value = wa::HistorySyncMsg::default();
-                            proto_value.message = buffa::MessageField::some({
+                            proto_value.message = waproto::protobuf::MessageField::some({
                                 let mut proto_value = wa::WebMessageInfo::default();
-                                proto_value.key = buffa::MessageField::some({
+                                proto_value.key = waproto::protobuf::MessageField::some({
                                     let mut proto_value = wa::MessageKey::default();
                                     proto_value.remote_jid = Some(group.to_string());
                                     proto_value.from_me = Some(false);
@@ -359,7 +359,7 @@ impl Session {
                                     proto_value.participant = Some(peer_jid.to_string());
                                     proto_value
                                 });
-                                proto_value.message = buffa::MessageField::some({
+                                proto_value.message = waproto::protobuf::MessageField::some({
                                     let mut proto_value = wa::Message::default();
                                     proto_value.conversation = Some(text.clone());
                                     proto_value
@@ -864,7 +864,7 @@ impl Wire {
                 ))?;
                 let response = waproto::codec::handshake_message_to_vec(&{
                     let mut proto_value = wa::HandshakeMessage::default();
-                    proto_value.server_hello = buffa::MessageField::some({
+                    proto_value.server_hello = waproto::protobuf::MessageField::some({
                         let mut proto_addition = wa::handshake_message::ServerHello::default();
                         proto_addition.ephemeral = Some(ephemeral_pub.to_vec());
                         proto_addition.r#static = Some(encrypted_static);

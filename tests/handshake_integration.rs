@@ -28,12 +28,12 @@
 #![allow(clippy::disallowed_methods)]
 
 use async_trait::async_trait;
-use buffa::Message;
 use bytes::Bytes;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicU32;
 use std::time::Duration;
+use waproto::protobuf::Message;
 
 use wacore::handshake::NoiseHandshake;
 use wacore::libsignal::protocol::KeyPair;
@@ -158,7 +158,7 @@ async fn xx_serve_hello_only(
 
     let server_hello = {
         let mut proto = wa::HandshakeMessage::default();
-        proto.server_hello = buffa::MessageField::some({
+        proto.server_hello = waproto::protobuf::MessageField::some({
             let mut proto = wa::handshake_message::ServerHello::default();
             proto.ephemeral = Some(server_eph_pub.to_vec());
             proto.r#static = Some(encrypted_static);
@@ -209,7 +209,7 @@ async fn xx_serve_full(
 
     let server_hello = {
         let mut proto = wa::HandshakeMessage::default();
-        proto.server_hello = buffa::MessageField::some({
+        proto.server_hello = waproto::protobuf::MessageField::some({
             let mut proto = wa::handshake_message::ServerHello::default();
             proto.ephemeral = Some(server_eph_pub.to_vec());
             proto.r#static = Some(encrypted_static);
@@ -276,7 +276,7 @@ async fn ik_serve_accept(
 
     let server_hello = {
         let mut proto = wa::HandshakeMessage::default();
-        proto.server_hello = buffa::MessageField::some({
+        proto.server_hello = waproto::protobuf::MessageField::some({
             let mut proto = wa::handshake_message::ServerHello::default();
             proto.ephemeral = Some(server_eph_pub.to_vec());
             proto.r#static = None;
@@ -672,7 +672,7 @@ async fn ik_serve_fallback_with_corrupt_payloads(
 
     let server_hello = {
         let mut proto = wa::HandshakeMessage::default();
-        proto.server_hello = buffa::MessageField::some({
+        proto.server_hello = waproto::protobuf::MessageField::some({
             let mut proto = wa::handshake_message::ServerHello::default();
             proto.ephemeral = Some(server_eph_pub.to_vec());
             proto.r#static = Some(vec![0xCC; 32 + 16]);
@@ -988,7 +988,7 @@ async fn ik_serve_force_fallback(
 
     let server_hello = {
         let mut proto = wa::HandshakeMessage::default();
-        proto.server_hello = buffa::MessageField::some({
+        proto.server_hello = waproto::protobuf::MessageField::some({
             let mut proto = wa::handshake_message::ServerHello::default();
             proto.ephemeral = Some(server_eph_pub.to_vec());
             proto.r#static = Some(encrypted_static);
@@ -1129,7 +1129,7 @@ async fn ik_with_stale_cache_invalidates_and_increments_counter() {
     let bogus_server_eph_bytes: [u8; 32] = *bogus_server_eph.public_key_bytes();
     let server_hello = {
         let mut proto = wa::HandshakeMessage::default();
-        proto.server_hello = buffa::MessageField::some({
+        proto.server_hello = waproto::protobuf::MessageField::some({
             let mut proto = wa::handshake_message::ServerHello::default();
             proto.ephemeral = Some(bogus_server_eph_bytes.to_vec());
             proto.r#static = None; // `payload` here is just garbage — AEAD MAC check will fail.

@@ -299,7 +299,7 @@ impl<'a> Profile<'a> {
 
         let value = {
             let mut proto = wa::SyncActionValue::default();
-            proto.push_name_setting = buffa::MessageField::some({
+            proto.push_name_setting = waproto::protobuf::MessageField::some({
                 let mut proto = wa::sync_action_value::PushNameSetting::default();
                 proto.name = Some(name.to_string());
                 proto

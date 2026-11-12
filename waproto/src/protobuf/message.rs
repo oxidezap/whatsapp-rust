@@ -1,4 +1,7 @@
 #![forbid(unsafe_code)]
+// Trait defaults and their codec tests are the implementation, not downstream
+// instantiations. Application callers still use the pinned codec entry points.
+#![allow(clippy::disallowed_methods)]
 
 use super::{
     DecodeContext, DecodeError, DecodeOptions, DefaultInstance, EncodeError, EncodeSink,

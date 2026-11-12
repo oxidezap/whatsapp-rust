@@ -84,7 +84,7 @@ fn verify_cert_step(
 #[derive(Debug, Error)]
 pub enum HandshakeError {
     #[error("Protobuf decoding error: {0}")]
-    ProtoDecode(#[from] buffa::DecodeError),
+    ProtoDecode(#[from] waproto::protobuf::DecodeError),
     #[error("Handshake response is missing required parts")]
     IncompleteResponse,
     #[error("Crypto operation failed: {0}")]
@@ -139,7 +139,7 @@ impl HandshakeUtils {
     pub fn build_client_hello(ephemeral_key: &[u8]) -> HandshakeMessage {
         {
             let mut proto = HandshakeMessage::default();
-            proto.client_hello = buffa::MessageField::some({
+            proto.client_hello = waproto::protobuf::MessageField::some({
                 let mut proto = wa::handshake_message::ClientHello::default();
                 proto.ephemeral = Some(ephemeral_key.to_vec());
                 proto
@@ -157,7 +157,7 @@ impl HandshakeUtils {
     ) -> HandshakeMessage {
         {
             let mut proto = HandshakeMessage::default();
-            proto.client_hello = buffa::MessageField::some({
+            proto.client_hello = waproto::protobuf::MessageField::some({
                 let mut proto = wa::handshake_message::ClientHello::default();
                 proto.ephemeral = Some(ephemeral_key.to_vec());
                 proto.r#static = Some(encrypted_static);
@@ -336,7 +336,7 @@ impl HandshakeUtils {
     ) -> HandshakeMessage {
         {
             let mut proto = HandshakeMessage::default();
-            proto.client_finish = buffa::MessageField::some({
+            proto.client_finish = waproto::protobuf::MessageField::some({
                 let mut proto = wa::handshake_message::ClientFinish::default();
                 proto.r#static = Some(encrypted_pubkey);
                 proto.payload = Some(encrypted_payload);
@@ -838,8 +838,8 @@ impl XxFallbackHandshakeState {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
-    use buffa::Message;
     use wacore_binary::consts::WA_CONN_HEADER;
+    use waproto::protobuf::Message;
     use waproto::whatsapp as wa;
 
     /// A self-contained Noise responder used to exercise the initiator-side
@@ -909,7 +909,7 @@ mod tests {
 
         let server_hello = {
             let mut proto = HandshakeMessage::default();
-            proto.server_hello = buffa::MessageField::some({
+            proto.server_hello = waproto::protobuf::MessageField::some({
                 let mut proto = wa::handshake_message::ServerHello::default();
                 proto.ephemeral = Some(server_eph_pub.to_vec());
                 proto.r#static = Some(encrypted_static);
@@ -1002,7 +1002,7 @@ mod tests {
 
         let server_hello = {
             let mut proto = HandshakeMessage::default();
-            proto.server_hello = buffa::MessageField::some({
+            proto.server_hello = waproto::protobuf::MessageField::some({
                 let mut proto = wa::handshake_message::ServerHello::default();
                 proto.ephemeral = Some(server_eph_pub.to_vec());
                 proto.r#static = None;
@@ -1056,7 +1056,7 @@ mod tests {
 
         let server_hello = {
             let mut proto = HandshakeMessage::default();
-            proto.server_hello = buffa::MessageField::some({
+            proto.server_hello = waproto::protobuf::MessageField::some({
                 let mut proto = wa::handshake_message::ServerHello::default();
                 proto.ephemeral = Some(server_eph_pub.to_vec());
                 proto.r#static = Some(encrypted_static);

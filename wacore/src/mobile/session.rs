@@ -49,7 +49,7 @@ pub enum MobileSessionError {
     #[error("mobile server certificate has expired")]
     ExpiredCertificate,
     #[error("{0}")]
-    Protobuf(#[from] buffa::DecodeError),
+    Protobuf(#[from] waproto::protobuf::DecodeError),
     #[error("{0}")]
     Noise(#[from] HandshakeError),
 }
@@ -219,7 +219,7 @@ impl MobileLoginProfile {
         }
         let mut user_agent = cp::UserAgent::default();
         user_agent.platform = Some(platform.to_protobuf());
-        user_agent.app_version = buffa::MessageField::some(version.to_protobuf());
+        user_agent.app_version = waproto::protobuf::MessageField::some(version.to_protobuf());
         user_agent.manufacturer = Some(device.manufacturer);
         user_agent.device = Some(device.device);
         user_agent.os_version = Some(device.os_version);
@@ -265,7 +265,7 @@ impl MobileLoginProfile {
         }
         let mut payload = wa::ClientPayload::default();
         payload.username = Some(username);
-        payload.user_agent = buffa::MessageField::some(self.user_agent.clone());
+        payload.user_agent = waproto::protobuf::MessageField::some(self.user_agent.clone());
         payload.passive = options.passive;
         payload.pull = options.pull;
         payload.device = options.device;
@@ -280,10 +280,10 @@ impl MobileLoginProfile {
         payload.product = options.product;
         payload.year_class = options.year_class;
         payload.mem_class = options.mem_class;
-        payload.dns_source = options
-            .dns_source
-            .clone()
-            .map_or_else(buffa::MessageField::default, buffa::MessageField::some);
+        payload.dns_source = options.dns_source.clone().map_or_else(
+            waproto::protobuf::MessageField::default,
+            waproto::protobuf::MessageField::some,
+        );
         payload.traffic_anonymization = options.traffic_anonymization;
         payload.connection_sequence_info = options.connection_sequence_info;
         payload.lid_db_migrated = options.lid_db_migrated;
@@ -1003,7 +1003,7 @@ mod tests {
         server_hello.ephemeral = Some(server_ephemeral.public_key.public_key_bytes().to_vec());
         server_hello.r#static = Some(encrypted_static);
         server_hello.payload = Some(encrypted_certificate);
-        response.server_hello = buffa::MessageField::some(server_hello);
+        response.server_hello = waproto::protobuf::MessageField::some(server_hello);
         (
             waproto::codec::handshake_message_to_vec(&response),
             peer,
@@ -1117,7 +1117,7 @@ mod tests {
             server.ephemeral = Some(low_order.to_vec());
             server.r#static = Some(vec![0; 48]);
             server.payload = Some(vec![0; 16]);
-            message.server_hello = buffa::MessageField::some(server);
+            message.server_hello = waproto::protobuf::MessageField::some(server);
             assert!(matches!(
                 client
                     .receive_server_hello(&waproto::codec::handshake_message_to_vec(&message), 100),
@@ -1148,7 +1148,7 @@ mod tests {
             server.ephemeral = Some(ephemeral.public_key.public_key_bytes().to_vec());
             server.r#static = Some(peer.encrypt(&low_order).unwrap());
             server.payload = Some(vec![0; 16]);
-            message.server_hello = buffa::MessageField::some(server);
+            message.server_hello = waproto::protobuf::MessageField::some(server);
             assert!(matches!(
                 client
                     .receive_server_hello(&waproto::codec::handshake_message_to_vec(&message), 100),

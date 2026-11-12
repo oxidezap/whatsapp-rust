@@ -243,7 +243,7 @@ fn explicit_platform_variants(source: &str) -> std::collections::BTreeSet<String
 
 #[test]
 fn platform_mapping_covers_every_generated_variant() {
-    use buffa::Enumeration;
+    use waproto::protobuf::Enumeration;
     use waproto::whatsapp::device_props::PlatformType;
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../wacore/src/companion_reg.rs");
     let source = match std::fs::read_to_string(path) {

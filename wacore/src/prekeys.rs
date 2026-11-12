@@ -1,10 +1,10 @@
 use crate::libsignal::protocol::{IdentityKey, PreKeyBundle, PreKeyId, PublicKey, SignedPreKeyId};
-use buffa::MessageView as _;
 use std::collections::HashMap;
 use wacore_binary::CompactString;
 use wacore_binary::Jid;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Node, NodeRef};
+use waproto::protobuf::MessageView as _;
 
 /// A device the server refused to hand a bundle for, named individually.
 #[derive(Debug, Clone)]
@@ -515,7 +515,7 @@ mod tests {
 
     #[test]
     fn extract_prekey_public_key_matches_full_decode_validation() {
-        use buffa::Message;
+        use waproto::protobuf::Message;
         let public_key = vec![0x05u8; 33];
         let record = {
             let mut proto_ = waproto::whatsapp::PreKeyRecordStructure::default();
@@ -567,7 +567,7 @@ mod tests {
     }
 
     fn mock_certificate() -> Vec<u8> {
-        use buffa::Message;
+        use waproto::protobuf::Message;
         let account = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
         crate::adv::test_util::signed_identity(
             &account,
@@ -860,7 +860,7 @@ mod tests {
     #[test]
     fn prekey_fetch_validates_mixed_and_hosted_adv_chains() {
         use crate::adv::test_util;
-        use buffa::Message;
+        use waproto::protobuf::Message;
         use waproto::whatsapp as wa;
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let account = KeyPair::generate(&mut rng);
@@ -977,7 +977,7 @@ mod tests {
 
     /// Encode an ADVSignedDeviceIdentity without the account_signature_key field.
     fn trimmed_device_identity(account: &KeyPair, device: &KeyPair, details: &[u8]) -> Vec<u8> {
-        use buffa::Message;
+        use waproto::protobuf::Message;
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let identity = device.public_key.public_key_bytes();
         let account_key = account.public_key.public_key_bytes();

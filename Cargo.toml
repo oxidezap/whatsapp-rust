@@ -289,7 +289,6 @@ async-lock = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bon = { workspace = true }
-buffa = { workspace = true }
 bytes = { workspace = true }
 # `now` rather than `clock`: only `Utc::now()` is used, and `clock` exists to
 # resolve the local timezone (pulling iana-time-zone and its per-OS backends).

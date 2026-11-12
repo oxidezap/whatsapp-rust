@@ -25,7 +25,7 @@ async fn replacing_status_privacy_releases_the_assembled_copy() {
     );
     let first = {
         let mut proto = wa::sync_action_value::StatusPrivacyAction::default();
-        proto.mode = Some(buffa::EnumValue::Unknown(99));
+        proto.mode = Some(waproto::protobuf::EnumValue::Unknown(99));
         proto.user_jid = vec!["120363000000000042@lid".into()];
         proto
     };
@@ -52,7 +52,7 @@ async fn replacing_status_privacy_releases_the_assembled_copy() {
 
     let second = {
         let mut proto = wa::sync_action_value::StatusPrivacyAction::default();
-        proto.mode = Some(buffa::EnumValue::Unknown(100));
+        proto.mode = Some(waproto::protobuf::EnumValue::Unknown(100));
         proto
     };
     persistence_manager

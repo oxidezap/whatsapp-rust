@@ -245,7 +245,7 @@ async fn serve_noise_handshake(
     let encrypted_payload = noise.encrypt(&cert_chain)?;
     let server_hello = {
         let mut proto = wa::HandshakeMessage::default();
-        proto.server_hello = buffa::MessageField::some({
+        proto.server_hello = waproto::protobuf::MessageField::some({
             let mut proto = wa::handshake_message::ServerHello::default();
             proto.ephemeral = Some(server_eph_pub.to_vec());
             proto.r#static = Some(encrypted_static);

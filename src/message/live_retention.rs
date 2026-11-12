@@ -933,9 +933,9 @@ mod tests {
         let mut context = waproto::whatsapp::ContextInfo::default();
         context.mentioned_jid = vec![String::new(); 8192];
         let mut text = waproto::whatsapp::message::ExtendedTextMessage::default();
-        text.context_info = buffa::MessageField::some(context);
+        text.context_info = waproto::protobuf::MessageField::some(context);
         let mut message = waproto::whatsapp::Message::default();
-        message.extended_text_message = buffa::MessageField::some(text);
+        message.extended_text_message = waproto::protobuf::MessageField::some(text);
         let mut target = waproto::whatsapp::MessageKey::default();
         target.id = Some("RETAINED_PARENT".into());
         let mut item = PendingDelivery::from(

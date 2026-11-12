@@ -1214,7 +1214,7 @@ pub(crate) fn synthetic_serialized_session(
     remote_registration: u32,
     base: Option<&[u8]>,
 ) -> Vec<u8> {
-    use buffa::Message as _;
+    use waproto::protobuf::Message as _;
     let mut session = waproto::whatsapp::SessionStructure::default();
     session.session_version = Some(3);
     let mut local = vec![5];
@@ -1229,6 +1229,6 @@ pub(crate) fn synthetic_serialized_session(
     session.remote_registration_id = Some(remote_registration);
     session.alice_base_key = base.map(<[u8]>::to_vec);
     let mut record = waproto::whatsapp::RecordStructure::default();
-    record.current_session = buffa::MessageField::some(session);
+    record.current_session = waproto::protobuf::MessageField::some(session);
     record.encode_to_vec()
 }
