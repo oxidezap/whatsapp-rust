@@ -5821,6 +5821,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "wacore-signal-ops"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-lock",
+ "async-trait",
+ "buffa",
+ "bytes",
+ "futures",
+ "hex",
+ "hmac 0.13.0",
+ "rand 0.10.3",
+ "serde",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
+ "tokio",
+ "wacore",
+ "wacore-binary",
+ "wacore-recordstore",
+ "waproto",
+]
+
+[[package]]
 name = "wait-timeout"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

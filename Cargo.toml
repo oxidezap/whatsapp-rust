@@ -46,6 +46,7 @@ members = [
     "wacore/libsignal",
     "wacore/noise",
     "wacore/recordstore",
+    "wacore/signal-ops",
     "waproto",
 ]
 exclude = ["vendor/wasmtime-internal-cache"]
@@ -61,6 +62,7 @@ default-members = [
     "wacore/libsignal",
     "wacore/noise",
     "wacore/recordstore",
+    "wacore/signal-ops",
     "waproto",
 ]
 

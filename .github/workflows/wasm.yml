@@ -100,6 +100,13 @@ jobs:
           cargo build -p wacore-recordstore --lib --release
           --target wasm32-unknown-unknown
           --features wacore/js
+      - name: Build wacore-signal-ops for wasm32 (release)
+        env:
+          RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
+        run: >
+          cargo build -p wacore-signal-ops --lib --release
+          --target wasm32-unknown-unknown
+          --features wacore/js
       # The sans-IO VoIP core (wacore::voip: the CallEngine, the portable run_call driver,
       # the RelayTransport seam, the MLow codec, SRTP/SFrame crypto) must stay wasm-buildable
       # so a browser front end can drive 1:1 calls.
