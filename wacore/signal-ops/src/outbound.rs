@@ -6,8 +6,9 @@
 //! The application hands the service a `waE2E.Message`; wacore's stanza
 //! builder pads it, adds own-device copies and encrypts it per device. The
 //! WhatsApp client only answers device-list and prekey queries through the
-//! [`SendContextResolver`] and transmits the finished stanza, so it never sees
-//! the plaintext. Session changes and the sent-message record commit before
+//! [`SendContextResolver`] and transmits the finished stanza, so it never
+//! handles the plaintext. It does decide which devices and keys a message is
+//! encrypted to; see the crate's trust boundary. Session changes and the sent-message record commit before
 //! the stanza is returned, matching wacore's rule that Signal state is durable
 //! before ciphertext is published.
 
