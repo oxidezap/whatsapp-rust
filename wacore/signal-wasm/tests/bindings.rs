@@ -191,6 +191,8 @@ struct State {
     /// Make each `acquire` call in turn reject after its delay without taking
     /// a lease (`true`), then none.
     acquire_failures: RefCell<Vec<bool>>,
+    /// Make this many `release` calls reject before releasing anything.
+    release_failures: Cell<u32>,
     /// Delay every `get`, so concurrent opens interleave.
     read_delay_ms: Cell<u32>,
 }
@@ -430,6 +432,11 @@ impl MemoryBackend {
     }
 
     pub async fn release(&self, lease: JsValue) -> Result<JsValue, JsValue> {
+        let failures = self.state.release_failures.get();
+        if failures > 0 {
+            self.state.release_failures.set(failures - 1);
+            return Err(JsValue::from_str("lease backend unavailable"));
+        }
         let scope = string_of(&get(&lease, "scope"));
         if let Some(row) = self.state.leases.borrow_mut().get_mut(&scope)
             && row.generation == number_of(&get(&lease, "generation"))
@@ -2683,6 +2690,72 @@ async fn a_rejected_device_named_by_the_resolver_is_reported_as_a_stale_group_us
     .await;
     assert!(strings_of(&get(&sent, "distributionTargets")).contains(&BOB_DEVICE.to_owned()));
     assert_eq!(strings_of(&get(&sent, "staleDeviceUsers")), ["222"]);
+}
+
+#[wasm_bindgen_test]
+async fn a_release_the_backend_rejected_is_retried_by_the_next_call() {
+    let h = Harness::new();
+    let bob = h
+        .open("bob-release-retry", "tab-a", 0.0, true)
+        .await
+        .ok()
+        .unwrap();
+    h.state.release_failures.set(1);
+    // The backend rejection reaches the caller.
+    rejected(bob.release()).await;
+    let refused = expect_err(h.open("bob-release-retry", "tab-b", 1.0, false).await);
+    assert_eq!(code_of(&refused).as_deref(), Some("lease_held"));
+    run(bob.release()).await;
+    let other = h
+        .open("bob-release-retry", "tab-b", 2.0, false)
+        .await
+        .expect("the retried release gives the scope up");
+    run(other.release()).await;
+}
+
+#[wasm_bindgen_test]
+async fn a_late_acquire_of_an_older_generation_releases_a_newer_lease_left_behind() {
+    let h = Harness::new();
+    let seed = h
+        .open("bob-late-acquire", "tab-a", 0.0, true)
+        .await
+        .ok()
+        .unwrap();
+    run(seed.release()).await;
+    drop(seed);
+    // The first open takes a generation at once but its answer is late. Its
+    // lease then expires; another holder takes and releases the scope; a
+    // second open by the same holder takes a newer generation and fails while
+    // the first is still waiting.
+    h.state.acquire_delays.replace(vec![80, 0, 0]);
+    let wrong: JsValue = TestSealer::new().into();
+    let later = async {
+        sleep_ms(10).await;
+        let other = h
+            .open("bob-late-acquire", "tab-b", TTL + 10.0, false)
+            .await
+            .ok()
+            .unwrap();
+        run(other.release()).await;
+        drop(other);
+        open_with(
+            &h.backend,
+            &wrong,
+            "bob-late-acquire",
+            "tab-a",
+            TTL + 20.0,
+            false,
+        )
+        .await
+    };
+    let (late, failed) = join2(h.open("bob-late-acquire", "tab-a", 1.0, false), later).await;
+    assert!(failed.is_err());
+    drop(late);
+    let next = h
+        .open("bob-late-acquire", "tab-c", TTL + 30.0, false)
+        .await
+        .expect("the newer lease the failed open left was released");
+    run(next.release()).await;
 }
 
 #[wasm_bindgen_test]

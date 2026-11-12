@@ -111,6 +111,9 @@ struct Inner {
     tracked: Lease,
     /// Set by `release`, which already dropped this device's count.
     released: std::cell::Cell<bool>,
+    /// A backend release that `release` owed and that failed, retried by the
+    /// next call.
+    release_owed: std::cell::Cell<bool>,
 }
 
 impl Drop for Inner {
@@ -207,7 +210,9 @@ impl SignalDevice {
                 return Err(ops_error(OpsError::Store(e)));
             }
         };
-        records.acquired(&lease);
+        for orphan in records.acquired(&lease) {
+            let _ = records.release(&orphan).await;
+        }
         let store = Arc::new(RecordSignalStore::new(
             records.clone(),
             Arc::new(JsSealerAdapter::new(sealer)),
@@ -238,6 +243,7 @@ impl SignalDevice {
                 records,
                 tracked: lease.clone(),
                 released: std::cell::Cell::new(false),
+                release_owed: std::cell::Cell::new(false),
                 lease: RefCell::new(lease),
                 store,
             }),
@@ -276,22 +282,28 @@ impl SignalDevice {
     /// Give the scope up so another holder can take it at once. When other
     /// devices opened by the same holder still share this lease, or an open of
     /// it is still acquiring, the lease stays with them and the last one to
-    /// finish releases it. Calling this again does nothing.
+    /// finish releases it. Calling it again does nothing, unless the backend
+    /// rejected the release, which the next call retries.
     pub fn release(&self) -> Promise {
         let inner = self.inner.clone();
         promise(async move {
-            if inner.released.replace(true) {
-                return Ok(JsValue::UNDEFINED);
-            }
             // The count and the decision are one step; the release call is
-            // issued before anything else is awaited.
-            if inner.records.untrack(&inner.tracked) {
+            // issued before anything else is awaited. The count drops once;
+            // a backend release that failed is retried by the next call.
+            let owed = if inner.released.replace(true) {
+                inner.release_owed.get()
+            } else {
+                inner.records.untrack(&inner.tracked)
+            };
+            if owed {
                 let current = inner.lease.borrow().clone();
+                inner.release_owed.set(true);
                 inner
                     .records
                     .release(&current)
                     .await
                     .map_err(|e| ops_error(OpsError::Store(e)))?;
+                inner.release_owed.set(false);
             }
             Ok(JsValue::UNDEFINED)
         })

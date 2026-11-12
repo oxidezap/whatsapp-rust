@@ -211,19 +211,31 @@ impl JsRecords {
 
     /// Turn a reservation into a handle on `lease`'s generation. Each
     /// `acquired` is paired with one `untrack` of the same lease. A deferred
-    /// lease of the same generation is now this handle's; one of another
-    /// generation was already replaced by the store.
-    pub fn acquired(&self, lease: &Lease) {
+    /// lease of the same generation is now this handle's. Once no open is
+    /// still acquiring, returns the deferred leases of newer generations, which
+    /// the caller must release: a late response can carry an older generation
+    /// than one a failed open left behind. Older ones were already replaced.
+    pub fn acquired(&self, lease: &Lease) -> Vec<Lease> {
+        let mut orphans = Vec::new();
         self.update(&lease.fence.scope, &lease.holder, |opens| {
+            let generation = lease.fence.generation;
             opens.acquiring = opens.acquiring.saturating_sub(1);
-            *opens.live.entry(lease.fence.generation).or_insert(0) += 1;
-            opens.deferred.remove(&lease.fence.generation);
+            *opens.live.entry(generation).or_insert(0) += 1;
+            opens.deferred.remove(&generation);
             if opens.acquiring == 0 {
-                // The store granted a newer generation, so older ones it
-                // still lists were already replaced.
-                opens.deferred.clear();
+                let live = &opens.live;
+                orphans.extend(
+                    opens
+                        .deferred
+                        .drain()
+                        .filter(|(deferred, _)| {
+                            *deferred > generation && !live.contains_key(deferred)
+                        })
+                        .map(|(_, lease)| lease),
+                );
             }
         });
+        orphans
     }
 
     /// Drop one handle on `lease`. True when nobody else uses that lease: no
