@@ -96,10 +96,17 @@ fn now_ms() -> u64 {
     u64::try_from(wacore::time::now_utc().timestamp_millis()).unwrap_or(0)
 }
 
+/// Flag bits in a buffer entry's third byte.
+const FLAG_IDENTITY_CHANGED: u8 = 1;
+const FLAG_SENDER_KEY_REJECTED: u8 = 2;
+
 struct BufferEntry {
     state: u8,
     padding_version: u8,
     identity_changed: bool,
+    /// Kept so a redelivery reports a rejected distribution the first
+    /// response may have lost.
+    sender_key_rejected: bool,
     inserted_ms: u64,
     padded_plaintext: Vec<u8>,
 }
@@ -109,7 +116,14 @@ impl BufferEntry {
         let mut out = Vec::with_capacity(HEADER_LEN + self.padded_plaintext.len());
         out.push(self.state);
         out.push(self.padding_version);
-        out.push(u8::from(self.identity_changed));
+        let mut flags = 0;
+        if self.identity_changed {
+            flags |= FLAG_IDENTITY_CHANGED;
+        }
+        if self.sender_key_rejected {
+            flags |= FLAG_SENDER_KEY_REJECTED;
+        }
+        out.push(flags);
         out.extend_from_slice(&self.inserted_ms.to_be_bytes());
         out.extend_from_slice(&self.padded_plaintext);
         out
@@ -126,7 +140,8 @@ impl BufferEntry {
         Ok(Self {
             state: bytes[0],
             padding_version: bytes[1],
-            identity_changed: bytes[2] != 0,
+            identity_changed: bytes[2] & FLAG_IDENTITY_CHANGED != 0,
+            sender_key_rejected: bytes[2] & FLAG_SENDER_KEY_REJECTED != 0,
             inserted_ms: u64::from_be_bytes(inserted),
             padded_plaintext: bytes[HEADER_LEN..].to_vec(),
         })
@@ -137,6 +152,7 @@ impl BufferEntry {
             state: STATE_DELIVERED,
             padding_version: 0,
             identity_changed: false,
+            sender_key_rejected: false,
             inserted_ms,
             padded_plaintext: Vec::new(),
         }
@@ -216,7 +232,7 @@ impl<S: ServiceStore> SignalOps<S> {
                     content,
                     identity_changed: entry.identity_changed,
                     redelivered: true,
-                    sender_key_rejected: false,
+                    sender_key_rejected: entry.sender_key_rejected,
                 })));
             }
 
@@ -286,6 +302,7 @@ impl<S: ServiceStore> SignalOps<S> {
                 state: STATE_PENDING,
                 padding_version: request.padding_version,
                 identity_changed,
+                sender_key_rejected,
                 inserted_ms,
                 padded_plaintext: padded,
             };

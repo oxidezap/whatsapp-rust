@@ -319,5 +319,10 @@ fn a_bad_sender_key_does_not_block_the_message_carrying_it() {
         Some("still readable")
     );
     // Committed: a redelivery is served from the buffer, not decrypted again.
-    assert!(message(block_on(bob.ops.receive(req)).unwrap()).redelivered);
+    let again = message(block_on(bob.ops.receive(req)).unwrap());
+    assert!(again.redelivered);
+    assert!(
+        again.sender_key_rejected,
+        "a redelivery must still report the rejected distribution"
+    );
 }
