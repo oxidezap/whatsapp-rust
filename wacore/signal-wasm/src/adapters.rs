@@ -130,8 +130,8 @@ async fn settle(
     JsFuture::from(call?).await
 }
 
-/// Live `SignalDevice`s per (scope, holder, lease generation).
-type LiveDevices = Mutex<HashMap<(Arc<str>, Arc<str>, u64), usize>>;
+/// Opens per (scope, holder): live devices and opens still acquiring.
+type LiveDevices = Mutex<HashMap<(Arc<str>, Arc<str>), usize>>;
 
 pub struct JsRecords(SendWrapper<RecordBackend>, LiveDevices);
 
@@ -161,30 +161,28 @@ impl JsRecords {
         })
     }
 
-    fn live_key(lease: &Lease) -> (Arc<str>, Arc<str>, u64) {
-        (
-            lease.fence.scope.clone(),
-            lease.holder.clone(),
-            lease.fence.generation,
-        )
+    fn live_key(scope: &str, holder: &str) -> (Arc<str>, Arc<str>) {
+        (Arc::from(scope), Arc::from(holder))
     }
 
-    /// Count one open on `lease`: a live device or an open still starting.
-    /// A second open by the same holder gets the same lease, so releasing it
-    /// must wait for the last of them.
-    pub fn track(&self, lease: &Lease) {
+    /// Count one open of (`scope`, `holder`) before it asks for the lease, so
+    /// a concurrent open that fails cannot release a lease this one is about
+    /// to share. Every `reserve` is paired with one `untrack`.
+    pub fn reserve(&self, scope: &str, holder: &str) {
         if let Ok(mut live) = self.1.lock() {
-            *live.entry(Self::live_key(lease)).or_insert(0) += 1;
+            *live.entry(Self::live_key(scope, holder)).or_insert(0) += 1;
         }
     }
 
-    /// Drop one open on `lease`. True when it was the last, so nobody else
-    /// still uses the lease.
-    pub fn untrack(&self, lease: &Lease) -> bool {
+    /// Drop one open of (`scope`, `holder`). True when it was the last, so
+    /// nobody else, live or still acquiring, uses the lease. The count and the
+    /// answer are one step under the lock; the caller issues its release call
+    /// before awaiting anything, so a later acquire is ordered after it.
+    pub fn untrack(&self, scope: &str, holder: &str) -> bool {
         let Ok(mut live) = self.1.lock() else {
             return false;
         };
-        let key = Self::live_key(lease);
+        let key = Self::live_key(scope, holder);
         let Some(count) = live.get_mut(&key) else {
             return true;
         };

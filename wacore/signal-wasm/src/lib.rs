@@ -104,13 +104,15 @@ struct Inner {
     records: Arc<JsRecords>,
     lease: RefCell<Lease>,
     store: Arc<Store>,
-    /// The lease this device was created on, counted in `records` until drop.
+    /// The lease this device was created on; its open is counted in `records`
+    /// until drop.
     tracked: Lease,
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        self.records.untrack(&self.tracked);
+        self.records
+            .untrack(&self.tracked.fence.scope, &self.tracked.holder);
     }
 }
 
@@ -146,6 +148,23 @@ fn lease_times(now_ms: f64, ttl_ms: f64) -> Result<(u64, u64), JsValue> {
     Ok((now, ttl))
 }
 
+/// Remove key material the page must not see from `message` and from every
+/// `DeviceSentMessage` wrapper layer inside it. Own-device copies can nest
+/// wrappers, and the library unwraps only one.
+fn scrub_message(message: &mut waproto::whatsapp::Message) {
+    if let Some(protocol) = message.protocol_message.as_option_mut() {
+        protocol.app_state_sync_key_share = Default::default();
+        protocol.app_state_sync_key_request = Default::default();
+    }
+    message.sender_key_distribution_message = Default::default();
+    message.fast_ratchet_key_sender_key_distribution_message = Default::default();
+    if let Some(sent) = message.device_sent_message.as_option_mut()
+        && let Some(inner) = sent.message.as_option_mut()
+    {
+        scrub_message(inner);
+    }
+}
+
 fn promise<F>(future: F) -> Promise
 where
     F: std::future::Future<Output = Result<JsValue, JsValue>> + 'static,
@@ -177,15 +196,25 @@ impl SignalDevice {
         let _ = wacore::time::set_time_provider(DateNow);
         let (now_ms, ttl_ms) = lease_times(now_ms, ttl_ms)?;
         let records = JsRecords::shared(backend);
-        let lease = records
-            .acquire(&scope, &holder, now_ms, ttl_ms)
-            .await
-            .map_err(|e| ops_error(OpsError::Store(e)))?
-            .ok_or_else(|| convert::coded_error("lease_held", "another holder owns this scope"))?;
-        // Count this open from the moment it holds the lease: an open of the
-        // same scope by the same holder shares it, including while this one is
-        // still initialising.
-        records.track(&lease);
+        // Count this open before it asks for the lease: an open of the same
+        // scope by the same holder shares the lease, including while this one
+        // is still acquiring or initialising.
+        records.reserve(&scope, &holder);
+        let acquired = records.acquire(&scope, &holder, now_ms, ttl_ms).await;
+        let lease = match acquired {
+            Ok(Some(lease)) => lease,
+            Ok(None) => {
+                records.untrack(&scope, &holder);
+                return Err(convert::coded_error(
+                    "lease_held",
+                    "another holder owns this scope",
+                ));
+            }
+            Err(e) => {
+                records.untrack(&scope, &holder);
+                return Err(ops_error(OpsError::Store(e)));
+            }
+        };
         let store = Arc::new(RecordSignalStore::new(
             records.clone(),
             Arc::new(JsSealerAdapter::new(sealer)),
@@ -204,7 +233,7 @@ impl SignalDevice {
                 // until it expires, unless another open by the same holder
                 // (live or still starting) shares it. A failed release changes
                 // nothing for the caller, who gets the original error.
-                if records.untrack(&lease) {
+                if records.untrack(&scope, &holder) {
                     let _ = records.release(&lease).await;
                 }
                 return Err(ops_error(e));
@@ -447,15 +476,32 @@ impl SignalDevice {
     }
 
     /// Decrypt a pairwise payload. `kind` is the `<enc type>` value.
-    pub fn decrypt(&self, user: String, device: u32, kind: String, ciphertext: Vec<u8>) -> Promise {
+    /// A prekey message from a companion device needs that device's
+    /// `deviceIdentity` (the stanza's `<device-identity>` bytes); it must
+    /// verify against the pinned account or the call rejects with code
+    /// "bundle_refused".
+    pub fn decrypt(
+        &self,
+        user: String,
+        device: u32,
+        kind: String,
+        ciphertext: Vec<u8>,
+        device_identity: Option<Uint8Array>,
+    ) -> Promise {
         let inner = self.inner.clone();
         promise(async move {
+            let device_identity = device_identity.map(|bytes| bytes.to_vec());
             let kind = EncKind::try_from(kind.as_str()).map_err(|_| {
                 convert::coded_error("invalid_input", &format!("unsupported enc type {kind}"))
             })?;
             let result = inner
                 .ops
-                .decrypt(&address(&user, device)?, kind, &ciphertext)
+                .decrypt(
+                    &address(&user, device)?,
+                    kind,
+                    &ciphertext,
+                    device_identity.as_deref(),
+                )
                 .await
                 .map_err(ops_error)?;
             let out = Object::new();
@@ -571,6 +617,9 @@ impl SignalDevice {
     /// once the app has stored the message. `share_app_state_keys` defaults
     /// off; enabling it exposes own-device app-state keys separately, allowing
     /// synchronized metadata decryption. It never enables foreign-device shares.
+    /// A prekey message from a companion device needs its `deviceIdentity`
+    /// (`<device-identity>` bytes); without a verifying one it rejects with
+    /// code "bundle_refused".
     #[wasm_bindgen(unchecked_return_type = "Promise<ReceiveResult>")]
     #[allow(clippy::too_many_arguments)]
     pub fn receive(
@@ -583,9 +632,11 @@ impl SignalDevice {
         padding_version: u8,
         is_from_me: bool,
         share_app_state_keys: Option<adapters::AppStateSharingConsent>,
+        device_identity: Option<Uint8Array>,
     ) -> Promise {
         let inner = self.inner.clone();
         promise(async move {
+            let device_identity = device_identity.map(|bytes| bytes.to_vec());
             let share_app_state_keys = match share_app_state_keys {
                 None => false,
                 Some(value) => value.as_bool().ok_or_else(|| {
@@ -608,6 +659,7 @@ impl SignalDevice {
                     ciphertext: &ciphertext,
                     padding_version,
                     is_from_me,
+                    device_identity: device_identity.as_deref(),
                 })
                 .await
                 .map_err(ops_error)?;
@@ -620,16 +672,7 @@ impl SignalDevice {
                 Received::Message(mut message) => {
                     set(&out, "status", &JsValue::from_str("message"));
                     set(&out, "receiptKey", &JsValue::from_str(&message.receipt_key));
-                    if let Some(protocol) = message.content.message.protocol_message.as_option_mut()
-                    {
-                        protocol.app_state_sync_key_share = Default::default();
-                        protocol.app_state_sync_key_request = Default::default();
-                    }
-                    message.content.message.sender_key_distribution_message = Default::default();
-                    message
-                        .content
-                        .message
-                        .fast_ratchet_key_sender_key_distribution_message = Default::default();
+                    scrub_message(&mut message.content.message);
                     let encoded = waproto::codec::message_to_vec(&message.content.message);
                     set(&out, "message", &Uint8Array::from(encoded.as_slice()));
                     set(
