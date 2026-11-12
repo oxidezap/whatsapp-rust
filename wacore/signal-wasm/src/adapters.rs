@@ -12,7 +12,8 @@ use async_trait::async_trait;
 use js_sys::{Array, Object, Promise, Reflect, Uint8Array};
 use send_wrapper::SendWrapper;
 use std::cell::RefCell;
-use std::sync::{Arc, Weak};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Weak};
 use wacore::store::error::{Result, StoreError};
 use wacore_recordstore::{
     Fence, FenceLost, Lease, LeaseStore, Namespace, RecordExists, RecordStore, SealError, WriteOp,
@@ -129,7 +130,10 @@ async fn settle(
     JsFuture::from(call?).await
 }
 
-pub struct JsRecords(SendWrapper<RecordBackend>);
+/// Live `SignalDevice`s per (scope, holder, lease generation).
+type LiveDevices = Mutex<HashMap<(Arc<str>, Arc<str>, u64), usize>>;
+
+pub struct JsRecords(SendWrapper<RecordBackend>, LiveDevices);
 
 impl JsRecords {
     /// The adapter for `backend`, shared by every open over the same JS
@@ -151,10 +155,45 @@ impl JsRecords {
             {
                 return records;
             }
-            let records = Arc::new(Self(SendWrapper::new(backend)));
+            let records = Arc::new(Self(SendWrapper::new(backend), Mutex::default()));
             open.push(Arc::downgrade(&records));
             records
         })
+    }
+
+    fn live_key(lease: &Lease) -> (Arc<str>, Arc<str>, u64) {
+        (
+            lease.fence.scope.clone(),
+            lease.holder.clone(),
+            lease.fence.generation,
+        )
+    }
+
+    /// Count one open on `lease`: a live device or an open still starting.
+    /// A second open by the same holder gets the same lease, so releasing it
+    /// must wait for the last of them.
+    pub fn track(&self, lease: &Lease) {
+        if let Ok(mut live) = self.1.lock() {
+            *live.entry(Self::live_key(lease)).or_insert(0) += 1;
+        }
+    }
+
+    /// Drop one open on `lease`. True when it was the last, so nobody else
+    /// still uses the lease.
+    pub fn untrack(&self, lease: &Lease) -> bool {
+        let Ok(mut live) = self.1.lock() else {
+            return false;
+        };
+        let key = Self::live_key(lease);
+        let Some(count) = live.get_mut(&key) else {
+            return true;
+        };
+        *count -= 1;
+        if *count == 0 {
+            live.remove(&key);
+            return true;
+        }
+        false
     }
 }
 

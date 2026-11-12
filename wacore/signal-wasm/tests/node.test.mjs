@@ -1189,6 +1189,78 @@ test("initialized-module upload example keeps pairing secrets out of its callbac
   );
 });
 
+class SlowReads extends MemoryBackend {
+  async get(...args) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    return super.get(...args);
+  }
+}
+
+test("a failed open keeps the lease that a concurrent open by the same holder shares", async () => {
+  const backend = new SlowReads();
+  const sealer = await webCryptoSealer();
+  const alice = await device("alice-live-lease");
+  const seed = await SignalDevice.open(
+    backend,
+    sealer,
+    "bob-live-lease",
+    "tab-a",
+    0,
+    TTL,
+    true,
+  );
+  await seed.release();
+  seed.free();
+  // Same holder, same lease: the first open reads with the wrong key and
+  // fails while the second is still starting. The failure must not release
+  // the lease the second one is about to use.
+  const opens = await Promise.allSettled([
+    SignalDevice.open(
+      backend,
+      await webCryptoSealer(),
+      "bob-live-lease",
+      "tab-a",
+      1,
+      TTL,
+      false,
+    ),
+    SignalDevice.open(backend, sealer, "bob-live-lease", "tab-a", 1, TTL, false),
+  ]);
+  assert.equal(opens[0].status, "rejected");
+  assert.equal(opens[1].status, "fulfilled");
+  const bob = opens[1].value;
+  await assert.rejects(
+    SignalDevice.open(backend, sealer, "bob-live-lease", "tab-b", 2, TTL, false),
+    (error) => error.code === "lease_held",
+  );
+  await alice.signal.establishSession(BOB, 1, await bundleFor(bob));
+  const sent = await alice.signal.encrypt(BOB, 1, text("still live"));
+  const got = await bob.decrypt(ALICE, 1, sent.kind, sent.ciphertext);
+  assert.equal(read(got.plaintext), "still live");
+  const reply = await bob.encrypt(ALICE, 1, text("reply"));
+  assert.ok(reply.ciphertext.length > 0);
+});
+
+test("a second open with the wrong sealer does not disturb the live device", async () => {
+  const backend = new MemoryBackend();
+  const sealer = await webCryptoSealer();
+  const bob = await device("bob-wrong-key", { backend, sealer, now: 0 });
+  await SignalDevice.open(
+    backend,
+    await webCryptoSealer(),
+    "bob-wrong-key",
+    "tab-a",
+    1,
+    TTL,
+    false,
+  ).catch(() => {});
+  await assert.rejects(
+    SignalDevice.open(backend, sealer, "bob-wrong-key", "tab-b", 2, TTL, false),
+    (error) => error.code === "lease_held",
+  );
+  assert.ok((await bob.signal.publicIdentity()).identityKey.length > 0);
+});
+
 test("pruneDecryptBuffer refuses cutoffs that are not safe integers", async () => {
   const bob = await device("bob-prune-input");
   for (const bad of [Infinity, NaN, -1, 1.5]) {

@@ -98,6 +98,14 @@ struct Inner {
     records: Arc<JsRecords>,
     lease: RefCell<Lease>,
     store: Arc<Store>,
+    /// The lease this device was created on, counted in `records` until drop.
+    tracked: Lease,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.records.untrack(&self.tracked);
+    }
 }
 
 struct DateNow;
@@ -149,6 +157,10 @@ impl SignalDevice {
             .await
             .map_err(|e| ops_error(OpsError::Store(e)))?
             .ok_or_else(|| convert::coded_error("lease_held", "another holder owns this scope"))?;
+        // Count this open from the moment it holds the lease: an open of the
+        // same scope by the same holder shares it, including while this one is
+        // still initialising.
+        records.track(&lease);
         let store = Arc::new(RecordSignalStore::new(
             records.clone(),
             Arc::new(JsSealerAdapter::new(sealer)),
@@ -164,9 +176,12 @@ impl SignalDevice {
             Err(e) => {
                 // No SignalDevice is returned, so nobody else could release
                 // this lease; give it up now rather than block other holders
-                // until it expires. A failed release changes nothing for the
-                // caller, who gets the original error.
-                let _ = records.release(&lease).await;
+                // until it expires, unless another open by the same holder
+                // (live or still starting) shares it. A failed release changes
+                // nothing for the caller, who gets the original error.
+                if records.untrack(&lease) {
+                    let _ = records.release(&lease).await;
+                }
                 return Err(ops_error(e));
             }
         };
@@ -174,6 +189,7 @@ impl SignalDevice {
             inner: Rc::new(Inner {
                 ops,
                 records,
+                tracked: lease.clone(),
                 lease: RefCell::new(lease),
                 store,
             }),
