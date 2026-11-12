@@ -790,10 +790,35 @@ async fn receive_with(
     from_me: bool,
     consent: Option<JsValue>,
 ) -> Result<JsValue, JsValue> {
+    receive_from(
+        at,
+        (ALICE, 1),
+        chat,
+        kind,
+        ciphertext,
+        padding_version,
+        from_me,
+        consent,
+    )
+    .await
+}
+
+/// `receive_with` for a given sender `(user, device)`.
+#[allow(clippy::too_many_arguments)]
+async fn receive_from(
+    at: &SignalDevice,
+    (user, device): (&str, u32),
+    chat: &str,
+    kind: &str,
+    ciphertext: &[u8],
+    padding_version: u8,
+    from_me: bool,
+    consent: Option<JsValue>,
+) -> Result<JsValue, JsValue> {
     JsFuture::from(at.receive(
         chat.into(),
-        ALICE.into(),
-        1,
+        user.into(),
+        device,
         kind.into(),
         ciphertext.to_vec(),
         padding_version,
@@ -803,6 +828,22 @@ async fn receive_with(
     ))
     .await
 }
+
+/// Bob's second device: a genuine device of the receiver's own account,
+/// paired under the same account key, with both devices' own JIDs set.
+async fn own_sibling(bob: &Dev, scope: &str) -> Dev {
+    let sibling = device(scope).await;
+    run(bob.signal.set_own_jids("222:1@s.whatsapp.net".into(), None)).await;
+    run(sibling
+        .signal
+        .set_own_jids("222:2@s.whatsapp.net".into(), None))
+    .await;
+    remember_identity(&bob.signal, &bob_account()).await;
+    remember_identity(&sibling.signal, &bob_account()).await;
+    sibling
+}
+
+const BOB_SIBLING: (&str, u32) = (BOB, 2);
 
 /// Receive as a message from Alice with padding version 2.
 async fn receive(at: &SignalDevice, kind: &str, ciphertext: &[u8]) -> JsValue {
@@ -1849,13 +1890,37 @@ async fn app_state_sharing_requires_separate_explicit_consent_and_own_device_evi
         (Some(true), true),
         (Some(true), false),
     ] {
-        let alice = device(&format!("alice-share-{consent:?}-{from_me}")).await;
         let bob = device(&format!("bob-share-{consent:?}-{from_me}")).await;
+        // The sender is a peer, or a second device of Bob's own account.
+        let scope = format!("alice-share-{consent:?}-{from_me}");
+        let (alice, sender) = if from_me {
+            (own_sibling(&bob, &scope).await, BOB_SIBLING)
+        } else {
+            (device(&scope).await, (ALICE, 1))
+        };
         establish(&alice.signal, BOB, bundle_for(&bob.signal, true).await).await;
         let plain = pad(&[conversation("mixed own-device content"), protocol.clone()].concat());
         let (kind, ciphertext) = encrypt(&alice.signal, BOB, &plain).await;
-        let received = receive_with(
+        if !from_me {
+            // A peer cannot claim to be this account's own device.
+            let error = expect_err(
+                receive_from(
+                    &bob.signal,
+                    sender,
+                    ALICE,
+                    &kind,
+                    &ciphertext,
+                    2,
+                    true,
+                    Some(JsValue::TRUE),
+                )
+                .await,
+            );
+            assert_eq!(code_of(&error).as_deref(), Some("invalid_input"));
+        }
+        let received = receive_from(
             &bob.signal,
+            sender,
             ALICE,
             &kind,
             &ciphertext,
@@ -1880,15 +1945,25 @@ async fn app_state_sharing_requires_separate_explicit_consent_and_own_device_evi
                 "separate share bytes match the synthetic protocol fixture"
             );
         }
-        let retry = receive_with(&bob.signal, ALICE, &kind, &ciphertext, 2, from_me, None)
-            .await
-            .ok()
-            .unwrap();
+        let retry = receive_from(
+            &bob.signal,
+            sender,
+            ALICE,
+            &kind,
+            &ciphertext,
+            2,
+            from_me,
+            None,
+        )
+        .await
+        .ok()
+        .unwrap();
         assert_eq!(get(&retry, "redelivered"), JsValue::TRUE);
         assert!(bytes_of(&get(&retry, "appStateKeyShare")).is_empty());
         persist_then_mark(&bob.signal, &received).await;
-        let after = receive_with(
+        let after = receive_from(
             &bob.signal,
+            sender,
             ALICE,
             &kind,
             &ciphertext,
@@ -2446,12 +2521,13 @@ async fn a_nested_device_sent_wrapper_does_not_surface_app_state_keys() {
     let inner = [conversation("nested own-device content"), protocol].concat();
     // Message.deviceSentMessage is field 31 and holds a Message in field 2.
     let wrapped = (0..2).fold(inner, |message, _| field(31, &field(2, &message)));
-    let alice = device("alice-nested-dsm").await;
     let bob = device("bob-nested-dsm").await;
+    let alice = own_sibling(&bob, "alice-nested-dsm").await;
     establish(&alice.signal, BOB, bundle_for(&bob.signal, true).await).await;
     let (kind, ciphertext) = encrypt(&alice.signal, BOB, &pad(&wrapped)).await;
-    let received = receive_with(
+    let received = receive_from(
         &bob.signal,
+        BOB_SIBLING,
         ALICE,
         &kind,
         &ciphertext,
