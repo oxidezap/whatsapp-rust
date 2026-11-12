@@ -180,7 +180,7 @@ fn compile(source: &Path, out: &Path) -> Result<()> {
 fn write_pkg_config(lib_dir: &Path) -> Result<()> {
     let dir = lib_dir.join("pkgconfig");
     std::fs::create_dir_all(&dir)?;
-    let lib = lib_dir.display();
+    let lib = pkg_config_escape(&lib_dir.to_string_lossy());
     std::fs::write(
         dir.join("sqlite3.pc"),
         format!(
@@ -189,6 +189,19 @@ fn write_pkg_config(lib_dir: &Path) -> Result<()> {
         ),
     )?;
     Ok(())
+}
+
+/// pkg-config splits flag values on unescaped whitespace and treats `\\`,
+/// quotes and `$` specially, so escape them in a path.
+fn pkg_config_escape(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        if c.is_whitespace() || matches!(c, '\\' | '"' | '\'' | '$' | '#') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn host_triple() -> Result<String> {
@@ -211,6 +224,15 @@ pub fn default_out(root: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paths_are_escaped_for_pkg_config() {
+        assert_eq!(
+            pkg_config_escape("/tmp/fixed sqlite/$x"),
+            "/tmp/fixed\\ sqlite/\\$x"
+        );
+        assert_eq!(pkg_config_escape("/plain/path"), "/plain/path");
+    }
 
     #[test]
     fn a_wrong_archive_is_refused() {
