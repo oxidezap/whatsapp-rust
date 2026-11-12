@@ -283,7 +283,7 @@ pub fn generate(fds: &FileDescriptorSet, output: &Path) -> std::io::Result<()> {
         }
         oracle.push_str(parts.last().expect("type"));
         let test_start = source.len();
-        source.push_str(&format!("#[cfg(test)] #[test] fn differential_{}() {{ crate::differential::<{oracle}, {name}>(|input| {view}::decode(input).map(|v| v.to_owned_message()), &[", name.to_snake_case()));
+        source.push_str(&format!("#[cfg(test)] #[test] fn differential_{}() {{ crate::differential::<{oracle}, {name}>({name}::decode, &[", name.to_snake_case()));
         for field in &fields {
             let scalar = field_scalar(path, field);
             source.push_str(&format!(
@@ -293,7 +293,28 @@ pub fn generate(fds: &FileDescriptorSet, output: &Path) -> std::io::Result<()> {
             ));
         }
         source.push_str("]); }\n");
-        source.push_str(&format!("#[cfg(test)] impl crate::Candidate for {name} {{ fn encode_bytes(&self) -> Vec<u8> {{ let mut bytes = Vec::with_capacity(self.encoded_len()); self.encode_into(&mut bytes); assert_eq!(bytes.len(), self.encoded_len()); bytes }} }}\n"));
+        source.push_str(&format!("#[cfg(test)] impl crate::Candidate for {name} {{ type Reference = {oracle}; fn encode_bytes(&self) -> Vec<u8> {{ let mut bytes = Vec::with_capacity(self.encoded_len()); self.encode_into(&mut bytes); assert_eq!(bytes.len(), self.encoded_len()); bytes }} fn borrowed_to_owned(input: &[u8]) -> Result<Self, wire::Error> {{ Ok({view}::decode(input)?.to_owned_message()) }} fn assert_reference(&self, expected: &Self::Reference) {{\n"));
+        for field in &fields {
+            let field_name = field.name.as_deref().expect("field name").to_snake_case();
+            let bits = match field.r#type {
+                Some(Type::TYPE_DOUBLE) => ".map(f64::to_bits)",
+                Some(Type::TYPE_FLOAT) => ".map(f32::to_bits)",
+                _ => "",
+            };
+            source.push_str(&format!("assert_eq!(self.{field_name}{bits}, expected.{field_name}{bits}, \"{name}.{field_name}\");\n"));
+        }
+        source.push_str(&format!("}} fn assert_borrowed(input: &[u8], expected: &Self::Reference) {{ let view = {view}::decode(input).expect(\"valid candidate view\");\n"));
+        for field in &fields {
+            let field_name = field.name.as_deref().expect("field name").to_snake_case();
+            let (actual, expected) = match field.r#type {
+                Some(Type::TYPE_STRING | Type::TYPE_BYTES) => ("", ".as_deref()"),
+                Some(Type::TYPE_DOUBLE) => (".map(f64::to_bits)", ".map(f64::to_bits)"),
+                Some(Type::TYPE_FLOAT) => (".map(f32::to_bits)", ".map(f32::to_bits)"),
+                _ => ("", ""),
+            };
+            source.push_str(&format!("assert_eq!(view.{field_name}{actual}, expected.{field_name}{expected}, \"{view}.{field_name}\");\n"));
+        }
+        source.push_str("} }\n");
         checks.push_str(&source.split_off(test_start));
     }
     let file = syn::parse_file(&source).map_err(std::io::Error::other)?;

@@ -10,7 +10,13 @@ mod candidate {
 }
 
 trait Candidate {
+    type Reference;
     fn encode_bytes(&self) -> Vec<u8>;
+    fn borrowed_to_owned(input: &[u8]) -> Result<Self, wire::Error>
+    where
+        Self: Sized;
+    fn assert_reference(&self, reference: &Self::Reference);
+    fn assert_borrowed(input: &[u8], reference: &Self::Reference);
 }
 
 fn error(error: buffa::DecodeError) -> wire::Error {
@@ -42,15 +48,18 @@ fn error(error: buffa::DecodeError) -> wire::Error {
 fn differential<M, C>(decode: impl Fn(&[u8]) -> Result<C, wire::Error>, fields: &[(u32, u8)])
 where
     M: buffa::Message + buffa::HasMessageView,
-    C: Candidate,
+    C: Candidate<Reference = M>,
 {
     use buffa::MessageView as _;
 
     let compare = |input: &[u8]| {
-        let reference = M::decode_from_slice(input)
-            .map(|v| v.encode_to_vec())
-            .map_err(error);
-        let actual = decode(input).map(|v| v.encode_bytes());
+        let reference = M::decode_from_slice(input).map_err(error);
+        let actual = decode(input);
+        if let (Ok(actual), Ok(reference)) = (&actual, &reference) {
+            actual.assert_reference(reference);
+        }
+        let reference = reference.map(|v| v.encode_to_vec());
+        let actual = actual.map(|v| v.encode_bytes());
         assert_eq!(
             actual,
             reference,
@@ -59,10 +68,16 @@ where
         );
         let reference_view = <M as buffa::HasMessageView>::decode_view(input)
             .and_then(|v| v.to_owned_message())
-            .map(|v| v.encode_to_vec())
             .map_err(error);
+        let actual_view = C::borrowed_to_owned(input);
+        if let (Ok(actual), Ok(reference)) = (&actual_view, &reference_view) {
+            actual.assert_reference(reference);
+            C::assert_borrowed(input, reference);
+        }
+        let reference_view = reference_view.map(|v| v.encode_to_vec());
+        let actual_view = actual_view.map(|v| v.encode_bytes());
         assert_eq!(
-            actual,
+            actual_view,
             reference_view,
             "view {} input={input:02x?}",
             std::any::type_name::<M>()
