@@ -1188,3 +1188,14 @@ test("initialized-module upload example keeps pairing secrets out of its callbac
     TypeError,
   );
 });
+
+test("pruneDecryptBuffer refuses cutoffs that are not safe integers", async () => {
+  const bob = await device("bob-prune-input");
+  for (const bad of [Infinity, NaN, -1, 1.5]) {
+    await assert.rejects(
+      bob.signal.pruneDecryptBuffer(bad),
+      (error) => error.code === "invalid_input",
+    );
+  }
+});
+

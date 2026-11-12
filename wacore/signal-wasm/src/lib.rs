@@ -577,9 +577,15 @@ impl SignalDevice {
     pub fn prune_decrypt_buffer(&self, cutoff_ms: f64) -> Promise {
         let inner = self.inner.clone();
         promise(async move {
+            let cutoff = convert::safe_u64(cutoff_ms, "cutoffMs").map_err(|_| {
+                convert::coded_error(
+                    "invalid_input",
+                    "cutoffMs must be a non-negative safe integer",
+                )
+            })?;
             let removed = inner
                 .ops
-                .prune_decrypt_buffer(cutoff_ms as u64)
+                .prune_decrypt_buffer(cutoff)
                 .await
                 .map_err(ops_error)?;
             Ok(JsValue::from_f64(removed as f64))
