@@ -196,7 +196,7 @@ impl SignalDevice {
             Ok(Some(lease)) => lease,
             Ok(None) => {
                 for orphan in records.unreserve(&scope, &holder) {
-                    let _ = records.release(&orphan).await;
+                    let _ = records.release_unclaimed(&orphan).await;
                 }
                 return Err(convert::coded_error(
                     "lease_held",
@@ -205,13 +205,13 @@ impl SignalDevice {
             }
             Err(e) => {
                 for orphan in records.unreserve(&scope, &holder) {
-                    let _ = records.release(&orphan).await;
+                    let _ = records.release_unclaimed(&orphan).await;
                 }
                 return Err(ops_error(OpsError::Store(e)));
             }
         };
         for orphan in records.acquired(&lease) {
-            let _ = records.release(&orphan).await;
+            let _ = records.release_unclaimed(&orphan).await;
         }
         let store = Arc::new(RecordSignalStore::new(
             records.clone(),
@@ -291,7 +291,15 @@ impl SignalDevice {
             // issued before anything else is awaited. The count drops once;
             // a backend release that failed is retried by the next call.
             let owed = if inner.released.replace(true) {
-                inner.release_owed.get()
+                // A retry: another open of this holder may have taken the
+                // lease over since, in which case it is no longer ours to free.
+                inner.release_owed.get() && {
+                    let still_free = inner.records.claim_for_release(&inner.tracked);
+                    if !still_free {
+                        inner.release_owed.set(false);
+                    }
+                    still_free
+                }
             } else {
                 inner.records.untrack(&inner.tracked)
             };

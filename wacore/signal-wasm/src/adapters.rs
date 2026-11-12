@@ -268,6 +268,36 @@ impl JsRecords {
         last
     }
 
+    /// Decide, just before a cleanup release of `lease`, whether it is still
+    /// unclaimed. False when a live handle holds its generation (the lease is
+    /// theirs now) or an open of the holder is still acquiring (the lease goes
+    /// back to the deferred set for that open to settle). The caller issues the
+    /// backend release right after a true answer, before awaiting anything.
+    pub fn claim_for_release(&self, lease: &Lease) -> bool {
+        let mut free = false;
+        self.update(&lease.fence.scope, &lease.holder, |opens| {
+            let generation = lease.fence.generation;
+            if opens.live.contains_key(&generation) {
+                return;
+            }
+            if opens.acquiring > 0 {
+                opens.deferred.insert(generation, lease.clone());
+                return;
+            }
+            free = true;
+        });
+        free
+    }
+
+    /// Release `lease` on the backend if [`Self::claim_for_release`] allows.
+    pub async fn release_unclaimed(&self, lease: &Lease) -> Result<bool> {
+        if !self.claim_for_release(lease) {
+            return Ok(false);
+        }
+        self.release(lease).await?;
+        Ok(true)
+    }
+
     fn update(&self, scope: &str, holder: &str, change: impl FnOnce(&mut HolderOpens)) {
         let Ok(mut live) = self.1.lock() else {
             return;

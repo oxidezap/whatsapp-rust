@@ -2714,6 +2714,39 @@ async fn a_release_the_backend_rejected_is_retried_by_the_next_call() {
 }
 
 #[wasm_bindgen_test]
+async fn a_retried_release_leaves_a_lease_another_device_took_over() {
+    let h = Harness::new();
+    let first = h
+        .open("bob-retry-taken", "tab-a", 0.0, true)
+        .await
+        .ok()
+        .unwrap();
+    h.state.release_failures.set(1);
+    rejected(first.release()).await;
+    // The same holder opens again on the unchanged lease, then the first
+    // device retries its release.
+    let second = h
+        .open("bob-retry-taken", "tab-a", 1.0, false)
+        .await
+        .ok()
+        .unwrap();
+    run(first.release()).await;
+    let refused = expect_err(h.open("bob-retry-taken", "tab-b", 2.0, false).await);
+    assert_eq!(
+        code_of(&refused).as_deref(),
+        Some("lease_held"),
+        "the retry released a lease the second device uses"
+    );
+    assert_eq!(run(second.renew_lease(3.0, TTL)).await, JsValue::TRUE);
+    run(second.release()).await;
+    let other = h
+        .open("bob-retry-taken", "tab-b", 4.0, false)
+        .await
+        .expect("the second device's release frees the scope");
+    run(other.release()).await;
+}
+
+#[wasm_bindgen_test]
 async fn a_late_acquire_of_an_older_generation_releases_a_newer_lease_left_behind() {
     let h = Harness::new();
     let seed = h
