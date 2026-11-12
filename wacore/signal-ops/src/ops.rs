@@ -251,6 +251,16 @@ pub(crate) fn chain_key(group: &str, sender: &str) -> String {
 }
 
 /// Lock key for a group's sender-key distribution marks.
+/// Per-account lock: every path that can create a session with a peer takes
+/// it, and `forget_user` takes it before scanning, so a session set up before
+/// a reset cannot commit after it. Keyed on the user part, covering the
+/// account's PN, hosted and LID addresses of that number alike. `p:` sorts
+/// after `g:`/`k:` and before `s:`, matching the order every caller already
+/// acquires those in.
+pub(crate) fn account_lock(user: &str) -> String {
+    format!("p:{user}")
+}
+
 pub(crate) fn group_key(group: &str) -> String {
     format!("g:{group}")
 }
@@ -603,28 +613,36 @@ impl<S: ServiceStore> SignalOps<S> {
     /// message either way starts a fresh session. Sender keys are left alone:
     /// they are replaced when the peer distributes a new one.
     pub async fn forget_user(&self, user: &Jid) -> Result<(), OpsError> {
-        let mut addresses = Vec::new();
-        for server in with_hosted(user.server) {
-            for (address, _) in self.device_addresses(&user.user, server).await? {
-                addresses.push(address);
-            }
-        }
-        addresses.dedup();
-        if addresses.is_empty() {
-            return Ok(());
-        }
-        let held = self
-            .lock_keys(addresses.iter().map(|a| format!("s:{a}")).collect())
-            .await?;
-        held.run(async {
-            let batch: Vec<Arc<str>> = addresses.iter().map(|a| Arc::from(a.as_str())).collect();
-            let staged = self.store.staged();
-            staged.delete_sessions_batch(&batch).await?;
-            staged.delete_identities_batch(&batch).await?;
-            staged.commit().await?;
-            Ok(())
-        })
-        .await
+        let account = self.lock_keys(vec![account_lock(&user.user)]).await?;
+        account
+            .run(async {
+                // Scanned under the account lock, so no session setup for this
+                // user is still in flight.
+                let mut addresses = Vec::new();
+                for server in with_hosted(user.server) {
+                    for (address, _) in self.device_addresses(&user.user, server).await? {
+                        addresses.push(address);
+                    }
+                }
+                addresses.dedup();
+                if addresses.is_empty() {
+                    return Ok(());
+                }
+                let held = self
+                    .lock_keys(addresses.iter().map(|a| format!("s:{a}")).collect())
+                    .await?;
+                held.run(async {
+                    let batch: Vec<Arc<str>> =
+                        addresses.iter().map(|a| Arc::from(a.as_str())).collect();
+                    let staged = self.store.staged();
+                    staged.delete_sessions_batch(&batch).await?;
+                    staged.delete_identities_batch(&batch).await?;
+                    staged.commit().await?;
+                    Ok(())
+                })
+                .await
+            })
+            .await
     }
 
     /// Move a user's sessions and identities from phone-number addresses to
@@ -639,66 +657,73 @@ impl<S: ServiceStore> SignalOps<S> {
                 "migrate_pn_to_lid needs a phone-number JID and a LID".into(),
             ));
         }
-        let mut moves = Vec::new();
-        for (from, to) in [
-            (Server::Pn, Server::Lid),
-            (Server::Hosted, Server::HostedLid),
-        ] {
-            for (address, device) in self.device_addresses(&pn.user, from).await? {
-                let target = Jid::new(lid.user.clone(), to).with_device(device);
-                moves.push((address, target.to_protocol_address().as_str().to_owned()));
-            }
-        }
-        if moves.is_empty() {
-            return Ok(0);
-        }
-        let held = self
-            .lock_keys(
-                moves
-                    .iter()
-                    .flat_map(|(from, to)| [format!("s:{from}"), format!("s:{to}")])
-                    .collect(),
-            )
+        // Both accounts first, then the scan, so no session for either is
+        // being set up while this decides what to move.
+        let accounts = self
+            .lock_keys(vec![account_lock(&pn.user), account_lock(&lid.user)])
             .await?;
-        held.run(async {
-            let staged = self.store.staged();
-            let mut moved = 0;
-            for (from, to) in &moves {
-                let mut changed = false;
-                if let Some(session) = staged.get_session(from).await? {
-                    staged.put_session(to, &session).await?;
-                    staged.delete_session(from).await?;
-                    changed = true;
-                }
-                if let Some(identity) = staged.load_identity(from).await? {
-                    if staged.load_identity(to).await?.is_none() {
-                        staged.put_identity(to, identity).await?;
+        accounts
+            .run(async {
+                let mut moves = Vec::new();
+                for (from, to) in [
+                    (Server::Pn, Server::Lid),
+                    (Server::Hosted, Server::HostedLid),
+                ] {
+                    for (address, device) in self.device_addresses(&pn.user, from).await? {
+                        let target = Jid::new(lid.user.clone(), to).with_device(device);
+                        moves.push((address, target.to_protocol_address().as_str().to_owned()));
                     }
-                    staged.delete_identity(from).await?;
-                    changed = true;
                 }
-                moved += usize::from(changed);
-            }
-            // The account's pin moves with it. An existing LID pin wins: it
-            // was pinned or accepted for that address directly.
-            let (pn_account, lid_account) =
-                (pn.to_non_ad().to_string(), lid.to_non_ad().to_string());
-            if let Some(pin) = staged
-                .load_aux(Namespace::AccountIdentity, &pn_account)
-                .await?
-                && staged
-                    .load_aux(Namespace::AccountIdentity, &lid_account)
-                    .await?
-                    .is_none()
-            {
-                staged
-                    .put_aux(Namespace::AccountIdentity, &lid_account, &pin)
+                let held = self
+                    .lock_keys(
+                        moves
+                            .iter()
+                            .flat_map(|(from, to)| [format!("s:{from}"), format!("s:{to}")])
+                            .collect(),
+                    )
                     .await?;
-            }
-            staged.commit().await?;
-            Ok(moved)
-        })
-        .await
+                held.run(async {
+                    let staged = self.store.staged();
+                    let mut moved = 0;
+                    for (from, to) in &moves {
+                        let mut changed = false;
+                        if let Some(session) = staged.get_session(from).await? {
+                            staged.put_session(to, &session).await?;
+                            staged.delete_session(from).await?;
+                            changed = true;
+                        }
+                        if let Some(identity) = staged.load_identity(from).await? {
+                            if staged.load_identity(to).await?.is_none() {
+                                staged.put_identity(to, identity).await?;
+                            }
+                            staged.delete_identity(from).await?;
+                            changed = true;
+                        }
+                        moved += usize::from(changed);
+                    }
+                    // The account's pin moves with it, even with no session to
+                    // move. An existing LID pin wins: it was pinned or accepted
+                    // for that address directly.
+                    let (pn_account, lid_account) =
+                        (pn.to_non_ad().to_string(), lid.to_non_ad().to_string());
+                    if let Some(pin) = staged
+                        .load_aux(Namespace::AccountIdentity, &pn_account)
+                        .await?
+                        && staged
+                            .load_aux(Namespace::AccountIdentity, &lid_account)
+                            .await?
+                            .is_none()
+                    {
+                        staged
+                            .put_aux(Namespace::AccountIdentity, &lid_account, &pin)
+                            .await?;
+                    }
+                    staged.commit().await?;
+                    Ok(moved)
+                })
+                .await
+            })
+            .await
     }
 
     pub async fn has_session(&self, address: &ProtocolAddress) -> Result<bool, OpsError> {
@@ -712,7 +737,10 @@ impl<S: ServiceStore> SignalOps<S> {
         address: &ProtocolAddress,
         bundle: &RemoteBundle,
     ) -> Result<(), OpsError> {
-        let held = self.lock_keys(vec![session_key(address)]).await?;
+        let user = crate::trust::device_of(address)?.user;
+        let held = self
+            .lock_keys(vec![session_key(address), account_lock(&user)])
+            .await?;
         held.run(async {
             let staged = Arc::new(self.store.staged());
             self.establish_into(&staged, address, bundle).await?;
@@ -759,7 +787,10 @@ impl<S: ServiceStore> SignalOps<S> {
         ciphertext: &[u8],
         device_identity: Option<&[u8]>,
     ) -> Result<Decrypted, OpsError> {
-        let held = self.lock_keys(vec![session_key(sender)]).await?;
+        let user = crate::trust::device_of(sender)?.user;
+        let held = self
+            .lock_keys(vec![session_key(sender), account_lock(&user)])
+            .await?;
         held.run(async {
             let staged = Arc::new(self.store.staged());
             let decrypted = self

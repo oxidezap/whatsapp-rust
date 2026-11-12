@@ -14,7 +14,7 @@
 
 use crate::error::OpsError;
 use crate::ops::RemoteBundle;
-use crate::ops::{ServiceStore, SignalOps, chain_key, group_key, session_key};
+use crate::ops::{ServiceStore, SignalOps, account_lock, chain_key, group_key, session_key};
 use crate::trust::{SignalResolver, Verifying};
 use std::collections::HashSet;
 use wacore::client::context::{GroupRoutingInfo, SendContextResolver};
@@ -380,10 +380,11 @@ impl<S: ServiceStore> SignalOps<S> {
         // An existing PN session remains a valid fallback even when the client
         // knows the preferred LID. Both addresses can be written by fan-out.
         let lock_jids = dm_lock_jids(resolved.devices(), &encryption);
-        let held_keys: Vec<String> = lock_jids
+        let mut held_keys: Vec<String> = lock_jids
             .iter()
             .map(|jid| session_key(&jid.to_protocol_address()))
             .collect();
+        held_keys.extend(lock_jids.iter().map(|jid| account_lock(&jid.user)));
         let _ = resolved.signal_addressing_or_init(DmSignalAddressing::new(encryption, lock_jids));
         let held = self.lock_keys(held_keys).await?;
         held.run(async {
@@ -580,6 +581,8 @@ impl<S: ServiceStore> SignalOps<S> {
                 let encryption = encryption_jid(resolver, device).await;
                 held_keys.push(session_key(&device.to_protocol_address()));
                 held_keys.push(session_key(&encryption.to_protocol_address()));
+                held_keys.push(account_lock(&device.user));
+                held_keys.push(account_lock(&encryption.user));
                 signal_addresses.insert(device.clone(), encryption);
             }
             let session_held = self.lock_keys(held_keys).await?;
@@ -823,7 +826,11 @@ impl<S: ServiceStore> SignalOps<S> {
         // A group retry also means the requester may have lost this device's
         // sender key: forget its mark so the next group send redistributes it,
         // as WA Web and the client do (mark_requester_for_fresh_skdm).
-        let mut held_keys = vec![session_key(&address)];
+        let mut held_keys = vec![
+            session_key(&address),
+            account_lock(&request.encryption_jid.user),
+            account_lock(&request.requester.user),
+        ];
         if matches!(request.route, RetryRoute::Group { .. }) {
             held_keys.push(group_key(&request.chat.to_string()));
         }

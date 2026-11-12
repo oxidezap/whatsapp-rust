@@ -10,7 +10,7 @@
 //! buffered result; once delivered it returns [`Received::AlreadyDelivered`].
 
 use crate::error::OpsError;
-use crate::ops::{EncKind, ServiceStore, SignalOps, chain_key, session_key};
+use crate::ops::{EncKind, ServiceStore, SignalOps, account_lock, chain_key, session_key};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use wacore::libsignal::protocol::{ProtocolAddress, SignalProtocolError};
@@ -219,7 +219,13 @@ impl<S: ServiceStore> SignalOps<S> {
         let chain = chain_key(request.chat, request.sender.as_str());
         let keys = match request.kind {
             ReceiveKind::SenderKey => vec![chain],
-            _ => vec![session_key(request.sender), chain],
+            // A prekey message can create a session, so it also takes the
+            // sender's account lock (see `account_lock`).
+            _ => vec![
+                session_key(request.sender),
+                chain,
+                account_lock(&crate::trust::device_of(request.sender)?.user),
+            ],
         };
         let held = self.lock_keys(keys).await?;
         held.run(async {
