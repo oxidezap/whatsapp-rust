@@ -228,6 +228,19 @@ impl<S: ServiceStore> SignalOps<S> {
         Ok(Ok(()))
     }
 
+    /// Copy `from`'s account pin to `to`'s account in `store` when `to` has
+    /// none. Both name the same account in different address forms.
+    pub(crate) async fn mirror_pin(&self, store: &S, from: &Jid, to: &Jid) -> Result<(), OpsError> {
+        if let Some(pin) = Self::pinned(store, from).await?
+            && Self::pinned(store, to).await?.is_none()
+        {
+            store
+                .insert_aux(Namespace::AccountIdentity, &account_key(to), &pin)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Verify a fetch, returning only the bundles that pass. Primary bundles
     /// are checked first so a fresh account's primary can anchor its
     /// companions in the same fetch.
@@ -271,6 +284,34 @@ pub(crate) struct Verifying<'a, S> {
     pub ops: &'a SignalOps<S>,
     pub inner: &'a dyn SignalResolver,
     pub store: Arc<S>,
+    /// The LID account each phone-number user is encrypted to in this
+    /// operation, as fixed before its locks were taken.
+    pub lids: HashMap<String, Jid>,
+}
+
+impl<'a, S> Verifying<'a, S> {
+    pub fn new(ops: &'a SignalOps<S>, inner: &'a dyn SignalResolver, store: Arc<S>) -> Self {
+        Self {
+            ops,
+            inner,
+            store,
+            lids: HashMap::new(),
+        }
+    }
+
+    /// Record the addresses an operation encrypts to, `(device, address)`.
+    pub fn with_addresses<'j>(
+        mut self,
+        pairs: impl IntoIterator<Item = (&'j Jid, &'j Jid)>,
+    ) -> Self {
+        for (device, address) in pairs {
+            if device.is_pn() && address.is_lid() {
+                self.lids
+                    .insert(device.user.to_string(), address.to_non_ad());
+            }
+        }
+        self
+    }
 }
 
 fn op_error(error: OpsError) -> anyhow::Error {
@@ -302,6 +343,21 @@ impl<S: ServiceStore> SendContextResolver for Verifying<'_, S> {
             .verify_fetched(&self.store, fetched)
             .await
             .map_err(op_error)?;
+        // A session for a PN device is set up at its LID when the mapping is
+        // known, and later messages arrive from that LID; pin the account
+        // there too. An existing LID pin is kept.
+        let mut mirrored = std::collections::HashSet::new();
+        for jid in bundles.keys() {
+            if let Some(lid) = self.lids.get(jid.user.as_str())
+                && jid.is_pn()
+                && mirrored.insert(lid.clone())
+            {
+                self.ops
+                    .mirror_pin(&self.store, jid, lid)
+                    .await
+                    .map_err(op_error)?;
+            }
+        }
         Ok(PreKeyFetchOutcome { bundles, rejected })
     }
 

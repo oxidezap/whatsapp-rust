@@ -380,6 +380,7 @@ impl<S: ServiceStore> SignalOps<S> {
         // An existing PN session remains a valid fallback even when the client
         // knows the preferred LID. Both addresses can be written by fan-out.
         let lock_jids = dm_lock_jids(resolved.devices(), &encryption);
+        let dm_encryption = encryption.clone();
         let mut held_keys: Vec<String> = lock_jids
             .iter()
             .map(|jid| session_key(&jid.to_protocol_address()))
@@ -404,11 +405,8 @@ impl<S: ServiceStore> SignalOps<S> {
                 prekey_store: &mut prekeys,
                 signed_prekey_store: &signed_prekeys,
             };
-            let verifying = Verifying {
-                ops: self,
-                inner: resolver,
-                store: staged.clone(),
-            };
+            let verifying = Verifying::new(self, resolver, staged.clone())
+                .with_addresses(resolved.devices().iter().zip(&dm_encryption));
             let prepared = prepare_dm_stanza(
                 runtime,
                 &mut signal,
@@ -648,11 +646,8 @@ impl<S: ServiceStore> SignalOps<S> {
                         prekey_store: &mut prekeys,
                         signed_prekey_store: &signed_prekeys,
                     };
-                    let verifying = Verifying {
-                        ops: self,
-                        inner: resolver,
-                        store: staged.clone(),
-                    };
+                    let verifying = Verifying::new(self, resolver, staged.clone())
+                        .with_addresses(&signal_addresses);
                     let prepared = prepare_group_stanza_resolved(
                         runtime,
                         &mut signal,
@@ -866,11 +861,7 @@ impl<S: ServiceStore> SignalOps<S> {
             if let Some(bundle) = request.bundle {
                 self.establish_into(&staged, &address, bundle).await?;
             } else if !staged.has_session(address.as_str()).await? {
-                let verifying = Verifying {
-                    ops: self,
-                    inner: resolver,
-                    store: staged.clone(),
-                };
+                let verifying = Verifying::new(self, resolver, staged.clone());
                 let fetched = verifying
                     .fetch_prekeys(std::slice::from_ref(request.encryption_jid))
                     .await

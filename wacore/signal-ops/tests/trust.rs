@@ -750,3 +750,128 @@ async fn forgetting_a_user_waits_for_a_session_setup_already_in_flight() {
         "no session may survive the reset"
     );
 }
+
+/// `Client` with a known phone-number to LID mapping, so sends set up
+/// sessions at the LID address.
+struct Mapped {
+    inner: Client,
+    phone: &'static str,
+    lid: &'static str,
+}
+
+#[async_trait]
+impl SendContextResolver for Mapped {
+    async fn lock_device_sessions(&self, device_jids: &[Jid]) -> SessionLockGuard {
+        self.inner.lock_device_sessions(device_jids).await
+    }
+
+    async fn resolve_devices(&self, jids: &[Jid]) -> anyhow::Result<Vec<Jid>> {
+        self.inner.resolve_devices(jids).await
+    }
+
+    async fn fetch_prekeys(&self, jids: &[Jid]) -> anyhow::Result<HashMap<Jid, PreKeyBundle>> {
+        self.inner.fetch_prekeys(jids).await
+    }
+
+    async fn fetch_prekeys_for_identity_check(
+        &self,
+        jids: &[Jid],
+    ) -> anyhow::Result<PreKeyFetchOutcome> {
+        self.inner.fetch_prekeys_for_identity_check(jids).await
+    }
+
+    async fn resolve_group_routing_info(&self, jid: &Jid) -> anyhow::Result<Arc<GroupRoutingInfo>> {
+        self.inner.resolve_group_routing_info(jid).await
+    }
+
+    async fn get_lid_for_phone(&self, phone_user: &str) -> Option<wacore_binary::CompactString> {
+        (phone_user == self.phone).then(|| self.lid.into())
+    }
+}
+
+#[async_trait]
+impl SignalResolver for Mapped {
+    async fn fetch_verifiable_prekeys(&self, jids: &[Jid]) -> anyhow::Result<VerifiablePrekeys> {
+        self.inner.fetch_verifiable_prekeys(jids).await
+    }
+}
+
+async fn mapped_client(
+    bob: &SignalOps<Store>,
+    account: &KeyPair,
+    device_identity: Vec<u8>,
+) -> Mapped {
+    let primary: Jid = "222@s.whatsapp.net".parse().unwrap();
+    let companion: Jid = "222:1@s.whatsapp.net".parse().unwrap();
+    Mapped {
+        inner: Client {
+            devices: vec![primary.clone(), companion.clone()],
+            bundles: HashMap::from([
+                (
+                    primary,
+                    FetchedBundle {
+                        bundle: primary_bundle(account),
+                        device_identity: None,
+                    },
+                ),
+                (
+                    companion,
+                    FetchedBundle {
+                        bundle: bundle_for(bob, 1).await,
+                        device_identity: Some(device_identity),
+                    },
+                ),
+            ]),
+            group: None,
+            gate: None,
+        },
+        phone: "222",
+        lid: "900222",
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_send_at_a_mapped_lid_pins_the_account_there_too() {
+    let alice = device("alice-mapped", "111:1@s.whatsapp.net").await;
+    let bob = device("bob-mapped", "222:1@s.whatsapp.net").await;
+    let (account, device_identity) = pair_with_account(&bob).await;
+    let primary: Jid = "222@s.whatsapp.net".parse().unwrap();
+    let lid_companion: Jid = "900222:1@lid".parse().unwrap();
+
+    let client = mapped_client(&bob, &account, device_identity.clone()).await;
+    alice
+        .send_direct(&TokioRuntime, &client, &primary, &text("hi"), "M1")
+        .await
+        .unwrap();
+    assert_eq!(
+        alice.account_identity(&lid_companion).await.unwrap(),
+        Some(*account.public_key.public_key_bytes())
+    );
+
+    // A companion that later arrives at the LID verifies against that pin.
+    let reset = remote(&bundle_for(&bob, 1).await, Some(device_identity));
+    alice
+        .establish_session(&lid_companion.to_protocol_address(), &reset)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_send_at_a_mapped_lid_keeps_an_existing_lid_pin() {
+    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    let alice = device("alice-mapped-kept", "111:1@s.whatsapp.net").await;
+    let bob = device("bob-mapped-kept", "222:1@s.whatsapp.net").await;
+    let (account, device_identity) = pair_with_account(&bob).await;
+    let primary: Jid = "222@s.whatsapp.net".parse().unwrap();
+    let lid: Jid = "900222@lid".parse().unwrap();
+    let accepted = KeyPair::generate(&mut rng);
+    let accepted = *accepted.public_key.public_key_bytes();
+    alice.trust_account_identity(&lid, accepted).await.unwrap();
+
+    let client = mapped_client(&bob, &account, device_identity).await;
+    alice
+        .send_direct(&TokioRuntime, &client, &primary, &text("hi"), "M2")
+        .await
+        .unwrap();
+    assert_eq!(alice.account_identity(&lid).await.unwrap(), Some(accepted));
+}
