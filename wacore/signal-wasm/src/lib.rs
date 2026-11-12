@@ -73,6 +73,12 @@ export interface RemoteBundle {
   signedPrekeySignature: Uint8Array;
   prekeyId?: number;
   prekey?: Uint8Array;
+  /**
+   * The `ADVSignedDeviceIdentity` bytes the server sent with the bundle.
+   * Required for companion devices (device above 0); a primary device has none.
+   * A bundle that fails verification rejects with code "bundle_refused".
+   */
+  deviceIdentity?: Uint8Array;
 }
 export interface PublicPreKey { id: number; publicKey: Uint8Array }
 export interface PrekeyUploadBatch { batchId: string; preKeys: PublicPreKey[] }
@@ -384,7 +390,9 @@ impl SignalDevice {
         })
     }
 
-    /// Run X3DH against a bundle the client fetched from the server.
+    /// Run X3DH against a bundle the client fetched from the server, after
+    /// verifying it against the peer account's pinned identity. Rejects with
+    /// code "bundle_refused" when the bundle does not verify.
     #[wasm_bindgen(js_name = establishSession)]
     pub fn establish_session(&self, user: String, device: u32, bundle: JsValue) -> Promise {
         let inner = self.inner.clone();
@@ -393,6 +401,45 @@ impl SignalDevice {
             inner
                 .ops
                 .establish_session(&address(&user, device)?, &bundle)
+                .await
+                .map_err(ops_error)?;
+            Ok(JsValue::UNDEFINED)
+        })
+    }
+
+    /// The pinned identity key (32 bytes) of a peer account, or `null` when
+    /// none has been seen. `account` is any device JID of the account.
+    #[wasm_bindgen(js_name = accountIdentity, unchecked_return_type = "Promise<Uint8Array | null>")]
+    pub fn account_identity(&self, account: String) -> Promise {
+        let inner = self.inner.clone();
+        promise(async move {
+            let account = convert::jid(&account)?;
+            let pinned = inner
+                .ops
+                .account_identity(&account)
+                .await
+                .map_err(ops_error)?;
+            Ok(pinned.map_or(JsValue::NULL, |key| Uint8Array::from(key.as_slice()).into()))
+        })
+    }
+
+    /// Pin `identity_key` (32 bytes) as the peer account's identity,
+    /// replacing any earlier pin. Call this only after the application, and
+    /// the user where the product asks them, accepted the changed key. This
+    /// library does not decide that: the WhatsApp client that reports a
+    /// change is not trusted to accept it. Until then bundles carrying the
+    /// new key reject with code "bundle_refused".
+    #[wasm_bindgen(js_name = trustAccountIdentity, unchecked_return_type = "Promise<void>")]
+    pub fn trust_account_identity(&self, account: String, identity_key: Uint8Array) -> Promise {
+        let inner = self.inner.clone();
+        promise(async move {
+            let account = convert::jid(&account)?;
+            let key: [u8; 32] = identity_key.to_vec().try_into().map_err(|_| {
+                convert::coded_error("invalid_input", "identityKey must be 32 bytes")
+            })?;
+            inner
+                .ops
+                .trust_account_identity(&account, key)
                 .await
                 .map_err(ops_error)?;
             Ok(JsValue::UNDEFINED)

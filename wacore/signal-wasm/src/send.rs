@@ -23,6 +23,7 @@ use wacore::prekeys::PreKeyFetchOutcome;
 use wacore::runtime::{AbortHandle, Runtime};
 use wacore::types::message::AddressingMode;
 use wacore_binary::{CompactString, Jid};
+use wacore_signal_ops::{FetchedBundle, SignalResolver, VerifiablePrekeys};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
@@ -32,7 +33,11 @@ const TS_SEND_TYPES: &str = r#"
 export interface SendResolver {
   /** Device JIDs for these user JIDs. */
   resolveDevices(jids: string[]): Promise<string[]>;
-  /** Prekey bundles by device JID; omit devices without one. */
+  /**
+   * Prekey bundles by device JID; omit devices without one. A companion
+   * device's bundle must carry the `<device-identity>` the server sent with it
+   * as `deviceIdentity`; a bundle that does not verify is not used.
+   */
   fetchPrekeys(jids: string[]): Promise<Record<string, RemoteBundle>>;
   /**
    * Optional. The LID user (no server) that a phone-number user maps to, if
@@ -149,6 +154,37 @@ fn parse_jid(value: &JsValue, context: &str) -> anyhow::Result<Jid> {
 }
 
 #[async_trait(?Send)]
+impl SignalResolver for JsResolver {
+    async fn fetch_verifiable_prekeys(&self, jids: &[Jid]) -> anyhow::Result<VerifiablePrekeys> {
+        let value = call("fetchPrekeys", self.0.fetch_prekeys(jid_array(jids))).await?;
+        let object: Object = value
+            .dyn_into()
+            .map_err(|_| anyhow::anyhow!("fetchPrekeys must resolve to an object"))?;
+        let mut bundles = HashMap::new();
+        for entry in Object::entries(&object).iter() {
+            let pair: Array = entry.unchecked_into();
+            let jid = parse_jid(&pair.get(0), "fetchPrekeys")?;
+            let remote =
+                remote_bundle(&pair.get(1)).map_err(|e| js_error("fetchPrekeys bundle", e))?;
+            let bundle = remote
+                .to_prekey_bundle()
+                .map_err(|e| anyhow::anyhow!("fetchPrekeys bundle: {e}"))?;
+            bundles.insert(
+                jid,
+                FetchedBundle {
+                    bundle,
+                    device_identity: remote.device_identity,
+                },
+            );
+        }
+        Ok(VerifiablePrekeys {
+            bundles,
+            rejected: Vec::new(),
+        })
+    }
+}
+
+#[async_trait(?Send)]
 impl SendContextResolver for JsResolver {
     // `SignalOps` holds the session lock of every target address for the
     // whole send, so the host needs no second lock set here.
@@ -167,21 +203,13 @@ impl SendContextResolver for JsResolver {
     }
 
     async fn fetch_prekeys(&self, jids: &[Jid]) -> anyhow::Result<HashMap<Jid, PreKeyBundle>> {
-        let value = call("fetchPrekeys", self.0.fetch_prekeys(jid_array(jids))).await?;
-        let object: Object = value
-            .dyn_into()
-            .map_err(|_| anyhow::anyhow!("fetchPrekeys must resolve to an object"))?;
-        let mut bundles = HashMap::new();
-        for entry in Object::entries(&object).iter() {
-            let pair: Array = entry.unchecked_into();
-            let jid = parse_jid(&pair.get(0), "fetchPrekeys")?;
-            let bundle = remote_bundle(&pair.get(1))
-                .map_err(|e| js_error("fetchPrekeys bundle", e))?
-                .to_prekey_bundle()
-                .map_err(|e| anyhow::anyhow!("fetchPrekeys bundle: {e}"))?;
-            bundles.insert(jid, bundle);
-        }
-        Ok(bundles)
+        Ok(self
+            .fetch_verifiable_prekeys(jids)
+            .await?
+            .bundles
+            .into_iter()
+            .map(|(jid, fetched)| (jid, fetched.bundle))
+            .collect())
     }
 
     async fn fetch_prekeys_for_identity_check(

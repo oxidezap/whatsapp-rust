@@ -46,6 +46,7 @@ pub fn ops_error(error: OpsError) -> JsValue {
         OpsError::InvalidInput(message) => coded_error("invalid_input", &message),
         OpsError::NotInitialised => coded_error("not_initialised", "scope has no device keys"),
         OpsError::Send(message) => coded_error("send", &message),
+        OpsError::BundleRefused(reason) => coded_error("bundle_refused", &reason.to_string()),
         OpsError::Signal(e) => coded_error("signal", &e.to_string()),
         OpsError::Store(e) => coded_error("store", &error_chain(&e)),
     }
@@ -153,7 +154,20 @@ pub fn remote_bundle(value: &JsValue) -> Result<RemoteBundle, JsValue> {
         signed_prekey: fixed_bytes(value, "signedPrekey")?,
         signed_prekey_signature: fixed_bytes(value, "signedPrekeySignature")?,
         prekey,
+        device_identity: optional_bytes(value, "deviceIdentity")?,
     })
+}
+
+/// An optional `Uint8Array` property; any other present value is invalid.
+fn optional_bytes(source: &JsValue, key: &str) -> Result<Option<Vec<u8>>, JsValue> {
+    let value = get(source, key);
+    if value.is_undefined() || value.is_null() {
+        return Ok(None);
+    }
+    let array: Uint8Array = value
+        .dyn_into()
+        .map_err(|_| invalid(&format!("{key} must be a Uint8Array")))?;
+    Ok(Some(array.to_vec()))
 }
 
 /// Generations and expiry times travel as JS numbers; both stay far below
