@@ -260,10 +260,22 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
                 .await;
         };
         let overlay = overlay.lock().await;
-        // Pending deletes can hide stored keys, so scan without the limit.
+        // Pending deletes can hide stored keys, so ask the backend for that
+        // many extra. Inserts only add keys, so they need no headroom.
+        let backend_limit = limit.map(|limit| {
+            let hidden = overlay
+                .iter()
+                .filter(|((pns, key), change)| {
+                    *pns == ns
+                        && key.starts_with(prefix)
+                        && matches!(change, Staged::Delete | Staged::InsertDeleted)
+                })
+                .count();
+            limit.saturating_add(hidden)
+        });
         let mut keys: std::collections::BTreeSet<String> = self
             .records
-            .scan_keys(self.scope(), ns, prefix, None)
+            .scan_keys(self.scope(), ns, prefix, backend_limit)
             .await?
             .into_iter()
             .collect();
@@ -801,6 +813,58 @@ mod tests {
             lease.fence,
         );
         (records, store)
+    }
+
+    /// Delegates to a [`MemoryRecordStore`] and records each scan limit.
+    #[derive(Default)]
+    struct ScanSpy {
+        inner: MemoryRecordStore,
+        limits: std::sync::Mutex<Vec<Option<usize>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RecordStore for ScanSpy {
+        async fn get(&self, scope: &str, ns: Namespace, key: &str) -> Result<Option<Vec<u8>>> {
+            self.inner.get(scope, ns, key).await
+        }
+
+        async fn scan_keys(
+            &self,
+            scope: &str,
+            ns: Namespace,
+            prefix: &str,
+            limit: Option<usize>,
+        ) -> Result<Vec<String>> {
+            self.limits.lock().unwrap().push(limit);
+            self.inner.scan_keys(scope, ns, prefix, limit).await
+        }
+
+        async fn write(&self, fence: &Fence, ops: &[WriteOp]) -> Result<()> {
+            self.inner.write(fence, ops).await
+        }
+    }
+
+    #[test]
+    fn a_limited_staged_scan_stays_bounded_and_skips_pending_deletes() {
+        let records = Arc::new(ScanSpy::default());
+        let lease = block_on(records.inner.acquire("device-1", "node-a", 0, TTL))
+            .unwrap()
+            .unwrap();
+        let store = RecordSignalStore::new(
+            records.clone(),
+            Arc::new(AesGcmSealer::new(&[3; 32])),
+            lease.fence,
+        );
+        for key in ["s1", "s2", "s3", "s4", "s5", "s6"] {
+            block_on(store.put_session(key, b"v")).unwrap();
+        }
+        let staged = store.staged();
+        block_on(staged.delete_session("s1")).unwrap();
+        block_on(staged.delete_session("s2")).unwrap();
+        block_on(staged.put_session("s25", b"v")).unwrap();
+        let keys = block_on(staged.scan(Namespace::Session, "s", Some(3))).unwrap();
+        assert_eq!(keys, ["s25", "s3", "s4"]);
+        assert_eq!(records.limits.lock().unwrap().as_slice(), [Some(5)]);
     }
 
     #[test]
