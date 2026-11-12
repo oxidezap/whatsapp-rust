@@ -35,6 +35,14 @@ required-features = ["protobuf-experiment"]
 name = "protobuf_target_inventory"
 required-features = ["protobuf-experiment"]
 
+[[example]]
+name = "protobuf_inventory"
+required-features = ["protobuf-experiment"]
+
+[[example]]
+name = "protobuf_owned_view_cost"
+required-features = ["protobuf-experiment"]
+
 [dependencies]
 buffa = { workspace = true }
 bytes = { workspace = true }

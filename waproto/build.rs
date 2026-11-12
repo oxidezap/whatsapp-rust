@@ -36,6 +36,9 @@ mod descriptor;
 #[path = "build/pin_clone.rs"]
 mod pin_clone;
 
+#[path = "codegen/policy.rs"]
+mod policy;
+
 #[cfg(feature = "protobuf-experiment")]
 #[path = "experiment/generate.rs"]
 mod experiment;
@@ -153,10 +156,7 @@ fn main() -> std::io::Result<()> {
         .idiomatic_field_names(true)
         // Open enum (buffa 0.9): unknown wire values surface as
         // EnumValue::Unknown(n) instead of silently decoding as None.
-        .open_enums_in(&[
-            ".whatsapp.SyncdMutation.SyncdOperation",
-            ".whatsapp.SyncActionValue.StatusPrivacyAction.StatusDistributionMode",
-        ])
+        .open_enums_in(policy::OPEN_ENUMS)
         // Keep opened fields on the closed-enum serde contracts
         // (serde-enum-repr numbers, serde-snake-case lowercase); see
         // crate::open_enum_serde.
@@ -233,13 +233,7 @@ fn main() -> std::io::Result<()> {
             "#[cfg_attr(all(feature = \"serde-snake-case\", not(feature = \"serde-enum-repr\")), serde(rename_all(deserialize = \"lowercase\")))]",
         )
         // O(1)-clone Bytes for hot-path crypto structures instead of Vec<u8>.
-        .use_bytes_type_in(&[
-            ".whatsapp.SessionStructure.Chain.ChainKey",
-            ".whatsapp.SessionStructure.Chain.MessageKey",
-            ".whatsapp.SenderKeyStateStructure.SenderChainKey",
-            ".whatsapp.SenderKeyStateStructure.SenderMessageKey",
-            ".whatsapp.SenderKeyStateStructure.SenderSigningKey",
-        ])
+        .use_bytes_type_in(policy::SHARED_BYTES_MESSAGES)
         // Bytes fields lack serde support; skip them (internal crypto state).
         .field_attribute(
             ".whatsapp.SessionStructure.Chain.ChainKey.key",

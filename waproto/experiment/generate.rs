@@ -181,7 +181,7 @@ fn field_scalar(path: &str, field: &FieldDescriptorProto) -> Scalar {
     assert!(field.oneof_index.is_none());
     scalar(
         field.r#type.expect("field kind"),
-        path.starts_with("SessionStructure.Chain."),
+        crate::policy::SHARED_BYTES_MESSAGES.contains(&format!(".whatsapp.{path}").as_str()),
     )
 }
 
