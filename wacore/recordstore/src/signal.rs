@@ -836,7 +836,8 @@ mod tests {
         limits: std::sync::Mutex<Vec<Option<usize>>>,
     }
 
-    #[async_trait::async_trait]
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl RecordStore for ScanSpy {
         async fn get(&self, scope: &str, ns: Namespace, key: &str) -> Result<Option<Vec<u8>>> {
             self.inner.get(scope, ns, key).await
