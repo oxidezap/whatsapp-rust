@@ -772,15 +772,17 @@ async fn a_send_waiting_on_devices_cannot_give_a_removed_member_the_replacement_
         .is_err(),
         "a removed participant received the replacement sender key from a stale resolution"
     );
-    receive_group_component(
-        &carol,
-        &group,
-        &alice_jid,
-        &alice_identity_carol,
-        enc_for(&after.stanza, &carol_jid),
-    )
-    .await
-    .unwrap();
+    let carrier = enc_for(&after.stanza, &carol_jid);
+    if carrier.0 == "pkmsg" {
+        assert_eq!(
+            stanza_device_identity(&after.stanza).as_deref(),
+            Some(alice_identity_carol.as_slice()),
+            "Carol verifies the identity the stanza carries"
+        );
+    }
+    receive_group_component(&carol, &group, &alice_jid, &alice_identity_carol, carrier)
+        .await
+        .unwrap();
     let Received::Message(message) = receive_group_component(
         &carol,
         &group,
