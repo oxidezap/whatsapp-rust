@@ -327,6 +327,8 @@ async fn an_open_overlapping_a_live_instance_cannot_restore_its_older_keys() {
         () = records.reading.notified() => None,
         opened = &mut opening => Some(opened),
     };
+    // The fixed open never reads; keep the pause for the open alone.
+    records.pause.store(false, Ordering::SeqCst);
     let rotated = first.rotate_signed_prekey().await.unwrap();
     drop(first);
     records.resume.notify_one();

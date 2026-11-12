@@ -110,6 +110,17 @@ impl RecordStore for Records {
                 "synthetic atomic commit failure".into(),
             ));
         }
+        // Mode 6: a prekey batch commits, but its response is lost.
+        let lose_response = failure == 6
+            && ops.iter().any(|op| {
+                matches!(
+                    op,
+                    WriteOp::Insert {
+                        ns: Namespace::PreKey,
+                        ..
+                    }
+                )
+            });
         let consumed = self.consume.swap(0, Ordering::SeqCst);
         if consumed != 0
             && ops.iter().any(|op| {
@@ -132,7 +143,11 @@ impl RecordStore for Records {
                 )
                 .await?;
         }
-        self.inner.write(fence, ops).await
+        self.inner.write(fence, ops).await?;
+        if lose_response {
+            return Err(StoreError::Validation("synthetic lost response".into()));
+        }
+        Ok(())
     }
 }
 
@@ -1049,5 +1064,32 @@ fn prekey_generation_runs_as_blocking_work() {
         assert_eq!(runtime.jobs.load(std::sync::atomic::Ordering::SeqCst), 1);
         f.ops.generate_prekeys(&runtime, 3).await.unwrap();
         assert_eq!(runtime.jobs.load(std::sync::atomic::Ordering::SeqCst), 2);
+    });
+}
+
+#[test]
+fn a_lost_prekey_commit_response_cannot_rewind_the_counter() {
+    block_on(async {
+        let f = Fixture::new().await;
+        let before = f.counter().await;
+        f.records.fail.store(6, Ordering::SeqCst);
+        assert!(
+            f.ops
+                .prepare_prekey_upload(&InlineRuntime, 2)
+                .await
+                .is_err(),
+            "the caller sees the lost response"
+        );
+        let committed = f.counter().await;
+        assert_eq!(committed, before + 2, "the batch did commit");
+
+        // A cached write after the uncertain commit must not write the old
+        // counter back.
+        f.ops
+            .set_own_jids("111:1@s.whatsapp.net", None)
+            .await
+            .unwrap();
+        f.ops.rotate_signed_prekey().await.unwrap();
+        assert_eq!(f.counter().await, committed);
     });
 }

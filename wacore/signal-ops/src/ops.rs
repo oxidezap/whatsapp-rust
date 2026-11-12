@@ -447,7 +447,7 @@ impl<S: ServiceStore> SignalOps<S> {
         }
         let held = self.lock_device().await?;
         held.run(async {
-            let mut keys = (**self.authority.keys.read().await).clone();
+            let mut keys = self.durable_keys().await?;
             keys.own_pn = Some(pn.to_owned());
             keys.own_lid = lid.map(str::to_owned);
             self.replace_keys(keys).await
@@ -456,9 +456,36 @@ impl<S: ServiceStore> SignalOps<S> {
     }
 
     async fn replace_keys(&self, keys: DeviceKeys) -> Result<(), OpsError> {
-        self.store.save_device_keys(&keys.encode()).await?;
+        if let Err(error) = self.store.save_device_keys(&keys.encode()).await {
+            self.refresh_keys().await;
+            return Err(error.into());
+        }
         *self.authority.keys.write().await = Arc::new(keys);
         Ok(())
+    }
+
+    /// The device keys as last committed. Read-modify-write starts here, not
+    /// from the cache: a write whose response was lost may still have
+    /// committed, leaving the cache behind the store, and writing the cached
+    /// blob back would rewind it (for example `next_prekey_id`). Call with
+    /// the device lock held.
+    pub(crate) async fn durable_keys(&self) -> Result<DeviceKeys, OpsError> {
+        DeviceKeys::decode(
+            &self
+                .store
+                .load_device_keys()
+                .await?
+                .ok_or(OpsError::NotInitialised)?,
+        )
+    }
+
+    /// After a device-key write with an uncertain outcome, bring the cache in
+    /// line with the store. Best effort: on failure the cache stays as it
+    /// was, and writers still start from [`Self::durable_keys`].
+    pub(crate) async fn refresh_keys(&self) {
+        if let Ok(keys) = self.durable_keys().await {
+            *self.authority.keys.write().await = Arc::new(keys);
+        }
     }
 
     pub async fn public_identity(&self) -> PublicIdentity {
@@ -488,7 +515,7 @@ impl<S: ServiceStore> SignalOps<S> {
     pub async fn rotate_signed_prekey(&self) -> Result<PublicSignedPreKey, OpsError> {
         let held = self.lock_device().await?;
         held.run(async {
-            let mut keys = (**self.authority.keys.read().await).clone();
+            let mut keys = self.durable_keys().await?;
             let retired = record_helpers::new_signed_pre_key_record(
                 keys.signed_prekey_id,
                 &keys.signed_prekey,
@@ -888,7 +915,7 @@ impl<S: ServiceStore> SignalOps<S> {
         // Kept for prekey messages, which carry the device identity.
         let held = self.lock_device().await?;
         held.run(async {
-            let mut updated = (**self.authority.keys.read().await).clone();
+            let mut updated = self.durable_keys().await?;
             updated.account = Some(signed_identity.clone());
             self.replace_keys(updated).await?;
             Ok(PairingSignature {

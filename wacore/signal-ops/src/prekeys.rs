@@ -288,13 +288,7 @@ impl<S: ServiceStore> SignalOps<S> {
         reserved: &BTreeSet<u32>,
         batch_id: Option<&str>,
     ) -> Result<Vec<PublicPreKey>, OpsError> {
-        let mut keys = DeviceKeys::decode(
-            &self
-                .store
-                .load_device_keys()
-                .await?
-                .ok_or(OpsError::NotInitialised)?,
-        )?;
+        let mut keys = self.durable_keys().await?;
         if !(1..=MAX_PREKEY_ID).contains(&keys.next_prekey_id) {
             return Err(corrupt());
         }
@@ -368,7 +362,10 @@ impl<S: ServiceStore> SignalOps<S> {
                 .insert_aux(Namespace::Device, PENDING, &batch.encode()?)
                 .await?;
         }
-        staged.commit().await?;
+        if let Err(error) = staged.commit().await {
+            self.refresh_keys().await;
+            return Err(error.into());
+        }
         *self.authority.keys.write().await = Arc::new(keys);
         Ok(public)
     }
