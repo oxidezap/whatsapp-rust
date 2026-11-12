@@ -128,8 +128,57 @@ fn dm_lock_jids(devices: &[Jid], preferred: &[Jid]) -> Vec<Jid> {
     jids
 }
 
-fn send_error(error: anyhow::Error) -> OpsError {
-    OpsError::Send(format!("{error:#}"))
+/// A failure from wacore's send path. Errors this crate raised inside it
+/// (bundle verification, its stores) come back typed; resolver and other
+/// failures become [`OpsError::Send`].
+pub(crate) fn send_error(error: anyhow::Error) -> OpsError {
+    let error = match error.downcast::<OpsError>() {
+        Ok(error) => return error,
+        Err(error) => error,
+    };
+    match error.downcast::<wacore::store::error::StoreError>() {
+        Ok(error) => OpsError::Store(error),
+        Err(error) => OpsError::Send(format!("{error:#}")),
+    }
+}
+
+#[cfg(test)]
+mod send_error_tests {
+    use super::*;
+
+    fn fence_lost() -> OpsError {
+        OpsError::Store(
+            wacore_recordstore::FenceLost {
+                scope: "scope".into(),
+                generation: 1,
+            }
+            .into_store_error(),
+        )
+    }
+
+    #[test]
+    fn a_lost_fence_raised_inside_a_send_stays_a_lost_fence() {
+        let error = crate::trust::op_error(fence_lost());
+        assert!(send_error(error.context("while fetching prekeys")).is_fence_lost());
+    }
+
+    #[test]
+    fn a_store_error_from_the_send_path_stays_a_store_error() {
+        let store = wacore_recordstore::FenceLost {
+            scope: "scope".into(),
+            generation: 1,
+        }
+        .into_store_error();
+        assert!(send_error(anyhow::Error::new(store)).is_fence_lost());
+    }
+
+    #[test]
+    fn other_failures_are_send_errors() {
+        assert!(matches!(
+            send_error(anyhow::anyhow!("resolver down")),
+            OpsError::Send(_)
+        ));
+    }
 }
 
 /// A finished group `<message>` stanza.

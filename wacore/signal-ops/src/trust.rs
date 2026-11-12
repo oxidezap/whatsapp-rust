@@ -321,8 +321,10 @@ impl<'a, S> Verifying<'a, S> {
     }
 }
 
-fn op_error(error: OpsError) -> anyhow::Error {
-    anyhow::anyhow!("{error}")
+/// Carry `error` through wacore's `anyhow` boundary intact, so the send
+/// can return it typed (a lost fence must still read as one).
+pub(crate) fn op_error(error: OpsError) -> anyhow::Error {
+    anyhow::Error::new(error)
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
