@@ -19,6 +19,10 @@
 /// directly would require version-matching this crate exactly.
 pub use buffa;
 
+#[cfg(feature = "protobuf-experiment")]
+#[doc(hidden)]
+pub mod experiment;
+
 pub mod whatsapp {
     // disallowed_methods: the generated impls call the buffa trait methods on
     // nested messages; that IS the pinned instantiation.

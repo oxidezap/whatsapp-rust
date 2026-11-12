@@ -1,13 +1,11 @@
 #![cfg(feature = "protobuf-experiment")]
 #![forbid(unsafe_code)]
 
-#[path = "../experiment/wire.rs"]
-mod wire;
+use waproto::experiment::wire;
 
 #[allow(dead_code)]
 mod candidate {
-    use super::wire;
-    include!(concat!(env!("OUT_DIR"), "/experiment.rs"));
+    pub use waproto::experiment::*;
     include!(concat!(env!("OUT_DIR"), "/experiment_tests.rs"));
 }
 

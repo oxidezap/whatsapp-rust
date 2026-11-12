@@ -208,7 +208,7 @@ pub fn generate(fds: &FileDescriptorSet, output: &Path) -> std::io::Result<()> {
         let mut fields: Vec<_> = message.field.iter().collect();
         fields.sort_by_key(|field| field.number);
         source.push_str(&format!(
-            "#[derive(Clone, Debug, Default, PartialEq)] pub struct {name} {{\n"
+            "#[derive(Clone, Debug, Default, PartialEq)] #[non_exhaustive] pub struct {name} {{\n"
         ));
         for field in &fields {
             let scalar = field_scalar(path, field);
@@ -220,7 +220,7 @@ pub fn generate(fds: &FileDescriptorSet, output: &Path) -> std::io::Result<()> {
         }
         source.push_str("}\n");
         source.push_str(&format!(
-            "#[derive(Clone, Debug, Default, PartialEq)] pub struct {view}<'a> {{\n"
+            "#[derive(Clone, Debug, Default, PartialEq)] #[non_exhaustive] pub struct {view}<'a> {{\n"
         ));
         for field in &fields {
             source.push_str(&format!(

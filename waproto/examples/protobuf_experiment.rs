@@ -4,19 +4,11 @@ use std::hint::black_box;
 use std::io::Write as _;
 use std::time::Instant;
 
-#[path = "../experiment/wire.rs"]
-#[allow(dead_code)]
-mod wire;
-
 #[cfg(not(feature = "protobuf-experiment-oracle"))]
-#[allow(dead_code)]
-mod candidate {
-    use super::wire;
-    include!(concat!(env!("OUT_DIR"), "/experiment.rs"));
-}
+use waproto::experiment as candidate;
 
 #[cfg(feature = "protobuf-experiment-oracle")]
-use buffa::{Message as _, MessageView as _};
+use waproto::buffa::{Message as _, MessageView as _};
 
 #[allow(clippy::disallowed_methods)]
 fn measure(name: &str, iterations: u64, mut run: impl FnMut()) {
