@@ -244,3 +244,97 @@ async fn a_cancelled_ratchet_write_cannot_be_followed_by_another_write_on_the_sa
 async fn a_delayed_cancelled_write_cannot_roll_back_the_replacement_fence() {
     cancellation_case(false).await;
 }
+
+/// Pauses the first device-key read after it has read, before it returns.
+struct SlowDeviceRead {
+    inner: Arc<MemoryRecordStore>,
+    pause: AtomicBool,
+    reading: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl RecordStore for SlowDeviceRead {
+    async fn get(&self, scope: &str, ns: Namespace, key: &str) -> Result<Option<Vec<u8>>> {
+        let value = self.inner.get(scope, ns, key).await;
+        if ns == Namespace::Device && self.pause.swap(false, Ordering::SeqCst) {
+            self.reading.notify_one();
+            self.resume.notified().await;
+        }
+        value
+    }
+
+    async fn get_many(
+        &self,
+        scope: &str,
+        ns: Namespace,
+        keys: &[&str],
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        self.inner.get_many(scope, ns, keys).await
+    }
+
+    async fn scan_keys(
+        &self,
+        scope: &str,
+        ns: Namespace,
+        prefix: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<String>> {
+        self.inner.scan_keys(scope, ns, prefix, limit).await
+    }
+
+    async fn write(&self, fence: &Fence, ops: &[WriteOp]) -> Result<()> {
+        self.inner.write(fence, ops).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_open_overlapping_a_live_instance_cannot_restore_its_older_keys() {
+    let records = Arc::new(SlowDeviceRead {
+        inner: Arc::new(MemoryRecordStore::new()),
+        pause: AtomicBool::new(false),
+        reading: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+    });
+    let lease = records
+        .inner
+        .acquire("slow-open", "node-a", 0, TTL)
+        .await
+        .unwrap()
+        .unwrap();
+    let store = || {
+        Arc::new(RecordSignalStore::new(
+            records.clone(),
+            Arc::new(AesGcmSealer::new(&DATA_KEY)),
+            lease.fence.clone(),
+        ))
+    };
+    let first = SignalOps::create(store()).await.unwrap();
+
+    // The second open starts while the first instance is live. If it reads
+    // the device keys before joining the first's authority, hold that read
+    // while the first rotates and goes away.
+    records.pause.store(true, Ordering::SeqCst);
+    let mut opening = tokio::spawn(SignalOps::open(store()));
+    let opened = tokio::select! {
+        () = records.reading.notified() => None,
+        opened = &mut opening => Some(opened),
+    };
+    let rotated = first.rotate_signed_prekey().await.unwrap();
+    drop(first);
+    records.resume.notify_one();
+    let second = match opened {
+        Some(opened) => opened,
+        None => opening.await,
+    }
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        second.public_identity().await.signed_prekey.id,
+        rotated.id,
+        "the second open must see the first instance's rotation"
+    );
+    let next = second.rotate_signed_prekey().await.unwrap();
+    assert_ne!(next.id, rotated.id, "a rotation must not reuse the live ID");
+}

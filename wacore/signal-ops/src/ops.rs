@@ -263,6 +263,8 @@ pub(crate) fn group_key(group: &str) -> String {
 pub struct SignalOps<S> {
     store: Arc<S>,
     authority: Arc<Authority>,
+    /// Keeps this fence's registry entry alive, so a later open joins it.
+    _slot: Arc<AuthoritySlot>,
 }
 
 /// Cached keys, locks and the usability flag for one lease fence. A second
@@ -277,16 +279,22 @@ struct Authority {
     sender_key_locks: Arc<KeyedLocks>,
 }
 
-fn authorities()
--> &'static std::sync::Mutex<std::collections::HashMap<AuthorityKey, std::sync::Weak<Authority>>> {
-    static AUTHORITIES: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<AuthorityKey, std::sync::Weak<Authority>>>,
-    > = std::sync::OnceLock::new();
+/// One fence's authority, filled by the first open that reads its keys.
+type AuthoritySlot = async_lock::OnceCell<Arc<Authority>>;
+
+type AuthorityRegistry =
+    std::sync::Mutex<std::collections::HashMap<AuthorityKey, std::sync::Weak<AuthoritySlot>>>;
+
+fn authorities() -> &'static AuthorityRegistry {
+    static AUTHORITIES: std::sync::OnceLock<AuthorityRegistry> = std::sync::OnceLock::new();
     AUTHORITIES.get_or_init(Default::default)
 }
 
-/// Return the live authority for `key`, or register one built from `keys`.
-fn shared_authority(key: AuthorityKey, keys: impl FnOnce() -> DeviceKeys) -> Arc<Authority> {
+/// Return the live slot for `key`, or register an empty one. The slot is
+/// registered before any device keys are read, so an open that overlaps a
+/// live instance, or another open, shares one authority instead of building
+/// a second one from a read taken before the other's writes.
+fn authority_slot(key: AuthorityKey) -> Arc<AuthoritySlot> {
     let mut map = authorities()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -294,15 +302,19 @@ fn shared_authority(key: AuthorityKey, keys: impl FnOnce() -> DeviceKeys) -> Arc
         return live;
     }
     map.retain(|_, weak| weak.strong_count() > 0);
-    let authority = Arc::new(Authority {
-        keys: RwLock::new(Arc::new(keys())),
+    let slot = Arc::new(AuthoritySlot::new());
+    map.insert(key, Arc::downgrade(&slot));
+    slot
+}
+
+fn new_authority(keys: DeviceKeys) -> Arc<Authority> {
+    Arc::new(Authority {
+        keys: RwLock::new(Arc::new(keys)),
         device_write: Arc::new(Mutex::new(())),
         usable: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         locks: Arc::new(KeyedLocks::default()),
         sender_key_locks: Arc::new(KeyedLocks::default()),
-    });
-    map.insert(key, Arc::downgrade(&authority));
-    authority
+    })
 }
 
 fn rng() -> rand::rngs::StdRng {
@@ -319,31 +331,54 @@ impl<S: ServiceStore> SignalOps<S> {
     /// the same fence while an instance is live shares that instance's keys,
     /// locks and retirement state.
     pub async fn open(store: Arc<S>) -> Result<Self, OpsError> {
-        let blob = store
-            .load_device_keys()
+        let slot = authority_slot(store.authority_key());
+        let authority = slot
+            .get_or_try_init(|| async {
+                let blob = store
+                    .load_device_keys()
+                    .await?
+                    .ok_or(OpsError::NotInitialised)?;
+                Ok::<_, OpsError>(new_authority(DeviceKeys::decode(&blob)?))
+            })
             .await?
-            .ok_or(OpsError::NotInitialised)?;
-        let keys = DeviceKeys::decode(&blob)?;
-        Ok(Self::with_keys(store, keys))
+            .clone();
+        Ok(Self {
+            store,
+            authority,
+            _slot: slot,
+        })
     }
 
     /// Generate and persist device keys for a new scope. Refuses to replace
     /// existing keys, which would silently unlink the device; the write is an
     /// exclusive insert, so concurrent initialisers cannot both succeed.
     pub async fn create(store: Arc<S>) -> Result<Self, OpsError> {
-        let keys = DeviceKeys::generate()?;
-        match store.create_device_keys(&keys.encode()).await {
-            Ok(()) => Ok(Self::with_keys(store, keys)),
-            Err(e) if wacore_recordstore::is_record_exists(&e) => Err(OpsError::InvalidInput(
-                "scope already has device keys".into(),
-            )),
-            Err(e) => Err(e.into()),
+        let exists = || OpsError::InvalidInput("scope already has device keys".into());
+        let slot = authority_slot(store.authority_key());
+        let created = std::sync::atomic::AtomicBool::new(false);
+        let authority = slot
+            .get_or_try_init(|| async {
+                let keys = DeviceKeys::generate()?;
+                match store.create_device_keys(&keys.encode()).await {
+                    Ok(()) => {
+                        created.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok(new_authority(keys))
+                    }
+                    Err(e) if wacore_recordstore::is_record_exists(&e) => Err(exists()),
+                    Err(e) => Err(e.into()),
+                }
+            })
+            .await?
+            .clone();
+        // A live instance under this fence means the keys already exist.
+        if !created.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(exists());
         }
-    }
-
-    fn with_keys(store: Arc<S>, keys: DeviceKeys) -> Self {
-        let authority = shared_authority(store.authority_key(), || keys);
-        Self { store, authority }
+        Ok(Self {
+            store,
+            authority,
+            _slot: slot,
+        })
     }
 
     async fn stores(&self) -> Stores<S> {
