@@ -2188,6 +2188,30 @@ async fn a_failed_open_keeps_the_lease_that_a_concurrent_open_by_the_same_holder
 }
 
 #[wasm_bindgen_test]
+async fn a_released_device_still_alive_does_not_keep_a_failed_opens_new_lease() {
+    let h = Harness::new();
+    let stale = h
+        .open("bob-stale-handle", "tab-a", 0.0, true)
+        .await
+        .ok()
+        .unwrap();
+    run(stale.release()).await;
+    // `stale` is released but not yet freed. A new open by the same holder
+    // takes a new lease generation and fails; nothing returned owns that
+    // lease, so it must be given up rather than block other holders.
+    let wrong: JsValue = TestSealer::new().into();
+    let failed =
+        expect_err(open_with(&h.backend, &wrong, "bob-stale-handle", "tab-a", 1.0, false).await);
+    assert!(!message_of(&failed).is_empty());
+    let other = h
+        .open("bob-stale-handle", "tab-b", 2.0, false)
+        .await
+        .expect("another holder takes the scope at once");
+    run(other.release()).await;
+    drop(stale);
+}
+
+#[wasm_bindgen_test]
 async fn a_second_open_with_the_wrong_sealer_does_not_disturb_the_live_device() {
     let bob = device("bob-wrong-key").await;
     let wrong: JsValue = TestSealer::new().into();

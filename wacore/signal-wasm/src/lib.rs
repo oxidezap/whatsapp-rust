@@ -111,8 +111,7 @@ struct Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        self.records
-            .untrack(&self.tracked.fence.scope, &self.tracked.holder);
+        self.records.untrack(&self.tracked);
     }
 }
 
@@ -204,17 +203,18 @@ impl SignalDevice {
         let lease = match acquired {
             Ok(Some(lease)) => lease,
             Ok(None) => {
-                records.untrack(&scope, &holder);
+                records.unreserve(&scope, &holder);
                 return Err(convert::coded_error(
                     "lease_held",
                     "another holder owns this scope",
                 ));
             }
             Err(e) => {
-                records.untrack(&scope, &holder);
+                records.unreserve(&scope, &holder);
                 return Err(ops_error(OpsError::Store(e)));
             }
         };
+        records.acquired(&lease);
         let store = Arc::new(RecordSignalStore::new(
             records.clone(),
             Arc::new(JsSealerAdapter::new(sealer)),
@@ -233,7 +233,7 @@ impl SignalDevice {
                 // until it expires, unless another open by the same holder
                 // (live or still starting) shares it. A failed release changes
                 // nothing for the caller, who gets the original error.
-                if records.untrack(&scope, &holder) {
+                if records.untrack(&lease) {
                     let _ = records.release(&lease).await;
                 }
                 return Err(ops_error(e));

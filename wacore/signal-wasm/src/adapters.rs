@@ -130,8 +130,15 @@ async fn settle(
     JsFuture::from(call?).await
 }
 
-/// Opens per (scope, holder): live devices and opens still acquiring.
-type LiveDevices = Mutex<HashMap<(Arc<str>, Arc<str>), usize>>;
+/// Opens of one scope by one holder: those still acquiring, and acquired
+/// handles counted by the lease generation they hold.
+#[derive(Default)]
+struct HolderOpens {
+    acquiring: usize,
+    live: HashMap<u64, usize>,
+}
+
+type LiveDevices = Mutex<HashMap<(Arc<str>, Arc<str>), HolderOpens>>;
 
 pub struct JsRecords(SendWrapper<RecordBackend>, LiveDevices);
 
@@ -167,31 +174,67 @@ impl JsRecords {
 
     /// Count one open of (`scope`, `holder`) before it asks for the lease, so
     /// a concurrent open that fails cannot release a lease this one is about
-    /// to share. Every `reserve` is paired with one `untrack`.
+    /// to share. Each `reserve` is followed by one `unreserve` (the acquire
+    /// failed) or one `acquired`.
     pub fn reserve(&self, scope: &str, holder: &str) {
         if let Ok(mut live) = self.1.lock() {
-            *live.entry(Self::live_key(scope, holder)).or_insert(0) += 1;
+            live.entry(Self::live_key(scope, holder))
+                .or_default()
+                .acquiring += 1;
         }
     }
 
-    /// Drop one open of (`scope`, `holder`). True when it was the last, so
-    /// nobody else, live or still acquiring, uses the lease. The count and the
-    /// answer are one step under the lock; the caller issues its release call
-    /// before awaiting anything, so a later acquire is ordered after it.
-    pub fn untrack(&self, scope: &str, holder: &str) -> bool {
+    /// Drop a reservation whose acquire returned no lease.
+    pub fn unreserve(&self, scope: &str, holder: &str) {
+        self.update(scope, holder, |opens| {
+            opens.acquiring = opens.acquiring.saturating_sub(1);
+        });
+    }
+
+    /// Turn a reservation into a handle on `lease`'s generation. Each
+    /// `acquired` is paired with one `untrack` of the same lease.
+    pub fn acquired(&self, lease: &Lease) {
+        self.update(&lease.fence.scope, &lease.holder, |opens| {
+            opens.acquiring = opens.acquiring.saturating_sub(1);
+            *opens.live.entry(lease.fence.generation).or_insert(0) += 1;
+        });
+    }
+
+    /// Drop one handle on `lease`. True when nobody else uses that lease: no
+    /// other handle on its generation and no open of the same holder still
+    /// acquiring, which could be handed the same lease. Handles on another
+    /// generation do not count. The count and the answer are one step under
+    /// the lock; the caller issues its release call before awaiting
+    /// anything, so a later acquire is ordered after it.
+    pub fn untrack(&self, lease: &Lease) -> bool {
+        let mut last = false;
+        self.update(&lease.fence.scope, &lease.holder, |opens| {
+            let generation = lease.fence.generation;
+            let remaining = match opens.live.get_mut(&generation) {
+                Some(count) => {
+                    *count = count.saturating_sub(1);
+                    *count
+                }
+                None => 0,
+            };
+            if remaining == 0 {
+                opens.live.remove(&generation);
+            }
+            last = remaining == 0 && opens.acquiring == 0;
+        });
+        last
+    }
+
+    fn update(&self, scope: &str, holder: &str, change: impl FnOnce(&mut HolderOpens)) {
         let Ok(mut live) = self.1.lock() else {
-            return false;
+            return;
         };
         let key = Self::live_key(scope, holder);
-        let Some(count) = live.get_mut(&key) else {
-            return true;
-        };
-        *count -= 1;
-        if *count == 0 {
+        let opens = live.entry(key.clone()).or_default();
+        change(opens);
+        if opens.acquiring == 0 && opens.live.is_empty() {
             live.remove(&key);
-            return true;
         }
-        false
     }
 }
 
