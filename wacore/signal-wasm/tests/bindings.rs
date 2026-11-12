@@ -1922,14 +1922,17 @@ async fn buffered_records_carry_the_wall_clock_so_a_yesterday_cutoff_keeps_them(
     let (kind, ciphertext) = encrypt(&alice.signal, BOB, &padded_conversation("fresh")).await;
     let first = receive(&bob.signal, &kind, &ciphertext).await;
     assert_eq!(string_of(&get(&first, "status")), "message");
-    let removed = run(bob
-        .signal
-        .prune_decrypt_buffer(js_sys::Date::now() - 86_400_000.0))
-    .await;
+    // Only delivered entries are pruned, so deliver first: an entry stamped
+    // with the epoch instead of the wall clock would then fall to a
+    // yesterday cutoff.
+    persist_then_mark(&bob.signal, &first).await;
+    let now = js_sys::Date::now();
+    let removed = run(bob.signal.prune_decrypt_buffer(now - 86_400_000.0)).await;
     assert_eq!(removed.as_f64(), Some(0.0));
     let again = receive(&bob.signal, &kind, &ciphertext).await;
-    assert_eq!(get(&again, "redelivered"), JsValue::TRUE);
-    assert_eq!(conversation_of(&bytes_of(&get(&again, "message"))), "fresh");
+    assert_eq!(string_of(&get(&again, "status")), "already_delivered");
+    let removed = run(bob.signal.prune_decrypt_buffer(now + 86_400_000.0)).await;
+    assert_eq!(removed.as_f64(), Some(1.0));
 }
 
 #[wasm_bindgen_test]
