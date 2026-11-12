@@ -1199,3 +1199,17 @@ test("pruneDecryptBuffer refuses cutoffs that are not safe integers", async () =
   }
 });
 
+test("buffered records carry the wall clock, so a yesterday cutoff keeps them", async () => {
+  const alice = await device("alice-clock");
+  const bob = await device("bob-clock");
+  await alice.signal.establishSession(BOB, 1, await bundleFor(bob.signal));
+  const sent = await alice.signal.encrypt(BOB, 1, paddedConversation("fresh"));
+  const args = [ALICE, ALICE, 1, sent.kind, sent.ciphertext, 2, false];
+  const first = await bob.signal.receive(...args);
+  assert.equal(first.status, "message");
+  assert.equal(await bob.signal.pruneDecryptBuffer(Date.now() - 86_400_000), 0);
+  const again = await bob.signal.receive(...args);
+  assert.equal(again.redelivered, true);
+  assert.equal(conversationOf(again.message), "fresh");
+});
+

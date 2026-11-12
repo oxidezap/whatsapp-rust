@@ -100,6 +100,14 @@ struct Inner {
     store: Arc<Store>,
 }
 
+struct DateNow;
+
+impl wacore::time::TimeProvider for DateNow {
+    fn now_millis(&self) -> i64 {
+        js_sys::Date::now() as i64
+    }
+}
+
 /// One linked device's Signal state, held under a lease.
 #[wasm_bindgen]
 pub struct SignalDevice {
@@ -131,6 +139,10 @@ impl SignalDevice {
         ttl_ms: f64,
         create: bool,
     ) -> Result<SignalDevice, JsValue> {
+        // wasm32 has no wall clock of its own; without this every timestamp
+        // wacore stamps (buffered and sent records) would be 0. Idempotent:
+        // an embedder's earlier provider wins.
+        let _ = wacore::time::set_time_provider(DateNow);
         let records = JsRecords::shared(backend);
         let lease = records
             .acquire(&scope, &holder, now_ms as u64, ttl_ms as u64)
