@@ -1935,7 +1935,6 @@ dependencies = [
  "subtle",
  "thiserror",
  "wacore-binary",
- "wacore-derive",
  "waproto",
  "zeroize",
 ]
