@@ -286,22 +286,21 @@ fn only_own_devices_can_hand_over_app_state_keys() {
 }
 
 #[test]
-fn pruning_drops_old_buffer_entries() {
+fn pruning_drops_old_delivered_markers_and_keeps_pending_results() {
     let alice = device("alice-prune");
     let bob = device("bob-prune");
     let (alice_addr, bob_addr) = (address("111"), address("222"));
     connect(&alice, &bob, &bob_addr);
     let chat = alice_addr.name().to_owned();
     let sent = block_on(alice.ops.encrypt(&bob_addr, &padded(&text("old")))).unwrap();
-    block_on(bob.ops.receive(request(
-        &chat,
-        &alice_addr,
-        kind(&sent),
-        &sent.ciphertext,
-        false,
-    )))
-    .unwrap();
+    let req = request(&chat, &alice_addr, kind(&sent), &sent.ciphertext, false);
+    let first = message(block_on(bob.ops.receive(req)).unwrap());
 
+    // Not yet delivered: the buffer holds the only copy of the plaintext.
+    assert_eq!(block_on(bob.ops.prune_decrypt_buffer(u64::MAX)).unwrap(), 0);
+    assert!(message(block_on(bob.ops.receive(req)).unwrap()).redelivered);
+
+    block_on(bob.ops.mark_delivered(&first.receipt_key)).unwrap();
     assert_eq!(block_on(bob.ops.prune_decrypt_buffer(0)).unwrap(), 0);
     assert_eq!(block_on(bob.ops.prune_decrypt_buffer(u64::MAX)).unwrap(), 1);
 }

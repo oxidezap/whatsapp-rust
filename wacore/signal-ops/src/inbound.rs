@@ -356,8 +356,11 @@ impl<S: ServiceStore> SignalOps<S> {
         Ok(())
     }
 
-    /// Delete buffer entries inserted before `cutoff_ms`, delivered or not.
-    /// Returns how many were removed.
+    /// Delete delivered markers inserted before `cutoff_ms`. Returns how many
+    /// were removed. Results not yet confirmed with [`Self::mark_delivered`]
+    /// are kept whatever their age: their keys are already consumed, so the
+    /// buffer is the only copy of that plaintext. The app bounds them by
+    /// confirming delivery.
     pub async fn prune_decrypt_buffer(&self, cutoff_ms: u64) -> Result<usize, OpsError> {
         let store = self.store();
         let mut expired = Vec::new();
@@ -365,7 +368,9 @@ impl<S: ServiceStore> SignalOps<S> {
             // An entry that no longer decodes cannot answer a replay; delete it
             // rather than let one corrupt entry stop every later prune.
             if let Some(bytes) = store.load_aux(Namespace::DecryptBuffer, &key).await?
-                && BufferEntry::decode(bytes).map_or(true, |entry| entry.inserted_ms < cutoff_ms)
+                && BufferEntry::decode(bytes).map_or(true, |entry| {
+                    entry.state == STATE_DELIVERED && entry.inserted_ms < cutoff_ms
+                })
             {
                 expired.push(key);
             }
