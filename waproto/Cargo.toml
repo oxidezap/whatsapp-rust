@@ -4,7 +4,7 @@ version = "0.7.0"
 edition = "2024"
 rust-version.workspace = true
 authors = ["João Lucas <jlucaso@hotmail.com>"]
-license = "MIT"
+license = "MIT AND Apache-2.0"
 repository = "https://github.com/oxidezap/whatsapp-rust"
 description = "Protocol Buffers definitions for WhatsApp"
 

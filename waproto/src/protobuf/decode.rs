@@ -117,6 +117,13 @@ impl DecodeOptions {
         if input_size > self.max_message_size {
             return Err(DecodeError::MessageTooLarge);
         }
+        self.with_context(decode)
+    }
+
+    pub(crate) fn with_context<R>(
+        &self,
+        decode: impl for<'a> FnOnce(DecodeContext<'a>) -> Result<R, DecodeError>,
+    ) -> Result<R, DecodeError> {
         let unknown = Cell::new(self.unknown_field_limit);
         let elements = Cell::new(self.element_memory_limit);
         decode(DecodeContext::new(self.recursion_limit, &unknown).with_element_memory(&elements))

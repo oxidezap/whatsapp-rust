@@ -21,6 +21,9 @@ impl Module {
     }
     fn render(&self, out: &mut String) {
         out.push_str("#[allow(unused_imports)] use crate::protobuf::Message as _;\n");
+        out.push_str(
+            "#[allow(unused_imports)] use crate::protobuf::{MessageView as _,ViewEncode as _};\n",
+        );
         out.push_str(&self.items);
         for (name, child) in &self.children {
             out.push_str(&format!("pub mod {name} {{\n"));
@@ -898,10 +901,16 @@ pub fn generate_raw(schema: &Schema, base: &str) -> String {
         root.at(&emitter.scope(message.parent))
             .items
             .push_str(&emitter.message_source(message));
+        root.at(&emitter.scope(message.parent))
+            .items
+            .push_str(&emitter.view_source(message, MessageId(index)));
         for id in &message.oneofs {
             root.at(&emitter.scope(Some(MessageId(index))))
                 .items
                 .push_str(&emitter.oneof_source(schema.oneof(*id)));
+            root.at(&emitter.scope(Some(MessageId(index))))
+                .items
+                .push_str(&emitter.view_oneof_source(schema.oneof(*id), *id));
         }
     }
     let mut source = String::new();
@@ -910,6 +919,542 @@ pub fn generate_raw(schema: &Schema, base: &str) -> String {
 }
 
 impl Emitter<'_> {
+    fn view_path(&self, id: MessageId) -> String {
+        let message = self.schema.message(id);
+        self.path(message.parent, &format!("{}View", message.name))
+    }
+    fn view_oneof_path(&self, id: OneofId) -> String {
+        let group = self.schema.oneof(id);
+        self.path(
+            Some(group.owner),
+            &format!("{}View", group.name.to_upper_camel_case()),
+        )
+    }
+    fn view_oneof_lifetime(&self, id: OneofId) -> bool {
+        self.schema.oneof(id).fields.iter().any(|field| {
+            matches!(
+                self.schema.field(*field).shape,
+                FieldShape::Oneof {
+                    value: ValueType::Message(..)
+                        | ValueType::Scalar(Scalar::String | Scalar::Bytes),
+                    ..
+                }
+            )
+        })
+    }
+    fn view_value_type(&self, value: ValueType) -> String {
+        match value {
+            ValueType::Scalar(Scalar::String) => "&'a str".into(),
+            ValueType::Scalar(Scalar::Bytes) => "&'a [u8]".into(),
+            ValueType::Message(id, _) => format!("{}<'a>", self.view_path(id)),
+            _ => self.value_type(value, BytesStorage::Vector),
+        }
+    }
+    fn view_field_type(&self, field: &Field) -> String {
+        match field.shape {
+            FieldShape::Singular {
+                value: ValueType::Message(id, _),
+                ..
+            } => format!("{RT}::MessageFieldView<{}<'a>>", self.view_path(id)),
+            FieldShape::Singular {
+                value,
+                presence: Presence::Explicit,
+            } => format!("::core::option::Option<{}>", self.view_value_type(value)),
+            FieldShape::Singular { value, .. } => self.view_value_type(value),
+            FieldShape::Repeated { value, .. } => {
+                format!("{RT}::RepeatedView<'a,{}>", self.view_value_type(value))
+            }
+            FieldShape::Map { key, value, .. } => format!(
+                "{RT}::MapView<'a,{},{}>",
+                self.view_value_type(ValueType::Scalar(key)),
+                self.view_value_type(value)
+            ),
+            FieldShape::Oneof { .. } => unreachable!(),
+        }
+    }
+    fn view_default(&self, field: &Field) -> String {
+        match field.shape {
+            FieldShape::Singular {
+                value: ValueType::Message(..),
+                ..
+            } => format!("{RT}::MessageFieldView::unset()"),
+            FieldShape::Repeated { .. } => {
+                format!("{RT}::RepeatedView::new(::std::vec::Vec::new())")
+            }
+            FieldShape::Map { .. } => format!("{RT}::MapView::new(::std::vec::Vec::new())"),
+            FieldShape::Singular {
+                presence: Presence::Explicit,
+                ..
+            }
+            | FieldShape::Oneof { .. } => "None".into(),
+            FieldShape::Singular {
+                value: ValueType::Scalar(Scalar::String),
+                ..
+            } => "\"\"".into(),
+            FieldShape::Singular {
+                value: ValueType::Scalar(Scalar::Bytes),
+                ..
+            } => "&[]".into(),
+            _ => self.default_field(field),
+        }
+    }
+    fn view_read(&self, value: ValueType, input: &str) -> String {
+        match value {
+            ValueType::Scalar(Scalar::String) => format!("{RT}::types::borrow_str({input})?"),
+            ValueType::Scalar(Scalar::Bytes) => format!("{RT}::types::borrow_bytes({input})?"),
+            _ => self.read_value(value, BytesStorage::Vector, input),
+        }
+    }
+    fn promoted(&self, value: ValueType, storage: BytesStorage, input: &str) -> String {
+        let dereferenced = input
+            .strip_prefix('&')
+            .map_or_else(|| format!("*{input}"), str::to_owned);
+        match value {
+            ValueType::Scalar(Scalar::String) => format!("({dereferenced}).to_owned()"),
+            ValueType::Scalar(Scalar::Bytes) if storage == BytesStorage::Shared => {
+                format!("{RT}::view::bytes_from_source(source,{input})")
+            }
+            ValueType::Scalar(Scalar::Bytes) => format!("({dereferenced}).to_vec()"),
+            ValueType::Message(..) => {
+                format!("{RT}::MessageView::to_owned_from_source({input},source)?")
+            }
+            _ => dereferenced,
+        }
+    }
+    fn view_oneof_source(&self, group: &Oneof, id: OneofId) -> String {
+        let name = format!("{}View", group.name.to_upper_camel_case());
+        let lifetime = if self.view_oneof_lifetime(id) {
+            "<'a>"
+        } else {
+            ""
+        };
+        let mut out =
+            format!("#[derive(Clone,Debug,PartialEq)]#[non_exhaustive]pub enum {name}{lifetime}{{");
+        for field in &group.fields {
+            let field = self.schema.field(*field);
+            let FieldShape::Oneof { value, .. } = field.shape else {
+                unreachable!()
+            };
+            let mut ty = self.view_value_type(value);
+            if matches!(value, ValueType::Message(..)) {
+                ty = format!("::std::boxed::Box<{ty}>");
+            }
+            out.push_str(&format!(
+                "{}({ty}),",
+                ident(&field.name.to_upper_camel_case())
+            ));
+        }
+        out.push_str("}\n");
+        out
+    }
+    fn view_encode_field(&self, field: &Field, write: bool) -> String {
+        let mut out = self
+            .encode_field(field, write)
+            .replace(&format!("{RT}::Message::"), &format!("{RT}::ViewEncode::"));
+        if let FieldShape::Oneof { owner, .. } = field.shape {
+            out = out.replace(&self.oneof_path(owner), &self.view_oneof_path(owner));
+        }
+        out
+    }
+    fn view_decode_field(&self, field: &Field) -> String {
+        let number = field.number.get();
+        let slot = self.slot(field);
+        if let FieldShape::Map { key, value, .. } = field.shape {
+            let kt = self.view_value_type(ValueType::Scalar(key));
+            let vt = self.view_value_type(value);
+            let key_default = if key == Scalar::String {
+                "\"\""
+            } else {
+                "::core::default::Default::default()"
+            };
+            let value_default = match value {
+                ValueType::Scalar(Scalar::String) => "\"\"",
+                ValueType::Scalar(Scalar::Bytes) => "&[]",
+                _ => "::core::default::Default::default()",
+            };
+            let mut out = format!(
+                "({number},{RT}::encoding::WireType::LengthDelimited)=>{{context.register_element_memory(::std::mem::size_of::<({kt},{vt})>())?;let context=context.descend()?;let mut entry={RT}::types::borrow_bytes(input)?;let mut key: {kt}={key_default};let mut value: {vt}={value_default};while !entry.is_empty(){{let item={RT}::encoding::Tag::decode(&mut entry)?;match item.field_number(){{1=>{{{RT}::encoding::check_wire_type(item,{RT}::encoding::WireType::from_u32({})?)?;key={};}},2=>{{{RT}::encoding::check_wire_type(item,{RT}::encoding::WireType::from_u32({})?)?;",
+                Self::wire(ValueType::Scalar(key)),
+                self.view_read(ValueType::Scalar(key), "&mut entry"),
+                Self::wire(value)
+            );
+            if let ValueType::Message(_, encoding) = value {
+                let payload = if encoding == MessageEncoding::Group {
+                    format!("{RT}::types::borrow_group(&mut entry,2,child_context.depth())?")
+                } else {
+                    format!("{RT}::types::borrow_bytes(&mut entry)?")
+                };
+                out.push_str(&format!("let child_context=context.descend()?;let payload={payload};{RT}::MessageView::merge_into_view(&mut value,payload,child_context)?;"));
+            } else if matches!(value,ValueType::Enumeration(id)if !self.schema.enumeration(id).open)
+            {
+                out.push_str(&format!(
+                    "if let Some(v)={}{{value=v;}}",
+                    self.view_read(value, "&mut entry")
+                ));
+            } else {
+                out.push_str(&format!("value={};", self.view_read(value, "&mut entry")));
+            }
+            out.push_str(&format!("}},_=>{RT}::encoding::skip_field_depth(item,&mut entry,context.depth())?,}}}}self.{slot}.push(key,value);Ok(())}},"));
+            return out;
+        }
+        let value = match field.shape {
+            FieldShape::Singular { value, .. }
+            | FieldShape::Repeated { value, .. }
+            | FieldShape::Oneof { value, .. } => value,
+            _ => unreachable!(),
+        };
+        let wire = Self::wire(value);
+        let wn = match wire {
+            0 => "Varint",
+            1 => "Fixed64",
+            2 => "LengthDelimited",
+            3 => "StartGroup",
+            5 => "Fixed32",
+            _ => unreachable!(),
+        };
+        let mut out = String::new();
+        if matches!(field.shape, FieldShape::Repeated { .. }) && value.is_packable() {
+            let expr = self.view_read(value, "&mut packed");
+            let push = if matches!(value,ValueType::Enumeration(id)if !self.schema.enumeration(id).open)
+            {
+                format!("if let Some(v)={expr}{{self.{slot}.push(v);}} ")
+            } else {
+                format!("self.{slot}.push({expr});")
+            };
+            out.push_str(&format!("({number},{RT}::encoding::WireType::LengthDelimited)=>{{let mut packed={RT}::types::borrow_bytes(input)?;while !packed.is_empty(){{{push}}}Ok(())}},"));
+        }
+        out.push_str(&format!("({number},{RT}::encoding::WireType::{wn})=>{{"));
+        if let ValueType::Message(id, encoding) = value {
+            if matches!(field.shape, FieldShape::Repeated { .. }) {
+                out.push_str(&format!(
+                    "context.register_element_memory(::std::mem::size_of::<{}<'a>>())?;",
+                    self.view_path(id)
+                ));
+            }
+            let payload = if encoding == MessageEncoding::Group {
+                format!("{RT}::types::borrow_group(input,{number},child_context.depth())?")
+            } else {
+                format!("{RT}::types::borrow_bytes(input)?")
+            };
+            out.push_str(&format!(
+                "let child_context=context.descend()?;let payload={payload};"
+            ));
+            match field.shape{
+                FieldShape::Singular{..}=>out.push_str(&format!("if let Some(value)=self.{slot}.as_mut(){{{RT}::MessageView::merge_into_view(value,payload,child_context)?;}}else{{self.{slot}={RT}::MessageFieldView::set(<{}<'a>as {RT}::MessageView<'a>>::decode_view_ctx(payload,child_context)?);}}",self.view_path(id))),
+                FieldShape::Repeated{..}=>out.push_str(&format!("self.{slot}.push(<{}<'a>as {RT}::MessageView<'a>>::decode_view_ctx(payload,child_context)?);",self.view_path(id))),
+                FieldShape::Oneof{owner,..}=>{let path=self.view_oneof_path(owner);let variant=ident(&field.name.to_upper_camel_case());out.push_str(&format!("if let Some({path}::{variant}(value))=&mut self.{slot}{{{RT}::MessageView::merge_into_view(value.as_mut(),payload,child_context)?;}}else{{self.{slot}=Some({path}::{variant}(::std::boxed::Box::new(<{}<'a>as {RT}::MessageView<'a>>::decode_view_ctx(payload,child_context)?)));}}",self.view_path(id)));},_=>unreachable!(),
+            }
+        } else {
+            if matches!(field.shape, FieldShape::Repeated { .. })
+                && matches!(value, ValueType::Scalar(Scalar::String | Scalar::Bytes))
+            {
+                out.push_str(&format!(
+                    "context.register_element_memory(::std::mem::size_of::<{}>())?;",
+                    self.view_value_type(value)
+                ));
+            }
+            let expr = self.view_read(value, "input");
+            let closed =
+                matches!(value,ValueType::Enumeration(id)if !self.schema.enumeration(id).open);
+            if closed {
+                out.push_str(&format!("if let Some(value)={expr}{{"));
+            } else {
+                out.push_str(&format!("let value={expr};"));
+            }
+            match field.shape {
+                FieldShape::Singular {
+                    presence: Presence::Explicit,
+                    ..
+                } => out.push_str(&format!("self.{slot}=Some(value);")),
+                FieldShape::Singular { .. } => out.push_str(&format!("self.{slot}=value;")),
+                FieldShape::Repeated { .. } => out.push_str(&format!("self.{slot}.push(value);")),
+                FieldShape::Oneof { owner, .. } => out.push_str(&format!(
+                    "self.{slot}=Some({}::{}(value));",
+                    self.view_oneof_path(owner),
+                    ident(&field.name.to_upper_camel_case())
+                )),
+                _ => unreachable!(),
+            }
+            if closed {
+                out.push('}');
+            }
+        }
+        out.push_str("Ok(())},");
+        out
+    }
+    fn view_source(&self, message: &Message, id: MessageId) -> String {
+        let name = ident(&format!("{}View", message.name));
+        let owned = self.message_path(id);
+        let mut out = format!("#[derive(Clone,PartialEq)]#[non_exhaustive]pub struct {name}<'a>{{");
+        for field in &message.fields {
+            let field = self.schema.field(*field);
+            if !matches!(field.shape, FieldShape::Oneof { .. }) {
+                out.push_str(&format!(
+                    "pub {}: {},",
+                    member(&field.name),
+                    self.view_field_type(field)
+                ));
+            }
+        }
+        for group in &message.oneofs {
+            let oneof = self.schema.oneof(*group);
+            out.push_str(&format!(
+                "pub {}: ::core::option::Option<{}{}>,",
+                member(&oneof.name),
+                self.view_oneof_path(*group),
+                if self.view_oneof_lifetime(*group) {
+                    "<'a>"
+                } else {
+                    ""
+                }
+            ));
+        }
+        out.push_str("_lifetime: ::core::marker::PhantomData<&'a()>,}\n");
+        let mut initial = String::new();
+        for field in &message.fields {
+            let field = self.schema.field(*field);
+            if !matches!(field.shape, FieldShape::Oneof { .. }) {
+                initial.push_str(&format!(
+                    "{}: {},",
+                    member(&field.name),
+                    self.view_default(field)
+                ));
+            }
+        }
+        for group in &message.oneofs {
+            initial.push_str(&format!(
+                "{}:None,",
+                member(&self.schema.oneof(*group).name)
+            ));
+        }
+        initial.push_str("_lifetime: ::core::marker::PhantomData,");
+        out.push_str(&format!("impl<'a>::core::default::Default for {name}<'a>{{fn default()->Self{{Self{{{initial}}}}}}}impl<'v>{RT}::DefaultViewInstance for {name}<'v>{{fn default_view_instance<'b>()->&'b Self where Self:'b{{static INSTANCE:{name}<'static>={name}{{{initial}}};&INSTANCE}}}}\n"));
+        out.push_str(&format!("impl<'a>::core::fmt::Debug for {name}<'a>{{fn fmt(&self,f:&mut ::core::fmt::Formatter<'_>)->::core::fmt::Result{{let mut d=f.debug_struct({name:?});"));
+        for field in &message.fields {
+            let field = self.schema.field(*field);
+            if !matches!(field.shape, FieldShape::Oneof { .. }) {
+                let n = member(&field.name);
+                out.push_str(&format!("d.field({n:?},&self.{n});"));
+            }
+        }
+        for group in &message.oneofs {
+            let n = member(&self.schema.oneof(*group).name);
+            out.push_str(&format!("d.field({n:?},&self.{n});"));
+        }
+        out.push_str("d.finish()}}\n");
+        out.push_str(&format!("impl {RT}::ViewReborrow for {name}<'static>{{type Reborrowed<'b>={name}<'b>;fn reborrow<'b>(this:&'b Self)->&'b Self::Reborrowed<'b>{{this}}}}impl<'a>{RT}::MessageName for {name}<'a>{{const NAME:&'static str=<{owned} as {RT}::MessageName>::NAME;const PACKAGE:&'static str=<{owned} as {RT}::MessageName>::PACKAGE;const FULL_NAME:&'static str=<{owned} as {RT}::MessageName>::FULL_NAME;const TYPE_URL:&'static str=<{owned} as {RT}::MessageName>::TYPE_URL;}}\n"));
+        let dispatch = if message.fields.is_empty() {
+            ""
+        } else {
+            "match(tag.field_number(),tag.wire_type()){ "
+        };
+        out.push_str(&format!("impl<'a>{RT}::MessageView<'a> for {name}<'a>{{type Owned={owned};fn decode_view(input:&'a[u8])->Result<Self,{RT}::DecodeError>{{{RT}::DecodeOptions::new().with_context(|context|Self::decode_view_ctx(input,context))}}fn decode_view_with_ctx(input:&'a[u8],context:{RT}::DecodeContext<'_>)->Result<Self,{RT}::DecodeError>{{Self::decode_view_ctx(input,context)}}fn merge_view_field(&mut self,tag:{RT}::encoding::Tag,cur:&'a[u8],_before_tag:&'a[u8],context:{RT}::DecodeContext<'_>)->Result<&'a[u8],{RT}::DecodeError>{{let _=&context;let mut cur=cur;let input=&mut cur;let result={dispatch}"));
+        for field in &message.fields {
+            out.push_str(&self.view_decode_field(self.schema.field(*field)));
+        }
+        let mut known = BTreeSet::new();
+        for field in &message.fields {
+            let field = self.schema.field(*field);
+            if known.insert(field.number.get()) {
+                let value = match field.shape {
+                    FieldShape::Singular { value, .. }
+                    | FieldShape::Repeated { value, .. }
+                    | FieldShape::Oneof { value, .. } => value,
+                    _ => ValueType::Scalar(Scalar::Bytes),
+                };
+                out.push_str(&format!("({},_)=>Err({RT}::encoding::wire_type_mismatch(tag,{RT}::encoding::WireType::from_u32({})?)),",field.number.get(),Self::wire(value)));
+            }
+        }
+        let (fallback, end) = if message.fields.is_empty() {
+            ("", "")
+        } else {
+            ("_=>", ",}")
+        };
+        out.push_str(&format!("{fallback}{RT}::encoding::skip_field_depth(tag,input,context.depth()){end};result?;Ok(cur)}}fn to_owned_message(&self)->Result<Self::Owned,{RT}::DecodeError>{{self.to_owned_from_source(None)}}fn to_owned_from_source(&self,source: ::core::option::Option<&::bytes::Bytes>)->Result<Self::Owned,{RT}::DecodeError>{{let _=&source;Ok({owned}{{"));
+        for field in &message.fields {
+            let field = self.schema.field(*field);
+            let slot = member(&field.name);
+            let expr = match field.shape {
+                FieldShape::Oneof { .. } => continue,
+                FieldShape::Singular {
+                    value: ValueType::Message(..),
+                    ..
+                } => format!(
+                    "match self.{slot}.as_option(){{Some(v)=>{RT}::MessageField::some({RT}::MessageView::to_owned_from_source(v,source)?),None=>{RT}::MessageField::none()}}"
+                ),
+                FieldShape::Singular {
+                    value,
+                    presence: Presence::Explicit,
+                } => format!(
+                    "self.{slot}.as_ref().map(|v|{})",
+                    self.promoted(value, field.bytes_storage, "v")
+                ),
+                FieldShape::Singular { value, .. } => {
+                    self.promoted(value, field.bytes_storage, &format!("&self.{slot}"))
+                }
+                FieldShape::Repeated {
+                    value: ValueType::Message(..),
+                    ..
+                } => format!(
+                    "self.{slot}.iter().map(|v|{RT}::MessageView::to_owned_from_source(v,source)).collect::<Result<_,{RT}::DecodeError>>()?"
+                ),
+                FieldShape::Repeated { value, .. } => format!(
+                    "self.{slot}.iter().map(|v|Ok({})).collect::<Result<_,{RT}::DecodeError>>()?",
+                    self.promoted(value, field.bytes_storage, "v")
+                ),
+                FieldShape::Map { key, value, .. } => format!(
+                    "self.{slot}.iter().map(|(k,v)|Ok(({},{}))).collect::<Result<_,{RT}::DecodeError>>()?",
+                    self.promoted(ValueType::Scalar(key), BytesStorage::Vector, "k"),
+                    self.promoted(value, field.bytes_storage, "v")
+                ),
+            };
+            out.push_str(&format!("{slot}: {expr},"));
+        }
+        for group in &message.oneofs {
+            let oneof = self.schema.oneof(*group);
+            let slot = member(&oneof.name);
+            if oneof.fields.len() == 1 {
+                let field = self.schema.field(oneof.fields[0]);
+                let FieldShape::Oneof { value, .. } = field.shape else {
+                    unreachable!()
+                };
+                if !matches!(value, ValueType::Message(..)) {
+                    let variant = ident(&field.name.to_upper_camel_case());
+                    let promoted = self.promoted(value, field.bytes_storage, "v");
+                    out.push_str(&format!("{slot}:self.{slot}.as_ref().map(|{}::{variant}(v)|{}::{variant}({promoted})),",self.view_oneof_path(*group),self.oneof_path(*group)));
+                    continue;
+                }
+            }
+            out.push_str(&format!("{slot}:match &self.{slot}{{None=>None,"));
+            for fid in &oneof.fields {
+                let field = self.schema.field(*fid);
+                let FieldShape::Oneof { value, .. } = field.shape else {
+                    unreachable!()
+                };
+                let variant = ident(&field.name.to_upper_camel_case());
+                let v = if matches!(value, ValueType::Message(..)) {
+                    "v.as_ref()"
+                } else {
+                    "v"
+                };
+                let mut promoted = self.promoted(value, field.bytes_storage, v);
+                if matches!(value, ValueType::Message(..)) {
+                    promoted = format!("::std::boxed::Box::new({promoted})");
+                }
+                out.push_str(&format!(
+                    "Some({}::{variant}(v))=>Some({}::{variant}({promoted})),",
+                    self.view_oneof_path(*group),
+                    self.oneof_path(*group)
+                ));
+            }
+            out.push_str("},");
+        }
+        out.push_str("})}}\n");
+        let mut fields = message
+            .fields
+            .iter()
+            .map(|field| self.schema.field(*field))
+            .collect::<Vec<_>>();
+        let positions: BTreeMap<_, _> = message
+            .oneofs
+            .iter()
+            .map(|id| {
+                (
+                    *id,
+                    self.schema
+                        .oneof(*id)
+                        .fields
+                        .iter()
+                        .map(|field| self.schema.field(*field).number.get())
+                        .min()
+                        .expect("oneof member"),
+                )
+            })
+            .collect();
+        fields.sort_by_key(|field| match field.shape {
+            FieldShape::Oneof { owner, .. } => (positions[&owner], field.number.get()),
+            _ => (field.number.get(), field.number.get()),
+        });
+        let mutable = if fields.is_empty() { "" } else { "mut " };
+        out.push_str(&format!("impl<'a>{RT}::ViewEncode<'a> for {name}<'a>{{fn compute_size(&self,cache:&mut {RT}::SizeCache)->u32{{let _=&cache;let {mutable}size=0u64;"));
+        for field in &fields {
+            out.push_str(&self.view_encode_field(field, false));
+        }
+        out.push_str(&format!("{RT}::saturate_size(size)}}fn write_to(&self,cache:&mut {RT}::SizeCache,output:&mut impl {RT}::EncodeSink){{let _=&cache;let _=&output;"));
+        for field in &fields {
+            out.push_str(&self.view_encode_field(field, true));
+        }
+        out.push_str("}}\n");
+        out.push_str(&self.owned_view_source(message, id));
+        out
+    }
+    fn owned_view_source(&self, message: &Message, id: MessageId) -> String {
+        let name = ident(&format!("{}OwnedView", message.name));
+        let view = ident(&format!("{}View", message.name));
+        let owned = self.message_path(id);
+        let inner = format!("{RT}::OwnedView<{view}<'static>>");
+        let mut out = format!(
+            "#[derive(Clone,Debug)]pub struct {name}({inner});impl {name}{{\
+             pub fn decode(bytes: ::bytes::Bytes)->Result<Self,{RT}::DecodeError>{{Ok(Self({RT}::OwnedView::decode(bytes)?))}}\
+             pub fn decode_with_options(bytes: ::bytes::Bytes,options:&{RT}::DecodeOptions)->Result<Self,{RT}::DecodeError>{{Ok(Self({RT}::OwnedView::decode_with_options(bytes,options)?))}}\
+             pub fn from_owned(value:&{owned})->Result<Self,{RT}::DecodeError>{{Ok(Self({RT}::OwnedView::from_owned(value)?))}}\
+             pub fn view(&self)->&{view}<'_>{{self.0.reborrow()}}\
+             pub fn to_owned_message(&self)->{owned}{{self.0.to_owned_message()}}\
+             pub fn bytes(&self)->&::bytes::Bytes{{self.0.bytes()}}\
+             pub fn into_bytes(self)->::bytes::Bytes{{self.0.into_bytes()}}"
+        );
+        let reserved = [
+            "decode",
+            "decode_with_options",
+            "from_owned",
+            "view",
+            "to_owned_message",
+            "bytes",
+            "into_bytes",
+            "clone",
+            "into",
+        ];
+        for fid in &message.fields {
+            let field = self.schema.field(*fid);
+            if matches!(field.shape, FieldShape::Oneof { .. }) {
+                continue;
+            }
+            let slot = member(&field.name);
+            if reserved.contains(&slot.as_str()) {
+                continue;
+            }
+            let ty = self.view_field_type(field).replace("'a", "'_");
+            let reference = matches!(
+                field.shape,
+                FieldShape::Map { .. }
+                    | FieldShape::Repeated { .. }
+                    | FieldShape::Singular {
+                        value: ValueType::Message(..),
+                        ..
+                    }
+            );
+            let borrow = if reference { "&" } else { "" };
+            out.push_str(&format!(
+                "pub fn {slot}(&self)->{borrow}{ty}{{{borrow}self.view().{slot}}}"
+            ));
+        }
+        for gid in &message.oneofs {
+            let group = self.schema.oneof(*gid);
+            let slot = member(&group.name);
+            if reserved.contains(&slot.as_str()) {
+                continue;
+            }
+            let ty = self.view_oneof_path(*gid);
+            let lifetime = if self.view_oneof_lifetime(*gid) {
+                "<'_>"
+            } else {
+                ""
+            };
+            out.push_str(&format!("pub fn {slot}(&self)->::core::option::Option<&{ty}{lifetime}>{{self.view().{slot}.as_ref()}}"));
+        }
+        out.push_str(&format!("}}impl From<{inner}> for {name}{{fn from(value:{inner})->Self{{Self(value)}}}}impl From<{name}> for {inner}{{fn from(value:{name})->Self{{value.0}}}}impl AsRef<{inner}> for {name}{{fn as_ref(&self)->&{inner}{{&self.0}}}}impl {RT}::HasMessageView for {owned}{{type View<'a>={view}<'a>;type ViewHandle={name};}}\n"));
+        out
+    }
     fn oracle_value(&self, value: ValueType, a: &str, b: &str) -> String {
         match value {
             ValueType::Scalar(Scalar::Float | Scalar::Double) => {
@@ -928,6 +1473,66 @@ impl Emitter<'_> {
             ValueType::Message(id, _) => format!("assert_m{}({a},{b});", id.0),
         }
     }
+}
+
+fn oracle_seed(schema: &Schema, id: MessageId, depth: usize) -> Vec<u8> {
+    fn varint(mut value: u64, out: &mut Vec<u8>) {
+        while value >= 128 {
+            out.push((value as u8 & 127) | 128);
+            value >>= 7;
+        }
+        out.push(value as u8);
+    }
+    let mut out = Vec::new();
+    for fid in &schema.message(id).fields {
+        let field = schema.field(*fid);
+        // Keep one map key across combined fixtures so randomized map
+        // iteration cannot obscure the byte-exact codec comparison.
+        if schema.message(id).map_entry && field.number.get() == 1 {
+            continue;
+        }
+        let value = match field.shape {
+            FieldShape::Singular { value, .. }
+            | FieldShape::Repeated { value, .. }
+            | FieldShape::Oneof { value, .. } => value,
+            FieldShape::Map { entry, .. } => {
+                ValueType::Message(entry, MessageEncoding::LengthPrefixed)
+            }
+        };
+        let payload = match value {
+            ValueType::Message(child, _) if depth > 0 => oracle_seed(schema, child, depth - 1),
+            ValueType::Message(..) => continue,
+            ValueType::Scalar(Scalar::String) => b"fixture".to_vec(),
+            ValueType::Scalar(Scalar::Bytes) => vec![0x42, 0x81],
+            ValueType::Enumeration(id) => {
+                let mut payload = Vec::new();
+                varint(
+                    schema.enumeration(id).values[0].number as i64 as u64,
+                    &mut payload,
+                );
+                payload
+            }
+            _ => match Emitter::wire(value) {
+                0 => vec![1],
+                1 => 1f64.to_le_bytes().to_vec(),
+                5 => 1f32.to_le_bytes().to_vec(),
+                _ => unreachable!(),
+            },
+        };
+        let wire = Emitter::wire(value);
+        varint(
+            (u64::from(field.number.get()) << 3) | u64::from(wire),
+            &mut out,
+        );
+        if wire == 2 {
+            varint(payload.len() as u64, &mut out);
+        }
+        out.extend_from_slice(&payload);
+        if wire == 3 {
+            varint((u64::from(field.number.get()) << 3) | 4, &mut out);
+        }
+    }
+    out
 }
 
 pub fn generate_oracle(schema: &Schema) -> Result<String, syn::Error> {
@@ -983,7 +1588,7 @@ pub fn generate_oracle(schema: &Schema) -> Result<String, syn::Error> {
         }
         source.push_str("}\n");
         source.push_str(&format!(
-            "#[test]fn m{index}(){{compare::<{},{}>(assert_m{index},&[",
+            "#[test]fn m{index}(){{compare::<{},{}>(assert_m{index},check_v{index},&[",
             new.message_path(id),
             old.message_path(id)
         ));
@@ -993,7 +1598,9 @@ pub fn generate_oracle(schema: &Schema) -> Result<String, syn::Error> {
                 FieldShape::Singular { value, .. }
                 | FieldShape::Repeated { value, .. }
                 | FieldShape::Oneof { value, .. } => value,
-                FieldShape::Map { .. } => ValueType::Message(id, MessageEncoding::LengthPrefixed),
+                FieldShape::Map { entry, .. } => {
+                    ValueType::Message(entry, MessageEncoding::LengthPrefixed)
+                }
             };
             let kind = match value {
                 ValueType::Message(..) => "Message",
@@ -1006,10 +1613,80 @@ pub fn generate_oracle(schema: &Schema) -> Result<String, syn::Error> {
                     _ => unreachable!(),
                 },
             };
-            source.push_str(&format!("({},Kind::{kind}),", field.number.get()));
+            if let ValueType::Message(child, _) = value {
+                let seed = oracle_seed(schema, child, 1);
+                source.push_str(&format!(
+                    "({},Kind::Message(&{seed:?})),",
+                    field.number.get()
+                ));
+            } else {
+                source.push_str(&format!("({},Kind::{kind}),", field.number.get()));
+            }
         }
         source.push_str("]);}\n");
     }
+    source.push_str(&generate_view_oracle(schema));
     let parsed = syn::parse_file(&source)?;
     Ok(prettyplease::unparse(&parsed))
+}
+
+fn generate_view_oracle(schema: &Schema) -> String {
+    let new = Emitter {
+        schema,
+        base: "rt::generated::whatsapp",
+    };
+    let old = Emitter {
+        schema,
+        base: "waproto::whatsapp",
+    };
+    let mut out = String::new();
+    let value_assert = |value, a: &str, b: &str| {
+        new.oracle_value(value, a, b)
+            .replace("assert_m", "assert_v")
+    };
+    for (index, message) in schema.messages.iter().enumerate() {
+        if message.map_entry {
+            continue;
+        }
+        let id = MessageId(index);
+        out.push_str(&format!(
+            "fn assert_v{index}(a:&{}<'_>,b:&{}<'_>){{let _=(a,b);",
+            new.view_path(id),
+            old.view_path(id)
+        ));
+        for fid in &message.fields {
+            let field = schema.field(*fid);
+            let slot = member(&field.name);
+            match field.shape{
+            FieldShape::Singular{value:ValueType::Message(child,_),..}=>out.push_str(&format!("assert_eq!(a.{slot}.is_set(),b.{slot}.is_set());if let(Some(a),Some(b))=(a.{slot}.as_option(),b.{slot}.as_option()){{assert_v{}(a,b);}}",child.0)),
+            FieldShape::Singular{value,presence:Presence::Explicit}=>out.push_str(&format!("match(&a.{slot},&b.{slot}){{(Some(a),Some(b))=>{{{}}},(None,None)=>{{}},_=>panic!(\"borrowed presence mismatch\"),}}",value_assert(value,"a","b"))),
+            FieldShape::Singular{value,..}=>out.push_str(&value_assert(value,&format!("&a.{slot}"),&format!("&b.{slot}"))),
+            FieldShape::Repeated{value,..}=>out.push_str(&format!("assert_eq!(a.{slot}.len(),b.{slot}.len());for(a,b)in a.{slot}.iter().zip(b.{slot}.iter()){{{}}}",value_assert(value,"a","b"))),
+            FieldShape::Map{key,value,..}=>out.push_str(&format!("assert_eq!(a.{slot}.len(),b.{slot}.len());for((ak,av),(bk,bv))in a.{slot}.iter().zip(b.{slot}.iter()){{{}{}}}",value_assert(ValueType::Scalar(key),"ak","bk"),value_assert(value,"av","bv"))),
+            FieldShape::Oneof{..}=>{},
+        }
+        }
+        for oid in &message.oneofs {
+            let oneof = schema.oneof(*oid);
+            let slot = member(&oneof.name);
+            out.push_str(&format!("match(&a.{slot},&b.{slot}){{(None,None)=>{{}},"));
+            for fid in &oneof.fields {
+                let field = schema.field(*fid);
+                let FieldShape::Oneof { value, .. } = field.shape else {
+                    unreachable!()
+                };
+                let variant = ident(&field.name.to_upper_camel_case());
+                out.push_str(&format!(
+                    "(Some({}::{variant}(a)),Some({}::{variant}(b)))=>{{{}}},",
+                    new.view_oneof_path(*oid),
+                    old.view_oneof_path(*oid),
+                    value_assert(value, "a", "b")
+                ));
+            }
+            out.push_str("_=>panic!(\"borrowed oneof discriminator mismatch\"),}");
+        }
+        out.push_str("}\n");
+        out.push_str(&format!("fn check_v{index}(input:&[u8]){{let a=<{}<'_>as rt::MessageView>::decode_view(input);let b=<{}<'_>as buffa::MessageView>::decode_view(input);match(a,b){{(Ok(a),Ok(b))=>{{assert_v{index}(&a,&b);let ao=rt::MessageView::to_owned_message(&a).expect(\"valid view\");let bo=buffa::MessageView::to_owned_message(&b).expect(\"valid reference view\");assert_m{index}(&ao,&bo);assert_eq!(rt::ViewEncode::encode_to_vec(&a),buffa::ViewEncode::encode_to_vec(&b));let handle=<{} as rt::HasMessageView>::decode_view_handle(bytes::Bytes::copy_from_slice(input)).expect(\"valid handle\");assert_v{index}(handle.view(),&b);assert_m{index}(&handle.to_owned_message(),&bo);let cloned=handle.clone();drop(handle);assert_v{index}(cloned.view(),&b);assert_eq!(cloned.into_bytes().as_ref(),input);}},(Err(a),Err(b))=>assert_eq!(format!(\"{{a:?}}\"),format!(\"{{b:?}}\")),(a,b)=>panic!(\"borrowed rejection mismatch {{a:?}} {{b:?}}\"),}}}}\n",new.view_path(id),old.view_path(id),new.message_path(id)));
+    }
+    out
 }

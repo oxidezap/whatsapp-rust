@@ -142,7 +142,13 @@ fn main() -> std::io::Result<()> {
         experiment::generate(&fds, &out_path)?;
         let projected = project::project(&fds).map_err(std::io::Error::other)?;
         let source = emit_owned::generate(&projected, "crate::protobuf::generated::whatsapp")
-            .map_err(std::io::Error::other)?;
+            .map_err(|error| {
+                let _ = std::fs::write(
+                    out_path.join("codec_parse_failure.rs"),
+                    emit_owned::generate_raw(&projected, "crate::protobuf::generated::whatsapp"),
+                );
+                std::io::Error::other(error)
+            })?;
         std::fs::write(out_path.join("owned_full.rs"), source)?;
         std::fs::write(
             out_path.join("owned_full_oracle.rs"),

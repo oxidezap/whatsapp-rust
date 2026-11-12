@@ -85,3 +85,37 @@ pub fn bytes_size(field: u32, length: usize) -> u64 {
         + encoding::varint_len(length as u64) as u64
         + length as u64
 }
+
+pub fn borrow_bytes<'a>(input: &mut &'a [u8]) -> Result<&'a [u8], DecodeError> {
+    let length = usize::try_from(encoding::decode_varint(input)?)
+        .map_err(|_| DecodeError::MessageTooLarge)?;
+    if input.len() < length {
+        return Err(DecodeError::UnexpectedEof);
+    }
+    let (value, tail) = input.split_at(length);
+    *input = tail;
+    Ok(value)
+}
+
+pub fn borrow_str<'a>(input: &mut &'a [u8]) -> Result<&'a str, DecodeError> {
+    std::str::from_utf8(borrow_bytes(input)?).map_err(|_| DecodeError::InvalidUtf8)
+}
+
+pub fn borrow_group<'a>(
+    input: &mut &'a [u8],
+    number: u32,
+    depth: u32,
+) -> Result<&'a [u8], DecodeError> {
+    let original = *input;
+    loop {
+        let before = input.len();
+        let tag = encoding::Tag::decode(input)?;
+        if tag.wire_type() == encoding::WireType::EndGroup {
+            if tag.field_number() != number {
+                return Err(DecodeError::InvalidEndGroup(tag.field_number()));
+            }
+            return Ok(&original[..original.len() - before]);
+        }
+        encoding::skip_field_depth(tag, input, depth)?;
+    }
+}

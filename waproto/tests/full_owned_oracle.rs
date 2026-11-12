@@ -11,7 +11,7 @@ enum Kind {
     Fixed64,
     String,
     Bytes,
-    Message,
+    Message(&'static [u8]),
 }
 
 fn field(number: u32, kind: Kind, payload: &[u8]) -> Vec<u8> {
@@ -30,7 +30,7 @@ fn field(number: u32, kind: Kind, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-fn compare<C, R>(assert_fields: fn(&C, &R), fields: &[(u32, Kind)])
+fn compare<C, R>(assert_fields: fn(&C, &R), assert_views: fn(&[u8]), fields: &[(u32, Kind)])
 where
     C: rt::Message + rt::MessageName + std::fmt::Debug + serde::Serialize,
     R: buffa::Message + buffa::MessageName + std::fmt::Debug + serde::Serialize,
@@ -40,6 +40,7 @@ where
     assert_eq!(C::FULL_NAME, R::FULL_NAME);
     assert_eq!(C::TYPE_URL, R::TYPE_URL);
     let check = |input: &[u8]| {
+        assert_views(input);
         let candidate = C::decode_from_slice(input);
         let reference = R::decode_from_slice(input);
         match (candidate, reference) {
@@ -120,7 +121,7 @@ where
             .map(<[u8]>::to_vec)
             .collect(),
             Kind::Bytes => vec![vec![], vec![0], vec![255], vec![1, 2, 3]],
-            Kind::Message => vec![vec![]],
+            Kind::Message(seed) => vec![vec![], seed.to_vec()],
         };
         for payload in payloads {
             let bytes = field(number, kind, &payload);
@@ -130,7 +131,7 @@ where
             }
             combined.extend_from_slice(&bytes);
         }
-        if matches!(kind, Kind::Message) {
+        if matches!(kind, Kind::Message(_)) {
             check(&field(number, kind, &[0]));
         }
         if matches!(kind, Kind::String) {
@@ -147,3 +148,54 @@ where
 }
 
 include!(concat!(env!("OUT_DIR"), "/owned_full_oracle.rs"));
+
+#[test]
+fn multiple_map_keys_preserve_semantics_and_duplicate_entries_replace_values() {
+    use buffa::Message as _;
+    use rt::{Message as _, MessageView as _};
+    let input = [
+        10, 6, 8, 1, 18, 2, 8, 2, 10, 6, 8, 2, 18, 2, 8, 3, 10, 6, 8, 1, 18, 2, 16, 4,
+    ];
+    let candidate = rt::generated::whatsapp::Config::decode_from_slice(&input).unwrap();
+    let reference = waproto::whatsapp::Config::decode_from_slice(&input).unwrap();
+    let expected = serde_json::to_value(&reference).unwrap();
+    assert_eq!(serde_json::to_value(&candidate).unwrap(), expected);
+    assert_eq!(candidate.field.len(), 2);
+    assert_eq!(candidate.field[&1].min_version, None);
+    assert_eq!(candidate.field[&1].max_version, Some(4));
+    assert_eq!(candidate.field[&2].min_version, Some(3));
+    let view = rt::generated::whatsapp::ConfigView::decode_view(&input).unwrap();
+    let old_view =
+        <waproto::whatsapp::ConfigView<'_> as buffa::MessageView>::decode_view(&input).unwrap();
+    assert_eq!(view.field.len(), old_view.field.len());
+    assert_eq!(view.field.len(), 3);
+    assert_eq!(view.field.keys().copied().collect::<Vec<_>>(), [1, 2, 1]);
+    assert_eq!(
+        view.field
+            .iter_unique()
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>(),
+        [2, 1]
+    );
+    assert_eq!(view.field.len_unique(), 2);
+    assert_eq!(
+        serde_json::to_value(view.to_owned_message().unwrap()).unwrap(),
+        expected
+    );
+    assert_eq!(
+        rt::ViewEncode::encode_to_vec(&view),
+        buffa::ViewEncode::encode_to_vec(&old_view)
+    );
+    let reference_from_candidate =
+        waproto::whatsapp::Config::decode_from_slice(&candidate.encode_to_vec()).unwrap();
+    let candidate_from_reference =
+        rt::generated::whatsapp::Config::decode_from_slice(&reference.encode_to_vec()).unwrap();
+    assert_eq!(
+        serde_json::to_value(reference_from_candidate).unwrap(),
+        expected
+    );
+    assert_eq!(
+        serde_json::to_value(candidate_from_reference).unwrap(),
+        expected
+    );
+}
