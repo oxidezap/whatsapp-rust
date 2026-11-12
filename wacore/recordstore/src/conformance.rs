@@ -27,6 +27,7 @@ pub async fn run_all<S: RecordStore + LeaseStore>(store: &S) {
     a_batch_applies_every_op(store, &run).await;
     update_never_inserts(store, &run).await;
     insert_is_exclusive_and_atomic(store, &run).await;
+    inserts_see_earlier_ops_in_the_same_batch(store, &run).await;
     insert_then_delete_preserves_absence_and_batch_atomicity(store, &run).await;
     scan_orders_filters_and_limits(store, &run).await;
     scopes_and_namespaces_are_isolated(store, &run).await;
@@ -236,7 +237,7 @@ pub async fn a_stale_batch_applies_nothing<S: RecordStore + LeaseStore>(store: &
         .await
         .unwrap();
     take(store, &scope, "b", 1_000 + TTL).await;
-    let _ = store
+    let stale = store
         .write(
             &a,
             &[
@@ -249,6 +250,10 @@ pub async fn a_stale_batch_applies_nothing<S: RecordStore + LeaseStore>(store: &
             ],
         )
         .await;
+    assert!(
+        stale.as_ref().is_err_and(is_fence_lost),
+        "a_stale_batch_applies_nothing: stale batch was not refused as fence lost"
+    );
     assert_eq!(
         store
             .get(&scope, Namespace::Session, "keep")
@@ -486,5 +491,62 @@ pub async fn insert_is_exclusive_and_atomic<S: RecordStore + LeaseStore>(store: 
             .unwrap()
             .is_none(),
         "insert_is_exclusive_and_atomic: refused batch applied another op"
+    );
+}
+
+pub async fn inserts_see_earlier_ops_in_the_same_batch<S: RecordStore + LeaseStore>(
+    store: &S,
+    run: &str,
+) {
+    let scope = scope(run, "insert-in-batch");
+    let fence = take(store, &scope, "a", 1_000).await;
+    let ns = Namespace::Device;
+    let insert = |key: &str, value: &[u8]| WriteOp::Insert {
+        ns,
+        key: key.to_owned(),
+        value: value.to_vec(),
+    };
+    let refused_cases: [(&str, Vec<WriteOp>); 2] = [
+        ("dup", vec![insert("dup", b"a"), insert("dup", b"b")]),
+        ("put", vec![put(ns, "put", b"a"), insert("put", b"b")]),
+    ];
+    for (key, mut ops) in refused_cases {
+        ops.push(put(Namespace::Session, "side-effect", b"x"));
+        let refused = store.write(&fence, &ops).await;
+        assert!(
+            refused.as_ref().is_err_and(is_record_exists),
+            "inserts_see_earlier_ops_in_the_same_batch: {key} batch was not refused"
+        );
+        assert!(
+            store.get(&scope, ns, key).await.unwrap().is_none(),
+            "inserts_see_earlier_ops_in_the_same_batch: {key} refused batch wrote a record"
+        );
+        assert!(
+            store
+                .get(&scope, Namespace::Session, "side-effect")
+                .await
+                .unwrap()
+                .is_none(),
+            "inserts_see_earlier_ops_in_the_same_batch: {key} refused batch applied another op"
+        );
+    }
+    store
+        .write(
+            &fence,
+            &[
+                insert("again", b"a"),
+                WriteOp::Delete {
+                    ns,
+                    key: "again".into(),
+                },
+                insert("again", b"b"),
+            ],
+        )
+        .await
+        .expect("inserts_see_earlier_ops_in_the_same_batch: insert after delete refused");
+    assert_eq!(
+        store.get(&scope, ns, "again").await.unwrap().as_deref(),
+        Some(&b"b"[..]),
+        "inserts_see_earlier_ops_in_the_same_batch: insert after delete lost"
     );
 }

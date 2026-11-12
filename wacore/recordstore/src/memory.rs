@@ -87,17 +87,35 @@ impl RecordStore for MemoryRecordStore {
             .into_store_error());
         }
         // Validation happens before any mutation, so the batch stays atomic.
+        // `present` tracks the batch's running effect on key presence, so an
+        // Insert sees earlier Put/Insert/Delete ops of the same batch.
+        let mut present: HashMap<(Namespace, &str), bool> = HashMap::new();
         for op in ops {
-            if let WriteOp::Insert { ns, key, .. } = op
-                && state
-                    .records
-                    .contains_key(&(fence.scope.clone(), *ns, key.clone()))
-            {
-                return Err(RecordExists {
-                    ns: *ns,
-                    key: key.clone(),
+            match op {
+                WriteOp::Insert { ns, key, .. } => {
+                    let exists = match present.get(&(*ns, key.as_str())) {
+                        Some(&known) => known,
+                        None => state
+                            .records
+                            .contains_key(&(fence.scope.clone(), *ns, key.clone())),
+                    };
+                    if exists {
+                        return Err(RecordExists {
+                            ns: *ns,
+                            key: key.clone(),
+                        }
+                        .into_store_error());
+                    }
+                    present.insert((*ns, key.as_str()), true);
                 }
-                .into_store_error());
+                WriteOp::Put { ns, key, .. } => {
+                    present.insert((*ns, key.as_str()), true);
+                }
+                WriteOp::Delete { ns, key } => {
+                    present.insert((*ns, key.as_str()), false);
+                }
+                // Update never changes presence.
+                WriteOp::Update { .. } => {}
             }
         }
         for op in ops {
