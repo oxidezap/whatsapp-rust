@@ -907,6 +907,14 @@ async fn deliver_message(
     stanza: Vec<u8>,
 ) -> wa::Message {
     let (kind, version, ciphertext) = first_enc(&stanza);
+    // A prekey message must carry the identity the receiver verifies.
+    if kind == "pkmsg" {
+        assert_eq!(
+            stanza_device_identity(&stanza).as_deref(),
+            Some(from_identity),
+            "the stanza carries a different device identity"
+        );
+    }
     let sender = from.to_protocol_address();
     let chat = from.to_non_ad().to_string();
     let received = ops
