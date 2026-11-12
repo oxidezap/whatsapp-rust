@@ -95,9 +95,11 @@ impl RecordStore for MemoryRecordStore {
                 WriteOp::Insert { ns, key, .. } => {
                     let exists = match present.get(&(*ns, key.as_str())) {
                         Some(&known) => known,
-                        None => state
-                            .records
-                            .contains_key(&(fence.scope.clone(), *ns, key.clone())),
+                        None => {
+                            state
+                                .records
+                                .contains_key(&(fence.scope.clone(), *ns, key.clone()))
+                        }
                     };
                     if exists {
                         return Err(RecordExists {
