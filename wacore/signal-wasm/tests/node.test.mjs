@@ -1213,3 +1213,37 @@ test("buffered records carry the wall clock, so a yesterday cutoff keeps them", 
   assert.equal(conversationOf(again.message), "fresh");
 });
 
+test("a send to a phone number reuses the session migrated to its LID", async () => {
+  const alice = await device("alice-lid-send");
+  const bob = await device("bob-lid-send");
+  const BOB_LID = "999@lid";
+  await alice.signal.setOwnJids("111:1@s.whatsapp.net", undefined);
+  await alice.signal.establishSession(BOB, 1, await bundleFor(bob.signal));
+  assert.equal(await alice.signal.migratePnToLid(BOB, BOB_LID), 1);
+  const lookups = [];
+  const resolver = {
+    async resolveDevices() {
+      return ["222:1@s.whatsapp.net"];
+    },
+    async fetchPrekeys() {
+      return {};
+    },
+    async lidForPhone(user) {
+      lookups.push(user);
+      return user === "222" ? "999" : undefined;
+    },
+    async resolveGroup() {
+      throw new Error("not a group send");
+    },
+  };
+  const sent = await alice.signal.sendDirect(
+    resolver,
+    BOB,
+    conversation("over lid"),
+    "LID1",
+  );
+  assert.deepEqual(sent.unreachedDevices, []);
+  assert.ok(lookups.includes("222"));
+  const delivered = await receiveStanza(bob.signal, sent.stanza);
+  assert.equal(conversationOf(delivered.message), "over lid");
+});

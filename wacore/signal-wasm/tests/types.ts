@@ -70,5 +70,13 @@ acceptModule({ SignalDevice });
 declare const raw: WebAssembly.Instance;
 // @ts-expect-error A raw WebAssembly instance lacks wasm-bindgen's class/glue.
 acceptModule(raw);
+// lidForPhone is optional on a resolver.
+const withLid: SendResolver = {
+  resolveDevices: async (jids) => jids,
+  fetchPrekeys: async () => ({}),
+  lidForPhone: async (user) => (user === "1" ? "2" : undefined),
+  resolveGroup: async () => ({ participants: [], addressingMode: "pn" }),
+};
+void withLid;
 void count;
 void invalid;

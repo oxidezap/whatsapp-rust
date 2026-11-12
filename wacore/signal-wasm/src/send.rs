@@ -34,6 +34,11 @@ export interface SendResolver {
   resolveDevices(jids: string[]): Promise<string[]>;
   /** Prekey bundles by device JID; omit devices without one. */
   fetchPrekeys(jids: string[]): Promise<Record<string, RemoteBundle>>;
+  /**
+   * Optional. The LID user (no server) that a phone-number user maps to, if
+   * known. Lets a send to a phone-number JID reuse a session migrated to the LID.
+   */
+  lidForPhone?(user: string): Promise<string | null | undefined>;
   /** Group members and addressing; `lidToPn` maps LID users to phone JIDs. */
   resolveGroup(jid: string): Promise<{
     participants: string[];
@@ -53,6 +58,9 @@ extern "C" {
 
     #[wasm_bindgen(method, catch, js_name = fetchPrekeys)]
     fn fetch_prekeys(this: &SendResolver, jids: Array) -> Result<Promise, JsValue>;
+
+    #[wasm_bindgen(method, catch, js_name = lidForPhone)]
+    fn lid_for_phone(this: &SendResolver, user: &str) -> Result<Promise, JsValue>;
 
     #[wasm_bindgen(method, catch, js_name = resolveGroup)]
     fn resolve_group(this: &SendResolver, jid: &str) -> Result<Promise, JsValue>;
@@ -184,6 +192,23 @@ impl SendContextResolver for JsResolver {
             bundles: self.fetch_prekeys(jids).await?,
             rejected: Vec::new(),
         })
+    }
+
+    async fn get_lid_for_phone(&self, phone_user: &str) -> Option<CompactString> {
+        // Optional on the JS side: a resolver without it keeps PN addressing.
+        let has = Reflect::get(&self.0, &JsValue::from_str("lidForPhone"))
+            .map(|f| f.is_function())
+            .unwrap_or(false);
+        if !has {
+            return None;
+        }
+        let value = call("lidForPhone", self.0.lid_for_phone(phone_user))
+            .await
+            .ok()?;
+        value
+            .as_string()
+            .filter(|lid| !lid.is_empty())
+            .map(CompactString::from)
     }
 
     async fn resolve_group_routing_info(&self, jid: &Jid) -> anyhow::Result<Arc<GroupRoutingInfo>> {
