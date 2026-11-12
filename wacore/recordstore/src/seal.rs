@@ -37,8 +37,10 @@ pub enum SealError {
 /// AES-256-GCM with a 256-bit data key held in memory.
 ///
 /// Layout, format 1: `[0x01][12-byte random nonce][ciphertext || 16-byte tag]`.
-/// Random 96-bit nonces stay within GCM's safety margin for well over 2^32
-/// records per key; rotate the data key before that.
+/// Nonces are random 96-bit values, so NIST SP 800-38D section 8.3 limits one
+/// key to 2^32 encryptions in total. Every seal counts, including overwrites
+/// and retries, not only distinct records. Callers must rotate the data key
+/// before reaching that limit.
 pub struct AesGcmSealer {
     cipher: Aes256Gcm,
 }
