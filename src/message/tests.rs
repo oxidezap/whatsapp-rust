@@ -18496,13 +18496,14 @@ async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
                 proto
             };
             let skdm = sender.create_group_skdm(&group).await;
+            let failed_ciphertext = sender
+                .encrypt_group_message(&group, &MessageUtils::encode_and_pad(&p))
+                .await;
             let failed = group_skmsg_stanza(
                 &group,
-                &sender.jid.to_non_ad(),
+                &sender.jid,
                 "COUNTERFACTUAL_MESSAGE",
-                sender
-                    .encrypt_group_message(&group, &MessageUtils::encode_and_pad(&p))
-                    .await,
+                failed_ciphertext,
             );
             let mut r1 = p.clone();
             if variant != 0 {
@@ -18718,8 +18719,7 @@ async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
             }
             if let Some(expected_chain_id) = rotated_chain_id {
                 let snapshot = client.persistence_manager.get_device_snapshot();
-                let name =
-                    make_sender_key_name(&group, &sender.jid.to_non_ad().to_protocol_address());
+                let name = make_sender_key_name(&group, &sender.jid.to_protocol_address());
                 let record = client
                     .signal_cache
                     .get_sender_key(&name, &*snapshot.backend)
@@ -18749,7 +18749,7 @@ async fn pdo_retry_skdm_equivalence_preserves_distinct_user_payloads() {
                     .clone()
                     .handle_incoming_message(group_skmsg_stanza(
                         &group,
-                        &sender.jid.to_non_ad(),
+                        &sender.jid,
                         "COUNTERFACTUAL_FOLLOWUP",
                         followup,
                     ))
@@ -19967,6 +19967,24 @@ async fn joined_group_sender(client: &Arc<Client>, jid_str: &str, group: &Jid) -
         .await
         .unwrap();
     peer
+}
+
+// Spelling-replay fixtures authorize both wire addresses explicitly. Their
+// durability assertions must not depend on two devices sharing a storage key.
+async fn seed_bare_group_spelling(client: &Arc<Client>, peer: &mut AlicePeer, group: &Jid) {
+    let distribution = peer.create_group_skdm(group).await;
+    client
+        .handle_sender_key_distribution_message(
+            group,
+            &peer.jid.to_non_ad(),
+            "BARE_SPELLING_SKDM",
+            distribution
+                .axolotl_sender_key_distribution_message
+                .as_deref()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 }
 
 fn group_skmsg_stanza(
@@ -22833,6 +22851,9 @@ async fn cancelled_raw_replay(full_capacity: bool, retry_in_drain: bool, change_
         .unwrap();
     let group: Jid = "120363000000000083@g.us".parse().unwrap();
     let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+    if change_sender {
+        seed_bare_group_spelling(&client, &mut alice, &group).await;
+    }
     let ciphertext = encrypt_group_text(&mut alice, &group, "cancelled raw plaintext").await;
     let first = group_skmsg_stanza(&group, &alice.jid, "RAW_CANCEL_REPLAY", ciphertext.clone());
     client
@@ -22971,8 +22992,7 @@ async fn full_pending_journal_flush_recreation(novel_payload: bool) {
     let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
     client.flush_signal_cache().await.unwrap();
     let backend = client.persistence_manager.backend();
-    let sender_key_name =
-        make_sender_key_name(&group, &alice.jid.to_non_ad().to_protocol_address());
+    let sender_key_name = make_sender_key_name(&group, &alice.jid.to_protocol_address());
     let before_iteration = client
         .persistence_manager
         .get_device_snapshot()
@@ -23192,6 +23212,9 @@ async fn group_pending_recreation(change_spelling: Option<bool>, legacy_device_r
     let backend = client.persistence_manager.backend();
     let group: Jid = "120363000000000008@g.us".parse().unwrap();
     let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+    if change_spelling.is_some() {
+        seed_bare_group_spelling(&client, &mut alice, &group).await;
+    }
     let ciphertext = encrypt_group_text(&mut alice, &group, "durable before restart").await;
     let first_sender = if change_spelling == Some(false) {
         alice.jid.to_non_ad()

@@ -2394,12 +2394,7 @@ impl Client {
         }
         let mut adapter = self.signal_adapter();
 
-        // Always use bare sender for sender key operations. Real WA delivers
-        // skmsg with bare participant but pkmsg (SKDM) with device-qualified
-        // participant — normalizing to bare ensures consistent lookup.
-        // Hoisted out of the payload loop: all three are loop-invariant.
-        let sender_for_sk = info.source.sender.to_non_ad();
-        let sender_address = sender_for_sk.to_protocol_address();
+        let sender_address = info.source.sender.to_protocol_address();
         let sender_key_name = make_sender_key_name(&info.source.chat, &sender_address);
 
         // Two workers for the same (group, sender) can coexist after a chat-lane
