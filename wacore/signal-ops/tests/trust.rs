@@ -1178,3 +1178,64 @@ async fn a_retry_at_a_lid_uses_the_pin_saved_for_its_phone_number() {
         Some(*account.public_key.public_key_bytes())
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hosted_companion_verifies_against_its_ordinary_accounts_pin() {
+    use wacore::adv::test_util::{account_prefix, signed_identity};
+    use waproto::whatsapp::ADVEncryptionType;
+    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    let alice = device("alice-hosted", "111:1@s.whatsapp.net").await;
+    let account = KeyPair::generate(&mut rng);
+    // The account is pinned under its phone number, as its primary would be.
+    alice
+        .trust_account_identity(
+            &"222@s.whatsapp.net".parse().unwrap(),
+            *account.public_key.public_key_bytes(),
+        )
+        .await
+        .unwrap();
+
+    // A hosted (Cloud API) companion of that account, with a hosted ADV chain.
+    let hosted_device = KeyPair::generate(&mut rng);
+    let mut details = waproto::whatsapp::ADVDeviceIdentity::default();
+    details.raw_id = Some(1);
+    details.key_index = Some(1);
+    details.device_type = Some(ADVEncryptionType::HOSTED);
+    let details = waproto::codec::adv_device_identity_to_vec(&details);
+    let identity = signed_identity(
+        &account,
+        &hosted_device,
+        &details,
+        account_prefix(Some(ADVEncryptionType::HOSTED)),
+        Some(&[6, 6]),
+        false,
+    );
+    let identity = waproto::codec::adv_signed_device_identity_to_vec(&identity);
+    let hosted: Jid = "222:99@hosted".parse().unwrap();
+    let bundle = remote(&primary_bundle(&hosted_device), Some(identity.clone()));
+    alice
+        .establish_session(&hosted.to_protocol_address(), &bundle)
+        .await
+        .expect("the hosted companion verifies against the phone-number pin");
+
+    // A hosted companion signed by another account is still refused.
+    let other = KeyPair::generate(&mut rng);
+    let forged = waproto::codec::adv_signed_device_identity_to_vec(&signed_identity(
+        &other,
+        &hosted_device,
+        &details,
+        account_prefix(Some(ADVEncryptionType::HOSTED)),
+        Some(&[6, 6]),
+        false,
+    ));
+    let forged_jid: Jid = "222:98@hosted".parse().unwrap();
+    refused(
+        alice
+            .establish_session(
+                &forged_jid.to_protocol_address(),
+                &remote(&primary_bundle(&hosted_device), Some(forged)),
+            )
+            .await,
+        BundleRejection::InvalidDeviceIdentity,
+    );
+}

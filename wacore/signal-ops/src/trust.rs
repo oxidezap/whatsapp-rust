@@ -90,8 +90,11 @@ pub(crate) fn device_of(address: &ProtocolAddress) -> Result<Jid, OpsError> {
     })
 }
 
+/// The record key of `device`'s account pin. A hosted device belongs to
+/// its ordinary account (`hosted` to the phone number, `hosted.lid` to the
+/// LID), as in WA Web's `asUserWidOrThrow`, so it shares that account's pin.
 fn account_key(device: &Jid) -> String {
-    device.to_non_ad().to_string()
+    wacore::types::jid::adv_account_jid(device).to_string()
 }
 
 fn is_primary(device: &Jid) -> bool {
@@ -146,7 +149,7 @@ impl<S: ServiceStore> SignalOps<S> {
     /// and LID. Never taken from the client.
     pub(crate) async fn is_own_account(&self, device: &Jid) -> bool {
         let keys = self.keys().await;
-        let account = device.to_non_ad();
+        let account = wacore::types::jid::adv_account_jid(device);
         [keys.own_pn.as_deref(), keys.own_lid.as_deref()]
             .into_iter()
             .flatten()
