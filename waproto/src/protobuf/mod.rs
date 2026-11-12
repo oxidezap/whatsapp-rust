@@ -6,8 +6,10 @@ mod enumeration;
 mod error;
 mod message;
 mod message_field;
+pub mod open_enum_serde;
 mod sink;
 mod size_cache;
+pub mod types;
 
 pub use decode::{
     DEFAULT_ELEMENT_MEMORY_LIMIT, DEFAULT_UNKNOWN_FIELD_LIMIT, DecodeContext, DecodeOptions,
@@ -19,3 +21,17 @@ pub use message::{Message, MessageName, checked_encode_size, encode_size_overflo
 pub use message_field::{DefaultInstance, Inline, MessageField, ProtoBox};
 pub use sink::EncodeSink;
 pub use size_cache::SizeCache;
+
+#[allow(
+    non_camel_case_types,
+    non_snake_case,
+    unused_qualifications,
+    unused_imports,
+    clippy::derivable_impls,
+    clippy::let_and_return
+)]
+pub mod generated {
+    pub mod whatsapp {
+        include!(concat!(env!("OUT_DIR"), "/owned_full.rs"));
+    }
+}

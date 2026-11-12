@@ -43,6 +43,16 @@ mod policy;
 #[path = "experiment/generate.rs"]
 mod experiment;
 
+#[cfg(feature = "protobuf-experiment")]
+#[path = "codegen/emit_owned.rs"]
+pub mod emit_owned;
+#[cfg(feature = "protobuf-experiment")]
+#[path = "codegen/project.rs"]
+pub mod project;
+#[cfg(feature = "protobuf-experiment")]
+#[path = "codegen/schema.rs"]
+pub mod schema;
+
 /// A field this crate persists that the upstream proto does not declare.
 struct LocalField {
     /// Message path inside the `whatsapp` package, e.g. `Outer.Inner`.
@@ -128,7 +138,17 @@ fn main() -> std::io::Result<()> {
     signal_storage::check(&names::wire_api(&fds))?;
 
     #[cfg(feature = "protobuf-experiment")]
-    experiment::generate(&fds, &out_path)?;
+    {
+        experiment::generate(&fds, &out_path)?;
+        let projected = project::project(&fds).map_err(std::io::Error::other)?;
+        let source = emit_owned::generate(&projected, "crate::protobuf::generated::whatsapp")
+            .map_err(std::io::Error::other)?;
+        std::fs::write(out_path.join("owned_full.rs"), source)?;
+        std::fs::write(
+            out_path.join("owned_full_oracle.rs"),
+            emit_owned::generate_oracle(&projected).map_err(std::io::Error::other)?,
+        )?;
+    }
 
     // Emit the wire-tag consts (field numbers) for hand-written partial decoders.
     generate_tags(&fds, &out_path.join("tags.rs"))?;
@@ -161,27 +181,27 @@ fn main() -> std::io::Result<()> {
         // (serde-enum-repr numbers, serde-snake-case lowercase); see
         // crate::open_enum_serde.
         .field_attribute(
-            ".whatsapp.SyncdMutation.operation",
+            policy::FEATURE_ENUM_SERDE_FIELDS[0],
             "#[serde(serialize_with = \"crate::open_enum_serde::serialize\")]",
         )
         .field_attribute(
-            ".whatsapp.SyncdMutation.operation",
+            policy::FEATURE_ENUM_SERDE_FIELDS[0],
             "#[cfg_attr(feature = \"serde-deserialize\", serde(deserialize_with = \"crate::open_enum_serde::deserialize\"))]",
         )
         .field_attribute(
-            ".whatsapp.SyncActionValue.StatusPrivacyAction.mode",
+            policy::FEATURE_ENUM_SERDE_FIELDS[1],
             "#[serde(serialize_with = \"crate::open_enum_serde::serialize\")]",
         )
         .field_attribute(
-            ".whatsapp.SyncActionValue.StatusPrivacyAction.mode",
+            policy::FEATURE_ENUM_SERDE_FIELDS[1],
             "#[cfg_attr(feature = \"serde-deserialize\", serde(deserialize_with = \"crate::open_enum_serde::deserialize\"))]",
         )
         .field_attribute(
-            ".whatsapp.SyncActionValue.StatusPrivacyAction.modes",
+            policy::FEATURE_ENUM_SERDE_FIELDS[2],
             "#[serde(serialize_with = \"crate::open_enum_serde::serialize_repeated\")]",
         )
         .field_attribute(
-            ".whatsapp.SyncActionValue.StatusPrivacyAction.modes",
+            policy::FEATURE_ENUM_SERDE_FIELDS[2],
             "#[cfg_attr(feature = \"serde-deserialize\", serde(deserialize_with = \"crate::open_enum_serde::deserialize_repeated\"))]",
         )
         // Box every singular message field. buffa defaults them to inline; for
