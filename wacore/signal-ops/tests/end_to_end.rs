@@ -400,6 +400,10 @@ fn migrate_pn_to_lid_moves_regular_and_hosted_devices() {
     block_on(store.put_identity("456:7@lid.0", [4; 32])).unwrap();
     // The plain libsignal form carries the device in its suffix.
     block_on(store.put_session("123@s.whatsapp.net.5", b"pn-5")).unwrap();
+    // Device 7 is also stored under the plain form: the canonical row wins
+    // and the plain one is dropped, never copied over it.
+    block_on(store.put_session("123@s.whatsapp.net.7", b"pn-7-plain")).unwrap();
+    block_on(store.put_identity("123@s.whatsapp.net.7", [8; 32])).unwrap();
     // Another user sharing the prefix is untouched.
     block_on(store.put_session("1234@c.us.0", b"other")).unwrap();
 
@@ -419,12 +423,14 @@ fn migrate_pn_to_lid_moves_regular_and_hosted_devices() {
     assert_eq!(session("456:7@lid.0").as_deref(), Some(&b"pn-7"[..]));
     assert_eq!(identity("456:7@lid.0"), Some([4; 32]));
     assert_eq!(session("456:5@lid.0").as_deref(), Some(&b"pn-5"[..]));
+    assert_eq!(identity("456:7@lid.0"), Some([4; 32]));
     assert_eq!(session("456@lid.0").as_deref(), Some(&b"pn-0"[..]));
     for gone in [
         "123@c.us.0",
         "123:7@c.us.0",
         "123:99@hosted.0",
         "123@s.whatsapp.net.5",
+        "123@s.whatsapp.net.7",
     ] {
         assert!(
             session(gone).is_none() && identity(gone).is_none(),

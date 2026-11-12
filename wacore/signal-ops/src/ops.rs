@@ -659,8 +659,9 @@ impl<S: ServiceStore> SignalOps<S> {
     /// LID addresses once the client learns the mapping, for regular and
     /// hosted devices. On a conflict the phone-number session wins (it is the
     /// one the peer has been using) and an existing LID identity wins. Sender
-    /// keys are not moved; WA Web keeps them where they are. Returns how many
-    /// addresses moved.
+    /// keys are not moved; WA Web keeps them where they are. When a device is
+    /// stored under two address forms, the one wacore writes wins and the other
+    /// is dropped. Returns how many target addresses changed.
     pub async fn migrate_pn_to_lid(&self, pn: &Jid, lid: &Jid) -> Result<usize, OpsError> {
         if !pn.is_pn() || !lid.is_lid() {
             return Err(OpsError::InvalidInput(
@@ -681,9 +682,25 @@ impl<S: ServiceStore> SignalOps<S> {
                 ] {
                     for (address, device) in self.device_addresses(&pn.user, from).await? {
                         let target = Jid::new(lid.user.clone(), to).with_device(device);
-                        moves.push((address, target.to_protocol_address().as_str().to_owned()));
+                        // The form wacore itself writes for this device; a
+                        // plain libsignal name for the same device is the
+                        // fallback.
+                        let canonical = Jid::new(pn.user.clone(), from)
+                            .with_device(device)
+                            .to_protocol_address();
+                        let fallback = address != canonical.as_str();
+                        moves.push((
+                            target.to_protocol_address().as_str().to_owned(),
+                            fallback,
+                            address,
+                        ));
                     }
                 }
+                // Two stored forms can name one device. Group them by target,
+                // canonical form first, so one source decides the target.
+                moves.sort();
+                let moves: Vec<(String, String)> =
+                    moves.into_iter().map(|(to, _, from)| (from, to)).collect();
                 let held = self
                     .lock_keys(
                         moves
@@ -694,23 +711,33 @@ impl<S: ServiceStore> SignalOps<S> {
                     .await?;
                 held.run(async {
                     let staged = self.store.staged();
-                    let mut moved = 0;
+                    let mut moved = std::collections::HashSet::new();
+                    // Targets whose session this migration already wrote. A
+                    // second source for the same device is dropped, not
+                    // copied over it, so the session and identity that land
+                    // at the target come from one source.
+                    let mut decided = std::collections::HashSet::new();
                     for (from, to) in &moves {
-                        let mut changed = false;
+                        let first = !decided.contains(to);
                         if let Some(session) = staged.get_session(from).await? {
-                            staged.put_session(to, &session).await?;
+                            if first {
+                                staged.put_session(to, &session).await?;
+                            }
                             staged.delete_session(from).await?;
-                            changed = true;
+                            moved.insert(to.clone());
                         }
                         if let Some(identity) = staged.load_identity(from).await? {
-                            if staged.load_identity(to).await?.is_none() {
+                            if first && staged.load_identity(to).await?.is_none() {
                                 staged.put_identity(to, identity).await?;
                             }
                             staged.delete_identity(from).await?;
-                            changed = true;
+                            moved.insert(to.clone());
                         }
-                        moved += usize::from(changed);
+                        if moved.contains(to) {
+                            decided.insert(to.clone());
+                        }
                     }
+                    let moved = moved.len();
                     // The account's pin moves with it, even with no session to
                     // move. An existing LID pin wins: it was pinned or accepted
                     // for that address directly.
