@@ -376,16 +376,19 @@ impl<S: ServiceStore> SendContextResolver for Verifying<'_, S> {
         // key the user's bundles are dropped: they verified only against the
         // PN pin, and the session would be built at the LID.
         let mut bundles = bundles;
-        let mapped: Vec<Jid> = bundles
+        let mut mapped: Vec<Jid> = bundles
             .keys()
             .filter(|jid| jid.is_pn() && self.lids.contains_key(jid.user.as_str()))
             .cloned()
             .collect();
+        mapped.sort_by_key(|jid| jid.to_string());
         let mut checked = std::collections::HashSet::new();
         let mut conflicting = std::collections::HashSet::new();
         for jid in mapped {
             let lid = &self.lids[jid.user.as_str()];
-            if checked.insert(lid.clone())
+            // Per PN user: two users mapped to one LID each need their own
+            // pin to agree with it.
+            if checked.insert((jid.user.clone(), lid.clone()))
                 && !self
                     .ops
                     .mirror_pin(&self.store, &jid, lid)

@@ -772,7 +772,7 @@ async fn forgetting_a_user_waits_for_a_session_setup_already_in_flight() {
 /// sessions at the LID address.
 struct Mapped {
     inner: Client,
-    phone: &'static str,
+    phones: &'static [&'static str],
     lid: &'static str,
 }
 
@@ -802,7 +802,7 @@ impl SendContextResolver for Mapped {
     }
 
     async fn get_lid_for_phone(&self, phone_user: &str) -> Option<wacore_binary::CompactString> {
-        (phone_user == self.phone).then(|| self.lid.into())
+        self.phones.contains(&phone_user).then(|| self.lid.into())
     }
 }
 
@@ -842,7 +842,7 @@ async fn mapped_client(
             group: None,
             gate: None,
         },
-        phone: "222",
+        phones: &["222"],
         lid: "900222",
     }
 }
@@ -1031,4 +1031,90 @@ async fn an_explicit_trust_waits_for_a_migration_and_is_not_overwritten() {
     migration.await.unwrap().unwrap();
     trust.await.unwrap();
     assert_eq!(alice.account_identity(&lid).await.unwrap(), Some([2; 32]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_phone_number_mapped_to_one_lid_must_agree_with_its_pin() {
+    use wacore::types::message::AddressingMode;
+    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    let alice = device("alice-two-phones", "111:1@s.whatsapp.net").await;
+    alice
+        .set_own_jids("111:1@s.whatsapp.net", Some("900111:1@lid"))
+        .await
+        .unwrap();
+    common::pair(&alice).await;
+    let eve = device("eve-two-phones", "333:1@s.whatsapp.net").await;
+    let (eve_account, eve_identity) = pair_with_account(&eve).await;
+    let bob_account = KeyPair::generate(&mut rng);
+    let lid: Jid = "900222@lid".parse().unwrap();
+    alice
+        .trust_account_identity(&lid, *bob_account.public_key.public_key_bytes())
+        .await
+        .unwrap();
+    let bob_primary: Jid = "222@s.whatsapp.net".parse().unwrap();
+    let eve_primary: Jid = "333@s.whatsapp.net".parse().unwrap();
+    let eve_companion: Jid = "333:1@s.whatsapp.net".parse().unwrap();
+    // Both phone numbers map to the LID pinned for Bob. Bob's key agrees
+    // with it and is checked first; Eve's does not.
+    let client = Mapped {
+        inner: Client {
+            devices: vec![
+                bob_primary.clone(),
+                eve_primary.clone(),
+                eve_companion.clone(),
+            ],
+            bundles: HashMap::from([
+                (
+                    bob_primary.clone(),
+                    FetchedBundle {
+                        bundle: primary_bundle(&bob_account),
+                        device_identity: None,
+                    },
+                ),
+                (
+                    eve_primary.clone(),
+                    FetchedBundle {
+                        bundle: primary_bundle(&eve_account),
+                        device_identity: None,
+                    },
+                ),
+                (
+                    eve_companion.clone(),
+                    FetchedBundle {
+                        bundle: bundle_for(&eve, 1).await,
+                        device_identity: Some(eve_identity),
+                    },
+                ),
+            ]),
+            group: Some(Arc::new(GroupRoutingInfo::new(
+                vec![
+                    "111@s.whatsapp.net".parse().unwrap(),
+                    bob_primary.clone(),
+                    eve_primary.clone(),
+                ],
+                AddressingMode::Pn,
+            ))),
+            gate: None,
+        },
+        phones: &["222", "333"],
+        lid: "900222",
+    };
+    let group: Jid = "120363000000020@g.us".parse().unwrap();
+    alice
+        .send_group(&TokioRuntime, &client, &group, &text("hi"), "T1")
+        .await
+        .unwrap();
+    // Only Eve's keys could set up a session for device 1 at the LID.
+    let lid_companion: Jid = "900222:1@lid".parse().unwrap();
+    assert!(
+        !alice
+            .has_session(&lid_companion.to_protocol_address())
+            .await
+            .unwrap(),
+        "keys the LID pin does not accept built a session there"
+    );
+    assert_eq!(
+        alice.account_identity(&lid).await.unwrap(),
+        Some(*bob_account.public_key.public_key_bytes())
+    );
 }
