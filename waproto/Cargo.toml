@@ -20,6 +20,20 @@ serde-snake-case = ["serde-deserialize"]
 # Enums (de)serialize as their numeric repr instead of the variant name — what
 # the JS bridge / camelCase serializer expects.
 serde-enum-repr = ["dep:serde_repr"]
+protobuf-experiment = []
+protobuf-experiment-oracle = ["protobuf-experiment"]
+
+[[example]]
+name = "protobuf_experiment"
+required-features = ["protobuf-experiment"]
+
+[[example]]
+name = "protobuf_compare"
+required-features = ["protobuf-experiment"]
+
+[[example]]
+name = "protobuf_target_inventory"
+required-features = ["protobuf-experiment"]
 
 [dependencies]
 buffa = { workspace = true }

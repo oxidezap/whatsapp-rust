@@ -36,6 +36,10 @@ mod descriptor;
 #[path = "build/pin_clone.rs"]
 mod pin_clone;
 
+#[cfg(feature = "protobuf-experiment")]
+#[path = "experiment/generate.rs"]
+mod experiment;
+
 /// A field this crate persists that the upstream proto does not declare.
 struct LocalField {
     /// Message path inside the `whatsapp` package, e.g. `Outer.Inner`.
@@ -119,6 +123,9 @@ fn main() -> std::io::Result<()> {
     apply_local_fields(&mut fds)?;
     emission::retain_wallpaper_fields(&mut fds)?;
     signal_storage::check(&names::wire_api(&fds))?;
+
+    #[cfg(feature = "protobuf-experiment")]
+    experiment::generate(&fds, &out_path)?;
 
     // Emit the wire-tag consts (field numbers) for hand-written partial decoders.
     generate_tags(&fds, &out_path.join("tags.rs"))?;
