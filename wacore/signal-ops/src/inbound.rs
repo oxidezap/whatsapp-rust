@@ -292,7 +292,17 @@ impl<S: ServiceStore> SignalOps<S> {
             // A storage failure is different: return it uncommitted, so the
             // redelivery decrypts again and retries installing the key.
             let mut sender_key_rejected = false;
+            // WA Web installs a distribution under its own group ID
+            // (`WAWebHandleMsgProcess`: `createGroupSignalSession(author,
+            // groupId, key)`). Only this chat's chain is locked here, so a
+            // distribution naming another group is refused rather than stored
+            // under the wrong one.
             if let Some(skdm) = &content.skdm
+                && skdm.axolotl_sender_key_distribution_message.is_some()
+                && skdm.group_id.as_deref() != Some(request.chat)
+            {
+                sender_key_rejected = true;
+            } else if let Some(skdm) = &content.skdm
                 && let Some(axolotl) = &skdm.axolotl_sender_key_distribution_message
                 && let Err(error) = self
                     .process_sender_key_distribution_into(

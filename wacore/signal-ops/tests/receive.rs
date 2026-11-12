@@ -474,3 +474,50 @@ fn a_storage_failure_installing_a_sender_key_is_retried_on_redelivery() {
         Some("after retry")
     );
 }
+
+#[test]
+fn a_sender_key_for_another_group_is_not_installed_under_this_chat() {
+    const OTHER: &str = "120363000000009@g.us";
+    let alice = device("alice-other-group");
+    let bob = device("bob-other-group");
+    let (alice_addr, bob_addr) = (address("111"), address("222"));
+    connect(&alice, &bob, &bob_addr);
+
+    let skdm = block_on(alice.ops.sender_key_distribution(OTHER, &alice_addr)).unwrap();
+    let mut distribution = wa::message::SenderKeyDistributionMessage::default();
+    distribution.group_id = Some(OTHER.to_owned());
+    distribution.axolotl_sender_key_distribution_message = Some(skdm);
+    let mut carrier = wa::Message::default();
+    carrier.sender_key_distribution_message = Some(distribution).into();
+    let sent = block_on(alice.ops.encrypt(&bob_addr, &padded(&carrier))).unwrap();
+    let received = message(
+        block_on(bob.ops.receive(request(
+            GROUP,
+            &alice_addr,
+            kind(&sent),
+            &sent.ciphertext,
+            false,
+        )))
+        .unwrap(),
+    );
+    assert!(received.sender_key_rejected);
+
+    // The other group's chain was not stored under this chat.
+    let skmsg = block_on(alice.ops.group_encrypt(
+        OTHER,
+        &alice_addr,
+        &padded(&text("other group")),
+    ))
+    .unwrap();
+    assert!(
+        block_on(bob.ops.receive(request(
+            GROUP,
+            &alice_addr,
+            ReceiveKind::SenderKey,
+            &skmsg,
+            false,
+        )))
+        .is_err(),
+        "a key for another group must not decrypt this chat's messages"
+    );
+}
