@@ -641,6 +641,15 @@ async fn a_refused_group_retry_bundle_leaves_distribution_state_untouched() {
         .await
         .unwrap();
     assert_eq!(sent.distribution_targets, vec![bob_jid.clone()]);
+    // The server acknowledged the send, so Bob holds the sender key. A
+    // companion counts as warm only with its primary, so mark both.
+    let acknowledged = [bob_jid.with_device(0), bob_jid.clone()];
+    assert!(
+        alice
+            .mark_sender_key_distributed(&group, &acknowledged, sent.distribution_epoch)
+            .await
+            .unwrap()
+    );
     // Alice lost Bob's session, so the retry receipt's keys would be used.
     alice.forget_user(&bob_jid.to_non_ad()).await.unwrap();
 
@@ -678,17 +687,25 @@ async fn a_refused_group_retry_bundle_leaves_distribution_state_untouched() {
         "a refused retry must not create a session"
     );
     // The refused retry started no new epoch, so the original send's
-    // acknowledgment still counts.
+    // acknowledgment still counts. No devices are named, so this check
+    // writes no mark of its own.
     assert!(
         alice
-            .mark_sender_key_distributed(
-                &group,
-                &sent.distribution_targets,
-                sent.distribution_epoch
-            )
+            .mark_sender_key_distributed(&group, &[], sent.distribution_epoch)
             .await
             .unwrap(),
         "a refused retry must not change the distribution epoch"
+    );
+    // Bob's mark survived: the next send does not distribute the key to him
+    // again.
+    let next = alice
+        .send_group(&TokioRuntime, &client, &group, &text("again"), "G2")
+        .await
+        .unwrap();
+    assert!(
+        next.distribution_targets.is_empty(),
+        "a refused retry must keep Bob's distribution mark, got {:?}",
+        next.distribution_targets
     );
 }
 
