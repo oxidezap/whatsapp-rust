@@ -715,7 +715,7 @@ impl<S: ServiceStore> SignalOps<S> {
                             .is_none()
                     {
                         staged
-                            .put_aux(Namespace::AccountIdentity, &lid_account, &pin)
+                            .insert_aux(Namespace::AccountIdentity, &lid_account, &pin)
                             .await?;
                     }
                     staged.commit().await?;

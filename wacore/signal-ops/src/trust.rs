@@ -115,16 +115,23 @@ impl<S: ServiceStore> SignalOps<S> {
     /// Pin `identity` as `account`'s identity key, replacing any earlier pin.
     /// Call this only once the application itself has accepted the key, for
     /// example after the user confirmed a changed security code: the client
-    /// is not trusted to say so.
+    /// is not trusted to say so. It waits for sends, receives and migrations
+    /// that hold the account, so none of them can write over it afterwards.
     pub async fn trust_account_identity(
         &self,
         account: &Jid,
         identity: [u8; 32],
     ) -> Result<(), OpsError> {
-        Ok(self
-            .store()
-            .put_aux(Namespace::AccountIdentity, &account_key(account), &identity)
-            .await?)
+        let held = self
+            .lock_keys(vec![crate::ops::account_lock(&account.user)])
+            .await?;
+        held.run(async {
+            Ok(self
+                .store()
+                .put_aux(Namespace::AccountIdentity, &account_key(account), &identity)
+                .await?)
+        })
+        .await
     }
 
     async fn pinned(store: &S, device: &Jid) -> Result<Option<[u8; 32]>, OpsError> {

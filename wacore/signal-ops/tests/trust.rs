@@ -875,3 +875,124 @@ async fn a_first_send_at_a_mapped_lid_keeps_an_existing_lid_pin() {
         .unwrap();
     assert_eq!(alice.account_identity(&lid).await.unwrap(), Some(accepted));
 }
+
+/// Records that hold the first armed write touching account pins until
+/// released, as a slow database would.
+struct PinWritePause {
+    inner: MemoryRecordStore,
+    armed: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl wacore_recordstore::RecordStore for PinWritePause {
+    async fn get(
+        &self,
+        scope: &str,
+        ns: wacore_recordstore::Namespace,
+        key: &str,
+    ) -> wacore::store::error::Result<Option<Vec<u8>>> {
+        self.inner.get(scope, ns, key).await
+    }
+
+    async fn get_many(
+        &self,
+        scope: &str,
+        ns: wacore_recordstore::Namespace,
+        keys: &[&str],
+    ) -> wacore::store::error::Result<Vec<(String, Vec<u8>)>> {
+        self.inner.get_many(scope, ns, keys).await
+    }
+
+    async fn scan_keys(
+        &self,
+        scope: &str,
+        ns: wacore_recordstore::Namespace,
+        prefix: &str,
+        limit: Option<usize>,
+    ) -> wacore::store::error::Result<Vec<String>> {
+        self.inner.scan_keys(scope, ns, prefix, limit).await
+    }
+
+    async fn write(
+        &self,
+        fence: &wacore_recordstore::Fence,
+        ops: &[wacore_recordstore::WriteOp],
+    ) -> wacore::store::error::Result<()> {
+        use wacore_recordstore::{Namespace, WriteOp};
+        let pins = ops.iter().any(|op| {
+            matches!(
+                op,
+                WriteOp::Put {
+                    ns: Namespace::AccountIdentity,
+                    ..
+                } | WriteOp::Insert {
+                    ns: Namespace::AccountIdentity,
+                    ..
+                }
+            )
+        });
+        if pins && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        self.inner.write(fence, ops).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_explicit_trust_waits_for_a_migration_and_is_not_overwritten() {
+    let records = Arc::new(PinWritePause {
+        inner: MemoryRecordStore::new(),
+        armed: std::sync::atomic::AtomicBool::new(false),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let lease = records
+        .inner
+        .acquire("alice-migrate-trust", "node-a", 0, 60_000)
+        .await
+        .unwrap()
+        .unwrap();
+    let alice = Arc::new(
+        SignalOps::create(Arc::new(RecordSignalStore::new(
+            records.clone(),
+            Arc::new(AesGcmSealer::new(&[5; 32])),
+            lease.fence,
+        )))
+        .await
+        .unwrap(),
+    );
+    let pn: Jid = "222@s.whatsapp.net".parse().unwrap();
+    let lid: Jid = "900222@lid".parse().unwrap();
+    alice.trust_account_identity(&pn, [1; 32]).await.unwrap();
+
+    records
+        .armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let migration = {
+        let (alice, pn, lid) = (alice.clone(), pn.clone(), lid.clone());
+        tokio::spawn(async move { alice.migrate_pn_to_lid(&pn, &lid).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), records.entered.notified())
+        .await
+        .expect("the migration reaches its commit");
+
+    // The application accepts a new key for the LID while the migration's
+    // batch, which copies the old PN key there, is still being written.
+    let trust = {
+        let (alice, lid) = (alice.clone(), lid.clone());
+        tokio::spawn(async move { alice.trust_account_identity(&lid, [2; 32]).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !trust.is_finished(),
+        "explicit trust waits for the migration"
+    );
+
+    records.release.notify_one();
+    migration.await.unwrap().unwrap();
+    trust.await.unwrap().unwrap();
+    assert_eq!(alice.account_identity(&lid).await.unwrap(), Some([2; 32]));
+}
