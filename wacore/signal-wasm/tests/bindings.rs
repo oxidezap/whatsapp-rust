@@ -2087,3 +2087,147 @@ async fn invalid_lease_times_are_refused_before_any_backend_call_and_strand_noth
     run(live.release()).await;
     open("tab-c", 2.0, TTL).await.ok().unwrap();
 }
+
+// ---- Peer bundle verification -----------------------------------------
+
+#[wasm_bindgen_test]
+async fn a_companion_bundle_without_a_device_identity_is_refused() {
+    let alice = device("alice-no-identity").await;
+    let bob = device("bob-no-identity").await;
+    let bundle = unverified_bundle_for(&bob.signal, true).await;
+    rejects_with(
+        alice.signal.establish_session(BOB.into(), 1, bundle),
+        "bundle_refused",
+    )
+    .await;
+    assert_eq!(
+        run(alice.signal.has_session(BOB.into(), 1)).await,
+        JsValue::FALSE
+    );
+}
+
+#[wasm_bindgen_test]
+async fn a_device_identity_signed_by_another_account_is_refused_and_creates_no_session() {
+    let alice = device("alice-wrong-account").await;
+    let bob = device("bob-wrong-account").await;
+    let other = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+    let bundle = unverified_bundle_for(&bob.signal, true).await;
+    set(
+        bundle.unchecked_ref(),
+        "deviceIdentity",
+        &device_identity_under(&bob.signal, &other).await,
+    );
+    rejects_with(
+        alice.signal.establish_session(BOB.into(), 1, bundle),
+        "bundle_refused",
+    )
+    .await;
+    assert_eq!(
+        run(alice.signal.has_session(BOB.into(), 1)).await,
+        JsValue::FALSE
+    );
+    assert_eq!(
+        bytes_of(&run(alice.signal.account_identity(BOB.into())).await),
+        bob_account().public_key.public_key_bytes().to_vec(),
+        "a refused bundle leaves the pin alone"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn a_changed_primary_identity_is_refused_until_the_application_trusts_it() {
+    let alice = device("alice-primary-change").await;
+    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    let changed = KeyPair::generate(&mut rng);
+    rejects_with(
+        alice
+            .signal
+            .establish_session(BOB.into(), 0, primary_bundle_of(&changed)),
+        "bundle_refused",
+    )
+    .await;
+    assert_eq!(
+        run(alice.signal.has_session(BOB.into(), 0)).await,
+        JsValue::FALSE
+    );
+
+    rejects_with(
+        alice
+            .signal
+            .trust_account_identity(BOB.into(), Uint8Array::from(&[1u8; 31][..])),
+        "invalid_input",
+    )
+    .await;
+    run(alice
+        .signal
+        .trust_account_identity(BOB.into(), account_bytes(&changed)))
+    .await;
+    assert_eq!(
+        bytes_of(&run(alice.signal.account_identity(BOB.into())).await),
+        changed.public_key.public_key_bytes().to_vec()
+    );
+    run(alice
+        .signal
+        .establish_session(BOB.into(), 0, primary_bundle_of(&changed)))
+    .await;
+    assert_eq!(
+        run(alice.signal.has_session(BOB.into(), 0)).await,
+        JsValue::TRUE
+    );
+}
+
+#[wasm_bindgen_test]
+async fn a_send_leaves_a_device_unreached_when_its_resolver_bundle_does_not_verify() {
+    const SECOND: &str = "222:2@s.whatsapp.net";
+    let alice = device("alice-unverifiable").await;
+    let bob = device("bob-unverifiable").await;
+    let rogue = device("bob-unverifiable-second").await;
+    run(alice
+        .signal
+        .set_own_jids("111:1@s.whatsapp.net".into(), None))
+    .await;
+    let resolver = Rc::new(ResolverState {
+        devices: vec![BOB_DEVICE.into(), SECOND.into()],
+        bundles: vec![
+            (BOB_DEVICE.into(), bundle_for(&bob.signal, true).await),
+            (
+                SECOND.into(),
+                unverified_bundle_for(&rogue.signal, true).await,
+            ),
+        ],
+        ..ResolverState::default()
+    });
+    let sent = run(alice.signal.send_direct(
+        plain_resolver(&resolver).unchecked_into(),
+        BOB.into(),
+        conversation("only the verified one"),
+        "UNV1".into(),
+    ))
+    .await;
+    assert_eq!(strings_of(&get(&sent, "unreachedDevices")), [SECOND]);
+    assert_eq!(
+        run(alice.signal.has_session(BOB.into(), 2)).await,
+        JsValue::FALSE
+    );
+    assert_eq!(
+        run(alice.signal.has_session(BOB.into(), 1)).await,
+        JsValue::TRUE
+    );
+    let tree = stanza(&bytes_of(&get(&sent, "stanza")));
+    let mut recipients = Vec::new();
+    collect_to(&tree, &mut recipients);
+    assert!(
+        !recipients.iter().any(|jid| jid == SECOND),
+        "nothing is addressed to the unverified device: {recipients:?}"
+    );
+    assert!(recipients.iter().any(|jid| jid == BOB_DEVICE));
+}
+
+/// Every `to` attribute in a stanza tree.
+fn collect_to(node: &wacore_binary::Node, out: &mut Vec<String>) {
+    if let Some(to) = attr(node, "jid").or_else(|| attr(node, "to")) {
+        out.push(to);
+    }
+    for child in node.children().into_iter().flatten() {
+        collect_to(child, out);
+    }
+}
