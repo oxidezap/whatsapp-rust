@@ -9,6 +9,9 @@ repository = "https://github.com/oxidezap/whatsapp-rust"
 description = "Fenced, sealed record storage for wacore Signal state"
 publish = false
 
+[lints]
+workspace = true
+
 [features]
 # Reusable checks every RecordStore implementation must pass. Adapter crates
 # enable it in their dev-dependencies and call `conformance::run_all`.
