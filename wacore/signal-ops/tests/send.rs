@@ -1784,3 +1784,77 @@ async fn a_retry_whose_route_does_not_match_its_chat_is_refused() {
         "the saved chat's user is accepted, got {result:?}"
     );
 }
+
+#[tokio::test]
+async fn acknowledgments_for_one_addressing_chain_do_not_skip_the_other() {
+    use wacore::types::message::AddressingMode;
+    let group: Jid = "120363000000031@g.us".parse().unwrap();
+    let alice_jid: Jid = "111:1@s.whatsapp.net".parse().unwrap();
+    // Bob has no known LID, so his resolved JID is the same in both modes.
+    let bob_jid: Jid = "222@s.whatsapp.net".parse().unwrap();
+    let alice = device_with_lid(
+        "alice-chain-switch",
+        &alice_jid.to_string(),
+        Some("900111:1@lid"),
+    )
+    .await;
+    common::pair(&alice).await;
+    let bob = device("bob-chain-switch", &bob_jid.to_string()).await;
+    let client = |mode| FakeClient {
+        devices: vec![alice_jid.clone(), bob_jid.clone()],
+        bundles: HashMap::new(),
+        device_identities: HashMap::new(),
+        group: Some(Arc::new(GroupRoutingInfo::new(
+            vec![alice_jid.to_non_ad(), bob_jid.clone()],
+            mode,
+        ))),
+    };
+    let mut pn = client(AddressingMode::Pn);
+    pn.bundles.insert(bob_jid.clone(), bundle_for(&bob).await);
+
+    // A phone-number send, acknowledged: Bob holds the PN chain.
+    let first = alice
+        .send_group(&TokioRuntime, &pn, &group, &text("pn"), "C1")
+        .await
+        .unwrap();
+    assert_eq!(first.distribution_targets, vec![bob_jid.clone()]);
+    assert!(
+        alice
+            .mark_sender_key_distributed(
+                &group,
+                &first.distribution_targets,
+                first.distribution_epoch
+            )
+            .await
+            .unwrap()
+    );
+
+    // The group switches to LID addressing. The first LID send carries the
+    // new chain, but its stanza is lost and never acknowledged.
+    let lid = client(AddressingMode::Lid);
+    let lost = alice
+        .send_group(&TokioRuntime, &lid, &group, &text("lid lost"), "C2")
+        .await
+        .unwrap();
+    assert!(lost.distribution_targets.contains(&bob_jid));
+    // A late acknowledgment of the PN send cannot mark the LID chain.
+    assert!(
+        !alice
+            .mark_sender_key_distributed(
+                &group,
+                &first.distribution_targets,
+                first.distribution_epoch
+            )
+            .await
+            .unwrap()
+    );
+    let next = alice
+        .send_group(&TokioRuntime, &lid, &group, &text("lid again"), "C3")
+        .await
+        .unwrap();
+    assert!(
+        next.distribution_targets.contains(&bob_jid),
+        "Bob never received the LID chain, so it is sent again: {:?}",
+        next.distribution_targets
+    );
+}

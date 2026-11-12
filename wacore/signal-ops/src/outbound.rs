@@ -257,6 +257,13 @@ fn distribution_epoch_key(group: &str) -> String {
     format!("{group}\u{1}epoch")
 }
 
+/// The sending chain (this device's PN or LID address) a group's
+/// distribution marks belong to. The group's addressing mode picks the chain,
+/// and a mark for one chain says nothing about the other.
+fn distribution_chain_key(group: &str) -> String {
+    format!("{group}\u{1}chain")
+}
+
 fn new_epoch() -> [u8; 8] {
     use rand::Rng;
     rand::make_rng::<rand::rngs::StdRng>()
@@ -669,7 +676,18 @@ impl<S: ServiceStore> SignalOps<S> {
                         .get_sender_key(own_chain.cache_key())
                         .await?
                         .is_none();
-                    let targets = if force {
+                    // Marks recorded for the other chain (the group switched
+                    // between PN and LID addressing) do not count: start over.
+                    let chain_changed = self
+                        .store()
+                        .load_aux(
+                            Namespace::SenderKeyDevices,
+                            &distribution_chain_key(&group_str),
+                        )
+                        .await?
+                        .as_deref()
+                        != Some(own_chain.sender_id().as_bytes());
+                    let targets = if force || chain_changed {
                         let mut all = addressed.devices().to_vec();
                         retain_skdm_distribution_targets(&mut all, own_sending);
                         all
@@ -697,6 +715,31 @@ impl<S: ServiceStore> SignalOps<S> {
                     };
 
                     let staged = std::sync::Arc::new(self.store().staged());
+                    if chain_changed {
+                        let marks = staged
+                            .scan_aux(Namespace::SenderKeyDevices, &format!("{group_str}\u{0}"))
+                            .await?;
+                        let refs: Vec<&str> = marks.iter().map(String::as_str).collect();
+                        staged
+                            .delete_aux(Namespace::SenderKeyDevices, &refs)
+                            .await?;
+                        // A new epoch, so an acknowledgment of an old-chain send cannot
+                        // mark a device for this chain.
+                        staged
+                            .put_aux(
+                                Namespace::SenderKeyDevices,
+                                &distribution_epoch_key(&group_str),
+                                &new_epoch(),
+                            )
+                            .await?;
+                        staged
+                            .put_aux(
+                                Namespace::SenderKeyDevices,
+                                &distribution_chain_key(&group_str),
+                                own_chain.sender_id().as_bytes(),
+                            )
+                            .await?;
+                    }
                     let stores = self.stores_over(staged.clone()).await;
                     let (
                         mut sender_keys,
