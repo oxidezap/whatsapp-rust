@@ -186,6 +186,11 @@ pub trait RecordStore: Send + Sync {
     /// exists fails the batch with [`RecordExists::into_store_error`].
     /// An `Insert` followed by a `Delete` of the same key checks absence
     /// atomically without retaining a record after a successful batch.
+    ///
+    /// The returned future may be dropped after the backend applied the batch.
+    /// A caller that did not see the result must re-read the affected records
+    /// before retrying, because a blind retry of an `Insert` fails with
+    /// [`RecordExists`].
     async fn write(&self, fence: &Fence, ops: &[WriteOp]) -> Result<()>;
 }
 

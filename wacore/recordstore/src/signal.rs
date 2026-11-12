@@ -127,6 +127,10 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
     /// Seal and apply every pending write of a staged view in one fenced
     /// batch. Pending writes remain available after an error or cancellation.
     /// Committing a view that is not staged is a no-op.
+    ///
+    /// If the future is dropped after the backend applied the batch, the
+    /// pending writes survive and a retry fails with `RecordExists` on its
+    /// inserts. Re-read the affected records to reconcile before retrying.
     pub async fn commit(&self) -> Result<()> {
         let mut pending = match &self.overlay {
             Some(overlay) => overlay.lock().await,
