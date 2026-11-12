@@ -1969,3 +1969,55 @@ async fn a_send_to_a_phone_number_reuses_the_session_migrated_to_its_lid() {
         "over lid"
     );
 }
+
+#[wasm_bindgen_test]
+async fn invalid_lease_times_are_refused_before_any_backend_call_and_strand_nothing() {
+    let h = Harness::new();
+    let open = |holder: &'static str, now: f64, ttl: f64| {
+        let (backend, sealer) = (h.backend.clone(), h.sealer.clone());
+        async move {
+            SignalDevice::open(
+                backend.unchecked_into(),
+                sealer.unchecked_into(),
+                "lease-times".into(),
+                holder.into(),
+                now,
+                ttl,
+                true,
+            )
+            .await
+        }
+    };
+    for (now, ttl) in [
+        (0.0, f64::INFINITY),
+        (0.0, f64::NAN),
+        (0.0, -1.0),
+        (0.5, 1.0),
+        (f64::INFINITY, 1.0),
+        (9_007_199_254_740_991.0, 1.0),
+    ] {
+        let error = expect_err(open("tab-a", now, ttl).await);
+        assert_eq!(
+            code_of(&error).as_deref(),
+            Some("invalid_input"),
+            "{now} {ttl}"
+        );
+    }
+    assert!(
+        h.state.leases.borrow().is_empty(),
+        "no backend call was made"
+    );
+    // Another holder acquires at once: nothing was left held.
+    let live = open("tab-b", 0.0, TTL).await.ok().unwrap();
+    for (now, ttl) in [
+        (1.0, f64::INFINITY),
+        (1.0, f64::NAN),
+        (9_007_199_254_740_991.0, 1.0),
+    ] {
+        rejects_with(live.renew_lease(now, ttl), "invalid_input").await;
+    }
+    assert_eq!(h.state.leases.borrow()["lease-times"].expires_at_ms, TTL);
+    assert_eq!(run(live.renew_lease(1.0, TTL)).await, JsValue::TRUE);
+    run(live.release()).await;
+    open("tab-c", 2.0, TTL).await.ok().unwrap();
+}

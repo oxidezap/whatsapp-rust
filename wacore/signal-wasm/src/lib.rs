@@ -122,6 +122,24 @@ pub struct SignalDevice {
     inner: Rc<Inner>,
 }
 
+/// Validate a lease clock before any backend call: both values must be safe
+/// integers and the expiry they imply must be one too, so a backend can never
+/// store a lease that `to_lease` would later refuse.
+fn lease_times(now_ms: f64, ttl_ms: f64) -> Result<(u64, u64), JsValue> {
+    let invalid = |_| {
+        convert::coded_error(
+            "invalid_input",
+            "nowMs and ttlMs must be non-negative safe integers whose sum is a safe integer",
+        )
+    };
+    let now = convert::safe_u64(now_ms, "nowMs").map_err(invalid)?;
+    let ttl = convert::safe_u64(ttl_ms, "ttlMs").map_err(invalid)?;
+    if now_ms + ttl_ms > 9_007_199_254_740_991.0 {
+        return Err(invalid(String::new()));
+    }
+    Ok((now, ttl))
+}
+
 fn promise<F>(future: F) -> Promise
 where
     F: std::future::Future<Output = Result<JsValue, JsValue>> + 'static,
@@ -151,9 +169,10 @@ impl SignalDevice {
         // wacore stamps (buffered and sent records) would be 0. Idempotent:
         // an embedder's earlier provider wins.
         let _ = wacore::time::set_time_provider(DateNow);
+        let (now_ms, ttl_ms) = lease_times(now_ms, ttl_ms)?;
         let records = JsRecords::shared(backend);
         let lease = records
-            .acquire(&scope, &holder, now_ms as u64, ttl_ms as u64)
+            .acquire(&scope, &holder, now_ms, ttl_ms)
             .await
             .map_err(|e| ops_error(OpsError::Store(e)))?
             .ok_or_else(|| convert::coded_error("lease_held", "another holder owns this scope"))?;
@@ -208,10 +227,11 @@ impl SignalDevice {
     pub fn renew_lease(&self, now_ms: f64, ttl_ms: f64) -> Promise {
         let inner = self.inner.clone();
         promise(async move {
+            let (now_ms, ttl_ms) = lease_times(now_ms, ttl_ms)?;
             let current = inner.lease.borrow().clone();
             let renewed = inner
                 .records
-                .renew(&current, now_ms as u64, ttl_ms as u64)
+                .renew(&current, now_ms, ttl_ms)
                 .await
                 .map_err(|e| ops_error(OpsError::Store(e)))?;
             Ok(JsValue::from_bool(match renewed {
