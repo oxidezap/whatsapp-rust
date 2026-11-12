@@ -2,9 +2,9 @@
 //! RustCrypto implementation using RFC 7748, RFC 5869 and the public XEdDSA
 //! specification, <https://signal.org/docs/specifications/xeddsa/> sections 2–5.
 //! Verification also accepts an Edwards sign bit transported in signature bit 511.
+use crate::curve::{edwards::EdwardsPoint, montgomery::MontgomeryPoint, scalar::Scalar};
 use crate::engine::{CryptoProvider, Error, RandomSource, Result};
 use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
-use curve25519_dalek::{edwards::EdwardsPoint, montgomery::MontgomeryPoint, scalar::Scalar};
 use hmac::{Hmac, HmacReset, KeyInit, Mac};
 use sha2::digest::{block_api::CoreProxy, common::hazmat::SerializableState};
 use sha2::{Digest, Sha256, Sha512};
@@ -295,7 +295,7 @@ mod tests {
         one[0] = 1;
         let mut low_order = vec![[0; 32], one, minus_one, p, p_plus_one];
         low_order.extend(
-            curve25519_dalek::constants::EIGHT_TORSION
+            crate::curve::EIGHT_TORSION
                 .iter()
                 .map(|point| point.to_montgomery().to_bytes()),
         );
@@ -383,7 +383,7 @@ mod tests {
     fn rfc8032_signature_with_montgomery_public_key() {
         // RFC 8032 section 7.1, test 1. XEdDSA uses the same verification equation.
         let ed = hex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
-        let public = curve25519_dalek::edwards::CompressedEdwardsY(ed)
+        let public = crate::curve::edwards::CompressedEdwardsY(ed)
             .decompress()
             .unwrap()
             .to_montgomery()

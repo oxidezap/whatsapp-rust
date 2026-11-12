@@ -238,8 +238,7 @@ impl KeyPair {
         rng.fill_bytes(raw.as_mut_slice());
         raw[0] &= 248;
         raw[31] = (raw[31] & 127) | 64;
-        let public =
-            curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(*raw).to_bytes();
+        let public = crate::curve::montgomery::MontgomeryPoint::mul_base_clamped(*raw).to_bytes();
         Self::new(PublicKey(public), PrivateKey::from_raw(*raw))
     }
 }
@@ -289,12 +288,12 @@ impl IdentityKeyPair {
 /// Decompresses the public point once for repeated XEdDSA checks.
 #[derive(Clone, Debug)]
 pub struct PreparedVerifyingKey {
-    point: curve25519_dalek::edwards::EdwardsPoint,
+    point: crate::curve::edwards::EdwardsPoint,
     encoding: [u8; 32],
 }
 impl PreparedVerifyingKey {
     pub fn new(public: &PublicKey) -> Result<Self> {
-        use curve25519_dalek::montgomery::MontgomeryPoint;
+        use crate::curve::montgomery::MontgomeryPoint;
         let point = MontgomeryPoint(public.0);
         let p0 = point.to_edwards(0).ok_or(CurveError::InvalidKey)?;
         if p0.is_small_order() {
@@ -312,7 +311,7 @@ impl PreparedVerifyingKey {
         })
     }
     pub fn verify_signature(&self, message: &[u8], signature: &[u8]) -> bool {
-        use curve25519_dalek::{edwards::EdwardsPoint, scalar::Scalar};
+        use crate::curve::{edwards::EdwardsPoint, scalar::Scalar};
         use sha2::{Digest, Sha512};
         use subtle::ConstantTimeEq;
         let Ok(sig) = <&[u8; 64]>::try_from(signature) else {
@@ -350,7 +349,7 @@ impl PreparedVerifyingKey {
 /// Keeps the normalized scalar and Edwards encoding for repeated signing.
 #[derive(Clone)]
 pub struct PreparedSigningKey {
-    scalar: curve25519_dalek::scalar::Scalar,
+    scalar: crate::curve::scalar::Scalar,
     public: [u8; 32],
 }
 impl Drop for PreparedSigningKey {
@@ -369,7 +368,7 @@ impl PreparedSigningKey {
     }
     #[inline]
     fn prepare(private: &[u8; 32]) -> Self {
-        use curve25519_dalek::{edwards::EdwardsPoint, scalar::Scalar};
+        use crate::curve::{edwards::EdwardsPoint, scalar::Scalar};
         use subtle::{Choice, ConditionallySelectable};
         let mut raw = zeroize::Zeroizing::new(*private);
         raw[0] &= 248;
@@ -394,7 +393,7 @@ impl PreparedSigningKey {
         message: &[u8],
         rng: &mut dyn RandomSource,
     ) -> crate::engine::Result<[u8; 64]> {
-        use curve25519_dalek::{edwards::EdwardsPoint, scalar::Scalar};
+        use crate::curve::{edwards::EdwardsPoint, scalar::Scalar};
         use sha2::{Digest, Sha512};
         let mut random = zeroize::Zeroizing::new([0; 64]);
         rng.fill(random.as_mut_slice())?;
@@ -474,7 +473,7 @@ mod tests {
         high_bit[31] |= 128;
         let mut invalid = vec![p, p_plus_one, high_bit, [0; 32], one, minus_one];
         invalid.extend(
-            curve25519_dalek::constants::EIGHT_TORSION
+            crate::curve::EIGHT_TORSION
                 .iter()
                 .map(|point| point.to_montgomery().to_bytes()),
         );
