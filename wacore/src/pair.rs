@@ -174,6 +174,21 @@ impl PairUtils {
         device_state: &DeviceState,
         device_identity_bytes: &[u8],
     ) -> Result<(Vec<u8>, u32), PairCryptoError> {
+        Self::do_pair_crypto_with(
+            &device_state.identity_key,
+            &device_state.adv_secret_key,
+            device_identity_bytes,
+        )
+    }
+
+    /// [`Self::do_pair_crypto`] with only the two secrets it uses, so a
+    /// process that holds the identity key but never the noise key (an
+    /// external Signal store) can complete pairing.
+    pub fn do_pair_crypto_with(
+        identity_key: &KeyPair,
+        adv_secret_key: &[u8; 32],
+        device_identity_bytes: &[u8],
+    ) -> Result<(Vec<u8>, u32), PairCryptoError> {
         let hmac_container = waproto::codec::adv_signed_device_identity_hmac_decode(
             device_identity_bytes,
         )
@@ -185,12 +200,14 @@ impl PairUtils {
 
         let is_hosted_account = hmac_container.account_type == Some(ADVEncryptionType::HOSTED);
 
-        let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(&device_state.adv_secret_key)
-            .map_err(|e| PairCryptoError {
-            code: 500,
-            text: "internal-error",
-            source: e.into(),
-        })?;
+        let mut mac =
+            <HmacSha256 as hmac::KeyInit>::new_from_slice(adv_secret_key).map_err(|e| {
+                PairCryptoError {
+                    code: 500,
+                    text: "internal-error",
+                    source: e.into(),
+                }
+            })?;
         let details_bytes = hmac_container
             .details
             .as_deref()
@@ -255,7 +272,7 @@ impl PairUtils {
 
         let msg_to_verify = AccountSignatureMessage::new(
             inner_details_bytes,
-            &device_state.identity_key.public_key,
+            &identity_key.public_key,
             identity_details.device_type,
         );
 
@@ -283,8 +300,7 @@ impl PairUtils {
         // WAWebAdvSignatureApi.generateDeviceSignature always signs a regular companion.
         let msg_to_sign =
             msg_to_verify.for_device(&account_public_key, DeviceSignatureKind::Companion);
-        let device_signature = device_state
-            .identity_key
+        let device_signature = identity_key
             .private_key
             .calculate_signature(&msg_to_sign, &mut rand::make_rng::<rand::rngs::StdRng>())
             .map_err(|e| PairCryptoError {
