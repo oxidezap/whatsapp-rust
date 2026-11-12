@@ -1006,3 +1006,115 @@ async fn a_corrupt_record_is_pruned_instead_of_stopping_the_prune() {
             .is_none()
     );
 }
+
+/// Maps phone user `222` to LID `900222` and holds no prekey bundles, so a
+/// send can only reach that user through a session that already exists.
+struct MappedClient {
+    inner: FakeClient,
+}
+
+#[async_trait]
+impl SendContextResolver for MappedClient {
+    async fn lock_device_sessions(&self, _device_jids: &[Jid]) -> SessionLockGuard {
+        SessionLockGuard::none()
+    }
+
+    async fn resolve_devices(&self, jids: &[Jid]) -> anyhow::Result<Vec<Jid>> {
+        self.inner.resolve_devices(jids).await
+    }
+
+    async fn fetch_prekeys(&self, jids: &[Jid]) -> anyhow::Result<HashMap<Jid, PreKeyBundle>> {
+        self.inner.fetch_prekeys(jids).await
+    }
+
+    async fn fetch_prekeys_for_identity_check(
+        &self,
+        jids: &[Jid],
+    ) -> anyhow::Result<PreKeyFetchOutcome> {
+        self.inner.fetch_prekeys_for_identity_check(jids).await
+    }
+
+    async fn resolve_group_routing_info(&self, jid: &Jid) -> anyhow::Result<Arc<GroupRoutingInfo>> {
+        self.inner.resolve_group_routing_info(jid).await
+    }
+
+    async fn get_lid_for_phone(&self, user: &str) -> Option<wacore_binary::CompactString> {
+        (user == "222").then(|| "900222".into())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_group_send_reuses_an_older_pn_session_when_the_mapped_lid_has_none() {
+    use wacore::types::message::AddressingMode;
+    let group: Jid = "120363000000002@g.us".parse().unwrap();
+    let alice_jid: Jid = "111:1@s.whatsapp.net".parse().unwrap();
+    let bob_jid: Jid = "222@s.whatsapp.net".parse().unwrap();
+    let alice = device_with_lid(
+        "alice-pn-fallback",
+        "111:1@s.whatsapp.net",
+        Some("900111:1@lid"),
+    )
+    .await;
+    let bob = device("bob-pn-fallback", "222@s.whatsapp.net").await;
+
+    // A PN session from before the LID mapping was known.
+    let dm_client = FakeClient {
+        devices: vec![bob_jid.clone()],
+        bundles: HashMap::from([(bob_jid.clone(), bundle_for(&bob).await)]),
+        group: None,
+    };
+    let dm = alice
+        .send_direct(
+            &TokioRuntime,
+            &dm_client,
+            &bob_jid.to_non_ad(),
+            &text("before"),
+            "DM1",
+        )
+        .await
+        .unwrap();
+    let (kind, version, ciphertext) = enc_for(&dm.stanza, &bob_jid);
+    let dm_chat = alice_jid.to_non_ad().to_string();
+    receive_group_component(
+        &bob,
+        &dm_chat.parse().unwrap(),
+        &alice_jid,
+        (kind, version, ciphertext),
+    )
+    .await
+    .unwrap();
+
+    // The frozen map now points bob at a LID with no session and no bundle.
+    // The send must still deliver the sender key over the PN session, which
+    // `SignalOps` locks together with the mapped LID address.
+    let client = MappedClient {
+        inner: FakeClient {
+            devices: vec![alice_jid.clone(), bob_jid.clone()],
+            bundles: HashMap::new(),
+            group: Some(Arc::new(GroupRoutingInfo::new(
+                vec![alice_jid.to_non_ad(), bob_jid.clone()],
+                AddressingMode::Pn,
+            ))),
+        },
+    };
+    let sent = alice
+        .send_group(&TokioRuntime, &client, &group, &text("after mapping"), "G1")
+        .await
+        .unwrap();
+    assert_eq!(sent.distribution_targets, vec![bob_jid.clone()]);
+    let carrier = pairwise_enc_for(&sent.stanza, &bob_jid).expect("the PN session carries the key");
+    receive_group_component(&bob, &group, &alice_jid, carrier)
+        .await
+        .unwrap();
+    let Received::Message(received) =
+        receive_group_component(&bob, &group, &alice_jid, skmsg_of(&sent.stanza))
+            .await
+            .unwrap()
+    else {
+        panic!("expected the group payload")
+    };
+    assert_eq!(
+        received.content.message.conversation.as_deref(),
+        Some("after mapping")
+    );
+}
