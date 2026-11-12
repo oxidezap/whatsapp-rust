@@ -248,7 +248,11 @@ impl SignalDevice {
     pub fn generate_prekeys(&self, count: u32) -> Promise {
         let inner = self.inner.clone();
         promise(async move {
-            let keys = inner.ops.generate_prekeys(count).await.map_err(ops_error)?;
+            let keys = inner
+                .ops
+                .generate_prekeys(&send::PageRuntime, count)
+                .await
+                .map_err(ops_error)?;
             Ok(public_prekeys(&keys))
         })
     }
@@ -267,7 +271,7 @@ impl SignalDevice {
             }
             let batch = inner
                 .ops
-                .prepare_prekey_upload(count as u32)
+                .prepare_prekey_upload(&send::PageRuntime, count as u32)
                 .await
                 .map_err(ops_error)?;
             let out = Object::new();
