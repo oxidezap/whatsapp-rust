@@ -930,6 +930,18 @@ impl<S: ServiceStore> SignalOps<S> {
                     .delete_aux(Namespace::SenderKeyDevices, &refs)
                     .await?;
             }
+            // The requester was checked to be the same account as its
+            // encryption address. A PN account pinned before its LID was
+            // known vouches for the LID too; an existing LID pin still
+            // decides, and this staged copy commits only with the retry.
+            if request.requester.is_pn() && request.encryption_jid.is_lid() {
+                self.mirror_pin(
+                    &staged,
+                    &request.requester.to_non_ad(),
+                    &request.encryption_jid.to_non_ad(),
+                )
+                .await?;
+            }
             if let Some(bundle) = request.bundle {
                 self.establish_into(&staged, &address, bundle).await?;
             } else if !staged.has_session(address.as_str()).await? {

@@ -1118,3 +1118,63 @@ async fn each_phone_number_mapped_to_one_lid_must_agree_with_its_pin() {
         Some(*bob_account.public_key.public_key_bytes())
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retry_at_a_lid_uses_the_pin_saved_for_its_phone_number() {
+    let alice = device("alice-retry-lid", "111:1@s.whatsapp.net").await;
+    common::pair(&alice).await;
+    let bob = device("bob-retry-lid", "222:1@s.whatsapp.net").await;
+    let (account, device_identity) = pair_with_account(&bob).await;
+    let primary: Jid = "222@s.whatsapp.net".parse().unwrap();
+    let companion: Jid = "222:1@s.whatsapp.net".parse().unwrap();
+    let lid_companion: Jid = "900222:1@lid".parse().unwrap();
+
+    // First send, before the LID is known: the pin is saved under the PN.
+    let unmapped = Mapped {
+        phones: &[],
+        ..mapped_client(&bob, &account, device_identity.clone()).await
+    };
+    alice
+        .send_direct(&TokioRuntime, &unmapped, &primary, &text("hi"), "R1")
+        .await
+        .unwrap();
+    assert!(
+        alice
+            .account_identity(&"900222@lid".parse().unwrap())
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Now the companion asks for a retry at its LID, where no session exists.
+    let mut mapped = mapped_client(&bob, &account, device_identity.clone()).await;
+    mapped.inner.bundles.insert(
+        lid_companion.clone(),
+        FetchedBundle {
+            bundle: bundle_for(&bob, 1).await,
+            device_identity: Some(device_identity),
+        },
+    );
+    alice
+        .resend(
+            &mapped,
+            RetryRequest {
+                chat: &primary,
+                message_id: "R1",
+                requester: &companion,
+                encryption_jid: &lid_companion,
+                route: RetryRoute::Direct { recipient: None },
+                retry_count: 1,
+                bundle: None,
+            },
+        )
+        .await
+        .expect("the PN pin vouches for the LID companion");
+    assert_eq!(
+        alice
+            .account_identity(&"900222@lid".parse().unwrap())
+            .await
+            .unwrap(),
+        Some(*account.public_key.public_key_bytes())
+    );
+}
