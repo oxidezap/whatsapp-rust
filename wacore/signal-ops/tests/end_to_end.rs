@@ -15,6 +15,9 @@ mod common;
 use common::pair_success_container;
 use wacore_signal_ops::{EncKind, OpsError, RemoteBundle, SignalOps};
 
+mod runtime;
+use runtime::InlineRuntime;
+
 type Store = RecordSignalStore<MemoryRecordStore, AesGcmSealer>;
 
 const TTL: u64 = 60_000;
@@ -56,7 +59,7 @@ fn address(user: &str) -> ProtocolAddress {
 fn bundle_for(node: &Node, with_prekey: bool) -> (RemoteBundle, Option<u32>) {
     let identity = block_on(node.ops.public_identity());
     let prekey = with_prekey.then(|| {
-        let keys = block_on(node.ops.generate_prekeys(1)).unwrap();
+        let keys = block_on(node.ops.generate_prekeys(&InlineRuntime, 1)).unwrap();
         (keys[0].id, keys[0].public_key)
     });
     (

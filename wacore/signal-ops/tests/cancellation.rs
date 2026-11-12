@@ -15,6 +15,9 @@ use wacore_recordstore::{
 };
 use wacore_signal_ops::{RemoteBundle, SignalOps};
 
+mod runtime;
+use runtime::InlineRuntime;
+
 const TTL: u64 = 60_000;
 const DATA_KEY: [u8; 32] = [42; 32];
 
@@ -136,7 +139,11 @@ async fn cancellation_case(release_before_takeover: bool) {
     .await
     .unwrap();
     let public = bob.public_identity().await;
-    let prekey = bob.generate_prekeys(1).await.unwrap().remove(0);
+    let prekey = bob
+        .generate_prekeys(&InlineRuntime, 1)
+        .await
+        .unwrap()
+        .remove(0);
     let bundle = RemoteBundle {
         registration_id: public.registration_id,
         device_id: 1,

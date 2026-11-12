@@ -468,8 +468,12 @@ impl<S: ServiceStore> SignalOps<S> {
     /// Generate fresh one-time prekeys for retry receipts. Unlike
     /// `prepare_prekey_upload`, each call reserves new IDs. The counter and
     /// private keys commit together; active upload IDs remain reserved.
-    pub async fn generate_prekeys(&self, count: u32) -> Result<Vec<PublicPreKey>, OpsError> {
-        self.generate_fresh_prekeys(count).await
+    pub async fn generate_prekeys(
+        &self,
+        runtime: &dyn wacore::runtime::Runtime,
+        count: u32,
+    ) -> Result<Vec<PublicPreKey>, OpsError> {
+        self.generate_fresh_prekeys(runtime, count).await
     }
 
     /// Mark fresh retry prekeys uploaded. Any original member of the pending

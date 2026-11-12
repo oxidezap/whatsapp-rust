@@ -19,6 +19,9 @@ use wacore_recordstore::{
 };
 use wacore_signal_ops::{DeviceKeys, SignalOps};
 
+mod runtime;
+use runtime::InlineRuntime;
+
 const SCOPE: &str = "synthetic-upload-device";
 const PENDING: &str = "prekey-upload-v1";
 const MAX: u32 = 0x00ff_ffff;
@@ -219,8 +222,12 @@ impl Fixture {
 fn legacy_mark_is_fresh_only_and_rejects_all_original_pending_members_atomically() {
     block_on(async {
         let f = Fixture::new().await;
-        let batch = f.ops.prepare_prekey_upload(2).await.unwrap();
-        let fresh = f.ops.generate_prekeys(1).await.unwrap()[0].id;
+        let batch = f
+            .ops
+            .prepare_prekey_upload(&InlineRuntime, 2)
+            .await
+            .unwrap();
+        let fresh = f.ops.generate_prekeys(&InlineRuntime, 1).await.unwrap()[0].id;
         for ids in [vec![1], vec![fresh, 2]] {
             let writes = f.records.batches.lock().unwrap().len();
             assert!(matches!(
@@ -232,14 +239,24 @@ fn legacy_mark_is_fresh_only_and_rejects_all_original_pending_members_atomically
             assert_eq!(f.uploaded(2).await, Some(false));
         }
         f.store.remove_prekey(1).await.unwrap();
-        let recovered = f.ops.prepare_prekey_upload(1).await.unwrap();
+        let recovered = f
+            .ops
+            .prepare_prekey_upload(&InlineRuntime, 1)
+            .await
+            .unwrap();
         assert_eq!(recovered.pre_keys, batch.pre_keys[1..]);
         assert!(f.ops.mark_prekeys_uploaded(&[fresh, 1]).await.is_err());
         assert_eq!(f.uploaded(1).await, None);
         assert_eq!(f.uploaded(fresh).await, Some(false));
         f.ops.mark_prekeys_uploaded(&[fresh]).await.unwrap();
         assert_eq!(f.uploaded(fresh).await, Some(true));
-        assert_eq!(f.ops.prepare_prekey_upload(1).await.unwrap(), recovered);
+        assert_eq!(
+            f.ops
+                .prepare_prekey_upload(&InlineRuntime, 1)
+                .await
+                .unwrap(),
+            recovered
+        );
         f.ops
             .acknowledge_prekey_upload(&batch.batch_id, &[1, 2])
             .await
@@ -253,7 +270,7 @@ fn legacy_mark_is_fresh_only_and_rejects_all_original_pending_members_atomically
 fn legacy_mark_refuses_corrupt_pending_metadata_and_stale_fences() {
     block_on(async {
         let f = Fixture::new().await;
-        let fresh = f.ops.generate_prekeys(1).await.unwrap()[0].id;
+        let fresh = f.ops.generate_prekeys(&InlineRuntime, 1).await.unwrap()[0].id;
         f.store
             .put_aux(Namespace::Device, PENDING, b"invalid-batch")
             .await
@@ -293,7 +310,7 @@ fn legacy_mark_and_prepare_share_the_device_mutex() {
         futures::pin_mut!(mark);
         assert!(futures::poll!(&mut mark).is_pending());
         observed.await.unwrap();
-        let prepare = f.ops.prepare_prekey_upload(1);
+        let prepare = f.ops.prepare_prekey_upload(&InlineRuntime, 1);
         futures::pin_mut!(prepare);
         assert!(futures::poll!(&mut prepare).is_pending());
         assert!(f.store.load_prekey(1).await.unwrap().is_none());
@@ -310,13 +327,29 @@ fn legacy_mark_and_prepare_share_the_device_mutex() {
 fn reopen_reuses_the_batch_and_repeated_requests_do_not_allocate_more() {
     block_on(async {
         let f = Fixture::new().await;
-        let first = f.ops.prepare_prekey_upload(3).await.unwrap();
+        let first = f
+            .ops
+            .prepare_prekey_upload(&InlineRuntime, 3)
+            .await
+            .unwrap();
         assert_eq!(first.pre_keys.len(), 3);
         for _ in 0..20 {
-            assert_eq!(f.ops.prepare_prekey_upload(812).await.unwrap(), first);
+            assert_eq!(
+                f.ops
+                    .prepare_prekey_upload(&InlineRuntime, 812)
+                    .await
+                    .unwrap(),
+                first
+            );
         }
         let reopened = SignalOps::open(f.store.clone()).await.unwrap();
-        assert_eq!(reopened.prepare_prekey_upload(1).await.unwrap(), first);
+        assert_eq!(
+            reopened
+                .prepare_prekey_upload(&InlineRuntime, 1)
+                .await
+                .unwrap(),
+            first
+        );
         assert_eq!(f.counter().await, 4);
         assert_eq!(
             f.records
@@ -338,7 +371,10 @@ fn reopen_reuses_the_batch_and_repeated_requests_do_not_allocate_more() {
             .acknowledge_prekey_upload(&first.batch_id, &[1, 2, 3])
             .await
             .unwrap();
-        let next = reopened.prepare_prekey_upload(2).await.unwrap();
+        let next = reopened
+            .prepare_prekey_upload(&InlineRuntime, 2)
+            .await
+            .unwrap();
         assert_ne!(next.batch_id, first.batch_id);
         assert_eq!(
             next.pre_keys.iter().map(|key| key.id).collect::<Vec<_>>(),
@@ -354,7 +390,12 @@ fn counter_private_keys_and_pending_batch_fail_together_without_exposure() {
             let f = Fixture::new().await;
             let before = f.store.load_device().await.unwrap();
             f.records.fail.store(failure, Ordering::SeqCst);
-            assert!(f.ops.prepare_prekey_upload(4).await.is_err());
+            assert!(
+                f.ops
+                    .prepare_prekey_upload(&InlineRuntime, 4)
+                    .await
+                    .is_err()
+            );
             assert_eq!(f.store.load_device().await.unwrap(), before);
             assert!(
                 f.store
@@ -390,13 +431,23 @@ fn counter_private_keys_and_pending_batch_fail_together_without_exposure() {
             assert!(failed.iter().any(|op| matches!(op, WriteOp::Insert { ns: Namespace::Device, key, .. } if key == PENDING)));
             let reopened = SignalOps::open(f.store.clone()).await.unwrap();
             assert_eq!(
-                reopened.prepare_prekey_upload(1).await.unwrap().pre_keys[0].id,
+                reopened
+                    .prepare_prekey_upload(&InlineRuntime, 1)
+                    .await
+                    .unwrap()
+                    .pre_keys[0]
+                    .id,
                 1
             );
         }
         let f = Fixture::new().await;
         f.sealer.fail_after.store(2, Ordering::SeqCst);
-        assert!(f.ops.prepare_prekey_upload(2).await.is_err());
+        assert!(
+            f.ops
+                .prepare_prekey_upload(&InlineRuntime, 2)
+                .await
+                .is_err()
+        );
         assert_eq!(f.counter().await, 1);
         assert!(f.store.load_prekey(1).await.unwrap().is_none());
         assert!(
@@ -407,7 +458,12 @@ fn counter_private_keys_and_pending_batch_fail_together_without_exposure() {
                 .is_none()
         );
         assert_eq!(
-            f.ops.prepare_prekey_upload(2).await.unwrap().pre_keys[0].id,
+            f.ops
+                .prepare_prekey_upload(&InlineRuntime, 2)
+                .await
+                .unwrap()
+                .pre_keys[0]
+                .id,
             1
         );
     });
@@ -416,12 +472,15 @@ fn counter_private_keys_and_pending_batch_fail_together_without_exposure() {
 #[tokio::test]
 async fn concurrent_prepare_is_bounded_and_retry_generation_stays_fresh() {
     let f = Fixture::new().await;
-    let batches = futures::future::join_all((0..24).map(|_| f.ops.prepare_prekey_upload(8))).await;
+    let batches =
+        futures::future::join_all((0..24).map(|_| f.ops.prepare_prekey_upload(&InlineRuntime, 8)))
+            .await;
     let batch = batches[0].as_ref().unwrap();
     for result in &batches {
         assert_eq!(result.as_ref().unwrap(), batch);
     }
-    let retries = futures::future::join_all((0..12).map(|_| f.ops.generate_prekeys(2))).await;
+    let retries =
+        futures::future::join_all((0..12).map(|_| f.ops.generate_prekeys(&InlineRuntime, 2))).await;
     let ids: std::collections::BTreeSet<_> = retries
         .into_iter()
         .flat_map(|keys| keys.unwrap().into_iter().map(|key| key.id))
@@ -435,21 +494,29 @@ async fn concurrent_prepare_is_bounded_and_retry_generation_stays_fresh() {
 fn wrap_reserves_consumed_pending_ids_and_late_ack_never_marks_retry_keys() {
     block_on(async {
         let f = Fixture::new().await;
-        let old = f.ops.generate_prekeys(1).await.unwrap();
+        let old = f.ops.generate_prekeys(&InlineRuntime, 1).await.unwrap();
         let old_record = f.store.load_prekey(old[0].id).await.unwrap();
         f.set_counter(MAX - 1).await;
-        let batch = f.ops.prepare_prekey_upload(3).await.unwrap();
+        let batch = f
+            .ops
+            .prepare_prekey_upload(&InlineRuntime, 3)
+            .await
+            .unwrap();
         let ids: Vec<_> = batch.pre_keys.iter().map(|key| key.id).collect();
         assert_eq!(ids, [MAX - 1, MAX, 2]);
         f.store.remove_prekey(MAX - 1).await.unwrap();
         f.set_counter(MAX - 1).await;
-        let fresh = f.ops.generate_prekeys(3).await.unwrap();
+        let fresh = f.ops.generate_prekeys(&InlineRuntime, 3).await.unwrap();
         assert_eq!(
             fresh.iter().map(|key| key.id).collect::<Vec<_>>(),
             [3, 4, 5]
         );
         assert_eq!(f.store.load_prekey(1).await.unwrap(), old_record);
-        let filtered = f.ops.prepare_prekey_upload(3).await.unwrap();
+        let filtered = f
+            .ops
+            .prepare_prekey_upload(&InlineRuntime, 3)
+            .await
+            .unwrap();
         assert_eq!(filtered.batch_id, batch.batch_id);
         assert_eq!(
             filtered
@@ -477,9 +544,17 @@ fn wrap_reserves_consumed_pending_ids_and_late_ack_never_marks_retry_keys() {
 fn consumed_keys_stay_gone_even_between_ack_read_and_atomic_commit() {
     block_on(async {
         let f = Fixture::new().await;
-        let batch = f.ops.prepare_prekey_upload(3).await.unwrap();
+        let batch = f
+            .ops
+            .prepare_prekey_upload(&InlineRuntime, 3)
+            .await
+            .unwrap();
         f.store.remove_prekey(1).await.unwrap();
-        let filtered = f.ops.prepare_prekey_upload(3).await.unwrap();
+        let filtered = f
+            .ops
+            .prepare_prekey_upload(&InlineRuntime, 3)
+            .await
+            .unwrap();
         assert_eq!(
             filtered
                 .pre_keys
@@ -510,7 +585,11 @@ fn consumed_keys_stay_gone_even_between_ack_read_and_atomic_commit() {
 fn ack_rejects_unknown_duplicate_missing_and_stale_batches_and_recovers_failed_commit() {
     block_on(async {
         let f = Fixture::new().await;
-        let batch = f.ops.prepare_prekey_upload(2).await.unwrap();
+        let batch = f
+            .ops
+            .prepare_prekey_upload(&InlineRuntime, 2)
+            .await
+            .unwrap();
         for (id, ids) in [
             ("unknown", vec![1, 2]),
             (batch.batch_id.as_str(), vec![1]),
@@ -518,7 +597,13 @@ fn ack_rejects_unknown_duplicate_missing_and_stale_batches_and_recovers_failed_c
             (batch.batch_id.as_str(), vec![1, 2, 3]),
         ] {
             assert!(f.ops.acknowledge_prekey_upload(id, &ids).await.is_err());
-            assert_eq!(f.ops.prepare_prekey_upload(2).await.unwrap(), batch);
+            assert_eq!(
+                f.ops
+                    .prepare_prekey_upload(&InlineRuntime, 2)
+                    .await
+                    .unwrap(),
+                batch
+            );
             assert_eq!(f.uploaded(1).await, Some(false));
         }
         f.records.fail.store(4, Ordering::SeqCst);
@@ -530,12 +615,21 @@ fn ack_rejects_unknown_duplicate_missing_and_stale_batches_and_recovers_failed_c
         );
         assert_eq!(f.uploaded(1).await, Some(false));
         let reopened = SignalOps::open(f.store.clone()).await.unwrap();
-        assert_eq!(reopened.prepare_prekey_upload(2).await.unwrap(), batch);
+        assert_eq!(
+            reopened
+                .prepare_prekey_upload(&InlineRuntime, 2)
+                .await
+                .unwrap(),
+            batch
+        );
         reopened
             .acknowledge_prekey_upload(&batch.batch_id, &[1, 2])
             .await
             .unwrap();
-        let next = reopened.prepare_prekey_upload(1).await.unwrap();
+        let next = reopened
+            .prepare_prekey_upload(&InlineRuntime, 1)
+            .await
+            .unwrap();
         reopened
             .acknowledge_prekey_upload(&batch.batch_id, &[1, 2])
             .await
@@ -546,7 +640,13 @@ fn ack_rejects_unknown_duplicate_missing_and_stale_batches_and_recovers_failed_c
                 .await
                 .is_err()
         );
-        assert_eq!(reopened.prepare_prekey_upload(1).await.unwrap(), next);
+        assert_eq!(
+            reopened
+                .prepare_prekey_upload(&InlineRuntime, 1)
+                .await
+                .unwrap(),
+            next
+        );
         reopened
             .acknowledge_prekey_upload(&next.batch_id, &[next.pre_keys[0].id])
             .await
@@ -564,9 +664,17 @@ fn ack_rejects_unknown_duplicate_missing_and_stale_batches_and_recovers_failed_c
 fn consumed_batch_retires_and_stale_holder_cannot_prepare_or_ack() {
     block_on(async {
         let f = Fixture::new().await;
-        let batch = f.ops.prepare_prekey_upload(1).await.unwrap();
+        let batch = f
+            .ops
+            .prepare_prekey_upload(&InlineRuntime, 1)
+            .await
+            .unwrap();
         f.store.remove_prekey(batch.pre_keys[0].id).await.unwrap();
-        let replacement = f.ops.prepare_prekey_upload(1).await.unwrap();
+        let replacement = f
+            .ops
+            .prepare_prekey_upload(&InlineRuntime, 1)
+            .await
+            .unwrap();
         assert_ne!(replacement.batch_id, batch.batch_id);
         assert!(
             f.ops
@@ -583,7 +691,7 @@ fn consumed_batch_retires_and_stale_holder_cannot_prepare_or_ack() {
             .unwrap();
         assert!(
             f.ops
-                .prepare_prekey_upload(1)
+                .prepare_prekey_upload(&InlineRuntime, 1)
                 .await
                 .unwrap_err()
                 .is_fence_lost()
@@ -595,14 +703,23 @@ fn consumed_batch_retires_and_stale_holder_cannot_prepare_or_ack() {
                 .unwrap_err()
                 .is_fence_lost()
         );
-        assert!(f.ops.generate_prekeys(1).await.unwrap_err().is_fence_lost());
+        assert!(
+            f.ops
+                .generate_prekeys(&InlineRuntime, 1)
+                .await
+                .unwrap_err()
+                .is_fence_lost()
+        );
         let store = Arc::new(RecordSignalStore::new(
             f.records.clone(),
             f.sealer.clone(),
             lease.fence,
         ));
         let new = SignalOps::open(store).await.unwrap();
-        assert_eq!(new.prepare_prekey_upload(1).await.unwrap(), replacement);
+        assert_eq!(
+            new.prepare_prekey_upload(&InlineRuntime, 1).await.unwrap(),
+            replacement
+        );
     });
 }
 
@@ -611,7 +728,10 @@ fn corrupted_pending_metadata_or_private_keys_fail_closed_without_replacement() 
     block_on(async {
         for kind in 0..5 {
             let f = Fixture::new().await;
-            f.ops.prepare_prekey_upload(2).await.unwrap();
+            f.ops
+                .prepare_prekey_upload(&InlineRuntime, 2)
+                .await
+                .unwrap();
             let mut pending = f
                 .store
                 .load_aux(Namespace::Device, PENDING)
@@ -641,20 +761,38 @@ fn corrupted_pending_metadata_or_private_keys_fail_closed_without_replacement() 
                 .await
                 .unwrap();
             let before = f.store.load_device().await.unwrap();
-            assert!(f.ops.prepare_prekey_upload(2).await.is_err());
-            assert!(f.ops.generate_prekeys(1).await.is_err());
+            assert!(
+                f.ops
+                    .prepare_prekey_upload(&InlineRuntime, 2)
+                    .await
+                    .is_err()
+            );
+            assert!(f.ops.generate_prekeys(&InlineRuntime, 1).await.is_err());
             assert_eq!(f.store.load_device().await.unwrap(), before);
         }
         let f = Fixture::new().await;
-        f.ops.prepare_prekey_upload(1).await.unwrap();
+        f.ops
+            .prepare_prekey_upload(&InlineRuntime, 1)
+            .await
+            .unwrap();
         f.store
             .store_prekey(1, b"corrupt-record", false)
             .await
             .unwrap();
-        assert!(f.ops.prepare_prekey_upload(1).await.is_err());
+        assert!(
+            f.ops
+                .prepare_prekey_upload(&InlineRuntime, 1)
+                .await
+                .is_err()
+        );
         for count in [0, 813, u32::MAX] {
-            assert!(f.ops.prepare_prekey_upload(count).await.is_err());
-            assert!(f.ops.generate_prekeys(count).await.is_err());
+            assert!(
+                f.ops
+                    .prepare_prekey_upload(&InlineRuntime, count)
+                    .await
+                    .is_err()
+            );
+            assert!(f.ops.generate_prekeys(&InlineRuntime, count).await.is_err());
         }
     });
 }
@@ -663,7 +801,11 @@ fn corrupted_pending_metadata_or_private_keys_fail_closed_without_replacement() 
 fn lost_ack_response_replays_after_restart_without_touching_new_pending_or_crossing_fence() {
     block_on(async {
         let f = Fixture::new().await;
-        let batch = f.ops.prepare_prekey_upload(2).await.unwrap();
+        let batch = f
+            .ops
+            .prepare_prekey_upload(&InlineRuntime, 2)
+            .await
+            .unwrap();
         f.records.fail.store(5, Ordering::SeqCst);
         assert!(
             f.ops
@@ -672,18 +814,33 @@ fn lost_ack_response_replays_after_restart_without_touching_new_pending_or_cross
                 .is_err()
         );
         assert_eq!(f.uploaded(1).await, Some(false));
-        assert_eq!(f.ops.prepare_prekey_upload(2).await.unwrap(), batch);
+        assert_eq!(
+            f.ops
+                .prepare_prekey_upload(&InlineRuntime, 2)
+                .await
+                .unwrap(),
+            batch
+        );
         f.ops
             .acknowledge_prekey_upload(&batch.batch_id, &[1, 2])
             .await
             .unwrap();
         let reopened = SignalOps::open(f.store.clone()).await.unwrap();
-        let next = reopened.prepare_prekey_upload(1).await.unwrap();
+        let next = reopened
+            .prepare_prekey_upload(&InlineRuntime, 1)
+            .await
+            .unwrap();
         reopened
             .acknowledge_prekey_upload(&batch.batch_id, &[2, 1])
             .await
             .unwrap();
-        assert_eq!(reopened.prepare_prekey_upload(1).await.unwrap(), next);
+        assert_eq!(
+            reopened
+                .prepare_prekey_upload(&InlineRuntime, 1)
+                .await
+                .unwrap(),
+            next
+        );
         assert!(
             reopened
                 .acknowledge_prekey_upload(&batch.batch_id, &[1, 1, 2])
@@ -716,7 +873,11 @@ fn allocation_work_is_bounded_and_collision_refuses_the_entire_staged_batch() {
         f.store.store_prekeys_batch(&occupied, false).await.unwrap();
         let before = f.store.load_device().await.unwrap();
         f.records.reads.store(0, Ordering::SeqCst);
-        let error = f.ops.prepare_prekey_upload(1).await.unwrap_err();
+        let error = f
+            .ops
+            .prepare_prekey_upload(&InlineRuntime, 1)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("4096-ID scan limit"));
         assert!(f.records.reads.load(Ordering::SeqCst) <= 4098);
         assert_eq!(f.store.load_device().await.unwrap(), before);
@@ -757,7 +918,11 @@ fn actual_signal_consumption_filters_the_recovered_public_batch() {
         use wacore_signal_ops::RemoteBundle;
         let sender = Fixture::new().await;
         let receiver = Fixture::new().await;
-        let batch = receiver.ops.prepare_prekey_upload(2).await.unwrap();
+        let batch = receiver
+            .ops
+            .prepare_prekey_upload(&InlineRuntime, 2)
+            .await
+            .unwrap();
         let identity = receiver.ops.public_identity().await;
         let sender_address = ProtocolAddress::new("111@s.whatsapp.net", DeviceId::from(1));
         let receiver_address = ProtocolAddress::new("222@s.whatsapp.net", DeviceId::from(1));
@@ -789,7 +954,10 @@ fn actual_signal_consumption_filters_the_recovered_public_batch() {
             .unwrap();
         assert_eq!(received.plaintext, b"synthetic-upload-roundtrip");
         let reopened = SignalOps::open(receiver.store.clone()).await.unwrap();
-        let filtered = reopened.prepare_prekey_upload(2).await.unwrap();
+        let filtered = reopened
+            .prepare_prekey_upload(&InlineRuntime, 2)
+            .await
+            .unwrap();
         assert_eq!(filtered.batch_id, batch.batch_id);
         assert_eq!(filtered.pre_keys, batch.pre_keys[1..]);
         reopened
@@ -805,7 +973,11 @@ fn actual_signal_consumption_filters_the_recovered_public_batch() {
 fn upload_ceiling_and_corrupt_ack_receipt_are_enforced() {
     block_on(async {
         let f = Fixture::new().await;
-        let batch = f.ops.prepare_prekey_upload(812).await.unwrap();
+        let batch = f
+            .ops
+            .prepare_prekey_upload(&InlineRuntime, 812)
+            .await
+            .unwrap();
         assert_eq!(batch.pre_keys.len(), 812);
         f.ops
             .acknowledge_prekey_upload(
@@ -829,5 +1001,53 @@ fn upload_ceiling_and_corrupt_ack_receipt_are_enforced() {
                 .is_err()
         );
         assert_eq!(f.counter().await, 813);
+    });
+}
+
+/// Counts blocking jobs and the thread each ran on.
+struct CountingRuntime {
+    jobs: std::sync::atomic::AtomicUsize,
+}
+
+impl wacore::runtime::Runtime for CountingRuntime {
+    fn spawn(
+        &self,
+        future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>,
+    ) -> wacore::runtime::AbortHandle {
+        InlineRuntime.spawn(future)
+    }
+
+    fn sleep(
+        &self,
+        duration: std::time::Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        InlineRuntime.sleep(duration)
+    }
+
+    fn spawn_blocking(
+        &self,
+        f: Box<dyn FnOnce() + Send + 'static>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+        self.jobs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        InlineRuntime.spawn_blocking(f)
+    }
+
+    fn yield_now(&self) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> {
+        None
+    }
+}
+
+#[test]
+fn prekey_generation_runs_as_blocking_work() {
+    block_on(async {
+        let f = Fixture::new().await;
+        let runtime = CountingRuntime {
+            jobs: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let batch = f.ops.prepare_prekey_upload(&runtime, 812).await.unwrap();
+        assert_eq!(batch.pre_keys.len(), 812);
+        assert_eq!(runtime.jobs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        f.ops.generate_prekeys(&runtime, 3).await.unwrap();
+        assert_eq!(runtime.jobs.load(std::sync::atomic::Ordering::SeqCst), 2);
     });
 }

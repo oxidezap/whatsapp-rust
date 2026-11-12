@@ -21,6 +21,9 @@ mod common;
 use wacore_signal_ops::{ReceiveKind, ReceiveRequest, Received, SignalOps};
 use waproto::whatsapp as wa;
 
+mod runtime;
+use runtime::InlineRuntime;
+
 type Store = RecordSignalStore<MemoryRecordStore, AesGcmSealer>;
 type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
@@ -118,7 +121,11 @@ impl SendContextResolver for FakeClient {
 
 async fn bundle_for(ops: &SignalOps<Store>) -> PreKeyBundle {
     let identity = ops.public_identity().await;
-    let prekey = ops.generate_prekeys(1).await.unwrap().remove(0);
+    let prekey = ops
+        .generate_prekeys(&InlineRuntime, 1)
+        .await
+        .unwrap()
+        .remove(0);
     PreKeyBundle::new(
         identity.registration_id,
         DeviceId::from(1),

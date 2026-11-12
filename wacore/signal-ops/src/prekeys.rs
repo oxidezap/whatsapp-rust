@@ -7,6 +7,7 @@ use super::*;
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use wacore::runtime::Runtime;
 use wacore::store::error::StoreError;
 
 const PENDING: &str = "prekey-upload-v1";
@@ -132,7 +133,12 @@ impl<S: ServiceStore> SignalOps<S> {
     /// instance per held scope; its device lock serializes upload and retry work.
     /// New batches accept 1..=812 keys and inspect at most 4096 candidate IDs;
     /// allocation exhaustion at that bound leaves the counter and keys unchanged.
-    pub async fn prepare_prekey_upload(&self, count: u32) -> Result<PreKeyUploadBatch, OpsError> {
+    /// Key generation runs through `runtime`'s blocking pool.
+    pub async fn prepare_prekey_upload(
+        &self,
+        runtime: &dyn Runtime,
+        count: u32,
+    ) -> Result<PreKeyUploadBatch, OpsError> {
         count_valid(count)?;
         let held = self.lock_device().await?;
         held.run(async {
@@ -158,7 +164,7 @@ impl<S: ServiceStore> SignalOps<S> {
             rng().fill_bytes(&mut batch_id);
             let batch_id = hex::encode(batch_id);
             let public = self
-                .allocate_prekeys(count, &BTreeSet::new(), Some(&batch_id))
+                .allocate_prekeys(runtime, count, &BTreeSet::new(), Some(&batch_id))
                 .await?;
             Ok(PreKeyUploadBatch {
                 batch_id,
@@ -240,6 +246,7 @@ impl<S: ServiceStore> SignalOps<S> {
 
     pub(super) async fn generate_fresh_prekeys(
         &self,
+        runtime: &dyn Runtime,
         count: u32,
     ) -> Result<Vec<PublicPreKey>, OpsError> {
         count_valid(count)?;
@@ -251,7 +258,7 @@ impl<S: ServiceStore> SignalOps<S> {
             } else {
                 BTreeSet::new()
             };
-            self.allocate_prekeys(count, &reserved, None).await
+            self.allocate_prekeys(runtime, count, &reserved, None).await
         })
         .await
     }
@@ -276,6 +283,7 @@ impl<S: ServiceStore> SignalOps<S> {
 
     async fn allocate_prekeys(
         &self,
+        runtime: &dyn Runtime,
         count: u32,
         reserved: &BTreeSet<u32>,
         batch_id: Option<&str>,
@@ -327,21 +335,27 @@ impl<S: ServiceStore> SignalOps<S> {
             ));
         }
         keys.next_prekey_id = next;
-        let mut random = rng();
-        let mut records = Vec::with_capacity(ids.len());
-        let mut public = Vec::with_capacity(ids.len());
-        for id in ids {
-            let pair = KeyPair::generate(&mut random);
-            let record = record_helpers::new_pre_key_record(id, &pair);
-            records.push((
-                id,
-                bytes::Bytes::from(waproto::codec::pre_key_record_to_vec(&record)),
-            ));
-            public.push(PublicPreKey {
-                id,
-                public_key: public_bytes(&pair.public_key),
-            });
-        }
+        // Up to 812 key generations and encodes: off the async executor, as
+        // the client's own prekey upload does.
+        let (records, public) = wacore::runtime::blocking(runtime, move || {
+            let mut random = rng();
+            let mut records = Vec::with_capacity(ids.len());
+            let mut public = Vec::with_capacity(ids.len());
+            for id in ids {
+                let pair = KeyPair::generate(&mut random);
+                let record = record_helpers::new_pre_key_record(id, &pair);
+                records.push((
+                    id,
+                    bytes::Bytes::from(waproto::codec::pre_key_record_to_vec(&record)),
+                ));
+                public.push(PublicPreKey {
+                    id,
+                    public_key: public_bytes(&pair.public_key),
+                });
+            }
+            (records, public)
+        })
+        .await;
         let staged = self.store.staged();
         staged.insert_prekeys_batch(&records).await?;
         staged.save_device_keys(&keys.encode()).await?;

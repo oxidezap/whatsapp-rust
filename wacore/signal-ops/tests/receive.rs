@@ -14,6 +14,9 @@ use wacore_signal_ops::{
 };
 use waproto::whatsapp as wa;
 
+mod runtime;
+use runtime::InlineRuntime;
+
 type Store = RecordSignalStore<MemoryRecordStore, AesGcmSealer>;
 
 const TTL: u64 = 60_000;
@@ -52,7 +55,9 @@ fn address(user: &str) -> ProtocolAddress {
 
 fn connect(from: &Device, to: &Device, to_addr: &ProtocolAddress) {
     let identity = block_on(to.ops.public_identity());
-    let prekey = block_on(to.ops.generate_prekeys(1)).unwrap().remove(0);
+    let prekey = block_on(to.ops.generate_prekeys(&InlineRuntime, 1))
+        .unwrap()
+        .remove(0);
     block_on(from.ops.establish_session(
         to_addr,
         &RemoteBundle {
