@@ -223,7 +223,10 @@ impl Fixture {
         let mut keys =
             DeviceKeys::decode(&self.store.load_device().await.unwrap().unwrap()).unwrap();
         keys.next_prekey_id = counter;
-        self.store.save_device(&keys.encode()).await.unwrap();
+        self.store
+            .save_device(&keys.encode().unwrap())
+            .await
+            .unwrap();
     }
     async fn uploaded(&self, id: u32) -> Option<bool> {
         let key = format!("{id:010}");
@@ -976,7 +979,7 @@ fn allocation_work_is_bounded_and_collision_refuses_the_entire_staged_batch() {
             .unwrap();
         let mut keys = DeviceKeys::decode(before.as_deref().unwrap()).unwrap();
         keys.next_prekey_id = 5001;
-        staged.save_device(&keys.encode()).await.unwrap();
+        staged.save_device(&keys.encode().unwrap()).await.unwrap();
         assert!(wacore_recordstore::is_record_exists(
             &staged.commit().await.unwrap_err()
         ));

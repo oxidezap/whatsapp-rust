@@ -395,7 +395,7 @@ impl<S: ServiceStore> SignalOps<S> {
         let authority = slot
             .get_or_try_init(|| async {
                 let keys = DeviceKeys::generate()?;
-                match store.create_device_keys(&keys.encode()).await {
+                match store.create_device_keys(&keys.encode()?).await {
                     Ok(()) => {
                         created.store(true, std::sync::atomic::Ordering::SeqCst);
                         Ok(new_authority(keys))
@@ -506,7 +506,8 @@ impl<S: ServiceStore> SignalOps<S> {
     }
 
     async fn replace_keys(&self, keys: DeviceKeys) -> Result<(), OpsError> {
-        if let Err(error) = self.store.save_device_keys(&keys.encode()).await {
+        let encoded = keys.encode()?;
+        if let Err(error) = self.store.save_device_keys(&encoded).await {
             self.refresh_keys().await;
             return Err(error.into());
         }

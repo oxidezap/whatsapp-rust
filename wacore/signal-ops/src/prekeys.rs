@@ -352,7 +352,7 @@ impl<S: ServiceStore> SignalOps<S> {
         .await;
         let staged = self.store.staged();
         staged.insert_prekeys_batch(&records).await?;
-        staged.save_device_keys(&keys.encode()).await?;
+        staged.save_device_keys(&keys.encode()?).await?;
         if let Some(batch_id) = batch_id {
             let batch = PreKeyUploadBatch {
                 batch_id: batch_id.to_owned(),

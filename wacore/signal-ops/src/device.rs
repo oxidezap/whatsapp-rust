@@ -112,7 +112,11 @@ impl DeviceKeys {
     /// ID, then three length-prefixed fields (u32 account, u16 own PN, u16 own
     /// LID; length 0 means absent). Integers are big-endian. Public keys are
     /// derived on load. Format 1 is the fixed part alone and still decodes.
-    pub fn encode(&self) -> Vec<u8> {
+    /// Encode for storage. Refuses a field too long for its length prefix
+    /// (the account blob over `u32::MAX` bytes, a JID over `u16::MAX`), since
+    /// a truncated prefix would make the stored record undecodable.
+    pub fn encode(&self) -> Result<Vec<u8>, OpsError> {
+        let too_long = |what: &str| OpsError::InvalidInput(format!("device keys: {what} too long"));
         let mut out = Vec::with_capacity(FIXED_LEN + 8);
         out.push(FORMAT_V2);
         out.extend_from_slice(self.identity.private_key.serialize());
@@ -123,14 +127,16 @@ impl DeviceKeys {
         out.extend_from_slice(&self.signed_prekey_signature);
         out.extend_from_slice(&self.next_prekey_id.to_be_bytes());
         let account = self.account.as_deref().unwrap_or_default();
-        out.extend_from_slice(&(account.len() as u32).to_be_bytes());
+        let account_len = u32::try_from(account.len()).map_err(|_| too_long("account"))?;
+        out.extend_from_slice(&account_len.to_be_bytes());
         out.extend_from_slice(account);
         for jid in [&self.own_pn, &self.own_lid] {
             let jid = jid.as_deref().unwrap_or_default().as_bytes();
-            out.extend_from_slice(&(jid.len() as u16).to_be_bytes());
+            let jid_len = u16::try_from(jid.len()).map_err(|_| too_long("JID"))?;
+            out.extend_from_slice(&jid_len.to_be_bytes());
             out.extend_from_slice(jid);
         }
-        out
+        Ok(out)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, OpsError> {
@@ -221,7 +227,7 @@ mod tests {
     #[test]
     fn keys_round_trip_through_the_encoding() {
         let keys = DeviceKeys::generate().unwrap();
-        let decoded = DeviceKeys::decode(&keys.encode()).unwrap();
+        let decoded = DeviceKeys::decode(&keys.encode().unwrap()).unwrap();
         assert_eq!(decoded.public(), keys.public());
         assert_eq!(decoded.next_prekey_id, keys.next_prekey_id);
         assert_eq!(
@@ -240,17 +246,27 @@ mod tests {
     }
 
     #[test]
+    fn a_field_too_long_for_its_length_prefix_is_refused() {
+        let mut keys = DeviceKeys::generate().unwrap();
+        keys.own_pn = Some("1".repeat(usize::from(u16::MAX) + 1));
+        assert!(matches!(keys.encode(), Err(OpsError::InvalidInput(_))));
+        keys.own_pn = Some("1".repeat(usize::from(u16::MAX)));
+        let decoded = DeviceKeys::decode(&keys.encode().unwrap()).unwrap();
+        assert_eq!(decoded.own_pn, keys.own_pn);
+    }
+
+    #[test]
     fn the_paired_identity_round_trips_and_format_1_still_decodes() {
         let mut keys = DeviceKeys::generate().unwrap();
         keys.account = Some(vec![1, 2, 3]);
         keys.own_pn = Some("15550001111:4@s.whatsapp.net".into());
         keys.own_lid = Some("123456789:4@lid".into());
-        let decoded = DeviceKeys::decode(&keys.encode()).unwrap();
+        let decoded = DeviceKeys::decode(&keys.encode().unwrap()).unwrap();
         assert_eq!(decoded.account, keys.account);
         assert_eq!(decoded.own_pn, keys.own_pn);
         assert_eq!(decoded.own_lid, keys.own_lid);
 
-        let mut v1 = keys.encode()[..FIXED_LEN].to_vec();
+        let mut v1 = keys.encode().unwrap()[..FIXED_LEN].to_vec();
         v1[0] = FORMAT_V1;
         let old = DeviceKeys::decode(&v1).unwrap();
         assert_eq!(old.public(), keys.public());
@@ -259,7 +275,7 @@ mod tests {
 
     #[test]
     fn corrupt_encodings_are_rejected() {
-        let mut bytes = DeviceKeys::generate().unwrap().encode();
+        let mut bytes = DeviceKeys::generate().unwrap().encode().unwrap();
         assert!(DeviceKeys::decode(&bytes[..10]).is_err());
         bytes[0] = 9;
         assert!(DeviceKeys::decode(&bytes).is_err());
