@@ -670,6 +670,13 @@ async fn a_refused_group_retry_bundle_leaves_distribution_state_untouched() {
         ),
         "got {result:?}"
     );
+    assert!(
+        !alice
+            .has_session(&bob_jid.to_protocol_address())
+            .await
+            .unwrap(),
+        "a refused retry must not create a session"
+    );
     // The refused retry started no new epoch, so the original send's
     // acknowledgment still counts.
     assert!(
