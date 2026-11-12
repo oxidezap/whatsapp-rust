@@ -654,15 +654,23 @@ struct Dev {
 async fn device(scope: &str) -> Dev {
     let h = Harness::new();
     let signal = h.open(scope, "tab-a", 0.0, true).await.ok().unwrap();
-    // Every sender knows Bob's account, as after a first contact.
-    run(signal.trust_account_identity(BOB.into(), account_bytes(&bob_account()))).await;
+    know_peers(&signal).await;
+    if scope.starts_with("alice") {
+        remember_identity(&signal, &alice_account()).await;
+    }
     Dev { signal, h }
+}
+
+/// Pin both test accounts, as after a first contact with each.
+async fn know_peers(signal: &SignalDevice) {
+    run(signal.trust_account_identity(BOB.into(), account_bytes(&bob_account()))).await;
+    run(signal.trust_account_identity(ALICE.into(), account_bytes(&alice_account()))).await;
 }
 
 /// A companion (device 1) bundle of Bob's account, with its device identity.
 async fn bundle_for(signal: &SignalDevice, with_prekey: bool) -> JsValue {
     let bundle = unverified_bundle_for(signal, with_prekey).await;
-    let identity = device_identity_under(signal, &bob_account()).await;
+    let identity = remember_identity(signal, &bob_account()).await;
     set(bundle.unchecked_ref(), "deviceIdentity", &identity);
     bundle
 }
@@ -700,7 +708,14 @@ async fn encrypt(from: &SignalDevice, to: &str, plaintext: &[u8]) -> (String, Ve
 }
 
 async fn decrypt(at: &SignalDevice, from: &str, kind: &str, ciphertext: &[u8]) -> Vec<u8> {
-    let out = run(at.decrypt(from.into(), 1, kind.into(), ciphertext.to_vec())).await;
+    let out = run(at.decrypt(
+        from.into(),
+        1,
+        kind.into(),
+        ciphertext.to_vec(),
+        device_identity_of_prekey(kind, ciphertext),
+    ))
+    .await;
     bytes_of(&get(&out, "plaintext"))
 }
 
@@ -723,6 +738,7 @@ async fn receive_with(
         padding_version,
         from_me,
         consent.map(JsCast::unchecked_into),
+        device_identity_of_prekey(kind, ciphertext),
     ))
     .await
 }
@@ -878,6 +894,75 @@ fn bob_account() -> KeyPair {
     BOB_ACCOUNT.with(KeyPair::clone)
 }
 
+std::thread_local! {
+    /// The account key Alice's devices are paired under.
+    static ALICE_ACCOUNT: KeyPair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+    /// `<device-identity>` bytes by the device's identity key, for the
+    /// prekey messages a test relays.
+    static IDENTITIES: RefCell<HashMap<Vec<u8>, Vec<u8>>> = RefCell::new(HashMap::new());
+}
+
+fn alice_account() -> KeyPair {
+    ALICE_ACCOUNT.with(KeyPair::clone)
+}
+
+/// Pair `signal` under `account` and remember its device identity, so a
+/// prekey message it makes can be relayed with the identity a server sends.
+async fn remember_identity(signal: &SignalDevice, account: &KeyPair) -> JsValue {
+    let blob = device_identity_under(signal, account).await;
+    let key = bytes_of(&get(&run(signal.public_identity()).await, "identityKey"));
+    IDENTITIES.with(|map| map.borrow_mut().insert(key, bytes_of(&blob)));
+    blob
+}
+
+/// The identity key a prekey message was made with (its field 3).
+fn prekey_sender_identity(ciphertext: &[u8]) -> Option<Vec<u8>> {
+    let mut rest = ciphertext.get(1..)?;
+    let read_varint = |rest: &mut &[u8]| -> Option<u64> {
+        let (mut value, mut shift) = (0u64, 0);
+        loop {
+            let byte = *rest.first()?;
+            *rest = &rest[1..];
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Some(value);
+            }
+            shift += 7;
+        }
+    };
+    while !rest.is_empty() {
+        let tag = read_varint(&mut rest)?;
+        match tag & 7 {
+            0 => {
+                read_varint(&mut rest)?;
+            }
+            2 => {
+                let len = read_varint(&mut rest)? as usize;
+                let value = rest.get(..len)?;
+                rest = &rest[len..];
+                if tag >> 3 == 3 {
+                    return Some(value.get(1..)?.to_vec());
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// What the server relays with a prekey message: its sender's device identity.
+fn device_identity_of_prekey(kind: &str, ciphertext: &[u8]) -> Option<Uint8Array> {
+    if kind != "pkmsg" {
+        return None;
+    }
+    let sender = prekey_sender_identity(ciphertext)?;
+    IDENTITIES.with(|map| {
+        map.borrow()
+            .get(&sender)
+            .map(|blob| Uint8Array::from(&blob[..]))
+    })
+}
+
 fn account_bytes(account: &KeyPair) -> Uint8Array {
     Uint8Array::from(account.public_key.public_key_bytes().as_slice())
 }
@@ -1010,6 +1095,7 @@ async fn a_second_tab_is_refused_while_the_lease_is_live_then_fences_the_first_o
         .await
         .ok()
         .unwrap();
+    know_peers(&bob_a).await;
     establish(&alice.signal, BOB, bundle_for(&bob_a, true).await).await;
     let (kind, ciphertext) = encrypt(&alice.signal, BOB, b"before").await;
     decrypt(&bob_a, ALICE, &kind, &ciphertext).await;
@@ -1024,7 +1110,13 @@ async fn a_second_tab_is_refused_while_the_lease_is_live_then_fences_the_first_o
         .unwrap();
     let (kind, ciphertext) = encrypt(&alice.signal, BOB, b"after").await;
     rejects_with(
-        bob_a.decrypt(ALICE.into(), 1, kind.clone(), ciphertext.clone()),
+        bob_a.decrypt(
+            ALICE.into(),
+            1,
+            kind.clone(),
+            ciphertext.clone(),
+            device_identity_of_prekey(&kind, &ciphertext),
+        ),
         "fence_lost",
     )
     .await;
@@ -1122,7 +1214,7 @@ async fn pairing_and_input_errors_carry_codes() {
     assert!(get(&error, "status").as_f64().is_some());
     rejects_with(
         bob.signal
-            .decrypt(ALICE.into(), 1, "skmsg".into(), vec![0; 4]),
+            .decrypt(ALICE.into(), 1, "skmsg".into(), vec![0; 4], None),
         "invalid_input",
     )
     .await;
@@ -1948,6 +2040,7 @@ async fn a_failed_open_keeps_the_lease_that_a_concurrent_open_by_the_same_holder
     let bob = started.expect("the concurrent open succeeds");
     let refused = expect_err(h.open("bob-live-lease", "tab-b", 2.0, false).await);
     assert_eq!(code_of(&refused).as_deref(), Some("lease_held"));
+    know_peers(&bob).await;
     establish(&alice.signal, BOB, bundle_for(&bob, true).await).await;
     let (kind, ciphertext) = encrypt(&alice.signal, BOB, b"still live").await;
     assert_eq!(
