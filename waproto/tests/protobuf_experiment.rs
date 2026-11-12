@@ -139,12 +139,12 @@ where
     }
     compare(&combined);
 
-    let mut unknowns = vec![0xa0, 0x06, 0x81, 0];
+    let mut unknowns = vec![0x80, 0xb5, 0x18, 0x81, 0];
     unknowns.extend_from_slice(&combined);
     compare(&unknowns);
     for depth in [1, 99, 100, 101] {
-        let mut input = [0xa3, 6].repeat(depth);
-        input.extend([0xa4, 6].repeat(depth));
+        let mut input = [0x83, 0xb5, 0x18].repeat(depth);
+        input.extend([0x84, 0xb5, 0x18].repeat(depth));
         compare(&input);
     }
     for input in [

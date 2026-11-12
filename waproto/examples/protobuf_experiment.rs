@@ -101,7 +101,7 @@ fn main() {
                     assert!(black_box(candidate::$owned::decode(black_box(&invalid))).is_err());
                 });
                 let mut unknown = input.clone();
-                unknown.extend_from_slice(&[0xa0, 6, 0x81, 0]);
+                unknown.extend_from_slice(&[0x80, 0xb5, 0x18, 0x81, 0]);
                 measure(concat!($name, "/unknown-owned"), iterations, || {
                     #[cfg(feature = "protobuf-experiment-oracle")]
                     black_box(
