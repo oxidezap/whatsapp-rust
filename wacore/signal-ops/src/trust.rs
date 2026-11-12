@@ -236,16 +236,34 @@ impl<S: ServiceStore> SignalOps<S> {
     }
 
     /// Copy `from`'s account pin to `to`'s account in `store` when `to` has
-    /// none. Both name the same account in different address forms.
-    pub(crate) async fn mirror_pin(&self, store: &S, from: &Jid, to: &Jid) -> Result<(), OpsError> {
-        if let Some(pin) = Self::pinned(store, from).await?
-            && Self::pinned(store, to).await?.is_none()
-        {
-            store
-                .insert_aux(Namespace::AccountIdentity, &account_key(to), &pin)
-                .await?;
+    /// none. Both name the same account in different address forms. False
+    /// when `to` is already pinned to another key: a session at `to` must not
+    /// be built from keys that only `from`'s pin vouches for.
+    pub(crate) async fn mirror_pin(
+        &self,
+        store: &S,
+        from: &Jid,
+        to: &Jid,
+    ) -> Result<bool, OpsError> {
+        let Some(pin) = Self::pinned(store, from).await? else {
+            return Ok(true);
+        };
+        match Self::pinned(store, to).await? {
+            Some(existing) => Ok(existing == pin),
+            None => {
+                store
+                    .insert_aux(Namespace::AccountIdentity, &account_key(to), &pin)
+                    .await?;
+                Ok(true)
+            }
         }
-        Ok(())
+    }
+
+    /// Whether `device` is one of this account's own devices, anchored by
+    /// this device's pairing. Before pairing nothing is: a sender that only
+    /// names the stored own phone number or LID proves nothing.
+    pub(crate) async fn is_anchored_own_device(&self, device: &Jid) -> bool {
+        self.own_account(device).await.is_some()
     }
 
     /// Verify a fetch, returning only the bundles that pass. Primary bundles
@@ -354,19 +372,30 @@ impl<S: ServiceStore> SendContextResolver for Verifying<'_, S> {
             .map_err(op_error)?;
         // A session for a PN device is set up at its LID when the mapping is
         // known, and later messages arrive from that LID; pin the account
-        // there too. An existing LID pin is kept.
-        let mut mirrored = std::collections::HashSet::new();
-        for jid in bundles.keys() {
-            if let Some(lid) = self.lids.get(jid.user.as_str())
-                && jid.is_pn()
-                && mirrored.insert(lid.clone())
-            {
-                self.ops
-                    .mirror_pin(&self.store, jid, lid)
+        // there too. An existing LID pin is kept, and when it names another
+        // key the user's bundles are dropped: they verified only against the
+        // PN pin, and the session would be built at the LID.
+        let mut bundles = bundles;
+        let mapped: Vec<Jid> = bundles
+            .keys()
+            .filter(|jid| jid.is_pn() && self.lids.contains_key(jid.user.as_str()))
+            .cloned()
+            .collect();
+        let mut checked = std::collections::HashSet::new();
+        let mut conflicting = std::collections::HashSet::new();
+        for jid in mapped {
+            let lid = &self.lids[jid.user.as_str()];
+            if checked.insert(lid.clone())
+                && !self
+                    .ops
+                    .mirror_pin(&self.store, &jid, lid)
                     .await
-                    .map_err(op_error)?;
+                    .map_err(op_error)?
+            {
+                conflicting.insert(jid.user.clone());
             }
         }
+        bundles.retain(|jid, _| !(jid.is_pn() && conflicting.contains(&jid.user)));
         Ok(PreKeyFetchOutcome { bundles, rejected })
     }
 

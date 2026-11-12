@@ -857,7 +857,7 @@ async fn a_first_send_at_a_mapped_lid_pins_the_account_there_too() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_first_send_at_a_mapped_lid_keeps_an_existing_lid_pin() {
+async fn a_first_send_at_a_mapped_lid_refuses_keys_that_conflict_with_its_pin() {
     let mut rng = rand::make_rng::<rand::rngs::StdRng>();
     let alice = device("alice-mapped-kept", "111:1@s.whatsapp.net").await;
     let bob = device("bob-mapped-kept", "222:1@s.whatsapp.net").await;
@@ -868,11 +868,32 @@ async fn a_first_send_at_a_mapped_lid_keeps_an_existing_lid_pin() {
     let accepted = *accepted.public_key.public_key_bytes();
     alice.trust_account_identity(&lid, accepted).await.unwrap();
 
+    // Bob's PN bundles verify only against the PN pin, but the session would
+    // be built at the LID, where another key was accepted: refused.
     let client = mapped_client(&bob, &account, device_identity).await;
-    alice
+    let sent = alice
         .send_direct(&TokioRuntime, &client, &primary, &text("hi"), "M2")
-        .await
-        .unwrap();
+        .await;
+    for device in [
+        "900222@lid",
+        "900222:1@lid",
+        "222@s.whatsapp.net",
+        "222:1@s.whatsapp.net",
+    ] {
+        let device: Jid = device.parse().unwrap();
+        assert!(
+            !alice
+                .has_session(&device.to_protocol_address())
+                .await
+                .unwrap(),
+            "no session for {device}"
+        );
+    }
+    if let Ok(sent) = sent {
+        let companion: Jid = "222:1@s.whatsapp.net".parse().unwrap();
+        assert!(enc_for(&sent.stanza, &primary).is_none());
+        assert!(enc_for(&sent.stanza, &companion).is_none());
+    }
     assert_eq!(alice.account_identity(&lid).await.unwrap(), Some(accepted));
 }
 
@@ -981,18 +1002,16 @@ async fn an_explicit_trust_waits_for_a_migration_and_is_not_overwritten() {
 
     // The application accepts a new key for the LID while the migration's
     // batch, which copies the old PN key there, is still being written.
-    let trust = {
-        let (alice, lid) = (alice.clone(), lid.clone());
-        tokio::spawn(async move { alice.trust_account_identity(&lid, [2; 32]).await })
-    };
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Polled here, so the attempt has certainly reached the account lock.
+    let trust = alice.trust_account_identity(&lid, [2; 32]);
+    futures::pin_mut!(trust);
     assert!(
-        !trust.is_finished(),
+        futures::poll!(&mut trust).is_pending(),
         "explicit trust waits for the migration"
     );
 
     records.release.notify_one();
     migration.await.unwrap().unwrap();
-    trust.await.unwrap().unwrap();
+    trust.await.unwrap();
     assert_eq!(alice.account_identity(&lid).await.unwrap(), Some([2; 32]));
 }
