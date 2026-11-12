@@ -700,14 +700,15 @@ impl<S: ServiceStore> SignalOps<S> {
         address: &ProtocolAddress,
         bundle: &RemoteBundle,
     ) -> Result<(), OpsError> {
-        let device = address
-            .name()
+        // WhatsApp Signal addresses carry the device in the name (Signal's
+        // device id is always 0) and spell the PN server as legacy `c.us`.
+        let name = address.name();
+        let name = name
+            .strip_suffix("@c.us")
+            .map_or_else(|| name.to_owned(), |user| format!("{user}@s.whatsapp.net"));
+        let device = name
             .parse::<wacore_binary::Jid>()
-            .map_err(|_| OpsError::InvalidInput(format!("{address} is not a device address")))?
-            .with_device(
-                u16::try_from(u32::from(address.device_id()))
-                    .map_err(|_| OpsError::InvalidInput("device id out of range".into()))?,
-            );
+            .map_err(|_| OpsError::InvalidInput(format!("{address} is not a device address")))?;
         let device_identity = bundle.device_identity.as_deref();
         let bundle = bundle.to_prekey_bundle()?;
         self.verify_bundle(staged, &device, &bundle, device_identity, None)
