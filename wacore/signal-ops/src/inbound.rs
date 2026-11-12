@@ -13,7 +13,7 @@ use crate::error::OpsError;
 use crate::ops::{EncKind, ServiceStore, SignalOps, chain_key, session_key};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use wacore::libsignal::protocol::ProtocolAddress;
+use wacore::libsignal::protocol::{ProtocolAddress, SignalProtocolError};
 use wacore::message_processing::{DecryptedMessageResult, process_decrypted_plaintext};
 use wacore_recordstore::Namespace;
 use waproto::whatsapp as wa;
@@ -159,6 +159,13 @@ impl BufferEntry {
     }
 }
 
+fn is_storage_failure(error: &OpsError) -> bool {
+    matches!(
+        error,
+        OpsError::Store(_) | OpsError::Signal(SignalProtocolError::BackendError(..))
+    )
+}
+
 fn classify(
     padded: &[u8],
     padding_version: u8,
@@ -282,10 +289,12 @@ impl<S: ServiceStore> SignalOps<S> {
             // A bad distribution must not block the message carrying it: failing
             // here would discard the ratchet advance, and every redelivery would
             // fail the same way. The client logs and continues the same way.
+            // A storage failure is different: return it uncommitted, so the
+            // redelivery decrypts again and retries installing the key.
             let mut sender_key_rejected = false;
             if let Some(skdm) = &content.skdm
                 && let Some(axolotl) = &skdm.axolotl_sender_key_distribution_message
-                && self
+                && let Err(error) = self
                     .process_sender_key_distribution_into(
                         &staged,
                         request.chat,
@@ -293,8 +302,10 @@ impl<S: ServiceStore> SignalOps<S> {
                         axolotl,
                     )
                     .await
-                    .is_err()
             {
+                if is_storage_failure(&error) {
+                    return Err(error);
+                }
                 sender_key_rejected = true;
             }
 

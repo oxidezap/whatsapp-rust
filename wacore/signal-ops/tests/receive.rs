@@ -8,7 +8,10 @@ use futures::executor::block_on;
 use std::sync::Arc;
 use wacore::libsignal::protocol::{DeviceId, ProtocolAddress};
 use wacore::messages::MessageUtils;
-use wacore_recordstore::{AesGcmSealer, LeaseStore, MemoryRecordStore, RecordSignalStore};
+use wacore_recordstore::{
+    AesGcmSealer, Fence, LeaseStore, MemoryRecordStore, Namespace, RecordSignalStore, RecordStore,
+    WriteOp,
+};
 use wacore_signal_ops::{
     Encrypted, ReceiveKind, ReceiveRequest, Received, ReceivedMessage, RemoteBundle, SignalOps,
 };
@@ -329,5 +332,141 @@ fn a_bad_sender_key_does_not_block_the_message_carrying_it() {
     assert!(
         again.sender_key_rejected,
         "a redelivery must still report the rejected distribution"
+    );
+}
+
+/// Fails the next sender-key read, as a transient backend error would.
+struct FlakySenderKeys {
+    inner: Arc<MemoryRecordStore>,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+impl FlakySenderKeys {
+    fn check(&self, ns: Namespace) -> wacore::store::error::Result<()> {
+        if ns == Namespace::SenderKey && self.fail.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(wacore::store::error::StoreError::Validation(
+                "backend unavailable".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl RecordStore for FlakySenderKeys {
+    async fn get(
+        &self,
+        scope: &str,
+        ns: Namespace,
+        key: &str,
+    ) -> wacore::store::error::Result<Option<Vec<u8>>> {
+        self.check(ns)?;
+        self.inner.get(scope, ns, key).await
+    }
+
+    async fn get_many(
+        &self,
+        scope: &str,
+        ns: Namespace,
+        keys: &[&str],
+    ) -> wacore::store::error::Result<Vec<(String, Vec<u8>)>> {
+        self.check(ns)?;
+        self.inner.get_many(scope, ns, keys).await
+    }
+
+    async fn scan_keys(
+        &self,
+        scope: &str,
+        ns: Namespace,
+        prefix: &str,
+        limit: Option<usize>,
+    ) -> wacore::store::error::Result<Vec<String>> {
+        self.inner.scan_keys(scope, ns, prefix, limit).await
+    }
+
+    async fn write(&self, fence: &Fence, ops: &[WriteOp]) -> wacore::store::error::Result<()> {
+        self.inner.write(fence, ops).await
+    }
+}
+
+#[test]
+fn a_storage_failure_installing_a_sender_key_is_retried_on_redelivery() {
+    let alice = device("alice-flaky");
+    let records = Arc::new(FlakySenderKeys {
+        inner: Arc::new(MemoryRecordStore::new()),
+        fail: std::sync::atomic::AtomicBool::new(false),
+    });
+    let lease = block_on(records.inner.acquire("bob-flaky", "node-a", 0, TTL))
+        .unwrap()
+        .expect("lease available");
+    let bob = block_on(SignalOps::create(Arc::new(RecordSignalStore::new(
+        records.clone(),
+        Arc::new(AesGcmSealer::new(&[9; 32])),
+        lease.fence,
+    ))))
+    .unwrap();
+    let (alice_addr, bob_addr) = (address("111"), address("222"));
+
+    let identity = block_on(bob.public_identity());
+    let prekey = block_on(bob.generate_prekeys(&InlineRuntime, 1))
+        .unwrap()
+        .remove(0);
+    block_on(alice.ops.establish_session(
+        &bob_addr,
+        &RemoteBundle {
+            registration_id: identity.registration_id,
+            device_id: 1,
+            identity_key: identity.identity_key,
+            signed_prekey_id: identity.signed_prekey.id,
+            signed_prekey: identity.signed_prekey.public_key,
+            signed_prekey_signature: identity.signed_prekey.signature,
+            prekey: Some((prekey.id, prekey.public_key)),
+        },
+    ))
+    .unwrap();
+
+    let skdm = block_on(alice.ops.sender_key_distribution(GROUP, &alice_addr)).unwrap();
+    let mut distribution = wa::message::SenderKeyDistributionMessage::default();
+    distribution.group_id = Some(GROUP.to_owned());
+    distribution.axolotl_sender_key_distribution_message = Some(skdm);
+    let mut carrier = wa::Message::default();
+    carrier.sender_key_distribution_message = Some(distribution).into();
+    let sent = block_on(alice.ops.encrypt(&bob_addr, &padded(&carrier))).unwrap();
+    let req = request(GROUP, &alice_addr, kind(&sent), &sent.ciphertext, false);
+
+    records
+        .fail
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        block_on(bob.receive(req)).is_err(),
+        "a storage failure must not commit the message without its key"
+    );
+    let retried = message(block_on(bob.receive(req)).unwrap());
+    assert!(
+        !retried.redelivered,
+        "nothing was buffered by the failed attempt"
+    );
+    assert!(!retried.sender_key_rejected);
+
+    let skmsg = block_on(alice.ops.group_encrypt(
+        GROUP,
+        &alice_addr,
+        &padded(&text("after retry")),
+    ))
+    .unwrap();
+    let group = message(
+        block_on(bob.receive(request(
+            GROUP,
+            &alice_addr,
+            ReceiveKind::SenderKey,
+            &skmsg,
+            false,
+        )))
+        .unwrap(),
+    );
+    assert_eq!(
+        group.content.message.conversation.as_deref(),
+        Some("after retry")
     );
 }
