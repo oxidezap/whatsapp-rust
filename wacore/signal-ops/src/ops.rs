@@ -706,9 +706,15 @@ impl<S: ServiceStore> SignalOps<S> {
         let name = name
             .strip_suffix("@c.us")
             .map_or_else(|| name.to_owned(), |user| format!("{user}@s.whatsapp.net"));
-        let device = name
+        let mut device = name
             .parse::<wacore_binary::Jid>()
             .map_err(|_| OpsError::InvalidInput(format!("{address} is not a device address")))?;
+        // A plain libsignal address keeps the device in its device id instead.
+        let device_id = u16::try_from(u32::from(address.device_id()))
+            .map_err(|_| OpsError::InvalidInput("device id out of range".into()))?;
+        if device.device == 0 && device_id != 0 {
+            device = device.with_device(device_id);
+        }
         let device_identity = bundle.device_identity.as_deref();
         let bundle = bundle.to_prekey_bundle()?;
         self.verify_bundle(staged, &device, &bundle, device_identity, None)
