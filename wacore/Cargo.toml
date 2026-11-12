@@ -63,7 +63,6 @@ async-lock = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bon = { workspace = true }
-buffa = { workspace = true }
 bytes = { workspace = true }
 # Media upload/download run AES-256-CBC incrementally over a stream, which the
 # mode's own batch loop does with the chaining block in a register.
@@ -108,7 +107,6 @@ waproto = { workspace = true }
 zerocopy = { workspace = true, optional = true }
 
 [build-dependencies]
-buffa-build = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]

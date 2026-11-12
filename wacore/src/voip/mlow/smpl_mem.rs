@@ -71,7 +71,7 @@ const NUM_CONTOURS: usize = 217;
 /// every address the consumer reads.
 fn build_smpl_mem() -> SmplMem {
     let seed: super::smpl_pitch_seed::PitchSeed =
-        super::smpl_tables_blob::load_blob_buffa(include_bytes!("testdata/pitch_seed.bin"));
+        super::smpl_tables_blob::load_blob(include_bytes!("testdata/pitch_seed.bin"));
     let w = seed.build_contour_window();
 
     let mut regions = Vec::with_capacity(6);

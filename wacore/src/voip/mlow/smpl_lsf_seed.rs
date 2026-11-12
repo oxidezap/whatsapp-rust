@@ -565,7 +565,7 @@ static LSF_BUILT: OnceLock<LsfBuilt> = OnceLock::new();
 pub(crate) fn lsf_built() -> &'static LsfBuilt {
     LSF_BUILT.get_or_init(|| {
         let seed: LsfSeed =
-            super::smpl_tables_blob::load_blob_buffa(include_bytes!("testdata/lsf_seed.bin"));
+            super::smpl_tables_blob::load_blob(include_bytes!("testdata/lsf_seed.bin"));
         seed.build()
     })
 }
@@ -718,9 +718,8 @@ mod tests {
     /// computed synth tables from the seed fields they're derived from.
     #[test]
     fn lsf_seed_grid16_derivation() {
-        let seed: LsfSeed = super::super::smpl_tables_blob::load_blob_buffa(include_bytes!(
-            "testdata/lsf_seed.bin"
-        ));
+        let seed: LsfSeed =
+            super::super::smpl_tables_blob::load_blob(include_bytes!("testdata/lsf_seed.bin"));
         let nested = seed.reshape();
         let synth = &seed.build().synth;
 

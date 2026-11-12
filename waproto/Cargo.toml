@@ -43,6 +43,10 @@ required-features = ["protobuf-experiment"]
 name = "protobuf_owned_view_cost"
 required-features = ["protobuf-experiment"]
 
+[[example]]
+name = "protobuf_codegen"
+required-features = ["protobuf-experiment"]
+
 [dependencies]
 buffa = { workspace = true }
 bytes = { workspace = true }
@@ -64,6 +68,7 @@ quote = "1"
 prettyplease = "0.3"
 
 [dev-dependencies]
+sha2 = { workspace = true }
 buffa-build = { workspace = true }
 buffa-descriptor = { workspace = true }
 heck = { workspace = true }

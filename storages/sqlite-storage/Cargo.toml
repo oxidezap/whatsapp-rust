@@ -32,7 +32,6 @@ wasm-test = ["js"]
 
 [dependencies]
 async-trait = { workspace = true }
-buffa = { workspace = true }
 bytes = { workspace = true }
 diesel = { workspace = true }
 diesel_migrations = { workspace = true }
@@ -47,14 +46,13 @@ tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
 thiserror = { workspace = true }
 wacore = { workspace = true }
 wacore-binary = { workspace = true }
+waproto = { workspace = true }
 
 [build-dependencies]
-buffa-build = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
 divan = { workspace = true }
-waproto = { workspace = true }
 portable-atomic = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

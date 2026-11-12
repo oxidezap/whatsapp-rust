@@ -132,7 +132,19 @@ impl Emitter<'_> {
             FieldShape::Singular {
                 value: ValueType::Message(id, _),
                 ..
-            } => format!("{RT}::MessageField<{}>", self.message_path(id)),
+            } => {
+                let path = format!(
+                    "{}.{}",
+                    self.schema.message(field.owner).full_name,
+                    field.name
+                );
+                let message = self.message_path(id);
+                if crate::policy::INLINE_MESSAGE_FIELDS.contains(&path.as_str()) {
+                    format!("{RT}::MessageField<{message},{RT}::Inline<{message}>>")
+                } else {
+                    format!("{RT}::MessageField<{message}>")
+                }
+            }
             FieldShape::Singular {
                 value,
                 presence: Presence::Explicit,
@@ -908,6 +920,49 @@ pub fn generate(schema: &Schema, base: &str) -> Result<String, syn::Error> {
 }
 
 pub fn generate_raw(schema: &Schema, base: &str) -> String {
+    generate_raw_models(schema, base, true)
+}
+
+pub fn generate_private_owned(
+    schema: &Schema,
+    base: &str,
+    runtime: &str,
+) -> Result<String, syn::Error> {
+    use syn::visit_mut::VisitMut as _;
+    let _: syn::Path = syn::parse_str(runtime)?;
+    let source = generate_private_owned_raw(schema, base, runtime);
+    let mut parsed = syn::parse_file(&source)?;
+    struct BinaryOnly;
+    impl syn::visit_mut::VisitMut for BinaryOnly {
+        fn visit_attributes_mut(&mut self, attributes: &mut Vec<syn::Attribute>) {
+            attributes.retain(|attribute| {
+                !attribute.path().is_ident("serde") && !attribute.path().is_ident("cfg_attr")
+            });
+            for attribute in attributes {
+                if attribute.path().is_ident("derive") {
+                    let mut paths = attribute.parse_args_with(syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated).expect("emitted derives parse");
+                    paths = paths
+                        .into_iter()
+                        .filter(|path| {
+                            !path.segments.first().is_some_and(|segment| {
+                                segment.ident == "serde" || segment.ident == "serde_repr"
+                            })
+                        })
+                        .collect();
+                    attribute.meta = syn::parse_quote!(derive(#paths));
+                }
+            }
+        }
+    }
+    BinaryOnly.visit_file_mut(&mut parsed);
+    Ok(prettyplease::unparse(&parsed))
+}
+
+pub fn generate_private_owned_raw(schema: &Schema, base: &str, runtime: &str) -> String {
+    generate_raw_models(schema, base, false).replace(RT, &format!(" {runtime}"))
+}
+
+fn generate_raw_models(schema: &Schema, base: &str, views: bool) -> String {
     let emitter = Emitter { schema, base };
     let mut root = Module::default();
     for enumeration in &schema.enumerations {
@@ -922,16 +977,20 @@ pub fn generate_raw(schema: &Schema, base: &str) -> String {
         root.at(&emitter.scope(message.parent))
             .items
             .push_str(&emitter.message_source(message));
-        root.at(&emitter.scope(message.parent))
-            .items
-            .push_str(&emitter.view_source(message, MessageId(index)));
+        if views {
+            root.at(&emitter.scope(message.parent))
+                .items
+                .push_str(&emitter.view_source(message, MessageId(index)));
+        }
         for id in &message.oneofs {
             root.at(&emitter.scope(Some(MessageId(index))))
                 .items
                 .push_str(&emitter.oneof_source(schema.oneof(*id)));
-            root.at(&emitter.scope(Some(MessageId(index))))
-                .items
-                .push_str(&emitter.view_oneof_source(schema.oneof(*id), *id));
+            if views {
+                root.at(&emitter.scope(Some(MessageId(index))))
+                    .items
+                    .push_str(&emitter.view_oneof_source(schema.oneof(*id), *id));
+            }
         }
     }
     let mut source = String::new();

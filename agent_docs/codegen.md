@@ -59,8 +59,13 @@ shape, and both owned and view decoders dispatch on number and wire type. Keep
 the frozen API snapshot unchanged; do not generalize this exception to unrelated
 field collisions.
 
-`waproto` uses buffa/buffa-build. Use `cargo xt proto-desc`, `tables-desc` and
-`wire-desc` for descriptors and hash sidecars; `cargo xt --help` lists tooling.
+`waproto` emits its specialized codecs from the descriptor. Buffa remains the
+temporary descriptor adapter and differential reference. Use `cargo xt proto-desc`,
+`tables-desc` and `wire-desc` for descriptors and hash sidecars. MLow and SQLite
+use committed private codecs with no views or Serde implementations. Their
+descriptor tasks also regenerate these codecs. `cargo xt proto-codecs --check`
+verifies deterministic regeneration; build scripts check descriptor and source
+hashes. `cargo xt --help` lists tooling.
 Host tooling must not become a published runtime dependency. Task implementations
 belong in Rust, not new Bash/Python scripts.
 
@@ -88,7 +93,7 @@ The generated boundary covers six protobuf methods and the decoded SET method.
 The batch recipe preserves separate SET/REMOVE identities and exposes diagnostic
 hooks for Patch/Snapshot/Local. Its conformance fixtures qualify the ordered
 methods against the official Web snapshot; protobuf decoding is stubbed in that
-oracle and native adapter tests exercise the real buffa decoder separately.
+oracle and native adapter tests exercise the real protobuf decoder separately.
 `wacore::appstate_sync` validates wire protobufs before downloading or mutating
 collection state. Crypto, persistence, recovery, and the existing processor's
 post-decryption batch integration remain handwritten. The public batch/SET APIs

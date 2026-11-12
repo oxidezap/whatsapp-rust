@@ -5650,8 +5650,6 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "bon",
- "buffa",
- "buffa-build",
  "bytes",
  "cbc",
  "chrono",
@@ -6307,8 +6305,6 @@ name = "whatsapp-rust-sqlite-storage"
 version = "0.7.0"
 dependencies = [
  "async-trait",
- "buffa",
- "buffa-build",
  "bytes",
  "codspeed-divan-compat",
  "diesel",

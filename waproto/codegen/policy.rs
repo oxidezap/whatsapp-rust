@@ -16,3 +16,8 @@ pub const SHARED_BYTES_MESSAGES: &[&str] = &[
     ".whatsapp.SenderKeyStateStructure.SenderMessageKey",
     ".whatsapp.SenderKeyStateStructure.SenderSigningKey",
 ];
+
+pub const INLINE_MESSAGE_FIELDS: &[&str] = &[
+    ".wire.ServerCertChain.intermediate",
+    ".wire.ServerCertChain.leaf",
+];

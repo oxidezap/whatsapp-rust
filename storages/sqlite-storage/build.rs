@@ -1,8 +1,6 @@
-//! Generates Rust types for the on-disk wire format (`src/wire.rs` consumes
-//! them) from the committed descriptor `proto/wire.desc`, compiled once from
-//! `proto/wire.proto`. Reading the descriptor means consumers never need
-//! `protoc`; editing the proto requires regenerating the descriptor via
-//! `cargo xt wire-desc`.
+//! Checks the committed storage schema, descriptor and static codec hashes.
+//! Consumers need no generator or protoc. Schema changes regenerate both the
+//! descriptor and codec with `cargo xt wire-desc`.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto/wire.desc");
@@ -18,14 +16,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "cargo xt wire-desc",
     )?;
 
-    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR must be set by cargo");
+    ensure_generated_fresh(
+        "proto/wire.desc",
+        "src/wire.generated.rs",
+        "src/wire.generated.rs.sha256",
+    )?;
+    Ok(())
+}
 
-    buffa_build::Config::new()
-        .descriptor_set("proto/wire.desc")
-        .files(&["wire.proto"])
-        .preserve_unknown_fields(false)
-        .out_dir(&out_dir)
-        .compile()
+fn ensure_generated_fresh(descriptor: &str, source: &str, manifest: &str) -> std::io::Result<()> {
+    use sha2::{Digest as _, Sha256};
+    println!("cargo:rerun-if-changed={source}");
+    println!("cargo:rerun-if-changed={manifest}");
+    let manifest = std::fs::read_to_string(manifest)?;
+    for (kind, path) in [("descriptor", descriptor), ("rust", source)] {
+        let expected = manifest
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{kind} ")));
+        let digest: String = Sha256::digest(std::fs::read(path)?)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        if expected != Some(digest.as_str()) {
+            return Err(std::io::Error::other(format!(
+                "{path} has stale generated protobuf code. Run `cargo xt proto-codecs`."
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Fail the build if the committed `.desc` no longer matches its `.proto` (proto

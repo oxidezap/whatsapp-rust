@@ -305,7 +305,7 @@ static TABLES: OnceLock<CcTables> = OnceLock::new();
 pub(crate) fn load_cc_tables() -> &'static CcTables {
     TABLES.get_or_init(|| {
         let seed: CcSeed =
-            super::smpl_tables_blob::load_blob_buffa(include_bytes!("testdata/cc_seed.bin"));
+            super::smpl_tables_blob::load_blob(include_bytes!("testdata/cc_seed.bin"));
         seed.build()
     })
 }
