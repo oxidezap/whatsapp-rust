@@ -5880,6 +5880,7 @@ dependencies = [
  "js-sys",
  "rand 0.10.3",
  "send_wrapper",
+ "serde",
  "sha2 0.11.1",
  "wacore",
  "wacore-binary",

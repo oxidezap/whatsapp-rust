@@ -2571,6 +2571,72 @@ async fn a_nested_device_sent_wrapper_does_not_surface_app_state_keys() {
         !contains_run(&message, &share),
         "no wrapper layer may carry key material"
     );
+    assert_eq!(get(&received, "contentWithheld"), JsValue::FALSE);
+}
+
+/// A protocol message carrying an app-state key share, and the share.
+fn key_share_protocol() -> (Vec<u8>, Vec<u8>) {
+    let share = field(
+        1,
+        &[field(1, &field(1, &[5; 32])), field(2, &field(1, &[6; 32]))].concat(),
+    );
+    let protocol = field(12, &[varint(2 * 8), vec![6], field(7, &share)].concat());
+    (protocol, share)
+}
+
+async fn receive_own(scope: &str, plaintext: &[u8]) -> JsValue {
+    let bob = device(&format!("bob-{scope}")).await;
+    let alice = own_sibling(&bob, &format!("alice-{scope}")).await;
+    establish(&alice.signal, BOB, bundle_for(&bob.signal, true).await).await;
+    let (kind, ciphertext) = encrypt(&alice.signal, BOB, &pad(plaintext)).await;
+    receive_from(
+        &bob.signal,
+        BOB_SIBLING,
+        ALICE,
+        &kind,
+        &ciphertext,
+        2,
+        true,
+        Some(JsValue::TRUE),
+    )
+    .await
+    .ok()
+    .unwrap()
+}
+
+#[wasm_bindgen_test]
+async fn key_material_in_another_wrapper_withholds_the_content() {
+    let (protocol, share) = key_share_protocol();
+    // Message.ephemeralMessage is field 40; FutureProofMessage holds a
+    // Message in field 1.
+    let wrapped = [conversation("outer"), field(40, &field(1, &protocol))].concat();
+    let received = receive_own("ephemeral-share", &wrapped).await;
+    assert_eq!(get(&received, "contentWithheld"), JsValue::TRUE);
+    let message = bytes_of(&get(&received, "message"));
+    assert!(message.is_empty());
+    assert!(!contains_run(&message, &share));
+}
+
+#[wasm_bindgen_test]
+async fn key_material_in_a_quoted_message_withholds_the_content() {
+    let (protocol, _) = key_share_protocol();
+    // extendedTextMessage (6) → contextInfo (17) → quotedMessage (3).
+    let text = [field(1, b"reply"), field(17, &field(3, &protocol))].concat();
+    let received = receive_own("quoted-share", &field(6, &text)).await;
+    assert_eq!(get(&received, "contentWithheld"), JsValue::TRUE);
+    assert!(bytes_of(&get(&received, "message")).is_empty());
+}
+
+#[wasm_bindgen_test]
+async fn a_quoted_message_without_key_material_is_returned() {
+    let quoted = conversation("the original");
+    let text = [field(1, b"reply"), field(17, &field(3, &quoted))].concat();
+    let received = receive_own("quoted-plain", &field(6, &text)).await;
+    assert_eq!(get(&received, "contentWithheld"), JsValue::FALSE);
+    assert!(contains_run(
+        &bytes_of(&get(&received, "message")),
+        b"the original"
+    ));
 }
 
 #[wasm_bindgen_test]

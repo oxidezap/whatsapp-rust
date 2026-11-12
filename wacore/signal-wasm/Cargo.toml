@@ -20,6 +20,7 @@ async-trait = { workspace = true }
 buffa = { workspace = true }
 js-sys = "0.3.105"
 send_wrapper = "0.6"
+serde = { workspace = true }
 wacore = { workspace = true }
 wacore-binary = { workspace = true }
 wacore-recordstore = { path = "../recordstore" }
