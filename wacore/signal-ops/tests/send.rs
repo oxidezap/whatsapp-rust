@@ -299,6 +299,16 @@ async fn receive_group_component(
     .await
 }
 
+/// The `<device-identity>` a stanza carries for its prekey messages.
+fn stanza_device_identity(stanza: &[u8]) -> Option<Vec<u8>> {
+    let node = parse(stanza);
+    let identity = node.get_optional_child("device-identity")?;
+    match &identity.content {
+        Some(NodeContent::Bytes(bytes)) => Some(bytes.clone()),
+        _ => None,
+    }
+}
+
 fn parse(stanza: &[u8]) -> wacore_binary::Node {
     wacore_binary::marshal::unmarshal_packed_ref(stanza)
         .unwrap()
@@ -612,9 +622,16 @@ async fn a_send_waiting_on_devices_cannot_give_a_removed_member_the_replacement_
         .await,
     );
     let bob = device("bob-removal-race", &bob_jid.to_string()).await;
-    let alice_identity = common::vouch(&bob, &*alice, "111:1@s.whatsapp.net").await;
     let carol = device("carol-removal-race", &carol_jid.to_string()).await;
-    let alice_identity_carol = common::vouch(&carol, &*alice, "111:1@s.whatsapp.net").await;
+    // Pair Alice once; both recipients pin that one account.
+    let alice_paired = common::pair(&*alice).await;
+    for peer in [&bob, &carol] {
+        peer.trust_account_identity(&alice_jid, alice_paired.account)
+            .await
+            .unwrap();
+    }
+    let alice_identity = alice_paired.device_identity.clone();
+    let alice_identity_carol = alice_paired.device_identity.clone();
     let client = Arc::new(ChangingGroupClient::new(
         FakeClient {
             devices: vec![alice_jid.clone(), bob_jid.clone(), carol_jid.clone()],
@@ -640,6 +657,11 @@ async fn a_send_waiting_on_devices_cannot_give_a_removed_member_the_replacement_
         )
         .await
         .unwrap();
+    // The receivers verify with the identity the stanza actually carries.
+    assert_eq!(
+        stanza_device_identity(&first.stanza).as_deref(),
+        Some(alice_identity.as_slice())
+    );
     receive_group_component(
         &bob,
         &group,
@@ -923,14 +945,18 @@ async fn a_retry_receipt_gets_the_message_re_encrypted() {
     let bob_jid: Jid = "222:1@s.whatsapp.net".parse().unwrap();
     let alice = device("alice-retry", "111:1@s.whatsapp.net").await;
     // A retry pkmsg must carry the device identity, which pairing provides.
-    common::pair(&alice).await;
+    // Alice is paired once, and Bob pins that account.
+    let alice_paired = common::pair(&alice).await;
     let bob = device("bob-retry", "222:1@s.whatsapp.net").await;
     let bob_paired = common::pair(&bob).await;
     alice
         .trust_account_identity(&bob_jid, bob_paired.account)
         .await
         .unwrap();
-    let alice_identity = common::vouch(&bob, &alice, "111:1@s.whatsapp.net").await;
+    bob.trust_account_identity(&alice_jid, alice_paired.account)
+        .await
+        .unwrap();
+    let alice_identity = alice_paired.device_identity.clone();
     let client = FakeClient {
         devices: vec![bob_jid.clone()],
         bundles: HashMap::from([(bob_jid.clone(), bundle_for(&bob).await)]),
