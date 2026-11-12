@@ -5807,6 +5807,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "wacore-recordstore"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "async-lock",
+ "async-trait",
+ "bytes",
+ "futures",
+ "rand 0.10.3",
+ "thiserror 2.0.21",
+ "wacore",
+]
+
+[[package]]
 name = "wait-timeout"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
