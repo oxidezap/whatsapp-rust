@@ -108,6 +108,12 @@ pub async fn prepare_group_stanza(
 /// Prepare a group send with optional frozen device-to-Signal addresses.
 /// When supplied, the map must cover every distribution target; missing
 /// entries fail rather than looking up a mapping outside the caller's locks.
+///
+/// A mapped LID address is preferred, but an existing session at the
+/// device's own PN address is still used when the LID has none, as in
+/// [`ensure_sessions_for_devices_resolved`]. A caller that serializes session
+/// access itself must therefore hold the locks of both the device address and
+/// its mapped address for the whole call.
 #[cfg_attr(
     feature = "tracing",
     tracing::instrument(name = "wa.send.group_prepare", level = "debug", skip_all, err(Debug))
