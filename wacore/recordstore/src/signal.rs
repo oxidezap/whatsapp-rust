@@ -341,7 +341,16 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
                         };
                         ((ns, key), change)
                     }
-                    PlainOp::Insert(ns, key, v) => ((ns, key), Staged::Insert(v)),
+                    PlainOp::Insert(ns, key, v) => {
+                        // Deleting a stored key and inserting it again in one
+                        // view replaces it: the commit must not demand the
+                        // key's absence, since the delete is never sent.
+                        let change = match overlay.get(&(ns, key.clone())) {
+                            Some(Staged::Delete) => Staged::Put(v),
+                            _ => Staged::Insert(v),
+                        };
+                        ((ns, key), change)
+                    }
                     PlainOp::Update(ns, key, v) => {
                         // Updating a key this view already wrote keeps it a Put.
                         let staged = match overlay.get(&(ns, key.clone())) {
@@ -1269,6 +1278,20 @@ mod tests {
         );
         block_on(store.remove_signed_prekey(2)).unwrap();
         assert_eq!(block_on(store.load_signed_prekey(2)).unwrap(), None);
+    }
+
+    #[test]
+    fn deleting_and_reinserting_a_stored_key_in_one_view_replaces_it() {
+        let (_, store) = setup();
+        block_on(store.put_aux(Namespace::SentMessage, "k", b"old")).unwrap();
+        let staged = store.staged();
+        block_on(staged.delete_aux(Namespace::SentMessage, &["k"])).unwrap();
+        block_on(staged.insert_aux(Namespace::SentMessage, "k", b"new")).unwrap();
+        block_on(staged.commit()).unwrap();
+        assert_eq!(
+            block_on(store.load_aux(Namespace::SentMessage, "k")).unwrap(),
+            Some(b"new".to_vec())
+        );
     }
 
     #[test]
