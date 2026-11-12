@@ -317,9 +317,10 @@ fn only_own_devices_can_hand_over_app_state_keys() {
         Err(wacore_signal_ops::OpsError::InvalidInput(_))
     ));
 
+    block_on(bob.ops.set_own_jids("222:1@s.whatsapp.net", None)).unwrap();
+
     // Bob's own second device, paired under Bob's account, may hand it over.
     let account = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
-    block_on(bob.ops.set_own_jids("222:1@s.whatsapp.net", None)).unwrap();
     let bob_identity = block_on(common::pair_under(&bob.ops, &account));
     let second = device("bob-keys-second");
     block_on(second.ops.set_own_jids("222:2@s.whatsapp.net", None)).unwrap();
@@ -357,6 +358,60 @@ fn only_own_devices_can_hand_over_app_state_keys() {
         .unwrap(),
     );
     assert!(own.app_state_key_share.is_some());
+}
+
+#[test]
+fn an_unpaired_account_takes_no_app_state_keys_from_its_own_number() {
+    let bob = device("bob-unpaired-keys");
+    let mut protocol = wa::message::ProtocolMessage::default();
+    protocol.app_state_sync_key_share = Some(wa::message::AppStateSyncKeyShare::default()).into();
+    let mut share = wa::Message::default();
+    share.protocol_message = Some(protocol).into();
+    let chat = "222@s.whatsapp.net".to_owned();
+    // Before pairing, a sender that only names Bob's own number proves
+    // nothing: another device poses as Bob's primary.
+    block_on(bob.ops.set_own_jids("222:1@s.whatsapp.net", None)).unwrap();
+    let poser = device("bob-keys-poser");
+    let own_primary = ProtocolAddress::new("222@s.whatsapp.net", DeviceId::from(0));
+    let bob_public = block_on(bob.ops.public_identity());
+    let bob_prekey = block_on(bob.ops.generate_prekeys(&InlineRuntime, 1))
+        .unwrap()
+        .remove(0);
+    // The poser addresses Bob as a primary, which needs no device identity.
+    let bob_primary = ProtocolAddress::new("222@s.whatsapp.net", DeviceId::from(0));
+    block_on(poser.ops.establish_session(
+        &bob_primary,
+        &RemoteBundle {
+            registration_id: bob_public.registration_id,
+            device_id: 0,
+            identity_key: bob_public.identity_key,
+            signed_prekey_id: bob_public.signed_prekey.id,
+            signed_prekey: bob_public.signed_prekey.public_key,
+            signed_prekey_signature: bob_public.signed_prekey.signature,
+            prekey: Some((bob_prekey.id, bob_prekey.public_key)),
+            device_identity: None,
+        },
+    ))
+    .unwrap();
+    let posed = block_on(poser.ops.encrypt(&bob_primary, &padded(&share))).unwrap();
+    let posed_request = |is_from_me| ReceiveRequest {
+        chat: &chat,
+        sender: &own_primary,
+        kind: kind(&posed),
+        ciphertext: &posed.ciphertext,
+        padding_version: 2,
+        is_from_me,
+        device_identity: None,
+    };
+    assert!(matches!(
+        block_on(bob.ops.receive(posed_request(true))),
+        Err(wacore_signal_ops::OpsError::InvalidInput(_))
+    ));
+    let posed = message(block_on(bob.ops.receive(posed_request(false))).unwrap());
+    assert!(
+        posed.app_state_key_share.is_none(),
+        "an unpaired account has no own devices to take keys from"
+    );
 }
 
 #[test]

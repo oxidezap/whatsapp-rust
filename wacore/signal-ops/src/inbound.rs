@@ -230,14 +230,16 @@ impl<S: ServiceStore> SignalOps<S> {
             ],
         };
         // `is_from_me` gates app-state key shares, so it is derived from the
-        // sender and this account's stored JIDs; a client claim the sender
-        // does not support is refused rather than believed.
+        // sender, this account's stored JIDs and its pairing; a client claim
+        // the sender does not support is refused rather than believed. Until
+        // pairing anchors the account, no sender counts as an own device.
         let from_me = self
-            .is_own_account(&crate::trust::device_of(request.sender)?)
+            .is_anchored_own_device(&crate::trust::device_of(request.sender)?)
             .await;
         if request.is_from_me && !from_me {
             return Err(OpsError::InvalidInput(
-                "is_from_me is set, but the sender is not one of this account's devices".into(),
+                "is_from_me is set, but the sender is not one of this paired account's devices"
+                    .into(),
             ));
         }
         let held = self.lock_keys(keys).await?;
