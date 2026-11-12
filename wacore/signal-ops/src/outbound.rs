@@ -7,8 +7,8 @@
 //! builder pads it, adds own-device copies and encrypts it per device. The
 //! WhatsApp client only answers device-list and prekey queries through the
 //! [`SendContextResolver`] and transmits the finished stanza, so it never
-//! handles the plaintext. It does decide which devices and keys a message is
-//! encrypted to; see the crate's trust boundary. Session changes and the sent-message record commit before
+//! handles the plaintext. The prekey bundles it supplies are verified before
+//! use; see the crate's trust boundary. Session changes and the sent-message record commit before
 //! the stanza is returned, matching wacore's rule that Signal state is durable
 //! before ciphertext is published.
 

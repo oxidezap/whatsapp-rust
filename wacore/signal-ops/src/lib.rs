@@ -16,16 +16,19 @@
 //! operations. The client never holds them, and a client that only relays
 //! ciphertext learns nothing more than it would as a transport.
 //!
-//! The client is still trusted for who a message goes to. Device lists,
-//! prekey bundles, PN/LID mappings and group membership all come from the
-//! [`wacore::client::context::SendContextResolver`] or from the retry
-//! receipt, and identity keys are accepted on first use or change, as WA
-//! Web does. These operations do not verify a bundle against the peer
-//! account's signed device identity. A client that lies about devices or
-//! keys can therefore have new messages, and retries of messages still kept
-//! by [`SignalOps::sent_message`], encrypted to keys it controls. Prune sent
-//! messages ([`SignalOps::prune_sent_messages`]) to bound what a retry can
-//! reach.
+//! Prekey bundles come from the client too, so none is used until it is
+//! bound to the peer account (see [`SignalResolver`] and [`BundleRejection`]):
+//! a primary device's identity is pinned on first use and a change needs
+//! [`SignalOps::trust_account_identity`] from the application; a companion
+//! must carry an ADV device identity that verifies against the pinned key.
+//! This applies to sends, retries and [`SignalOps::establish_session`].
+//!
+//! The client is still trusted for which of an account's verified devices
+//! and which accounts a message goes to: device lists, PN/LID mappings and
+//! group membership come from it, and a pin is taken on first use. Device
+//! revocation is not checked against the account's signed key-index list.
+//! Prune sent messages ([`SignalOps::prune_sent_messages`]) to bound what a
+//! retry can reach.
 //!
 //! Message padding is the caller's concern: [`SignalOps::decrypt`] returns
 //! libsignal's plaintext exactly as received and [`SignalOps::encrypt`] takes

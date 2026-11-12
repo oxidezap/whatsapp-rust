@@ -35,7 +35,7 @@ pub enum OpsError {
     #[error("send failed: {0}")]
     Send(String),
     /// A peer's prekey bundle did not verify against its pinned account
-    /// identity; see [`crate::trust`].
+    /// identity; see [`crate::BundleRejection`].
     #[error("prekey bundle refused: {0}")]
     BundleRefused(crate::trust::BundleRejection),
     /// The scope has no device keys yet; call `SignalOps::create`.

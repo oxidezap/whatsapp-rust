@@ -173,7 +173,7 @@ pub struct RemoteBundle {
     pub signed_prekey_signature: [u8; 64],
     pub prekey: Option<(u32, [u8; 32])>,
     /// The `<device-identity>` (`ADVSignedDeviceIdentity` bytes) the bundle
-    /// came with. Required for companion devices; see [`crate::trust`].
+    /// came with. Required for companion devices; see [`crate::SignalResolver`].
     pub device_identity: Option<Vec<u8>>,
 }
 
