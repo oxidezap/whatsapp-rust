@@ -32,7 +32,7 @@ fn main() {
     // Fix the decision rule before collecting results. The report retains
     // every scenario and marks unstable measurements inconclusive.
     let repetitions = 9;
-    let iterations = 200_000;
+    let iterations = 2_000_000;
     for repeat in 0..repetitions {
         for index in if repeat % 2 == 0 { [0, 1] } else { [1, 0] } {
             let raw = output(Command::new(&args[index + 1]).arg(iterations.to_string()));
@@ -91,7 +91,7 @@ fn main() {
         "candidate_bytes": std::fs::metadata(&args[2]).expect("candidate size").len(),
         "profile": "release, workspace defaults",
         "allocator": "system, no custom allocator",
-        "warmup_iterations": 1000,
+        "warmup_iterations": 10_000,
         "iterations": iterations,
         "repetitions": repetitions,
         "noise_mad_fraction_limit": 0.03,

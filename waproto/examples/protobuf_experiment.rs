@@ -12,7 +12,7 @@ use waproto::buffa::{Message as _, MessageView as _};
 
 #[allow(clippy::disallowed_methods)]
 fn measure(name: &str, iterations: u64, mut run: impl FnMut()) {
-    for _ in 0..1000 {
+    for _ in 0..10_000 {
         run();
     }
     let start = Instant::now();
