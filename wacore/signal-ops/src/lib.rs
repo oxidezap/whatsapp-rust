@@ -54,6 +54,7 @@ mod inbound;
 mod ops;
 mod outbound;
 mod stores;
+mod trust;
 
 pub use device::{DeviceKeys, PublicIdentity, PublicPreKey, PublicSignedPreKey};
 pub use error::OpsError;
@@ -63,3 +64,4 @@ pub use ops::{
     ServiceStore, SignalOps,
 };
 pub use outbound::{PreparedGroupSend, PreparedSend, RetryRequest, RetryRoute};
+pub use trust::{BundleRejection, FetchedBundle, SignalResolver, VerifiablePrekeys};

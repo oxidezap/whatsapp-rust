@@ -51,9 +51,23 @@ pub fn pair_success_container(
     (container, account)
 }
 
+/// A paired device as its peers see it: the account key that signed it, and
+/// the `<device-identity>` its prekey bundles carry.
+pub struct Paired {
+    pub account: [u8; 32],
+    pub device_identity: Vec<u8>,
+}
+
 /// Pair `ops` the way a real primary would, so it holds an account identity.
-pub async fn pair<S: wacore_signal_ops::ServiceStore>(ops: &wacore_signal_ops::SignalOps<S>) {
+pub async fn pair<S: wacore_signal_ops::ServiceStore>(
+    ops: &wacore_signal_ops::SignalOps<S>,
+) -> Paired {
     let identity = ops.public_identity().await;
-    let (container, _) = pair_success_container(identity.identity_key, &identity.adv_secret, 1);
-    ops.sign_pairing(&container).await.unwrap();
+    let (container, account) =
+        pair_success_container(identity.identity_key, &identity.adv_secret, 1);
+    let signed = ops.sign_pairing(&container).await.unwrap();
+    Paired {
+        account: *account.public_key.public_key_bytes(),
+        device_identity: signed.signed_identity,
+    }
 }

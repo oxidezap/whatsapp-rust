@@ -34,6 +34,10 @@ pub enum OpsError {
     /// prekey fetch) failures reported by the WhatsApp client.
     #[error("send failed: {0}")]
     Send(String),
+    /// A peer's prekey bundle did not verify against its pinned account
+    /// identity; see [`crate::trust`].
+    #[error("prekey bundle refused: {0}")]
+    BundleRefused(crate::trust::BundleRejection),
     /// The scope has no device keys yet; call `SignalOps::create`.
     #[error("device keys are not initialised for this scope")]
     NotInitialised,

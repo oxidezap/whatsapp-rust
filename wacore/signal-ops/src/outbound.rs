@@ -15,6 +15,7 @@
 use crate::error::OpsError;
 use crate::ops::RemoteBundle;
 use crate::ops::{ServiceStore, SignalOps, chain_key, group_key, session_key};
+use crate::trust::{SignalResolver, Verifying};
 use std::collections::HashSet;
 use wacore::client::context::{GroupRoutingInfo, SendContextResolver};
 use wacore::libsignal::protocol::{UsePQRatchet, process_prekey_bundle};
@@ -335,7 +336,7 @@ impl<S: ServiceStore> SignalOps<S> {
     pub async fn send_direct(
         &self,
         runtime: &dyn Runtime,
-        resolver: &dyn SendContextResolver,
+        resolver: &dyn SignalResolver,
         to: &Jid,
         message: &wa::Message,
         message_id: &str,
@@ -388,10 +389,15 @@ impl<S: ServiceStore> SignalOps<S> {
                 prekey_store: &mut prekeys,
                 signed_prekey_store: &signed_prekeys,
             };
+            let verifying = Verifying {
+                ops: self,
+                inner: resolver,
+                store: staged.clone(),
+            };
             let prepared = prepare_dm_stanza(
                 runtime,
                 &mut signal,
-                resolver,
+                &verifying,
                 DmStanzaRequest {
                     own_jid: &own_jid,
                     own_lid: own_lid.as_ref(),
@@ -486,7 +492,7 @@ impl<S: ServiceStore> SignalOps<S> {
     pub async fn send_group(
         &self,
         runtime: &dyn Runtime,
-        resolver: &dyn SendContextResolver,
+        resolver: &dyn SignalResolver,
         group: &Jid,
         message: &wa::Message,
         message_id: &str,
@@ -625,10 +631,15 @@ impl<S: ServiceStore> SignalOps<S> {
                         prekey_store: &mut prekeys,
                         signed_prekey_store: &signed_prekeys,
                     };
+                    let verifying = Verifying {
+                        ops: self,
+                        inner: resolver,
+                        store: staged.clone(),
+                    };
                     let prepared = prepare_group_stanza_resolved(
                         runtime,
                         &mut signal,
-                        resolver,
+                        &verifying,
                         GroupStanzaRequest {
                             group: &routing,
                             own_jid: &own_jid,
@@ -784,7 +795,7 @@ impl<S: ServiceStore> SignalOps<S> {
     /// the resolver, as the client does. Status messages are not handled here.
     pub async fn resend(
         &self,
-        resolver: &dyn SendContextResolver,
+        resolver: &dyn SignalResolver,
         request: RetryRequest<'_>,
     ) -> Result<Vec<u8>, OpsError> {
         let (message, audience) = self
@@ -830,7 +841,12 @@ impl<S: ServiceStore> SignalOps<S> {
             if let Some(bundle) = request.bundle {
                 self.establish_into(&staged, &address, bundle).await?;
             } else if !staged.has_session(address.as_str()).await? {
-                let fetched = resolver
+                let verifying = Verifying {
+                    ops: self,
+                    inner: resolver,
+                    store: staged.clone(),
+                };
+                let fetched = verifying
                     .fetch_prekeys(std::slice::from_ref(request.encryption_jid))
                     .await
                     .map_err(send_error)?;

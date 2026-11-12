@@ -172,6 +172,9 @@ pub struct RemoteBundle {
     pub signed_prekey: [u8; 32],
     pub signed_prekey_signature: [u8; 64],
     pub prekey: Option<(u32, [u8; 32])>,
+    /// The `<device-identity>` (`ADVSignedDeviceIdentity` bytes) the bundle
+    /// came with. Required for companion devices; see [`crate::trust`].
+    pub device_identity: Option<Vec<u8>>,
 }
 
 impl RemoteBundle {
@@ -697,7 +700,19 @@ impl<S: ServiceStore> SignalOps<S> {
         address: &ProtocolAddress,
         bundle: &RemoteBundle,
     ) -> Result<(), OpsError> {
+        let device = address
+            .name()
+            .parse::<wacore_binary::Jid>()
+            .map_err(|_| OpsError::InvalidInput(format!("{address} is not a device address")))?
+            .with_device(
+                u16::try_from(u32::from(address.device_id()))
+                    .map_err(|_| OpsError::InvalidInput("device id out of range".into()))?,
+            );
+        let device_identity = bundle.device_identity.as_deref();
         let bundle = bundle.to_prekey_bundle()?;
+        self.verify_bundle(staged, &device, &bundle, device_identity, None)
+            .await?
+            .map_err(OpsError::BundleRefused)?;
         let mut sessions = self.stores_over(staged.clone()).await;
         let mut identities = sessions.clone();
         process_prekey_bundle(
