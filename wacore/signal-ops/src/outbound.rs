@@ -833,6 +833,9 @@ impl<S: ServiceStore> SignalOps<S> {
             // membership answer cannot predate a removal that already ran.
             self.check_retry_requester(resolver, &request, &own, &audience)
                 .await?;
+            let staged = std::sync::Arc::new(self.store().staged());
+            // Staged with the session, so a refused bundle or a failed retry
+            // leaves the distribution state untouched.
             if matches!(request.route, RetryRoute::Group { .. }) {
                 let group = request.chat.to_string();
                 let keys: Vec<String> = [request.requester, request.encryption_jid]
@@ -840,20 +843,19 @@ impl<S: ServiceStore> SignalOps<S> {
                     .map(|jid| sender_key_device_key(&group, jid))
                     .collect();
                 let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-                // A new epoch first, so an acknowledgment still in flight from
-                // an earlier send cannot restore the mark deleted here.
-                self.store()
+                // A new epoch, so an acknowledgment still in flight from an
+                // earlier send cannot restore the mark deleted here.
+                staged
                     .put_aux(
                         Namespace::SenderKeyDevices,
                         &distribution_epoch_key(&group),
                         &new_epoch(),
                     )
                     .await?;
-                self.store()
+                staged
                     .delete_aux(Namespace::SenderKeyDevices, &refs)
                     .await?;
             }
-            let staged = std::sync::Arc::new(self.store().staged());
             if let Some(bundle) = request.bundle {
                 self.establish_into(&staged, &address, bundle).await?;
             } else if !staged.has_session(address.as_str()).await? {

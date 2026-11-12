@@ -140,6 +140,7 @@ fn primary_bundle(account: &KeyPair) -> PreKeyBundle {
 struct Client {
     devices: Vec<Jid>,
     bundles: HashMap<Jid, FetchedBundle>,
+    group: Option<Arc<GroupRoutingInfo>>,
 }
 
 #[async_trait]
@@ -167,7 +168,9 @@ impl SendContextResolver for Client {
         &self,
         _jid: &Jid,
     ) -> anyhow::Result<Arc<GroupRoutingInfo>> {
-        anyhow::bail!("no groups here")
+        self.group
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no group here"))
     }
 }
 
@@ -340,6 +343,7 @@ async fn a_changed_primary_identity_is_refused_until_the_application_accepts_it(
 #[tokio::test(flavor = "multi_thread")]
 async fn a_send_skips_a_companion_whose_bundle_does_not_verify() {
     let alice = device("alice-send-adv", "111:1@s.whatsapp.net").await;
+    let alice_paired = common::pair(&alice).await;
     let bob = device("bob-send-adv", "222:1@s.whatsapp.net").await;
     let eve = device("eve-send-adv", "333:1@s.whatsapp.net").await;
     let bob_paired = common::pair(&bob).await;
@@ -360,6 +364,7 @@ async fn a_send_skips_a_companion_whose_bundle_does_not_verify() {
                 device_identity: Some(eve_paired.device_identity),
             },
         )]),
+        group: None,
     };
     // Bob's only device fails verification, so there is nothing to send.
     let sent = alice
@@ -385,6 +390,7 @@ async fn a_send_skips_a_companion_whose_bundle_does_not_verify() {
                 device_identity: Some(bob_paired.device_identity),
             },
         )]),
+        group: None,
     };
     let sent = alice
         .send_direct(&TokioRuntime, &honest, &to, &text("for bob"), "F2")
@@ -392,6 +398,10 @@ async fn a_send_skips_a_companion_whose_bundle_does_not_verify() {
         .unwrap();
     let (kind, ciphertext) = enc_for(&sent.stanza, &bob_jid).expect("bob is reached");
     let alice_jid: Jid = "111:1@s.whatsapp.net".parse().unwrap();
+    // Bob verifies Alice's prekey message against her pinned account.
+    bob.trust_account_identity(&alice_jid, alice_paired.account)
+        .await
+        .unwrap();
     let received = bob
         .receive(ReceiveRequest {
             chat: &alice_jid.to_non_ad().to_string(),
@@ -400,6 +410,7 @@ async fn a_send_skips_a_companion_whose_bundle_does_not_verify() {
             ciphertext: &ciphertext,
             padding_version: 2,
             is_from_me: false,
+            device_identity: Some(&alice_paired.device_identity),
         })
         .await
         .unwrap();
@@ -441,6 +452,7 @@ async fn a_fresh_account_is_anchored_by_its_primary_in_the_same_fetch() {
                 },
             ),
         ]),
+        group: None,
     };
     let sent = alice
         .send_direct(&TokioRuntime, &mismatched, &primary, &text("hi"), "A1")
@@ -482,6 +494,7 @@ async fn a_companion_is_accepted_when_its_account_primary_is_in_the_same_fetch()
                 },
             ),
         ]),
+        group: None,
     };
     let sent = alice
         .send_direct(&TokioRuntime, &client, &primary, &text("hi"), "A2")
@@ -517,6 +530,7 @@ async fn a_retry_naming_a_recipient_with_another_accounts_keys_is_refused() {
                 device_identity: Some(bob_paired.device_identity.clone()),
             },
         )]),
+        group: None,
     };
     alice
         .send_direct(&TokioRuntime, &client, &to, &text("for bob only"), "R1")
@@ -574,4 +588,87 @@ async fn a_retry_naming_a_recipient_with_another_accounts_keys_is_refused() {
         )
         .await
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_group_retry_bundle_leaves_distribution_state_untouched() {
+    use wacore::types::message::AddressingMode;
+
+    let group: Jid = "120363000000010@g.us".parse().unwrap();
+    let alice = device("alice-group-retry-adv", "111:1@s.whatsapp.net").await;
+    alice
+        .set_own_jids("111:1@s.whatsapp.net", Some("900111:1@lid"))
+        .await
+        .unwrap();
+    common::pair(&alice).await;
+    let bob = device("bob-group-retry-adv", "222:1@s.whatsapp.net").await;
+    let eve = device("eve-group-retry-adv", "333:1@s.whatsapp.net").await;
+    let bob_paired = common::pair(&bob).await;
+    let eve_paired = common::pair(&eve).await;
+    let bob_jid: Jid = "222:1@s.whatsapp.net".parse().unwrap();
+    alice
+        .trust_account_identity(&bob_jid, bob_paired.account)
+        .await
+        .unwrap();
+    let client = Client {
+        devices: vec![bob_jid.clone()],
+        bundles: HashMap::from([(
+            bob_jid.clone(),
+            FetchedBundle {
+                bundle: bundle_for(&bob, 1).await,
+                device_identity: Some(bob_paired.device_identity),
+            },
+        )]),
+        group: Some(Arc::new(GroupRoutingInfo::new(
+            vec!["111@s.whatsapp.net".parse().unwrap(), bob_jid.to_non_ad()],
+            AddressingMode::Pn,
+        ))),
+    };
+    let sent = alice
+        .send_group(&TokioRuntime, &client, &group, &text("members"), "G1")
+        .await
+        .unwrap();
+    assert_eq!(sent.distribution_targets, vec![bob_jid.clone()]);
+    // Alice lost Bob's session, so the retry receipt's keys would be used.
+    alice.forget_user(&bob_jid.to_non_ad()).await.unwrap();
+
+    let eve_bundle = remote(&bundle_for(&eve, 1).await, Some(eve_paired.device_identity));
+    let result = alice
+        .resend(
+            &client,
+            RetryRequest {
+                chat: &group,
+                message_id: "G1",
+                requester: &bob_jid,
+                encryption_jid: &bob_jid,
+                route: RetryRoute::Group {
+                    addressing_mode: AddressingMode::Pn,
+                },
+                retry_count: 1,
+                bundle: Some(&eve_bundle),
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(OpsError::BundleRefused(
+                BundleRejection::InvalidDeviceIdentity
+            ))
+        ),
+        "got {result:?}"
+    );
+    // The refused retry started no new epoch, so the original send's
+    // acknowledgment still counts.
+    assert!(
+        alice
+            .mark_sender_key_distributed(
+                &group,
+                &sent.distribution_targets,
+                sent.distribution_epoch
+            )
+            .await
+            .unwrap(),
+        "a refused retry must not change the distribution epoch"
+    );
 }
