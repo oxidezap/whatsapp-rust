@@ -40,7 +40,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-16
+          toolchain: 1.100.0
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
         with:
@@ -67,7 +67,7 @@ jobs:
       matrix:
         include:
           - lane: native
-            toolchain: nightly-2026-06-16
+            toolchain: 1.100.0
           - lane: msrv
             toolchain: 1.95.0
           - lane: wasm
@@ -80,7 +80,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-16
+          toolchain: 1.100.0
           targets: wasm32-unknown-unknown
       - uses: dtolnay/rust-toolchain@1.95.0
         if: matrix.lane != 'native'
@@ -107,7 +107,7 @@ jobs:
           # one immutable cache key. Keep both lanes' build artifacts.
           key: compatibility-${{ matrix.lane }}
       - name: Build the qualification driver
-        run: cargo +nightly-2026-06-16 build --locked -p whatsapp-xtask
+        run: cargo +1.100.0 build --locked -p whatsapp-xtask
       - name: Validate contracts before release
         if: inputs.release-check
         run: target/debug/whatsapp-xtask ci compatibility --release --lane "$LANE" --toolchain "$TOOLCHAIN"

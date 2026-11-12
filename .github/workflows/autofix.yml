@@ -17,7 +17,7 @@ jobs:
       # fixer and the gate never disagree on formatting.
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-06-16
+          toolchain: 1.100.0
           components: rustfmt
       # rustfmt only: it is deterministic and never changes semantics. Clippy
       # stays a manual gate — `clippy --fix` can rewrite logic, and the
