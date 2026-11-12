@@ -901,9 +901,14 @@ test("a group retry clears only the requester distribution acknowledgment", asyn
     [...initial.distributionTargets].sort(),
     [BOB, "222:1@s.whatsapp.net"].sort(),
   );
-  await alice.signal.markSenderKeyDistributed(
-    group,
-    initial.distributionTargets,
+  assert.equal(typeof initial.distributionEpoch, "bigint");
+  assert.equal(
+    await alice.signal.markSenderKeyDistributed(
+      group,
+      initial.distributionTargets,
+      initial.distributionEpoch,
+    ),
+    true,
   );
   assert.deepEqual(
     (
@@ -928,6 +933,16 @@ test("a group retry clears only the requester distribution acknowledgment", asyn
   const received = await receiveStanza(bob.signal, retried, group);
   assert.equal(conversationOf(received.message), "group retry");
   await persistThenMark(bob.signal, received);
+  // A late acknowledgment of the send before the retry must not restore the
+  // requester's cleared mark.
+  assert.equal(
+    await alice.signal.markSenderKeyDistributed(
+      group,
+      initial.distributionTargets,
+      initial.distributionEpoch,
+    ),
+    false,
+  );
   assert.deepEqual(
     (
       await alice.signal.sendGroup(

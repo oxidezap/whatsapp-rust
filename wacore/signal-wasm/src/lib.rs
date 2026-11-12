@@ -638,8 +638,9 @@ impl SignalDevice {
     }
 
     /// Build a group stanza. Resolves `{ stanza, distributionTargets,
-    /// staleDeviceUsers, phash }`; after the server acks it, pass
-    /// `distributionTargets` to `markSenderKeyDistributed`.
+    /// distributionEpoch, staleDeviceUsers, phash }`; after the server acks
+    /// it, pass `distributionTargets` and the `distributionEpoch` bigint to
+    /// `markSenderKeyDistributed`.
     #[wasm_bindgen(js_name = sendGroup)]
     pub fn send_group(
         &self,
@@ -665,6 +666,11 @@ impl SignalDevice {
                 "distributionTargets",
                 &convert::jid_list(&sent.distribution_targets),
             );
+            set(
+                &out,
+                "distributionEpoch",
+                &js_sys::BigInt::from(sent.distribution_epoch),
+            );
             let stale: js_sys::Array = sent
                 .stale_device_users
                 .iter()
@@ -681,8 +687,15 @@ impl SignalDevice {
     }
 
     /// Record that the server acked a group send carrying the sender key.
+    /// Resolves `false`, recording nothing, when the group's sender key has
+    /// rotated since the send that returned `epoch`.
     #[wasm_bindgen(js_name = markSenderKeyDistributed)]
-    pub fn mark_sender_key_distributed(&self, group: String, devices: Vec<String>) -> Promise {
+    pub fn mark_sender_key_distributed(
+        &self,
+        group: String,
+        devices: Vec<String>,
+        epoch: u64,
+    ) -> Promise {
         let inner = self.inner.clone();
         promise(async move {
             let group = convert::jid(&group)?;
@@ -690,12 +703,12 @@ impl SignalDevice {
                 .iter()
                 .map(|d| convert::jid(d))
                 .collect::<Result<Vec<_>, _>>()?;
-            inner
+            let recorded = inner
                 .ops
-                .mark_sender_key_distributed(&group, &devices)
+                .mark_sender_key_distributed(&group, &devices, epoch)
                 .await
                 .map_err(ops_error)?;
-            Ok(JsValue::UNDEFINED)
+            Ok(JsValue::from_bool(recorded))
         })
     }
 
