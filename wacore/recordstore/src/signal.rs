@@ -20,11 +20,12 @@ const PREKEY_UPLOADED: u8 = 1;
 
 /// Namespaces the Signal service reads and writes directly, outside the
 /// [`SignalStore`] surface.
-const AUX_NAMESPACES: [Namespace; 4] = [
+const AUX_NAMESPACES: [Namespace; 5] = [
     Namespace::Device,
     Namespace::DecryptBuffer,
     Namespace::SentMessage,
     Namespace::SenderKeyDevices,
+    Namespace::AccountIdentity,
 ];
 
 /// A write before sealing.

@@ -23,10 +23,13 @@ pub enum Namespace {
     SentMessage,
     /// Group member devices confirmed to hold this device's sender key.
     SenderKeyDevices,
+    /// Pinned identity keys of peer accounts, the anchor that companion
+    /// devices' ADV signatures are verified against.
+    AccountIdentity,
 }
 
 impl Namespace {
-    pub const ALL: [Namespace; 9] = [
+    pub const ALL: [Namespace; 10] = [
         Namespace::Identity,
         Namespace::Session,
         Namespace::PreKey,
@@ -36,6 +39,7 @@ impl Namespace {
         Namespace::DecryptBuffer,
         Namespace::SentMessage,
         Namespace::SenderKeyDevices,
+        Namespace::AccountIdentity,
     ];
 
     /// Stable persisted name.
@@ -50,6 +54,7 @@ impl Namespace {
             Namespace::DecryptBuffer => "decrypt_buffer",
             Namespace::SentMessage => "sent_message",
             Namespace::SenderKeyDevices => "sender_key_devices",
+            Namespace::AccountIdentity => "account_identity",
         }
     }
 }
