@@ -21,6 +21,14 @@ use super::traits::Identity;
 use super::window::NafLookupTable5;
 
 pub fn mul(a: &Scalar, A: &EdwardsPoint, b: &Scalar) -> EdwardsPoint {
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    if let Some(result) = super::avx2::mul(a, A, b) {
+        return result;
+    }
+    mul_serial(a, A, b)
+}
+
+pub(super) fn mul_serial(a: &Scalar, A: &EdwardsPoint, b: &Scalar) -> EdwardsPoint {
     let a_naf = a.non_adjacent_form(5);
 
     let b_naf = b.non_adjacent_form(8);

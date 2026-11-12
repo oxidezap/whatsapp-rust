@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Runtime adapters for independently implemented Signal transitions.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
 pub mod bench_support;
