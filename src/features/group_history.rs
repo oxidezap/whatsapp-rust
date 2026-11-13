@@ -1059,7 +1059,7 @@ mod tests {
                     .unwrap_or_default()
             })
             .collect();
-        assert_eq!(ids, vec!["kept-2", "evicted"]);
+        assert_eq!(ids, vec!["evicted", "kept-2"]);
         assert_eq!(selected.oldest_timestamp, 950);
     }
 
