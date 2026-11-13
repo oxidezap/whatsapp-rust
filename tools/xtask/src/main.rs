@@ -78,6 +78,7 @@ fn main() -> Result<std::process::ExitCode> {
         }
         Task::ProtoDesc => {
             descriptor(&root, "waproto/src/whatsapp", true)?;
+            proto_codecs(&root, false)?;
             0
         }
         Task::TablesDesc => {
@@ -121,6 +122,11 @@ fn descriptor(root: &Path, stem: &str, source_info: bool) -> Result<()> {
 fn proto_codecs(root: &Path, check: bool) -> Result<()> {
     for (descriptor, base, output) in [
         (
+            "waproto/src/whatsapp.desc",
+            "crate::protobuf::generated::whatsapp",
+            "waproto/src/generated/whatsapp.rs",
+        ),
+        (
             "wacore/src/voip/mlow/tables.desc",
             "crate::voip::mlow::smpl_tables_blob::tables",
             "wacore/src/voip/mlow/tables.generated.rs",
@@ -136,19 +142,24 @@ fn proto_codecs(root: &Path, check: bool) -> Result<()> {
             "run",
             "--locked",
             "-p",
-            "waproto",
-            "--features",
-            "protobuf-experiment",
-            "--example",
-            "protobuf_codegen",
+            "whatspec-codegen",
+            "--bin",
+            "protobuf-codegen",
             "--",
             descriptor,
             base,
-            "::waproto::protobuf",
+            if descriptor == "waproto/src/whatsapp.desc" {
+                "crate::protobuf"
+            } else {
+                "::waproto::protobuf"
+            },
             output,
         ]);
         if check {
             command.arg("--check");
+        }
+        if descriptor == "waproto/src/whatsapp.desc" {
+            command.arg("--whatsapp");
         }
         let status = command.status().context("run protobuf codec generator")?;
         anyhow::ensure!(

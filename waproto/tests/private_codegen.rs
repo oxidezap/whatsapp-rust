@@ -5,6 +5,12 @@
 pub mod descriptor;
 #[path = "../codegen/features.rs"]
 pub mod features;
+#[path = "../codegen/names.rs"]
+pub mod names;
+#[path = "../codegen/retained.rs"]
+pub mod retained;
+#[path = "../codegen/wallpaper.rs"]
+pub mod wallpaper;
 
 #[path = "../codegen/emit_owned.rs"]
 pub mod emit_owned;

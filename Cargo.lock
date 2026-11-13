@@ -6408,9 +6408,13 @@ name = "whatspec-codegen"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "heck",
+ "prettyplease 0.3.0",
+ "quote",
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "syn 3.0.9",
  "toml 1.2.1+spec-1.1.0",
  "wa-codegen",
  "wa-ir",

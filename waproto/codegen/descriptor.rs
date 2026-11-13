@@ -7,7 +7,7 @@ use std::io::{self, ErrorKind};
 
 macro_rules! descriptor_enum {
     ($name:ident {$first:ident=$number:literal $(,$variant:ident=$value:literal)* $(,)?}) => {
-        #[allow(non_camel_case_types)]
+        #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
         #[derive(Clone,Copy,Debug,Default,PartialEq,Eq)]
         #[repr(i32)]
         pub enum $name { #[default] $first=$number, $($variant=$value,)* }

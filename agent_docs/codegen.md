@@ -45,7 +45,7 @@ claim that every recovered stanza or every field has independent qualification.
 Request repetition and disjunctions stay outside this checked emitter until a
 fallible builder can enforce them. No JavaScript runtime is linked into core.
 
-Locally persisted protobuf fields belong in `LOCAL_FIELDS` in `waproto/build.rs`;
+Locally persisted protobuf fields belong in `LOCAL_FIELDS` in `waproto/codegen/retained.rs`;
 retained whole messages belong in the proto emitter's `LOCAL_BLOCKS`. Unlisted
 app-state schemas and stale props use their hand-written sibling files. Select
 wire enums by the owning module, not just an identical variant set. IQ targets
@@ -53,19 +53,21 @@ are generated only where the namespace does not already imply the target.
 Incoming wire tags include notification, server-request and stanza domains.
 
 The reviewed wallpaper migration is the exceptional same-number, different-wire
-case: `build_support/wallpaper.rs` retains historical string fields alongside the
-upstream fixed32 ARGB fields. Its descriptor and AST guards require the reviewed
+case: `codegen/wallpaper.rs` retains historical string fields alongside the
+upstream fixed32 ARGB fields. Its descriptor and generated-code guards require the reviewed
 shape, and both owned and view decoders dispatch on number and wire type. Keep
 the frozen API snapshot unchanged; do not generalize this exception to unrelated
 field collisions.
 
-`waproto` emits its specialized codecs from the descriptor. Buffa remains the
-temporary descriptor adapter and differential reference. Use `cargo xt proto-desc`,
-`tables-desc` and `wire-desc` for descriptors and hash sidecars. MLow and SQLite
-use committed private codecs with no views or Serde implementations. Their
-descriptor tasks also regenerate these codecs. `cargo xt proto-codecs --check`
-verifies deterministic regeneration; build scripts check descriptor and source
-hashes. `cargo xt --help` lists tooling.
+`waproto`, MLow and SQLite compile committed static codecs. Normal builds only
+verify schema, descriptor and Rust hashes. The `protobuf-codegen` binary in
+`whatspec-codegen` owns generation; no runtime crate depends on that tool.
+Use `cargo xt proto-desc`, `tables-desc` and `wire-desc` for descriptors, codecs
+and hash sidecars. `cargo xt proto-codecs --check` verifies all three domains
+without updating files. MLow and SQLite omit borrowed views and Serde because
+their private callers do not use them. The temporary `protobuf-experiment`
+feature still enables the locked differential reference. `cargo xt --help`
+lists tooling.
 Host tooling must not become a published runtime dependency. Task implementations
 belong in Rust, not new Bash/Python scripts.
 
