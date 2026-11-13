@@ -169,7 +169,7 @@ impl core::ops::Neg for Scalar {
     }
 }
 fn read_le_u64_into(src: &[u8], dst: &mut [u64]) {
-    for (input, output) in src.chunks_exact(8).zip(dst) {
-        *output = u64::from_le_bytes(input.try_into().expect("eight-byte chunk"));
+    for (input, output) in src.as_chunks::<8>().0.iter().zip(dst) {
+        *output = u64::from_le_bytes(*input);
     }
 }

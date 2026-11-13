@@ -182,7 +182,6 @@ impl Scalar52 {
         z
     }
 
-    #[rustfmt::skip] // keep alignment of return calculations
     #[rustfmt::skip] // keep alignment of n* and r* calculations
     pub(super) fn montgomery_reduce(limbs: &[u128; 9]) -> Scalar52 {
 
