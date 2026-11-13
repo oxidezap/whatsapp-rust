@@ -1154,6 +1154,7 @@ fn keepalive_future_stays_within_baseline_budget() {
     let bytes = bytes(Client::keepalive_loop);
     // 3016 before the drain permit pool; +24 for the quiescence acquire on the
     // reconnect path, which now holds a Vec of every drain permit instead of a
-    // single guard.
-    assert!(bytes <= 3040, "keepalive future grew to {bytes} bytes");
+    // single guard. +8 for `reconnect_immediately()` waking a parked reconnect
+    // backoff after its teardown (#1903), which this loop awaits inline.
+    assert!(bytes <= 3048, "keepalive future grew to {bytes} bytes");
 }

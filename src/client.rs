@@ -2296,6 +2296,10 @@ pub struct Client {
     /// so the run loop's reconnect backoff can watch it without the spurious
     /// wakes that would collapse the delay it exists to serve.
     pub(crate) pause_state_notifier: event_listener::Event,
+    /// Fired by [`Client::reconnect_immediately`], and by nothing else, so a
+    /// run loop already parked in its reconnect backoff honours the request
+    /// instead of serving the rest of a delay of up to the 900s cap.
+    pub(crate) immediate_reconnect_notifier: event_listener::Event,
     /// Bumped by every [`Client::pause`]. A connection attempt reads it once at
     /// the start and is refused if it has moved, so an attempt that spanned a
     /// pause is never published — even when a [`Client::resume`] landed while it

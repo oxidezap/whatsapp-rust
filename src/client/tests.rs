@@ -3800,6 +3800,9 @@ fn client_size_pins_runtime_cache_config_saving() {
         size_of::<Option<Arc<dyn crate::ConnectAdmission>>>(),
         2 * size_of::<usize>(),
     );
+    // The dedicated notifier `reconnect_immediately()` wakes a parked
+    // reconnect backoff through (#1903).
+    expected += size_of::<event_listener::Event>();
     if cfg!(feature = "client-lifecycle") {
         expected += size_of::<std::sync::Mutex<()>>() + size_of::<Option<Arc<()>>>();
     }

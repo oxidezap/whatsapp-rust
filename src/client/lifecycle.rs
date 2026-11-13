@@ -705,6 +705,7 @@ impl Client {
 
             session_state: SessionState::new(true),
             pause_state_notifier: event_listener::Event::new(),
+            immediate_reconnect_notifier: event_listener::Event::new(),
             pause_generation: AtomicU64::new(0),
             connection_publish: Mutex::new(()),
 
@@ -1106,6 +1107,14 @@ impl Client {
                 break;
             }
 
+            // Registered before the expected-disconnect flag is read, for the
+            // same edge-trigger reason as `pause_changed` below: a
+            // `reconnect_immediately()` that sets the flag just after this read
+            // fires its notify later, after its teardown, and only a listener
+            // that already exists catches it. Without one the loop parks for a
+            // delay the caller asked it to skip.
+            let immediate_reconnect = self.immediate_reconnect_notifier.listen();
+
             // If this was an expected disconnect (e.g., 515 after pairing), reconnect immediately
             if wacore::protocol::reconnect::reconnect_action(
                 false,
@@ -1167,6 +1176,8 @@ impl Client {
             // watching it would collapse the backoff instead of interrupting it.
             let shutdown_fired = wacore::runtime::wait_for_shutdown(&shutdown);
             let reconnect_disabled = self.wait_for_auto_reconnect_disabled();
+            let immediate_reconnect =
+                self.wait_for_unpenalized_immediate_reconnect(immediate_reconnect);
             // Third arm for the pause state, on the listener registered
             // above. `pause()` landing here must not wait out a delay before
             // parking, and `resume()` must not wait one out at all — the
@@ -1192,6 +1203,16 @@ impl Client {
                 _ = pause_changed.fuse() => {
                     client_log!(self, debug, "Pause state changed during reconnect backoff, re-reading it.");
                 }
+                // The application asked to skip the backoff while it was
+                // already running, and no server penalty stands behind it (see
+                // `wait_for_unpenalized_immediate_reconnect`). Forgiven the same
+                // way the expected-disconnect branch above forgives it; the top
+                // of the loop still honours a pause and any installed admission
+                // policy before dialling. The reset itself happened in that
+                // future, under the same lock as its penalty check.
+                _ = immediate_reconnect.fuse() => {
+                    client_log!(self, info, "Immediate reconnect requested during reconnect backoff, reconnecting now.");
+                }
             }
         }
         #[cfg(feature = "client-lifecycle")]
@@ -1202,6 +1223,37 @@ impl Client {
             RunCompletionReason::ShutdownRequested
         } else {
             completion
+        }
+    }
+
+    /// Completes on a `reconnect_immediately()` the backoff may honour, having
+    /// reset that backoff.
+    ///
+    /// Not while a backoff penalty is pending: that delay is one the server
+    /// asked for (a 429 adds five Fibonacci steps) or a manual `reconnect()`
+    /// imposed, not one accrued from local failures. The callers that land here
+    /// are the repeating ones (a host watchdog, a wake handler, a Reconnect
+    /// button), so releasing on them would turn a rate-limit backoff into a dial
+    /// per call. Such a request is ignored and the backoff runs on, which is
+    /// what it did before this arm existed. The penalty clears only on the next
+    /// authenticated connection, so it cannot lapse during the wait.
+    async fn wait_for_unpenalized_immediate_reconnect(
+        &self,
+        mut listener: event_listener::EventListener,
+    ) {
+        loop {
+            listener.await;
+            // Checks the penalty and resets the backoff under one lock; see
+            // `release_unpenalized_backoff`.
+            if self.release_unpenalized_backoff() {
+                return;
+            }
+            client_log!(
+                self,
+                debug,
+                "Immediate reconnect ignored during a penalised reconnect backoff."
+            );
+            listener = self.immediate_reconnect_notifier.listen();
         }
     }
 
@@ -2019,7 +2071,12 @@ impl Client {
     ///
     /// Unlike [`reconnect`](Self::reconnect), which introduces a deliberate offline window,
     /// this method sets the `expected_disconnect` flag so the run loop
-    /// skips the backoff delay and reconnects as fast as possible. An installed
+    /// skips the backoff delay and reconnects as fast as possible. Called while
+    /// the run loop is already waiting out a reconnect backoff (the connection
+    /// is gone, so there is nothing to tear down), it ends that wait and resets
+    /// the backoff, unless that backoff carries a penalty (a 429 rate limit, or
+    /// a manual [`reconnect`](Self::reconnect)): then it is kept, and the call
+    /// does not shorten it. An installed
     /// [`crate::ConnectAdmission`] policy still reserves that run-loop attempt.
     #[cfg_attr(
         feature = "tracing",
@@ -2036,6 +2093,14 @@ impl Client {
         self.expect_session_disconnect();
 
         self.teardown_for_reconnect().await;
+        // After the teardown, not before: a backoff released while this call
+        // was still closing the transport could dial, and the teardown's
+        // connection shutdown would then end the attempt it had just released.
+        // When a live connection was torn down, the flag set above is what the
+        // run loop reads; this notify then finds no listener, or at worst
+        // releases one backoff of a redial that already failed, which is
+        // still the immediate retry the caller asked for.
+        self.immediate_reconnect_notifier.notify(usize::MAX);
     }
 
     async fn teardown_for_reconnect(self: &Arc<Self>) {
@@ -5736,6 +5801,109 @@ mod tests {
             client.reconnect_errors(Ordering::Relaxed),
             CAPPED_BACKOFF_ATTEMPTS + 1,
             "a per-connection shutdown must not release the reconnect backoff"
+        );
+
+        let _ = client.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("run() must still return on a terminal shutdown")
+            .expect("the run task must not panic");
+    }
+
+    /// `reconnect_immediately()` promises to skip the backoff, and the case
+    /// where that matters most is the one where the connection is already gone
+    /// and the loop is parked at the cap: a host watchdog or a user's
+    /// "Reconnect" lands there after any long outage. With nothing to tear
+    /// down, only the backoff racing the request can keep that promise.
+    #[tokio::test]
+    async fn reconnect_immediately_interrupts_the_reconnect_backoff() {
+        let client = crate::test_utils::create_test_client().await;
+        let run = run_until_parked_in_backoff(&client).await;
+
+        client.reconnect_immediately().await;
+
+        // Released and reset: the loop dials again at once, and the attempt
+        // counter restarts from zero instead of climbing past the cap.
+        crate::test_utils::poll_until(
+            "the run loop to leave the capped backoff and redial",
+            || client.reconnect_errors(Ordering::Relaxed) <= CAPPED_BACKOFF_ATTEMPTS,
+        )
+        .await;
+
+        let _ = client.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("run() must still return on a terminal shutdown")
+            .expect("the run task must not panic");
+    }
+
+    /// A backoff the server asked for is not the caller's to skip. A 429 adds
+    /// five steps and marks the penalty; the callers this arm serves repeat, so
+    /// releasing on them would turn the rate-limit backoff into a dial per
+    /// watchdog tick against a server that just said to slow down.
+    #[tokio::test]
+    async fn reconnect_immediately_keeps_a_rate_limit_penalty_backoff() {
+        let client = crate::test_utils::create_test_client().await;
+        client.set_backoff_penalty_for_test(true, Ordering::Relaxed);
+        let run = run_until_parked_in_backoff(&client).await;
+
+        client.reconnect_immediately().await;
+        client.reconnect_immediately().await;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            client.reconnect_errors(Ordering::Relaxed),
+            CAPPED_BACKOFF_ATTEMPTS + 1,
+            "a penalised backoff must neither be released nor reset"
+        );
+        assert!(
+            client.backoff_penalty_pending(Ordering::Relaxed),
+            "the penalty survives the request"
+        );
+
+        let _ = client.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("run() must still return on a terminal shutdown")
+            .expect("the run task must not panic");
+    }
+
+    /// The penalty check and the reset are one transition: a penalty, whether
+    /// from a 429 or from a manual `reconnect()` racing the request, keeps its
+    /// attempt instead of being zeroed between a separate check and reset.
+    #[tokio::test]
+    async fn the_immediate_release_checks_the_penalty_and_resets_under_one_lock() {
+        let client = crate::test_utils::create_test_client().await;
+
+        client.set_reconnect_errors_for_test(CAPPED_BACKOFF_ATTEMPTS, Ordering::Relaxed);
+        client.set_backoff_penalty_for_test(true, Ordering::Relaxed);
+        assert!(!client.release_unpenalized_backoff());
+        assert_eq!(
+            client.reconnect_errors(Ordering::Relaxed),
+            CAPPED_BACKOFF_ATTEMPTS,
+            "a penalised backoff keeps its attempt"
+        );
+
+        client.set_backoff_penalty_for_test(false, Ordering::Relaxed);
+        assert!(client.release_unpenalized_backoff());
+        assert_eq!(client.reconnect_errors(Ordering::Relaxed), 0);
+    }
+
+    /// The counterpart guard for the arm above: it must answer only
+    /// `reconnect_immediately()`. A plain session-state hint fires on every
+    /// teardown, so a backoff that woke on it would never wait at all.
+    #[tokio::test]
+    async fn a_session_state_hint_does_not_release_the_backoff_as_an_immediate_reconnect() {
+        let client = crate::test_utils::create_test_client().await;
+        let run = run_until_parked_in_backoff(&client).await;
+
+        client.notify_session_state();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            client.reconnect_errors(Ordering::Relaxed),
+            CAPPED_BACKOFF_ATTEMPTS + 1,
+            "a session-state hint must not release the reconnect backoff"
         );
 
         let _ = client.shutdown().await;
