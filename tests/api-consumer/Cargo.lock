@@ -60,7 +60,6 @@ dependencies = [
  "tokio",
  "wacore",
  "wacore-binary",
- "waproto",
  "wasm-bindgen",
  "wasm-bindgen-test",
  "whatsapp-rust",

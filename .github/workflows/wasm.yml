@@ -101,15 +101,6 @@ jobs:
           cargo build -p wacore --lib --release
           --target wasm32-unknown-unknown
           --no-default-features --features "voip,js"
-      # The optional Signal operations (`wacore::signal`) run in browser hosts too;
-      # nothing else builds them for this target.
-      - name: Build wacore Signal operations for wasm32 (release)
-        env:
-          RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
-        run: >
-          cargo build -p wacore --lib --release
-          --target wasm32-unknown-unknown
-          --no-default-features --features "signal-operations,js"
       # And the half above it: signaling, the facade, `CallHandle` -- everything a consumer
       # actually places a call through. It builds here because `voip-runtime` no longer carries the
       # native relay dialer (that is `voip-relay-native`, and it is the one thing that still

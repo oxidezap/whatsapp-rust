@@ -747,6 +747,3 @@ pub mod test_support;
 mod reexports_test;
 
 mod logging;
-
-#[cfg(feature = "signal-backend")]
-pub use wacore::signal;

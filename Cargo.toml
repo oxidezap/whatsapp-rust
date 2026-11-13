@@ -173,8 +173,6 @@ zerocopy = { version = "0.8.55", default-features = false, features = ["derive"]
 zlib-rs = { version = "0.6.6", default-features = false, features = ["std", "rust-allocator"] }
 
 [features]
-signal-backend = ["wacore/signal-backend"]
-signal-operations = ["signal-backend", "wacore/signal-operations"]
 # Mobile protocol and SDK using host-supplied runtime, clock, HTTP and storage.
 mobile-core = ["wacore/mobile", "instance-clock", "dep:subtle", "whatsapp-rust-sqlite-storage?/mobile"]
 # Optional native adapter; browser/embedded hosts supply their own transport.
