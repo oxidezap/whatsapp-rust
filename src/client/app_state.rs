@@ -4891,7 +4891,9 @@ mod tests {
         // correlate), meaningless across runs (so offline enumeration of
         // low-entropy ids buys nothing). Assert shape + stability + masking,
         // never a fixed digest — the key is random per process.
-        for id in ["MSGID123", "call-42", "abc"] {
+        // `xyz` is short and cannot occur in the hex digest by chance; a
+        // probe made of hex digits (such as `abc`) would, now and then.
+        for id in ["MSGID123", "call-42", "xyz"] {
             let fp = fingerprint_id(id);
             assert!(fp.starts_with("id#"), "{id} fingerprints, got {fp}");
             assert_eq!(fp.len(), 3 + 16);
@@ -4899,7 +4901,7 @@ mod tests {
         }
         // Stable within the process; distinct inputs diverge (including the
         // old head/tail-collision pair, which a prefix scheme conflated).
-        assert_eq!(fingerprint_id("abc"), fingerprint_id("abc"));
+        assert_eq!(fingerprint_id("xyz"), fingerprint_id("xyz"));
         assert_ne!(
             fingerprint_id("ABCD1111WXYZ"),
             fingerprint_id("ABCD2222WXYZ")

@@ -943,6 +943,9 @@ impl SenderKeyRecord {
             .collect::<Result<_>>()?;
         let mut record = Self::default();
         record.inner.states = states;
+        // Components carry cryptographic state, not store-recovery provenance.
+        // Importing a bound external row must not reopen legacy recovery.
+        record.disable_legacy_receiver_recovery();
         Ok(record)
     }
     pub fn into_components(mut self) -> Result<SenderKeyRecordComponents> {
@@ -1018,10 +1021,17 @@ mod tests {
         let bytes = record.serialize().unwrap();
         let mut digest = sha2::Sha256::new();
         use sha2::Digest;
-        digest.update(&bytes);
+        assert!(record.legacy_receiver_recovery_disabled());
+        // Keep the original cryptographic-byte pin independent of the new
+        // store-only recovery policy, and pin the complete record as well.
+        digest.update(bytes.strip_suffix(&[0xb0, 0x06, 1]).unwrap());
         assert_eq!(
             hex::encode(digest.finalize()),
             "cd58fc7d88e3de26e5767d02e6d54723e6feb9a76a4a5870b8dea6b08ee801da"
+        );
+        assert_eq!(
+            hex::encode(sha2::Sha256::digest(&bytes)),
+            "6f7b551ee6ad4b042cdcd902c7bd4cc8edd47c41c49db6965c3230571a2324f6"
         );
         assert_eq!(record.clone().into_components().unwrap(), expected);
         let reloaded = SenderKeyRecord::deserialize(&bytes).unwrap();

@@ -403,9 +403,20 @@ fn decode_sender_key_record_inner<C: CryptoProvider>(
     let f = fields(input)?;
     let (mut reservation, trusted) = decode_reservation(&f, live)?;
     let mut states = Vec::new();
+    let mut legacy_receiver_recovery_disabled = None;
     for (n, v) in &f {
         if *n == 1 && states.len() < MAX_SENDER_STATES {
             states.push(decode_sender_state(as_bytes(*v)?)?);
+        }
+        if *n == 102 {
+            if legacy_receiver_recovery_disabled.is_some() {
+                return Err(Error::Encoding("duplicate sender-key recovery policy"));
+            }
+            legacy_receiver_recovery_disabled = Some(match as_u32(*v)? {
+                0 => false,
+                1 => true,
+                _ => return Err(Error::Encoding("invalid sender-key recovery policy")),
+            });
         }
     }
     if !trusted && let (Some(ceiling), Some(state)) = (reservation.ceiling, states.first_mut()) {
@@ -424,6 +435,7 @@ fn decode_sender_key_record_inner<C: CryptoProvider>(
     Ok(SenderKeyRecord {
         states,
         reservation,
+        legacy_receiver_recovery_disabled: legacy_receiver_recovery_disabled.unwrap_or(false),
     })
 }
 pub fn encode_pre_key(record: &PreKeyRecord) -> Vec<u8> {

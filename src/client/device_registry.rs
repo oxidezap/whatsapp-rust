@@ -314,13 +314,16 @@ impl Client {
                 .record_group_devices(Outcome::MissAbsent);
         }
 
-        let devices = self
-            .resolve_group_devices_uncached(
+        let (devices, complete) = self
+            .resolve_group_devices_checked(
                 group_info,
                 own_sending_jid,
                 crate::cache::Freshness::CachePreferred,
             )
             .await?;
+        if !complete {
+            return Ok(Arc::new(wacore::send::ResolvedGroupDevices::new(devices)));
+        }
 
         // Member identifiers in both namespaces, so the scoped-invalidation
         // check can match however a write was keyed: writes record every
@@ -371,6 +374,21 @@ impl Client {
         own_sending_jid: &Jid,
         freshness: crate::cache::Freshness,
     ) -> Result<Vec<Jid>, anyhow::Error> {
+        self.resolve_group_devices_checked(group_info, own_sending_jid, freshness)
+            .await
+            .map(|(devices, _)| devices)
+    }
+
+    /// As [`Self::resolve_group_devices_uncached`], plus whether every member
+    /// resolved. A partial view must not be memoized: a member rejected on a
+    /// transient failure writes nothing to the topology, so a memo would keep
+    /// it out of the fanout until an unrelated change.
+    async fn resolve_group_devices_checked(
+        &self,
+        group_info: &wacore::client::context::GroupRoutingInfo,
+        own_sending_jid: &Jid,
+        freshness: crate::cache::Freshness,
+    ) -> Result<(Vec<Jid>, bool), anyhow::Error> {
         let is_lid_mode = group_info.addressing_mode == wacore::types::message::AddressingMode::Lid;
         let mut jids_to_resolve: Vec<Jid> = group_info
             .participants
@@ -401,13 +419,14 @@ impl Client {
             jids_to_resolve.push(own);
         }
 
-        let mut devices = match freshness {
+        let (mut devices, complete) = match freshness {
             crate::cache::Freshness::CachePreferred => {
-                self.get_user_devices_owned(jids_to_resolve).await?
+                self.get_group_user_devices_owned(jids_to_resolve).await?
             }
-            crate::cache::Freshness::Refresh => {
-                self.refresh_group_user_devices(jids_to_resolve).await?
-            }
+            crate::cache::Freshness::Refresh => (
+                self.refresh_group_user_devices(jids_to_resolve).await?,
+                true,
+            ),
         };
         if is_lid_mode {
             // WA Web expects LID addressing in SKDM <to> nodes for LID groups.
@@ -416,7 +435,7 @@ impl Client {
                 .map(|d| group_info.phone_device_jid_into_lid(d))
                 .collect();
         }
-        Ok(devices)
+        Ok((devices, complete))
     }
 
     /// Resolve the DM fan-out (recipient devices + our own companions),

@@ -495,6 +495,27 @@ impl Client {
         &self,
         jids: Vec<Jid>,
     ) -> Result<Vec<Jid>, anyhow::Error> {
+        self.get_user_devices_cached_first(jids, false)
+            .await
+            .map(|(devices, _)| devices)
+    }
+
+    /// Group fanout: a contact whose PN and LID carry conflicting primaries is
+    /// rejected alone (keeping its old record) instead of failing the send
+    /// for every other participant. The flag is false when a fetched user came
+    /// back without devices, so callers must not memoize that partial view.
+    pub(crate) async fn get_group_user_devices_owned(
+        &self,
+        jids: Vec<Jid>,
+    ) -> Result<(Vec<Jid>, bool), anyhow::Error> {
+        self.get_user_devices_cached_first(jids, true).await
+    }
+
+    async fn get_user_devices_cached_first(
+        &self,
+        jids: Vec<Jid>,
+        group: bool,
+    ) -> Result<(Vec<Jid>, bool), anyhow::Error> {
         // One batched registry pass: the cache answers per user, and every
         // user it cannot answer goes to the backend in ONE read. The
         // previous per-user fan-out (16 concurrent `get_devices`) bought
@@ -513,13 +534,25 @@ impl Client {
                 "get_user_devices: Cache miss, fetching from network for {} unique users",
                 jids_to_fetch.len()
             );
-            let fetched = self.fetch_user_devices(jids_to_fetch).await?;
+            let requested = jids_to_fetch.len();
+            let fetched = if group {
+                self.refresh_group_user_devices(jids_to_fetch).await?
+            } else {
+                self.fetch_user_devices(jids_to_fetch).await?
+            };
+            // Counting is enough: every resolved user keeps device 0, and an
+            // undercount (e.g. PN and LID collapsing) only costs a memo miss.
+            let mut users: Vec<_> = fetched.iter().map(|device| &device.user).collect();
+            users.sort_unstable();
+            users.dedup();
+            let complete = users.len() == requested;
             self.remove_superseded_cached_devices(&mut all_devices, &fetched)
                 .await;
             all_devices.extend(fetched);
+            return Ok((all_devices, complete));
         }
 
-        Ok(all_devices)
+        Ok((all_devices, true))
     }
 
     pub(crate) async fn refresh_user_devices(

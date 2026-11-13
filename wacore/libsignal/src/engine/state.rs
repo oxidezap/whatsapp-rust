@@ -716,6 +716,7 @@ impl Drop for SenderKeyState {
 pub struct SenderKeyRecord {
     pub states: Vec<SenderKeyState>,
     pub reservation: Reservation,
+    pub legacy_receiver_recovery_disabled: bool,
 }
 #[derive(Clone, PartialEq, Eq)]
 pub struct PreKeyRecord {
