@@ -13,7 +13,9 @@ resolver = "3"
 
 [features]
 signal-backend = ["wacore/signal-backend", "dep:async-trait", "dep:waproto"]
-signal-execution = ["signal-backend", "js", "dep:wasm-bindgen-test"]
+# `sdk` puts whatsapp-rust in the graph, which the wasm runner resolves
+# its SDK source from.
+signal-execution = ["signal-backend", "sdk", "js", "dep:wasm-bindgen-test"]
 default = []
 core = ["dep:anyhow"]
 contracts = []
