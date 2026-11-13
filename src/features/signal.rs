@@ -7,7 +7,6 @@ use wacore::libsignal::protocol::{
     CiphertextMessage, DecryptionResult, IdentityChange, PreKeyBundle, PreKeySignalMessage,
     PublicKey, SENDERKEY_MESSAGE_CURRENT_VERSION, SenderKeyDistributionMessage, SenderKeyStore,
     SignalMessage, SignalProtocolError, UsePQRatchet, message_decrypt, message_encrypt,
-    process_sender_key_distribution_message,
 };
 use wacore::message_processing::EncType;
 use wacore::messages::MessageUtils;
@@ -307,6 +306,8 @@ impl<'a> Signal<'a> {
     }
 
     /// Process a sender-key distribution and durably expose it before return.
+    /// The caller must authenticate the sender and distribution through the
+    /// enclosing pairwise message before invoking this low-level operation.
     pub async fn process_sender_key_distribution(
         &self,
         group_jid: &Jid,
@@ -328,14 +329,50 @@ impl<'a> Signal<'a> {
         distribution: &[u8],
     ) -> Result<(), SignalError> {
         let distribution = decode_sender_key_distribution(distribution)?;
-        let sender_address = sender_jid.to_non_ad().to_protocol_address();
+        let sender_address = sender_jid.to_protocol_address();
         let sender_key_name = make_sender_key_name(group_jid, &sender_address);
         let mut store = self.client.sender_key_adapter();
         let chain_lock = store.sender_key_lock(&sender_key_name).await;
         let chain_guard = chain_lock.lock().await;
 
-        process_sender_key_distribution_message(&sender_key_name, &distribution, &mut store)
-            .await?;
+        let mut record = store
+            .load_sender_key(&sender_key_name)
+            .await?
+            .unwrap_or_else(wacore::libsignal::protocol::SenderKeyRecord::new_empty);
+        if sender_jid.device != 0
+            && !record.has_sender_key_state(distribution.id(), distribution.signing_key())
+        {
+            // Old receive rows discarded the companion device. Only an
+            // authenticated redistribution can bind their ratchet to a device;
+            // ciphertext alone must never authorize an address alias.
+            let legacy =
+                make_sender_key_name(group_jid, &sender_jid.to_non_ad().to_protocol_address());
+            let device = self.client.persistence_manager.get_device_snapshot();
+            if self
+                .client
+                .signal_cache
+                .get_sender_key(&legacy, &*device.backend)
+                .await?
+                .is_some()
+            {
+                let legacy_lock = store.sender_key_lock(&legacy).await;
+                let _legacy_guard = legacy_lock.lock().await;
+                if let Some(previous) = self
+                    .client
+                    .signal_cache
+                    .get_sender_key(&legacy, &*device.backend)
+                    .await?
+                {
+                    record.inherit_receiver_state(
+                        &previous,
+                        distribution.id(),
+                        distribution.signing_key(),
+                    );
+                }
+            }
+        }
+        record.process_distribution(&distribution)?;
+        store.store_sender_key(&sender_key_name, record).await?;
         drop(chain_guard);
         Ok(())
     }
@@ -346,7 +383,7 @@ impl<'a> Signal<'a> {
         group_jid: &Jid,
         sender_jid: &Jid,
     ) -> Result<Vec<u8>, SignalError> {
-        let sender_address = sender_jid.to_non_ad().to_protocol_address();
+        let sender_address = sender_jid.to_protocol_address();
         let sender_key_name = make_sender_key_name(group_jid, &sender_address);
         let mut store = self.client.sender_key_adapter();
         let chain_lock = store.sender_key_lock(&sender_key_name).await;
@@ -370,7 +407,7 @@ impl<'a> Signal<'a> {
         group_jid: &Jid,
         sender_jid: &Jid,
     ) -> Result<bool, SignalError> {
-        let sender_address = sender_jid.to_non_ad().to_protocol_address();
+        let sender_address = sender_jid.to_protocol_address();
         let sender_key_name = make_sender_key_name(group_jid, &sender_address);
         let device = self.client.persistence_manager.get_device_snapshot();
         Ok(self
@@ -387,7 +424,7 @@ impl<'a> Signal<'a> {
         group_jid: &Jid,
         sender_jid: &Jid,
     ) -> Result<(), SignalError> {
-        let sender_address = sender_jid.to_non_ad().to_protocol_address();
+        let sender_address = sender_jid.to_protocol_address();
         let sender_key_name = make_sender_key_name(group_jid, &sender_address);
         let backend = self.client.persistence_manager.backend();
         self.client
@@ -645,8 +682,7 @@ impl<'a> Signal<'a> {
         sender_jid: &Jid,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, SignalError> {
-        let sender_key_name =
-            make_sender_key_name(group_jid, &sender_jid.to_non_ad().to_protocol_address());
+        let sender_key_name = make_sender_key_name(group_jid, &sender_jid.to_protocol_address());
 
         let mut store = self.client.sender_key_adapter();
         let chain_lock = store.sender_key_lock(&sender_key_name).await;
@@ -1062,6 +1098,312 @@ mod tests {
             )))
             .await;
         (client, backend)
+    }
+
+    async fn companion_group_sender(group: &Jid, author: &Jid) -> (Arc<Client>, Vec<u8>) {
+        use wacore::libsignal::protocol::{KeyPair, SenderKeyRecord};
+        let (client, backend) = memory_client().await;
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetId(Some(
+                author.clone(),
+            )))
+            .await;
+        let pair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let mut record = SenderKeyRecord::new_empty();
+        record
+            .add_sender_key_state(3, 17, 0, &[7; 32], pair.public_key, Some(pair.private_key))
+            .unwrap();
+        let name = make_sender_key_name(group, &author.to_protocol_address());
+        backend
+            .put_sender_key(name.cache_key(), &record.serialize().unwrap())
+            .await
+            .unwrap();
+        let distribution =
+            SenderKeyDistributionMessage::new(3, 17, 0, [7; 32], pair.public_key).unwrap();
+        (client, distribution.serialize())
+    }
+
+    #[tokio::test]
+    async fn companion_sender_key_addresses_remain_independent() {
+        let group = Jid::new("120363000000000001", Server::Group);
+        let (receiver, backend) = memory_client().await;
+        let mut previous_ciphertext: Option<Vec<u8>> = None;
+        for device in [33, 81] {
+            let author = Jid::pn_device("15550001000", device);
+            let (sender, distribution) = companion_group_sender(&group, &author).await;
+            receiver
+                .signal()
+                .process_sender_key_distribution(&group, &author, &distribution)
+                .await
+                .unwrap();
+            let exact = make_sender_key_name(&group, &author.to_protocol_address());
+            assert!(
+                backend
+                    .get_sender_key(exact.cache_key())
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            let (_, ciphertext) = sender
+                .signal()
+                .encrypt_group_message(&group, &[device as u8])
+                .await
+                .unwrap();
+            if let Some(previous) = previous_ciphertext.as_ref() {
+                assert!(matches!(
+                    receiver
+                        .signal()
+                        .decrypt_group_message(&group, &author, previous)
+                        .await,
+                    Err(SignalError::Protocol(
+                        SignalProtocolError::SignatureValidationFailed
+                    ))
+                ));
+            }
+            let mut tampered = ciphertext.clone();
+            *tampered.last_mut().unwrap() ^= 1;
+            assert!(matches!(
+                receiver
+                    .signal()
+                    .decrypt_group_message(&group, &author, &tampered)
+                    .await,
+                Err(SignalError::Protocol(
+                    SignalProtocolError::SignatureValidationFailed
+                ))
+            ));
+            assert_eq!(
+                receiver
+                    .signal()
+                    .decrypt_group_message(&group, &author, &ciphertext)
+                    .await
+                    .unwrap(),
+                [device as u8]
+            );
+            assert!(
+                receiver
+                    .signal()
+                    .decrypt_group_message(&group, &author, &ciphertext)
+                    .await
+                    .is_err()
+            );
+            previous_ciphertext = Some(ciphertext);
+        }
+        let bare = make_sender_key_name(&group, &Jid::pn("15550001000").to_protocol_address());
+        assert!(
+            backend
+                .get_sender_key(bare.cache_key())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        for device in [33, 81] {
+            assert!(
+                receiver
+                    .signal()
+                    .has_sender_key(&group, &Jid::pn_device("15550001000", device))
+                    .await
+                    .unwrap()
+            );
+        }
+        receiver
+            .signal()
+            .delete_sender_key(&group, &Jid::pn_device("15550001000", 33))
+            .await
+            .unwrap();
+        assert!(
+            !receiver
+                .signal()
+                .has_sender_key(&group, &Jid::pn_device("15550001000", 33))
+                .await
+                .unwrap()
+        );
+        assert!(
+            receiver
+                .signal()
+                .has_sender_key(&group, &Jid::pn_device("15550001000", 81))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn companion_lid_sender_key_keeps_its_device() {
+        let group = Jid::new("120363000000000001", Server::Group);
+        let pn = Jid::pn_device("15550001000", 33);
+        let lid = Jid::lid_device("100000000000001", 33);
+        let (sender, distribution) = companion_group_sender(&group, &pn).await;
+        let (receiver, backend) = memory_client().await;
+        receiver
+            .signal()
+            .process_sender_key_distribution(&group, &lid, &distribution)
+            .await
+            .unwrap();
+        let exact = make_sender_key_name(&group, &lid.to_protocol_address());
+        let bare = make_sender_key_name(&group, &lid.to_non_ad().to_protocol_address());
+        assert!(
+            backend
+                .get_sender_key(exact.cache_key())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            backend
+                .get_sender_key(bare.cache_key())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let (_, ciphertext) = sender
+            .signal()
+            .encrypt_group_message(&group, b"LID companion")
+            .await
+            .unwrap();
+        assert_eq!(
+            receiver
+                .signal()
+                .decrypt_group_message(&group, &lid, &ciphertext)
+                .await
+                .unwrap(),
+            b"LID companion"
+        );
+    }
+
+    #[tokio::test]
+    async fn companion_distribution_preserves_legacy_replay_and_skipped_keys() {
+        let group = Jid::new("120363000000000001", Server::Group);
+        let author = Jid::pn_device("15550001000", 33);
+        let bare_author = author.to_non_ad();
+        let (sender, distribution) = companion_group_sender(&group, &author).await;
+        let (receiver, backend) = memory_client().await;
+        receiver
+            .signal()
+            .process_sender_key_distribution(&group, &bare_author, &distribution)
+            .await
+            .unwrap();
+        let mut ciphertexts = Vec::new();
+        for value in 0..3u8 {
+            ciphertexts.push(
+                sender
+                    .signal()
+                    .encrypt_group_message(&group, &[value])
+                    .await
+                    .unwrap()
+                    .1,
+            );
+        }
+        for index in [0, 2] {
+            assert_eq!(
+                receiver
+                    .signal()
+                    .decrypt_group_message(&group, &bare_author, &ciphertexts[index])
+                    .await
+                    .unwrap(),
+                [index as u8]
+            );
+        }
+        let legacy = make_sender_key_name(&group, &bare_author.to_protocol_address());
+        let before = backend
+            .get_sender_key(legacy.cache_key())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            receiver
+                .signal()
+                .decrypt_group_message(&group, &author, &ciphertexts[1])
+                .await,
+            Err(SignalError::Protocol(
+                SignalProtocolError::NoSenderKeyState(_)
+            ))
+        ));
+        receiver
+            .signal()
+            .process_sender_key_distribution(&group, &author, &distribution)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .get_sender_key(legacy.cache_key())
+                .await
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        for index in [0, 2] {
+            assert!(
+                receiver
+                    .signal()
+                    .decrypt_group_message(&group, &author, &ciphertexts[index])
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            receiver
+                .signal()
+                .decrypt_group_message(&group, &author, &ciphertexts[1])
+                .await
+                .unwrap(),
+            [1]
+        );
+        receiver.signal_shutdown_sync();
+        let restarted = crate::test_utils::create_test_client_with_backend(backend).await;
+        restarted
+            .signal()
+            .process_sender_key_distribution(&group, &author, &distribution)
+            .await
+            .unwrap();
+        assert!(
+            restarted
+                .signal()
+                .decrypt_group_message(&group, &author, &ciphertexts[1])
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn companion_distribution_does_not_inherit_another_signing_identity() {
+        let group = Jid::new("120363000000000001", Server::Group);
+        let author = Jid::pn_device("15550001000", 33);
+        let (old_sender, old_distribution) = companion_group_sender(&group, &author).await;
+        let (receiver, _) = memory_client().await;
+        receiver
+            .signal()
+            .process_sender_key_distribution(&group, &author.to_non_ad(), &old_distribution)
+            .await
+            .unwrap();
+        let (_, old_ciphertext) = old_sender
+            .signal()
+            .encrypt_group_message(&group, b"old")
+            .await
+            .unwrap();
+        receiver
+            .signal()
+            .decrypt_group_message(&group, &author.to_non_ad(), &old_ciphertext)
+            .await
+            .unwrap();
+        let (new_sender, new_distribution) = companion_group_sender(&group, &author).await;
+        receiver
+            .signal()
+            .process_sender_key_distribution(&group, &author, &new_distribution)
+            .await
+            .unwrap();
+        let (_, ciphertext) = new_sender
+            .signal()
+            .encrypt_group_message(&group, b"new")
+            .await
+            .unwrap();
+        assert_eq!(
+            receiver
+                .signal()
+                .decrypt_group_message(&group, &author, &ciphertext)
+                .await
+                .unwrap(),
+            b"new"
+        );
     }
 
     #[cfg(not(target_arch = "wasm32"))]

@@ -1,5 +1,19 @@
 // SPDX-License-Identifier: MIT
 use super::*;
+
+#[test]
+fn receiver_state_inheritance_never_copies_a_signing_secret() {
+    let pair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+    let mut previous = SenderKeyRecord::new_empty();
+    previous
+        .add_sender_key_state(3, 17, 5, &[7; 32], pair.public_key, Some(pair.private_key))
+        .unwrap();
+    let before = previous.serialize().unwrap();
+    let mut destination = SenderKeyRecord::new_empty();
+    assert!(!destination.inherit_receiver_state(&previous, 17, &pair.public_key));
+    assert!(destination.is_empty());
+    assert_eq!(previous.serialize().unwrap(), before);
+}
 use async_trait::async_trait;
 use rand::SeedableRng;
 use std::{

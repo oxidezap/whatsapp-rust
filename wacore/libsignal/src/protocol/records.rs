@@ -1018,6 +1018,43 @@ impl SenderKeyRecord {
         }
         Ok(())
     }
+
+    pub fn has_sender_key_state(&self, id: u32, signing_public: &PublicKey) -> bool {
+        self.inner.states.iter().any(|state| {
+            state.id == id && state.signing_public == *signing_public.public_key_bytes()
+        })
+    }
+
+    /// Retain receive counters and skipped keys only for the same authenticated
+    /// distribution. Signing private keys never cross this recovery boundary.
+    pub fn inherit_receiver_state(
+        &mut self,
+        previous: &Self,
+        id: u32,
+        signing_public: &PublicKey,
+    ) -> bool {
+        if self.has_sender_key_state(id, signing_public) {
+            return false;
+        }
+        let Some(state) = previous.inner.states.iter().find(|state| {
+            state.id == id
+                && state.signing_public == *signing_public.public_key_bytes()
+                && state.signing_private.is_none()
+        }) else {
+            return false;
+        };
+        self.inner.states.retain(|state| state.id != id);
+        self.inner.states.insert(0, state.clone());
+        self.inner.states.truncate(engine::MAX_SENDER_STATES);
+        true
+    }
+
+    pub fn process_distribution(&mut self, message: &SenderKeyDistributionMessage) -> Result<()> {
+        engine::Engine::new(&engine::RustCrypto, &mut NoRandomSource)
+            .process_sender_distribution(&mut self.inner, &message.bytes)?;
+        self.warm_current_verifier();
+        Ok(())
+    }
     pub fn sender_key_state(&self) -> Result<SenderKeyState<'_>> {
         self.inner
             .states
