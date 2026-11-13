@@ -4,19 +4,20 @@
 //! Submitted storage writes may outlive the caller that awaited them.
 #![cfg(not(target_arch = "wasm32"))]
 
+use crate::records::{
+    AesGcmSealer, Fence, LeaseStore, MemoryRecordStore, Namespace, RecordSignalStore, RecordStore,
+    WriteOp,
+};
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use wacore::libsignal::protocol::{DeviceId, ProtocolAddress};
+use wacore::signal::{RemoteBundle, SignalOps};
 use wacore::store::error::{Result, StoreError};
-use wacore_recordstore::{
-    AesGcmSealer, Fence, LeaseStore, MemoryRecordStore, Namespace, RecordSignalStore, RecordStore,
-    WriteOp, is_fence_lost,
-};
-use wacore_signal_ops::{RemoteBundle, SignalOps};
+use wacore::store::transaction::is_authority_lost;
 
-mod common;
-mod runtime;
+use crate::common;
+use crate::runtime;
 use runtime::InlineRuntime;
 
 const TTL: u64 = 60_000;
@@ -98,7 +99,10 @@ impl RecordStore for DelayedRecords {
             resume.notified().await;
             let result = inner.write(&fence, &ops).await;
             committed.store(result.is_ok(), Ordering::SeqCst);
-            refused.store(result.as_ref().is_err_and(is_fence_lost), Ordering::SeqCst);
+            refused.store(
+                result.as_ref().is_err_and(is_authority_lost),
+                Ordering::SeqCst,
+            );
             let _ = send.send(result);
             finished.notify_one();
         });
@@ -190,12 +194,12 @@ async fn cancellation_case(release_before_takeover: bool) {
     encrypt.abort();
     assert!(encrypt.await.unwrap_err().is_cancelled());
     assert!(!alice.is_usable());
-    assert!(waiter.await.unwrap().unwrap_err().is_fence_lost());
+    assert!(waiter.await.unwrap().unwrap_err().is_authority_lost());
     let refused = alice
         .encrypt(&bob_address, b"must not publish under the uncertain fence")
         .await
         .unwrap_err();
-    assert!(refused.is_fence_lost());
+    assert!(refused.is_authority_lost());
     if release_before_takeover {
         records.resume.notify_one();
         records.finished.notified().await;

@@ -1,144 +1,36 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Polymorfa (Softium LLC)
 
-use crate::device::{
-    DeviceKeys, MAX_PREKEY_ID, PublicIdentity, PublicPreKey, PublicSignedPreKey, public_bytes,
-    sign_prekey,
-};
-use crate::error::OpsError;
-use crate::stores::{KeyedLocks, Stores};
-use async_lock::{Mutex, RwLock};
-use async_trait::async_trait;
-use std::sync::Arc;
-use wacore::libsignal::protocol::{
+use crate::libsignal::protocol::{
     CiphertextMessageType, DeviceId, IdentityKey, KeyPair, PreKeyBundle, PreKeySignalMessage,
     ProtocolAddress, PublicKey, SenderKeyDistributionMessage, SignalMessage, UsePQRatchet,
     create_sender_key_distribution_message, group_decrypt, group_encrypt, message_decrypt_prekey,
     message_decrypt_signal, message_encrypt, process_prekey_bundle,
     process_sender_key_distribution_message,
 };
-use wacore::libsignal::store::record_helpers;
-use wacore::libsignal::store::sender_key_name::SenderKeyName;
-use wacore::pair::PairUtils;
-use wacore::store::error::Result as StoreResult;
-use wacore::store::traits::SignalStore;
-use wacore::types::jid::JidExt;
+use crate::libsignal::store::record_helpers;
+use crate::libsignal::store::sender_key_name::SenderKeyName;
+use crate::pair::PairUtils;
+use crate::signal::device::{
+    DeviceKeys, MAX_PREKEY_ID, PublicIdentity, PublicPreKey, PublicSignedPreKey, public_bytes,
+    sign_prekey,
+};
+use crate::signal::error::OpsError;
+use crate::signal::stores::{KeyedLocks, Stores};
+use crate::store::transaction::SignalRecord as Namespace;
+use crate::types::jid::JidExt;
+use async_lock::{Mutex, RwLock};
+use std::sync::Arc;
 use wacore_binary::{Jid, Server};
-use wacore_recordstore::{Fence, Namespace, RecordSignalStore, RecordStore, Sealer};
 
 #[path = "prekeys.rs"]
 mod prekeys;
 pub use prekeys::PreKeyUploadBatch;
 
-/// Storage the Signal service needs beyond [`SignalStore`]: the device key
-/// blob, its own records (decrypt buffer, sent messages), and staged views
-/// whose writes commit as one batch.
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-pub trait ServiceStore: SignalStore + Sized + 'static {
-    async fn load_device_keys(&self) -> StoreResult<Option<Vec<u8>>>;
-    async fn save_device_keys(&self, blob: &[u8]) -> StoreResult<()>;
-    /// Write the first device key blob; fails with `RecordExists` if one is
-    /// already stored.
-    async fn create_device_keys(&self, blob: &[u8]) -> StoreResult<()>;
-    /// A view whose writes are held until [`Self::commit`].
-    fn staged(&self) -> Self;
-    /// Apply a staged view's writes as one fenced batch.
-    async fn commit(&self) -> StoreResult<()>;
-    async fn load_aux(&self, ns: Namespace, key: &str) -> StoreResult<Option<Vec<u8>>>;
-    async fn put_aux(&self, ns: Namespace, key: &str, value: &[u8]) -> StoreResult<()>;
-    /// Exclusive inserts used to publish durable prekey uploads atomically.
-    async fn insert_aux(&self, ns: Namespace, key: &str, value: &[u8]) -> StoreResult<()>;
-    async fn insert_prekeys_batch(&self, keys: &[(u32, bytes::Bytes)]) -> StoreResult<()>;
-    async fn delete_aux(&self, ns: Namespace, keys: &[&str]) -> StoreResult<()>;
-    async fn scan_aux(&self, ns: Namespace, prefix: &str) -> StoreResult<Vec<String>>;
-    /// Addresses with a stored session ([`Namespace::Session`]) or identity
-    /// ([`Namespace::Identity`]) starting with `prefix`.
-    async fn scan_peer_addresses(&self, ns: Namespace, prefix: &str) -> StoreResult<Vec<String>>;
-    /// Identifies the backend and lease fence this store writes under.
-    /// Instances with equal keys in one process share one [`SignalOps`]
-    /// authority.
-    fn authority_key(&self) -> AuthorityKey;
-}
-
-/// The record backend and lease fence behind a [`ServiceStore`].
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct AuthorityKey {
-    backend: usize,
-    scope: Arc<str>,
-    generation: u64,
-}
-
-impl AuthorityKey {
-    /// `backend` must be the shared handle that every store over the same
-    /// records holds; it stays alive while an instance using it is open.
-    pub fn new<B: ?Sized>(backend: &Arc<B>, fence: &Fence) -> Self {
-        Self {
-            backend: Arc::as_ptr(backend).cast::<()>() as usize,
-            scope: fence.scope.clone(),
-            generation: fence.generation,
-        }
-    }
-}
-
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-impl<R: RecordStore + 'static, S: Sealer + 'static> ServiceStore for RecordSignalStore<R, S> {
-    fn authority_key(&self) -> AuthorityKey {
-        AuthorityKey::new(self.records(), RecordSignalStore::fence(self))
-    }
-
-    async fn load_device_keys(&self) -> StoreResult<Option<Vec<u8>>> {
-        self.load_device().await
-    }
-
-    async fn save_device_keys(&self, blob: &[u8]) -> StoreResult<()> {
-        self.save_device(blob).await
-    }
-
-    async fn create_device_keys(&self, blob: &[u8]) -> StoreResult<()> {
-        self.create_device(blob).await
-    }
-
-    fn staged(&self) -> Self {
-        RecordSignalStore::staged(self)
-    }
-
-    async fn commit(&self) -> StoreResult<()> {
-        RecordSignalStore::commit(self).await
-    }
-
-    async fn load_aux(&self, ns: Namespace, key: &str) -> StoreResult<Option<Vec<u8>>> {
-        RecordSignalStore::load_aux(self, ns, key).await
-    }
-
-    async fn put_aux(&self, ns: Namespace, key: &str, value: &[u8]) -> StoreResult<()> {
-        RecordSignalStore::put_aux(self, ns, key, value).await
-    }
-
-    async fn insert_aux(&self, ns: Namespace, key: &str, value: &[u8]) -> StoreResult<()> {
-        RecordSignalStore::insert_aux(self, ns, key, value).await
-    }
-
-    async fn insert_prekeys_batch(&self, keys: &[(u32, bytes::Bytes)]) -> StoreResult<()> {
-        RecordSignalStore::insert_prekeys_batch(self, keys).await
-    }
-
-    async fn delete_aux(&self, ns: Namespace, keys: &[&str]) -> StoreResult<()> {
-        RecordSignalStore::delete_aux(self, ns, keys).await
-    }
-
-    async fn scan_aux(&self, ns: Namespace, prefix: &str) -> StoreResult<Vec<String>> {
-        RecordSignalStore::scan_aux(self, ns, prefix, None).await
-    }
-
-    async fn scan_peer_addresses(&self, ns: Namespace, prefix: &str) -> StoreResult<Vec<String>> {
-        RecordSignalStore::scan_peer_addresses(self, ns, prefix, None).await
-    }
-}
+pub use crate::store::transaction::{AuthorityKey, SignalOperationStore};
 
 /// Pairwise ciphertext kinds, named as in the `<enc type>` attribute.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, wacore::WireEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
 pub enum EncKind {
     /// First message of a session, carries X3DH material.
     #[wire = "pkmsg"]
@@ -173,7 +65,7 @@ pub struct RemoteBundle {
     pub signed_prekey_signature: [u8; 64],
     pub prekey: Option<(u32, [u8; 32])>,
     /// The `<device-identity>` (`ADVSignedDeviceIdentity` bytes) the bundle
-    /// came with. Required for companion devices; see [`crate::SignalResolver`].
+    /// came with. Required for companion devices; see [`crate::signal::SignalResolver`].
     pub device_identity: Option<Vec<u8>>,
 }
 
@@ -204,7 +96,7 @@ pub struct PairingSignature {
     pub key_index: u32,
 }
 
-use crate::guard::Held;
+use crate::signal::guard::Held;
 
 /// Lock key for one peer device's session and identity.
 pub(crate) fn session_key(address: &ProtocolAddress) -> String {
@@ -281,17 +173,17 @@ pub(crate) fn group_key(group: &str) -> String {
 /// marks. Staged views commit whole batches, so two views writing the same
 /// record would lose an update; disjoint views proceed in parallel. Locks are
 /// taken in sorted order, so overlapping operations cannot deadlock. The
-/// store's lease fencing protects against a second node.
+/// store must coordinate writers in other processes.
 pub struct SignalOps<S> {
     store: Arc<S>,
     authority: Arc<Authority>,
-    /// Keeps this fence's registry entry alive, so a later open joins it.
+    /// Keeps this authority's registry entry alive, so a later open joins it.
     _slot: Arc<AuthoritySlot>,
 }
 
-/// Cached keys, locks and the usability flag for one lease fence. A second
-/// instance opened under the same fence shares them instead of creating an
-/// independent authority whose writes the fence would also accept.
+/// Cached keys, locks and the usability flag for one writer authority. A second
+/// instance opened under the same authority shares them instead of creating an
+/// independent authority whose writes the store would also accept.
 struct Authority {
     keys: RwLock<Arc<DeviceKeys>>,
     /// Held while device keys are read-modify-written.
@@ -301,7 +193,7 @@ struct Authority {
     sender_key_locks: Arc<KeyedLocks>,
 }
 
-/// One fence's authority, filled by the first open that reads its keys.
+/// One writer's authority, filled by the first open that reads its keys.
 type AuthoritySlot = async_lock::OnceCell<Arc<Authority>>;
 
 type AuthorityRegistry =
@@ -348,9 +240,9 @@ fn public_key(bytes: &[u8; 32], what: &str) -> Result<PublicKey, OpsError> {
         .map_err(|_| OpsError::InvalidInput(format!("{what} is not a valid public key")))
 }
 
-impl<S: ServiceStore> SignalOps<S> {
+impl<S: SignalOperationStore> SignalOps<S> {
     /// Open a scope that already has device keys. Opening a scope again under
-    /// the same fence while an instance is live shares that instance's keys,
+    /// the same authority while an instance is live shares that instance's keys,
     /// locks and retirement state.
     pub async fn open(store: Arc<S>) -> Result<Self, OpsError> {
         let slot = authority_slot(store.authority_key());
@@ -400,13 +292,13 @@ impl<S: ServiceStore> SignalOps<S> {
                         created.store(true, std::sync::atomic::Ordering::SeqCst);
                         Ok(new_authority(keys))
                     }
-                    Err(e) if wacore_recordstore::is_record_exists(&e) => Err(exists()),
+                    Err(e) if crate::store::transaction::is_record_exists(&e) => Err(exists()),
                     Err(e) => Err(e.into()),
                 }
             })
             .await?
             .clone();
-        // A live instance under this fence means the keys already exist.
+        // A live instance under this authority means the keys already exist.
         if !created.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(exists());
         }
@@ -434,7 +326,7 @@ impl<S: ServiceStore> SignalOps<S> {
     }
 
     /// Whether this instance can still mutate Signal state. Cancellation of a
-    /// locked operation retires it; release the lease and use a higher fence
+    /// locked operation retires it; reconcile persisted state and use a fresh authority
     /// before constructing its replacement.
     pub fn is_usable(&self) -> bool {
         self.authority
@@ -446,7 +338,7 @@ impl<S: ServiceStore> SignalOps<S> {
         if self.is_usable() {
             Ok(())
         } else {
-            Err(crate::error::interrupted_operation())
+            Err(crate::signal::error::interrupted_operation())
         }
     }
 
@@ -482,7 +374,7 @@ impl<S: ServiceStore> SignalOps<S> {
             if u16::try_from(jid.len()).is_err() {
                 return Err(OpsError::InvalidInput(format!("{jid} is too long")));
             }
-            jid.parse::<wacore_binary::Jid>()
+            jid.parse::<Jid>()
                 .map_err(|_| OpsError::InvalidInput(format!("{jid} is not a JID")))
         };
         if !parse(pn)?.is_pn() {
@@ -551,7 +443,7 @@ impl<S: ServiceStore> SignalOps<S> {
     /// private keys commit together; active upload IDs remain reserved.
     pub async fn generate_prekeys(
         &self,
-        runtime: &dyn wacore::runtime::Runtime,
+        runtime: &dyn crate::runtime::Runtime,
         count: u32,
     ) -> Result<Vec<PublicPreKey>, OpsError> {
         self.generate_fresh_prekeys(runtime, count).await
@@ -574,7 +466,7 @@ impl<S: ServiceStore> SignalOps<S> {
                 keys.signed_prekey_id,
                 &keys.signed_prekey,
                 keys.signed_prekey_signature,
-                wacore::time::now_utc(),
+                crate::time::now_utc(),
             )?;
             self.store
                 .store_signed_prekey(
@@ -774,7 +666,7 @@ impl<S: ServiceStore> SignalOps<S> {
         address: &ProtocolAddress,
         bundle: &RemoteBundle,
     ) -> Result<(), OpsError> {
-        let user = crate::trust::device_of(address)?.user;
+        let user = crate::signal::trust::device_of(address)?.user;
         let held = self
             .lock_keys(vec![session_key(address), account_lock(&user)])
             .await?;
@@ -795,7 +687,7 @@ impl<S: ServiceStore> SignalOps<S> {
         address: &ProtocolAddress,
         bundle: &RemoteBundle,
     ) -> Result<(), OpsError> {
-        let device = crate::trust::device_of(address)?;
+        let device = crate::signal::trust::device_of(address)?;
         let device_identity = bundle.device_identity.as_deref();
         let bundle = bundle.to_prekey_bundle()?;
         self.verify_bundle(staged, &device, &bundle, device_identity, None)
@@ -824,7 +716,7 @@ impl<S: ServiceStore> SignalOps<S> {
         ciphertext: &[u8],
         device_identity: Option<&[u8]>,
     ) -> Result<Decrypted, OpsError> {
-        let user = crate::trust::device_of(sender)?.user;
+        let user = crate::signal::trust::device_of(sender)?.user;
         let held = self
             .lock_keys(vec![session_key(sender), account_lock(&user)])
             .await?;
@@ -857,7 +749,7 @@ impl<S: ServiceStore> SignalOps<S> {
                 .identity_key()
                 .public_key()
                 .public_key_bytes();
-            let device = crate::trust::device_of(sender)?;
+            let device = crate::signal::trust::device_of(sender)?;
             self.verify_identity(staged, &device, identity, device_identity, None)
                 .await?
                 .map_err(OpsError::BundleRefused)?;
@@ -868,8 +760,7 @@ impl<S: ServiceStore> SignalOps<S> {
         // for an ordinary `msg` that commits a session with another identity,
         // so compare the stored identity around the decrypt as well.
         let before =
-            wacore::libsignal::protocol::IdentityKeyStore::get_identity(&identities, sender)
-                .await?;
+            crate::libsignal::protocol::IdentityKeyStore::get_identity(&identities, sender).await?;
         let result = match kind {
             EncKind::PreKey => {
                 let message = PreKeySignalMessage::try_from(ciphertext)?;
@@ -899,13 +790,12 @@ impl<S: ServiceStore> SignalOps<S> {
             staged.remove_prekey(id.into()).await?;
         }
         let after =
-            wacore::libsignal::protocol::IdentityKeyStore::get_identity(&identities, sender)
-                .await?;
+            crate::libsignal::protocol::IdentityKeyStore::get_identity(&identities, sender).await?;
         Ok(Decrypted {
             plaintext: result.plaintext,
             identity_changed: matches!(
                 result.identity_change,
-                wacore::libsignal::protocol::IdentityChange::ReplacedExisting
+                crate::libsignal::protocol::IdentityChange::ReplacedExisting
             ) || before
                 .is_some_and(|before| after.is_some_and(|after| before != after)),
         })

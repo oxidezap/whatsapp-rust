@@ -18,17 +18,17 @@
 //! in-blob account key never replaces the pinned one: the client that would
 //! report either is the party this check distrusts.
 
-use crate::error::OpsError;
-use crate::ops::{ServiceStore, SignalOps};
+use crate::adv::{AdvValidation, validate_adv_with_identity_key};
+use crate::client::context::{GroupRoutingInfo, SendContextResolver, SessionLockGuard};
+use crate::libsignal::protocol::{PreKeyBundle, ProtocolAddress};
+use crate::prekeys::{PreKeyFetchOutcome, RejectedDevice};
+use crate::signal::error::OpsError;
+use crate::signal::ops::{SignalOperationStore, SignalOps};
+use crate::store::transaction::SignalRecord as Namespace;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
-use wacore::adv::{AdvValidation, validate_adv_with_identity_key};
-use wacore::client::context::{GroupRoutingInfo, SendContextResolver, SessionLockGuard};
-use wacore::libsignal::protocol::{PreKeyBundle, ProtocolAddress};
-use wacore::prekeys::{PreKeyFetchOutcome, RejectedDevice};
 use wacore_binary::{Jid, JidExt as _};
-use wacore_recordstore::Namespace;
 
 /// A fetched bundle and the `<device-identity>` the server sent with it.
 #[derive(Debug, Clone)]
@@ -94,7 +94,7 @@ pub(crate) fn device_of(address: &ProtocolAddress) -> Result<Jid, OpsError> {
 /// its ordinary account (`hosted` to the phone number, `hosted.lid` to the
 /// LID), as in WA Web's `asUserWidOrThrow`, so it shares that account's pin.
 fn account_key(device: &Jid) -> String {
-    wacore::types::jid::adv_account_jid(device).to_string()
+    crate::types::jid::adv_account_jid(device).to_string()
 }
 
 fn is_primary(device: &Jid) -> bool {
@@ -109,7 +109,7 @@ fn decode_pin(bytes: Option<Vec<u8>>) -> Option<[u8; 32]> {
     bytes.and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
 }
 
-impl<S: ServiceStore> SignalOps<S> {
+impl<S: SignalOperationStore> SignalOps<S> {
     /// The pinned identity of `account` (any device of it), if one is known.
     pub async fn account_identity(&self, account: &Jid) -> Result<Option<[u8; 32]>, OpsError> {
         Self::pinned(self.store(), account).await
@@ -126,7 +126,7 @@ impl<S: ServiceStore> SignalOps<S> {
         identity: [u8; 32],
     ) -> Result<(), OpsError> {
         let held = self
-            .lock_keys(vec![crate::ops::account_lock(&account.user)])
+            .lock_keys(vec![crate::signal::ops::account_lock(&account.user)])
             .await?;
         held.run(async {
             Ok(self
@@ -149,7 +149,7 @@ impl<S: ServiceStore> SignalOps<S> {
     /// and LID. Never taken from the client.
     pub(crate) async fn is_own_account(&self, device: &Jid) -> bool {
         let keys = self.keys().await;
-        let account = wacore::types::jid::adv_account_jid(device);
+        let account = crate::types::jid::adv_account_jid(device);
         [keys.own_pn.as_deref(), keys.own_lid.as_deref()]
             .into_iter()
             .flatten()
@@ -343,15 +343,15 @@ impl<'a, S> Verifying<'a, S> {
 }
 
 /// Carry `error` through wacore's `anyhow` boundary intact, so the send
-/// can return it typed (a lost fence must still read as one).
+/// can return it typed (lost write authority must remain typed).
 pub(crate) fn op_error(error: OpsError) -> anyhow::Error {
     anyhow::Error::new(error)
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-impl<S: ServiceStore> SendContextResolver for Verifying<'_, S> {
-    fn sender_identity_role(&self) -> wacore::send::SenderIdentityRole {
+impl<S: SignalOperationStore> SendContextResolver for Verifying<'_, S> {
+    fn sender_identity_role(&self) -> crate::send::SenderIdentityRole {
         self.inner.sender_identity_role()
     }
 
@@ -420,12 +420,12 @@ impl<S: ServiceStore> SendContextResolver for Verifying<'_, S> {
     fn on_local_identity_change_with_keys(
         &self,
         jid: &Jid,
-        change: wacore::libsignal::protocol::IdentityChange,
+        change: crate::libsignal::protocol::IdentityChange,
     ) {
         self.inner.on_local_identity_change_with_keys(jid, change);
     }
 
-    fn on_unkeyable_devices(&self, reason: wacore::stats::UnkeyableDevice, count: u64) {
+    fn on_unkeyable_devices(&self, reason: crate::stats::UnkeyableDevice, count: u64) {
         self.inner.on_unkeyable_devices(reason, count);
     }
 

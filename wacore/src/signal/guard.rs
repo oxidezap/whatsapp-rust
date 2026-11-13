@@ -3,7 +3,7 @@
 
 //! A cancelled state-changing operation retires its instance before unlocking.
 
-use crate::OpsError;
+use crate::signal::OpsError;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

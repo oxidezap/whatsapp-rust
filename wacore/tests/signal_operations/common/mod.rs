@@ -74,8 +74,8 @@ pub struct Paired {
 }
 
 /// Pair `ops` the way a real primary would, so it holds an account identity.
-pub async fn pair<S: wacore_signal_ops::ServiceStore>(
-    ops: &wacore_signal_ops::SignalOps<S>,
+pub async fn pair<S: wacore::signal::SignalOperationStore>(
+    ops: &wacore::signal::SignalOps<S>,
 ) -> Paired {
     let identity = ops.public_identity().await;
     let (container, account) =
@@ -90,8 +90,8 @@ pub async fn pair<S: wacore_signal_ops::ServiceStore>(
 
 /// Pair `ops` under an existing account key, as a primary does for a device
 /// that was reset or replaced. Returns its new `<device-identity>`.
-pub async fn pair_under<S: wacore_signal_ops::ServiceStore>(
-    ops: &wacore_signal_ops::SignalOps<S>,
+pub async fn pair_under<S: wacore::signal::SignalOperationStore>(
+    ops: &wacore::signal::SignalOps<S>,
     account: &wacore::libsignal::protocol::KeyPair,
 ) -> Vec<u8> {
     let identity = ops.public_identity().await;
@@ -103,9 +103,12 @@ pub async fn pair_under<S: wacore_signal_ops::ServiceStore>(
 /// Pair `peer` under a fresh account and have `sender` pin that account for
 /// `peer_jid`, as it would after meeting the peer's primary device. Returns
 /// the `<device-identity>` the peer's bundle must carry.
-pub async fn vouch<S: wacore_signal_ops::ServiceStore, P: wacore_signal_ops::ServiceStore>(
-    sender: &wacore_signal_ops::SignalOps<S>,
-    peer: &wacore_signal_ops::SignalOps<P>,
+pub async fn vouch<
+    S: wacore::signal::SignalOperationStore,
+    P: wacore::signal::SignalOperationStore,
+>(
+    sender: &wacore::signal::SignalOps<S>,
+    peer: &wacore::signal::SignalOps<P>,
     peer_jid: &str,
 ) -> Vec<u8> {
     let paired = pair(peer).await;

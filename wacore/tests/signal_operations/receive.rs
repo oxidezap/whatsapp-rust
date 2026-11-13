@@ -4,21 +4,21 @@
 //! Buffered receive: idempotent redelivery, atomic commits, sender keys and
 //! the app-state key share gate, with real padded WhatsApp messages.
 
+use crate::records::{
+    AesGcmSealer, Fence, LeaseStore, MemoryRecordStore, Namespace, RecordSignalStore, RecordStore,
+    WriteOp,
+};
 use futures::executor::block_on;
 use std::sync::Arc;
 use wacore::libsignal::protocol::{DeviceId, KeyPair, ProtocolAddress};
 use wacore::messages::MessageUtils;
-use wacore_recordstore::{
-    AesGcmSealer, Fence, LeaseStore, MemoryRecordStore, Namespace, RecordSignalStore, RecordStore,
-    WriteOp,
-};
-use wacore_signal_ops::{
+use wacore::signal::{
     Encrypted, ReceiveKind, ReceiveRequest, Received, ReceivedMessage, RemoteBundle, SignalOps,
 };
 use waproto::whatsapp as wa;
 
-mod common;
-mod runtime;
+use crate::common;
+use crate::runtime;
 use runtime::InlineRuntime;
 
 type Store = RecordSignalStore<MemoryRecordStore, AesGcmSealer>;
@@ -67,7 +67,7 @@ thread_local! {
 
 /// Have `receiver` pin `sender`'s account and remember the identity its
 /// prekey messages must carry (see [`request`]).
-fn accept_sender<R: wacore_signal_ops::ServiceStore>(
+fn accept_sender<R: wacore::signal::SignalOperationStore>(
     receiver: &SignalOps<R>,
     sender: &SignalOps<Store>,
     sender_addr: &ProtocolAddress,
@@ -118,8 +118,8 @@ fn text(body: &str) -> wa::Message {
 
 fn kind(encrypted: &Encrypted) -> ReceiveKind {
     match encrypted.kind {
-        wacore_signal_ops::EncKind::PreKey => ReceiveKind::PreKey,
-        wacore_signal_ops::EncKind::Message => ReceiveKind::Message,
+        wacore::signal::EncKind::PreKey => ReceiveKind::PreKey,
+        wacore::signal::EncKind::Message => ReceiveKind::Message,
     }
 }
 
@@ -205,7 +205,7 @@ fn a_fenced_out_receive_leaves_the_ciphertext_decryptable_by_the_successor() {
         &second.ciphertext,
         false,
     )));
-    assert!(stale.expect_err("fenced out").is_fence_lost());
+    assert!(stale.expect_err("fenced out").is_authority_lost());
 
     // The stale node's ratchet advance never committed, so nothing was lost.
     let bob_b = block_on(SignalOps::open(successor)).unwrap();
@@ -314,7 +314,7 @@ fn only_own_devices_can_hand_over_app_state_keys() {
             &claimed.ciphertext,
             true,
         ))),
-        Err(wacore_signal_ops::OpsError::InvalidInput(_))
+        Err(wacore::signal::OpsError::InvalidInput(_))
     ));
 
     block_on(bob.ops.set_own_jids("222:1@s.whatsapp.net", None)).unwrap();
@@ -405,7 +405,7 @@ fn an_unpaired_account_takes_no_app_state_keys_from_its_own_number() {
     };
     assert!(matches!(
         block_on(bob.ops.receive(posed_request(true))),
-        Err(wacore_signal_ops::OpsError::InvalidInput(_))
+        Err(wacore::signal::OpsError::InvalidInput(_))
     ));
     let posed = message(block_on(bob.ops.receive(posed_request(false))).unwrap());
     assert!(

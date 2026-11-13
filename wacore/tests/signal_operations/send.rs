@@ -4,6 +4,8 @@
 //! Outbound: the service builds the stanza, the client only resolves devices
 //! and bundles, and the recipient decrypts what was built.
 
+use crate::common;
+use crate::records::{AesGcmSealer, LeaseStore, MemoryRecordStore, RecordSignalStore};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::future::Future;
@@ -14,17 +16,15 @@ use wacore::client::context::{GroupRoutingInfo, SendContextResolver, SessionLock
 use wacore::libsignal::protocol::{DeviceId, IdentityKey, PreKeyBundle, PublicKey};
 use wacore::prekeys::PreKeyFetchOutcome;
 use wacore::runtime::{AbortHandle, Runtime};
-use wacore::types::jid::JidExt as _;
-use wacore_binary::{Jid, NodeContent};
-use wacore_recordstore::{AesGcmSealer, LeaseStore, MemoryRecordStore, RecordSignalStore};
-mod common;
-use wacore_signal_ops::{
+use wacore::signal::{
     FetchedBundle, ReceiveKind, ReceiveRequest, Received, SignalOps, SignalResolver,
     VerifiablePrekeys,
 };
+use wacore::types::jid::JidExt as _;
+use wacore_binary::{Jid, NodeContent};
 use waproto::whatsapp as wa;
 
-mod runtime;
+use crate::runtime;
 use runtime::InlineRuntime;
 
 type Store = RecordSignalStore<MemoryRecordStore, AesGcmSealer>;
@@ -286,7 +286,7 @@ async fn receive_group_component(
     from: &Jid,
     from_identity: &[u8],
     (kind, version, ciphertext): (String, u8, Vec<u8>),
-) -> Result<Received, wacore_signal_ops::OpsError> {
+) -> Result<Received, wacore::signal::OpsError> {
     ops.receive(ReceiveRequest {
         chat: &group.to_string(),
         sender: &from.to_protocol_address(),
@@ -541,12 +541,12 @@ async fn a_group_send_distributes_the_sender_key_once_then_reuses_it() {
     alice
         .resend(
             &client,
-            wacore_signal_ops::RetryRequest {
+            wacore::signal::RetryRequest {
                 chat: &group,
                 message_id: "G2",
                 requester: &bob_jid,
                 encryption_jid: &bob_jid,
-                route: wacore_signal_ops::RetryRoute::Group {
+                route: wacore::signal::RetryRoute::Group {
                     addressing_mode: AddressingMode::Pn,
                 },
                 retry_count: 1,
@@ -880,9 +880,9 @@ fn first_enc(stanza: &[u8]) -> (String, u8, Vec<u8>) {
 fn remote_bundle_from(
     bundle: &PreKeyBundle,
     device_identity: Option<Vec<u8>>,
-) -> wacore_signal_ops::RemoteBundle {
+) -> wacore::signal::RemoteBundle {
     let key = |k: &PublicKey| -> [u8; 32] { *k.public_key_bytes() };
-    wacore_signal_ops::RemoteBundle {
+    wacore::signal::RemoteBundle {
         registration_id: bundle.registration_id().unwrap(),
         device_id: bundle.device_id().unwrap().into(),
         identity_key: key(bundle.identity_key().unwrap().public_key()),
@@ -954,7 +954,7 @@ async fn deliver(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_retry_receipt_gets_the_message_re_encrypted() {
-    use wacore_signal_ops::{RetryRequest, RetryRoute};
+    use wacore::signal::{RetryRequest, RetryRoute};
 
     let alice_jid: Jid = "111:1@s.whatsapp.net".parse().unwrap();
     let bob_jid: Jid = "222:1@s.whatsapp.net".parse().unwrap();
@@ -1189,7 +1189,7 @@ async fn a_corrupt_record_is_pruned_instead_of_stopping_the_prune() {
         lease.fence,
     ));
     let ops = SignalOps::create(store.clone()).await.unwrap();
-    use wacore_recordstore::Namespace;
+    use crate::records::Namespace;
     store
         .put_aux(Namespace::SentMessage, "corrupt", b"x")
         .await
@@ -1426,8 +1426,8 @@ async fn an_acknowledgment_from_before_a_rotation_does_not_mark_the_new_key() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_retry_for_a_device_outside_the_conversation_is_refused() {
+    use wacore::signal::{OpsError, RetryRequest, RetryRoute};
     use wacore::types::message::AddressingMode;
-    use wacore_signal_ops::{OpsError, RetryRequest, RetryRoute};
 
     let bob_jid: Jid = "222:1@s.whatsapp.net".parse().unwrap();
     let eve_jid: Jid = "333:1@s.whatsapp.net".parse().unwrap();
@@ -1558,8 +1558,8 @@ async fn a_retry_for_a_device_outside_the_conversation_is_refused() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_group_retry_is_answered_only_for_members_the_message_went_to() {
+    use wacore::signal::{OpsError, RetryRequest, RetryRoute};
     use wacore::types::message::AddressingMode;
-    use wacore_signal_ops::{OpsError, RetryRequest, RetryRoute};
 
     let alice_member: Jid = "111@s.whatsapp.net".parse().unwrap();
     let bob_jid: Jid = "222:1@s.whatsapp.net".parse().unwrap();
@@ -1611,7 +1611,7 @@ async fn a_group_retry_is_answered_only_for_members_the_message_went_to() {
     fn retry<'a>(
         group: &'a Jid,
         requester: &'a Jid,
-        bundle: Option<&'a wacore_signal_ops::RemoteBundle>,
+        bundle: Option<&'a wacore::signal::RemoteBundle>,
     ) -> RetryRequest<'a> {
         RetryRequest {
             chat: group,
@@ -1654,8 +1654,8 @@ async fn a_group_retry_is_answered_only_for_members_the_message_went_to() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_retry_whose_route_does_not_match_its_chat_is_refused() {
+    use wacore::signal::{OpsError, RetryRequest, RetryRoute};
     use wacore::types::message::AddressingMode;
-    use wacore_signal_ops::{OpsError, RetryRequest, RetryRoute};
 
     let bob_jid: Jid = "222:1@s.whatsapp.net".parse().unwrap();
     let alice = device_with_lid(

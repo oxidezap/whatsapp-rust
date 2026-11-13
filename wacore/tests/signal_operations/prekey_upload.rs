@@ -2,6 +2,10 @@
 // Copyright (C) 2026 Polymorfa (Softium LLC)
 
 //! Public upload retries recover from the sealed store, not process memory.
+use crate::records::{
+    AesGcmSealer, Fence, LeaseStore, MemoryRecordStore, Namespace, RecordSignalStore, RecordStore,
+    SealError, Sealer, WriteOp,
+};
 use async_trait::async_trait;
 use futures::channel::oneshot;
 use futures::executor::block_on;
@@ -9,18 +13,14 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU32, AtomicUsize, Ordering},
 };
+use wacore::signal::{DeviceKeys, SignalOps};
 use wacore::store::{
     error::{Result as StoreResult, StoreError},
     traits::SignalStore,
 };
-use wacore_recordstore::{
-    AesGcmSealer, Fence, LeaseStore, MemoryRecordStore, Namespace, RecordSignalStore, RecordStore,
-    SealError, Sealer, WriteOp,
-};
-use wacore_signal_ops::{DeviceKeys, SignalOps};
 
-mod common;
-mod runtime;
+use crate::common;
+use crate::runtime;
 use runtime::InlineRuntime;
 
 const SCOPE: &str = "synthetic-upload-device";
@@ -263,7 +263,7 @@ fn legacy_mark_is_fresh_only_and_rejects_all_original_pending_members_atomically
             let writes = f.records.batches.lock().unwrap().len();
             assert!(matches!(
                 f.ops.mark_prekeys_uploaded(&ids).await,
-                Err(wacore_signal_ops::OpsError::InvalidInput(_))
+                Err(wacore::signal::OpsError::InvalidInput(_))
             ));
             assert_eq!(f.records.batches.lock().unwrap().len(), writes);
             assert_eq!(f.uploaded(fresh).await, Some(false));
@@ -323,7 +323,7 @@ fn legacy_mark_refuses_corrupt_pending_metadata_and_stale_fences() {
                 .mark_prekeys_uploaded(&[fresh])
                 .await
                 .unwrap_err()
-                .is_fence_lost()
+                .is_authority_lost()
         );
         assert_eq!(f.uploaded(fresh).await, Some(false));
     });
@@ -759,21 +759,21 @@ fn consumed_batch_retires_and_stale_holder_cannot_prepare_or_ack() {
                 .prepare_prekey_upload(&InlineRuntime, 1)
                 .await
                 .unwrap_err()
-                .is_fence_lost()
+                .is_authority_lost()
         );
         assert!(
             f.ops
                 .acknowledge_prekey_upload(&replacement.batch_id, &[replacement.pre_keys[0].id])
                 .await
                 .unwrap_err()
-                .is_fence_lost()
+                .is_authority_lost()
         );
         assert!(
             f.ops
                 .generate_prekeys(&InlineRuntime, 1)
                 .await
                 .unwrap_err()
-                .is_fence_lost()
+                .is_authority_lost()
         );
         let store = Arc::new(RecordSignalStore::new(
             f.records.clone(),
@@ -853,7 +853,7 @@ fn corrupted_pending_metadata_or_private_keys_fail_closed_without_replacement() 
         // Count validation, on a healthy device so no other check can be
         // what refuses.
         let f = Fixture::new().await;
-        let count_error = |error: wacore_signal_ops::OpsError| {
+        let count_error = |error: wacore::signal::OpsError| {
             assert!(
                 error.to_string().contains("prekey count must be 1 to 812"),
                 "{error}"
@@ -939,7 +939,7 @@ fn lost_ack_response_replays_after_restart_without_touching_new_pending_or_cross
                 .acknowledge_prekey_upload(&batch.batch_id, &[1, 2])
                 .await
                 .unwrap_err()
-                .is_fence_lost()
+                .is_authority_lost()
         );
     });
 }
@@ -980,7 +980,7 @@ fn allocation_work_is_bounded_and_collision_refuses_the_entire_staged_batch() {
         let mut keys = DeviceKeys::decode(before.as_deref().unwrap()).unwrap();
         keys.next_prekey_id = 5001;
         staged.save_device(&keys.encode().unwrap()).await.unwrap();
-        assert!(wacore_recordstore::is_record_exists(
+        assert!(crate::records::is_record_exists(
             &staged.commit().await.unwrap_err()
         ));
         assert_eq!(f.store.load_device().await.unwrap(), before);
@@ -996,7 +996,7 @@ fn allocation_work_is_bounded_and_collision_refuses_the_entire_staged_batch() {
 fn actual_signal_consumption_filters_the_recovered_public_batch() {
     block_on(async {
         use wacore::libsignal::protocol::{DeviceId, ProtocolAddress};
-        use wacore_signal_ops::RemoteBundle;
+        use wacore::signal::RemoteBundle;
         let sender = Fixture::new().await;
         let receiver = Fixture::new().await;
         let batch = receiver
@@ -1095,13 +1095,13 @@ fn upload_ceiling_and_corrupt_ack_receipt_are_enforced() {
 
 /// Counts blocking jobs and the thread each ran on.
 struct CountingRuntime {
-    jobs: std::sync::atomic::AtomicUsize,
+    jobs: AtomicUsize,
 }
 
 impl wacore::runtime::Runtime for CountingRuntime {
     fn spawn(
         &self,
-        future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>,
+        future: std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
     ) -> wacore::runtime::AbortHandle {
         InlineRuntime.spawn(future)
     }
@@ -1109,19 +1109,19 @@ impl wacore::runtime::Runtime for CountingRuntime {
     fn sleep(
         &self,
         duration: std::time::Duration,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
         InlineRuntime.sleep(duration)
     }
 
     fn spawn_blocking(
         &self,
         f: Box<dyn FnOnce() + Send + 'static>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
-        self.jobs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        self.jobs.fetch_add(1, Ordering::SeqCst);
         InlineRuntime.spawn_blocking(f)
     }
 
-    fn yield_now(&self) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> {
+    fn yield_now(&self) -> Option<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>> {
         None
     }
 }
@@ -1131,13 +1131,13 @@ fn prekey_generation_runs_as_blocking_work() {
     block_on(async {
         let f = Fixture::new().await;
         let runtime = CountingRuntime {
-            jobs: std::sync::atomic::AtomicUsize::new(0),
+            jobs: AtomicUsize::new(0),
         };
         let batch = f.ops.prepare_prekey_upload(&runtime, 812).await.unwrap();
         assert_eq!(batch.pre_keys.len(), 812);
-        assert_eq!(runtime.jobs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(runtime.jobs.load(Ordering::SeqCst), 1);
         f.ops.generate_prekeys(&runtime, 3).await.unwrap();
-        assert_eq!(runtime.jobs.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(runtime.jobs.load(Ordering::SeqCst), 2);
     });
 }
 

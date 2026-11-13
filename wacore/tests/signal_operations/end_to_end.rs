@@ -4,18 +4,18 @@
 //! Two linked devices talking through real Signal sessions, each keeping its
 //! state in a sealed, fenced record store.
 
+use crate::common;
+use crate::records::{
+    AesGcmSealer, LeaseStore, MemoryRecordStore, Namespace, RecordSignalStore, RecordStore,
+};
+use common::pair_success_container;
 use futures::executor::block_on;
 use std::sync::Arc;
 use wacore::libsignal::protocol::{DeviceId, ProtocolAddress};
+use wacore::signal::{EncKind, OpsError, RemoteBundle, SignalOps};
 use wacore::store::traits::SignalStore;
-use wacore_recordstore::{
-    AesGcmSealer, LeaseStore, MemoryRecordStore, Namespace, RecordSignalStore, RecordStore,
-};
-mod common;
-use common::pair_success_container;
-use wacore_signal_ops::{EncKind, OpsError, RemoteBundle, SignalOps};
 
-mod runtime;
+use crate::runtime;
 use runtime::InlineRuntime;
 
 type Store = RecordSignalStore<MemoryRecordStore, AesGcmSealer>;
@@ -190,7 +190,7 @@ fn a_failed_over_node_keeps_the_session_and_the_old_node_is_fenced_out() {
         Some(&alice_identity),
     ));
     let err = stale.expect_err("the superseded node must not advance the ratchet");
-    assert!(err.is_fence_lost(), "unexpected error: {err:?}");
+    assert!(err.is_authority_lost(), "unexpected error: {err:?}");
 
     let opened = block_on(bob_b.decrypt(
         &alice_addr,

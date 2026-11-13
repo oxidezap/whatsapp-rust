@@ -12,25 +12,27 @@
 //! the stanza is returned, matching wacore's rule that Signal state is durable
 //! before ciphertext is published.
 
-use crate::error::OpsError;
-use crate::ops::RemoteBundle;
-use crate::ops::{ServiceStore, SignalOps, account_lock, chain_key, group_key, session_key};
-use crate::trust::{SignalResolver, Verifying};
-use std::collections::HashSet;
-use wacore::client::context::{GroupRoutingInfo, SendContextResolver};
-use wacore::libsignal::protocol::{UsePQRatchet, process_prekey_bundle};
-use wacore::libsignal::store::sender_key_name::SenderKeyName;
-use wacore::runtime::Runtime;
-use wacore::send::{
+use crate::client::context::{GroupRoutingInfo, SendContextResolver};
+use crate::libsignal::protocol::{UsePQRatchet, process_prekey_bundle};
+use crate::libsignal::store::sender_key_name::SenderKeyName;
+use crate::runtime::Runtime;
+use crate::send::{
     DmSignalAddressing, DmStanzaRequest, GroupStanzaRequest, ResolvedDmDevices,
     ResolvedGroupDevices, SenderKeyDistributionPolicy, SignalStores, prepare_dm_stanza,
     prepare_group_stanza_resolved, retain_skdm_distribution_targets,
 };
-use wacore::send::{PairwiseRetryDestination, PairwiseRetryRequest, prepare_pairwise_retry_stanza};
-use wacore::types::jid::JidExt as _;
-use wacore::types::message::{AddressingMode, EditAttribute};
+use crate::send::{PairwiseRetryDestination, PairwiseRetryRequest, prepare_pairwise_retry_stanza};
+use crate::signal::error::OpsError;
+use crate::signal::ops::RemoteBundle;
+use crate::signal::ops::{
+    SignalOperationStore, SignalOps, account_lock, chain_key, group_key, session_key,
+};
+use crate::signal::trust::{SignalResolver, Verifying};
+use crate::store::transaction::SignalRecord as Namespace;
+use crate::types::jid::JidExt as _;
+use crate::types::message::{AddressingMode, EditAttribute};
+use std::collections::HashSet;
 use wacore_binary::{Jid, JidExt};
-use wacore_recordstore::Namespace;
 use waproto::whatsapp as wa;
 
 /// A finished `<message>` stanza for the client to transmit.
@@ -55,7 +57,7 @@ fn sent_key(chat: &Jid, message_id: &str) -> String {
 /// message, the group's participants at send time otherwise. A retry is only
 /// answered for that audience.
 fn encode_sent(message: &[u8], secret: Option<&[u8; 32]>, audience: &[Jid]) -> Vec<u8> {
-    let inserted_ms = u64::try_from(wacore::time::now_utc().timestamp_millis()).unwrap_or(0);
+    let inserted_ms = u64::try_from(crate::time::now_utc().timestamp_millis()).unwrap_or(0);
     let audience: Vec<String> = audience.iter().map(Jid::to_string).collect();
     let mut out = Vec::with_capacity(
         8 + 1 + 32 + 4 + audience.iter().map(|jid| 2 + jid.len()).sum::<usize>() + message.len(),
@@ -136,7 +138,7 @@ pub(crate) fn send_error(error: anyhow::Error) -> OpsError {
         Ok(error) => return error,
         Err(error) => error,
     };
-    match error.downcast::<wacore::store::error::StoreError>() {
+    match error.downcast::<crate::store::error::StoreError>() {
         Ok(error) => OpsError::Store(error),
         Err(error) => OpsError::Send(format!("{error:#}")),
     }
@@ -147,29 +149,19 @@ mod send_error_tests {
     use super::*;
 
     fn fence_lost() -> OpsError {
-        OpsError::Store(
-            wacore_recordstore::FenceLost {
-                scope: "scope".into(),
-                generation: 1,
-            }
-            .into_store_error(),
-        )
+        OpsError::Store(crate::store::transaction::AuthorityLost.into_store_error())
     }
 
     #[test]
     fn a_lost_fence_raised_inside_a_send_stays_a_lost_fence() {
-        let error = crate::trust::op_error(fence_lost());
-        assert!(send_error(error.context("while fetching prekeys")).is_fence_lost());
+        let error = crate::signal::trust::op_error(fence_lost());
+        assert!(send_error(error.context("while fetching prekeys")).is_authority_lost());
     }
 
     #[test]
     fn a_store_error_from_the_send_path_stays_a_store_error() {
-        let store = wacore_recordstore::FenceLost {
-            scope: "scope".into(),
-            generation: 1,
-        }
-        .into_store_error();
-        assert!(send_error(anyhow::Error::new(store)).is_fence_lost());
+        let store = crate::store::transaction::AuthorityLost.into_store_error();
+        assert!(send_error(anyhow::Error::new(store)).is_authority_lost());
     }
 
     #[test]
@@ -305,7 +297,7 @@ async fn same_account(
         .is_some_and(|user| user == lid.user)
 }
 
-impl<S: ServiceStore> SignalOps<S> {
+impl<S: SignalOperationStore> SignalOps<S> {
     /// Refuse a retry for a device outside the original conversation before
     /// any state changes: re-encrypting a stored message to a device the
     /// caller picks would hand out past plaintext. Membership and PN/LID
@@ -446,7 +438,7 @@ impl<S: ServiceStore> SignalOps<S> {
             .map_err(send_error)?;
         // Hosted (Cloud API) devices never get a copy, as in the client.
         devices.retain(|device| !device.is_hosted());
-        wacore::types::jid::sort_dedup_by_device(&mut devices);
+        crate::types::jid::sort_dedup_by_device(&mut devices);
         let resolved = ResolvedDmDevices::new(devices, &own_jid, own_lid.as_ref());
 
         // Fix each device's Signal address up front (its LID when the client
@@ -649,7 +641,7 @@ impl<S: ServiceStore> SignalOps<S> {
                     .map(|device| routing.phone_device_jid_into_lid(device))
                     .collect();
             }
-            wacore::types::jid::sort_dedup_by_device(&mut devices);
+            crate::types::jid::sort_dedup_by_device(&mut devices);
             let addressed = ResolvedGroupDevices::new(devices);
 
             let mut held_keys = Vec::new();
@@ -874,7 +866,7 @@ impl<S: ServiceStore> SignalOps<S> {
     }
 
     /// Rotate this device's PN and LID sender-key chains, clear distribution
-    /// marks and start a new distribution epoch in one fenced batch. Use after membership changes so a removed
+    /// marks and start a new distribution epoch in one atomic batch. Use after membership changes so a removed
     /// participant cannot decrypt later messages using the previous chain.
     pub async fn forget_sender_key_devices(&self, group: &Jid) -> Result<(), OpsError> {
         let OwnIdentity { pn, lid, .. } = self.own_identity().await?;

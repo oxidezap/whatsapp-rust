@@ -8,7 +8,7 @@ use aes_gcm::{
 use async_trait::async_trait;
 use rand::Rng;
 
-/// Seals record values before they reach a [`crate::RecordStore`].
+/// Seals record values before they reach a [`crate::records::RecordStore`].
 ///
 /// Implementations other than [`AesGcmSealer`] exist where the key must not
 /// enter this process, for example a non-extractable WebCrypto key in a

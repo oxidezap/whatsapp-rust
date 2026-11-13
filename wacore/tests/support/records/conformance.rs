@@ -8,7 +8,7 @@
 //! scope with a random suffix, so the suite can share a database with other
 //! tests and with earlier runs.
 
-use crate::record::{
+use crate::records::record::{
     Fence, LeaseStore, Namespace, RecordStore, WriteOp, is_fence_lost, is_record_exists,
 };
 use rand::Rng;

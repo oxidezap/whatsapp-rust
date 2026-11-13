@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Polymorfa (Softium LLC)
 
-use crate::record::{Fence, Namespace, RecordExists, RecordStore, WriteOp};
-use crate::seal::{SealError, Sealer};
+use crate::records::record::{Fence, Namespace, RecordExists, RecordStore, WriteOp};
+use crate::records::seal::{SealError, Sealer};
 use async_lock::Mutex;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -513,7 +513,7 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
     }
 
     /// Write the local device's first key blob. Fails with
-    /// [`crate::RecordExists`] if the scope already has one, so two concurrent
+    /// [`crate::records::RecordExists`] if the scope already has one, so two concurrent
     /// initialisers cannot both succeed.
     pub async fn create_device(&self, blob: &[u8]) -> Result<()> {
         self.apply(vec![PlainOp::Insert(
@@ -806,9 +806,9 @@ impl<R: RecordStore, S: Sealer> SignalStore for RecordSignalStore<R, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::MemoryRecordStore;
-    use crate::record::{LeaseStore, is_fence_lost};
-    use crate::seal::AesGcmSealer;
+    use crate::records::memory::MemoryRecordStore;
+    use crate::records::record::{LeaseStore, is_fence_lost};
+    use crate::records::seal::AesGcmSealer;
     use futures::executor::block_on;
 
     const TTL: u64 = 10_000;
@@ -908,7 +908,7 @@ mod tests {
             (7, Bytes::from_static(b"replacement")),
         ]))
         .unwrap_err();
-        assert!(crate::is_record_exists(&error));
+        assert!(crate::records::is_record_exists(&error));
         assert_eq!(
             block_on(staged.load_prekey(7)).unwrap(),
             Some(Bytes::from_static(b"first"))
@@ -930,9 +930,9 @@ mod tests {
         block_on(staged.store_prekey(7, b"updated", false)).unwrap();
         block_on(store.store_prekey(7, b"independent", false)).unwrap();
         let error = block_on(staged.commit()).unwrap_err();
-        assert!(crate::is_record_exists(&error));
+        assert!(crate::records::is_record_exists(&error));
         let retry = block_on(staged.commit()).unwrap_err();
-        assert!(crate::is_record_exists(&retry));
+        assert!(crate::records::is_record_exists(&retry));
         assert_eq!(
             block_on(staged.load_prekey(7)).unwrap(),
             Some(Bytes::from_static(b"updated"))
@@ -959,7 +959,7 @@ mod tests {
             block_on(store.store_prekey(7, b"independent", false)).unwrap();
             for _ in 0..2 {
                 let error = block_on(staged.commit()).unwrap_err();
-                assert!(crate::is_record_exists(&error));
+                assert!(crate::records::is_record_exists(&error));
                 assert_eq!(
                     block_on(store.load_prekey(7)).unwrap(),
                     Some(Bytes::from_static(b"independent"))

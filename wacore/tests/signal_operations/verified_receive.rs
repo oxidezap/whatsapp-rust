@@ -4,17 +4,17 @@
 //! A prekey message starts a session, so its sender is verified like a
 //! fetched bundle; pins follow a PN-to-LID migration; own JIDs are checked.
 
+use crate::records::{AesGcmSealer, LeaseStore, MemoryRecordStore, RecordSignalStore};
 use futures::executor::block_on;
 use std::sync::Arc;
+use wacore::signal::{
+    BundleRejection, EncKind, OpsError, RemoteBundle, SignalOperationStore, SignalOps,
+};
 use wacore::types::jid::JidExt as _;
 use wacore_binary::Jid;
-use wacore_recordstore::{AesGcmSealer, LeaseStore, MemoryRecordStore, RecordSignalStore};
-use wacore_signal_ops::{
-    BundleRejection, EncKind, OpsError, RemoteBundle, ServiceStore, SignalOps,
-};
 
-mod common;
-mod runtime;
+use crate::common;
+use crate::runtime;
 use runtime::InlineRuntime;
 
 type Store = RecordSignalStore<MemoryRecordStore, AesGcmSealer>;

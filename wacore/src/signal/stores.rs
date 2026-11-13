@@ -6,20 +6,20 @@
 //! Records use the same for-store encodings as wacore's own direct-write
 //! adapters, so a scope written here reads back in any wacore consumer.
 
-use crate::device::DeviceKeys;
-use async_lock::Mutex;
-use async_trait::async_trait;
-use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
-use wacore::libsignal::protocol::{
+use crate::libsignal::protocol::{
     Direction, GenericSignedPreKey, IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore,
     PreKeyId, PreKeyRecord, PreKeyStore, ProtocolAddress, PublicKey, SenderKeyRecord,
     SenderKeyStore, SessionRecord, SessionStore, SignalProtocolError, SignedPreKeyId,
     SignedPreKeyRecord, SignedPreKeyStore,
 };
-use wacore::libsignal::store::record_helpers;
-use wacore::libsignal::store::sender_key_name::SenderKeyName;
-use wacore::store::traits::SignalStore;
+use crate::libsignal::store::record_helpers;
+use crate::libsignal::store::sender_key_name::SenderKeyName;
+use crate::signal::device::DeviceKeys;
+use crate::store::traits::SignalStore;
+use async_lock::Mutex;
+use async_trait::async_trait;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 type SignalResult<T> = Result<T, SignalProtocolError>;
 
@@ -222,7 +222,7 @@ impl<S: SignalStore + 'static> SignedPreKeyStore for Stores<S> {
                 id,
                 &self.keys.signed_prekey,
                 self.keys.signed_prekey_signature,
-                wacore::time::now_utc(),
+                crate::time::now_utc(),
             )?
         } else {
             // A prekey message minted against a rotated-out signed prekey

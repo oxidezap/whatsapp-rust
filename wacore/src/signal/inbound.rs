@@ -4,18 +4,20 @@
 //! Buffered, idempotent receive for the Signal service.
 //!
 //! A decrypt advances the ratchet, so the same ciphertext cannot be decrypted
-//! twice. Each result is kept in the sealed decrypt buffer, written in the
+//! twice. Each result is kept in the persisted decrypt buffer, written in the
 //! same batch as the ratchet advance, until the app confirms delivery with
 //! [`SignalOps::mark_delivered`]. A redelivered ciphertext returns the
 //! buffered result; once delivered it returns [`Received::AlreadyDelivered`].
 
-use crate::error::OpsError;
-use crate::ops::{EncKind, ServiceStore, SignalOps, account_lock, chain_key, session_key};
+use crate::libsignal::protocol::{ProtocolAddress, SignalProtocolError};
+use crate::message_processing::{DecryptedMessageResult, process_decrypted_plaintext};
+use crate::signal::error::OpsError;
+use crate::signal::ops::{
+    EncKind, SignalOperationStore, SignalOps, account_lock, chain_key, session_key,
+};
+use crate::store::transaction::SignalRecord as Namespace;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use wacore::libsignal::protocol::{ProtocolAddress, SignalProtocolError};
-use wacore::message_processing::{DecryptedMessageResult, process_decrypted_plaintext};
-use wacore_recordstore::Namespace;
 use waproto::whatsapp as wa;
 
 const STATE_PENDING: u8 = 1;
@@ -23,7 +25,7 @@ const STATE_DELIVERED: u8 = 2;
 const HEADER_LEN: usize = 1 + 1 + 1 + 8;
 
 /// The `<enc type>` of a received payload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, wacore::WireEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
 pub enum ReceiveKind {
     #[wire = "pkmsg"]
     PreKey,
@@ -99,7 +101,7 @@ fn receipt_key(request: &ReceiveRequest<'_>) -> String {
 }
 
 fn now_ms() -> u64 {
-    u64::try_from(wacore::time::now_utc().timestamp_millis()).unwrap_or(0)
+    u64::try_from(crate::time::now_utc().timestamp_millis()).unwrap_or(0)
 }
 
 /// Flag bits in a buffer entry's third byte.
@@ -211,7 +213,7 @@ fn key_share(
         .and_then(|p| p.app_state_sync_key_share.clone())
 }
 
-impl<S: ServiceStore> SignalOps<S> {
+impl<S: SignalOperationStore> SignalOps<S> {
     /// Decrypt, buffer and classify one received payload. Sender-key
     /// distributions inside it are stored in the same batch as the decrypt.
     pub async fn receive(&self, request: ReceiveRequest<'_>) -> Result<Received, OpsError> {
@@ -226,7 +228,7 @@ impl<S: ServiceStore> SignalOps<S> {
             _ => vec![
                 session_key(request.sender),
                 chain,
-                account_lock(&crate::trust::device_of(request.sender)?.user),
+                account_lock(&crate::signal::trust::device_of(request.sender)?.user),
             ],
         };
         // `is_from_me` gates app-state key shares, so it is derived from the
@@ -234,7 +236,7 @@ impl<S: ServiceStore> SignalOps<S> {
         // the sender does not support is refused rather than believed. Until
         // pairing anchors the account, no sender counts as an own device.
         let from_me = self
-            .is_anchored_own_device(&crate::trust::device_of(request.sender)?)
+            .is_anchored_own_device(&crate::signal::trust::device_of(request.sender)?)
             .await;
         if request.is_from_me && !from_me {
             return Err(OpsError::InvalidInput(

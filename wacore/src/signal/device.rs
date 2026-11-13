@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Polymorfa (Softium LLC)
 
-use crate::error::OpsError;
+use crate::libsignal::protocol::{IdentityKeyPair, KeyPair, PrivateKey, PublicKey};
+use crate::signal::error::OpsError;
 use rand::{Rng, RngExt};
-use wacore::libsignal::protocol::{IdentityKeyPair, KeyPair, PrivateKey, PublicKey};
 
 /// The local device's own keys. Private halves never leave the Signal store.
 #[derive(Clone)]

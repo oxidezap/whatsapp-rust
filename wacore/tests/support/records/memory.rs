@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Polymorfa (Softium LLC)
 
-use crate::record::{
+use crate::records::record::{
     Fence, FenceLost, Lease, LeaseStore, Namespace, RecordExists, RecordStore, WriteOp,
 };
 use async_trait::async_trait;
@@ -224,6 +224,8 @@ mod tests {
 
     #[test]
     fn passes_the_conformance_suite() {
-        futures::executor::block_on(crate::conformance::run_all(&MemoryRecordStore::new()));
+        futures::executor::block_on(crate::records::conformance::run_all(
+            &MemoryRecordStore::new(),
+        ));
     }
 }

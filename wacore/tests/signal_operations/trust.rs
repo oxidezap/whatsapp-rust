@@ -5,6 +5,7 @@
 //! built from them, whether they come from a send's fetch, a retry receipt
 //! or `establish_session`.
 
+use crate::records::{AesGcmSealer, LeaseStore, MemoryRecordStore, RecordSignalStore};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::future::Future;
@@ -15,17 +16,16 @@ use wacore::client::context::{GroupRoutingInfo, SendContextResolver, SessionLock
 use wacore::libsignal::protocol::{DeviceId, IdentityKey, KeyPair, PreKeyBundle, PublicKey};
 use wacore::prekeys::PreKeyFetchOutcome;
 use wacore::runtime::{AbortHandle, Runtime};
-use wacore::types::jid::JidExt as _;
-use wacore_binary::{Jid, NodeContent};
-use wacore_recordstore::{AesGcmSealer, LeaseStore, MemoryRecordStore, RecordSignalStore};
-use wacore_signal_ops::{
+use wacore::signal::{
     BundleRejection, FetchedBundle, OpsError, ReceiveKind, ReceiveRequest, Received, RemoteBundle,
     RetryRequest, RetryRoute, SignalOps, SignalResolver, VerifiablePrekeys,
 };
+use wacore::types::jid::JidExt as _;
+use wacore_binary::{Jid, NodeContent};
 use waproto::whatsapp as wa;
 
-mod common;
-mod runtime;
+use crate::common;
+use crate::runtime;
 use runtime::InlineRuntime;
 
 type Store = RecordSignalStore<MemoryRecordStore, AesGcmSealer>;
@@ -924,11 +924,11 @@ struct PinWritePause {
 }
 
 #[async_trait]
-impl wacore_recordstore::RecordStore for PinWritePause {
+impl crate::records::RecordStore for PinWritePause {
     async fn get(
         &self,
         scope: &str,
-        ns: wacore_recordstore::Namespace,
+        ns: crate::records::Namespace,
         key: &str,
     ) -> wacore::store::error::Result<Option<Vec<u8>>> {
         self.inner.get(scope, ns, key).await
@@ -937,7 +937,7 @@ impl wacore_recordstore::RecordStore for PinWritePause {
     async fn get_many(
         &self,
         scope: &str,
-        ns: wacore_recordstore::Namespace,
+        ns: crate::records::Namespace,
         keys: &[&str],
     ) -> wacore::store::error::Result<Vec<(String, Vec<u8>)>> {
         self.inner.get_many(scope, ns, keys).await
@@ -946,7 +946,7 @@ impl wacore_recordstore::RecordStore for PinWritePause {
     async fn scan_keys(
         &self,
         scope: &str,
-        ns: wacore_recordstore::Namespace,
+        ns: crate::records::Namespace,
         prefix: &str,
         limit: Option<usize>,
     ) -> wacore::store::error::Result<Vec<String>> {
@@ -955,10 +955,10 @@ impl wacore_recordstore::RecordStore for PinWritePause {
 
     async fn write(
         &self,
-        fence: &wacore_recordstore::Fence,
-        ops: &[wacore_recordstore::WriteOp],
+        fence: &crate::records::Fence,
+        ops: &[crate::records::WriteOp],
     ) -> wacore::store::error::Result<()> {
-        use wacore_recordstore::{Namespace, WriteOp};
+        use crate::records::{Namespace, WriteOp};
         let pins = ops.iter().any(|op| {
             matches!(
                 op,

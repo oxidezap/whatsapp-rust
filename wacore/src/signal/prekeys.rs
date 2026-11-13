@@ -4,11 +4,11 @@
 //! Durable public upload batches, separate from fresh retry prekeys.
 
 use super::*;
+use crate::runtime::Runtime;
+use crate::store::error::StoreError;
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use wacore::runtime::Runtime;
-use wacore::store::error::StoreError;
 
 const PENDING: &str = "prekey-upload-v1";
 const LAST_ACK: &str = "prekey-upload-ack-v1";
@@ -87,7 +87,7 @@ impl PreKeyUploadBatch {
     }
 }
 
-impl<S: ServiceStore> SignalOps<S> {
+impl<S: SignalOperationStore> SignalOps<S> {
     async fn pending_upload(&self) -> Result<Option<PreKeyUploadBatch>, OpsError> {
         self.store
             .load_aux(Namespace::Device, PENDING)
@@ -146,7 +146,7 @@ impl<S: ServiceStore> SignalOps<S> {
                 let live = self.live_upload_keys(&batch).await?;
                 let staged = self.store.staged();
                 if !live.is_empty() {
-                    // A fenced write also refuses a superseded holder before any
+                    // The backend must refuse a superseded writer before any
                     // public batch is returned, including a recovered one.
                     staged
                         .put_aux(Namespace::Device, PENDING, &batch.encode()?)
@@ -331,7 +331,7 @@ impl<S: ServiceStore> SignalOps<S> {
         keys.next_prekey_id = next;
         // Up to 812 key generations and encodes: off the async executor, as
         // the client's own prekey upload does.
-        let (records, public) = wacore::runtime::blocking(runtime, move || {
+        let (records, public) = crate::runtime::blocking(runtime, move || {
             let mut random = rng();
             let mut records = Vec::with_capacity(ids.len());
             let mut public = Vec::with_capacity(ids.len());
