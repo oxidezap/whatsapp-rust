@@ -26,7 +26,10 @@ impl SendContextResolver for Client {
     }
 
     async fn resolve_devices(&self, jids: &[Jid]) -> Result<Vec<Jid>, anyhow::Error> {
-        self.get_user_devices(jids).await
+        // Only group sends resolve through here.
+        self.get_group_user_devices_owned(jids.iter().map(Jid::to_non_ad).collect())
+            .await
+            .map(|(devices, _)| devices)
     }
 
     async fn fetch_prekeys(

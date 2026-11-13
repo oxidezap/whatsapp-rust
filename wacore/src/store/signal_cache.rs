@@ -2705,6 +2705,48 @@ impl SignalStoreCache {
         Ok(())
     }
 
+    /// Retain a durable empty row so a deleted companion chain cannot borrow
+    /// stale counters from an older bare-address row after restart.
+    pub async fn clear_sender_key_durable(
+        &self,
+        name: &SenderKeyName,
+        backend: &dyn SignalStore,
+    ) -> Result<()> {
+        let lock = self.sender_key_lock(name).await;
+        let _guard = lock.lock().await;
+        let _flush_guard = self.flush_lock.lock().await;
+        let key = name.cache_key();
+        let (bytes, version) = {
+            let mut state = self.sender_keys.lock().await;
+            let mut record = SenderKeyRecord::new_empty();
+            record.disable_legacy_receiver_recovery();
+            state.delete(key);
+            state.put(key, record);
+            if state.pending_distributions.is_empty() {
+                self.has_pending_sender_key_distributions
+                    .store(false, Ordering::Release);
+            }
+            let record = state
+                .cache
+                .get(key)
+                .and_then(Option::as_ref)
+                .expect("inserted empty sender key");
+            (
+                record.serialize_for_store(&state.incarnation)?,
+                Arc::downgrade(record),
+            )
+        };
+        backend.put_sender_key(key, &bytes).await?;
+        let mut state = self.sender_keys.lock().await;
+        if matches!(state.cache.get(key), Some(Some(record)) if same_flush_version(record, &version))
+        {
+            state.dirty.remove(key);
+            state.wire_gate_pending.remove(key);
+        }
+        state.evict_if_needed(self.max_entries);
+        Ok(())
+    }
+
     // === Consumed pre-keys ===
 
     /// Buffer a consumed one-time pre-key for deletion on the next flush, keyed by
