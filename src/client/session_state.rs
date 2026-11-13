@@ -155,7 +155,6 @@ impl Client {
         self.session_state.reconnect_errors.load(ordering)
     }
 
-    #[cfg(test)]
     pub(crate) fn backoff_penalty_pending(&self, ordering: Ordering) -> bool {
         self.session_state.status.load(ordering) & SessionState::PENALTY != 0
     }
