@@ -5,59 +5,9 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use wacore::store::error::{Result, StoreError};
 
-/// Record families. The wire tag is persisted by adapters; never renumber.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Namespace {
-    Identity,
-    Session,
-    PreKey,
-    SignedPreKey,
-    SenderKey,
-    /// The local device's own keys (identity, registration ID, ADV secret,
-    /// current signed prekey). Read and written whole by the Signal service.
-    Device,
-    /// Decrypted results kept until the app confirms delivery, so a
-    /// redelivered ciphertext returns the same result instead of failing.
-    DecryptBuffer,
-    /// Messages this device sent, kept so a retry receipt can re-encrypt them.
-    SentMessage,
-    /// Group member devices confirmed to hold this device's sender key.
-    SenderKeyDevices,
-    /// Pinned identity keys of peer accounts, the anchor that companion
-    /// devices' ADV signatures are verified against.
-    AccountIdentity,
-}
-
-impl Namespace {
-    pub const ALL: [Namespace; 10] = [
-        Namespace::Identity,
-        Namespace::Session,
-        Namespace::PreKey,
-        Namespace::SignedPreKey,
-        Namespace::SenderKey,
-        Namespace::Device,
-        Namespace::DecryptBuffer,
-        Namespace::SentMessage,
-        Namespace::SenderKeyDevices,
-        Namespace::AccountIdentity,
-    ];
-
-    /// Stable persisted name.
-    pub const fn tag(self) -> &'static str {
-        match self {
-            Namespace::Identity => "identity",
-            Namespace::Session => "session",
-            Namespace::PreKey => "prekey",
-            Namespace::SignedPreKey => "signed_prekey",
-            Namespace::SenderKey => "sender_key",
-            Namespace::Device => "device",
-            Namespace::DecryptBuffer => "decrypt_buffer",
-            Namespace::SentMessage => "sent_message",
-            Namespace::SenderKeyDevices => "sender_key_devices",
-            Namespace::AccountIdentity => "account_identity",
-        }
-    }
-}
+pub use wacore::store::transaction::{
+    RecordExists, SignalRecord as Namespace, is_authority_lost as is_fence_lost, is_record_exists,
+};
 
 /// Authority to write one scope. A scope is one linked device's Signal state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,47 +61,8 @@ pub struct FenceLost {
 
 impl FenceLost {
     pub fn into_store_error(self) -> StoreError {
-        StoreError::Database(Box::new(self))
+        wacore::store::transaction::AuthorityLost.into_store_error()
     }
-}
-
-/// An [`WriteOp::Insert`] found its key already present; nothing was applied.
-#[derive(Debug, Clone, thiserror::Error)]
-#[error("{ns:?} record {key} already exists")]
-pub struct RecordExists {
-    pub ns: Namespace,
-    pub key: String,
-}
-
-impl RecordExists {
-    pub fn into_store_error(self) -> StoreError {
-        StoreError::Database(Box::new(self))
-    }
-}
-
-/// Whether `error` (or any error it wraps) is a [`RecordExists`].
-pub fn is_record_exists(error: &StoreError) -> bool {
-    let mut layer: Option<&(dyn std::error::Error + 'static)> = Some(error);
-    while let Some(current) = layer {
-        if current.is::<RecordExists>() {
-            return true;
-        }
-        layer = current.source();
-    }
-    false
-}
-
-/// Whether `error` (or any error it wraps) is a [`FenceLost`]. A node that
-/// sees this must stop serving the scope; retrying cannot succeed.
-pub fn is_fence_lost(error: &StoreError) -> bool {
-    let mut layer: Option<&(dyn std::error::Error + 'static)> = Some(error);
-    while let Some(current) = layer {
-        if current.is::<FenceLost>() {
-            return true;
-        }
-        layer = current.source();
-    }
-    false
 }
 
 /// Byte-level storage an adapter implements. Values are already sealed.

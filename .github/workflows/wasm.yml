@@ -91,15 +91,6 @@ jobs:
       # the store once the shim exists.
       - name: Guard sqlite-storage's platform shim
         run: cargo xt ci workflow guard-sqlite-shim
-      # The fenced, sealed record store backs a browser-held Signal store, so
-      # it must keep building for the page as well as the server.
-      - name: Build wacore-recordstore for wasm32 (release)
-        env:
-          RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
-        run: >
-          cargo build -p wacore-recordstore --lib --release
-          --target wasm32-unknown-unknown
-          --features wacore/js
       # The sans-IO VoIP core (wacore::voip: the CallEngine, the portable run_call driver,
       # the RelayTransport seam, the MLow codec, SRTP/SFrame crypto) must stay wasm-buildable
       # so a browser front end can drive 1:1 calls.
