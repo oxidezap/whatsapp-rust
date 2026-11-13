@@ -138,6 +138,13 @@
         "wasm_test": true
       },
       {
+        "lanes": ["wasm"],
+        "mode": "test",
+        "features": ["wasm-execution"],
+        "test": "sqlite_version",
+        "wasm_test": true
+      },
+      {
         "lanes": ["native", "msrv"],
         "mode": "test",
         "features": ["mobile-core"],

@@ -31,7 +31,7 @@ requests = ["sdk"]
 js = ["wacore/js"]
 runtime-execution = ["voip-control", "js", "dep:wasm-bindgen-test"]
 sqlite = ["sdk", "whatsapp-rust/sqlite-storage", "dep:whatsapp-rust-sqlite-storage", "dep:tokio"]
-wasm-execution = ["sqlite", "js", "whatsapp-rust-sqlite-storage/test-util", "dep:getrandom", "dep:rand", "dep:portable-atomic", "dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-test"]
+wasm-execution = ["sqlite", "js", "whatsapp-rust-sqlite-storage/test-util", "dep:diesel", "dep:getrandom", "dep:rand", "dep:portable-atomic", "dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-test"]
 
 proto-owned-literal = ["sdk"]
 proto-view-literal = ["sdk"]
@@ -94,6 +94,7 @@ tokio = { version = "1.53.1", features = ["macros", "rt", "time"], optional = tr
 whatsapp-rust-sqlite-storage = { path = "../../storages/sqlite-storage", default-features = false, features = ["bundled-sqlite"], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+diesel = { version = "2.3.14", default-features = false, features = ["sqlite"], optional = true }
 whatsapp-rust-sqlite-storage = { path = "../../storages/sqlite-storage", default-features = false, features = ["wasm-test"], optional = true }
 getrandom = { version = "0.4", features = ["wasm_js"], optional = true }
 portable-atomic = { version = "1", default-features = false, features = ["fallback"], optional = true }
@@ -109,6 +110,11 @@ required-features = ["wasm-execution"]
 [[test]]
 name = "sqlite_timer"
 path = "tests/sqlite_timer.rs"
+required-features = ["wasm-execution"]
+
+[[test]]
+name = "sqlite_version"
+path = "tests/sqlite_version.rs"
 required-features = ["wasm-execution"]
 
 [[bin]]

@@ -16,6 +16,11 @@ not a new crate. `tools/xtask/consumers.json` defines the executed profiles.
   in the `wasm` lane with the storage crate's `wasm-test` feature. `sdk,requests` checks request
   branches separately from default requests.
 
+The `wasm-execution` SQLite version test queries the engine linked in a real
+browser and rejects versions before the WAL page-size fix in SQLite 3.54.0.
+The separate SDK-only browser host still checks that no direct storage or
+SQLite dependency masks the SDK's browser feature edges.
+
 Directed negatives run through xtask's shared diagnostic validator. It checks
 one error, the exact code/type and the primary source span. Positive controls
 compile the same imports. Rustdoc covers additional examples and rejection cases.
