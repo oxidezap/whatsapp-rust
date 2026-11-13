@@ -786,6 +786,12 @@ impl SenderKeyRecord {
     pub fn new_empty() -> Self {
         Self::default()
     }
+    pub fn disable_legacy_receiver_recovery(&mut self) {
+        self.inner.legacy_receiver_recovery_disabled = true;
+    }
+    pub fn legacy_receiver_recovery_disabled(&self) -> bool {
+        self.inner.legacy_receiver_recovery_disabled
+    }
     /// Retain prepared crypto across component-backed store handoffs.
     pub fn crypto_context(&self) -> SenderKeyCryptoContext {
         SenderKeyCryptoContext {
@@ -1033,7 +1039,8 @@ impl SenderKeyRecord {
         id: u32,
         signing_public: &PublicKey,
     ) -> bool {
-        if self.has_sender_key_state(id, signing_public) {
+        if self.legacy_receiver_recovery_disabled() || self.has_sender_key_state(id, signing_public)
+        {
             return false;
         }
         let Some(state) = previous.inner.states.iter().find(|state| {

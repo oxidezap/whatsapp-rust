@@ -57,6 +57,15 @@ struct LocalField {
 /// original wire numbers; either kind must stop on a future collision.
 const LOCAL_FIELDS: &[LocalField] = &[
     LocalField {
+        // An explicit chain deletion must not recover stale counters from a
+        // pre-device-address receive row, including after a later redistribution.
+        message: "SenderKeyRecordStructure",
+        name: "legacyReceiverRecoveryDisabled",
+        number: 102,
+        kind: field_descriptor_proto::Type::TYPE_BOOL,
+        type_name: None,
+    },
+    LocalField {
         // Local persisted retention policy for a bounded imported backlog.
         // Never alters the network forward-jump limit.
         message: "SessionStructure.Chain",
